@@ -1,0 +1,66 @@
+================================================================================
+VR180 SILVER BULLET - WINDOWS BUILD PACK
+================================================================================
+
+WHAT YOU NEED:
+1. Python 3.11 or 3.12 (https://www.python.org/downloads/windows/)
+   - IMPORTANT: Check "Add Python to PATH" during install
+   
+2. FFmpeg (https://www.gyan.dev/ffmpeg/builds/)
+   - Download: ffmpeg-release-essentials.zip
+   - Extract to C:\ffmpeg
+   - Add C:\ffmpeg\bin to System PATH
+
+HOW TO BUILD:
+1. Open Command Prompt in this folder
+2. Run: BUILD.bat
+3. Wait for build to complete
+4. Find app in: dist\VR180 Silver Bullet\VR180Processor.exe
+
+MANUAL BUILD:
+pip install -r requirements.txt
+pyinstaller --clean vr180_processor.spec
+
+VERIFY INSTALLATION:
+python --version    (should show 3.11 or 3.12)
+ffmpeg -version     (should show FFmpeg version)
+pip --version       (should show pip version)
+
+WHAT WORKS ON WINDOWS:
+✓ All VR180 adjustments (shift, yaw, pitch, roll, stereo offset)
+✓ H.265 encoding (8-bit and 10-bit) with NVENC support
+✓ ProRes encoding (all profiles, software-based)
+✓ Color grading (gamma, white/black points, LUT support)
+✓ All preview modes (Side by Side, Anaglyph, Single Eye, etc.)
+✓ YouTube VR180 metadata injection
+✓ Hardware acceleration (NVIDIA GPUs)
+
+WHAT DOESN'T WORK:
+✗ Vision Pro features (macOS only - UI is hidden on Windows)
+
+DISTRIBUTION:
+After building, you can distribute the entire folder:
+  dist\VR180 Silver Bullet\
+  
+Users just need to run VR180Processor.exe - no Python or dependencies needed!
+
+TROUBLESHOOTING:
+- "Python not found" → Reinstall Python, check "Add to PATH", restart CMD
+- "FFmpeg not found" → Add C:\ffmpeg\bin to PATH, restart CMD
+- Build fails → Update: python -m pip install --upgrade pip pyinstaller
+- App won't start → Run from CMD to see errors
+
+FILES INCLUDED:
+- vr180_gui.py           - Main application code
+- vr180_processor.spec   - PyInstaller build configuration
+- icon.ico               - Windows application icon
+- icon.png               - Source icon (for reference)
+- BUILD.bat              - Automated build script
+- requirements.txt       - Python dependencies
+- README_WINDOWS.md      - Full documentation
+- BUILD_WINDOWS.md       - Detailed build guide
+
+NEED HELP?
+Read BUILD_WINDOWS.md for detailed instructions and troubleshooting.
+
+================================================================================

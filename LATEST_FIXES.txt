@@ -1,0 +1,165 @@
+================================================================================
+LATEST FIXES - Progress Hang & Settings Persistence
+================================================================================
+
+ISSUE #1: Progress Still Hanging at 41%
+════════════════════════════════════════
+
+Problem:
+  • With hardware acceleration, encoding is SO fast that FFmpeg doesn't
+    send many progress updates
+  • Process finishes but UI still waiting for progress data
+  • Hangs at random percentages (41%, 35%, etc.)
+
+Root Cause:
+  • Hardware encoding completes quickly
+  • FFmpeg may not flush all progress output before exiting
+  • readline() waiting for data that never comes
+
+Solution Applied:
+─────────────────
+1. Added -stats_period 0.5 to FFmpeg command
+   Forces progress updates every 0.5 seconds
+
+2. Added no_progress_count tracking
+   Counts iterations without progress updates
+
+3. Timeout detection
+   If no progress for 5 seconds (15 iterations × 0.3s)
+   AND output file exists with data
+   → Assume complete and break loop
+
+4. Drain remaining output
+   When process.poll() shows it ended, read remaining data
+
+5. Better error handling
+   Wrapped all I/O in try/except to handle edge cases
+
+6. Line buffering
+   Added bufsize=1 to Popen for better output handling
+
+Key Changes:
+  • -stats_period 0.5 → more frequent updates
+  • no_progress_count → detects stalled progress
+  • Check output file size → confirms completion
+  • process.kill() as fallback → ensures cleanup
+
+ISSUE #2: Remember Stereo Offset Settings
+══════════════════════════════════════════
+
+Problem:
+  • Every time you open the app, settings reset to 0
+  • Have to re-enter stereo offset values each time
+  • Annoying for repeated adjustments on similar videos
+
+Solution Applied:
+─────────────────
+Using Qt's QSettings for persistent storage
+
+Saved Settings:
+  ✓ Stereo Yaw Offset
+  ✓ Stereo Pitch Offset
+  ✓ Stereo Roll Offset
+  ✓ Global Yaw
+  ✓ Global Pitch
+  ✓ Global Roll
+  ✓ Global Horizontal Shift
+  ✓ Hardware Acceleration checkbox
+
+When It Saves:
+  • Automatically on app close (closeEvent)
+  • Settings stored in platform-specific location:
+    - macOS: ~/Library/Preferences/com.VR180Processor.plist
+    - Windows: Registry
+    - Linux: ~/.config/VR180Processor/
+
+When It Loads:
+  • Automatically on app startup (_load_settings)
+  • Restores all values from last session
+
+BONUS FIX: UI Text Update
+═════════════════════════
+
+Changed:
+  "Hardware Acceleration (5-10x faster)"
+To:
+  "Hardware Acceleration"
+
+Reason:
+  • Cleaner UI
+  • Less cluttered
+  • Speed is obvious when you use it!
+
+================================================================================
+CODE CHANGES SUMMARY:
+================================================================================
+
+1. VideoProcessor.run() method:
+   • Added -stats_period 0.5
+   • Added bufsize=1 to Popen
+   • Added no_progress_count tracking
+   • Added timeout detection (15 iterations)
+   • Added output file size check
+   • Improved error handling with try/except
+   • Better process cleanup
+
+2. VR180ProcessorGUI.__init__():
+   • Added QSettings initialization
+   • Added _load_settings() call
+
+3. New methods:
+   • _load_settings() - Restores values on startup
+   • _save_settings() - Saves values to disk
+   • closeEvent() - Auto-save on window close
+
+4. Hardware acceleration checkbox:
+   • Removed "(5-10x faster)" text
+
+================================================================================
+TESTING:
+================================================================================
+
+Test Progress Monitoring:
+  □ Process short clip (< 1 min)
+  □ Process medium clip (3-5 min) - your ProRes clip
+  □ Process long clip (10+ min)
+  □ Try with hardware acceleration ON
+  □ Try with hardware acceleration OFF
+  □ Progress should reach 100% every time
+  □ "Complete!" dialog should appear
+  □ No hanging at random percentages
+
+Test Settings Persistence:
+  □ Set stereo offset values
+  □ Close app
+  □ Reopen app
+  □ Verify values restored
+  □ Change hardware acceleration checkbox
+  □ Close and reopen
+  □ Verify checkbox state restored
+
+Expected Results:
+  ✓ No more hanging
+  ✓ Progress reaches 100%
+  ✓ Settings remembered between sessions
+  ✓ Clean UI without extra text
+
+================================================================================
+USAGE:
+================================================================================
+
+Just run the updated file:
+  python3 vr180_gui.py
+
+Your settings will now be remembered!
+
+Process your 3:49 ProRes clip:
+  1. Load video
+  2. Notice your previous settings are still there!
+  3. Apply adjustments (or keep saved ones)
+  4. Click "Process Video"
+  5. Watch it complete to 100% without hanging
+  6. Close app
+  7. Reopen - settings still there!
+
+================================================================================

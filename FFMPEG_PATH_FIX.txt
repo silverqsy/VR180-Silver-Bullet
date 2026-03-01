@@ -1,0 +1,72 @@
+================================================================================
+FFMPEG PATH FIX - Bundled Binary Resolution
+================================================================================
+
+PROBLEM:
+────────
+When testing on another Mac, the app reported:
+  "no such file ffprobe"
+
+This meant the app couldn't find the bundled FFmpeg binaries.
+
+ROOT CAUSE:
+───────────
+The original code hardcoded "ffmpeg" and "ffprobe" strings, assuming they
+would be in the system PATH. In a bundled app, we need to locate the binaries
+relative to the application bundle.
+
+SOLUTION IMPLEMENTED:
+────────────────────
+Added two helper functions that intelligently locate FFmpeg:
+
+1. get_ffmpeg_path()
+2. get_ffprobe_path()
+
+These functions check multiple locations in order:
+  ✓ PyInstaller's _MEIPASS directory (runtime extraction folder)
+  ✓ macOS .app bundle Resources folder
+  ✓ macOS .app bundle Frameworks folder  
+  ✓ System PATH (fallback for development/non-bundled)
+
+CODE CHANGES:
+─────────────
+vr180_gui.py:
+  - Added get_ffmpeg_path() and get_ffprobe_path() functions
+  - Replaced all "ffmpeg" strings with get_ffmpeg_path()
+  - Replaced all "ffprobe" strings with get_ffprobe_path()
+
+vr180_cli.py:
+  - Same changes as GUI version
+
+BUNDLE STRUCTURE:
+─────────────────
+The built app contains FFmpeg in multiple locations:
+
+dist/VR180Processor/_internal/ffmpeg         (runtime extraction)
+dist/VR180Processor/_internal/ffprobe
+dist/VR180 Processor.app/Contents/Frameworks/ffmpeg
+dist/VR180 Processor.app/Contents/Frameworks/ffprobe
+dist/VR180 Processor.app/Contents/Resources/ffmpeg   (symlink)
+dist/VR180 Processor.app/Contents/Resources/ffprobe  (symlink)
+
+TESTING:
+────────
+✅ Rebuild completed successfully
+✅ App size: 156MB (unchanged)
+✅ FFmpeg binaries verified in bundle
+✅ Code now checks all possible locations
+
+NEXT STEPS:
+───────────
+Test on another Mac without Python/FFmpeg installed:
+1. Transfer the rebuilt app
+2. Try loading a video
+3. Verify FFmpeg/ffprobe are found
+4. If it works, create release package!
+
+BUILD VERSION:
+──────────────
+This fix is in the current build at:
+  dist/VR180 Processor.app
+
+================================================================================

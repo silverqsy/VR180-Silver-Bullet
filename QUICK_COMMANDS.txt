@@ -1,0 +1,48 @@
+================================================================================
+VR180 PROCESSOR - QUICK COMMAND REFERENCE
+================================================================================
+
+BUILD & TEST:
+────────────
+  ./build_mac.sh                          # Build macOS app with bundled FFmpeg
+  open "dist/VR180 Processor.app"         # Test the app
+  
+CREATE RELEASE:
+──────────────
+  ./create_release.sh --version 1.0.0     # Package for distribution
+  
+VERIFY BUILD:
+────────────
+  du -sh "dist/VR180 Processor.app"                          # Check app size
+  find "dist/VR180 Processor.app" -name "ffmpeg"             # Find FFmpeg
+  find "dist/VR180 Processor.app" -name "libav*.dylib" | wc -l  # Count libs
+  "dist/VR180 Processor.app/Contents/Frameworks/ffmpeg" -version  # Test FFmpeg
+  
+CLEAN:
+─────
+  rm -rf build dist *.zip                 # Clean all build artifacts
+  
+WINDOWS (on Windows machine):
+────────────────────────────
+  build_windows.bat                       # Build Windows version
+  
+================================================================================
+FILE LOCATIONS:
+================================================================================
+
+macOS App:              dist/VR180 Processor.app
+FFmpeg binary:          dist/VR180 Processor.app/Contents/Frameworks/ffmpeg
+FFmpeg libraries:       dist/VR180 Processor.app/Contents/Frameworks/*.dylib
+Distribution ZIP:       VR180-Processor-X.Y.Z-macOS.zip
+
+Windows App:            dist\VR180Processor\VR180Processor.exe
+FFmpeg binary:          dist\VR180Processor\ffmpeg.exe
+
+================================================================================
+SIZES:
+================================================================================
+
+macOS:                  156MB (fully bundled)
+Windows:                ~250MB (fully bundled)
+
+================================================================================
