@@ -1,0 +1,42 @@
+# Build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.spec.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Video files
+*.360
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.LRV
+*.osv
+*.CRM
+
+# Test/debug artifacts
+*.csv
+*.mp3
+*.jpg
+*.png
+debug_steps*/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.Python
+
+# Backup copies
+vr180_gui\ copy*.py
+vr180_gui_*.py
