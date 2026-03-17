@@ -400,7 +400,7 @@ if HAS_NUMBA:
     def _nb_apply_lut_3d(frame, lut, out, lut_size):
         """Numba JIT: per-pixel trilinear 3D LUT interpolation.
         frame: (H, W, 3) uint8 BGR. lut: (S, S, S, 3) float32 RGB.
-        out: (H, W, 3) uint8 BGR. 33³ LUT fits in L2 cache → ~5ms at half res."""
+        out: (H, W, 3) uint8 BGR. 33³ LUT fits in L2 cache."""
         h = frame.shape[0]
         w = frame.shape[1]
         scale = numba.float32((lut_size - 1) / 255.0)
@@ -3792,8 +3792,8 @@ class ProcessingConfig:
     mask_feather: float = 0.0  # Feather width in % of half-width (0 = hard edge)
     edge_fill: bool = True  # Clamp out-of-bounds EAC pixels to face edges instead of black
     # Output resolution for .360 EAC→equirect
-    eac_out_w: int = 8192   # Output equirect width (SBS: each eye = eac_out_w/2 × eac_out_h)
-    eac_out_h: int = 4096   # Output equirect height
+    eac_out_w: int = 8192   # Output equirect width (SBS: each eye = eac_out_w/2 × eac_out_h). Options: 8192/8640/7680
+    eac_out_h: int = 4096   # Output equirect height. Options: 4096/4320/3840
     # Equirectangular-aware sharpening
     sharpen_amount: float = 0.0  # Sharpening amount (0=off, 0.5=subtle, 1.0=moderate, 2.0=strong)
     sharpen_radius: float = 1.5  # Sharpening radius / sigma (0.5=fine detail, 3.0=coarse structure)
@@ -5042,8 +5042,8 @@ class VideoProcessor(QThread):
                 map_x = np.clip(map_x, 0, w - 1)
                 map_y = np.clip(map_y, 0, h - 1)
 
-                # Apply remapping with bilinear interpolation
-                result = cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                # Apply remapping with Lanczos interpolation for sharper output
+                result = cv2.remap(img, map_x, map_y, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT)
                 return result
 
             # (Roll remap is baked into per-frame rotation matrix R — no separate table needed)
@@ -5085,59 +5085,54 @@ class VideoProcessor(QThread):
                     _lut_3d_size = lut.shape[0]
 
             def apply_lut_3d_fast(frame, lut, intensity):
-                """Apply 3D LUT at half resolution. Uses Metal GPU > Numba > numpy."""
+                """Apply 3D LUT at full resolution. Uses Metal GPU > Numba > numpy."""
                 if lut is None or intensity < 0.01:
                     return frame
                 h, w = frame.shape[:2]
                 lut_size = lut.shape[0]
-                small_h, small_w = h // 2, w // 2
-                small = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
+                n_pixels = h * w
 
                 if HAS_MLX:
                     _prepare_mlx_lut(lut)
-                    n_small = small_h * small_w
                     if intensity < 1.0:
-                        # Blend: need original at half res too
-                        result_small = _mlx_apply_lut_3d(small, _mlx_lut_flat, lut_size, n_small)
-                        orig_f = small.astype(np.float32)
-                        res_f = result_small.astype(np.float32)
+                        result = _mlx_apply_lut_3d(frame, _mlx_lut_flat, lut_size, n_pixels)
+                        orig_f = frame.astype(np.float32)
+                        res_f = result.astype(np.float32)
                         blended = orig_f + (res_f - orig_f) * np.float32(intensity)
-                        result_small = np.clip(blended, 0, 255).astype(np.uint8)
+                        return np.clip(blended, 0, 255).astype(np.uint8)
                     else:
-                        result_small = _mlx_apply_lut_3d(small, _mlx_lut_flat, lut_size, n_small)
-                    return cv2.resize(result_small, (w, h), interpolation=cv2.INTER_LINEAR)
+                        return _mlx_apply_lut_3d(frame, _mlx_lut_flat, lut_size, n_pixels)
 
                 if HAS_NUMBA_CUDA:
-                    result_small = _cuda_apply_lut_3d(small, lut, lut_size)
+                    result = _cuda_apply_lut_3d(frame, lut, lut_size)
                     if intensity < 1.0:
-                        orig_f = small.astype(np.float32)
-                        res_f = result_small.astype(np.float32)
+                        orig_f = frame.astype(np.float32)
+                        res_f = result.astype(np.float32)
                         blended = orig_f + (res_f - orig_f) * np.float32(intensity)
-                        result_small = np.clip(blended, 0, 255).astype(np.uint8)
-                    return cv2.resize(result_small, (w, h), interpolation=cv2.INTER_LINEAR)
+                        return np.clip(blended, 0, 255).astype(np.uint8)
+                    return result
 
                 if HAS_WGPU and _wgpu_device is not None:
-                    n_small = small_h * small_w
-                    result_small = _wgpu_apply_lut_3d(small, lut.ravel(), lut_size, n_small)
+                    result = _wgpu_apply_lut_3d(frame, lut.ravel(), lut_size, n_pixels)
                     if intensity < 1.0:
-                        orig_f = small.astype(np.float32)
-                        res_f = result_small.astype(np.float32)
+                        orig_f = frame.astype(np.float32)
+                        res_f = result.astype(np.float32)
                         blended = orig_f + (res_f - orig_f) * np.float32(intensity)
-                        result_small = np.clip(blended, 0, 255).astype(np.uint8)
-                    return cv2.resize(result_small, (w, h), interpolation=cv2.INTER_LINEAR)
+                        return np.clip(blended, 0, 255).astype(np.uint8)
+                    return result
 
                 if HAS_NUMBA:
-                    out_small = np.empty_like(small)
-                    _nb_apply_lut_3d(small, lut, out_small, lut_size)
+                    out = np.empty_like(frame)
+                    _nb_apply_lut_3d(frame, lut, out, lut_size)
                     if intensity < 1.0:
-                        orig_f = small.astype(np.float32)
-                        res_f = out_small.astype(np.float32)
+                        orig_f = frame.astype(np.float32)
+                        res_f = out.astype(np.float32)
                         blended = orig_f + (res_f - orig_f) * np.float32(intensity)
-                        out_small = np.clip(blended, 0, 255).astype(np.uint8)
-                    return cv2.resize(out_small, (w, h), interpolation=cv2.INTER_LINEAR)
+                        return np.clip(blended, 0, 255).astype(np.uint8)
+                    return out
 
                 # Numpy fallback
-                img = small.astype(np.float32) / 255.0
+                img = frame.astype(np.float32) / 255.0
 
                 b_idx = np.clip(img[:, :, 0] * (lut_size - 1), 0, lut_size - 1.001)
                 g_idx = np.clip(img[:, :, 1] * (lut_size - 1), 0, lut_size - 1.001)
@@ -5168,8 +5163,7 @@ class VideoProcessor(QThread):
                     img_rgb = img[:, :, ::-1]
                     result_rgb = img_rgb + (result_rgb - img_rgb) * intensity
 
-                result_small = np.clip(result_rgb[:, :, ::-1] * 255.0, 0, 255).astype(np.uint8)
-                return cv2.resize(result_small, (w, h), interpolation=cv2.INTER_LINEAR)
+                return np.clip(result_rgb[:, :, ::-1] * 255.0, 0, 255).astype(np.uint8)
 
             # ── Equirectangular-aware sharpening ────────────────────────────
             # CUDA (Windows/NVIDIA): full GPU separable blur + fused USM kernel
@@ -5435,6 +5429,9 @@ class VideoProcessor(QThread):
             # Each eye needs its own xyz grid for thread-safe parallel remap computation
             xyz_x_r, xyz_y_r, xyz_z_r = xyz_x.copy(), xyz_y.copy(), xyz_z.copy()
 
+            # Export uses Lanczos4 (4×4 sinc) for sharper output; preview uses bilinear for speed
+            _export_interp = cv2.INTER_LANCZOS4
+
             def _process_right_eye(left_src, R_right_eye):
                 """Process right eye (runs in thread). Uses _r grid copies for thread safety."""
                 R = R_right_eye.astype(np.float32)
@@ -5446,7 +5443,7 @@ class VideoProcessor(QThread):
                 mx = np.clip((lon_new * inv_pi + 0.5) * half_w_f, 0, half_w_f - 1).reshape(out_height, half_w)
                 my = np.clip((0.5 - lat_new * inv_v_fov) * height_f, 0, height_f - 1).reshape(out_height, half_w)
                 result_buf[:, half_w:] = cv2.remap(left_src, mx, my,
-                                                   cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                                                   _export_interp, borderMode=cv2.BORDER_REFLECT)
 
             def _process_left_eye(right_src, R_left_eye):
                 """Process left eye (runs in thread). Uses original grid."""
@@ -5459,7 +5456,7 @@ class VideoProcessor(QThread):
                 mx = np.clip((lon_new * inv_pi + 0.5) * half_w_f, 0, half_w_f - 1).reshape(out_height, half_w)
                 my = np.clip((0.5 - lat_new * inv_v_fov) * height_f, 0, height_f - 1).reshape(out_height, half_w)
                 result_buf[:, :half_w] = cv2.remap(right_src, mx, my,
-                                                   cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                                                   _export_interp, borderMode=cv2.BORDER_REFLECT)
 
             # RS correction config (needed early for precompute decision)
             rs_ms = cfg.rs_correction_ms
@@ -5562,7 +5559,7 @@ class VideoProcessor(QThread):
                         zn = R[2, 0] * xyz_x_r + R[2, 1] * xyz_y_r + R[2, 2] * xyz_z_r
                         mx, my = _dirs_to_cross_maps(xn, yn, zn, _cmx_r, _cmy_r)
                     result_buf[:, half_w:] = cv2.remap(crossA, mx, my,
-                                                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                                                       _export_interp, borderMode=cv2.BORDER_CONSTANT,
                                                        borderValue=(0, 0, 0))
 
                 def _process_left_eye_cross(crossB, R_left_eye):
@@ -5582,7 +5579,7 @@ class VideoProcessor(QThread):
                         zn = R[2, 0] * xyz_x + R[2, 1] * xyz_y + R[2, 2] * xyz_z
                         mx, my = _dirs_to_cross_maps(xn, yn, zn, _cmx_l, _cmy_l)
                     result_buf[:, :half_w] = cv2.remap(crossB, mx, my,
-                                                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                                                       _export_interp, borderMode=cv2.BORDER_CONSTANT,
                                                        borderValue=(0, 0, 0))
 
             # Precompute constant used by RS code paths (must be in scope for closures)
@@ -5680,7 +5677,7 @@ class VideoProcessor(QThread):
                         mx, my = _dirs_to_cross_maps(xn, yn, zn, _cmx_r, _cmy_r)
 
                     result_buf[:, half_w:] = cv2.remap(crossA, mx, my,
-                                                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                                                       _export_interp, borderMode=cv2.BORDER_CONSTANT,
                                                        borderValue=(0, 0, 0))
 
             # Precompute fisheye-aware RS time-offset map for .mov path only
@@ -5852,7 +5849,7 @@ class VideoProcessor(QThread):
                     # Apply color via 1D LUT (near instant via cv2.LUT)
                     result = apply_color_1d(result_buf, color_1d_lut)
 
-                    # Apply 3D LUT at half resolution
+                    # Apply 3D LUT
                     result = apply_lut_3d_fast(result, lut_3d, cfg.lut_intensity)
 
                     # Apply equirectangular-aware sharpening (after color/LUT, before edge mask)
@@ -5954,9 +5951,17 @@ class VideoProcessor(QThread):
                     decode_segment_list_s4 = []
 
             # Set up FFmpeg encode pipeline
+            # Hardware encoders have max resolution limits (NVENC/AMF/QSV: 8192 per dimension).
+            # Fall back to software encoding if the output exceeds these limits.
+            _hw_max_dim = 8192
+            _enc_type = cfg.encoder_type
+            if _enc_type in ('auto', 'nvenc', 'amf', 'qsv') and (width > _hw_max_dim or out_height > _hw_max_dim):
+                _enc_type = 'software'
+                print(f"⚠ Output {width}×{out_height} exceeds hardware encoder limit ({_hw_max_dim}px) — using software encoder")
+
             # Determine encoder settings using selected encoder type
             if output_codec == "h265":
-                enc = get_hw_encoder_args('h265', cfg.encoder_type, cfg.quality, cfg.bitrate,
+                enc = get_hw_encoder_args('h265', _enc_type, cfg.quality, cfg.bitrate,
                                          cfg.use_bitrate, cfg.h265_bit_depth)
             elif output_codec == "prores":
                 profile_map = {"proxy": "0", "lt": "1", "standard": "2", "hq": "3", "4444": "4", "4444xq": "5"}
@@ -5965,7 +5970,7 @@ class VideoProcessor(QThread):
                 else:
                     enc = ["-c:v", "prores_ks", "-profile:v", profile_map.get(cfg.prores_profile, "3"), "-vendor", "apl0"]
             else:
-                enc = get_hw_encoder_args('h264', cfg.encoder_type, cfg.quality, cfg.bitrate,
+                enc = get_hw_encoder_args('h264', _enc_type, cfg.quality, cfg.bitrate,
                                          cfg.use_bitrate)
 
             # Build audio source for encoder
@@ -5996,6 +6001,9 @@ class VideoProcessor(QThread):
                 # Non-.360: map all audio streams
                 audio_args = ["-map", "1:a?", "-c:a", "copy"]
 
+            # Only set yuv420p if encoder args don't already specify a pixel format
+            # (e.g. 10-bit H.265 uses p010le, ProRes uses yuv422p10le)
+            pix_fmt_args = ["-pix_fmt", "yuv420p"] if not any(a == "-pix_fmt" for a in enc) else []
             encode_cmd = [
                 get_ffmpeg_path(), "-y",
                 "-f", "rawvideo",
@@ -6006,9 +6014,8 @@ class VideoProcessor(QThread):
                 "-i", "-",
             ] + audio_input_args + [
                 "-map", "0:v",
-                "-pix_fmt", "yuv420p",
                 "-f", "mov"
-            ] + audio_args + enc + [str(cfg.output_path)]
+            ] + pix_fmt_args + audio_args + enc + [str(cfg.output_path)]
 
             # Start encode process (decode started per-segment in decode_thread)
             self.status.emit("Starting video decode...")
@@ -7230,11 +7237,12 @@ class VR180ProcessorGUI(QMainWindow):
         # Output resolution (for .360 EAC→equirect)
         self.resolution_label = QLabel("Resolution:")
         self.resolution_combo = QComboBox()
-        self.resolution_combo.addItems(["8192x4096", "7680x3840"])
+        self.resolution_combo.addItems(["8192x4096", "8640x4320 for YT", "7680x3840"])
         self.resolution_combo.setToolTip(
             "Output equirectangular resolution (SBS: each eye = half width × height).\n"
-            "8192x4096: maximum quality — uses all available .360 sensor pixels.\n"
-            "7680x3840: standard 4K VR180 (slightly faster processing)."
+            "8192×4096: default — uses all available .360 sensor pixels.\n"
+            "8640×4320 for YT: YouTube 8K upload resolution (software encode on Windows).\n"
+            "7680×3840: standard 8K VR180 (slightly faster processing)."
         )
         self.resolution_combo.currentIndexChanged.connect(self._on_resolution_changed)
         self.resolution_label.setVisible(False)
@@ -7716,8 +7724,10 @@ class VR180ProcessorGUI(QMainWindow):
 
     def _on_resolution_changed(self, _idx=None):
         """Called when output resolution dropdown changes"""
-        res = self.resolution_combo.currentText()  # "8192x4096" or "7680x3840"
-        parts = res.split("x")
+        res = self.resolution_combo.currentText()  # "8192x4096", "8640x4320 for YT", "7680x3840"
+        # Strip any suffix after the resolution (e.g. " for YT")
+        res_part = res.split()[0]  # "8640x4320"
+        parts = res_part.split("x")
         self.config.eac_out_w = int(parts[0])
         self.config.eac_out_h = int(parts[1])
         # Update class-level defaults so preview uses the new resolution
@@ -8990,7 +9000,21 @@ class VR180ProcessorGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Select input file"); return
         if config.output_path.exists():
             if QMessageBox.question(self, "Overwrite?", f"Overwrite {config.output_path}?") != QMessageBox.StandardButton.Yes: return
-        
+
+        # Warn Windows GPU users about 8640×4320 software fallback
+        if (sys.platform == 'win32' and config.encoder_type != 'software'
+                and max(config.eac_out_w, config.eac_out_h) > 8192
+                and config.is_360_input):
+            reply = QMessageBox.question(
+                self, "Software Encoding Required",
+                f"Output resolution {config.eac_out_w}×{config.eac_out_h} exceeds the GPU encoder limit (8192px).\n\n"
+                "The export will use software encoding (libx265/libx264) which is significantly slower.\n\n"
+                "Continue with software encoding?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         self.process_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.ffmpeg_output.clear()
