@@ -396,6 +396,76 @@ if HAS_NUMBA:
             if my_out[i] > numba.float32(3935.0):
                 my_out[i] = numba.float32(3935.0)
 
+    @njit(cache=True, parallel=True)
+    def _nb_equirect_remap_rs(xyz_x, xyz_y, xyz_z,
+                              R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                              t_offset,
+                              yaw_coeff, pitch_coeff, roll_coeff,
+                              mx_out, my_out, n,
+                              half_w_f, height_f, inv_pi):
+        """Numba JIT: fused RS pipeline — R×dir → RS rotation → half-equirect maps.
+        One loop, zero temporaries. Equivalent to _nb_cross_remap_rs but outputs
+        equirect pixel coords instead of EAC cross coords."""
+        mx_max = half_w_f - numba.float32(1.0)
+        my_max = height_f - numba.float32(1.0)
+        for i in prange(n):
+            ox = xyz_x[i]; oy = xyz_y[i]; oz = xyz_z[i]
+            # Step 1: R × direction
+            xr = R00 * ox + R01 * oy + R02 * oz
+            yr = R10 * ox + R11 * oy + R12 * oz
+            zr = R20 * ox + R21 * oy + R22 * oz
+            # Step 2: RS small-angle rotation
+            t = t_offset[i]
+            ya = yaw_coeff * t
+            pa = pitch_coeff * t
+            ra = roll_coeff * t
+            xn = xr + ya * zr - ra * yr
+            yn = yr + ra * xr - pa * zr
+            zn = zr - ya * xr + pa * yr
+            # Step 3: direction → equirect pixel coords
+            lat_n = _math.asin(max(numba.float32(-1.0), min(numba.float32(1.0), yn)))
+            lon_n = _math.atan2(xn, zn)
+            px = (lon_n * inv_pi + numba.float32(0.5)) * half_w_f
+            py = (numba.float32(0.5) - lat_n * inv_pi) * height_f
+            if px < numba.float32(0.0):
+                px = numba.float32(0.0)
+            elif px > mx_max:
+                px = mx_max
+            if py < numba.float32(0.0):
+                py = numba.float32(0.0)
+            elif py > my_max:
+                py = my_max
+            mx_out[i] = px
+            my_out[i] = py
+
+    @njit(cache=True, parallel=True)
+    def _nb_equirect_remap_rot(xyz_x, xyz_y, xyz_z,
+                               R00, R01, R02, R10, R11, R12, R20, R21, R22,
+                               mx_out, my_out, n,
+                               half_w_f, height_f, inv_pi):
+        """Numba JIT: rotation only → half-equirect maps (no RS). For non-360 path."""
+        mx_max = half_w_f - numba.float32(1.0)
+        my_max = height_f - numba.float32(1.0)
+        for i in prange(n):
+            ox = xyz_x[i]; oy = xyz_y[i]; oz = xyz_z[i]
+            x = R00 * ox + R01 * oy + R02 * oz
+            y = R10 * ox + R11 * oy + R12 * oz
+            z = R20 * ox + R21 * oy + R22 * oz
+            lat_n = _math.asin(max(numba.float32(-1.0), min(numba.float32(1.0), y)))
+            lon_n = _math.atan2(x, z)
+            px = (lon_n * inv_pi + numba.float32(0.5)) * half_w_f
+            py = (numba.float32(0.5) - lat_n * inv_pi) * height_f
+            if px < numba.float32(0.0):
+                px = numba.float32(0.0)
+            elif px > mx_max:
+                px = mx_max
+            if py < numba.float32(0.0):
+                py = numba.float32(0.0)
+            elif py > my_max:
+                py = my_max
+            mx_out[i] = px
+            my_out[i] = py
+
     @njit(parallel=True)
     def _nb_apply_lut_3d(frame, lut, out, lut_size):
         """Numba JIT: per-pixel trilinear 3D LUT interpolation.
@@ -673,6 +743,122 @@ if HAS_NUMBA_CUDA:
                    w01 * cross_img[base01 + c] +
                    w10 * cross_img[base10 + c] +
                    w11 * cross_img[base11 + c])
+            v_int = int(val + 0.5)
+            if v_int > 255: v_int = 255
+            out_bgr[obase + c] = v_int
+
+    # ── CUDA equirect kernels (for non-360 SBS input) ──────────────────
+    @_cuda.jit
+    def _cuda_equirect_remap_rs_bilinear(xyz_x, xyz_y, xyz_z,
+                                          R, t_offset, rs_coeffs,
+                                          src_img, src_w, src_h,
+                                          out_bgr, n):
+        """CUDA kernel: fused R×dir → RS rotation → equirect lookup → bilinear sample.
+        For non-360 half-equirect source images. Same RS math as cross kernel."""
+        INV_PI = 0.3183098861837907
+        idx = _cuda.grid(1)
+        if idx >= n:
+            return
+
+        ox = xyz_x[idx]; oy = xyz_y[idx]; oz = xyz_z[idx]
+        xr = R[0]*ox + R[1]*oy + R[2]*oz
+        yr = R[3]*ox + R[4]*oy + R[5]*oz
+        zr = R[6]*ox + R[7]*oy + R[8]*oz
+
+        t = t_offset[idx]
+        ya = rs_coeffs[0] * t
+        pa = rs_coeffs[1] * t
+        ra = rs_coeffs[2] * t
+        xn = xr + ya*zr - ra*yr
+        yn = yr + ra*xr - pa*zr
+        zn = zr - ya*xr + pa*yr
+
+        lat = _cuda_math.asin(max(-1.0, min(1.0, yn)))
+        lon = _cuda_math.atan2(xn, zn)
+        mx = (lon * INV_PI + 0.5) * src_w
+        my = (0.5 - lat * INV_PI) * src_h
+
+        mx_max = src_w - 1.0
+        my_max = src_h - 1.0
+        if mx < 0.0: mx = 0.0
+        elif mx > mx_max: mx = mx_max
+        if my < 0.0: my = 0.0
+        elif my > my_max: my = my_max
+
+        x0 = int(mx); y0 = int(my)
+        x1 = min(x0 + 1, int(src_w) - 1)
+        y1 = min(y0 + 1, int(src_h) - 1)
+        fx = mx - x0; fy = my - y0
+        w00 = (1.0 - fx) * (1.0 - fy)
+        w01 = fx * (1.0 - fy)
+        w10 = (1.0 - fx) * fy
+        w11 = fx * fy
+
+        sw = int(src_w)
+        base00 = (y0 * sw + x0) * 3
+        base01 = (y0 * sw + x1) * 3
+        base10 = (y1 * sw + x0) * 3
+        base11 = (y1 * sw + x1) * 3
+
+        obase = idx * 3
+        for c in range(3):
+            val = (w00 * src_img[base00 + c] +
+                   w01 * src_img[base01 + c] +
+                   w10 * src_img[base10 + c] +
+                   w11 * src_img[base11 + c])
+            v_int = int(val + 0.5)
+            if v_int > 255: v_int = 255
+            out_bgr[obase + c] = v_int
+
+    @_cuda.jit
+    def _cuda_equirect_remap_rot_bilinear(xyz_x, xyz_y, xyz_z,
+                                           R,
+                                           src_img, src_w, src_h,
+                                           out_bgr, n):
+        """CUDA kernel: rotation-only equirect remap + bilinear sample (no RS)."""
+        INV_PI = 0.3183098861837907
+        idx = _cuda.grid(1)
+        if idx >= n:
+            return
+
+        ox = xyz_x[idx]; oy = xyz_y[idx]; oz = xyz_z[idx]
+        x = R[0]*ox + R[1]*oy + R[2]*oz
+        y = R[3]*ox + R[4]*oy + R[5]*oz
+        z = R[6]*ox + R[7]*oy + R[8]*oz
+
+        lat = _cuda_math.asin(max(-1.0, min(1.0, y)))
+        lon = _cuda_math.atan2(x, z)
+        mx = (lon * INV_PI + 0.5) * src_w
+        my = (0.5 - lat * INV_PI) * src_h
+
+        mx_max = src_w - 1.0
+        my_max = src_h - 1.0
+        if mx < 0.0: mx = 0.0
+        elif mx > mx_max: mx = mx_max
+        if my < 0.0: my = 0.0
+        elif my > my_max: my = my_max
+
+        x0 = int(mx); y0 = int(my)
+        x1 = min(x0 + 1, int(src_w) - 1)
+        y1 = min(y0 + 1, int(src_h) - 1)
+        fx = mx - x0; fy = my - y0
+        w00 = (1.0 - fx) * (1.0 - fy)
+        w01 = fx * (1.0 - fy)
+        w10 = (1.0 - fx) * fy
+        w11 = fx * fy
+
+        sw = int(src_w)
+        base00 = (y0 * sw + x0) * 3
+        base01 = (y0 * sw + x1) * 3
+        base10 = (y1 * sw + x0) * 3
+        base11 = (y1 * sw + x1) * 3
+
+        obase = idx * 3
+        for c in range(3):
+            val = (w00 * src_img[base00 + c] +
+                   w01 * src_img[base01 + c] +
+                   w10 * src_img[base10 + c] +
+                   w11 * src_img[base11 + c])
             v_int = int(val + 0.5)
             if v_int > 255: v_int = 255
             out_bgr[obase + c] = v_int
@@ -1149,6 +1335,128 @@ if HAS_NUMBA_CUDA:
         np.copyto(result_buf[:, half_w:], _cuda_fused_process._host_A[:n_elems].reshape(out_h, half_w, 3))
         np.copyto(result_buf[:, :half_w], _cuda_fused_process._host_B[:n_elems].reshape(out_h, half_w, 3))
 
+    def _cuda_fused_process_eq(srcA_np, srcB_np, d_xyz_x, d_xyz_y, d_xyz_z,
+                               R_right_np, R_left_np,
+                               d_t_offset_right,
+                               rs_coeffs_np,
+                               n_pixels, out_h, out_w, result_buf,
+                               color_1d_lut, lut_3d, lut_intensity,
+                               sharpen_kernel_1d, sharpen_lat, sharpen_amount, sharpen_ksize):
+        """Fused GPU pipeline for non-360 equirect: remap → 1D LUT → 3D LUT → sharpen.
+        srcA_np = right eye source (left_src after shift swap).
+        srcB_np = left eye source (right_src after shift swap).
+        Same post-processing as _cuda_fused_process but uses equirect remap kernels."""
+        p = _cuda_persistent
+        # Reuse buffer allocation (cross buffers work for any source size)
+        _cuda_ensure_buffers(srcA_np, n_pixels)
+
+        src_h_px, src_w_px = srcA_np.shape[:2]
+        half_w = out_w
+        n_elems = n_pixels * 3
+
+        # Upload source half-equirect images (caller provides contiguous buffers)
+        if srcA_np.flags['C_CONTIGUOUS']:
+            p['d_cross_A'].copy_to_device(srcA_np.ravel())
+            p['d_cross_B'].copy_to_device(srcB_np.ravel())
+        else:
+            p['d_cross_A'].copy_to_device(np.ascontiguousarray(srcA_np).ravel())
+            p['d_cross_B'].copy_to_device(np.ascontiguousarray(srcB_np).ravel())
+
+        # Upload rotation matrices
+        p['d_R_A'].copy_to_device(R_right_np.ravel().astype(np.float32))
+        p['d_R_B'].copy_to_device(R_left_np.ravel().astype(np.float32))
+
+        grid_pix = (n_pixels + _CUDA_BLOCK - 1) // _CUDA_BLOCK
+        grid_elem = (n_elems + _CUDA_BLOCK - 1) // _CUDA_BLOCK
+
+        # ── Step 1: Remap both eyes ──
+        src_w_f = float(src_w_px)
+        src_h_f = float(src_h_px)
+        # Right eye (with RS if active)
+        if rs_coeffs_np is not None:
+            p['d_rs'].copy_to_device(rs_coeffs_np.astype(np.float32))
+            _cuda_equirect_remap_rs_bilinear[grid_pix, _CUDA_BLOCK](
+                d_xyz_x, d_xyz_y, d_xyz_z,
+                p['d_R_A'], d_t_offset_right, p['d_rs'],
+                p['d_cross_A'], src_w_f, src_h_f,
+                p['d_out_A'], n_pixels)
+        else:
+            _cuda_equirect_remap_rot_bilinear[grid_pix, _CUDA_BLOCK](
+                d_xyz_x, d_xyz_y, d_xyz_z,
+                p['d_R_A'],
+                p['d_cross_A'], src_w_f, src_h_f,
+                p['d_out_A'], n_pixels)
+        # Left eye (no RS)
+        _cuda_equirect_remap_rot_bilinear[grid_pix, _CUDA_BLOCK](
+            d_xyz_x, d_xyz_y, d_xyz_z,
+            p['d_R_B'],
+            p['d_cross_B'], src_w_f, src_h_f,
+            p['d_out_B'], n_pixels)
+
+        # After remap: d_out_A = right eye, d_out_B = left eye (on GPU)
+        cur_A, aux_A = p['d_out_A'], p['d_aux_A']
+        cur_B, aux_B = p['d_out_B'], p['d_aux_B']
+
+        # ── Step 2: 1D color LUT ──
+        if color_1d_lut is not None:
+            if p['d_1d_lut'] is None:
+                p['d_1d_lut'] = _cuda.device_array(256, dtype=np.uint8)
+            p['d_1d_lut'].copy_to_device(color_1d_lut)
+            _cuda_apply_1d_lut_inplace[grid_elem, _CUDA_BLOCK](cur_A, p['d_1d_lut'], n_elems)
+            _cuda_apply_1d_lut_inplace[grid_elem, _CUDA_BLOCK](cur_B, p['d_1d_lut'], n_elems)
+
+        # ── Step 3: 3D LUT ──
+        if lut_3d is not None and lut_intensity > 0.01:
+            lut_size = lut_3d.shape[0]
+            lut_elems = lut_3d.size
+            if p['lut_size'] != lut_elems:
+                p['d_lut'] = _cuda.to_device(lut_3d.ravel().astype(np.float32))
+                p['lut_size'] = lut_elems
+            if lut_intensity >= 0.99:
+                _cuda_apply_lut_3d_kernel[grid_pix, _CUDA_BLOCK](cur_A, p['d_lut'], aux_A, lut_size, n_pixels)
+                _cuda_apply_lut_3d_kernel[grid_pix, _CUDA_BLOCK](cur_B, p['d_lut'], aux_B, lut_size, n_pixels)
+            else:
+                _cuda_apply_lut_3d_blend_kernel[grid_pix, _CUDA_BLOCK](
+                    cur_A, p['d_lut'], aux_A, lut_size, np.float32(lut_intensity), n_pixels)
+                _cuda_apply_lut_3d_blend_kernel[grid_pix, _CUDA_BLOCK](
+                    cur_B, p['d_lut'], aux_B, lut_size, np.float32(lut_intensity), n_pixels)
+            cur_A, aux_A = aux_A, cur_A
+            cur_B, aux_B = aux_B, cur_B
+
+        # ── Step 4: Equirectangular-aware sharpen ──
+        if sharpen_kernel_1d is not None and sharpen_amount > 0.01:
+            if p['d_sharpen_kernel'] is None or p['d_sharpen_kernel'].size != len(sharpen_kernel_1d):
+                p['d_sharpen_kernel'] = _cuda.to_device(sharpen_kernel_1d)
+            if p['d_sharpen_lat'] is None or p['d_sharpen_lat'].size != len(sharpen_lat):
+                p['d_sharpen_lat'] = _cuda.to_device(sharpen_lat)
+            K = np.int32(sharpen_ksize)
+            H = np.int32(out_h)
+            W = np.int32(half_w)
+            amt = np.float32(sharpen_amount)
+            _cuda_blur_h_kernel[grid_elem, _CUDA_BLOCK](cur_A, aux_A, p['d_sharpen_kernel'], K, H, W)
+            _cuda_blur_v_usm_kernel[grid_elem, _CUDA_BLOCK](
+                cur_A, aux_A, p['d_sharpen_lat'], p['d_final_A'], amt, p['d_sharpen_kernel'], K, H, W)
+            cur_A = p['d_final_A']
+            _cuda_blur_h_kernel[grid_elem, _CUDA_BLOCK](cur_B, aux_B, p['d_sharpen_kernel'], K, H, W)
+            _cuda_blur_v_usm_kernel[grid_elem, _CUDA_BLOCK](
+                cur_B, aux_B, p['d_sharpen_lat'], p['d_final_B'], amt, p['d_sharpen_kernel'], K, H, W)
+            cur_B = p['d_final_B']
+
+        # ── Step 5: Single sync + download ──
+        _cuda.synchronize()
+
+        if not hasattr(_cuda_fused_process_eq, '_host_A'):
+            _cuda_fused_process_eq._host_A = np.empty(n_elems, dtype=np.uint8)
+            _cuda_fused_process_eq._host_B = np.empty(n_elems, dtype=np.uint8)
+        elif _cuda_fused_process_eq._host_A.size != n_elems:
+            _cuda_fused_process_eq._host_A = np.empty(n_elems, dtype=np.uint8)
+            _cuda_fused_process_eq._host_B = np.empty(n_elems, dtype=np.uint8)
+
+        cur_A.copy_to_host(_cuda_fused_process_eq._host_A)
+        cur_B.copy_to_host(_cuda_fused_process_eq._host_B)
+        np.copyto(result_buf[:, half_w:], _cuda_fused_process_eq._host_A[:n_elems].reshape(out_h, half_w, 3))
+        np.copyto(result_buf[:, :half_w], _cuda_fused_process_eq._host_B[:n_elems].reshape(out_h, half_w, 3))
+
     print("  ✓ Numba CUDA kernels defined")
 
 # ── MLX Metal GPU acceleration (Apple Silicon) ──────────────────────────
@@ -1265,6 +1573,74 @@ if HAS_MLX:
         source=_MLX_CROSS_REMAP_SOURCE,
     )
 
+    # ── MLX Metal equirect remap shader (for non-360 SBS half-equirect input) ──
+    _MLX_EQUIRECT_REMAP_SOURCE = '''
+        uint idx = thread_position_in_grid.x;
+        if (idx >= n[0]) return;
+
+        float ox = xyz_x[idx], oy = xyz_y[idx], oz = xyz_z[idx];
+
+        // R × direction → rotated direction
+        float xn = R[0]*ox + R[1]*oy + R[2]*oz;
+        float yn = R[3]*ox + R[4]*oy + R[5]*oz;
+        float zn = R[6]*ox + R[7]*oy + R[8]*oz;
+
+        // Equirect UV: lon = atan2(x, z), lat = asin(y)
+        float lon = metal::atan2(xn, zn);
+        float lat = metal::precise::asin(metal::clamp(yn, -1.0f, 1.0f));
+        float INV_PI = 0.31830988618f;
+        float img_w = img_dims[0];
+        float img_h = img_dims[1];
+        float mx_f = metal::clamp((lon * INV_PI + 0.5f) * img_w, 0.0f, img_w - 1.0f);
+        float my_f = metal::clamp((0.5f - lat * INV_PI) * img_h, 0.0f, img_h - 1.0f);
+
+        // Bilinear interpolation from source image (H × W × 3 BGR uint8)
+        int iw = (int)img_w;
+        int ix = (int)metal::floor(mx_f);
+        int iy = (int)metal::floor(my_f);
+        float fx = mx_f - (float)ix;
+        float fy = my_f - (float)iy;
+        int ix1 = metal::min(ix + 1, iw - 1);
+        int iy1 = metal::min(iy + 1, (int)img_h - 1);
+
+        uint out_base = idx * 3;
+        for (int c = 0; c < 3; c++) {
+            float v00 = (float)src_img[(iy  * iw + ix ) * 3 + c];
+            float v10 = (float)src_img[(iy  * iw + ix1) * 3 + c];
+            float v01 = (float)src_img[(iy1 * iw + ix ) * 3 + c];
+            float v11 = (float)src_img[(iy1 * iw + ix1) * 3 + c];
+            float val = v00*(1.0f-fx)*(1.0f-fy) + v10*fx*(1.0f-fy)
+                      + v01*(1.0f-fx)*fy + v11*fx*fy;
+            out[out_base + c] = (uint8_t)metal::clamp(val + 0.5f, 0.0f, 255.0f);
+        }
+    '''
+
+    _mlx_equirect_kernel = _mlx_metal_kernel(
+        name="equirect_remap_bilinear",
+        input_names=["xyz_x", "xyz_y", "xyz_z", "R", "img_dims", "src_img", "n"],
+        output_names=["out"],
+        source=_MLX_EQUIRECT_REMAP_SOURCE,
+    )
+
+    def _mlx_process_eye_equirect(src_np, mlx_xyz_x, mlx_xyz_y, mlx_xyz_z,
+                                   R_np, n_pixels):
+        """Run equirect remap kernel for one eye (non-360 path). Returns flat uint8 array."""
+        mlx_R = mx.array(R_np.ravel().astype(np.float32))
+        src_h, src_w = src_np.shape[:2]
+        mlx_dims = mx.array(np.array([float(src_w), float(src_h)], dtype=np.float32))
+        mlx_src = mx.array(src_np.ravel())
+        mlx_n = mx.array(np.array([n_pixels], dtype=np.int32))
+
+        outputs = _mlx_equirect_kernel(
+            inputs=[mlx_xyz_x, mlx_xyz_y, mlx_xyz_z, mlx_R, mlx_dims, mlx_src, mlx_n],
+            output_shapes=[(n_pixels * 3,)],
+            output_dtypes=[mx.uint8],
+            grid=(n_pixels, 1, 1),
+            threadgroup=(256, 1, 1),
+        )
+        mx.eval(outputs[0])
+        return np.array(outputs[0])
+
     # Preallocate constant MLX arrays (reused every frame)
     _mlx_identity_R = mx.array(np.eye(3, dtype=np.float32).ravel())
     _mlx_zero_rs = mx.array(np.zeros(3, dtype=np.float32))
@@ -1376,6 +1752,7 @@ HAS_WGPU = False
 # wgpu globals (lazy-initialized on first use)
 _wgpu_device = None
 _wgpu_cross_pipeline = None
+_wgpu_equirect_pipeline = None
 _wgpu_lut_pipeline = None
 
 # ── WGSL compute shader: fused cross remap + RS + IORI + bilinear ────────
@@ -1496,6 +1873,68 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 """
 
+# ── WGSL compute shader: equirect remap + bilinear (non-360 path) ─────────
+_WGSL_EQUIRECT_REMAP_SOURCE = """
+@group(0) @binding(0) var<storage, read> xyz_x: array<f32>;
+@group(0) @binding(1) var<storage, read> xyz_y: array<f32>;
+@group(0) @binding(2) var<storage, read> xyz_z: array<f32>;
+@group(0) @binding(3) var<storage, read> R: array<f32>;
+@group(0) @binding(4) var<storage, read> img_dims: array<f32>;
+@group(0) @binding(5) var<storage, read> src_img: array<u32>;
+@group(0) @binding(6) var<storage, read> n_buf: array<u32>;
+@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+
+fn read_byte(byte_idx: u32) -> f32 {
+    let word_idx = byte_idx / 4u;
+    let shift = (byte_idx % 4u) * 8u;
+    return f32((src_img[word_idx] >> shift) & 0xFFu);
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * 65535u * 256u;
+    if (idx >= n_buf[0]) { return; }
+
+    let ox = xyz_x[idx];
+    let oy = xyz_y[idx];
+    let oz = xyz_z[idx];
+
+    // R × direction → rotated direction
+    let xn = R[0]*ox + R[1]*oy + R[2]*oz;
+    let yn = R[3]*ox + R[4]*oy + R[5]*oz;
+    let zn = R[6]*ox + R[7]*oy + R[8]*oz;
+
+    // Equirect UV: lon = atan2(x, z), lat = asin(y)
+    let lon = atan2(xn, zn);
+    let lat = asin(clamp(yn, -1.0, 1.0));
+    let INV_PI: f32 = 0.31830988618;
+    let img_w = img_dims[0];
+    let img_h = img_dims[1];
+    let mx_f = clamp((lon * INV_PI + 0.5) * img_w, 0.0, img_w - 1.0);
+    let my_f = clamp((0.5 - lat * INV_PI) * img_h, 0.0, img_h - 1.0);
+
+    // Bilinear interpolation from source image (H × W × 3 BGR uint8)
+    let iw = i32(img_w);
+    let ix = i32(floor(mx_f));
+    let iy = i32(floor(my_f));
+    let fx = mx_f - f32(ix);
+    let fy = my_f - f32(iy);
+    let ix1 = min(ix + 1, iw - 1);
+    let iy1 = min(iy + 1, i32(img_h) - 1);
+
+    let out_base = idx * 3u;
+    for (var c: u32 = 0u; c < 3u; c = c + 1u) {
+        let v00 = read_byte(u32(iy  * iw + ix ) * 3u + c);
+        let v10 = read_byte(u32(iy  * iw + ix1) * 3u + c);
+        let v01 = read_byte(u32(iy1 * iw + ix ) * 3u + c);
+        let v11 = read_byte(u32(iy1 * iw + ix1) * 3u + c);
+        let val = v00*(1.0-fx)*(1.0-fy) + v10*fx*(1.0-fy)
+                + v01*(1.0-fx)*fy + v11*fx*fy;
+        out[out_base + c] = clamp(val + 0.5, 0.0, 255.0);
+    }
+}
+"""
+
 # ── WGSL compute shader: 3D LUT trilinear interpolation ──────────────────
 _WGSL_LUT3D_SOURCE = """
 @group(0) @binding(0) var<storage, read> frame_packed: array<u32>;
@@ -1558,7 +1997,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 def _wgpu_init():
     """Lazy-initialize wgpu device and compile compute pipelines."""
-    global _wgpu_device, _wgpu_cross_pipeline, _wgpu_lut_pipeline, HAS_WGPU
+    global _wgpu_device, _wgpu_cross_pipeline, _wgpu_equirect_pipeline, _wgpu_lut_pipeline, HAS_WGPU
     if _wgpu_device is not None:
         return True
     if not HAS_WGPU:
@@ -1575,6 +2014,10 @@ def _wgpu_init():
         _wgpu_cross_pipeline = _wgpu_device.create_compute_pipeline(
             layout="auto",
             compute={"module": cross_module, "entry_point": "main"})
+        equirect_module = _wgpu_device.create_shader_module(code=_WGSL_EQUIRECT_REMAP_SOURCE)
+        _wgpu_equirect_pipeline = _wgpu_device.create_compute_pipeline(
+            layout="auto",
+            compute={"module": equirect_module, "entry_point": "main"})
         lut_module = _wgpu_device.create_shader_module(code=_WGSL_LUT3D_SOURCE)
         _wgpu_lut_pipeline = _wgpu_device.create_compute_pipeline(
             layout="auto",
@@ -1699,6 +2142,79 @@ def _wgpu_process_eye(cross_np, xyz_x_buf, xyz_y_buf, xyz_z_buf,
     result = np.frombuffer(raw, dtype=np.float32)[:n_pixels * 3]
     return np.clip(result, 0, 255).astype(np.uint8)
 
+# ── wgpu persistent buffer pool for equirect remap (non-360) ──
+_wgpu_equirect_pool = None
+
+def _wgpu_ensure_equirect_pool(n_pixels, src_w, src_h, xyz_x_buf, xyz_y_buf, xyz_z_buf, out_buf):
+    """Ensure persistent buffer pool for equirect remap. Create once, reuse every frame."""
+    global _wgpu_equirect_pool
+    if (_wgpu_equirect_pool is not None and
+            _wgpu_equirect_pool['n_pixels'] == n_pixels and
+            _wgpu_equirect_pool['src_w'] == src_w and
+            _wgpu_equirect_pool['src_h'] == src_h):
+        return _wgpu_equirect_pool
+
+    src_size = (src_h * src_w * 3 + 3) // 4 * 4
+    pool = {
+        'n_pixels': n_pixels,
+        'src_w': src_w,
+        'src_h': src_h,
+        'R_buf': _wgpu_device.create_buffer(size=9*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
+        'dims_buf': _wgpu_device.create_buffer(size=2*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
+        'src_buf': _wgpu_device.create_buffer(size=src_size, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
+        'n_buf': _wgpu_device.create_buffer(size=4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
+    }
+    _wgpu_device.queue.write_buffer(pool['n_buf'], 0, np.array([n_pixels], dtype=np.uint32).tobytes())
+    _wgpu_device.queue.write_buffer(pool['dims_buf'], 0,
+                                     np.array([float(src_w), float(src_h)], dtype=np.float32).tobytes())
+
+    pool['bind_group'] = _wgpu_device.create_bind_group(
+        layout=_wgpu_equirect_pipeline.get_bind_group_layout(0),
+        entries=[
+            {"binding": 0, "resource": {"buffer": xyz_x_buf}},
+            {"binding": 1, "resource": {"buffer": xyz_y_buf}},
+            {"binding": 2, "resource": {"buffer": xyz_z_buf}},
+            {"binding": 3, "resource": {"buffer": pool['R_buf']}},
+            {"binding": 4, "resource": {"buffer": pool['dims_buf']}},
+            {"binding": 5, "resource": {"buffer": pool['src_buf']}},
+            {"binding": 6, "resource": {"buffer": pool['n_buf']}},
+            {"binding": 7, "resource": {"buffer": out_buf}},
+        ],
+    )
+    _wgpu_equirect_pool = pool
+    return pool
+
+def _wgpu_process_eye_equirect(src_np, xyz_x_buf, xyz_y_buf, xyz_z_buf,
+                                R_np, n_pixels, out_buf):
+    """Run wgpu equirect remap kernel for one eye. Returns (n_pixels*3,) uint8 numpy array."""
+    src_h, src_w = src_np.shape[:2]
+    pool = _wgpu_ensure_equirect_pool(n_pixels, src_w, src_h, xyz_x_buf, xyz_y_buf, xyz_z_buf, out_buf)
+    q = _wgpu_device.queue
+
+    q.write_buffer(pool['R_buf'], 0, R_np.ravel().astype(np.float32).tobytes())
+
+    src_bytes = np.ascontiguousarray(src_np).tobytes()
+    pad = (4 - len(src_bytes) % 4) % 4
+    if pad:
+        src_bytes += b'\x00' * pad
+    q.write_buffer(pool['src_buf'], 0, src_bytes)
+
+    encoder = _wgpu_device.create_command_encoder()
+    pass_enc = encoder.begin_compute_pass()
+    pass_enc.set_pipeline(_wgpu_equirect_pipeline)
+    pass_enc.set_bind_group(0, pool['bind_group'])
+    _wg_x = (n_pixels + 255) // 256
+    if _wg_x > 65535:
+        pass_enc.dispatch_workgroups(65535, (_wg_x + 65534) // 65535, 1)
+    else:
+        pass_enc.dispatch_workgroups(_wg_x, 1, 1)
+    pass_enc.end()
+    _wgpu_device.queue.submit([encoder.finish()])
+
+    raw = _wgpu_device.queue.read_buffer(out_buf)
+    result = np.frombuffer(raw, dtype=np.float32)[:n_pixels * 3]
+    return np.clip(result, 0, 255).astype(np.uint8)
+
 # ── wgpu persistent buffer pool for LUT ──
 _wgpu_lut_pool = None
 
@@ -1770,10 +2286,6 @@ def _wgpu_apply_lut_3d(frame_np, lut_flat_np, lut_size, n_pixels):
     raw = _wgpu_device.queue.read_buffer(pool['out_buf'])
     result = np.frombuffer(raw, dtype=np.float32)[:n_pixels * 3]
     return np.clip(result, 0, 255).astype(np.uint8).reshape(frame_np.shape)
-
-# Import select only on Unix/Mac (not available on Windows)
-if sys.platform != 'win32':
-    import select
 
 # Windows-specific flag to hide console windows
 def get_subprocess_flags():
@@ -2362,9 +2874,11 @@ def parse_geoc(file_path: str) -> dict:
 def detect_gopro_segments(file_path: str) -> list:
     """Detect GoPro multi-segment recording files from a single segment.
 
-    GoPro MAX splits long recordings into segments with naming pattern:
-      GS01XXXX.360, GS02XXXX.360, GS03XXXX.360, ...
-    where XX is the chapter number (01, 02, ...) and XXXX is the recording ID.
+    GoPro naming patterns (cc=chapter, IIII=recording id):
+      .360:  GS01XXXX.360, GH01XXXX.360
+      .MP4:  GX01XXXX.MP4, GH01XXXX.MP4, GP01XXXX.MP4
+      .LRV:  GL01XXXX.LRV
+      .MOV:  same prefixes with .MOV extension
 
     Given any segment, returns sorted list of all segment paths in order.
     Returns [file_path] if no other segments found (single-segment recording).
@@ -2372,8 +2886,8 @@ def detect_gopro_segments(file_path: str) -> list:
     import re
     p = Path(file_path)
     name = p.name
-    # Match GoPro MAX naming: GSccIIII.360 where cc=chapter, IIII=recording id
-    m = re.match(r'^(G[SH])(\d{2})(\d{4})(\.360)$', name, re.IGNORECASE)
+    # Match GoPro naming: G[SHXLP]ccIIII.ext where cc=chapter, IIII=recording id
+    m = re.match(r'^(G[SHXLP])(\d{2})(\d{4})(\.\w+)$', name, re.IGNORECASE)
     if not m:
         return [str(p)]
 
@@ -3170,37 +3684,26 @@ class GyroStabilizer:
                             Q[i] *= -1
                     print(f"  Applied gravity alignment to {N} CORI frames")
 
-        # ── Smooth full CORI for yaw+pitch ──
+        # ── Smooth full CORI (all axes: yaw, pitch, roll) ──
         _NO_STABILIZE = 'no_stab'
+        _camera_lock = False
+        smooth_q = None
         if not stabilize:
-            smooth_yp = _NO_STABILIZE
-            smooth_roll = _NO_STABILIZE
+            smooth_q = _NO_STABILIZE
             print(f"IORI compensation only (no heading correction, source={self.source})")
-        elif window_ms > 0 and N > 1:
-            smooth_yp = self._smooth_quats_velocity_dampened(
+        elif window_ms == 0:
+            # Camera lock: fully counteract all camera rotation on all axes
+            _camera_lock = True
+            print(f"Gyro stabilization: CAMERA LOCK (all axes locked)")
+        elif N > 1:
+            smooth_q = self._smooth_quats_velocity_dampened(
                 Q, self.fps, smooth_ms=window_ms, fast_ms=50.0,
                 max_velocity=200.0, max_corr_deg=max_corr_deg,
                 responsiveness=responsiveness)
-            print(f"Gyro stabilization: heading {window_ms:.0f}ms (vel-dampened, soft-limit {max_corr_deg:.0f}°, resp {responsiveness:.1f}), ", end="")
-        else:
-            smooth_yp = None  # camera lock
-            print(f"Gyro stabilization: yaw+pitch locked, ", end="")
-
-        # ── Smooth full CORI for roll ──
-        if not stabilize:
-            pass
-        elif horizon_lock or roll_window_ms == 0:
-            smooth_roll = None  # roll lock
-            print(f"roll locked (horizon lock)")
-        elif roll_window_ms > 0 and N > 1:
-            smooth_roll = self._smooth_quats_velocity_dampened(
-                Q, self.fps, smooth_ms=roll_window_ms, fast_ms=100.0,
-                max_velocity=200.0, max_corr_deg=0,
-                responsiveness=responsiveness)  # no limit for roll
-            print(f"roll {roll_window_ms:.0f}ms (vel-dampened)")
-        else:
-            smooth_roll = None
-            print(f"roll locked")
+            if horizon_lock:
+                print(f"Gyro stabilization: {window_ms:.0f}ms (vel-dampened, soft-limit {max_corr_deg:.0f}°, resp {responsiveness:.1f}), horizon lock (GRAV)")
+            else:
+                print(f"Gyro stabilization: {window_ms:.0f}ms all-axis (vel-dampened, soft-limit {max_corr_deg:.0f}°, resp {responsiveness:.1f})")
 
         # ── Detect non-zero IORI ──
         self.has_iori = any(
@@ -3239,8 +3742,8 @@ class GyroStabilizer:
             grav_arr = np.array(self.grav_samples, dtype=np.float64)  # (n_grav, 3)
             if upside_down:
                 grav_arr = -grav_arr
-            # Downsample to per-frame by binning (n_grav / N samples per frame)
-            _grav_roll_per_frame = np.empty(N, dtype=np.float64)
+            # Downsample GRAV to per-frame by binning (n_grav / N samples per frame)
+            _raw_grav_roll = np.empty(N, dtype=np.float64)
             bin_size = n_grav / N
             for i in range(N):
                 g_start = int(i * bin_size)
@@ -3249,26 +3752,37 @@ class GyroStabilizer:
                 g_end = min(g_end, n_grav)
                 gx_avg = grav_arr[g_start:g_end, 0].mean()
                 gy_avg = grav_arr[g_start:g_end, 1].mean()
-                _grav_roll_per_frame[i] = _math.atan2(-gx_avg, gy_avg)
-            # Light smoothing to reduce accelerometer noise (50ms window)
-            smooth_frames = max(1, int(round(0.050 * self.fps)))
-            if smooth_frames > 1 and N > smooth_frames:
-                pad = smooth_frames // 2
-                padded = np.concatenate([
-                    _grav_roll_per_frame[pad:0:-1],
-                    _grav_roll_per_frame,
-                    _grav_roll_per_frame[-2:-2-pad:-1]
-                ])
-                cs = np.cumsum(padded)
-                cs = np.insert(cs, 0, 0.0)
-                _grav_roll_per_frame = (cs[smooth_frames:] - cs[:-smooth_frames]) / smooth_frames
-            print(f"GRAV roll: per-frame from {n_grav} samples "
-                  f"(bin={bin_size:.1f}, smooth={smooth_frames}f)")
+                _raw_grav_roll[i] = _math.atan2(-gx_avg, gy_avg)
 
-        # ── Build per-frame heading via split-axis correction ──
-        # YP: swing-twist on correction quaternion (small angles → no gimbal lock)
-        # Roll: for horizon lock, use per-frame GRAV (drift-free accelerometer).
-        #       For roll smoothing, use CORI-based _local_roll (relative correction).
+            # Complementary filter: fuse CORI roll (smooth, drifts) with GRAV roll
+            # (noisy, drift-free). CORI provides frame-to-frame smoothness (high-freq),
+            # GRAV anchors long-term drift correction (low-freq).
+            #   fused[0] = grav[0]
+            #   fused[i] = alpha * (fused[i-1] + cori_delta[i]) + (1-alpha) * grav[i]
+            # where alpha = exp(-dt / tau), tau = time constant for drift correction.
+            # tau ~2s means GRAV corrects drift over ~2 seconds while CORI keeps
+            # frame-to-frame transitions smooth.
+            _cori_roll = np.array([_local_roll(tuple(Q[i])) for i in range(N)], dtype=np.float64)
+            dt = 1.0 / self.fps
+            tau = 2.0  # seconds — drift correction time constant
+            alpha = _math.exp(-dt / tau)
+            _grav_roll_per_frame = np.empty(N, dtype=np.float64)
+            _grav_roll_per_frame[0] = _raw_grav_roll[0]
+            for i in range(1, N):
+                cori_delta = _cori_roll[i] - _cori_roll[i - 1]
+                # Wrap delta to [-pi, pi]
+                if cori_delta > _math.pi:
+                    cori_delta -= 2 * _math.pi
+                elif cori_delta < -_math.pi:
+                    cori_delta += 2 * _math.pi
+                predicted = _grav_roll_per_frame[i - 1] + cori_delta
+                _grav_roll_per_frame[i] = alpha * predicted + (1.0 - alpha) * _raw_grav_roll[i]
+            print(f"GRAV roll: complementary filter (CORI+GRAV) from {n_grav} samples "
+                  f"(bin={bin_size:.1f}, tau={tau:.1f}s, alpha={alpha:.4f})")
+
+        # ── Build per-frame heading correction ──
+        # Single smoother for all axes. Horizon lock overrides the roll component
+        # with GRAV complementary filter for drift-free horizon.
         left_corr = []
         left_mats = []
         right_corr = []
@@ -3282,47 +3796,34 @@ class GyroStabilizer:
             q_iori = self.iori_quats[i]
             q_raw = tuple(Q[i])
 
-            if smooth_yp is _NO_STABILIZE:
+            if smooth_q is _NO_STABILIZE:
                 # No heading correction at all
                 q_heading = identity_q
+            elif _camera_lock:
+                # Camera lock: counteract full CORI rotation
+                q_heading = q_raw
             else:
-                # ── YP correction: raw × smooth_yp⁻¹ → take swing (non-roll) part ──
-                if smooth_yp is not None:
-                    q_corr_yp = quat_multiply(q_raw, quat_inverse(tuple(smooth_yp[i])))
+                # Correction = raw × smooth⁻¹ (all axes)
+                q_corr = quat_multiply(q_raw, quat_inverse(tuple(smooth_q[i])))
+
+                if horizon_lock and _grav_roll_per_frame is not None:
+                    # Horizon lock: keep yaw+pitch from smoother, replace roll with GRAV
+                    # Swing-twist decompose to extract yaw+pitch (swing) from correction
+                    w, x, y, z = q_corr
+                    n_twist = _math.sqrt(w * w + z * z)
+                    if n_twist > 1e-10:
+                        tw, tz = w / n_twist, z / n_twist
+                    else:
+                        tw, tz = 1.0, 0.0
+                    swing_yp = quat_multiply(q_corr, (tw, 0, 0, -tz))
+
+                    # Replace roll with GRAV complementary filter (drift-free)
+                    half_r = _grav_roll_per_frame[i] / 2.0
+                    twist_roll = (_math.cos(half_r), 0.0, 0.0, _math.sin(half_r))
+                    q_heading = quat_multiply(swing_yp, twist_roll)
                 else:
-                    q_corr_yp = q_raw  # lock: correct everything
-
-                # Swing-twist decompose: twist = roll around Z, swing = yaw+pitch
-                w, x, y, z = q_corr_yp
-                n_twist = _math.sqrt(w * w + z * z)
-                if n_twist > 1e-10:
-                    tw, tz = w / n_twist, z / n_twist
-                else:
-                    tw, tz = 1.0, 0.0
-                # swing = q_corr × twist⁻¹
-                swing_yp = quat_multiply(q_corr_yp, (tw, 0, 0, -tz))
-
-                # ── Roll correction: camera-local Z-rotation (correct sign at all yaw) ──
-                if smooth_roll is not None:
-                    # Roll smoothing: relative correction via CORI (drift ok for short windows)
-                    raw_local = _local_roll(q_raw)
-                    smooth_local = _local_roll(tuple(smooth_roll[i]))
-                    roll_corr_angle = raw_local - smooth_local
-                elif _grav_roll_per_frame is not None:
-                    # Horizon lock with GRAV: drift-free roll from accelerometer
-                    # GRAV directly measures gravity in body frame, independent of
-                    # CORI's gyro integration which drifts in yaw over time.
-                    roll_corr_angle = _grav_roll_per_frame[i]
-                else:
-                    # Horizon lock fallback (no GRAV): use CORI-based roll
-                    roll_corr_angle = _local_roll(q_raw)
-
-                # Build roll-only quaternion around Z axis
-                half_r = roll_corr_angle / 2.0
-                twist_roll = (_math.cos(half_r), 0.0, 0.0, _math.sin(half_r))
-
-                # Final heading = swing_yp (yaw+pitch) × twist_roll (roll)
-                q_heading = quat_multiply(swing_yp, twist_roll)
+                    # All-axis stabilization: use full correction as-is
+                    q_heading = q_corr
 
             # Heading only (no IORI)
             heading_corr.append(q_heading)
@@ -3537,6 +4038,34 @@ class GyroStabilizer:
             'angular_vel': angvel_arr,
             'iori_right_matrices': iori_right_mats,
         }
+
+
+def _denoise_cross(cross, strength, mode):
+    """Single-frame spatial denoise on EAC cross (bilateral or NLM)."""
+    if strength <= 0:
+        return cross
+    if mode == "nlm":
+        return cv2.fastNlMeansDenoisingColored(
+            cross, None, float(strength), float(strength), 7, 21)
+    else:  # bilateral
+        return cv2.bilateralFilter(
+            cross, 7, float(strength), float(strength * 2))
+
+
+def _denoise_temporal(cross, prev_cross, strength):
+    """Temporal bilateral denoise: blend with previous frame weighted by
+    per-pixel color similarity. ~4ms per cross, no ghosting on motion."""
+    if prev_cross is None:
+        return cross.copy()
+    diff = np.abs(cross.astype(np.int16) - prev_cross.astype(np.int16))
+    motion = np.mean(diff, axis=2)  # (H, W)
+    sigma = max(1.0, float(strength) * 2.0)
+    weight = np.exp(-(motion * motion) / (2.0 * sigma * sigma))
+    weight = weight[:, :, np.newaxis].astype(np.float32)
+    alpha = np.float32(min(0.5, strength / 30.0))
+    blended = (cross.astype(np.float32) * (1.0 - weight * alpha)
+               + prev_cross.astype(np.float32) * weight * alpha)
+    return np.clip(blended, 0, 255).astype(np.uint8)
 
 
 def klns_forward(theta, klns):
@@ -3768,7 +4297,6 @@ class ProcessingConfig:
     # Gyro stabilization (full 3-axis CORI-based)
     gyro_data: Optional[dict] = None  # Full CORI/IORI data from parse_gopro_gyro_data()
     gyro_smooth_ms: float = 500.0  # Heading (yaw+pitch) smoothing window in ms
-    gyro_roll_smooth_ms: float = 2000.0  # Roll smoothing window in ms (higher = more stable horizon)
     gyro_horizon_lock: bool = False  # True = fully lock roll (cancel all roll motion)
     gyro_max_corr_deg: float = 10.0  # Max heading correction angle (degrees) before soft limit
     gyro_responsiveness: float = 1.0  # Velocity response curve power (0.2–3.0, <1=anticipatory, >1=laggy)
@@ -3797,6 +4325,10 @@ class ProcessingConfig:
     # Equirectangular-aware sharpening
     sharpen_amount: float = 0.0  # Sharpening amount (0=off, 0.5=subtle, 1.0=moderate, 2.0=strong)
     sharpen_radius: float = 1.5  # Sharpening radius / sigma (0.5=fine detail, 3.0=coarse structure)
+    # Noise reduction
+    denoise_enabled: bool = False
+    denoise_strength: int = 10      # 0-50, controls filter strength
+    denoise_mode: str = "bilateral"  # "bilateral", "nlm", or "temporal"
     # Multi-segment GoPro recording
     segment_paths: Optional[list] = None  # List of segment file paths (GS01..., GS02..., etc.)
     upside_down: bool = False  # Camera mounted upside down: rotates output 180° and inverts gravity
@@ -4421,450 +4953,10 @@ class VideoProcessor(QThread):
                 pass
     
     def run(self):
-        try:
-            cfg = self.config
+        """Process video using per-frame OpenCV pipeline.
 
-            # Use per-frame OpenCV processing for gyro/RS correction or .360 input
-            # (.360 requires Python-based EAC cross assembly + remap)
-            needs_per_frame = cfg.is_360_input or \
-                              (cfg.gyro_stabilize and cfg.gyro_data) or \
-                              (cfg.rs_correction_enabled and cfg.rs_correction_ms > 0.01 and cfg.gyro_data)
-            if needs_per_frame:
-                self._run_with_gyro_stabilization()
-                return
-
-            self.status.emit("Processing...")
-
-            # Detect codec
-            probe = subprocess.run([get_ffprobe_path(), "-v", "quiet", "-select_streams", "v:0",
-                                   "-show_entries", "stream=codec_name", "-of", "json",
-                                   str(cfg.input_path)], capture_output=True, text=True, check=True, creationflags=get_subprocess_flags())
-            codec = json.loads(probe.stdout)["streams"][0]["codec_name"]
-            if codec in ["hevc", "h265"]: codec = "h265"
-            elif codec in ["prores", "prores_ks"]: codec = "prores"
-            output_codec = codec if cfg.output_codec == "auto" else cfg.output_codec
-            
-            # Get video info
-            probe = subprocess.run([get_ffprobe_path(), "-v", "quiet", "-select_streams", "v:0",
-                                   "-show_entries", "stream=width,height,pix_fmt,color_space,color_transfer,color_primaries",
-                                   "-show_entries", "format=duration", "-of", "json",
-                                   str(cfg.input_path)], capture_output=True, text=True, check=True, creationflags=get_subprocess_flags())
-            video_info = json.loads(probe.stdout)
-            full_duration = float(video_info.get("format", {}).get("duration", 0))
-            stream = video_info["streams"][0]
-
-            # Calculate effective duration (considering trim)
-            if cfg.trim_end > 0 and cfg.trim_end > cfg.trim_start:
-                duration = cfg.trim_end - cfg.trim_start
-                self.status.emit(f"Video duration: {full_duration:.2f}s (trimmed to {duration:.2f}s)")
-            else:
-                duration = full_duration
-                self.status.emit(f"Video duration: {duration:.2f}s")
-
-            # Check if input is 10-bit
-            pix_fmt = stream.get("pix_fmt", "")
-            is_10bit = "10le" in pix_fmt or "p010" in pix_fmt
-
-            # Build filter
-            filters = []
-
-            # .360 input always uses per-frame path (handled above), so this code path is non-.360 only
-            eac_label = None
-
-            # Only convert 10-bit to 8-bit if output is 8-bit H.265
-            # For 10-bit H.265 or ProRes output, preserve 10-bit input
-            need_8bit_conversion = is_10bit and output_codec == "h265" and cfg.h265_bit_depth == 8
-
-            if need_8bit_conversion:
-                self.status.emit("Converting 10-bit input to 8-bit for output...")
-                src_label = eac_label or "[0:v]"
-                filters.append(f"{src_label}format=yuv420p[input_8bit]")
-                input_label = "[input_8bit]"
-            else:
-                if is_10bit and (output_codec == "prores" or (output_codec == "h265" and cfg.h265_bit_depth == 10)):
-                    self.status.emit("Detected 10-bit input - preserving 10-bit for output...")
-                input_label = eac_label or "[0:v]"
-
-            if cfg.global_shift != 0:
-                shift = cfg.global_shift
-                if shift > 0:
-                    filters.extend([f"{input_label}split=2[sh_a][sh_b]", f"[sh_a]crop={shift}:ih:0:0[sh_right]",
-                                   f"[sh_b]crop=iw-{shift}:ih:{shift}:0[sh_left]", f"[sh_left][sh_right]hstack=inputs=2[shifted]"])
-                else:
-                    abs_shift = abs(shift)
-                    filters.extend([f"{input_label}split=2[sh_a][sh_b]", f"[sh_a]crop={abs_shift}:ih:iw-{abs_shift}:0[sh_left]",
-                                   f"[sh_b]crop=iw-{abs_shift}:ih:0:0[sh_right]", f"[sh_left][sh_right]hstack=inputs=2[shifted]"])
-                input_label = "[shifted]"
-            
-            filters.extend([f"{input_label}split=2[full1][full2]", "[full1]crop=iw/2:ih:0:0[left_in]", "[full2]crop=iw/2:ih:iw/2:0[right_in]"])
-
-            left_yaw = cfg.global_adjustment.yaw + cfg.stereo_offset.yaw
-            left_pitch = cfg.global_adjustment.pitch + cfg.stereo_offset.pitch
-            left_roll = cfg.global_adjustment.roll + cfg.stereo_offset.roll
-            right_yaw = cfg.global_adjustment.yaw - cfg.stereo_offset.yaw
-            right_pitch = cfg.global_adjustment.pitch - cfg.stereo_offset.pitch
-            right_roll = cfg.global_adjustment.roll - cfg.stereo_offset.roll
-
-            # Apply standard v360 transformation
-            if any([left_yaw, left_pitch, left_roll]):
-                filters.append(f"[left_in]v360=input=hequirect:output=hequirect:yaw={left_yaw}:pitch={left_pitch}:roll={left_roll}:interp=lanczos[left_out]")
-            else:
-                filters.append("[left_in]null[left_out]")
-
-            if any([right_yaw, right_pitch, right_roll]):
-                filters.append(f"[right_in]v360=input=hequirect:output=hequirect:yaw={right_yaw}:pitch={right_pitch}:roll={right_roll}:interp=lanczos[right_out]")
-            else:
-                filters.append("[right_in]null[right_out]")
-
-            # Combine left and right
-            filters.append("[left_out][right_out]hstack=inputs=2[stacked]")
-
-            # Apply pre-LUT color adjustments (gamma, white point, black point)
-            pre_lut_filters = []
-            current_label = "[stacked]"
-
-            # Check if any pre-LUT adjustments are needed (ASC CDL style: Lift, Gamma, Gain)
-            has_adjustments = (abs(cfg.gamma - 1.0) > 0.01 or
-                             abs(cfg.gain - 1.0) > 0.01 or
-                             abs(cfg.lift) > 0.01)
-
-            if has_adjustments:
-                # Use classic Lift/Gamma/Gain formula: out = (gain * (x + lift * (1-x)))^(1/gamma)
-                # Lift affects shadows (preserves white at 1.0)
-                # Gain affects highlights (preserves black at 0.0)
-                # Gamma affects midtones (power function)
-                # lutrgb works with pixel values (0-255 for 8-bit), normalize to 0-1 first
-
-                # Normalize to 0-1 range
-                lut_expr = "val/maxval"
-
-                # Apply Lift: x + lift * (1-x)
-                # This lifts shadows while preserving white point
-                # lift range: -1 to 1 (0 = neutral)
-                if abs(cfg.lift) > 0.01:
-                    lut_expr = f"({lut_expr}+{cfg.lift}*(1-{lut_expr}))"
-
-                # Apply Gain: multiply the result
-                # This scales highlights while preserving black point (after lift adjustment)
-                # gain range: 0.5 to 2.0 (1.0 = neutral)
-                if abs(cfg.gain - 1.0) > 0.01:
-                    lut_expr = f"({lut_expr}*{cfg.gain})"
-
-                # Clamp before gamma to avoid pow() on negative values
-                lut_expr = f"clip({lut_expr},0,1)"
-
-                # Apply Gamma: power function
-                # gamma range: 0.1 to 3.0 (1.0 = neutral)
-                if abs(cfg.gamma - 1.0) > 0.01:
-                    power = 1.0 / cfg.gamma
-                    lut_expr = f"pow({lut_expr},{power})"
-
-                # Final clamp and denormalize back to pixel values
-                lut_expr = f"clip({lut_expr},0,1)*maxval"
-
-                filters.append(f"{current_label}lutrgb=r='{lut_expr}':g='{lut_expr}':b='{lut_expr}'[color_adjusted]")
-                current_label = "[color_adjusted]"
-
-            # Apply LUT if specified - optimized for performance
-            if cfg.lut_path and cfg.lut_path.exists():
-                # Escape the path for FFmpeg filter syntax
-                lut_path_str = str(cfg.lut_path).replace('\\', '/').replace(':', '\\:')
-
-                if cfg.lut_intensity >= 0.99:
-                    # Full intensity - apply LUT directly without blending (much faster)
-                    # Use tetrahedral interpolation for best performance
-                    # Format to RGB for LUT processing, then back to YUV for encoding
-                    filters.append(f"{current_label}format=gbrp,lut3d=file='{lut_path_str}':interp=tetrahedral[lut_final]")
-                    current_label = "[lut_final]"
-                elif cfg.lut_intensity > 0.01:
-                    # Partial intensity - use same blend formula as preview for consistency
-                    # Linear interpolation: original * (1-intensity) + lut * intensity
-                    filters.append(f"{current_label}format=gbrp,split[original][lut_input]")
-                    filters.append(f"[lut_input]lut3d=file='{lut_path_str}':interp=tetrahedral[lut_output]")
-                    # Use blend with custom expression for accurate color mixing (matches preview)
-                    filters.append(f"[original][lut_output]blend=all_expr='A*(1-{cfg.lut_intensity})+B*{cfg.lut_intensity}'[lut_final]")
-                    current_label = "[lut_final]"
-                else:
-                    # No intensity - skip LUT
-                    pass  # current_label stays as is
-
-            # Finalize filter chain - add format conversion for ProRes if needed
-            # We need to determine the output format before finalizing filters
-            needs_prores = cfg.vision_pro_mode == "mvhevc" or output_codec == "prores"
-
-            if needs_prores and sys.platform != 'darwin':
-                # For Windows ProRes encoding, ensure correct pixel format in filter chain
-                if output_codec == "prores" and cfg.prores_profile in ["4444", "4444xq"]:
-                    filters.append(f"{current_label}format=yuv444p10le[out]")
-                else:
-                    filters.append(f"{current_label}format=yuv422p10le[out]")
-            else:
-                filters.append(f"{current_label}null[out]")
-
-            # If outputting to MV-HEVC, use lossless intermediate to avoid double lossy compression
-            if cfg.vision_pro_mode == "mvhevc":
-                # Use ProRes HQ as lossless intermediate for MV-HEVC workflow
-                if cfg.encoder_type == 'videotoolbox' and sys.platform == 'darwin':
-                    enc = ["-c:v", "prores_videotoolbox", "-profile:v", "3"]  # ProRes HQ
-                else:
-                    enc = ["-c:v", "prores_ks", "-profile:v", "3", "-vendor", "apl0"]  # ProRes HQ (format set in filter)
-            # Encoder settings - use selected encoder type
-            elif output_codec == "h265":
-                enc = get_hw_encoder_args('h265', cfg.encoder_type, cfg.quality, cfg.bitrate,
-                                         cfg.use_bitrate, cfg.h265_bit_depth)
-            elif output_codec == "prores":
-                profile_map = {"proxy": "0", "lt": "1", "standard": "2", "hq": "3", "4444": "4", "4444xq": "5"}
-                if cfg.encoder_type == 'videotoolbox' and sys.platform == 'darwin':
-                    # macOS VideoToolbox ProRes encoding
-                    enc = ["-c:v", "prores_videotoolbox", "-profile:v", profile_map.get(cfg.prores_profile, "3")]
-                else:
-                    # Software ProRes - pixel format is set in filter chain for Windows
-                    enc = ["-c:v", "prores_ks", "-profile:v", profile_map.get(cfg.prores_profile, "3"),
-                           "-vendor", "apl0"]
-            elif output_codec in ["h264", "libx264"]:
-                enc = get_hw_encoder_args('h264', cfg.encoder_type, cfg.quality, cfg.bitrate,
-                                         cfg.use_bitrate)
-            else:
-                enc = ["-c:v", output_codec]
-            
-            # Build FFmpeg command with hardware decode for HEVC input
-            # CRITICAL: Disable hardware decode when using LUT or complex color filters
-            # GPU→CPU transfers for filter processing kills performance
-            has_lut = cfg.lut_path and cfg.lut_path.exists() and cfg.lut_intensity > 0.01
-            decode_args = []
-            if cfg.is_360_input:
-                # No hwaccel for .360 — multi-stream filter_complex is incompatible
-                pass
-            elif codec == "h265" and sys.platform == 'darwin' and not has_lut and not has_adjustments:
-                # Use VideoToolbox hardware decoding for HEVC (much faster for 10-bit)
-                # Only when NOT using CPU-bound filters (LUT, color grading)
-                decode_args = ["-hwaccel", "videotoolbox"]
-            elif has_lut or has_adjustments:
-                # When using LUT/color grading, use software decode and optimize for CPU
-                self.status.emit("Using optimized software decoding for LUT processing...")
-
-            # Add multi-threading optimization
-            import os
-            cpu_count = os.cpu_count() or 4
-            thread_args = ["-threads", str(cpu_count)]
-            filter_thread_args = ["-filter_threads", str(cpu_count)]
-
-            # Build trim arguments
-            trim_args = []
-            if cfg.trim_start > 0:
-                trim_args.extend(["-ss", str(cfg.trim_start)])
-            if cfg.trim_end > 0 and cfg.trim_end > cfg.trim_start:
-                # Use -t (duration) instead of -to for accurate trimming with -ss
-                trim_duration = cfg.trim_end - cfg.trim_start
-                trim_args.extend(["-t", str(trim_duration)])
-                self.status.emit(f"Trimming: {cfg.trim_start:.2f}s to {cfg.trim_end:.2f}s (duration: {trim_duration:.2f}s)")
-
-            cmd = [get_ffmpeg_path(), "-y"] + decode_args + thread_args + trim_args + [
-                   "-i", str(cfg.input_path)] + filter_thread_args + [
-                   "-filter_complex", ";".join(filters),
-                   "-map", "[out]", "-map", "0:a?", "-c:a", "copy",
-                   "-f", "mov"] + enc + \
-                   ["-progress", "pipe:1", "-stats_period", "0.5", str(cfg.output_path)]
-
-            self._process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, creationflags=get_subprocess_flags())
-            process = self._process
-
-            # Thread to read stderr
-            import threading
-            import queue
-            stderr_queue = queue.Queue()
-
-            def read_stderr():
-                try:
-                    for line in process.stderr:
-                        stderr_queue.put(line)
-                except:
-                    pass
-
-            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-            stderr_thread.start()
-
-            # Monitor both stdout and stderr
-            progress_data = {}
-            while True:
-                if self._cancelled:
-                    process.terminate()
-                    process.wait(timeout=5)
-                    self.finished_signal.emit(False, "Cancelled")
-                    return
-
-                # Check if process finished
-                if process.poll() is not None:
-                    break
-
-                # Try to read stderr (non-blocking)
-                try:
-                    while not stderr_queue.empty():
-                        stderr_line = stderr_queue.get_nowait().strip()
-                        if stderr_line:
-                            self.output_line.emit(f"[stderr] {stderr_line}")
-                except:
-                    pass
-
-                # Try to read stdout with timeout
-                try:
-                    if sys.platform != 'win32':
-                        ready, _, _ = select.select([process.stdout], [], [], 0.5)
-                        if not ready:
-                            continue
-
-                    line = process.stdout.readline()
-                    if not line:
-                        continue
-
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    # Emit every line to the output display
-                    self.output_line.emit(line)
-
-                    # Parse key=value for specific handling
-                    if '=' in line:
-                        key, value = line.split('=', 1)
-                        progress_data[key] = value
-
-                        # When we get 'progress' marker, calculate percentage and show FPS
-                        if key == 'progress':
-                            fps_str = ""
-                            pct_str = ""
-
-                            # Get FPS
-                            if 'fps' in progress_data:
-                                try:
-                                    fps = float(progress_data['fps'])
-                                    if fps > 0:
-                                        fps_str = f"{fps:.1f} fps"
-                                except:
-                                    pass
-
-                            # Calculate percentage from out_time
-                            time_s = None
-
-                            # Try different time formats
-                            if 'out_time' in progress_data:
-                                # Format: "00:00:47.500000"
-                                try:
-                                    time_str = progress_data['out_time']
-                                    parts = time_str.split(':')
-                                    if len(parts) == 3:
-                                        hours = int(parts[0])
-                                        minutes = int(parts[1])
-                                        seconds = float(parts[2])
-                                        time_s = hours * 3600 + minutes * 60 + seconds
-                                except:
-                                    pass
-                            elif 'out_time_ms' in progress_data:
-                                try:
-                                    time_s = int(progress_data['out_time_ms']) / 1000.0
-                                except:
-                                    pass
-                            elif 'out_time_us' in progress_data:
-                                try:
-                                    time_s = int(progress_data['out_time_us']) / 1000000.0
-                                except:
-                                    pass
-
-                            # Calculate percentage
-                            if time_s is not None and duration > 0:
-                                try:
-                                    pct = min(99, int((time_s / duration) * 100))
-                                    pct_str = f"{pct}%"
-                                except:
-                                    pass
-
-                            # Show status with both percentage and FPS
-                            status_parts = []
-                            if pct_str:
-                                status_parts.append(pct_str)
-                            if fps_str:
-                                status_parts.append(fps_str)
-                            if status_parts:
-                                self.status.emit(f"Processing... {' - '.join(status_parts)}")
-
-                            # Clear for next update
-                            progress_data = {}
-                except:
-                    pass
-
-            # Wait for process to finish - no timeout, let it run as long as needed
-            process.wait()
-
-            # Read any remaining stderr
-            try:
-                while not stderr_queue.empty():
-                    stderr_line = stderr_queue.get_nowait().strip()
-                    if stderr_line:
-                        self.output_line.emit(f"[stderr] {stderr_line}")
-            except:
-                pass
-
-            # Check return code - only 0 means success
-            if process.returncode == 0:
-                self.progress.emit(100)
-
-                # Track completion messages
-                completion_tags = []
-
-                # Inject VR180 metadata for YouTube if requested
-                if cfg.inject_vr180_metadata:
-                    self.status.emit("Injecting VR180 metadata for YouTube...")
-                    try:
-                        self._inject_vr180_metadata(cfg.output_path)
-                        completion_tags.append("YouTube VR180")
-                    except Exception as meta_error:
-                        completion_tags.append(f"VR180 metadata failed: {meta_error}")
-
-                # Add Vision Pro processing if requested
-                if cfg.vision_pro_mode == "hvc1":
-                    self.status.emit("Adding hvc1 tag for Apple compatibility...")
-                    try:
-                        self._inject_hvc1_tag(cfg.output_path)
-                        completion_tags.append("Apple compatible")
-                    except Exception as meta_error:
-                        completion_tags.append(f"hvc1 tag failed: {meta_error}")
-                elif cfg.vision_pro_mode == "mvhevc":
-                    self.status.emit("Converting to MV-HEVC for Vision Pro...")
-                    try:
-                        self._convert_to_mvhevc(cfg)
-                        completion_tags.append("Vision Pro MV-HEVC")
-                    except Exception as meta_error:
-                        completion_tags.append(f"MV-HEVC conversion failed: {meta_error}")
-
-                # Generate completion message
-                if completion_tags:
-                    self.finished_signal.emit(True, f"Complete! ({', '.join(completion_tags)})")
-                else:
-                    self.finished_signal.emit(True, "Complete!")
-            else:
-                # FFmpeg failed - read stderr for error details
-                try:
-                    stderr_output = process.stderr.read()
-                    # Filter to show only error-related lines
-                    error_lines = [line for line in stderr_output.split('\n')
-                                  if any(keyword in line.lower() for keyword in
-                                        ['error', 'failed', 'invalid', 'no such', 'cannot', 'unable'])]
-                    if error_lines:
-                        error_msg = '\n'.join(error_lines[:15])  # Show first 15 error lines
-                    else:
-                        # No specific errors found, show last part of output
-                        error_msg = '\n'.join(stderr_output.split('\n')[-30:])
-                    self.finished_signal.emit(False, f"FFmpeg error (return code {process.returncode}):\n{error_msg}")
-                except:
-                    self.finished_signal.emit(False, f"FFmpeg failed with return code {process.returncode}")
-
-        except Exception as e:
-            self.finished_signal.emit(False, str(e))
-
-    def _run_with_gyro_stabilization(self):
-        """Process video with per-frame gyro stabilization using OpenCV.
-
-        Uses OpenCV for fast in-memory equirectangular remap with CORI/IORI corrections.
+        Handles all input types (.360, equirect SBS) with GPU-accelerated remap,
+        optional gyro stabilization, RS correction, LUT, color grading, and sharpening.
         """
         import bisect
         import math
@@ -4874,7 +4966,7 @@ class VideoProcessor(QThread):
             return
 
         cfg = self.config
-        self.status.emit("Processing with gyro stabilization (OpenCV)...")
+        self.status.emit("Processing with OpenCV pipeline...")
 
         try:
             # Get video info
@@ -4927,6 +5019,10 @@ class VideoProcessor(QThread):
             duration = end_time - start_time
             total_frames = int(duration * fps)
 
+            print(f"[EXPORT] trim_start={cfg.trim_start:.3f}s, trim_end={cfg.trim_end:.3f}s, "
+                  f"start_time={start_time:.3f}s, end_time={end_time:.3f}s, "
+                  f"duration={duration:.3f}s, total_frames={total_frames}, fps={fps:.2f}, "
+                  f"gyro_stabilize={cfg.gyro_stabilize}, rs_enabled={cfg.rs_correction_enabled}")
             self.status.emit(f"Will process {total_frames} frames at {fps:.2f} fps using OpenCV")
 
             # Initialize gyro stabilizer (also used for RS correction angular velocity)
@@ -4938,7 +5034,6 @@ class VideoProcessor(QThread):
             if gyro_stabilizer:
                 gyro_stabilizer.smooth(
                     window_ms=cfg.gyro_smooth_ms,
-                    roll_window_ms=cfg.gyro_roll_smooth_ms,
                     horizon_lock=cfg.gyro_horizon_lock,
                     stabilize=cfg.gyro_stabilize,
                     max_corr_deg=cfg.gyro_max_corr_deg,
@@ -4946,10 +5041,12 @@ class VideoProcessor(QThread):
                     upside_down=cfg.upside_down,
                 )
                 if cfg.gyro_stabilize:
-                    roll_desc = "locked" if cfg.gyro_horizon_lock else f"{cfg.gyro_roll_smooth_ms:.0f}ms"
-                    self.status.emit(f"Gyro stabilization ready (heading {cfg.gyro_smooth_ms:.0f}ms, roll {roll_desc})")
-                    # Force -1920 shift when gyro stabilization is enabled
-                    cfg.global_shift = -1920
+                    hl_desc = ", horizon lock" if cfg.gyro_horizon_lock else ""
+                    self.status.emit(f"Gyro stabilization ready ({cfg.gyro_smooth_ms:.0f}ms{hl_desc})")
+                    # Force -1920 shift for .360 when gyro stabilization is enabled
+                    # (non-360 SBS eye swap is handled by _effective_shift below)
+                    if cfg.is_360_input:
+                        cfg.global_shift = -1920
                 else:
                     self.status.emit("RS/IORI correction mode (no gyro stabilization)")
 
@@ -4978,6 +5075,16 @@ class VideoProcessor(QThread):
                 precomputed = gyro_stabilizer.precompute_export_matrices(
                     start_time, fps, total_frames, _export_rs_enabled,
                     R_view_left, R_view_right)
+                print(f"[EXPORT] Precomputed {total_frames} matrices: "
+                      f"gyro timestamps[0]={gyro_stabilizer.timestamps[0]:.3f}s, "
+                      f"[-1]={gyro_stabilizer.timestamps[-1]:.3f}s, "
+                      f"first lookup t={start_time:.3f}s, last lookup t={start_time + (total_frames-1)/fps:.3f}s")
+                # Debug: show first few frame matrices to verify correctness
+                _dbg_L0 = precomputed['left_matrices'][0]
+                _dbg_mid = total_frames // 2
+                _dbg_Lm = precomputed['left_matrices'][_dbg_mid]
+                print(f"[EXPORT] Frame 0 left mat diag: [{_dbg_L0[0,0]:.6f}, {_dbg_L0[1,1]:.6f}, {_dbg_L0[2,2]:.6f}]")
+                print(f"[EXPORT] Frame {_dbg_mid} left mat diag: [{_dbg_Lm[0,0]:.6f}, {_dbg_Lm[1,1]:.6f}, {_dbg_Lm[2,2]:.6f}]")
                 self.status.emit(f"Pre-computed {total_frames} frame matrices"
                                  f"{' (with RS)' if _export_rs_enabled else ''}")
 
@@ -5165,6 +5272,21 @@ class VideoProcessor(QThread):
 
                 return np.clip(result_rgb[:, :, ::-1] * 255.0, 0, 255).astype(np.uint8)
 
+            # ── Noise reduction ──────────────────────────────────────────────
+            # Applied at EAC cross stage (before remap) for:
+            #   - Stereo consistency: both eyes get identical treatment
+            #   - VR-aware: denoise in native EAC pixel space, not warped equirect
+            #   - Before remap: Lanczos4 won't amplify noise into output
+            _denoise_enabled = cfg.denoise_enabled and cfg.denoise_strength > 0
+            _denoise_strength = cfg.denoise_strength
+            _denoise_mode = cfg.denoise_mode
+            _prev_crossA = [None]  # temporal denoise: previous frame history (mutable for closure)
+            _prev_crossB = [None]
+            _dn_result_B = [None]  # mutable container for thread return
+
+            if _denoise_enabled:
+                print(f"Denoise: {_denoise_mode} strength={_denoise_strength}")
+
             # ── Equirectangular-aware sharpening ────────────────────────────
             # CUDA (Windows/NVIDIA): full GPU separable blur + fused USM kernel
             # CPU fallback (macOS/other): stackBlur + band-based addWeighted
@@ -5292,7 +5414,7 @@ class VideoProcessor(QThread):
             _cuda_xyz_x = _cuda_xyz_y = _cuda_xyz_z = None
             _cuda_t_offset = _cuda_zero_t_offset = None
             _cuda_n_pixels = 0
-            if HAS_NUMBA_CUDA and cfg.is_360_input:
+            if HAS_NUMBA_CUDA:
                 _cuda_xyz_x = _cuda.to_device(xyz_x)
                 _cuda_xyz_y = _cuda.to_device(xyz_y)
                 _cuda_xyz_z = _cuda.to_device(xyz_z)
@@ -5301,7 +5423,10 @@ class VideoProcessor(QThread):
                 _cuda_t_offset = _cuda_zero_t_offset
 
             # MLX: upload direction grids to GPU (persist across all frames)
-            if HAS_MLX and cfg.is_360_input:
+            _mlx_xyz_x = _mlx_xyz_y = _mlx_xyz_z = None
+            _mlx_n_pixels = 0
+            _mlx_zero_t_offset = _mlx_t_offset = None
+            if HAS_MLX:
                 _mlx_xyz_x = mx.array(xyz_x)
                 _mlx_xyz_y = mx.array(xyz_y)
                 _mlx_xyz_z = mx.array(xyz_z)
@@ -5359,12 +5484,18 @@ class VideoProcessor(QThread):
                 map_y = np.clip((0.5 - lat_new * inv_v_fov) * height_f, 0, height_f - 1).reshape(out_height, half_w)
                 return map_x, map_y
 
+            # For non-360 SBS input: always apply -width/2 base shift to swap eye halves
+            # (code puts left_src → right output, so left half of input must contain right-eye data)
+            _effective_shift = cfg.global_shift
+            if not cfg.is_360_input:
+                _effective_shift = -(width // 2) + cfg.global_shift
+
             # Precompute global shift slicing offsets (avoid np.roll which copies entire frame)
-            # After shift by -1920: "left var" = columns [1920, 5760), "right var" = columns [5760, 7680)+[0, 1920)
-            shift_abs = abs(cfg.global_shift) if cfg.global_shift != 0 else 0
-            if cfg.global_shift < 0:
-                left_start = shift_abs  # 1920
-            elif cfg.global_shift > 0:
+            # After shift: "left var" = right-eye data, "right var" = left-eye data
+            shift_abs = abs(_effective_shift) if _effective_shift != 0 else 0
+            if _effective_shift < 0:
+                left_start = shift_abs
+            elif _effective_shift > 0:
                 left_start = width - shift_abs
             else:
                 left_start = 0
@@ -5388,6 +5519,7 @@ class VideoProcessor(QThread):
             ]
             _result_buf_idx = 0
             result_buf = _result_bufs[0]
+            _identity3 = np.eye(3, dtype=np.float64)
 
             # Pre-allocate cross assembly buffers (avoid 92MB allocation per frame)
             if cfg.is_360_input:
@@ -5685,9 +5817,37 @@ class VideoProcessor(QThread):
                                             ctrx=geoc_ctrx, ctry=geoc_ctry,
                                             cal_dim=geoc_cal_dim) if (rs_enabled and geoc_klns and not cfg.is_360_input) else None
 
+            # Preallocate equirect remap scratch buffers for non-360 path (avoid per-frame alloc)
+            _cuda_t_offset_eq = None  # CUDA device array for non-360 RS time offset
+            _eq_src_buf_A = None  # Pre-allocated contiguous source buffer (right eye = left_src)
+            _eq_src_buf_B = None  # Pre-allocated contiguous source buffer (left eye = right_src)
+            _eq_src_flat_A = None  # Flat view for GPU upload (avoids per-frame ravel)
+            _eq_src_flat_B = None
+            if not cfg.is_360_input:
+                _n_eq = xyz_x.shape[0]
+                _emx_r = np.empty(_n_eq, dtype=np.float32)
+                _emy_r = np.empty(_n_eq, dtype=np.float32)
+                _emx_l = np.empty(_n_eq, dtype=np.float32)
+                _emy_l = np.empty(_n_eq, dtype=np.float32)
+                # Pre-allocate contiguous source buffers for GPU upload (avoids np.ascontiguousarray per frame)
+                _eq_src_buf_A = np.empty((out_height, half_w, 3), dtype=np.uint8)
+                _eq_src_buf_B = np.empty((out_height, half_w, 3), dtype=np.uint8)
+                _eq_src_flat_A = _eq_src_buf_A.ravel()  # flat view (zero copy, stays valid)
+                _eq_src_flat_B = _eq_src_buf_B.ravel()
+                # Pre-scale RS time map once (constant across all frames)
+                if rs_time_map is not None:
+                    _rs_t_eq = (rs_time_map * np.float32(rs_ms / 1000.0)).ravel().astype(np.float32)
+                    # Upload to GPU for CUDA equirect path
+                    if HAS_NUMBA_CUDA:
+                        _cuda_t_offset_eq = _cuda.to_device(_rs_t_eq)
+                else:
+                    _rs_t_eq = None
+                _rs_deg2rad_eq = np.float32(np.pi / 180.0)
+
             def process_frame_opencv(frame, gyro_left, gyro_right, angular_vel=None,
                                      rs_R_sensor_right=None, rs_R_cross_right=None,
-                                     pre_split_s0=None, pre_split_s4=None):
+                                     pre_split_s0=None, pre_split_s4=None,
+                                     pre_split_eyes=None):
                 """Process a single SBS frame with parallel remap per eye.
 
                 gyro_left/gyro_right: IORI_cancel × heading × global × stereo (for non-RS path).
@@ -5714,6 +5874,31 @@ class VideoProcessor(QThread):
                     crossA = FrameExtractor._assemble_lensA(s0, s4, _cross_buf_A)
                     _t_crossB.join()
                     crossB = _cross_buf_B
+
+                    # ── Denoise crosses before remap (stereo-consistent, VR-native space) ──
+                    if _denoise_enabled:
+                        if _denoise_mode == "temporal":
+                            _dn_result_B[0] = None
+                            _pca = _prev_crossA[0]
+                            _pcb = _prev_crossB[0]
+                            def _dn_B_temporal(_cb=crossB, _pcb=_pcb):
+                                _dn_result_B[0] = _denoise_temporal(_cb, _pcb, _denoise_strength)
+                            _t_dnB = threading.Thread(target=_dn_B_temporal)
+                            _t_dnB.start()
+                            crossA = _denoise_temporal(crossA, _pca, _denoise_strength)
+                            _t_dnB.join()
+                            crossB = _dn_result_B[0]
+                            _prev_crossA[0] = crossA.copy()
+                            _prev_crossB[0] = crossB.copy()
+                        else:
+                            _dn_result_B[0] = None
+                            def _dn_B_spatial():
+                                _dn_result_B[0] = _denoise_cross(crossB, _denoise_strength, _denoise_mode)
+                            _t_dnB = threading.Thread(target=_dn_B_spatial)
+                            _t_dnB.start()
+                            crossA = _denoise_cross(crossA, _denoise_strength, _denoise_mode)
+                            _t_dnB.join()
+                            crossB = _dn_result_B[0]
 
                     if HAS_MLX:
                         # MLX Metal GPU: fused rotation+RS+IORI+cross+bilinear in one kernel
@@ -5824,23 +6009,150 @@ class VideoProcessor(QThread):
 
                 else:
                     # .mov path: split frame into per-eye halves with shift baked in
-                    left_src = frame[:, left_start:left_end]
-                    if right_wraps:
-                        right_src = np.concatenate([frame[:, right_start:], frame[:, :right_end - width]], axis=1)
+                    if pre_split_eyes is not None:
+                        # Eyes already split in decode thread (contiguous, zero copy here)
+                        left_src, right_src = pre_split_eyes
+                    elif _eq_src_buf_A is not None and frame is not None and frame.shape[0] == out_height:
+                        # Copy into pre-allocated contiguous buffers (avoids per-frame np.ascontiguousarray)
+                        np.copyto(_eq_src_buf_A, frame[:, left_start:left_end])
+                        left_src = _eq_src_buf_A
+                        if right_wraps:
+                            _rw = width - right_start
+                            _eq_src_buf_B[:, :_rw] = frame[:, right_start:]
+                            _eq_src_buf_B[:, _rw:] = frame[:, :right_end - width]
+                        else:
+                            np.copyto(_eq_src_buf_B, frame[:, right_start:right_end])
+                        right_src = _eq_src_buf_B
                     else:
-                        right_src = frame[:, right_start:right_end]
+                        left_src = frame[:, left_start:left_end]
+                        if right_wraps:
+                            right_src = np.concatenate([frame[:, right_start:], frame[:, :right_end - width]], axis=1)
+                        else:
+                            right_src = frame[:, right_start:right_end]
 
-                    # RS correction on raw source BEFORE gyro rotation
-                    if rs_enabled and angular_vel is not None:
-                        left_src = apply_rs_correction(left_src.copy(), angular_vel, rs_ms,
-                                                       t_map=rs_time_map, rs_factor=rs_yaw_factor,
-                                                       roll_factor=rs_roll_factor, pitch_factor=rs_pitch_factor)
+                    # RS correction: fused into remap in 3D space (matches .360 kernel)
+                    # right eye = left_src (after shift swap), left eye = right_src
+                    _has_rs = (rs_enabled and angular_vel is not None and rs_time_map is not None)
 
-                    # Process both eyes in parallel (numpy/cv2 release GIL)
-                    t_right = threading.Thread(target=_process_right_eye, args=(left_src, R_right_eye))
-                    t_right.start()
-                    _process_left_eye(right_src, R_left_eye)
-                    t_right.join()
+                    # Fast path: skip expensive remap when rotation is identity and no RS
+                    _is_identity_R = (np.max(np.abs(R_right_eye - _identity3)) < 1e-6 and
+                                      np.max(np.abs(R_left_eye - _identity3)) < 1e-6)
+                    _needs_gpu_post = (color_1d_lut is not None or lut_3d is not None or
+                                       (_sharpen_enabled and _sharpen_amount > 0.01))
+                    if HAS_NUMBA_CUDA and (_has_rs or not _is_identity_R or _needs_gpu_post):
+                        # ── CUDA GPU fused pipeline: remap + LUT + sharpen in one pass ──
+                        if _has_rs:
+                            rs_c = np.array([
+                                np.float32(-angular_vel[2] * rs_yaw_factor) * _rs_deg2rad_eq,
+                                np.float32(angular_vel[1] * rs_pitch_factor) * _rs_deg2rad_eq,
+                                np.float32(angular_vel[0] * rs_roll_factor) * _rs_deg2rad_eq
+                            ], dtype=np.float32)
+                            _cuda_fused_process_eq(
+                                left_src, right_src, _cuda_xyz_x, _cuda_xyz_y, _cuda_xyz_z,
+                                R_right_eye, R_left_eye,
+                                _cuda_t_offset_eq,
+                                rs_c,
+                                _cuda_n_pixels, out_height, half_w, result_buf,
+                                color_1d_lut, lut_3d, cfg.lut_intensity,
+                                _fused_sharpen_kernel, _fused_sharpen_lat,
+                                _sharpen_amount if _sharpen_enabled else 0.0, _fused_sharpen_ksize)
+                        else:
+                            _cuda_fused_process_eq(
+                                left_src, right_src, _cuda_xyz_x, _cuda_xyz_y, _cuda_xyz_z,
+                                R_right_eye, R_left_eye,
+                                None,
+                                None,
+                                _cuda_n_pixels, out_height, half_w, result_buf,
+                                color_1d_lut, lut_3d, cfg.lut_intensity,
+                                _fused_sharpen_kernel, _fused_sharpen_lat,
+                                _sharpen_amount if _sharpen_enabled else 0.0, _fused_sharpen_ksize)
+                        _cuda_fused_done = True
+                    elif _is_identity_R and not _has_rs:
+                        # CPU fast path: no remap needed when rotation is identity and no RS
+                        if left_src.shape == (out_height, half_w, 3):
+                            result_buf[:, half_w:] = left_src
+                            result_buf[:, :half_w] = right_src
+                        else:
+                            result_buf[:, half_w:] = cv2.resize(left_src, (half_w, out_height), interpolation=cv2.INTER_AREA)
+                            result_buf[:, :half_w] = cv2.resize(right_src, (half_w, out_height), interpolation=cv2.INTER_AREA)
+                    else:
+                        # ── CPU: Threaded parallel remap for both eyes ──
+                        def _remap_right_eye_eq():
+                            """Build remap + cv2.remap for right eye (with RS if active)."""
+                            if _has_rs:
+                                _yaw_c = np.float32(-angular_vel[2] * rs_yaw_factor) * _rs_deg2rad_eq
+                                _pitch_c = np.float32(angular_vel[1] * rs_pitch_factor) * _rs_deg2rad_eq
+                                _roll_c = np.float32(angular_vel[0] * rs_roll_factor) * _rs_deg2rad_eq
+                                R_r = R_right_eye.astype(np.float32)
+                                if HAS_NUMBA:
+                                    _nb_equirect_remap_rs(
+                                        xyz_x, xyz_y, xyz_z,
+                                        R_r[0,0], R_r[0,1], R_r[0,2],
+                                        R_r[1,0], R_r[1,1], R_r[1,2],
+                                        R_r[2,0], R_r[2,1], R_r[2,2],
+                                        _rs_t_eq,
+                                        _yaw_c, _pitch_c, _roll_c,
+                                        _emx_r, _emy_r, _n_eq,
+                                        half_w_f, height_f, inv_pi)
+                                    r_mx = _emx_r.reshape(out_height, half_w)
+                                    r_my = _emy_r.reshape(out_height, half_w)
+                                else:
+                                    xr = R_r[0,0]*xyz_x + R_r[0,1]*xyz_y + R_r[0,2]*xyz_z
+                                    yr = R_r[1,0]*xyz_x + R_r[1,1]*xyz_y + R_r[1,2]*xyz_z
+                                    zr = R_r[2,0]*xyz_x + R_r[2,1]*xyz_y + R_r[2,2]*xyz_z
+                                    xn = xr + _yaw_c * _rs_t_eq * zr - _roll_c * _rs_t_eq * yr
+                                    yn = yr + _roll_c * _rs_t_eq * xr - _pitch_c * _rs_t_eq * zr
+                                    zn = zr - _yaw_c * _rs_t_eq * xr + _pitch_c * _rs_t_eq * yr
+                                    lat_n = np.arcsin(np.clip(yn, -1, 1))
+                                    lon_n = np.arctan2(xn, zn)
+                                    r_mx = np.clip((lon_n * inv_pi + 0.5) * half_w_f, 0, half_w_f - 1).reshape(out_height, half_w).astype(np.float32)
+                                    r_my = np.clip((0.5 - lat_n * inv_pi) * height_f, 0, height_f - 1).reshape(out_height, half_w).astype(np.float32)
+                            else:
+                                R_r = R_right_eye.astype(np.float32)
+                                if HAS_NUMBA:
+                                    _nb_equirect_remap_rot(
+                                        xyz_x, xyz_y, xyz_z,
+                                        R_r[0,0], R_r[0,1], R_r[0,2],
+                                        R_r[1,0], R_r[1,1], R_r[1,2],
+                                        R_r[2,0], R_r[2,1], R_r[2,2],
+                                        _emx_r, _emy_r, _n_eq,
+                                        half_w_f, height_f, inv_pi)
+                                    r_mx = _emx_r.reshape(out_height, half_w)
+                                    r_my = _emy_r.reshape(out_height, half_w)
+                                else:
+                                    r_mx, r_my = compute_remap_tables(R_right_eye)
+                                    r_mx = r_mx.astype(np.float32)
+                                    r_my = r_my.astype(np.float32)
+                            result_buf[:, half_w:] = cv2.remap(left_src, r_mx, r_my,
+                                                                cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                                                                borderValue=(0, 0, 0))
+
+                        def _remap_left_eye_eq():
+                            """Build remap + cv2.remap for left eye (rotation only, no RS)."""
+                            R_l = R_left_eye.astype(np.float32)
+                            if HAS_NUMBA:
+                                _nb_equirect_remap_rot(
+                                    xyz_x, xyz_y, xyz_z,
+                                    R_l[0,0], R_l[0,1], R_l[0,2],
+                                    R_l[1,0], R_l[1,1], R_l[1,2],
+                                    R_l[2,0], R_l[2,1], R_l[2,2],
+                                    _emx_l, _emy_l, _n_eq,
+                                    half_w_f, height_f, inv_pi)
+                                l_mx = _emx_l.reshape(out_height, half_w)
+                                l_my = _emy_l.reshape(out_height, half_w)
+                            else:
+                                l_mx, l_my = compute_remap_tables(R_left_eye)
+                                l_mx = l_mx.astype(np.float32)
+                                l_my = l_my.astype(np.float32)
+                            result_buf[:, :half_w] = cv2.remap(right_src, l_mx, l_my,
+                                                                cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                                                                borderValue=(0, 0, 0))
+
+                        # Run both eyes in parallel (numba releases GIL; cv2.remap also releases GIL)
+                        t_right = threading.Thread(target=_remap_right_eye_eq)
+                        t_right.start()
+                        _remap_left_eye_eq()
+                        t_right.join()
 
                 # When CUDA fused pipeline handled remap+LUT+sharpen, skip CPU post-processing
                 if _cuda_fused_done:
@@ -5881,9 +6193,10 @@ class VideoProcessor(QThread):
 
             # Set up FFmpeg decode pipeline
             # Build list of decode commands (one per segment for multi-segment, or single)
-            def _build_decode_cmd(input_path, ss=0, t=None, stream_index=None):
+            def _build_decode_cmd(input_path, ss=0, t=None, stream_index=None, crop_rect=None):
                 """Build FFmpeg decode command for a single input file.
                 If stream_index is given, decode only that stream (for parallel .360 decode).
+                If crop_rect is given as (x, y, w, h), apply crop filter (for parallel non-360 decode).
                 """
                 cmd = [get_ffmpeg_path()]
                 # Hardware decode: NVDEC on Windows (NVIDIA), VideoToolbox on macOS
@@ -5903,6 +6216,10 @@ class VideoProcessor(QThread):
                 elif cfg.is_360_input:
                     eac_raw_filter = FrameExtractor.EAC_RAW_FILTER + "[out]"
                     cmd += ["-filter_complex", eac_raw_filter, "-map", "[out]"]
+                elif crop_rect is not None:
+                    # Parallel non-360: crop one eye from SBS frame
+                    cx, cy, cw, ch = crop_rect
+                    cmd += ["-vf", f"crop={cw}:{ch}:{cx}:{cy}"]
                 cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-v", "quiet", "-"]
                 return cmd
 
@@ -5910,7 +6227,18 @@ class VideoProcessor(QThread):
             # The vstack filter forces sequential decoding of both HEVC streams, ~4x slower
             # than decoding them in parallel (benchmarked: 126ms/frame vs 37ms/frame).
             use_parallel_360_decode = cfg.is_360_input
+            # For non-360 SBS: use parallel decode with FFmpeg crop to split eyes at decode level.
+            # Halves per-pipe bandwidth (50MB vs 100MB per frame at 8K) and gives contiguous eye frames.
+            use_parallel_sbs_decode = (not cfg.is_360_input and not right_wraps
+                                       and half_w > 0 and out_height > 0)
 
+            # For parallel .360 decode with trim: we must NOT use FFmpeg -ss on
+            # individual streams because s0 and s4 may seek to different frame
+            # positions (GoPro .360 uses all P-frames, so timestamp-based seeking
+            # can land on different frames for each HEVC track). Instead, decode
+            # from the beginning and skip frames in the decode thread to ensure
+            # perfect s0/s4 synchronization.
+            _parallel_skip_frames = 0  # frames to skip in decode thread for trim sync
             if is_multi_segment:
                 # Build per-segment decode commands
                 # For trim: skip segments before start_time, truncate at end_time
@@ -5931,20 +6259,44 @@ class VideoProcessor(QThread):
                     local_end = min(seg_dur, end_time - seg_time_offset)
                     local_t = local_end - local_ss
                     if use_parallel_360_decode:
-                        cmd_s0 = _build_decode_cmd(seg_path, local_ss, local_t, stream_index=0)
-                        cmd_s4 = _build_decode_cmd(seg_path, local_ss, local_t, stream_index=4)
+                        # No -ss for parallel .360: decode full segment, skip in Python
+                        _parallel_skip_frames = int(round(local_ss * fps))
+                        cmd_s0 = _build_decode_cmd(seg_path, 0, None, stream_index=0)
+                        cmd_s4 = _build_decode_cmd(seg_path, 0, None, stream_index=4)
                         decode_segment_list.append((cmd_s0, seg_path))
                         decode_segment_list_s4.append((cmd_s4, seg_path))
+                    elif use_parallel_sbs_decode:
+                        # Parallel non-360 SBS: two FFmpeg processes, each cropping one eye
+                        crop_A = (left_start, 0, half_w, height)  # left_src = right eye data
+                        crop_B = (right_start, 0, half_w, height)  # right_src = left eye data
+                        cmd_A = _build_decode_cmd(seg_path, local_ss, local_t, crop_rect=crop_A)
+                        cmd_B = _build_decode_cmd(seg_path, local_ss, local_t, crop_rect=crop_B)
+                        decode_segment_list.append((cmd_A, seg_path))
+                        decode_segment_list_s4.append((cmd_B, seg_path))
                     else:
                         cmd = _build_decode_cmd(seg_path, local_ss, local_t)
                         decode_segment_list.append((cmd, seg_path))
                     seg_time_offset = seg_end
             else:
                 if use_parallel_360_decode:
-                    cmd_s0 = _build_decode_cmd(cfg.input_path, start_time, duration, stream_index=0)
-                    cmd_s4 = _build_decode_cmd(cfg.input_path, start_time, duration, stream_index=4)
+                    # No -ss for parallel .360: decode from start, skip frames in Python
+                    _parallel_skip_frames = int(round(start_time * fps))
+                    if _parallel_skip_frames > 0:
+                        print(f"[EXPORT] Parallel .360 decode: will skip {_parallel_skip_frames} frames for trim sync")
+                    cmd_s0 = _build_decode_cmd(cfg.input_path, 0, None, stream_index=0)
+                    cmd_s4 = _build_decode_cmd(cfg.input_path, 0, None, stream_index=4)
                     decode_segment_list = [(cmd_s0, str(cfg.input_path))]
                     decode_segment_list_s4 = [(cmd_s4, str(cfg.input_path))]
+                elif use_parallel_sbs_decode:
+                    # Parallel non-360 SBS: two FFmpeg processes, each cropping one eye
+                    crop_A = (left_start, 0, half_w, height)
+                    crop_B = (right_start, 0, half_w, height)
+                    cmd_A = _build_decode_cmd(cfg.input_path, start_time, duration, crop_rect=crop_A)
+                    cmd_B = _build_decode_cmd(cfg.input_path, start_time, duration, crop_rect=crop_B)
+                    decode_segment_list = [(cmd_A, str(cfg.input_path))]
+                    decode_segment_list_s4 = [(cmd_B, str(cfg.input_path))]
+                    print(f"[EXPORT] Parallel SBS decode: eye A crop=({left_start},0,{half_w},{height}), "
+                          f"eye B crop=({right_start},0,{half_w},{height})")
                 else:
                     decode_cmd = _build_decode_cmd(cfg.input_path, start_time, duration)
                     decode_segment_list = [(decode_cmd, str(cfg.input_path))]
@@ -6036,6 +6388,8 @@ class VideoProcessor(QThread):
                     decode_w, decode_h = 5952, 1920  # single stream size
                 else:
                     decode_w, decode_h = FrameExtractor.EAC_RAW_W, FrameExtractor.EAC_RAW_H
+            elif use_parallel_sbs_decode:
+                decode_w, decode_h = half_w, height  # each FFmpeg outputs one cropped eye
             else:
                 decode_w, decode_h = width, height
             frame_size = decode_w * decode_h * 3  # BGR24
@@ -6054,6 +6408,8 @@ class VideoProcessor(QThread):
             # starts writing to a buffer that encode thread is still writing to stdin.
             encode_queue = queue.Queue(maxsize=1)   # processed frames waiting to be encoded
             pipeline_error = [None]  # shared error state
+            _dec_split_non360 = False  # set True below for non-360 pre-split path
+            _dec_eye_pool = None
 
             if use_parallel_360_decode:
                 def decode_thread():
@@ -6102,6 +6458,8 @@ class VideoProcessor(QThread):
                             t_s4.start()
 
                             try:
+                                _dec_frame_n = 0
+                                _frames_queued = 0
                                 while not self._cancelled:
                                     raw_s0 = proc_s0.stdout.read(frame_size)
                                     if len(raw_s0) < frame_size:
@@ -6114,7 +6472,17 @@ class VideoProcessor(QThread):
                                         break
                                     if s4_err[0]:
                                         raise s4_err[0]
+                                    _dec_frame_n += 1
+                                    # Skip frames before trim start (parallel .360 sync)
+                                    if _dec_frame_n <= _parallel_skip_frames:
+                                        _s4_consumed.set()
+                                        continue
+                                    # Stop after enough frames for trim duration
+                                    if _frames_queued >= total_frames + 2:
+                                        _s4_consumed.set()
+                                        break
                                     decode_queue.put((raw_s0, raw_s4))
+                                    _frames_queued += 1
                                     _s4_consumed.set()
                             finally:
                                 _s4_consumed.set()  # unblock s4 thread
@@ -6123,6 +6491,75 @@ class VideoProcessor(QThread):
                                 proc_s4.stdout.close()
                                 proc_s4.wait()
                                 t_s4.join(timeout=5)
+                    except Exception as e:
+                        pipeline_error[0] = e
+                    finally:
+                        decode_queue.put(None)  # sentinel
+            elif use_parallel_sbs_decode:
+                def decode_thread():
+                    """Parallel non-360 SBS decode: run 2 FFmpeg processes (eye A + eye B)
+                    concurrently with crop filters. Each pipe carries half the bandwidth.
+                    Puts (eyeA_bytes, eyeB_bytes) tuples on the queue."""
+                    try:
+                        for seg_idx in range(len(decode_segment_list)):
+                            if self._cancelled:
+                                break
+                            cmd_A = decode_segment_list[seg_idx][0]
+                            cmd_B = decode_segment_list_s4[seg_idx][0]
+
+                            proc_A = subprocess.Popen(cmd_A, stdout=subprocess.PIPE,
+                                                       stderr=subprocess.DEVNULL,
+                                                       creationflags=get_subprocess_flags())
+                            proc_B = subprocess.Popen(cmd_B, stdout=subprocess.PIPE,
+                                                       stderr=subprocess.DEVNULL,
+                                                       creationflags=get_subprocess_flags())
+                            # Read eye B in helper thread to overlap I/O
+                            _eyeB_buf = [None]
+                            _eyeB_err = [None]
+
+                            def _read_eye_B():
+                                try:
+                                    while not self._cancelled:
+                                        raw = proc_B.stdout.read(frame_size)
+                                        if len(raw) < frame_size:
+                                            _eyeB_buf[0] = None
+                                            return
+                                        _eyeB_buf[0] = raw
+                                        _eyeB_ready.set()
+                                        _eyeB_consumed.wait()
+                                        _eyeB_consumed.clear()
+                                except Exception as e:
+                                    _eyeB_err[0] = e
+                                finally:
+                                    _eyeB_buf[0] = None
+                                    _eyeB_ready.set()
+
+                            _eyeB_ready = threading.Event()
+                            _eyeB_consumed = threading.Event()
+                            t_B = threading.Thread(target=_read_eye_B, daemon=True)
+                            t_B.start()
+
+                            try:
+                                while not self._cancelled:
+                                    raw_A = proc_A.stdout.read(frame_size)
+                                    if len(raw_A) < frame_size:
+                                        break
+                                    _eyeB_ready.wait()
+                                    _eyeB_ready.clear()
+                                    raw_B = _eyeB_buf[0]
+                                    if raw_B is None:
+                                        break
+                                    if _eyeB_err[0]:
+                                        raise _eyeB_err[0]
+                                    decode_queue.put((raw_A, raw_B))
+                                    _eyeB_consumed.set()
+                            finally:
+                                _eyeB_consumed.set()
+                                proc_A.stdout.close()
+                                proc_A.wait()
+                                proc_B.stdout.close()
+                                proc_B.wait()
+                                t_B.join(timeout=5)
                     except Exception as e:
                         pipeline_error[0] = e
                     finally:
@@ -6195,6 +6632,7 @@ class VideoProcessor(QThread):
                     if raw_frame is None:
                         break
 
+                    _dec_eye_pair = None  # track for buffer pool return
                     if use_parallel_360_decode:
                         # Parallel .360 decode: raw_frame is (s0_bytes, s4_bytes) tuple.
                         # Pass pre-split arrays to process_frame_opencv to avoid ~11ms vstack copy.
@@ -6202,6 +6640,17 @@ class VideoProcessor(QThread):
                         _pre_s0 = np.frombuffer(raw_s0, dtype=np.uint8).reshape((1920, 5952, 3))
                         _pre_s4 = np.frombuffer(raw_s4, dtype=np.uint8).reshape((1920, 5952, 3))
                         frame = None  # not used for .360 parallel path
+                    elif use_parallel_sbs_decode and isinstance(raw_frame, tuple):
+                        # Parallel SBS decode: raw_frame is (eyeA_bytes, eyeB_bytes)
+                        # Each is already cropped to half_w × height by FFmpeg — contiguous!
+                        raw_A, raw_B = raw_frame
+                        # Use pre-allocated contiguous buffers (avoids per-frame allocation)
+                        np.copyto(_eq_src_buf_A, np.frombuffer(raw_A, dtype=np.uint8).reshape((decode_h, half_w, 3)))
+                        np.copyto(_eq_src_buf_B, np.frombuffer(raw_B, dtype=np.uint8).reshape((decode_h, half_w, 3)))
+                        _dec_eye_pair = (_eq_src_buf_A, _eq_src_buf_B)
+                        frame = None
+                        _pre_s0 = None
+                        _pre_s4 = None
                     else:
                         frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((decode_h, decode_w, 3))
                         _pre_s0 = None
@@ -6213,6 +6662,12 @@ class VideoProcessor(QThread):
                     # Clamp index: FFmpeg may decode 1-2 extra frames beyond total_frames estimate
                     if precomputed is not None:
                         _fc = min(frame_count, total_frames - 1)
+                        if frame_count < 3:
+                            _dbg_t = start_time + _fc / fps
+                            print(f"[EXPORT] frame_count={frame_count} _fc={_fc} lookup_t={_dbg_t:.4f}s "
+                                  f"mat_diag=[{precomputed['left_matrices'][_fc][0,0]:.6f},"
+                                  f"{precomputed['left_matrices'][_fc][1,1]:.6f},"
+                                  f"{precomputed['left_matrices'][_fc][2,2]:.6f}]")
                         gyro_left = precomputed['left_matrices'][_fc]
                         gyro_right = precomputed['right_matrices'][_fc]
                         if _export_rs_enabled:
@@ -6224,15 +6679,21 @@ class VideoProcessor(QThread):
                             rs_R_sensor_right = None
                             rs_R_cross_right = None
                     else:
-                        gyro_left = np.eye(3, dtype=np.float64)
-                        gyro_right = np.eye(3, dtype=np.float64)
+                        # No gyro: apply manual view adjustments (panomap rotation + stereo) directly
+                        gyro_left = R_view_left.astype(np.float64) if R_view_left is not None else np.eye(3, dtype=np.float64)
+                        gyro_right = R_view_right.astype(np.float64) if R_view_right is not None else np.eye(3, dtype=np.float64)
                         angular_vel = None
                         rs_R_sensor_right = None
                         rs_R_cross_right = None
 
                     processed = process_frame_opencv(frame, gyro_left, gyro_right, angular_vel,
                                                      rs_R_sensor_right, rs_R_cross_right,
-                                                     pre_split_s0=_pre_s0, pre_split_s4=_pre_s4)
+                                                     pre_split_s0=_pre_s0, pre_split_s4=_pre_s4,
+                                                     pre_split_eyes=_dec_eye_pair)
+
+                    # Return pre-split eye buffers to pool (data already consumed by GPU/remap)
+                    if _dec_eye_pair is not None and _dec_eye_pool is not None:
+                        _dec_eye_pool.put(_dec_eye_pair)
 
                     # Triple-buffer: enqueue current buffer as numpy array (encode thread
                     # writes via memoryview, avoiding tobytes() copy ~13ms/frame at 8K),
@@ -7021,6 +7482,20 @@ class VR180ProcessorGUI(QMainWindow):
         self.gopro_status.setStyleSheet("QLabel { color: #666; font-style: italic; }")
         gopro_layout.addWidget(self.gopro_status)
 
+        # "Load .360 Gyro" button row — only visible for non-.360 inputs
+        self.gyro_load_row = QWidget()
+        _gyro_btn_layout = QHBoxLayout(self.gyro_load_row)
+        _gyro_btn_layout.setContentsMargins(0, 0, 0, 0)
+        self.load_gyro_360_btn = QPushButton("Load .360 Gyro...")
+        self.load_gyro_360_btn.setToolTip("Load gyro stabilization data from a matching .360 file")
+        _gyro_btn_layout.addWidget(self.load_gyro_360_btn)
+        self.clear_gyro_btn = QPushButton("Clear")
+        self.clear_gyro_btn.setToolTip("Clear loaded gyro data")
+        _gyro_btn_layout.addWidget(self.clear_gyro_btn)
+        _gyro_btn_layout.addStretch()
+        self.gyro_load_row.setVisible(False)  # shown when non-.360 input loaded
+        gopro_layout.addWidget(self.gyro_load_row)
+
         self.gyro_stabilize_checkbox = QCheckBox("Enable Gyro Stabilization")
         if HAS_SCIPY:
             self.gyro_stabilize_checkbox.setToolTip("Use CORI (Camera Orientation) data to smooth camera motion.\nRequires .360 file to be loaded.")
@@ -7035,39 +7510,33 @@ class VR180ProcessorGUI(QMainWindow):
         gyro_grid = QGridLayout(self.gyro_controls_widget)
         gyro_grid.setContentsMargins(0, 0, 0, 0)
 
-        # Heading (yaw+pitch) smoothing window slider
-        gyro_grid.addWidget(QLabel("Heading:"), 0, 0)
-        self.gyro_smooth_slider = SliderWithSpinBox(0, 2000, 500, 0, 50, " ms")
-        self.gyro_smooth_slider.setToolTip("Yaw+pitch smoothing window. 0 = camera lock.\nHigher = more stabilization (removes shake, follows slow pans).")
+        # Smoothing window slider (all axes)
+        gyro_grid.addWidget(QLabel("Smooth:"), 0, 0)
+        self.gyro_smooth_slider = SliderWithSpinBox(0, 5000, 500, 0, 50, " ms")
+        self.gyro_smooth_slider.setToolTip("Stabilization smoothing window. 0 = camera lock.\nHigher = more stabilization (removes shake, follows slow pans).")
         gyro_grid.addWidget(self.gyro_smooth_slider, 0, 1)
 
-        # Roll smoothing window slider (separate axis — more room for correction)
-        gyro_grid.addWidget(QLabel("Roll:"), 1, 0)
-        self.gyro_roll_smooth_slider = SliderWithSpinBox(0, 5000, 2000, 0, 100, " ms")
-        self.gyro_roll_smooth_slider.setToolTip("Roll (horizon) smoothing window.\nHigher = more stable horizon. Default 2000ms.\nIgnored when Horizon Lock is enabled.")
-        gyro_grid.addWidget(self.gyro_roll_smooth_slider, 1, 1)
-
         # Max correction angle slider
-        gyro_grid.addWidget(QLabel("Max Corr:"), 2, 0)
+        gyro_grid.addWidget(QLabel("Max Corr:"), 1, 0)
         self.gyro_max_corr_slider = SliderWithSpinBox(1, 30, 10, 0, 1, "°")
         self.gyro_max_corr_slider.setToolTip("Maximum heading correction angle (degrees).\nSoft elastic limit — smoothly resists beyond this angle.\n10° recommended. Lower = fewer borders but less stabilization.")
-        gyro_grid.addWidget(self.gyro_max_corr_slider, 2, 1)
+        gyro_grid.addWidget(self.gyro_max_corr_slider, 1, 1)
 
         # Responsiveness slider (velocity curve power)
-        gyro_grid.addWidget(QLabel("Response:"), 3, 0)
+        gyro_grid.addWidget(QLabel("Response:"), 2, 0)
         self.gyro_responsiveness_slider = SliderWithSpinBox(0.2, 3.0, 1.0, 1, 0.1, "")
         self.gyro_responsiveness_slider.setToolTip(
             "How quickly the camera follows motion (velocity response curve).\n"
             "Lower = starts following early, eases in gradually (anticipatory).\n"
             "Higher = holds still longer, then catches up (cinematic lag).\n"
             "Default 1.0 = linear response.")
-        gyro_grid.addWidget(self.gyro_responsiveness_slider, 3, 1)
+        gyro_grid.addWidget(self.gyro_responsiveness_slider, 2, 1)
 
         # Horizon lock checkbox
         self.gyro_horizon_lock_checkbox = QCheckBox("Horizon Lock")
-        self.gyro_horizon_lock_checkbox.setToolTip("Fully cancel all roll motion (level horizon).\nOverrides roll smoothing slider.")
+        self.gyro_horizon_lock_checkbox.setToolTip("Lock horizon level using accelerometer data.\nPrevents roll drift during panning.")
         self.gyro_horizon_lock_checkbox.setChecked(False)
-        gyro_grid.addWidget(self.gyro_horizon_lock_checkbox, 4, 0, 1, 2)
+        gyro_grid.addWidget(self.gyro_horizon_lock_checkbox, 3, 0, 1, 2)
 
         self.gyro_controls_widget.setVisible(False)
         gopro_layout.addWidget(self.gyro_controls_widget)
@@ -7271,6 +7740,15 @@ class VR180ProcessorGUI(QMainWindow):
         self.sharpen_radius_slider.valueChanged.connect(self._schedule_preview_update)
         output_layout.addWidget(self.sharpen_radius_slider, 11, 1)
 
+        # ── Noise reduction (hidden for now — feature not yet complete) ──
+        self.denoise_checkbox = QCheckBox("Denoise")
+        self.denoise_checkbox.setVisible(False)
+        self.denoise_strength_slider = SliderWithSpinBox(0, 50, 10, decimals=0, step=1, suffix="")
+        self.denoise_strength_slider.setVisible(False)
+        self.denoise_mode_combo = QComboBox()
+        self.denoise_mode_combo.addItems(["Bilateral (Fast)", "NLM (Quality)", "Temporal (Best)"])
+        self.denoise_mode_combo.setVisible(False)
+
         # Pre-LUT color adjustments (ASC CDL: Lift, Gamma, Gain)
         output_layout.addWidget(QLabel("Lift:"), 12, 0)
         self.lift_slider = SliderWithSpinBox(-100, 100, 0, decimals=0, step=1, suffix="")
@@ -7414,6 +7892,8 @@ class VR180ProcessorGUI(QMainWindow):
     
     def _connect_signals(self):
         self.browse_input_btn.clicked.connect(self._browse_input)
+        self.load_gyro_360_btn.clicked.connect(self._browse_gyro_360)
+        self.clear_gyro_btn.clicked.connect(self._clear_gopro_gyro_data)
         self.browse_output_btn.clicked.connect(self._browse_output)
         self.preview_mode_combo.currentIndexChanged.connect(self._schedule_preview_update)
         self.zoom_in_btn.clicked.connect(lambda: self._zoom(1.25))
@@ -7468,7 +7948,6 @@ class VR180ProcessorGUI(QMainWindow):
         # Gyro stabilization controls
         self.gyro_stabilize_checkbox.toggled.connect(self._on_gyro_stabilize_toggled)
         self.gyro_smooth_slider.valueChanged.connect(self._on_gyro_param_changed)
-        self.gyro_roll_smooth_slider.valueChanged.connect(self._on_gyro_param_changed)
         self.gyro_max_corr_slider.valueChanged.connect(self._on_gyro_param_changed)
         self.gyro_responsiveness_slider.valueChanged.connect(self._on_gyro_param_changed)
         self.gyro_horizon_lock_checkbox.toggled.connect(self._on_horizon_lock_toggled)
@@ -7494,36 +7973,31 @@ class VR180ProcessorGUI(QMainWindow):
             self.config.input_path = Path(path)
             self.config.is_360_input = path.lower().endswith('.360')
             self.input_path_edit.setText(path)
-            # Detect multi-segment GoPro recordings and ask user
-            if self.config.is_360_input:
-                segments = detect_gopro_segments(path)
-                if len(segments) > 1:
-                    seg_names = [Path(s).name for s in segments]
-                    msg = QMessageBox(self)
-                    msg.setWindowTitle("Multi-Segment Recording Detected")
-                    msg.setText(
-                        f"Found {len(segments)} segments for this recording:\n"
-                        + "\n".join(f"  {name}" for name in seg_names)
-                    )
-                    msg.setInformativeText("Import all segments as one combined clip, or just this file?")
-                    combine_btn = msg.addButton("Combined Clip", QMessageBox.ButtonRole.AcceptRole)
-                    single_btn = msg.addButton("This File Only", QMessageBox.ButtonRole.RejectRole)
-                    msg.setDefaultButton(combine_btn)
-                    msg.exec()
-                    if msg.clickedButton() == combine_btn:
-                        self.config.segment_paths = segments
-                        stem = Path(segments[0]).stem
-                        output = Path(path).parent / f"{stem}_combined.mov"
-                        self.input_path_edit.setText(f"{path} (+{len(segments)-1} segments)")
-                    else:
-                        self.config.segment_paths = None
-                        output = Path(path).parent / f"{Path(path).stem}_adjusted.mov"
+            # Detect multi-segment GoPro recordings (works for .360, .MP4, .MOV, .LRV)
+            segments = detect_gopro_segments(path)
+            if len(segments) > 1:
+                seg_names = [Path(s).name for s in segments]
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Multi-Segment Recording Detected")
+                msg.setText(
+                    f"Found {len(segments)} segments for this recording:\n"
+                    + "\n".join(f"  {name}" for name in seg_names)
+                )
+                msg.setInformativeText("Import all segments as one combined clip, or just this file?")
+                combine_btn = msg.addButton("Combined Clip", QMessageBox.ButtonRole.AcceptRole)
+                single_btn = msg.addButton("This File Only", QMessageBox.ButtonRole.RejectRole)
+                msg.setDefaultButton(combine_btn)
+                msg.exec()
+                if msg.clickedButton() == combine_btn:
+                    self.config.segment_paths = segments
+                    stem = Path(segments[0]).stem
+                    output = Path(path).parent / f"{stem}_combined.mov"
+                    self.input_path_edit.setText(f"{path} (+{len(segments)-1} segments)")
                 else:
                     self.config.segment_paths = None
                     output = Path(path).parent / f"{Path(path).stem}_adjusted.mov"
             else:
                 self.config.segment_paths = None
-                # Always use .mov output (supports all codecs + ambisonic audio)
                 output = Path(path).parent / f"{Path(path).stem}_adjusted.mov"
             self.output_path_edit.setText(str(output))
             self.config.output_path = output
@@ -7536,10 +8010,12 @@ class VR180ProcessorGUI(QMainWindow):
             self.resolution_combo.setVisible(self.config.is_360_input)
             if not self.config.is_360_input:
                 self.audio_format_combo.setCurrentIndex(0)  # reset to stereo
-            # Auto-load GPMF gyro data when .360 is loaded as input
+            # Show/hide gyro load buttons based on input type
             if self.config.is_360_input:
+                self.gyro_load_row.setVisible(False)  # auto-load handles it
                 self._auto_load_360_gyro(path)
             else:
+                self.gyro_load_row.setVisible(True)  # show manual load button
                 self._clear_gopro_gyro_data()
     
     def _browse_output(self):
@@ -7564,9 +8040,131 @@ class VR180ProcessorGUI(QMainWindow):
         self.lut_path_edit.clear()
         self._schedule_preview_update()
 
+    def _browse_gyro_360(self):
+        """Browse for a .360 file to load gyro stabilization data for non-.360 input."""
+        last_folder = self.settings.value("last_input_folder", str(Path.home()), type=str)
+        path, _ = QFileDialog.getOpenFileName(self, "Select .360 File for Gyro Data", last_folder, "GoPro 360 (*.360)")
+        if not path:
+            return
+        # Detect multi-segment .360 recordings
+        segments = detect_gopro_segments(path)
+        gyro_segments = None
+        if len(segments) > 1:
+            seg_names = [Path(s).name for s in segments]
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Multi-Segment .360 Recording Detected")
+            msg.setText(
+                f"Found {len(segments)} .360 segments:\n"
+                + "\n".join(f"  {name}" for name in seg_names)
+            )
+            msg.setInformativeText("Load gyro data from all segments combined, or just this file?")
+            combine_btn = msg.addButton("Combined", QMessageBox.ButtonRole.AcceptRole)
+            single_btn = msg.addButton("This File Only", QMessageBox.ButtonRole.RejectRole)
+            msg.setDefaultButton(combine_btn)
+            msg.exec()
+            if msg.clickedButton() == combine_btn:
+                gyro_segments = segments
+        # Load gyro data (reuses same code as _auto_load_360_gyro)
+        self.config.gyro_data = None
+        self._gyro_stabilizer = None
+        try:
+            is_multi = gyro_segments is not None and len(gyro_segments) > 1
+            self.gopro_status.setText(f"Loading gyro from .360{'...' if not is_multi else f' ({len(gyro_segments)} segments)...'}")
+            self.gopro_status.setStyleSheet("QLabel { color: #0066cc; font-style: italic; }")
+            QApplication.processEvents()
+
+            if is_multi:
+                gyro_data = concatenate_gyro_data(gyro_segments)
+            else:
+                gyro_data = parse_gopro_gyro_data(path)
+            self.config.gyro_data = gyro_data
+            self._rebuild_gyro_stabilizer()
+
+            self.gyro_stabilize_checkbox.setEnabled(True)
+            self.rs_correction_checkbox.setEnabled(True)
+            self.rs_correction_checkbox.setVisible(True)
+
+            frames = gyro_data['frames']
+            duration = frames[-1]['time'] if frames else 0
+            cori_rolls = [f['cori_euler'][0] for f in frames]
+            cori_pitches = [f['cori_euler'][1] for f in frames]
+            cori_yaws = [f['cori_euler'][2] for f in frames]
+            seg_info = f" ({len(gyro_segments)} segments)" if is_multi else ""
+            self.gopro_status.setText(
+                f"Loaded from .360{seg_info}: {len(frames)} frames ({duration:.1f}s)\n"
+                f"CORI range: R[{min(cori_rolls):.1f},{max(cori_rolls):.1f}] "
+                f"P[{min(cori_pitches):.1f},{max(cori_pitches):.1f}] "
+                f"Y[{min(cori_yaws):.1f},{max(cori_yaws):.1f}]"
+            )
+            self.gopro_status.setStyleSheet("QLabel { color: #009900; }")
+
+            # Duration mismatch warning
+            if self.video_duration > 0 and duration > 0:
+                ratio = abs(duration - self.video_duration) / self.video_duration
+                if ratio > 0.05:
+                    self.gopro_status.setText(
+                        self.gopro_status.text() +
+                        f"\n⚠ Duration mismatch: video {self.video_duration:.1f}s vs gyro {duration:.1f}s"
+                    )
+                    self.gopro_status.setStyleSheet("QLabel { color: #cc6600; }")
+
+            # Load 800Hz GYRO angular velocity for RS correction
+            try:
+                fps = gyro_data['fps']
+                if is_multi:
+                    gyro_times, gyro_angvel = concatenate_800hz_gyro(gyro_segments, fps, gyro_data)
+                else:
+                    import sys as _sys_tmp
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    if script_dir not in _sys_tmp.path:
+                        _sys_tmp.path.insert(0, script_dir)
+                    from parse_gyro_raw import get_gyro_angular_velocity
+                    n_frames = len(gyro_data['frames'])
+                    gyro_times, gyro_angvel = get_gyro_angular_velocity(path, fps, n_frames)
+                if gyro_times is not None and len(gyro_times) > 0:
+                    gyro_data['gyro_angvel_times'] = gyro_times
+                    gyro_data['gyro_angvel'] = gyro_angvel
+                    print(f"Loaded 800Hz GYRO angular velocity: {len(gyro_times)} samples")
+            except Exception as e:
+                print(f"Warning: Could not load GYRO angular velocity: {e}")
+
+            # Auto-set RS from SROT
+            srot_ms = gyro_data.get('srot_ms')
+            if srot_ms is not None and srot_ms > 0:
+                self.rs_correction_slider.setValue(srot_ms)
+                self.rs_correction_checkbox.setChecked(True)
+                print(f"Auto-set RS correction from SROT: {srot_ms:.3f} ms")
+
+            # Parse GEOC lens calibration
+            geoc_path = gyro_segments[0] if is_multi else path
+            try:
+                geoc = parse_geoc(geoc_path)
+                if geoc and 'FRNT' in geoc and 'KLNS' in geoc['FRNT']:
+                    frnt = geoc['FRNT']
+                    self.config.geoc_klns = frnt['KLNS']
+                    self.config.geoc_ctrx = frnt.get('CTRX', 0.0)
+                    self.config.geoc_ctry = frnt.get('CTRY', 0.0)
+                    self.config.geoc_cal_dim = frnt.get('CAL_DIM', 4216)
+                    print(f"GEOC: KLNS={self.config.geoc_klns[:3]}..., CTR=({self.config.geoc_ctrx:.1f}, {self.config.geoc_ctry:.1f})")
+            except Exception as e:
+                print(f"Warning: Could not parse GEOC: {e}")
+
+            self.status_bar.showMessage(f"Loaded gyro from .360: {Path(path).name}")
+            self._schedule_preview_update()
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.gopro_status.setText(f"Gyro load error: {str(e)}")
+            self.gopro_status.setStyleSheet("QLabel { color: #cc0000; }")
+            self.status_bar.showMessage(f"Failed to load gyro from .360")
+
     def _auto_load_360_gyro(self, path):
         """Auto-load GPMF gyro data when a .360 file is loaded as video input.
         Handles multi-segment recordings by concatenating gyro data across segments."""
+        # Clear old gyro state first to prevent stale data if loading fails
+        self.config.gyro_data = None
+        self._gyro_stabilizer = None
         try:
             segments = self.config.segment_paths
             is_multi = segments is not None and len(segments) > 1
@@ -7717,9 +8315,16 @@ class VR180ProcessorGUI(QMainWindow):
             self._rebuild_gyro_stabilizer()
         self._schedule_preview_update()
 
+    def _on_denoise_toggled(self, state):
+        """Toggle denoise — enables/disables strength slider and mode combo."""
+        enabled = bool(state)
+        self.denoise_strength_slider.setEnabled(enabled)
+        self.denoise_mode_combo.setEnabled(enabled)
+        self.config.denoise_enabled = enabled
+        self._schedule_preview_update()
+
     def _on_horizon_lock_toggled(self, checked):
-        """Toggle horizon lock — disables roll slider when locked."""
-        self.gyro_roll_smooth_slider.setEnabled(not checked)
+        """Toggle horizon lock."""
         self._on_gyro_param_changed()
 
     def _on_resolution_changed(self, _idx=None):
@@ -7752,13 +8357,15 @@ class VR180ProcessorGUI(QMainWindow):
         self._gyro_stabilizer = GyroStabilizer(self.config.gyro_data)
         self._gyro_stabilizer.smooth(
             window_ms=self.gyro_smooth_slider.value(),
-            roll_window_ms=self.gyro_roll_smooth_slider.value(),
             horizon_lock=self.gyro_horizon_lock_checkbox.isChecked(),
             stabilize=self.gyro_stabilize_checkbox.isChecked(),
             max_corr_deg=self.gyro_max_corr_slider.value(),
             responsiveness=self.gyro_responsiveness_slider.value(),
             upside_down=self.upside_down_checkbox.isChecked(),
         )
+        # Clear preview remap cache (stale rotation matrix keys from previous file/params)
+        if hasattr(self, '_preview_remap_cache'):
+            self._preview_remap_cache.clear()
 
     def _update_codec_settings(self):
         """Show/hide settings based on selected codec"""
@@ -7885,7 +8492,10 @@ class VR180ProcessorGUI(QMainWindow):
                     f"(EAC→{width}x{self.config.eac_out_h}) — "
                     f"Remap: {accel_parts[0]}")
             else:
-                self.status_bar.showMessage(f"Loaded: {self.config.input_path.name} ({width}x{info['streams'][0]['height']})")
+                seg_info = ""
+                if self.config.segment_paths and len(self.config.segment_paths) > 1:
+                    seg_info = f" ({len(self.config.segment_paths)} segments, {self.video_duration:.1f}s total)"
+                self.status_bar.showMessage(f"Loaded: {self.config.input_path.name} ({width}x{info['streams'][0]['height']}){seg_info}")
             self._extract_frame(0)
         except Exception as e:
             QMessageBox.warning(self, "Error", str(e))
@@ -8098,20 +8708,14 @@ class VR180ProcessorGUI(QMainWindow):
         has_stabilizer = (hasattr(self, '_gyro_stabilizer') and self._gyro_stabilizer is not None)
         gyro_enabled = (self.gyro_stabilize_checkbox.isChecked() and has_stabilizer)
 
-        if gyro_enabled:
-            left_yaw = global_yaw - stereo_yaw
-            left_pitch = global_pitch - stereo_pitch
-            left_roll = global_roll - stereo_roll
-            right_yaw = global_yaw + stereo_yaw
-            right_pitch = global_pitch + stereo_pitch
-            right_roll = global_roll + stereo_roll
-        else:
-            left_yaw = global_yaw + stereo_yaw
-            left_pitch = global_pitch + stereo_pitch
-            left_roll = global_roll + stereo_roll
-            right_yaw = global_yaw - stereo_yaw
-            right_pitch = global_pitch - stereo_pitch
-            right_roll = global_roll - stereo_roll
+        # Stereo offset: same convention as .360 path
+        # right = global + stereo, left = global - stereo
+        right_yaw = global_yaw + stereo_yaw
+        right_pitch = global_pitch + stereo_pitch
+        right_roll = global_roll + stereo_roll
+        left_yaw = global_yaw - stereo_yaw
+        left_pitch = global_pitch - stereo_pitch
+        left_roll = global_roll - stereo_roll
         if has_stabilizer:
             preview_time = 0
             if self.video_duration > 0:
@@ -8119,11 +8723,14 @@ class VR180ProcessorGUI(QMainWindow):
             gyro_left = self._gyro_stabilizer.get_left_matrix_at_time(preview_time)
             gyro_right = self._gyro_stabilizer.get_right_matrix_at_time(preview_time)
 
-        # When gyro stabilization is enabled, always force -1920 shift
-        # (GoPro Player output needs this shift, and the pipeline recombines
-        # eyes as hstack([right, left]) which swaps order, so use negative)
-        if gyro_enabled:
+        # Force -1920 shift for .360 with gyro (GoPro equirect eye alignment)
+        if gyro_enabled and self.config.is_360_input:
             global_shift = -1920
+
+        # For non-360 SBS: always apply -width/2 base shift to swap eye halves
+        # (code puts left half → right output, so input halves must be swapped)
+        if not self.config.is_360_input:
+            global_shift = -(full_w // 2) + global_shift
 
         # Apply global shift
         if global_shift != 0:
@@ -8229,11 +8836,74 @@ class VR180ProcessorGUI(QMainWindow):
             self._preview_remap_cache[cache_key] = maps
             return maps
 
+        def _build_halfequirect_remap_rs(R, half_w, h, angular_vel, rs_time_map,
+                                          rs_ms, rs_yaw_factor, rs_pitch_factor, rs_roll_factor):
+            """Build remap: rotation + RS correction in 3D space → source half-equirect.
+
+            Fused RS pipeline matching the .360 cross remap kernel:
+              1. R × direction → rotated direction
+              2. RS small-angle rotation using per-pixel time offset
+              3. Convert back to equirect source coordinates
+
+            This produces identical RS correction to the .360 path because
+            both operate in 3D direction space with the same KLNS-derived time offsets.
+            """
+            u = np.linspace(0, 1, half_w, dtype=np.float32)
+            v = np.linspace(0, 1, h, dtype=np.float32)
+            ug, vg = np.meshgrid(u, v)
+            lon = (ug - 0.5) * np.float32(math.pi)
+            lat = (0.5 - vg) * np.float32(math.pi)
+            cos_lat = np.cos(lat)
+            x = cos_lat * np.sin(lon)
+            y = np.sin(lat)
+            z = cos_lat * np.cos(lon)
+
+            # Step 1: R × direction (heading rotation)
+            R = R.astype(np.float32)
+            xr = R[0,0]*x + R[0,1]*y + R[0,2]*z
+            yr = R[1,0]*x + R[1,1]*y + R[1,2]*z
+            zr = R[2,0]*x + R[2,1]*y + R[2,2]*z
+
+            # Step 2: RS small-angle rotation (identical to .360 kernel)
+            readout_s = np.float32(rs_ms / 1000.0)
+            _deg2rad = np.float32(np.pi / 180.0)
+            yaw_coeff = np.float32(-angular_vel[2] * rs_yaw_factor) * _deg2rad
+            pitch_coeff = np.float32(angular_vel[1] * rs_pitch_factor) * _deg2rad
+            roll_coeff = np.float32(angular_vel[0] * rs_roll_factor) * _deg2rad
+            t = rs_time_map * readout_s  # (h, half_w) scaled time offsets
+
+            xn = xr + yaw_coeff * t * zr - roll_coeff * t * yr
+            yn = yr + roll_coeff * t * xr - pitch_coeff * t * zr
+            zn = zr - yaw_coeff * t * xr + pitch_coeff * t * yr
+
+            # Step 3: Convert back to equirect
+            lat_n = np.arcsin(np.clip(yn, -1, 1))
+            lon_n = np.arctan2(xn, zn)
+            mx = np.clip((lon_n / np.float32(math.pi) + 0.5) * np.float32(half_w),
+                         0, np.float32(half_w - 1)).astype(np.float32)
+            my = np.clip((0.5 - lat_n / np.float32(math.pi)) * np.float32(h),
+                         0, np.float32(h - 1)).astype(np.float32)
+            return mx, my
+
         # ── .360 per-eye cross remap path (184.5° FOV) ─────────────────────
         # For .360 input: remap each eye directly from its own EAC cross.
         # This avoids the parallax seam at the lens boundary and gives each eye
         # access to the full 184.5° FOV of its own lens.
         if is_360 and hasattr(self, 'cached_crossA') and hasattr(self, 'cached_crossB'):
+            # ── Denoise crosses for preview (spatial only; temporal needs frame history) ──
+            _pv_crossA = self.cached_crossA
+            _pv_crossB = self.cached_crossB
+            if self.config.denoise_enabled and self.config.denoise_strength > 0:
+                _dn_mode = self.config.denoise_mode
+                _dn_str = self.config.denoise_strength
+                if _dn_mode == "temporal":
+                    # Temporal has no frame history in single-frame preview → bilateral fallback
+                    _pv_crossA = _denoise_cross(_pv_crossA, _dn_str, "bilateral")
+                    _pv_crossB = _denoise_cross(_pv_crossB, _dn_str, "bilateral")
+                else:
+                    _pv_crossA = _denoise_cross(_pv_crossA, _dn_str, _dn_mode)
+                    _pv_crossB = _denoise_cross(_pv_crossB, _dn_str, _dn_mode)
+
             # Lazy-init precomputed grids + buffers for preview cross remap (same as render)
             if not hasattr(self, '_pv_xyz_x') or self._pv_dims != (h, half_w):
                 u = np.linspace(0, 1, half_w, dtype=np.float32)
@@ -8355,7 +9025,7 @@ class VR180ProcessorGUI(QMainWindow):
                     rs_c = np.array([yaw_coeff, pitch_coeff, roll_coeff], dtype=np.float32)
                     _pv_cb['d_zt'].copy_to_device(t_offset_scaled)
                     right = _cuda_process_eye(
-                        self.cached_crossA, _pv_cb['d_xx'], _pv_cb['d_yy'], _pv_cb['d_zz'],
+                        _pv_crossA, _pv_cb['d_xx'], _pv_cb['d_yy'], _pv_cb['d_zz'],
                         R, _pv_cb['d_zt'], rs_c,
                         R_cross_right if has_Rc else None, has_Rc,
                         n_pv, h, half_w)
@@ -8364,7 +9034,7 @@ class VR180ProcessorGUI(QMainWindow):
                     _wgpu_device.queue.write_buffer(
                         _pv_wb['t_offset'], 0, t_offset_scaled.tobytes())
                     right_out = _wgpu_process_eye(
-                        self.cached_crossA, _pv_wb['xyz_x'], _pv_wb['xyz_y'], _pv_wb['xyz_z'],
+                        _pv_crossA, _pv_wb['xyz_x'], _pv_wb['xyz_y'], _pv_wb['xyz_z'],
                         R, _pv_wb['t_offset'], rs_c,
                         R_cross_right if has_Rc else None, has_Rc,
                         _pv_wb['n'], _pv_wb['out'])
@@ -8379,7 +9049,7 @@ class VR180ProcessorGUI(QMainWindow):
                         self._pv_mx_r, self._pv_my_r, n_pv)
                     r_mx = self._pv_mx_r.reshape(h, half_w)
                     r_my = self._pv_my_r.reshape(h, half_w)
-                    right = cv2.remap(self.cached_crossA, r_mx, r_my,
+                    right = cv2.remap(_pv_crossA, r_mx, r_my,
                                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
                                       borderValue=(0, 0, 0))
                 else:
@@ -8389,7 +9059,7 @@ class VR180ProcessorGUI(QMainWindow):
                         self.config.geoc_klns, self.config.geoc_ctrx,
                         self.config.geoc_ctry, self.config.geoc_cal_dim,
                         R_cross=R_cross_right)
-                    right = cv2.remap(self.cached_crossA, r_mx, r_my,
+                    right = cv2.remap(_pv_crossA, r_mx, r_my,
                                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
                                       borderValue=(0, 0, 0))
             else:
@@ -8399,12 +9069,12 @@ class VR180ProcessorGUI(QMainWindow):
                 _pv_cb = getattr(self, '_pv_cuda_bufs', None)
                 if HAS_NUMBA_CUDA and _pv_cb is not None:
                     right = _cuda_process_eye(
-                        self.cached_crossA, _pv_cb['d_xx'], _pv_cb['d_yy'], _pv_cb['d_zz'],
+                        _pv_crossA, _pv_cb['d_xx'], _pv_cb['d_yy'], _pv_cb['d_zz'],
                         R, _pv_cb['d_zt'], None,
                         None, False, n_pv, h, half_w)
                 elif HAS_WGPU and _pv_wb is not None:
                     right_out = _wgpu_process_eye(
-                        self.cached_crossA, _pv_wb['xyz_x'], _pv_wb['xyz_y'], _pv_wb['xyz_z'],
+                        _pv_crossA, _pv_wb['xyz_x'], _pv_wb['xyz_y'], _pv_wb['xyz_z'],
                         R, _pv_wb['t_offset'], None,
                         None, False, _pv_wb['n'], _pv_wb['out'])
                     right = right_out.reshape(h, half_w, 3)
@@ -8415,12 +9085,12 @@ class VR180ProcessorGUI(QMainWindow):
                         self._pv_mx_r, self._pv_my_r, n_pv)
                     r_mx = self._pv_mx_r.reshape(h, half_w)
                     r_my = self._pv_my_r.reshape(h, half_w)
-                    right = cv2.remap(self.cached_crossA, r_mx, r_my,
+                    right = cv2.remap(_pv_crossA, r_mx, r_my,
                                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
                                       borderValue=(0, 0, 0))
                 else:
                     r_mx, r_my = FrameExtractor.build_cross_remap(R_right, half_w, h)
-                    right = cv2.remap(self.cached_crossA, r_mx, r_my,
+                    right = cv2.remap(_pv_crossA, r_mx, r_my,
                                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
                                       borderValue=(0, 0, 0))
 
@@ -8430,12 +9100,12 @@ class VR180ProcessorGUI(QMainWindow):
             _pv_cb = getattr(self, '_pv_cuda_bufs', None)
             if HAS_NUMBA_CUDA and _pv_cb is not None:
                 left = _cuda_process_eye(
-                    self.cached_crossB, _pv_cb['d_xx'], _pv_cb['d_yy'], _pv_cb['d_zz'],
+                    _pv_crossB, _pv_cb['d_xx'], _pv_cb['d_yy'], _pv_cb['d_zz'],
                     R, _pv_cb['d_zt'], None,
                     None, False, n_pv, h, half_w)
             elif HAS_WGPU and _pv_wb is not None:
                 left_out = _wgpu_process_eye(
-                    self.cached_crossB, _pv_wb['xyz_x'], _pv_wb['xyz_y'], _pv_wb['xyz_z'],
+                    _pv_crossB, _pv_wb['xyz_x'], _pv_wb['xyz_y'], _pv_wb['xyz_z'],
                     R, _pv_wb['t_offset'], None,
                     None, False, _pv_wb['n'], _pv_wb['out'])
                 left = left_out.reshape(h, half_w, 3)
@@ -8446,12 +9116,12 @@ class VR180ProcessorGUI(QMainWindow):
                     self._pv_mx_l, self._pv_my_l, n_pv)
                 l_mx = self._pv_mx_l.reshape(h, half_w)
                 l_my = self._pv_my_l.reshape(h, half_w)
-                left = cv2.remap(self.cached_crossB, l_mx, l_my,
+                left = cv2.remap(_pv_crossB, l_mx, l_my,
                                  cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
                                  borderValue=(0, 0, 0))
             else:
                 l_mx, l_my = FrameExtractor.build_cross_remap(R_left, half_w, h)
-                left = cv2.remap(self.cached_crossB, l_mx, l_my,
+                left = cv2.remap(_pv_crossB, l_mx, l_my,
                                  cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
                                  borderValue=(0, 0, 0))
 
@@ -8459,6 +9129,11 @@ class VR180ProcessorGUI(QMainWindow):
 
         # ── .mov / non-cross remap path ───────────────────────────────────
         else:
+            # After base shift: frame[:, :half_w] = RightEye, frame[:, half_w:] = LeftEye
+            # Consistent naming: right_eye/left_eye = actual eye content
+            right_eye = frame[:, :half_w].copy()
+            left_eye = frame[:, half_w:].copy()
+
             # Check RS activation
             rs_ms = self.rs_correction_slider.value()
             rs_on = self.rs_correction_checkbox.isChecked()
@@ -8470,105 +9145,73 @@ class VR180ProcessorGUI(QMainWindow):
                          and self._gyro_stabilizer is not None
                          and self.config.geoc_klns is not None)
 
-            if rs_active and (gyro_left is not None or gyro_right is not None):
-                # RS must be applied BEFORE gyro rotation to avoid jello.
-                # Two-pass for right eye: (1) extract raw, (2) RS correct, (3) gyro rotate.
+            # Pre-build RS time map for fused remap (cached)
+            _pv_rs_time_map = None
+            _pv_rs_angular_vel = None
+            if rs_active:
                 rs_time = 0
                 if self.video_duration > 0:
                     rs_time = (self.timeline_slider.value() / 1000.0) * self.video_duration
-                angular_vel = self._gyro_stabilizer.get_angular_velocity_at_time(rs_time)
+                _pv_rs_angular_vel = self._gyro_stabilizer.get_angular_velocity_at_time(rs_time)
+                # Build/cache RS time map from KLNS (same geometry as .360 path)
+                _rs_cache_key = ('rs_tmap', h, half_w)
+                if _rs_cache_key in self._preview_remap_cache:
+                    _pv_rs_time_map = self._preview_remap_cache[_rs_cache_key]
+                else:
+                    _pv_rs_time_map = build_rs_time_map(h, half_w,
+                                                         self.config.geoc_klns,
+                                                         ctrx=self.config.geoc_ctrx,
+                                                         ctry=self.config.geoc_ctry,
+                                                         cal_dim=self.config.geoc_cal_dim)
+                    self._preview_remap_cache[_rs_cache_key] = _pv_rs_time_map
 
-                # RIGHT EYE: raw extract → RS correct → gyro rotate
-                id_rk = (h, half_w, 'R', 'g', 'id')
-                id_rmaps = _build_full_remap(np.eye(3, dtype=np.float32), RIGHT_EYE_LON, id_rk)
-                raw_right = cv2.remap(remap_src, id_rmaps[0], id_rmaps[1],
-                                      cv2.INTER_LINEAR, borderMode=remap_border)
-                raw_right = apply_rs_correction(raw_right, angular_vel, rs_ms,
-                                            rs_factor=rs_yaw_factor, roll_factor=rs_roll_factor, pitch_factor=rs_pitch_factor,
-                                            klns=self.config.geoc_klns, ctrx=self.config.geoc_ctrx,
-                                            ctry=self.config.geoc_ctry, cal_dim=self.config.geoc_cal_dim)
+            # Build per-eye view adjustment matrices (global+stereo)
+            # Same convention as .360 cross path
+            has_right_view = abs(right_yaw) > 0.01 or abs(right_pitch) > 0.01 or abs(right_roll) > 0.01
+            has_left_view = abs(left_yaw) > 0.01 or abs(left_pitch) > 0.01 or abs(left_roll) > 0.01
+            R_view_right = _build_ypr_matrix(right_yaw, right_pitch, right_roll) if has_right_view else None
+            R_view_left = _build_ypr_matrix(left_yaw, left_pitch, left_roll) if has_left_view else None
 
-                if gyro_right is not None:
-                    rot_mx, rot_my = _build_halfequirect_remap(gyro_right, half_w, h)
-                    right = cv2.remap(raw_right, rot_mx, rot_my,
+            if gyro_left is not None or gyro_right is not None:
+                # Gyro + view: bake user adjustments into gyro matrix (same as .360 path)
+                R_right = gyro_right.astype(np.float32) if gyro_right is not None else np.eye(3, dtype=np.float32)
+                R_left = gyro_left.astype(np.float32) if gyro_left is not None else np.eye(3, dtype=np.float32)
+                if R_view_right is not None:
+                    R_right = (R_right @ R_view_right).astype(np.float32)
+                if R_view_left is not None:
+                    R_left = (R_left @ R_view_left).astype(np.float32)
+
+                # Right eye: fused RS + rotation remap in 3D (matches .360 kernel)
+                if _pv_rs_time_map is not None and _pv_rs_angular_vel is not None:
+                    rot_mx, rot_my = _build_halfequirect_remap_rs(
+                        R_right, half_w, h, _pv_rs_angular_vel, _pv_rs_time_map,
+                        rs_ms, rs_yaw_factor, rs_pitch_factor, rs_roll_factor)
+                else:
+                    rot_mx, rot_my = _build_halfequirect_remap(R_right, half_w, h)
+                right_eye = cv2.remap(right_eye, rot_mx, rot_my,
                                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
                                       borderValue=(0, 0, 0))
-                else:
-                    right = raw_right
 
-                # LEFT EYE: single-pass (no RS on left eye)
-                if gyro_left is not None:
-                    lk = (h, half_w, 'L', 'g') + tuple(np.round(gyro_left.flatten(), 4))
-                    l_maps = _build_full_remap(gyro_left, LEFT_EYE_LON, lk)
-                    left = cv2.remap(remap_src, l_maps[0], l_maps[1],
-                                     cv2.INTER_LINEAR, borderMode=remap_border)
-                else:
-                    id_lk = (h, half_w, 'L', 'g', 'id')
-                    id_lmaps = _build_full_remap(np.eye(3, dtype=np.float32), LEFT_EYE_LON, id_lk)
-                    left = cv2.remap(remap_src, id_lmaps[0], id_lmaps[1],
-                                     cv2.INTER_LINEAR, borderMode=remap_border)
-
-            elif gyro_left is not None or gyro_right is not None:
-                # Gyro without RS: single-pass (original code)
-                # After -1920 shift: "left" var = right eye data, "right" var = left eye data
-                if gyro_right is not None:
-                    rk = (h, half_w, 'R', 'g') + tuple(np.round(gyro_right.flatten(), 4))
-                    r_maps = _build_full_remap(gyro_right, RIGHT_EYE_LON, rk)
-                    left = cv2.remap(remap_src, r_maps[0], r_maps[1],
-                                     cv2.INTER_LINEAR, borderMode=remap_border)
-                else:
-                    left = frame[:, :half_w].copy()
-                if gyro_left is not None:
-                    lk = (h, half_w, 'L', 'g') + tuple(np.round(gyro_left.flatten(), 4))
-                    l_maps = _build_full_remap(gyro_left, LEFT_EYE_LON, lk)
-                    right = cv2.remap(remap_src, l_maps[0], l_maps[1],
-                                      cv2.INTER_LINEAR, borderMode=remap_border)
-                else:
-                    right = frame[:, half_w:].copy()
-
-                # Normalize: swap so left var = actual left eye, right var = actual right eye
-                left, right = right, left
+                # Left eye: rotation only (no RS on left eye)
+                rot_mx, rot_my = _build_halfequirect_remap(R_left, half_w, h)
+                left_eye = cv2.remap(left_eye, rot_mx, rot_my,
+                                     cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                                     borderValue=(0, 0, 0))
             else:
-                # No gyro, no RS: just split
-                left = frame[:, :half_w].copy()
-                right = frame[:, half_w:].copy()
+                # No gyro: apply manual adjustments directly
+                if has_left_view:
+                    l_mx, l_my = _build_halfequirect_remap(R_view_left, half_w, h)
+                    left_eye = cv2.remap(left_eye, l_mx, l_my,
+                                         cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                                         borderValue=(0, 0, 0))
+                if has_right_view:
+                    r_mx, r_my = _build_halfequirect_remap(R_view_right, half_w, h)
+                    right_eye = cv2.remap(right_eye, r_mx, r_my,
+                                          cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                                          borderValue=(0, 0, 0))
 
-                # RS correction without gyro (standalone)
-                # Note: after -1920 shift, left half = right eye data, right half = left eye data
-                # RS correction applies to right eye only (modded lens)
-                if rs_active:
-                    rs_time = 0
-                    if self.video_duration > 0:
-                        rs_time = (self.timeline_slider.value() / 1000.0) * self.video_duration
-                    angular_vel = self._gyro_stabilizer.get_angular_velocity_at_time(rs_time)
-                    left = apply_rs_correction(left, angular_vel, rs_ms,
-                                            rs_factor=rs_yaw_factor, roll_factor=rs_roll_factor, pitch_factor=rs_pitch_factor,
-                                            klns=self.config.geoc_klns, ctrx=self.config.geoc_ctrx,
-                                            ctry=self.config.geoc_ctry, cal_dim=self.config.geoc_cal_dim)
-
-            # Apply manual adjustments (global + stereo offset) via full-frame remap
-            if not gyro_enabled:
-                has_left_adj = abs(left_yaw) > 0.01 or abs(left_pitch) > 0.01 or abs(left_roll) > 0.01
-                has_right_adj = abs(right_yaw) > 0.01 or abs(right_pitch) > 0.01 or abs(right_roll) > 0.01
-
-                if has_left_adj:
-                    R_l = _build_ypr_matrix(left_yaw, left_pitch, left_roll)
-                    lk = (h, half_w, 'R', 'm', round(left_yaw,2), round(left_pitch,2), round(left_roll,2))
-                    l_maps = _build_full_remap(R_l, RIGHT_EYE_LON, lk)
-                    left = cv2.remap(remap_src, l_maps[0], l_maps[1],
-                                     cv2.INTER_LINEAR, borderMode=remap_border)
-                if has_right_adj:
-                    R_r = _build_ypr_matrix(right_yaw, right_pitch, right_roll)
-                    rk = (h, half_w, 'L', 'm', round(right_yaw,2), round(right_pitch,2), round(right_roll,2))
-                    r_maps = _build_full_remap(R_r, LEFT_EYE_LON, rk)
-                    right = cv2.remap(remap_src, r_maps[0], r_maps[1],
-                                      cv2.INTER_LINEAR, borderMode=remap_border)
-
-            # Combine back
-            if gyro_enabled:
-                result = np.hstack([left, right])
-            else:
-                result = np.hstack([right, left])
+            # Combine: left eye on left, right eye on right (standard SBS)
+            result = np.hstack([left_eye, right_eye])
 
         # Apply color adjustments (Lift/Gamma/Gain) using LUT for speed
         lift = self.lift_slider.value() / 100.0
@@ -8608,40 +9251,38 @@ class VR180ProcessorGUI(QMainWindow):
 
                 lut_3d = self._cached_lut_3d
                 lut_size = lut_3d.shape[0]
-
-                # Downscale for speed
-                preview_scale = 2 if h > 1000 else 1
-                if preview_scale > 1:
-                    small = cv2.resize(result, (full_w // preview_scale, h // preview_scale), interpolation=cv2.INTER_AREA)
-                else:
-                    small = result
+                n_pixels = result.shape[0] * result.shape[1]
 
                 if HAS_MLX:
                     if not hasattr(self, '_pv_mlx_lut_flat'):
                         self._pv_mlx_lut_flat = mx.array(lut_3d.ravel())
-                    n_small = small.shape[0] * small.shape[1]
-                    result_small = _mlx_apply_lut_3d(small, self._pv_mlx_lut_flat, lut_size, n_small)
+                    lut_result = _mlx_apply_lut_3d(result, self._pv_mlx_lut_flat, lut_size, n_pixels)
                     if lut_intensity < 1.0:
-                        result_small = cv2.addWeighted(small, 1.0 - lut_intensity, result_small, lut_intensity, 0)
-                elif HAS_NUMBA_CUDA:
-                    result_small = _cuda_apply_lut_3d(small, lut_3d, lut_size)
-                    if lut_intensity < 1.0:
-                        result_small = cv2.addWeighted(small, 1.0 - lut_intensity, result_small, lut_intensity, 0)
-                elif HAS_WGPU and _wgpu_device is not None:
-                    n_small = small.shape[0] * small.shape[1]
-                    result_small = _wgpu_apply_lut_3d(small, lut_3d.ravel(), lut_size, n_small)
-                    if lut_intensity < 1.0:
-                        result_small = cv2.addWeighted(small, 1.0 - lut_intensity, result_small, lut_intensity, 0)
-                elif HAS_NUMBA:
-                    out_small = np.empty_like(small)
-                    _nb_apply_lut_3d(small, lut_3d, out_small, lut_size)
-                    if lut_intensity < 1.0:
-                        result_small = cv2.addWeighted(small, 1.0 - lut_intensity, out_small, lut_intensity, 0)
+                        result = cv2.addWeighted(result, 1.0 - lut_intensity, lut_result, lut_intensity, 0)
                     else:
-                        result_small = out_small
+                        result = lut_result
+                elif HAS_NUMBA_CUDA:
+                    lut_result = _cuda_apply_lut_3d(result, lut_3d, lut_size)
+                    if lut_intensity < 1.0:
+                        result = cv2.addWeighted(result, 1.0 - lut_intensity, lut_result, lut_intensity, 0)
+                    else:
+                        result = lut_result
+                elif HAS_WGPU and _wgpu_device is not None:
+                    lut_result = _wgpu_apply_lut_3d(result, lut_3d.ravel(), lut_size, n_pixels)
+                    if lut_intensity < 1.0:
+                        result = cv2.addWeighted(result, 1.0 - lut_intensity, lut_result, lut_intensity, 0)
+                    else:
+                        result = lut_result
+                elif HAS_NUMBA:
+                    lut_result = np.empty_like(result)
+                    _nb_apply_lut_3d(result, lut_3d, lut_result, lut_size)
+                    if lut_intensity < 1.0:
+                        result = cv2.addWeighted(result, 1.0 - lut_intensity, lut_result, lut_intensity, 0)
+                    else:
+                        result = lut_result
                 else:
-                    # Numpy fallback
-                    img = small.astype(np.float32) / 255.0
+                    # Numpy fallback — full resolution trilinear interpolation
+                    img = result.astype(np.float32) / 255.0
                     b_idx = np.clip(img[:,:,0] * (lut_size - 1), 0, lut_size - 1.001)
                     g_idx = np.clip(img[:,:,1] * (lut_size - 1), 0, lut_size - 1.001)
                     r_idx = np.clip(img[:,:,2] * (lut_size - 1), 0, lut_size - 1.001)
@@ -8652,16 +9293,11 @@ class VR180ProcessorGUI(QMainWindow):
                     c01 = lut_3d[b0,g1,r0]*(1-fr) + lut_3d[b0,g1,r1]*fr
                     c10 = lut_3d[b1,g0,r0]*(1-fr) + lut_3d[b1,g0,r1]*fr
                     c11 = lut_3d[b1,g1,r0]*(1-fr) + lut_3d[b1,g1,r1]*fr
-                    lut_result = (c00*(1-fg)+c01*fg)*(1-fb) + (c10*(1-fg)+c11*fg)*fb
+                    lut_out = (c00*(1-fg)+c01*fg)*(1-fb) + (c10*(1-fg)+c11*fg)*fb
                     if lut_intensity < 1.0:
                         img_rgb = img[:,:,::-1]
-                        lut_result = img_rgb + (lut_result - img_rgb) * lut_intensity
-                    result_small = np.clip(lut_result[:,:,::-1] * 255.0, 0, 255).astype(np.uint8)
-
-                if preview_scale > 1:
-                    result = cv2.resize(result_small, (full_w, h), interpolation=cv2.INTER_LINEAR)
-                else:
-                    result = result_small
+                        lut_out = img_rgb + (lut_out - img_rgb) * lut_intensity
+                    result = np.clip(lut_out[:,:,::-1] * 255.0, 0, 255).astype(np.uint8)
 
             except Exception as e:
                 self.status_bar.showMessage(f"LUT error: {e}")
@@ -8970,7 +9606,6 @@ class VR180ProcessorGUI(QMainWindow):
             trim_end=trim_end,
             gyro_data=self.config.gyro_data,
             gyro_smooth_ms=self.gyro_smooth_slider.value(),
-            gyro_roll_smooth_ms=self.gyro_roll_smooth_slider.value(),
             gyro_horizon_lock=self.gyro_horizon_lock_checkbox.isChecked(),
             gyro_max_corr_deg=self.gyro_max_corr_slider.value(),
             gyro_responsiveness=self.gyro_responsiveness_slider.value(),
@@ -8993,6 +9628,9 @@ class VR180ProcessorGUI(QMainWindow):
             eac_out_h=self.config.eac_out_h,
             sharpen_amount=self.sharpen_slider.value() / 100.0,
             sharpen_radius=self.sharpen_radius_slider.value() / 10.0,
+            denoise_enabled=self.denoise_checkbox.isChecked(),
+            denoise_strength=self.denoise_strength_slider.value(),
+            denoise_mode=["bilateral", "nlm", "temporal"][self.denoise_mode_combo.currentIndex()],
             segment_paths=self.config.segment_paths,
             upside_down=self.upside_down_checkbox.isChecked())
         
@@ -9079,6 +9717,13 @@ class VR180ProcessorGUI(QMainWindow):
         self.sharpen_slider.setValue(self.settings.value("sharpen", 0, type=int))
         self.sharpen_radius_slider.setValue(self.settings.value("sharpen_radius", 15, type=int))
 
+        # Load denoise settings
+        _dn_enabled = self.settings.value("denoise_enabled", False, type=bool)
+        self.denoise_checkbox.setChecked(_dn_enabled)
+        self.denoise_strength_slider.setValue(self.settings.value("denoise_strength", 10, type=int))
+        self.denoise_mode_combo.setCurrentIndex(self.settings.value("denoise_mode_idx", 0, type=int))
+        self._on_denoise_toggled(self.denoise_checkbox.isChecked())
+
     def _save_settings(self):
         """Save current settings for next session"""
         # Save stereo offset values
@@ -9115,6 +9760,11 @@ class VR180ProcessorGUI(QMainWindow):
         self.settings.setValue("resolution_idx", self.resolution_combo.currentIndex())
         self.settings.setValue("sharpen", self.sharpen_slider.value())
         self.settings.setValue("sharpen_radius", self.sharpen_radius_slider.value())
+
+        # Save denoise settings
+        self.settings.setValue("denoise_enabled", self.denoise_checkbox.isChecked())
+        self.settings.setValue("denoise_strength", self.denoise_strength_slider.value())
+        self.settings.setValue("denoise_mode_idx", self.denoise_mode_combo.currentIndex())
 
     def dragEnterEvent(self, event):
         """Handle drag enter event - accept video files
