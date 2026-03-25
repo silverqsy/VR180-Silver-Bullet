@@ -467,13 +467,13 @@ if HAS_NUMBA:
             my_out[i] = py
 
     @njit(parallel=True)
-    def _nb_apply_lut_3d(frame, lut, out, lut_size):
+    def _nb_apply_lut_3d(frame, lut, out, lut_size, pix_max=255):
         """Numba JIT: per-pixel trilinear 3D LUT interpolation.
         frame: (H, W, 3) uint8 BGR. lut: (S, S, S, 3) float32 RGB.
         out: (H, W, 3) uint8 BGR. 33³ LUT fits in L2 cache."""
         h = frame.shape[0]
         w = frame.shape[1]
-        scale = numba.float32((lut_size - 1) / 255.0)
+        scale = numba.float32(lut_size - 1) / numba.float32(pix_max)
 
         for i in prange(h):
             for j in range(w):
@@ -505,10 +505,10 @@ if HAS_NUMBA:
                     val = c0_val + (c1_val - c0_val) * fb
 
                     out_c = 2 - c  # RGB→BGR
-                    val_u8 = int(val * numba.float32(255.0) + numba.float32(0.5))
-                    if val_u8 < 0: val_u8 = 0
-                    if val_u8 > 255: val_u8 = 255
-                    out[i, j, out_c] = numba.types.uint8(val_u8)
+                    val_out = int(val * numba.float32(pix_max) + numba.float32(0.5))
+                    if val_out < 0: val_out = 0
+                    if val_out > pix_max: val_out = pix_max
+                    out[i, j, out_c] = val_out
 
     # Warm up JIT on first import (compile with small dummy data)
     # Must be synchronous — numba's default workqueue layer is not thread-safe
@@ -538,7 +538,7 @@ if HAS_NUMBA:
         f4 = np.zeros((4, 4, 3), dtype=np.uint8)
         l2 = np.zeros((2, 2, 2, 3), dtype=np.float32)
         o4 = np.zeros_like(f4)
-        _nb_apply_lut_3d(f4, l2, o4, 2)
+        _nb_apply_lut_3d(f4, l2, o4, 2, 255)
 
     _warmup_numba_kernels()
     print("  ✓ Numba kernels compiled")
@@ -553,10 +553,10 @@ if HAS_NUMBA_CUDA:
                                        R, t_offset, rs_coeffs,
                                        Rc, has_iori,
                                        cross_img, cross_w, cross_h,
-                                       out_bgr, n):
+                                       out_bgr, n, pix_max):
         """CUDA kernel: fused R×dir → RS → IORI → EAC face → bilinear sample.
-        out_bgr: flat uint8 array (n*3), interleaved BGR output.
-        cross_img is flat uint8 array (H*W*3), row-major BGR."""
+        out_bgr: flat array (n*3), interleaved BGR output. pix_max: 255 for uint8, 65535 for uint16.
+        cross_img is flat array (H*W*3), row-major BGR."""
         TWO_OVER_PI = 0.6366197723675814  # 2/pi
         idx = _cuda.grid(1)
         if idx >= n:
@@ -657,14 +657,14 @@ if HAS_NUMBA_CUDA:
                    w10 * cross_img[base10 + c] +
                    w11 * cross_img[base11 + c])
             v_int = int(val + 0.5)
-            if v_int > 255: v_int = 255
+            if v_int > pix_max: v_int = pix_max
             out_bgr[obase + c] = v_int
 
     @_cuda.jit
     def _cuda_cross_remap_rot_bilinear(xyz_x, xyz_y, xyz_z,
                                         R,
                                         cross_img, cross_w, cross_h,
-                                        out_bgr, n):
+                                        out_bgr, n, pix_max):
         """CUDA kernel: rotation-only path (no RS, no IORI) + bilinear sample."""
         TWO_OVER_PI = 0.6366197723675814
         idx = _cuda.grid(1)
@@ -744,7 +744,7 @@ if HAS_NUMBA_CUDA:
                    w10 * cross_img[base10 + c] +
                    w11 * cross_img[base11 + c])
             v_int = int(val + 0.5)
-            if v_int > 255: v_int = 255
+            if v_int > pix_max: v_int = pix_max
             out_bgr[obase + c] = v_int
 
     # ── CUDA equirect kernels (for non-360 SBS input) ──────────────────
@@ -752,7 +752,7 @@ if HAS_NUMBA_CUDA:
     def _cuda_equirect_remap_rs_bilinear(xyz_x, xyz_y, xyz_z,
                                           R, t_offset, rs_coeffs,
                                           src_img, src_w, src_h,
-                                          out_bgr, n):
+                                          out_bgr, n, pix_max):
         """CUDA kernel: fused R×dir → RS rotation → equirect lookup → bilinear sample.
         For non-360 half-equirect source images. Same RS math as cross kernel."""
         INV_PI = 0.3183098861837907
@@ -807,14 +807,14 @@ if HAS_NUMBA_CUDA:
                    w10 * src_img[base10 + c] +
                    w11 * src_img[base11 + c])
             v_int = int(val + 0.5)
-            if v_int > 255: v_int = 255
+            if v_int > pix_max: v_int = pix_max
             out_bgr[obase + c] = v_int
 
     @_cuda.jit
     def _cuda_equirect_remap_rot_bilinear(xyz_x, xyz_y, xyz_z,
                                            R,
                                            src_img, src_w, src_h,
-                                           out_bgr, n):
+                                           out_bgr, n, pix_max):
         """CUDA kernel: rotation-only equirect remap + bilinear sample (no RS)."""
         INV_PI = 0.3183098861837907
         idx = _cuda.grid(1)
@@ -860,17 +860,18 @@ if HAS_NUMBA_CUDA:
                    w10 * src_img[base10 + c] +
                    w11 * src_img[base11 + c])
             v_int = int(val + 0.5)
-            if v_int > 255: v_int = 255
+            if v_int > pix_max: v_int = pix_max
             out_bgr[obase + c] = v_int
 
     @_cuda.jit
-    def _cuda_apply_lut_3d_kernel(frame, lut, out, lut_size, n):
-        """CUDA kernel: trilinear 3D LUT interpolation. frame/out: flat uint8 BGR, lut: flat float32 RGB."""
+    def _cuda_apply_lut_3d_kernel(frame, lut, out, lut_size, n, pix_max):
+        """CUDA kernel: trilinear 3D LUT interpolation. pix_max: 255 for uint8, 65535 for uint16."""
         idx = _cuda.grid(1)
         if idx >= n:
             return
         base = idx * 3
-        scale = (lut_size - 1) / 255.0
+        pm_f = float(pix_max)
+        scale = (lut_size - 1) / pm_f
         b_val = frame[base] * scale
         g_val = frame[base + 1] * scale
         r_val = frame[base + 2] * scale
@@ -901,13 +902,13 @@ if HAS_NUMBA_CUDA:
             val = c0v + (c1v - c0v) * fb
 
             out_c = 2 - c  # RGB→BGR
-            v_int = int(val * 255.0 + 0.5)
+            v_int = int(val * pm_f + 0.5)
             if v_int < 0: v_int = 0
-            if v_int > 255: v_int = 255
+            if v_int > pix_max: v_int = pix_max
             out[base + out_c] = v_int
 
     @_cuda.jit
-    def _cuda_blur_h_kernel(src, dst, kernel, K, H, W):
+    def _cuda_blur_h_kernel(src, dst, kernel, K, H, W, pix_max):
         """Horizontal separable blur. src/dst: flat uint8 (H*W*3)."""
         idx = _cuda.grid(1)
         if idx >= H * W * 3:
@@ -927,11 +928,11 @@ if HAS_NUMBA_CUDA:
             val += float(src[(y * W + sx) * 3 + c]) * kernel[k]
         v = int(val + 0.5)
         if v < 0: v = 0
-        if v > 255: v = 255
+        if v > pix_max: v = pix_max
         dst[idx] = v
 
     @_cuda.jit
-    def _cuda_blur_v_usm_kernel(src, h_blurred, lat_weights, out, amount, kernel, K, H, W):
+    def _cuda_blur_v_usm_kernel(src, h_blurred, lat_weights, out, amount, kernel, K, H, W, pix_max):
         """Vertical blur on h_blurred + fused USM: out = clamp(src + lat*amount*(src - blurred))."""
         idx = _cuda.grid(1)
         if idx >= H * W * 3:
@@ -954,7 +955,7 @@ if HAS_NUMBA_CUDA:
         result = f + w * (f - val)
         v = int(result + 0.5)
         if v < 0: v = 0
-        if v > 255: v = 255
+        if v > pix_max: v = pix_max
         out[idx] = v
 
     @_cuda.jit
@@ -965,13 +966,14 @@ if HAS_NUMBA_CUDA:
             data[idx] = lut[data[idx]]
 
     @_cuda.jit
-    def _cuda_apply_lut_3d_blend_kernel(src, lut, dst, lut_size, intensity, n):
-        """3D LUT with intensity blend: dst = src + intensity*(lut(src) - src). src/dst: flat uint8 BGR."""
+    def _cuda_apply_lut_3d_blend_kernel(src, lut, dst, lut_size, intensity, n, pix_max):
+        """3D LUT with intensity blend: dst = src + intensity*(lut(src) - src). pix_max: 255 or 65535."""
         idx = _cuda.grid(1)
         if idx >= n:
             return
         base = idx * 3
-        scale = (lut_size - 1) / 255.0
+        pm_f = float(pix_max)
+        scale = (lut_size - 1) / pm_f
         b_val = src[base] * scale
         g_val = src[base + 1] * scale
         r_val = src[base + 2] * scale
@@ -996,13 +998,13 @@ if HAS_NUMBA_CUDA:
             c11 = c110 + (c111 - c110) * fr
             c0v = c00 + (c01 - c00) * fg
             c1v = c10 + (c11 - c10) * fg
-            lut_val = (c0v + (c1v - c0v) * fb) * 255.0
+            lut_val = (c0v + (c1v - c0v) * fb) * pm_f
             out_c = 2 - c  # RGB→BGR
             orig = float(src[base + out_c])
             blended = orig + (lut_val - orig) * intensity
             v = int(blended + 0.5)
             if v < 0: v = 0
-            if v > 255: v = 255
+            if v > pix_max: v = pix_max
             dst[base + out_c] = v
 
     # ── CUDA wrapper functions ────────────────────────────────────────────
@@ -1038,22 +1040,28 @@ if HAS_NUMBA_CUDA:
         'stream_B': None,      # CUDA stream for left eye
     }
 
-    def _cuda_ensure_buffers(cross_np, n_pixels):
-        """Ensure persistent device buffers are allocated and correctly sized."""
+    def _cuda_ensure_buffers(cross_np, n_pixels, pix_dtype=np.uint8):
+        """Ensure persistent device buffers are allocated and correctly sized.
+        pix_dtype: np.uint8 for 8-bit, np.uint16 for 10-bit pipeline."""
         p = _cuda_persistent
-        cross_elems = cross_np.size  # H*W*3
+        cross_elems = cross_np.size  # H*W*3 (element count, not bytes)
         out_elems = n_pixels * 3
-        if p['cross_size'] != cross_elems:
-            p['d_cross_A'] = _cuda.device_array(cross_elems, dtype=np.uint8)
-            p['d_cross_B'] = _cuda.device_array(cross_elems, dtype=np.uint8)
+        # Reallocate if size OR dtype changed
+        _need_cross = (p['cross_size'] != cross_elems or
+                       (p['d_cross_A'] is not None and p['d_cross_A'].dtype != pix_dtype))
+        _need_out = (p['out_size'] != out_elems or
+                     (p['d_out_A'] is not None and p['d_out_A'].dtype != pix_dtype))
+        if _need_cross:
+            p['d_cross_A'] = _cuda.device_array(cross_elems, dtype=pix_dtype)
+            p['d_cross_B'] = _cuda.device_array(cross_elems, dtype=pix_dtype)
             p['cross_size'] = cross_elems
-        if p['out_size'] != out_elems:
-            p['d_out_A'] = _cuda.device_array(out_elems, dtype=np.uint8)
-            p['d_out_B'] = _cuda.device_array(out_elems, dtype=np.uint8)
-            p['d_aux_A'] = _cuda.device_array(out_elems, dtype=np.uint8)
-            p['d_aux_B'] = _cuda.device_array(out_elems, dtype=np.uint8)
-            p['d_final_A'] = _cuda.device_array(out_elems, dtype=np.uint8)
-            p['d_final_B'] = _cuda.device_array(out_elems, dtype=np.uint8)
+        if _need_out:
+            p['d_out_A'] = _cuda.device_array(out_elems, dtype=pix_dtype)
+            p['d_out_B'] = _cuda.device_array(out_elems, dtype=pix_dtype)
+            p['d_aux_A'] = _cuda.device_array(out_elems, dtype=pix_dtype)
+            p['d_aux_B'] = _cuda.device_array(out_elems, dtype=pix_dtype)
+            p['d_final_A'] = _cuda.device_array(out_elems, dtype=pix_dtype)
+            p['d_final_B'] = _cuda.device_array(out_elems, dtype=pix_dtype)
             p['out_size'] = out_elems
         if p['d_R_A'] is None:
             p['d_R_A'] = _cuda.device_array(9, dtype=np.float32)
@@ -1070,11 +1078,12 @@ if HAS_NUMBA_CUDA:
                                 R_right_np, R_left_np,
                                 d_t_offset_right, d_t_offset_left,
                                 rs_coeffs_np, R_cross_np, has_iori,
-                                n_pixels, out_h, out_w, result_buf):
+                                n_pixels, out_h, out_w, result_buf, pix_dtype=np.uint8):
         """Process BOTH eyes via CUDA with overlapping streams, writing directly into result_buf.
-        Eliminates per-eye sync, intermediate copies, and .copy() overhead."""
+        pix_dtype: np.uint8 for 8-bit, np.uint16 for 10-bit pipeline."""
         p = _cuda_persistent
-        _cuda_ensure_buffers(crossA_np, n_pixels)
+        _pix_max = np.int32(255 if pix_dtype == np.uint8 else 65535)
+        _cuda_ensure_buffers(crossA_np, n_pixels, pix_dtype)
 
         cross_h_px, cross_w_px = crossA_np.shape[:2]
         half_w = out_w
@@ -1105,32 +1114,32 @@ if HAS_NUMBA_CUDA:
                 p['d_R_A'], d_t_offset_right, p['d_rs'],
                 p['d_Rc'], has_iori,
                 p['d_cross_A'], cross_w_px, cross_h_px,
-                p['d_out_A'], n_pixels)
+                p['d_out_A'], n_pixels, _pix_max)
         else:
             _cuda_cross_remap_rot_bilinear[grid, _CUDA_BLOCK](
                 d_xyz_x, d_xyz_y, d_xyz_z,
                 p['d_R_A'],
                 p['d_cross_A'], cross_w_px, cross_h_px,
-                p['d_out_A'], n_pixels)
+                p['d_out_A'], n_pixels, _pix_max)
 
         # LEFT EYE kernel launch (no RS, rotation only)
         _cuda_cross_remap_rot_bilinear[grid, _CUDA_BLOCK](
             d_xyz_x, d_xyz_y, d_xyz_z,
             p['d_R_B'],
             p['d_cross_B'], cross_w_px, cross_h_px,
-            p['d_out_B'], n_pixels)
+            p['d_out_B'], n_pixels, _pix_max)
 
         # Single sync for both kernels
         _cuda.synchronize()
 
         # Readback into contiguous temp buffers, then copy into result_buf slices
         # (result_buf[:, half_w:] is non-contiguous due to stride, can't copy_to_host directly)
-        if not hasattr(_cuda_process_both_eyes, '_host_A'):
-            _cuda_process_both_eyes._host_A = np.empty(n_pixels * 3, dtype=np.uint8)
-            _cuda_process_both_eyes._host_B = np.empty(n_pixels * 3, dtype=np.uint8)
+        if not hasattr(_cuda_process_both_eyes, '_host_A') or _cuda_process_both_eyes._host_A.dtype != pix_dtype:
+            _cuda_process_both_eyes._host_A = np.empty(n_pixels * 3, dtype=pix_dtype)
+            _cuda_process_both_eyes._host_B = np.empty(n_pixels * 3, dtype=pix_dtype)
         elif _cuda_process_both_eyes._host_A.size != n_pixels * 3:
-            _cuda_process_both_eyes._host_A = np.empty(n_pixels * 3, dtype=np.uint8)
-            _cuda_process_both_eyes._host_B = np.empty(n_pixels * 3, dtype=np.uint8)
+            _cuda_process_both_eyes._host_A = np.empty(n_pixels * 3, dtype=pix_dtype)
+            _cuda_process_both_eyes._host_B = np.empty(n_pixels * 3, dtype=pix_dtype)
         p['d_out_A'].copy_to_host(_cuda_process_both_eyes._host_A)
         p['d_out_B'].copy_to_host(_cuda_process_both_eyes._host_B)
         np.copyto(result_buf[:, half_w:], _cuda_process_both_eyes._host_A.reshape(out_h, half_w, 3))
@@ -1141,7 +1150,8 @@ if HAS_NUMBA_CUDA:
                           R_cross_np, has_iori, n_pixels, out_h, out_w):
         """Process one eye via CUDA (for preview path). Returns (out_h, out_w, 3) uint8 BGR."""
         p = _cuda_persistent
-        _cuda_ensure_buffers(cross_np, n_pixels)
+        _pix_max = np.int32(255)  # Preview always 8-bit
+        _cuda_ensure_buffers(cross_np, n_pixels, np.uint8)
 
         cross_h_px, cross_w_px = cross_np.shape[:2]
         p['d_cross_A'].copy_to_device(np.ascontiguousarray(cross_np).ravel())
@@ -1160,13 +1170,13 @@ if HAS_NUMBA_CUDA:
                 p['d_R_A'], d_t_offset, p['d_rs'],
                 p['d_Rc'], has_iori,
                 p['d_cross_A'], cross_w_px, cross_h_px,
-                p['d_out_A'], n_pixels)
+                p['d_out_A'], n_pixels, _pix_max)
         else:
             _cuda_cross_remap_rot_bilinear[grid, _CUDA_BLOCK](
                 d_xyz_x, d_xyz_y, d_xyz_z,
                 p['d_R_A'],
                 p['d_cross_A'], cross_w_px, cross_h_px,
-                p['d_out_A'], n_pixels)
+                p['d_out_A'], n_pixels, _pix_max)
 
         _cuda.synchronize()
         result = np.empty(n_pixels * 3, dtype=np.uint8)
@@ -1174,28 +1184,32 @@ if HAS_NUMBA_CUDA:
         return result.reshape(out_h, out_w, 3)
 
     def _cuda_apply_lut_3d(frame_np, lut_np, lut_size):
-        """Apply 3D LUT via CUDA. frame_np: (H,W,3) uint8 BGR, lut_np: (S,S,S,3) float32 RGB.
+        """Apply 3D LUT via CUDA. frame_np: (H,W,3) uint8/uint16 BGR, lut_np: (S,S,S,3) float32 RGB.
         Uses persistent device buffers."""
         p = _cuda_persistent
         h, w = frame_np.shape[:2]
         n = h * w
         frame_elems = n * 3
         lut_elems = lut_np.size
+        pix_dtype = frame_np.dtype
 
         # Ensure LUT buffer (uploaded once, reused across frames)
         if p['lut_size'] != lut_elems:
             p['d_lut'] = _cuda.to_device(lut_np.ravel().astype(np.float32))
             p['lut_size'] = lut_elems
 
-        # Ensure frame I/O buffers
-        if p['lut_frame_size'] != frame_elems:
-            p['d_lut_frame'] = _cuda.device_array(frame_elems, dtype=np.uint8)
-            p['d_lut_out'] = _cuda.device_array(frame_elems, dtype=np.uint8)
+        # Ensure frame I/O buffers (reallocate if size or dtype changed)
+        _need_realloc = (p['lut_frame_size'] != frame_elems or
+                         (p.get('d_lut_frame') is not None and p['d_lut_frame'].dtype != pix_dtype))
+        if _need_realloc:
+            p['d_lut_frame'] = _cuda.device_array(frame_elems, dtype=pix_dtype)
+            p['d_lut_out'] = _cuda.device_array(frame_elems, dtype=pix_dtype)
             p['lut_frame_size'] = frame_elems
 
         p['d_lut_frame'].copy_to_device(frame_np.ravel())
         grid = (n + _CUDA_BLOCK - 1) // _CUDA_BLOCK
-        _cuda_apply_lut_3d_kernel[grid, _CUDA_BLOCK](p['d_lut_frame'], p['d_lut'], p['d_lut_out'], lut_size, n)
+        _pix_max = np.int32(65535 if pix_dtype == np.uint16 else 255)
+        _cuda_apply_lut_3d_kernel[grid, _CUDA_BLOCK](p['d_lut_frame'], p['d_lut'], p['d_lut_out'], lut_size, n, _pix_max)
         _cuda.synchronize()
         return p['d_lut_out'].copy_to_host().reshape(h, w, 3)
 
@@ -1205,18 +1219,13 @@ if HAS_NUMBA_CUDA:
                             rs_coeffs_np, R_cross_np, has_iori,
                             n_pixels, out_h, out_w, result_buf,
                             color_1d_lut, lut_3d, lut_intensity,
-                            sharpen_kernel_1d, sharpen_lat, sharpen_amount, sharpen_ksize):
+                            sharpen_kernel_1d, sharpen_lat, sharpen_amount, sharpen_ksize,
+                            pix_dtype=np.uint8):
         """Fused GPU pipeline: remap → 1D LUT → 3D LUT → sharpen → single download.
-
-        Eliminates all intermediate CPU↔GPU round-trips. Data stays on GPU from
-        remap through final post-processing; only the cross images are uploaded
-        and the final result is downloaded once.
-
-        sharpen_kernel_1d/sharpen_lat: numpy arrays (uploaded to GPU once and cached).
-        Pass None to skip any optional step.
-        """
+        pix_dtype: np.uint8 for 8-bit, np.uint16 for 10-bit pipeline."""
         p = _cuda_persistent
-        _cuda_ensure_buffers(crossA_np, n_pixels)
+        _pix_max = np.int32(255 if pix_dtype == np.uint8 else 65535)
+        _cuda_ensure_buffers(crossA_np, n_pixels, pix_dtype)
 
         cross_h_px, cross_w_px = crossA_np.shape[:2]
         half_w = out_w
@@ -1246,19 +1255,19 @@ if HAS_NUMBA_CUDA:
                 p['d_R_A'], d_t_offset_right, p['d_rs'],
                 p['d_Rc'], has_iori,
                 p['d_cross_A'], cross_w_px, cross_h_px,
-                p['d_out_A'], n_pixels)
+                p['d_out_A'], n_pixels, _pix_max)
         else:
             _cuda_cross_remap_rot_bilinear[grid_pix, _CUDA_BLOCK](
                 d_xyz_x, d_xyz_y, d_xyz_z,
                 p['d_R_A'],
                 p['d_cross_A'], cross_w_px, cross_h_px,
-                p['d_out_A'], n_pixels)
+                p['d_out_A'], n_pixels, _pix_max)
         # Left eye (no RS)
         _cuda_cross_remap_rot_bilinear[grid_pix, _CUDA_BLOCK](
             d_xyz_x, d_xyz_y, d_xyz_z,
             p['d_R_B'],
             p['d_cross_B'], cross_w_px, cross_h_px,
-            p['d_out_B'], n_pixels)
+            p['d_out_B'], n_pixels, _pix_max)
 
         # After remap: d_out_A = right eye, d_out_B = left eye (on GPU)
         # cur_A/cur_B track which device buffer holds the "current" data
@@ -1267,8 +1276,9 @@ if HAS_NUMBA_CUDA:
 
         # ── Step 2: 1D color LUT (in-place, ~0.1ms) ──
         if color_1d_lut is not None:
-            if p['d_1d_lut'] is None:
-                p['d_1d_lut'] = _cuda.device_array(256, dtype=np.uint8)
+            _lut_len = len(color_1d_lut)
+            if p['d_1d_lut'] is None or p['d_1d_lut'].size != _lut_len:
+                p['d_1d_lut'] = _cuda.device_array(_lut_len, dtype=color_1d_lut.dtype)
             p['d_1d_lut'].copy_to_device(color_1d_lut)
             _cuda_apply_1d_lut_inplace[grid_elem, _CUDA_BLOCK](cur_A, p['d_1d_lut'], n_elems)
             _cuda_apply_1d_lut_inplace[grid_elem, _CUDA_BLOCK](cur_B, p['d_1d_lut'], n_elems)
@@ -1281,22 +1291,18 @@ if HAS_NUMBA_CUDA:
                 p['d_lut'] = _cuda.to_device(lut_3d.ravel().astype(np.float32))
                 p['lut_size'] = lut_elems
             if lut_intensity >= 0.99:
-                # Full intensity: LUT replaces original
-                _cuda_apply_lut_3d_kernel[grid_pix, _CUDA_BLOCK](cur_A, p['d_lut'], aux_A, lut_size, n_pixels)
-                _cuda_apply_lut_3d_kernel[grid_pix, _CUDA_BLOCK](cur_B, p['d_lut'], aux_B, lut_size, n_pixels)
+                _cuda_apply_lut_3d_kernel[grid_pix, _CUDA_BLOCK](cur_A, p['d_lut'], aux_A, lut_size, n_pixels, _pix_max)
+                _cuda_apply_lut_3d_kernel[grid_pix, _CUDA_BLOCK](cur_B, p['d_lut'], aux_B, lut_size, n_pixels, _pix_max)
             else:
-                # Partial intensity: blend original with LUT result
                 _cuda_apply_lut_3d_blend_kernel[grid_pix, _CUDA_BLOCK](
-                    cur_A, p['d_lut'], aux_A, lut_size, np.float32(lut_intensity), n_pixels)
+                    cur_A, p['d_lut'], aux_A, lut_size, np.float32(lut_intensity), n_pixels, _pix_max)
                 _cuda_apply_lut_3d_blend_kernel[grid_pix, _CUDA_BLOCK](
-                    cur_B, p['d_lut'], aux_B, lut_size, np.float32(lut_intensity), n_pixels)
-            # Swap: aux now has the LUT result
+                    cur_B, p['d_lut'], aux_B, lut_size, np.float32(lut_intensity), n_pixels, _pix_max)
             cur_A, aux_A = aux_A, cur_A
             cur_B, aux_B = aux_B, cur_B
 
         # ── Step 4: Equirectangular-aware sharpen (separable blur + USM) ──
         if sharpen_kernel_1d is not None and sharpen_amount > 0.01:
-            # Upload kernel/lat weights once, cache on GPU
             if p['d_sharpen_kernel'] is None or p['d_sharpen_kernel'].size != len(sharpen_kernel_1d):
                 p['d_sharpen_kernel'] = _cuda.to_device(sharpen_kernel_1d)
             if p['d_sharpen_lat'] is None or p['d_sharpen_lat'].size != len(sharpen_lat):
@@ -1305,30 +1311,28 @@ if HAS_NUMBA_CUDA:
             H = np.int32(out_h)
             W = np.int32(half_w)
             amt = np.float32(sharpen_amount)
-            # Right eye: blur_h → aux_A, blur_v_usm(cur_A + aux_A → final_A)
             _cuda_blur_h_kernel[grid_elem, _CUDA_BLOCK](
-                cur_A, aux_A, p['d_sharpen_kernel'], K, H, W)
+                cur_A, aux_A, p['d_sharpen_kernel'], K, H, W, _pix_max)
             _cuda_blur_v_usm_kernel[grid_elem, _CUDA_BLOCK](
                 cur_A, aux_A, p['d_sharpen_lat'],
-                p['d_final_A'], amt, p['d_sharpen_kernel'], K, H, W)
+                p['d_final_A'], amt, p['d_sharpen_kernel'], K, H, W, _pix_max)
             cur_A = p['d_final_A']
-            # Left eye: blur_h → aux_B, blur_v_usm(cur_B + aux_B → final_B)
             _cuda_blur_h_kernel[grid_elem, _CUDA_BLOCK](
-                cur_B, aux_B, p['d_sharpen_kernel'], K, H, W)
+                cur_B, aux_B, p['d_sharpen_kernel'], K, H, W, _pix_max)
             _cuda_blur_v_usm_kernel[grid_elem, _CUDA_BLOCK](
                 cur_B, aux_B, p['d_sharpen_lat'],
-                p['d_final_B'], amt, p['d_sharpen_kernel'], K, H, W)
+                p['d_final_B'], amt, p['d_sharpen_kernel'], K, H, W, _pix_max)
             cur_B = p['d_final_B']
 
         # ── Step 5: Single sync + download ──
         _cuda.synchronize()
 
-        if not hasattr(_cuda_fused_process, '_host_A'):
-            _cuda_fused_process._host_A = np.empty(n_elems, dtype=np.uint8)
-            _cuda_fused_process._host_B = np.empty(n_elems, dtype=np.uint8)
+        if not hasattr(_cuda_fused_process, '_host_A') or _cuda_fused_process._host_A.dtype != pix_dtype:
+            _cuda_fused_process._host_A = np.empty(n_elems, dtype=pix_dtype)
+            _cuda_fused_process._host_B = np.empty(n_elems, dtype=pix_dtype)
         elif _cuda_fused_process._host_A.size != n_elems:
-            _cuda_fused_process._host_A = np.empty(n_elems, dtype=np.uint8)
-            _cuda_fused_process._host_B = np.empty(n_elems, dtype=np.uint8)
+            _cuda_fused_process._host_A = np.empty(n_elems, dtype=pix_dtype)
+            _cuda_fused_process._host_B = np.empty(n_elems, dtype=pix_dtype)
 
         cur_A.copy_to_host(_cuda_fused_process._host_A)
         cur_B.copy_to_host(_cuda_fused_process._host_B)
@@ -1341,14 +1345,13 @@ if HAS_NUMBA_CUDA:
                                rs_coeffs_np,
                                n_pixels, out_h, out_w, result_buf,
                                color_1d_lut, lut_3d, lut_intensity,
-                               sharpen_kernel_1d, sharpen_lat, sharpen_amount, sharpen_ksize):
+                               sharpen_kernel_1d, sharpen_lat, sharpen_amount, sharpen_ksize,
+                               pix_dtype=np.uint8):
         """Fused GPU pipeline for non-360 equirect: remap → 1D LUT → 3D LUT → sharpen.
-        srcA_np = right eye source (left_src after shift swap).
-        srcB_np = left eye source (right_src after shift swap).
-        Same post-processing as _cuda_fused_process but uses equirect remap kernels."""
+        pix_dtype: np.uint8 for 8-bit, np.uint16 for 10-bit pipeline."""
         p = _cuda_persistent
-        # Reuse buffer allocation (cross buffers work for any source size)
-        _cuda_ensure_buffers(srcA_np, n_pixels)
+        _pix_max = np.int32(255 if pix_dtype == np.uint8 else 65535)
+        _cuda_ensure_buffers(srcA_np, n_pixels, pix_dtype)
 
         src_h_px, src_w_px = srcA_np.shape[:2]
         half_w = out_w
@@ -1372,35 +1375,33 @@ if HAS_NUMBA_CUDA:
         # ── Step 1: Remap both eyes ──
         src_w_f = float(src_w_px)
         src_h_f = float(src_h_px)
-        # Right eye (with RS if active)
         if rs_coeffs_np is not None:
             p['d_rs'].copy_to_device(rs_coeffs_np.astype(np.float32))
             _cuda_equirect_remap_rs_bilinear[grid_pix, _CUDA_BLOCK](
                 d_xyz_x, d_xyz_y, d_xyz_z,
                 p['d_R_A'], d_t_offset_right, p['d_rs'],
                 p['d_cross_A'], src_w_f, src_h_f,
-                p['d_out_A'], n_pixels)
+                p['d_out_A'], n_pixels, _pix_max)
         else:
             _cuda_equirect_remap_rot_bilinear[grid_pix, _CUDA_BLOCK](
                 d_xyz_x, d_xyz_y, d_xyz_z,
                 p['d_R_A'],
                 p['d_cross_A'], src_w_f, src_h_f,
-                p['d_out_A'], n_pixels)
-        # Left eye (no RS)
+                p['d_out_A'], n_pixels, _pix_max)
         _cuda_equirect_remap_rot_bilinear[grid_pix, _CUDA_BLOCK](
             d_xyz_x, d_xyz_y, d_xyz_z,
             p['d_R_B'],
             p['d_cross_B'], src_w_f, src_h_f,
-            p['d_out_B'], n_pixels)
+            p['d_out_B'], n_pixels, _pix_max)
 
-        # After remap: d_out_A = right eye, d_out_B = left eye (on GPU)
         cur_A, aux_A = p['d_out_A'], p['d_aux_A']
         cur_B, aux_B = p['d_out_B'], p['d_aux_B']
 
         # ── Step 2: 1D color LUT ──
         if color_1d_lut is not None:
-            if p['d_1d_lut'] is None:
-                p['d_1d_lut'] = _cuda.device_array(256, dtype=np.uint8)
+            _lut_len = len(color_1d_lut)
+            if p['d_1d_lut'] is None or p['d_1d_lut'].size != _lut_len:
+                p['d_1d_lut'] = _cuda.device_array(_lut_len, dtype=color_1d_lut.dtype)
             p['d_1d_lut'].copy_to_device(color_1d_lut)
             _cuda_apply_1d_lut_inplace[grid_elem, _CUDA_BLOCK](cur_A, p['d_1d_lut'], n_elems)
             _cuda_apply_1d_lut_inplace[grid_elem, _CUDA_BLOCK](cur_B, p['d_1d_lut'], n_elems)
@@ -1413,13 +1414,13 @@ if HAS_NUMBA_CUDA:
                 p['d_lut'] = _cuda.to_device(lut_3d.ravel().astype(np.float32))
                 p['lut_size'] = lut_elems
             if lut_intensity >= 0.99:
-                _cuda_apply_lut_3d_kernel[grid_pix, _CUDA_BLOCK](cur_A, p['d_lut'], aux_A, lut_size, n_pixels)
-                _cuda_apply_lut_3d_kernel[grid_pix, _CUDA_BLOCK](cur_B, p['d_lut'], aux_B, lut_size, n_pixels)
+                _cuda_apply_lut_3d_kernel[grid_pix, _CUDA_BLOCK](cur_A, p['d_lut'], aux_A, lut_size, n_pixels, _pix_max)
+                _cuda_apply_lut_3d_kernel[grid_pix, _CUDA_BLOCK](cur_B, p['d_lut'], aux_B, lut_size, n_pixels, _pix_max)
             else:
                 _cuda_apply_lut_3d_blend_kernel[grid_pix, _CUDA_BLOCK](
-                    cur_A, p['d_lut'], aux_A, lut_size, np.float32(lut_intensity), n_pixels)
+                    cur_A, p['d_lut'], aux_A, lut_size, np.float32(lut_intensity), n_pixels, _pix_max)
                 _cuda_apply_lut_3d_blend_kernel[grid_pix, _CUDA_BLOCK](
-                    cur_B, p['d_lut'], aux_B, lut_size, np.float32(lut_intensity), n_pixels)
+                    cur_B, p['d_lut'], aux_B, lut_size, np.float32(lut_intensity), n_pixels, _pix_max)
             cur_A, aux_A = aux_A, cur_A
             cur_B, aux_B = aux_B, cur_B
 
@@ -1433,24 +1434,24 @@ if HAS_NUMBA_CUDA:
             H = np.int32(out_h)
             W = np.int32(half_w)
             amt = np.float32(sharpen_amount)
-            _cuda_blur_h_kernel[grid_elem, _CUDA_BLOCK](cur_A, aux_A, p['d_sharpen_kernel'], K, H, W)
+            _cuda_blur_h_kernel[grid_elem, _CUDA_BLOCK](cur_A, aux_A, p['d_sharpen_kernel'], K, H, W, _pix_max)
             _cuda_blur_v_usm_kernel[grid_elem, _CUDA_BLOCK](
-                cur_A, aux_A, p['d_sharpen_lat'], p['d_final_A'], amt, p['d_sharpen_kernel'], K, H, W)
+                cur_A, aux_A, p['d_sharpen_lat'], p['d_final_A'], amt, p['d_sharpen_kernel'], K, H, W, _pix_max)
             cur_A = p['d_final_A']
-            _cuda_blur_h_kernel[grid_elem, _CUDA_BLOCK](cur_B, aux_B, p['d_sharpen_kernel'], K, H, W)
+            _cuda_blur_h_kernel[grid_elem, _CUDA_BLOCK](cur_B, aux_B, p['d_sharpen_kernel'], K, H, W, _pix_max)
             _cuda_blur_v_usm_kernel[grid_elem, _CUDA_BLOCK](
-                cur_B, aux_B, p['d_sharpen_lat'], p['d_final_B'], amt, p['d_sharpen_kernel'], K, H, W)
+                cur_B, aux_B, p['d_sharpen_lat'], p['d_final_B'], amt, p['d_sharpen_kernel'], K, H, W, _pix_max)
             cur_B = p['d_final_B']
 
         # ── Step 5: Single sync + download ──
         _cuda.synchronize()
 
-        if not hasattr(_cuda_fused_process_eq, '_host_A'):
-            _cuda_fused_process_eq._host_A = np.empty(n_elems, dtype=np.uint8)
-            _cuda_fused_process_eq._host_B = np.empty(n_elems, dtype=np.uint8)
+        if not hasattr(_cuda_fused_process_eq, '_host_A') or _cuda_fused_process_eq._host_A.dtype != pix_dtype:
+            _cuda_fused_process_eq._host_A = np.empty(n_elems, dtype=pix_dtype)
+            _cuda_fused_process_eq._host_B = np.empty(n_elems, dtype=pix_dtype)
         elif _cuda_fused_process_eq._host_A.size != n_elems:
-            _cuda_fused_process_eq._host_A = np.empty(n_elems, dtype=np.uint8)
-            _cuda_fused_process_eq._host_B = np.empty(n_elems, dtype=np.uint8)
+            _cuda_fused_process_eq._host_A = np.empty(n_elems, dtype=pix_dtype)
+            _cuda_fused_process_eq._host_B = np.empty(n_elems, dtype=pix_dtype)
 
         cur_A.copy_to_host(_cuda_fused_process_eq._host_A)
         cur_B.copy_to_host(_cuda_fused_process_eq._host_B)
@@ -1539,7 +1540,8 @@ if HAS_MLX:
         mx_f = metal::clamp(mx_f, -1.0f, 3935.0f);
         my_f = metal::clamp(my_f, -1.0f, 3935.0f);
 
-        // Step 5: Bilinear interpolation from cross image (3936×3936×3 BGR uint8)
+        // Step 5: Bilinear interpolation from cross image (3936×3936×3 BGR)
+        float pix_max = params[1];  // 255.0 for uint8, 65535.0 for uint16
         uint out_base = idx * 3;
         if (mx_f < 0.0f || my_f < 0.0f) {
             out[out_base] = 0; out[out_base + 1] = 0; out[out_base + 2] = 0;
@@ -1561,7 +1563,7 @@ if HAS_MLX:
             float v11 = (float)cross_img[(iy1 * cross_w + ix1) * 3 + c];
             float val = v00*(1.0f-fx)*(1.0f-fy) + v10*fx*(1.0f-fy)
                       + v01*(1.0f-fx)*fy + v11*fx*fy;
-            out[out_base + c] = (uint8_t)metal::clamp(val + 0.5f, 0.0f, 255.0f);
+            out[out_base + c] = (uint16_t)metal::clamp(val + 0.5f, 0.0f, pix_max);
         }
     '''
 
@@ -1594,7 +1596,8 @@ if HAS_MLX:
         float mx_f = metal::clamp((lon * INV_PI + 0.5f) * img_w, 0.0f, img_w - 1.0f);
         float my_f = metal::clamp((0.5f - lat * INV_PI) * img_h, 0.0f, img_h - 1.0f);
 
-        // Bilinear interpolation from source image (H × W × 3 BGR uint8)
+        // Bilinear interpolation from source image (H × W × 3 BGR)
+        float pix_max = img_dims[2];  // 255.0 for uint8, 65535.0 for uint16
         int iw = (int)img_w;
         int ix = (int)metal::floor(mx_f);
         int iy = (int)metal::floor(my_f);
@@ -1611,7 +1614,7 @@ if HAS_MLX:
             float v11 = (float)src_img[(iy1 * iw + ix1) * 3 + c];
             float val = v00*(1.0f-fx)*(1.0f-fy) + v10*fx*(1.0f-fy)
                       + v01*(1.0f-fx)*fy + v11*fx*fy;
-            out[out_base + c] = (uint8_t)metal::clamp(val + 0.5f, 0.0f, 255.0f);
+            out[out_base + c] = (uint16_t)metal::clamp(val + 0.5f, 0.0f, pix_max);
         }
     '''
 
@@ -1623,18 +1626,19 @@ if HAS_MLX:
     )
 
     def _mlx_process_eye_equirect(src_np, mlx_xyz_x, mlx_xyz_y, mlx_xyz_z,
-                                   R_np, n_pixels):
-        """Run equirect remap kernel for one eye (non-360 path). Returns flat uint8 array."""
+                                   R_np, n_pixels, pix_max=255.0):
+        """Run equirect remap kernel for one eye (non-360 path). pix_max: 255 for preview, 65535 for export."""
         mlx_R = mx.array(R_np.ravel().astype(np.float32))
         src_h, src_w = src_np.shape[:2]
-        mlx_dims = mx.array(np.array([float(src_w), float(src_h)], dtype=np.float32))
+        mlx_dims = mx.array(np.array([float(src_w), float(src_h), float(pix_max)], dtype=np.float32))
         mlx_src = mx.array(src_np.ravel())
         mlx_n = mx.array(np.array([n_pixels], dtype=np.int32))
+        _out_dtype = mx.uint16 if pix_max > 256 else mx.uint8
 
         outputs = _mlx_equirect_kernel(
             inputs=[mlx_xyz_x, mlx_xyz_y, mlx_xyz_z, mlx_R, mlx_dims, mlx_src, mlx_n],
             output_shapes=[(n_pixels * 3,)],
-            output_dtypes=[mx.uint8],
+            output_dtypes=[_out_dtype],
             grid=(n_pixels, 1, 1),
             threadgroup=(256, 1, 1),
         )
@@ -1644,35 +1648,33 @@ if HAS_MLX:
     # Preallocate constant MLX arrays (reused every frame)
     _mlx_identity_R = mx.array(np.eye(3, dtype=np.float32).ravel())
     _mlx_zero_rs = mx.array(np.zeros(3, dtype=np.float32))
-    _mlx_no_iori = mx.array(np.array([0.0], dtype=np.float32))
-    _mlx_yes_iori = mx.array(np.array([1.0], dtype=np.float32))
-
     def _mlx_process_eye(cross_np, mlx_xyz_x, mlx_xyz_y, mlx_xyz_z,
                          R_np, mlx_t_offset, rs_coeffs_np,
-                         R_cross_np, has_iori, n_pixels):
-        """Run fused Metal kernel for one eye. Returns (out_h, half_w, 3) uint8 numpy array."""
+                         R_cross_np, has_iori, n_pixels, pix_max=255.0):
+        """Run fused Metal kernel for one eye. pix_max: 255 for preview, 65535 for export."""
         mlx_R = mx.array(R_np.ravel().astype(np.float32))
         mlx_cross = mx.array(cross_np.ravel())
 
         if rs_coeffs_np is not None and np.any(rs_coeffs_np != 0):
             mlx_rs = mx.array(rs_coeffs_np.astype(np.float32))
         else:
-            mlx_rs = _mlx_zero_rs
+            mlx_rs = mx.array(np.zeros(3, dtype=np.float32))
 
+        iori_flag = 1.0 if (has_iori and R_cross_np is not None) else 0.0
         if has_iori and R_cross_np is not None:
             mlx_Rc = mx.array(R_cross_np.ravel().astype(np.float32))
-            mlx_params = _mlx_yes_iori
         else:
-            mlx_Rc = _mlx_identity_R
-            mlx_params = _mlx_no_iori
+            mlx_Rc = mx.array(np.eye(3, dtype=np.float32).ravel())
 
+        mlx_params = mx.array(np.array([iori_flag, float(pix_max)], dtype=np.float32))
         mlx_n = mx.array(np.array([n_pixels], dtype=np.int32))
+        _out_dtype = mx.uint16 if pix_max > 256 else mx.uint8
 
         outputs = _mlx_cross_kernel(
             inputs=[mlx_xyz_x, mlx_xyz_y, mlx_xyz_z, mlx_R, mlx_t_offset,
                     mlx_rs, mlx_Rc, mlx_params, mlx_cross, mlx_n],
             output_shapes=[(n_pixels * 3,)],
-            output_dtypes=[mx.uint8],
+            output_dtypes=[_out_dtype],
             grid=(n_pixels, 1, 1),
             threadgroup=(256, 1, 1),
         )
@@ -1686,6 +1688,7 @@ if HAS_MLX:
         uint base = idx * 3;
         float scale = params[0];
         int lut_size = (int)params[1];
+        float pix_max = params[2];  // 255.0 for uint8, 65535.0 for uint16
         int ls = lut_size;
         int ls2 = ls * ls;
 
@@ -1718,7 +1721,7 @@ if HAS_MLX:
             float c1v = c10 + (c11 - c10) * fg;
             float val = c0v + (c1v - c0v) * fb;
             int out_c = 2 - c;
-            out[base + out_c] = (uint8_t)metal::clamp(val * 255.0f + 0.5f, 0.0f, 255.0f);
+            out[base + out_c] = (uint16_t)metal::clamp(val * pix_max + 0.5f, 0.0f, pix_max);
         }
     '''
 
@@ -1729,20 +1732,119 @@ if HAS_MLX:
         source=_MLX_LUT3D_SOURCE,
     )
 
-    def _mlx_apply_lut_3d(frame_np, lut_flat_mlx, lut_size, n_pixels):
-        """Apply 3D LUT via Metal kernel. frame_np: (H,W,3) uint8 BGR. Returns same."""
+    def _mlx_apply_lut_3d(frame_np, lut_flat_mlx, lut_size, n_pixels, pix_max=255.0):
+        """Apply 3D LUT via Metal kernel. pix_max: 255 for preview, 65535 for export."""
         mlx_frame = mx.array(frame_np.ravel())
-        mlx_params = mx.array(np.array([(lut_size - 1) / 255.0, float(lut_size)], dtype=np.float32))
+        mlx_params = mx.array(np.array([(lut_size - 1) / float(pix_max), float(lut_size), float(pix_max)], dtype=np.float32))
         mlx_n = mx.array(np.array([n_pixels], dtype=np.int32))
+        _out_dtype = mx.uint16 if pix_max > 256 else mx.uint8
         outputs = _mlx_lut3d_kernel(
             inputs=[mlx_frame, lut_flat_mlx, mlx_params, mlx_n],
             output_shapes=[(n_pixels * 3,)],
-            output_dtypes=[mx.uint8],
+            output_dtypes=[_out_dtype],
             grid=(n_pixels, 1, 1),
             threadgroup=(256, 1, 1),
         )
         mx.eval(outputs[0])
         return np.array(outputs[0]).reshape(frame_np.shape)
+
+    # ── MLX Metal sharpen kernels (separable Gaussian blur + latitude-weighted USM) ──
+    _MLX_BLUR_H_SOURCE = '''
+        uint idx = thread_position_in_grid.x;
+        int total = (int)blur_dims[0];  // H * W * 3
+        if ((int)idx >= total) return;
+        int W = (int)blur_dims[1];
+        int K = (int)blur_dims[2];
+        int half_k = K / 2;
+        int c = idx % 3;
+        int pix = idx / 3;
+        int x = pix % W;
+        int y = pix / W;
+        float val = 0.0f;
+        for (int k = 0; k < K; k++) {
+            int sx = x + k - half_k;
+            if (sx < 0) sx = 0;
+            if (sx >= W) sx = W - 1;
+            val += (float)src[(y * W + sx) * 3 + c] * gkernel[k];
+        }
+        float pix_max = blur_dims[3];
+        dst[idx] = (uint16_t)metal::clamp(val + 0.5f, 0.0f, pix_max);
+    '''
+
+    _MLX_BLUR_V_USM_SOURCE = '''
+        uint idx = thread_position_in_grid.x;
+        int total = (int)blur_dims[0];  // H * W * 3
+        if ((int)idx >= total) return;
+        int W = (int)blur_dims[1];
+        int H = (int)blur_dims[2];
+        int K = (int)blur_dims[3];
+        int half_k = K / 2;
+        float amount = usm_params[0];
+        float pix_max = usm_params[1];
+        int c = idx % 3;
+        int pix = idx / 3;
+        int x = pix % W;
+        int y = pix / W;
+        float val = 0.0f;
+        for (int k = 0; k < K; k++) {
+            int sy = y + k - half_k;
+            if (sy < 0) sy = 0;
+            if (sy >= H) sy = H - 1;
+            val += (float)h_blurred[(sy * W + x) * 3 + c] * gkernel[k];
+        }
+        float f = (float)src[idx];
+        float w = lat_weights[y] * amount;
+        float result = f + w * (f - val);
+        dst[idx] = (uint16_t)metal::clamp(result + 0.5f, 0.0f, pix_max);
+    '''
+
+    _mlx_blur_h_kernel = _mlx_metal_kernel(
+        name="blur_horizontal",
+        input_names=["src", "gkernel", "blur_dims"],
+        output_names=["dst"],
+        source=_MLX_BLUR_H_SOURCE,
+    )
+
+    _mlx_blur_v_usm_kernel = _mlx_metal_kernel(
+        name="blur_v_usm",
+        input_names=["src", "h_blurred", "gkernel", "lat_weights", "usm_params", "blur_dims"],
+        output_names=["dst"],
+        source=_MLX_BLUR_V_USM_SOURCE,
+    )
+
+    def _mlx_sharpen(frame_np, g1d_np, lat_weights_np, amount, ksize, pix_max=65535.0):
+        """GPU-accelerated equirect-aware USM via MLX Metal: separable blur + latitude-weighted USM."""
+        h, w = frame_np.shape[:2]
+        n_elem = h * w * 3
+
+        mlx_src = mx.array(frame_np.ravel())
+        mlx_kernel = mx.array(g1d_np)
+        _out_dtype = mx.uint16 if pix_max > 256 else mx.uint8
+
+        # Pass 1: horizontal blur
+        mlx_dims_h = mx.array(np.array([n_elem, w, ksize, pix_max], dtype=np.float32))
+        h_out = _mlx_blur_h_kernel(
+            inputs=[mlx_src, mlx_kernel, mlx_dims_h],
+            output_shapes=[(n_elem,)],
+            output_dtypes=[_out_dtype],
+            grid=(n_elem, 1, 1),
+            threadgroup=(256, 1, 1),
+        )
+
+        # Pass 2: vertical blur on h_blurred + fused USM
+        mlx_lat = mx.array(lat_weights_np)
+        mlx_params = mx.array(np.array([amount, pix_max], dtype=np.float32))
+        mlx_dims_v = mx.array(np.array([n_elem, w, h, ksize], dtype=np.float32))
+        v_out = _mlx_blur_v_usm_kernel(
+            inputs=[mlx_src, h_out[0], mlx_kernel, mlx_lat, mlx_params, mlx_dims_v],
+            output_shapes=[(n_elem,)],
+            output_dtypes=[_out_dtype],
+            grid=(n_elem, 1, 1),
+            threadgroup=(256, 1, 1),
+        )
+        mx.eval(v_out[0])
+        return np.array(v_out[0]).reshape(frame_np.shape)
+
 
     print("  ✓ MLX Metal kernels compiled")
 
@@ -1868,7 +1970,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let v11 = read_byte(u32(iy1 * cross_w + ix1) * 3u + c);
         let val = v00*(1.0-fx)*(1.0-fy) + v10*fx*(1.0-fy)
                 + v01*(1.0-fx)*fy + v11*fx*fy;
-        out[out_base + c] = clamp(val + 0.5, 0.0, 255.0);
+        out[out_base + c] = clamp(val + 0.5, 0.0, 65535.0);
     }
 }
 """
@@ -1930,7 +2032,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let v11 = read_byte(u32(iy1 * iw + ix1) * 3u + c);
         let val = v00*(1.0-fx)*(1.0-fy) + v10*fx*(1.0-fy)
                 + v01*(1.0-fx)*fy + v11*fx*fy;
-        out[out_base + c] = clamp(val + 0.5, 0.0, 255.0);
+        out[out_base + c] = clamp(val + 0.5, 0.0, 65535.0);
     }
 }
 """
@@ -1990,7 +2092,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let val = v0 + (v1 - v0) * fb;
         // BGR->RGB swap: out channel = 2 - c
         let out_c = u32(2 - c);
-        out[base + out_c] = clamp(val * 255.0 + 0.5, 0.0, 255.0);
+        let pix_max = params[2];  // 255.0 for uint8, 65535.0 for uint16
+        out[base + out_c] = clamp(val * pix_max + 0.5, 0.0, pix_max);
     }
 }
 """
@@ -2137,10 +2240,12 @@ def _wgpu_process_eye(cross_np, xyz_x_buf, xyz_y_buf, xyz_z_buf,
     pass_enc.end()
     _wgpu_device.queue.submit([encoder.finish()])
 
-    # Readback
+    # Readback — detect dtype from cross input
+    _out_dtype = cross_np.dtype
+    _out_pm = 65535 if _out_dtype == np.uint16 else 255
     raw = _wgpu_device.queue.read_buffer(out_buf)
     result = np.frombuffer(raw, dtype=np.float32)[:n_pixels * 3]
-    return np.clip(result, 0, 255).astype(np.uint8)
+    return np.clip(result, 0, _out_pm).astype(_out_dtype)
 
 # ── wgpu persistent buffer pool for equirect remap (non-360) ──
 _wgpu_equirect_pool = None
@@ -2213,7 +2318,9 @@ def _wgpu_process_eye_equirect(src_np, xyz_x_buf, xyz_y_buf, xyz_z_buf,
 
     raw = _wgpu_device.queue.read_buffer(out_buf)
     result = np.frombuffer(raw, dtype=np.float32)[:n_pixels * 3]
-    return np.clip(result, 0, 255).astype(np.uint8)
+    _out_dtype = src_np.dtype
+    _out_pm = 65535 if _out_dtype == np.uint16 else 255
+    return np.clip(result, 0, _out_pm).astype(_out_dtype)
 
 # ── wgpu persistent buffer pool for LUT ──
 _wgpu_lut_pool = None
@@ -2238,7 +2345,7 @@ def _wgpu_apply_lut_3d(frame_np, lut_flat_np, lut_size, n_pixels):
                          usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
             'lut_buf': _wgpu_device.create_buffer(size=lut_bytes_needed,
                        usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
-            'params_buf': _wgpu_device.create_buffer(size=2*4,
+            'params_buf': _wgpu_device.create_buffer(size=3*4,
                           usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
             'n_buf': _wgpu_device.create_buffer(size=4,
                      usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
@@ -2267,8 +2374,9 @@ def _wgpu_apply_lut_3d(frame_np, lut_flat_np, lut_size, n_pixels):
     if pad:
         frame_bytes += b'\x00' * pad
     q.write_buffer(pool['frame_buf'], 0, frame_bytes)
+    _wgpu_pm = 65535.0 if frame_np.dtype == np.uint16 else 255.0
     q.write_buffer(pool['params_buf'], 0,
-                   np.array([(lut_size - 1) / 255.0, float(lut_size)], dtype=np.float32).tobytes())
+                   np.array([(lut_size - 1) / _wgpu_pm, float(lut_size), _wgpu_pm], dtype=np.float32).tobytes())
 
     # Dispatch
     encoder = _wgpu_device.create_command_encoder()
@@ -2285,7 +2393,8 @@ def _wgpu_apply_lut_3d(frame_np, lut_flat_np, lut_size, n_pixels):
 
     raw = _wgpu_device.queue.read_buffer(pool['out_buf'])
     result = np.frombuffer(raw, dtype=np.float32)[:n_pixels * 3]
-    return np.clip(result, 0, 255).astype(np.uint8).reshape(frame_np.shape)
+    _pm = 65535 if frame_np.dtype == np.uint16 else 255
+    return np.clip(result, 0, _pm).astype(frame_np.dtype).reshape(frame_np.shape)
 
 # Windows-specific flag to hide console windows
 def get_subprocess_flags():
@@ -4040,32 +4149,6 @@ class GyroStabilizer:
         }
 
 
-def _denoise_cross(cross, strength, mode):
-    """Single-frame spatial denoise on EAC cross (bilateral or NLM)."""
-    if strength <= 0:
-        return cross
-    if mode == "nlm":
-        return cv2.fastNlMeansDenoisingColored(
-            cross, None, float(strength), float(strength), 7, 21)
-    else:  # bilateral
-        return cv2.bilateralFilter(
-            cross, 7, float(strength), float(strength * 2))
-
-
-def _denoise_temporal(cross, prev_cross, strength):
-    """Temporal bilateral denoise: blend with previous frame weighted by
-    per-pixel color similarity. ~4ms per cross, no ghosting on motion."""
-    if prev_cross is None:
-        return cross.copy()
-    diff = np.abs(cross.astype(np.int16) - prev_cross.astype(np.int16))
-    motion = np.mean(diff, axis=2)  # (H, W)
-    sigma = max(1.0, float(strength) * 2.0)
-    weight = np.exp(-(motion * motion) / (2.0 * sigma * sigma))
-    weight = weight[:, :, np.newaxis].astype(np.float32)
-    alpha = np.float32(min(0.5, strength / 30.0))
-    blended = (cross.astype(np.float32) * (1.0 - weight * alpha)
-               + prev_cross.astype(np.float32) * weight * alpha)
-    return np.clip(blended, 0, 255).astype(np.uint8)
 
 
 def klns_forward(theta, klns):
@@ -4325,10 +4408,6 @@ class ProcessingConfig:
     # Equirectangular-aware sharpening
     sharpen_amount: float = 0.0  # Sharpening amount (0=off, 0.5=subtle, 1.0=moderate, 2.0=strong)
     sharpen_radius: float = 1.5  # Sharpening radius / sigma (0.5=fine detail, 3.0=coarse structure)
-    # Noise reduction
-    denoise_enabled: bool = False
-    denoise_strength: int = 10      # 0-50, controls filter strength
-    denoise_mode: str = "bilateral"  # "bilateral", "nlm", or "temporal"
     # Multi-segment GoPro recording
     segment_paths: Optional[list] = None  # List of segment file paths (GS01..., GS02..., etc.)
     upside_down: bool = False  # Camera mounted upside down: rotates output 180° and inverts gravity
@@ -5164,9 +5243,11 @@ class VideoProcessor(QThread):
                 except Exception as e:
                     self.status.emit(f"Warning: Failed to load LUT: {e}")
 
-            def build_color_1d_lut(lift, gamma, gain):
-                """Build a 256-entry 1D LUT for color adjustments. Applied via cv2.LUT = near instant."""
-                x = np.arange(256, dtype=np.float32) / 255.0
+            def build_color_1d_lut(lift, gamma, gain, bit_depth=8):
+                """Build 1D LUT for color adjustments. 256-entry uint8 for preview, 65536-entry uint16 for export."""
+                n_entries = 256 if bit_depth == 8 else 65536
+                pix_max = 255.0 if bit_depth == 8 else 65535.0
+                x = np.arange(n_entries, dtype=np.float32) / pix_max
                 if abs(lift) > 0.01:
                     x = x + lift * (1.0 - x)
                 if abs(gain - 1.0) > 0.01:
@@ -5174,12 +5255,15 @@ class VideoProcessor(QThread):
                 x = np.clip(x, 0.0, 1.0)
                 if abs(gamma - 1.0) > 0.01:
                     x = np.power(x, 1.0 / gamma)
-                return np.clip(x * 255.0, 0, 255).astype(np.uint8)
+                return np.clip(x * pix_max, 0, pix_max).astype(np.uint8 if bit_depth == 8 else np.uint16)
 
             def apply_color_1d(frame, lut_1d):
-                """Apply 1D color LUT via cv2.LUT - extremely fast."""
+                """Apply 1D color LUT via cv2.LUT (uint8) or direct indexing (uint16)."""
                 if lut_1d is None:
                     return frame
+                if frame.dtype == np.uint16:
+                    # cv2.LUT only supports uint8 src; for uint16 use direct numpy indexing
+                    return lut_1d[frame]
                 return cv2.LUT(frame, lut_1d)
 
             # Precompute MLX LUT array (persistent on GPU)
@@ -5201,14 +5285,15 @@ class VideoProcessor(QThread):
 
                 if HAS_MLX:
                     _prepare_mlx_lut(lut)
+                    _pm = 65535.0 if frame.dtype == np.uint16 else 255.0
                     if intensity < 1.0:
-                        result = _mlx_apply_lut_3d(frame, _mlx_lut_flat, lut_size, n_pixels)
+                        result = _mlx_apply_lut_3d(frame, _mlx_lut_flat, lut_size, n_pixels, pix_max=_pm)
                         orig_f = frame.astype(np.float32)
                         res_f = result.astype(np.float32)
                         blended = orig_f + (res_f - orig_f) * np.float32(intensity)
-                        return np.clip(blended, 0, 255).astype(np.uint8)
+                        return np.clip(blended, 0, _pm).astype(frame.dtype)
                     else:
-                        return _mlx_apply_lut_3d(frame, _mlx_lut_flat, lut_size, n_pixels)
+                        return _mlx_apply_lut_3d(frame, _mlx_lut_flat, lut_size, n_pixels, pix_max=_pm)
 
                 if HAS_NUMBA_CUDA:
                     result = _cuda_apply_lut_3d(frame, lut, lut_size)
@@ -5216,7 +5301,8 @@ class VideoProcessor(QThread):
                         orig_f = frame.astype(np.float32)
                         res_f = result.astype(np.float32)
                         blended = orig_f + (res_f - orig_f) * np.float32(intensity)
-                        return np.clip(blended, 0, 255).astype(np.uint8)
+                        _pm = 65535 if frame.dtype == np.uint16 else 255
+                        return np.clip(blended, 0, _pm).astype(frame.dtype)
                     return result
 
                 if HAS_WGPU and _wgpu_device is not None:
@@ -5225,21 +5311,24 @@ class VideoProcessor(QThread):
                         orig_f = frame.astype(np.float32)
                         res_f = result.astype(np.float32)
                         blended = orig_f + (res_f - orig_f) * np.float32(intensity)
-                        return np.clip(blended, 0, 255).astype(np.uint8)
+                        _pm = 65535 if frame.dtype == np.uint16 else 255
+                        return np.clip(blended, 0, _pm).astype(frame.dtype)
                     return result
 
                 if HAS_NUMBA:
                     out = np.empty_like(frame)
-                    _nb_apply_lut_3d(frame, lut, out, lut_size)
+                    _pix_max = 65535 if frame.dtype == np.uint16 else 255
+                    _nb_apply_lut_3d(frame, lut, out, lut_size, _pix_max)
                     if intensity < 1.0:
                         orig_f = frame.astype(np.float32)
                         res_f = out.astype(np.float32)
                         blended = orig_f + (res_f - orig_f) * np.float32(intensity)
-                        return np.clip(blended, 0, 255).astype(np.uint8)
+                        return np.clip(blended, 0, _pix_max).astype(frame.dtype)
                     return out
 
                 # Numpy fallback
-                img = frame.astype(np.float32) / 255.0
+                _pm_np = 65535.0 if frame.dtype == np.uint16 else 255.0
+                img = frame.astype(np.float32) / _pm_np
 
                 b_idx = np.clip(img[:, :, 0] * (lut_size - 1), 0, lut_size - 1.001)
                 g_idx = np.clip(img[:, :, 1] * (lut_size - 1), 0, lut_size - 1.001)
@@ -5270,22 +5359,7 @@ class VideoProcessor(QThread):
                     img_rgb = img[:, :, ::-1]
                     result_rgb = img_rgb + (result_rgb - img_rgb) * intensity
 
-                return np.clip(result_rgb[:, :, ::-1] * 255.0, 0, 255).astype(np.uint8)
-
-            # ── Noise reduction ──────────────────────────────────────────────
-            # Applied at EAC cross stage (before remap) for:
-            #   - Stereo consistency: both eyes get identical treatment
-            #   - VR-aware: denoise in native EAC pixel space, not warped equirect
-            #   - Before remap: Lanczos4 won't amplify noise into output
-            _denoise_enabled = cfg.denoise_enabled and cfg.denoise_strength > 0
-            _denoise_strength = cfg.denoise_strength
-            _denoise_mode = cfg.denoise_mode
-            _prev_crossA = [None]  # temporal denoise: previous frame history (mutable for closure)
-            _prev_crossB = [None]
-            _dn_result_B = [None]  # mutable container for thread return
-
-            if _denoise_enabled:
-                print(f"Denoise: {_denoise_mode} strength={_denoise_strength}")
+                return np.clip(result_rgb[:, :, ::-1] * _pm_np, 0, _pm_np).astype(frame.dtype)
 
             # ── Equirectangular-aware sharpening ────────────────────────────
             # CUDA (Windows/NVIDIA): full GPU separable blur + fused USM kernel
@@ -5297,6 +5371,7 @@ class VideoProcessor(QThread):
             _sharpen_blur_buf = None
             _sharpen_stack_ksize = 5
             _sharpen_use_cuda = False
+            _sharpen_use_mlx = False
             _cuda_sharpen_kernel_d = None
             _cuda_sharpen_lat_d = None
             _cuda_sharpen_temp_d = None
@@ -5307,6 +5382,10 @@ class VideoProcessor(QThread):
             _fused_sharpen_kernel = None
             _fused_sharpen_lat = None
             _fused_sharpen_ksize = 5
+            # For MLX Metal sharpen
+            _mlx_sharpen_g1d = None
+            _mlx_sharpen_lat = None
+            _mlx_sharpen_ksize = 5
             if _sharpen_enabled:
                 # Gaussian 1D kernel for separable blur
                 ksize = max(3, int(np.ceil(_sharpen_sigma * 6)) | 1)
@@ -5326,9 +5405,9 @@ class VideoProcessor(QThread):
                     n_elements = height * width * 3
                     _cuda_sharpen_kernel_d = _numba_cuda.to_device(g1d)
                     _cuda_sharpen_lat_d = _numba_cuda.to_device(lat_weights)
-                    _cuda_sharpen_temp_d = _numba_cuda.device_array(n_elements, dtype=np.uint8)
-                    _cuda_sharpen_out_d = _numba_cuda.device_array(n_elements, dtype=np.uint8)
-                    _cuda_sharpen_src_d = _numba_cuda.device_array(n_elements, dtype=np.uint8)
+                    _cuda_sharpen_temp_d = _numba_cuda.device_array(n_elements, dtype=np.uint16)
+                    _cuda_sharpen_out_d = _numba_cuda.device_array(n_elements, dtype=np.uint16)
+                    _cuda_sharpen_src_d = _numba_cuda.device_array(n_elements, dtype=np.uint16)
                     _cuda_sharpen_ksize = ksize
                     _sharpen_use_cuda = True
                     # Also store numpy arrays for fused pipeline
@@ -5337,27 +5416,37 @@ class VideoProcessor(QThread):
                     _fused_sharpen_ksize = ksize
                     print(f"  CUDA sharpening: sigma={_sharpen_sigma:.1f}, kernel={ksize}px, "
                           f"{height}x{width} ({n_elements//3} pixels)")
+                elif HAS_MLX:
+                    # MLX Metal GPU: separable blur + latitude-weighted USM
+                    _mlx_sharpen_g1d = g1d
+                    _mlx_sharpen_lat = lat_weights
+                    _mlx_sharpen_ksize = ksize
+                    _sharpen_use_mlx = True
+                    print(f"  MLX sharpening: sigma={_sharpen_sigma:.1f}, kernel={ksize}px, "
+                          f"{height}x{width}")
                 else:
-                    # CPU fallback: band-based approach
-                    N_BANDS = 4
-                    _sharpen_bands = []
-                    for b in range(N_BANDS):
-                        y0 = b * height // N_BANDS
-                        y1 = (b + 1) * height // N_BANDS
-                        y_center = (y0 + y1) / 2.0
-                        lat = (0.5 - y_center / height) * np.pi
-                        strength = float(np.cos(lat)) * _sharpen_amount
-                        strength = max(0.02, min(strength, 4.0))
-                        _sharpen_bands.append((y0, y1, strength))
-                    _sharpen_blur_buf = np.empty((height, width, 3), dtype=np.uint8)
+                    # CPU fallback: smooth per-row latitude-weighted USM
+                    _sharpen_bands = True  # flag: use smooth path
+                    # Precompute per-row sharpening weights based on latitude (cos falloff at poles)
+                    _row_centers = (np.arange(height, dtype=np.float32) + 0.5) / height
+                    _row_lat = (0.5 - _row_centers) * np.float32(np.pi)
+                    _sharpen_row_weights = np.clip(np.cos(_row_lat) * _sharpen_amount, 0.02, 4.0).astype(np.float32)
+                    # Reshape to (H, 1, 1) for broadcasting with (H, W, 3) frames
+                    _sharpen_row_weights = _sharpen_row_weights[:, np.newaxis, np.newaxis]
+                    _sharpen_blur_buf = np.empty((height, width, 3), dtype=np.uint16)
                     _sharpen_stack_ksize = max(3, int(np.sqrt(12 * _sharpen_sigma**2 + 1) + 0.5) | 1)
 
             _has_stack_blur = hasattr(cv2, 'stackBlur')
 
             def apply_equirect_sharpen(frame, bands):
-                """Equirectangular-aware USM. CUDA GPU on Windows, CPU on macOS."""
+                """Equirectangular-aware USM. CUDA/MLX GPU accelerated, CPU fallback."""
                 if not _sharpen_enabled:
                     return frame
+
+                if _sharpen_use_mlx:
+                    _pm = 65535.0 if frame.dtype == np.uint16 else 255.0
+                    return _mlx_sharpen(frame, _mlx_sharpen_g1d, _mlx_sharpen_lat,
+                                        _sharpen_amount, _mlx_sharpen_ksize, pix_max=_pm)
 
                 if _sharpen_use_cuda:
                     # Full GPU path: separable blur + fused USM (persistent buffers)
@@ -5366,30 +5455,35 @@ class VideoProcessor(QThread):
                     _cuda_sharpen_src_d.copy_to_device(np.ascontiguousarray(frame).ravel())
                     grid = (n_elem + _CUDA_BLOCK - 1) // _CUDA_BLOCK
                     # Pass 1: horizontal blur
+                    _pm = np.int32(65535 if frame.dtype == np.uint16 else 255)
                     _cuda_blur_h_kernel[grid, _CUDA_BLOCK](
                         _cuda_sharpen_src_d, _cuda_sharpen_temp_d, _cuda_sharpen_kernel_d,
-                        np.int32(_cuda_sharpen_ksize), np.int32(h_f), np.int32(w_f))
+                        np.int32(_cuda_sharpen_ksize), np.int32(h_f), np.int32(w_f), _pm)
                     # Pass 2: vertical blur + fused latitude USM
                     _cuda_blur_v_usm_kernel[grid, _CUDA_BLOCK](
                         _cuda_sharpen_src_d, _cuda_sharpen_temp_d, _cuda_sharpen_lat_d,
                         _cuda_sharpen_out_d, np.float32(_sharpen_amount),
                         _cuda_sharpen_kernel_d, np.int32(_cuda_sharpen_ksize),
-                        np.int32(h_f), np.int32(w_f))
+                        np.int32(h_f), np.int32(w_f), _pm)
                     _numba_cuda.synchronize()
                     return _cuda_sharpen_out_d.copy_to_host().reshape(h_f, w_f, 3)
 
-                # CPU fallback: stackBlur + band-based addWeighted
-                if bands is None:
+                # CPU fallback: smooth per-row latitude-weighted USM
+                if not bands:
                     return frame
+                # cv2.stackBlur/GaussianBlur may not handle uint16 correctly on all
+                # platforms — convert to float32 for blur to guarantee correctness.
+                frame_f = frame.astype(np.float32)
                 if _has_stack_blur:
-                    cv2.stackBlur(frame, (_sharpen_stack_ksize, _sharpen_stack_ksize),
-                                  dst=_sharpen_blur_buf)
+                    blurred = cv2.stackBlur(frame_f, (_sharpen_stack_ksize, _sharpen_stack_ksize))
                 else:
-                    cv2.GaussianBlur(frame, (0, 0), sigmaX=_sharpen_sigma, dst=_sharpen_blur_buf)
-                for y0, y1, a in bands:
-                    cv2.addWeighted(frame[y0:y1], 1.0 + a, _sharpen_blur_buf[y0:y1], -a, 0,
-                                    dst=frame[y0:y1])
-                return frame
+                    blurred = cv2.GaussianBlur(frame_f, (0, 0), sigmaX=_sharpen_sigma)
+                # Smooth USM: frame + weight * (frame - blur)
+                diff = frame_f - blurred
+                result = frame_f + _sharpen_row_weights * diff
+                _pm = 65535.0 if frame.dtype == np.uint16 else 255.0
+                np.clip(result, 0, _pm, out=result)
+                return result.astype(frame.dtype)
 
             # (Yaw/pitch remap is baked into per-frame rotation matrix R — no separate table needed)
 
@@ -5513,9 +5607,9 @@ class VideoProcessor(QThread):
             # via memoryview (eliminating tobytes() copy ~13ms/frame at 8K), and a third
             # buffer is free for the next frame. This allows full pipeline overlap.
             _result_bufs = [
-                np.empty((out_height, width, 3), dtype=np.uint8),
-                np.empty((out_height, width, 3), dtype=np.uint8),
-                np.empty((out_height, width, 3), dtype=np.uint8),
+                np.empty((out_height, width, 3), dtype=np.uint16),
+                np.empty((out_height, width, 3), dtype=np.uint16),
+                np.empty((out_height, width, 3), dtype=np.uint16),
             ]
             _result_buf_idx = 0
             result_buf = _result_bufs[0]
@@ -5523,8 +5617,8 @@ class VideoProcessor(QThread):
 
             # Pre-allocate cross assembly buffers (avoid 92MB allocation per frame)
             if cfg.is_360_input:
-                _cross_buf_A = np.zeros((3936, 3936, 3), dtype=np.uint8)
-                _cross_buf_B = np.zeros((3936, 3936, 3), dtype=np.uint8)
+                _cross_buf_A = np.zeros((3936, 3936, 3), dtype=np.uint16)
+                _cross_buf_B = np.zeros((3936, 3936, 3), dtype=np.uint16)
             else:
                 _cross_buf_A = _cross_buf_B = None
 
@@ -5830,8 +5924,8 @@ class VideoProcessor(QThread):
                 _emx_l = np.empty(_n_eq, dtype=np.float32)
                 _emy_l = np.empty(_n_eq, dtype=np.float32)
                 # Pre-allocate contiguous source buffers for GPU upload (avoids np.ascontiguousarray per frame)
-                _eq_src_buf_A = np.empty((out_height, half_w, 3), dtype=np.uint8)
-                _eq_src_buf_B = np.empty((out_height, half_w, 3), dtype=np.uint8)
+                _eq_src_buf_A = np.empty((out_height, half_w, 3), dtype=np.uint16)
+                _eq_src_buf_B = np.empty((out_height, half_w, 3), dtype=np.uint16)
                 _eq_src_flat_A = _eq_src_buf_A.ravel()  # flat view (zero copy, stays valid)
                 _eq_src_flat_B = _eq_src_buf_B.ravel()
                 # Pre-scale RS time map once (constant across all frames)
@@ -5875,31 +5969,6 @@ class VideoProcessor(QThread):
                     _t_crossB.join()
                     crossB = _cross_buf_B
 
-                    # ── Denoise crosses before remap (stereo-consistent, VR-native space) ──
-                    if _denoise_enabled:
-                        if _denoise_mode == "temporal":
-                            _dn_result_B[0] = None
-                            _pca = _prev_crossA[0]
-                            _pcb = _prev_crossB[0]
-                            def _dn_B_temporal(_cb=crossB, _pcb=_pcb):
-                                _dn_result_B[0] = _denoise_temporal(_cb, _pcb, _denoise_strength)
-                            _t_dnB = threading.Thread(target=_dn_B_temporal)
-                            _t_dnB.start()
-                            crossA = _denoise_temporal(crossA, _pca, _denoise_strength)
-                            _t_dnB.join()
-                            crossB = _dn_result_B[0]
-                            _prev_crossA[0] = crossA.copy()
-                            _prev_crossB[0] = crossB.copy()
-                        else:
-                            _dn_result_B[0] = None
-                            def _dn_B_spatial():
-                                _dn_result_B[0] = _denoise_cross(crossB, _denoise_strength, _denoise_mode)
-                            _t_dnB = threading.Thread(target=_dn_B_spatial)
-                            _t_dnB.start()
-                            crossA = _denoise_cross(crossA, _denoise_strength, _denoise_mode)
-                            _t_dnB.join()
-                            crossB = _dn_result_B[0]
-
                     if HAS_MLX:
                         # MLX Metal GPU: fused rotation+RS+IORI+cross+bilinear in one kernel
                         if rs_enabled and angular_vel is not None and rs_R_sensor_right is not None:
@@ -5916,19 +5985,19 @@ class VideoProcessor(QThread):
                             right_out = _mlx_process_eye(
                                 crossA, _mlx_xyz_x, _mlx_xyz_y, _mlx_xyz_z,
                                 rs_R_sensor_right, _mlx_t_offset, rs_c,
-                                rs_R_cross_right if has_Rc else None, has_Rc, _mlx_n_pixels)
+                                rs_R_cross_right if has_Rc else None, has_Rc, _mlx_n_pixels, pix_max=65535.0)
                         else:
                             # Right eye: no RS
                             right_out = _mlx_process_eye(
                                 crossA, _mlx_xyz_x, _mlx_xyz_y, _mlx_xyz_z,
                                 R_right_eye, _mlx_zero_t_offset, None,
-                                None, False, _mlx_n_pixels)
+                                None, False, _mlx_n_pixels, pix_max=65535.0)
                         result_buf[:, half_w:] = right_out.reshape(out_height, half_w, 3)
                         # Left eye: never has RS
                         left_out = _mlx_process_eye(
                             crossB, _mlx_xyz_x, _mlx_xyz_y, _mlx_xyz_z,
                             R_left_eye, _mlx_zero_t_offset, None,
-                            None, False, _mlx_n_pixels)
+                            None, False, _mlx_n_pixels, pix_max=65535.0)
                         result_buf[:, :half_w] = left_out.reshape(out_height, half_w, 3)
                     elif HAS_NUMBA_CUDA:
                         # Numba CUDA: fused GPU pipeline — remap + LUT + sharpen in one pass
@@ -5947,7 +6016,8 @@ class VideoProcessor(QThread):
                                 _cuda_n_pixels, out_height, half_w, result_buf,
                                 color_1d_lut, lut_3d, cfg.lut_intensity,
                                 _fused_sharpen_kernel, _fused_sharpen_lat,
-                                _sharpen_amount if _sharpen_enabled else 0.0, _fused_sharpen_ksize)
+                                _sharpen_amount if _sharpen_enabled else 0.0, _fused_sharpen_ksize,
+                                pix_dtype=np.uint16)
                         else:
                             _cuda_fused_process(
                                 crossA, crossB, _cuda_xyz_x, _cuda_xyz_y, _cuda_xyz_z,
@@ -5957,7 +6027,8 @@ class VideoProcessor(QThread):
                                 _cuda_n_pixels, out_height, half_w, result_buf,
                                 color_1d_lut, lut_3d, cfg.lut_intensity,
                                 _fused_sharpen_kernel, _fused_sharpen_lat,
-                                _sharpen_amount if _sharpen_enabled else 0.0, _fused_sharpen_ksize)
+                                _sharpen_amount if _sharpen_enabled else 0.0, _fused_sharpen_ksize,
+                                pix_dtype=np.uint16)
                         _cuda_fused_done = True
                     elif HAS_WGPU and _wgpu_out_buf is not None:
                         # wgpu cross-platform GPU: fused rotation+RS+IORI+cross+bilinear
@@ -6055,7 +6126,8 @@ class VideoProcessor(QThread):
                                 _cuda_n_pixels, out_height, half_w, result_buf,
                                 color_1d_lut, lut_3d, cfg.lut_intensity,
                                 _fused_sharpen_kernel, _fused_sharpen_lat,
-                                _sharpen_amount if _sharpen_enabled else 0.0, _fused_sharpen_ksize)
+                                _sharpen_amount if _sharpen_enabled else 0.0, _fused_sharpen_ksize,
+                                pix_dtype=np.uint16)
                         else:
                             _cuda_fused_process_eq(
                                 left_src, right_src, _cuda_xyz_x, _cuda_xyz_y, _cuda_xyz_z,
@@ -6065,7 +6137,8 @@ class VideoProcessor(QThread):
                                 _cuda_n_pixels, out_height, half_w, result_buf,
                                 color_1d_lut, lut_3d, cfg.lut_intensity,
                                 _fused_sharpen_kernel, _fused_sharpen_lat,
-                                _sharpen_amount if _sharpen_enabled else 0.0, _fused_sharpen_ksize)
+                                _sharpen_amount if _sharpen_enabled else 0.0, _fused_sharpen_ksize,
+                                pix_dtype=np.uint16)
                         _cuda_fused_done = True
                     elif _is_identity_R and not _has_rs:
                         # CPU fast path: no remap needed when rotation is identity and no RS
@@ -6148,11 +6221,17 @@ class VideoProcessor(QThread):
                                                                 cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
                                                                 borderValue=(0, 0, 0))
 
-                        # Run both eyes in parallel (numba releases GIL; cv2.remap also releases GIL)
-                        t_right = threading.Thread(target=_remap_right_eye_eq)
-                        t_right.start()
-                        _remap_left_eye_eq()
-                        t_right.join()
+                        if HAS_NUMBA:
+                            # Numba prange uses all cores — run sequentially to avoid
+                            # concurrent workqueue access crash
+                            _remap_right_eye_eq()
+                            _remap_left_eye_eq()
+                        else:
+                            # Pure numpy/cv2: run in parallel (both release GIL)
+                            t_right = threading.Thread(target=_remap_right_eye_eq)
+                            t_right.start()
+                            _remap_left_eye_eq()
+                            t_right.join()
 
                 # When CUDA fused pipeline handled remap+LUT+sharpen, skip CPU post-processing
                 if _cuda_fused_done:
@@ -6169,9 +6248,14 @@ class VideoProcessor(QThread):
 
                 # Apply circular edge mask per eye (after color/LUT)
                 if _eye_mask is not None:
-                    # Fast integer multiply: uint8→uint16 * uint16(0-256) >> 8 → uint8
-                    result[:, half_w:] = (result[:, half_w:].astype(np.uint16) * _eye_mask >> 8).astype(np.uint8)
-                    result[:, :half_w] = (result[:, :half_w].astype(np.uint16) * _eye_mask >> 8).astype(np.uint8)
+                    if result.dtype == np.uint16:
+                        # uint16: use uint32 intermediate to avoid overflow
+                        result[:, half_w:] = (result[:, half_w:].astype(np.uint32) * _eye_mask >> 8).astype(np.uint16)
+                        result[:, :half_w] = (result[:, :half_w].astype(np.uint32) * _eye_mask >> 8).astype(np.uint16)
+                    else:
+                        # Fast integer multiply: uint8→uint16 * uint16(0-256) >> 8 → uint8
+                        result[:, half_w:] = (result[:, half_w:].astype(np.uint16) * _eye_mask >> 8).astype(np.uint8)
+                        result[:, :half_w] = (result[:, :half_w].astype(np.uint16) * _eye_mask >> 8).astype(np.uint8)
                     if not result.flags['C_CONTIGUOUS']:
                         result = np.ascontiguousarray(result)
 
@@ -6187,7 +6271,7 @@ class VideoProcessor(QThread):
             has_color = abs(cfg.lift) > 0.01 or abs(cfg.gamma - 1.0) > 0.01 or abs(cfg.gain - 1.0) > 0.01
             if has_color:
                 self.status.emit("Building color adjustment lookup table...")
-                color_1d_lut = build_color_1d_lut(cfg.lift, cfg.gamma, cfg.gain)
+                color_1d_lut = build_color_1d_lut(cfg.lift, cfg.gamma, cfg.gain, bit_depth=16)
             else:
                 color_1d_lut = None
 
@@ -6220,7 +6304,7 @@ class VideoProcessor(QThread):
                     # Parallel non-360: crop one eye from SBS frame
                     cx, cy, cw, ch = crop_rect
                     cmd += ["-vf", f"crop={cw}:{ch}:{cx}:{cy}"]
-                cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-v", "quiet", "-"]
+                cmd += ["-f", "rawvideo", "-pix_fmt", "bgr48le", "-v", "quiet", "-"]
                 return cmd
 
             # For .360: use parallel decode (2 FFmpeg processes) to avoid slow vstack filter.
@@ -6317,10 +6401,13 @@ class VideoProcessor(QThread):
                                          cfg.use_bitrate, cfg.h265_bit_depth)
             elif output_codec == "prores":
                 profile_map = {"proxy": "0", "lt": "1", "standard": "2", "hq": "3", "4444": "4", "4444xq": "5"}
+                _prores_prof = profile_map.get(cfg.prores_profile, "3")
+                # ProRes 4444/4444XQ use yuv444p10le, others use yuv422p10le
+                _prores_pix = "yuv444p10le" if _prores_prof in ("4", "5") else "yuv422p10le"
                 if cfg.encoder_type == 'videotoolbox' and sys.platform == 'darwin':
-                    enc = ["-c:v", "prores_videotoolbox", "-profile:v", profile_map.get(cfg.prores_profile, "3")]
+                    enc = ["-c:v", "prores_videotoolbox", "-profile:v", _prores_prof, "-pix_fmt", _prores_pix]
                 else:
-                    enc = ["-c:v", "prores_ks", "-profile:v", profile_map.get(cfg.prores_profile, "3"), "-vendor", "apl0"]
+                    enc = ["-c:v", "prores_ks", "-profile:v", _prores_prof, "-vendor", "apl0", "-pix_fmt", _prores_pix]
             else:
                 enc = get_hw_encoder_args('h264', _enc_type, cfg.quality, cfg.bitrate,
                                          cfg.use_bitrate)
@@ -6361,7 +6448,7 @@ class VideoProcessor(QThread):
                 "-f", "rawvideo",
                 "-vcodec", "rawvideo",
                 "-s", f"{width}x{out_height}",
-                "-pix_fmt", "bgr24",
+                "-pix_fmt", "bgr48le",
                 "-r", str(fps),
                 "-i", "-",
             ] + audio_input_args + [
@@ -6392,7 +6479,7 @@ class VideoProcessor(QThread):
                 decode_w, decode_h = half_w, height  # each FFmpeg outputs one cropped eye
             else:
                 decode_w, decode_h = width, height
-            frame_size = decode_w * decode_h * 3  # BGR24
+            frame_size = decode_w * decode_h * 6  # BGR48LE (uint16, 3 channels × 2 bytes)
             frame_count = 0
             last_update_frame = 0
             import time
@@ -6637,22 +6724,22 @@ class VideoProcessor(QThread):
                         # Parallel .360 decode: raw_frame is (s0_bytes, s4_bytes) tuple.
                         # Pass pre-split arrays to process_frame_opencv to avoid ~11ms vstack copy.
                         raw_s0, raw_s4 = raw_frame
-                        _pre_s0 = np.frombuffer(raw_s0, dtype=np.uint8).reshape((1920, 5952, 3))
-                        _pre_s4 = np.frombuffer(raw_s4, dtype=np.uint8).reshape((1920, 5952, 3))
+                        _pre_s0 = np.frombuffer(raw_s0, dtype=np.uint16).reshape((1920, 5952, 3))
+                        _pre_s4 = np.frombuffer(raw_s4, dtype=np.uint16).reshape((1920, 5952, 3))
                         frame = None  # not used for .360 parallel path
                     elif use_parallel_sbs_decode and isinstance(raw_frame, tuple):
                         # Parallel SBS decode: raw_frame is (eyeA_bytes, eyeB_bytes)
                         # Each is already cropped to half_w × height by FFmpeg — contiguous!
                         raw_A, raw_B = raw_frame
                         # Use pre-allocated contiguous buffers (avoids per-frame allocation)
-                        np.copyto(_eq_src_buf_A, np.frombuffer(raw_A, dtype=np.uint8).reshape((decode_h, half_w, 3)))
-                        np.copyto(_eq_src_buf_B, np.frombuffer(raw_B, dtype=np.uint8).reshape((decode_h, half_w, 3)))
+                        np.copyto(_eq_src_buf_A, np.frombuffer(raw_A, dtype=np.uint16).reshape((decode_h, half_w, 3)))
+                        np.copyto(_eq_src_buf_B, np.frombuffer(raw_B, dtype=np.uint16).reshape((decode_h, half_w, 3)))
                         _dec_eye_pair = (_eq_src_buf_A, _eq_src_buf_B)
                         frame = None
                         _pre_s0 = None
                         _pre_s4 = None
                     else:
-                        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((decode_h, decode_w, 3))
+                        frame = np.frombuffer(raw_frame, dtype=np.uint16).reshape((decode_h, decode_w, 3))
                         _pre_s0 = None
                         _pre_s4 = None
                     # frombuffer is read-only but frame/s0/s4 are only used as remap source (read-only).
@@ -6742,7 +6829,13 @@ class VideoProcessor(QThread):
                     raise Exception("Encoding timed out during finalization")
 
                 if encode_proc.returncode != 0:
-                    raise Exception(f"Encoding failed (return code {encode_proc.returncode})")
+                    # Some encoders (e.g. ProRes on macOS) return non-zero even on success.
+                    # If the output file exists and has reasonable size, treat as success.
+                    _out_p = cfg.output_path
+                    if _out_p.exists() and _out_p.stat().st_size > 1024:
+                        print(f"Warning: encoder returned code {encode_proc.returncode} but output file looks valid")
+                    else:
+                        raise Exception(f"Encoding failed (return code {encode_proc.returncode})")
 
                 if pipeline_error[0]:
                     raise pipeline_error[0]
@@ -7740,15 +7833,6 @@ class VR180ProcessorGUI(QMainWindow):
         self.sharpen_radius_slider.valueChanged.connect(self._schedule_preview_update)
         output_layout.addWidget(self.sharpen_radius_slider, 11, 1)
 
-        # ── Noise reduction (hidden for now — feature not yet complete) ──
-        self.denoise_checkbox = QCheckBox("Denoise")
-        self.denoise_checkbox.setVisible(False)
-        self.denoise_strength_slider = SliderWithSpinBox(0, 50, 10, decimals=0, step=1, suffix="")
-        self.denoise_strength_slider.setVisible(False)
-        self.denoise_mode_combo = QComboBox()
-        self.denoise_mode_combo.addItems(["Bilateral (Fast)", "NLM (Quality)", "Temporal (Best)"])
-        self.denoise_mode_combo.setVisible(False)
-
         # Pre-LUT color adjustments (ASC CDL: Lift, Gamma, Gain)
         output_layout.addWidget(QLabel("Lift:"), 12, 0)
         self.lift_slider = SliderWithSpinBox(-100, 100, 0, decimals=0, step=1, suffix="")
@@ -8313,14 +8397,6 @@ class VR180ProcessorGUI(QMainWindow):
         Rebuilds stabilizer if it exists (adjustments are baked into correction), otherwise just updates preview."""
         if self._gyro_stabilizer is not None and self.config.gyro_data:
             self._rebuild_gyro_stabilizer()
-        self._schedule_preview_update()
-
-    def _on_denoise_toggled(self, state):
-        """Toggle denoise — enables/disables strength slider and mode combo."""
-        enabled = bool(state)
-        self.denoise_strength_slider.setEnabled(enabled)
-        self.denoise_mode_combo.setEnabled(enabled)
-        self.config.denoise_enabled = enabled
         self._schedule_preview_update()
 
     def _on_horizon_lock_toggled(self, checked):
@@ -8890,19 +8966,8 @@ class VR180ProcessorGUI(QMainWindow):
         # This avoids the parallax seam at the lens boundary and gives each eye
         # access to the full 184.5° FOV of its own lens.
         if is_360 and hasattr(self, 'cached_crossA') and hasattr(self, 'cached_crossB'):
-            # ── Denoise crosses for preview (spatial only; temporal needs frame history) ──
             _pv_crossA = self.cached_crossA
             _pv_crossB = self.cached_crossB
-            if self.config.denoise_enabled and self.config.denoise_strength > 0:
-                _dn_mode = self.config.denoise_mode
-                _dn_str = self.config.denoise_strength
-                if _dn_mode == "temporal":
-                    # Temporal has no frame history in single-frame preview → bilateral fallback
-                    _pv_crossA = _denoise_cross(_pv_crossA, _dn_str, "bilateral")
-                    _pv_crossB = _denoise_cross(_pv_crossB, _dn_str, "bilateral")
-                else:
-                    _pv_crossA = _denoise_cross(_pv_crossA, _dn_str, _dn_mode)
-                    _pv_crossB = _denoise_cross(_pv_crossB, _dn_str, _dn_mode)
 
             # Lazy-init precomputed grids + buffers for preview cross remap (same as render)
             if not hasattr(self, '_pv_xyz_x') or self._pv_dims != (h, half_w):
@@ -9309,15 +9374,12 @@ class VR180ProcessorGUI(QMainWindow):
             h_s, w_s = result.shape[:2]
             sk = max(3, int(np.sqrt(12 * sharpen_rad**2 + 1) + 0.5) | 1)
             blurred = cv2.stackBlur(result, (sk, sk)) if hasattr(cv2, 'stackBlur') else cv2.GaussianBlur(result, (0, 0), sigmaX=sharpen_rad)
-            N_BANDS = 4
-            for b in range(N_BANDS):
-                y0 = b * h_s // N_BANDS
-                y1 = (b + 1) * h_s // N_BANDS
-                lat = (0.5 - (y0 + y1) / 2.0 / h_s) * np.pi
-                a = float(np.cos(lat)) * sharpen_amt
-                a = max(0.02, min(a, 4.0))
-                cv2.addWeighted(result[y0:y1], 1.0 + a, blurred[y0:y1], -a, 0,
-                                dst=result[y0:y1])
+            # Smooth per-row latitude-weighted USM (no visible band boundaries)
+            _pv_rows = (np.arange(h_s, dtype=np.float32) + 0.5) / h_s
+            _pv_lat = (0.5 - _pv_rows) * np.float32(np.pi)
+            _pv_w = np.clip(np.cos(_pv_lat) * sharpen_amt, 0.02, 4.0).astype(np.float32)[:, np.newaxis, np.newaxis]
+            diff = result.astype(np.float32) - blurred.astype(np.float32)
+            result = np.clip(result.astype(np.float32) + _pv_w * diff, 0, 255).astype(np.uint8)
 
         # Apply circular edge mask per eye (after color/LUT)
         mask_size = self.mask_size_slider.value()
@@ -9628,9 +9690,6 @@ class VR180ProcessorGUI(QMainWindow):
             eac_out_h=self.config.eac_out_h,
             sharpen_amount=self.sharpen_slider.value() / 100.0,
             sharpen_radius=self.sharpen_radius_slider.value() / 10.0,
-            denoise_enabled=self.denoise_checkbox.isChecked(),
-            denoise_strength=self.denoise_strength_slider.value(),
-            denoise_mode=["bilateral", "nlm", "temporal"][self.denoise_mode_combo.currentIndex()],
             segment_paths=self.config.segment_paths,
             upside_down=self.upside_down_checkbox.isChecked())
         
@@ -9717,13 +9776,6 @@ class VR180ProcessorGUI(QMainWindow):
         self.sharpen_slider.setValue(self.settings.value("sharpen", 0, type=int))
         self.sharpen_radius_slider.setValue(self.settings.value("sharpen_radius", 15, type=int))
 
-        # Load denoise settings
-        _dn_enabled = self.settings.value("denoise_enabled", False, type=bool)
-        self.denoise_checkbox.setChecked(_dn_enabled)
-        self.denoise_strength_slider.setValue(self.settings.value("denoise_strength", 10, type=int))
-        self.denoise_mode_combo.setCurrentIndex(self.settings.value("denoise_mode_idx", 0, type=int))
-        self._on_denoise_toggled(self.denoise_checkbox.isChecked())
-
     def _save_settings(self):
         """Save current settings for next session"""
         # Save stereo offset values
@@ -9760,11 +9812,6 @@ class VR180ProcessorGUI(QMainWindow):
         self.settings.setValue("resolution_idx", self.resolution_combo.currentIndex())
         self.settings.setValue("sharpen", self.sharpen_slider.value())
         self.settings.setValue("sharpen_radius", self.sharpen_radius_slider.value())
-
-        # Save denoise settings
-        self.settings.setValue("denoise_enabled", self.denoise_checkbox.isChecked())
-        self.settings.setValue("denoise_strength", self.denoise_strength_slider.value())
-        self.settings.setValue("denoise_mode_idx", self.denoise_mode_combo.currentIndex())
 
     def dragEnterEvent(self, event):
         """Handle drag enter event - accept video files
