@@ -40,7 +40,7 @@ echo ""
 rm -rf build dist
 
 # Build with PyInstaller
-pyinstaller --clean vr180_processor.spec
+pyinstaller --clean vr180_silver_bullet.spec
 
 # Verify FFmpeg was bundled
 echo ""

@@ -1,35 +1,79 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-*.egg-info/
-dist/
+# Build artifacts
 build/
-*.egg
-
-# PyInstaller
-# *.spec (keep the spec file in version control)
-
-# Virtual environments
-venv/
-env/
-ENV/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.spec.bak
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
-
-# macOS
 .DS_Store
-*.app
 
-# Testing
-test_videos/
+# Video files
+*.360
 *.mp4
+*.MP4
 *.mov
-*.mkv
+*.MOV
+*.LRV
+*.osv
+*.CRM
+
+# Test/debug artifacts
+*.csv
+*.mp3
+*.jpg
+*.png
+debug_steps*/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.Python
+
+# Backup copies
+vr180_gui\ copy*.py
+vr180_gui_*.py
+vt_denoise.bak.*
+vt_denoise\ copy*
+
+# Test/analysis scripts
+analyse_*.py
+analyze_*.py
+test_*.py
+diag_*.py
+debug_*.py
+check_*.py
+compare_*.py
+imu_*.py
+gyro_*.py
+validate_*.py
+verify_*.py
+assemble_*.py
+show_*.py
+find_*.py
+gen_*.py
+export_360_data.py
+extract_rect_via_equirect.py
+full_pipeline.py
+output_sbs_fisheye.py
+reanalyze_geoc.py
+rs_test_pattern.html
+rs_analyse/
+
+# Distribution zips (not tracked, too large)
+*.zip
+
+# Claude memory / local settings
+memory/
+.claude/settings.local.json
+
+# Firmware / update files
+UPDATE/
+LABS_*

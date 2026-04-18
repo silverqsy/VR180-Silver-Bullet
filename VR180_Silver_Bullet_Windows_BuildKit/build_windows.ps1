@@ -77,7 +77,7 @@ Write-Host "Building application with PyInstaller..." -ForegroundColor Yellow
 Write-Host "This will take 3-5 minutes..." -ForegroundColor Yellow
 Write-Host ""
 
-python -m PyInstaller --clean vr180_processor.spec
+python -m PyInstaller --clean vr180_silver_bullet.spec
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""

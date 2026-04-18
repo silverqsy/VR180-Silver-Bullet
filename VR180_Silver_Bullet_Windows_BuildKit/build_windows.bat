@@ -75,7 +75,7 @@ for /f "tokens=*" %%i in ('where ffprobe') do set FFPROBE_EXE=%%i
 
 REM Build with PyInstaller - using python -m to ensure it's found
 echo Running PyInstaller...
-python -m PyInstaller --clean vr180_processor.spec
+python -m PyInstaller --clean vr180_silver_bullet.spec
 
 if %ERRORLEVEL% NEQ 0 (
     echo.
@@ -89,21 +89,21 @@ if %ERRORLEVEL% NEQ 0 (
 REM Verify FFmpeg was bundled
 echo.
 echo Verifying bundled files...
-if exist "dist\VR180Processor\ffmpeg.exe" (
+if exist "dist\VR180 Silver Bullet\ffmpeg.exe" (
     echo FFmpeg bundled successfully
-    for %%A in ("dist\VR180Processor\ffmpeg.exe") do echo   Size: %%~zA bytes
+    for %%A in ("dist\VR180 Silver Bullet\ffmpeg.exe") do echo   Size: %%~zA bytes
 ) else (
     echo Warning: FFmpeg may not have been bundled
     echo Manually copying FFmpeg...
-    if defined FFMPEG_EXE copy "%FFMPEG_EXE%" "dist\VR180Processor\"
+    if defined FFMPEG_EXE copy "%FFMPEG_EXE%" "dist\VR180 Silver Bullet\"
 )
 
-if exist "dist\VR180Processor\ffprobe.exe" (
+if exist "dist\VR180 Silver Bullet\ffprobe.exe" (
     echo FFprobe bundled successfully
 ) else (
     echo Warning: FFprobe may not have been bundled
     echo Manually copying FFprobe...
-    if defined FFPROBE_EXE copy "%FFPROBE_EXE%" "dist\VR180Processor\"
+    if defined FFPROBE_EXE copy "%FFPROBE_EXE%" "dist\VR180 Silver Bullet\"
 )
 
 echo.
@@ -111,17 +111,17 @@ echo ===================================================
 echo Build completed successfully!
 echo ===================================================
 echo.
-echo Application folder: dist\VR180Processor\
-echo Executable: dist\VR180Processor\VR180Processor.exe
+echo Application folder: dist\VR180 Silver Bullet\
+echo Executable: dist\VR180 Silver Bullet\VR180Processor.exe
 echo.
 echo This is a FULLY STANDALONE application.
 echo No FFmpeg installation required on target systems!
 echo.
 echo To distribute:
-echo   1. Compress the entire dist\VR180Processor\ folder
+echo   1. Compress the entire dist\VR180 Silver Bullet\ folder
 echo   2. Share the ZIP file
 echo.
 echo To test:
-echo   dist\VR180Processor\VR180Processor.exe
+echo   dist\VR180 Silver Bullet\VR180Processor.exe
 echo.
 pause
