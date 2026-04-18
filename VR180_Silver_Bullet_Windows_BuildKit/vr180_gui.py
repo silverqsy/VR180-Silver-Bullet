@@ -9239,7 +9239,7 @@ class VR180ProcessorGUI(QMainWindow):
         self._load_settings()
     
     def _init_ui(self):
-        self.setWindowTitle("VR180 Silver Bullet V1.0")
+        self.setWindowTitle("VR180 Silver Bullet V1.1")
         self.setMinimumSize(1400, 900)
         
         central_widget = QWidget()
