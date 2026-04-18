@@ -7408,6 +7408,41 @@ class VideoProcessor(QThread):
                     _use_gbrp = _is_hwaccel or ('yuv' in _src_fmt and '10' in _src_fmt)
                     _skipped = 0
                     _yielded = 0
+                    # Seek to nearest keyframe before the skip point instead of
+                    # decoding and discarding thousands of frames sequentially.
+                    # PyAV's seek goes to the keyframe AT or BEFORE the target
+                    # timestamp, so we still need to decode+discard the few
+                    # frames between the keyframe and the exact trim point.
+                    if skip_frames > 30:
+                        _seek_fps = float(target_stream.average_rate) if target_stream.average_rate else fps
+                        _seek_ts = (skip_frames - 2) / _seek_fps  # 2-frame safety margin
+                        container.seek(int(_seek_ts * 1_000_000), stream=target_stream)
+                        # After seek, count decoded frames from the seek point
+                        # to determine how many more to skip to reach exact trim
+                        _pre_skip_count = 0
+                        for _pre_frame in container.decode(target_stream):
+                            if _pre_frame is None or _pre_frame.pts is None:
+                                continue
+                            _pre_time = float(_pre_frame.pts * _pre_frame.time_base)
+                            _pre_frame_n = int(_pre_time * _seek_fps + 0.5)
+                            if _pre_frame_n >= skip_frames:
+                                # This is our first wanted frame — reformat and yield it
+                                if _use_gbrp:
+                                    _gbr = _pre_frame.reformat(format='gbrp16le').to_ndarray()
+                                    arr = _gbr[:, :, ::-1].copy()
+                                else:
+                                    arr = _pre_frame.to_ndarray(format='bgr48le')
+                                if crop_rect is not None:
+                                    cx, cy, cw, ch = crop_rect
+                                    arr = arr[cy:cy+ch, cx:cx+cw].copy()
+                                yield arr
+                                _yielded += 1
+                                _skipped = skip_frames  # mark skip as done
+                                break
+                            _pre_skip_count += 1
+                        if _skipped < skip_frames:
+                            _skipped = skip_frames  # seek landed past skip point
+                        print(f"[DECODE] Seeked to {_seek_ts:.2f}s, skipped {_pre_skip_count} post-seek frames")
                     for frame in container.decode(target_stream):
                         if self._cancelled:
                             break
@@ -10222,6 +10257,8 @@ class VR180ProcessorGUI(QMainWindow):
             QApplication.processEvents()
 
             if is_multi:
+                self.gopro_status.setText(f"Parsing gyro from {len(segments)} segments...")
+                QApplication.processEvents()
                 gyro_data = concatenate_gyro_data(segments)
             else:
                 gyro_data = parse_gopro_gyro_data(path)
@@ -10244,6 +10281,8 @@ class VR180ProcessorGUI(QMainWindow):
                 self.rs_no_firmware_checkbox.setChecked(False)
                 self.rs_no_firmware_checkbox.blockSignals(False)
             # Build stabilizer immediately for IORI compensation (even without gyro/RS enabled)
+            self.gopro_status.setText("Building gyro stabilizer...")
+            QApplication.processEvents()
             self._rebuild_gyro_stabilizer()
 
             self.gyro_stabilize_checkbox.setEnabled(True)
@@ -10277,6 +10316,8 @@ class VR180ProcessorGUI(QMainWindow):
                 self.gopro_status.setStyleSheet("QLabel { color: #009900; }")
 
             # Load 800Hz GYRO angular velocity for RS correction
+            self.gopro_status.setText("Loading 800Hz gyro for RS correction...")
+            QApplication.processEvents()
             try:
                 fps = gyro_data['fps']
                 if is_multi:
@@ -10304,6 +10345,8 @@ class VR180ProcessorGUI(QMainWindow):
                 print(f"Auto-set RS correction from SROT: {srot_ms:.3f} ms")
 
             # Auto-parse GEOC lens calibration for proper RS fisheye geometry
+            self.gopro_status.setText("Parsing lens calibration (GEOC)...")
+            QApplication.processEvents()
             # Use first segment (all segments from same camera have identical GEOC)
             geoc_path = segments[0] if is_multi else path
             try:
