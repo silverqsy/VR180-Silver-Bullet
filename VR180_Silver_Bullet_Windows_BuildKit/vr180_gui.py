@@ -12395,11 +12395,46 @@ class VR180ProcessorGUI(QMainWindow):
         super().closeEvent(event)
 
 
+_bt709_colorspace = None  # Cached NSColorSpace, loaded once
+
+def _setup_bt709_window_colorspace(window):
+    """Set the main NSWindow's color space to BT.709 for display-accurate preview."""
+    global _bt709_colorspace
+    if sys.platform != 'darwin':
+        return
+    try:
+        from AppKit import NSApplication, NSColorSpace
+        from Foundation import NSData
+        if _bt709_colorspace is None:
+            icc_path = '/System/Library/ColorSync/Profiles/ITU-709.icc'
+            if not os.path.exists(icc_path):
+                return
+            with open(icc_path, 'rb') as f:
+                icc_data = f.read()
+            ns_data = NSData.dataWithBytes_length_(icc_data, len(icc_data))
+            _bt709_colorspace = NSColorSpace.alloc().initWithICCProfileData_(ns_data)
+            if _bt709_colorspace is None:
+                return
+            print("[ColorMgmt] BT.709 NSColorSpace loaded")
+        for nswindow in NSApplication.sharedApplication().windows():
+            nswindow.setColorSpace_(_bt709_colorspace)
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[ColorMgmt] Failed: {e}")
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = VR180ProcessorGUI()
     window.show()
+    # Set BT.709 BEFORE the first paint event. window.show() creates the
+    # NSWindow synchronously but doesn't paint until app.exec() runs the
+    # event loop. By setting the color space here (no processEvents!),
+    # the very first paint is already under BT.709 — no sRGB widget cache
+    # is ever created, so there's nothing stale to flicker against.
+    _setup_bt709_window_colorspace(window)
     sys.exit(app.exec())
 
 if __name__ == "__main__":
