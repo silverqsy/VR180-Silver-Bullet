@@ -12395,48 +12395,11 @@ class VR180ProcessorGUI(QMainWindow):
         super().closeEvent(event)
 
 
-def _setup_bt709_window_colorspace():
-    """Set the main NSWindow's color space to BT.709 for display-accurate preview.
-
-    On macOS, Qt windows default to the display's native color space with no
-    color management. QuickTime Player tags its output as BT.709 and lets the
-    compositor convert to the display profile. By setting our window to the
-    same BT.709 color space, the macOS compositor applies the identical
-    GPU-accelerated transform — giving pixel-matched WYSIWYG preview with
-    zero per-frame CPU cost.
-    """
-    if sys.platform != 'darwin':
-        return
-    try:
-        from AppKit import NSApplication, NSColorSpace
-        from Foundation import NSData
-        icc_path = '/System/Library/ColorSync/Profiles/ITU-709.icc'
-        if not os.path.exists(icc_path):
-            print("[ColorMgmt] BT.709 ICC profile not found, skipping")
-            return
-        with open(icc_path, 'rb') as f:
-            icc_data = f.read()
-        ns_data = NSData.dataWithBytes_length_(icc_data, len(icc_data))
-        bt709_cs = NSColorSpace.alloc().initWithICCProfileData_(ns_data)
-        if bt709_cs is None:
-            print("[ColorMgmt] Failed to create BT.709 NSColorSpace")
-            return
-        for nswindow in NSApplication.sharedApplication().windows():
-            nswindow.setColorSpace_(bt709_cs)
-        print("[ColorMgmt] Window color space set to BT.709 (matches QuickTime)")
-    except ImportError:
-        print("[ColorMgmt] PyObjC not available, skipping color management")
-    except Exception as e:
-        print(f"[ColorMgmt] Failed to set window color space: {e}")
-
-
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = VR180ProcessorGUI()
     window.show()
-    app.processEvents()  # Ensure NSWindow is created before setting color space
-    _setup_bt709_window_colorspace()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
