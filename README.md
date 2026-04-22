@@ -36,7 +36,6 @@ A professional VR180 stereo video processor for the **GoPro Max 2 VR180 Mod**. C
 - .cube 3D LUT support with intensity control
 - ASC CDL: Lift, Gamma, Gain, Saturation
 - Bundled Recommended LUT for GoPro LOG (auto-loads for .360 input)
-- BT.709 color-managed preview matching QuickTime Player output (macOS)
 
 ### Output
 - H.265 10-bit (VideoToolbox / NVENC / libx265)
