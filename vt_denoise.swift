@@ -82,16 +82,39 @@ if pipeMode {
     let supportedFmts: [OSType] = VTTemporalNoiseFilterConfiguration.supportedSourcePixelFormats
     var targetFmt: OSType = supportedFmts.first!
     var targetBpc: Int = 0
+    // Prefer a FULL-range 10-bit format (GoPro .360 sources are pc/full-range).
+    // Using a video-range format would force VTPixelTransferSession to compress
+    // the full-range RGB input into 64..940 and expand back, shifting tones.
+    // Full-range formats have the suffix 'f' in their fourcc (e.g. 'xf20' for
+    // 420YpCbCr10BiPlanarFullRange; lossless-compressed variants follow the
+    // same naming). The lossless '&xv0' variant is video-range (undesirable).
+    func _is_full_range(_ fmt: OSType) -> Bool {
+        let b1 = UInt8((fmt >> 16) & 0xff)  // second fourcc byte
+        return b1 == UInt8(ascii: "f") || b1 == UInt8(ascii: "F")
+    }
+    // First pass: prefer 10-bit full-range
     for fmt in supportedFmts {
-        if let desc = CVPixelFormatDescriptionCreateWithPixelFormatType(kCFAllocatorDefault, fmt) {
-            var bpc: Int = 0
-            if let v = CFDictionaryGetValue(desc, Unmanaged.passUnretained(kCVPixelFormatBitsPerComponent).toOpaque()) {
-                bpc = Unmanaged<NSNumber>.fromOpaque(v).takeUnretainedValue().intValue
-            }
-            if bpc == 10 {
+        if let desc = CVPixelFormatDescriptionCreateWithPixelFormatType(kCFAllocatorDefault, fmt),
+           let v = CFDictionaryGetValue(desc, Unmanaged.passUnretained(kCVPixelFormatBitsPerComponent).toOpaque()) {
+            let bpc = Unmanaged<NSNumber>.fromOpaque(v).takeUnretainedValue().intValue
+            if bpc == 10 && _is_full_range(fmt) {
                 targetFmt = fmt
                 targetBpc = 10
                 break
+            }
+        }
+    }
+    // Fallback: any 10-bit (even video-range is better than 8-bit)
+    if targetBpc != 10 {
+        for fmt in supportedFmts {
+            if let desc = CVPixelFormatDescriptionCreateWithPixelFormatType(kCFAllocatorDefault, fmt),
+               let v = CFDictionaryGetValue(desc, Unmanaged.passUnretained(kCVPixelFormatBitsPerComponent).toOpaque()) {
+                let bpc = Unmanaged<NSNumber>.fromOpaque(v).takeUnretainedValue().intValue
+                if bpc == 10 {
+                    targetFmt = fmt
+                    targetBpc = 10
+                    break
+                }
             }
         }
     }
@@ -165,10 +188,13 @@ if pipeMode {
     // RGB → YCbCr when transferring into the lossless compressed format.
     // BT.709 video range matches HEVC main10 from GoPro MAX which is the
     // typical source piped through this helper.
-    CVBufferSetAttachment(ioPB, kCVImageBufferColorPrimariesKey,
-                          kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
-    CVBufferSetAttachment(ioPB, kCVImageBufferTransferFunctionKey,
-                          kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+    // Only tag the YCbCr matrix (needed for correct RGB↔YCbCr coefficient
+    // selection). Do NOT tag transfer function or primaries: if both source
+    // and destination have matching transfer tags, VTPixelTransferSession
+    // may still apply EOTF linearization → matrix → OETF round-trip, which
+    // is lossy at 10-bit and causes a systematic tone shift (darks lifted,
+    // highlights compressed). Leaving transfer untagged tells it to do a
+    // pure matrix conversion without gamma work.
     CVBufferSetAttachment(ioPB, kCVImageBufferYCbCrMatrixKey,
                           kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
 
@@ -191,6 +217,12 @@ if pipeMode {
     func poolBuffer() -> CVPixelBuffer? {
         var pb: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, compressedPool, &pb)
+        // Only tag the YCbCr matrix to match the I/O buffer; do not tag
+        // transfer function (see comment where ioPB is tagged).
+        if let pb {
+            CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
+                                  kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+        }
         return pb
     }
 

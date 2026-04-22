@@ -7315,16 +7315,26 @@ class VideoProcessor(QThread):
                     cmd += ["-t", str(t)]
                 cmd += ["-threads", str(min(os.cpu_count() or 4, 8)),
                         "-i", str(input_path)]
+                # Filter chain: force swscale to expand from tv-range to
+                # pc-range, then format to gbrp16le for the correct BT.709
+                # matrix. Without in_range=tv:out_range=pc, swscale keeps the
+                # YUV→RGB output in video range (4096..60160 in 16-bit),
+                # shifting tones vs PyAV's full-range output (measured diff:
+                # darks +1000, highlights -4000 on GS030192.360).
+                # Despite the source being tagged color_range=pc, swscale
+                # treats the actual YUV samples as tv-range and needs the
+                # explicit expansion hint to match PyAV's behavior.
+                _rng_fmt = "scale=in_range=tv:out_range=pc,format=gbrp16le"
                 if stream_index is not None:
-                    # Parallel .360: decode a single stream directly (no vstack filter)
-                    cmd += ["-map", f"0:{stream_index}"]
+                    cmd += ["-map", f"0:{stream_index}", "-vf", _rng_fmt]
                 elif cfg.is_360_input:
-                    eac_raw_filter = FrameExtractor.EAC_RAW_FILTER + "[out]"
+                    eac_raw_filter = FrameExtractor.EAC_RAW_FILTER + f",{_rng_fmt}[out]"
                     cmd += ["-filter_complex", eac_raw_filter, "-map", "[out]"]
                 elif crop_rect is not None:
-                    # Parallel non-360: crop one eye from SBS frame
                     cx, cy, cw, ch = crop_rect
-                    cmd += ["-vf", f"crop={cw}:{ch}:{cx}:{cy}"]
+                    cmd += ["-vf", f"crop={cw}:{ch}:{cx}:{cy},{_rng_fmt}"]
+                else:
+                    cmd += ["-vf", _rng_fmt]
                 cmd += ["-f", "rawvideo", "-pix_fmt", "bgr48le", "-v", "quiet", "-"]
                 return cmd
 
@@ -7408,45 +7418,46 @@ class VideoProcessor(QThread):
                     _use_gbrp = _is_hwaccel or ('yuv' in _src_fmt and '10' in _src_fmt)
                     _skipped = 0
                     _yielded = 0
-                    # Seek to nearest keyframe before the skip point instead of
-                    # decoding and discarding thousands of frames sequentially.
-                    # PyAV's seek goes to the keyframe AT or BEFORE the target
-                    # timestamp, so we still need to decode+discard the few
-                    # frames between the keyframe and the exact trim point.
-                    if skip_frames > 30:
-                        _seek_fps = float(target_stream.average_rate) if target_stream.average_rate else fps
-                        _seek_ts = (skip_frames - 2) / _seek_fps  # 2-frame safety margin
-                        container.seek(int(_seek_ts * 1_000_000), stream=target_stream)
-                        # After seek, count decoded frames from the seek point
-                        # to determine how many more to skip to reach exact trim
-                        _pre_skip_count = 0
-                        for _pre_frame in container.decode(target_stream):
-                            if _pre_frame is None or _pre_frame.pts is None:
-                                continue
-                            _pre_time = float(_pre_frame.pts * _pre_frame.time_base)
-                            _pre_frame_n = int(_pre_time * _seek_fps + 0.5)
-                            if _pre_frame_n >= skip_frames:
-                                # This is our first wanted frame — reformat and yield it
-                                if _use_gbrp:
-                                    _gbr = _pre_frame.reformat(format='gbrp16le').to_ndarray()
-                                    arr = _gbr[:, :, ::-1].copy()
-                                else:
-                                    arr = _pre_frame.to_ndarray(format='bgr48le')
-                                if crop_rect is not None:
-                                    cx, cy, cw, ch = crop_rect
-                                    arr = arr[cy:cy+ch, cx:cx+cw].copy()
-                                yield arr
-                                _yielded += 1
-                                _skipped = skip_frames  # mark skip as done
-                                break
-                            _pre_skip_count += 1
-                        if _skipped < skip_frames:
-                            _skipped = skip_frames  # seek landed past skip point
-                        print(f"[DECODE] Seeked to {_seek_ts:.2f}s, skipped {_pre_skip_count} post-seek frames")
+                    # Fast seek for deep trims: jump to the nearest keyframe at
+                    # or before the target frame, then discard the few frames
+                    # between the keyframe and the exact trim point by PTS.
+                    # Threshold of 60 frames balances seek overhead vs the cost
+                    # of decoding + discarding each frame (~7-15ms each).
+                    _target_pts_sec = None
+                    if skip_frames > 60:
+                        target_ts = skip_frames / fps
+                        # Seek 0.5s before target to give keyframe headroom.
+                        seek_ts = max(0.0, target_ts - 0.5)
+                        # PyAV: passing stream= expects offset in stream's
+                        # time_base units; omitting stream uses AV_TIME_BASE
+                        # (microseconds). Use the latter to avoid unit confusion.
+                        try:
+                            container.seek(int(seek_ts * 1_000_000),
+                                           any_frame=False, backward=True)
+                            _target_pts_sec = target_ts
+                            print(f"[DECODE] Seeked to {seek_ts:.2f}s "
+                                  f"(trim at frame {skip_frames}, ts={target_ts:.2f}s)")
+                        except Exception as _seek_err:
+                            print(f"[DECODE] seek failed ({_seek_err}), "
+                                  f"falling back to sequential skip")
+                            _target_pts_sec = None
                     for frame in container.decode(target_stream):
                         if self._cancelled:
                             break
-                        if _skipped < skip_frames:
+                        if _target_pts_sec is not None:
+                            # Post-seek PTS filter: skip frames before the
+                            # exact trim point (seek landed at earlier keyframe).
+                            if frame is None or frame.pts is None:
+                                continue
+                            _f_ts = float(frame.pts * frame.time_base)
+                            if _f_ts < _target_pts_sec - (0.5 / fps):
+                                continue
+                            # Reached target — stop filtering by PTS, mark
+                            # the counter-based skip as also consumed so
+                            # the elif branch below never fires.
+                            _target_pts_sec = None
+                            _skipped = skip_frames
+                        elif _skipped < skip_frames:
                             _skipped += 1
                             continue
                         if _use_gbrp:
@@ -7616,19 +7627,9 @@ class VideoProcessor(QThread):
                     _denoise_will_run = os.path.isfile(_vt_path)
 
             _effective_h265_bit_depth = cfg.h265_bit_depth
-            if _denoise_will_run and output_codec == "h265" and _effective_h265_bit_depth > 8:
-                print(f"⚠ Denoise is active — overriding H.265 output to 8-bit. "
-                      f"vt_denoise truncates the working buffer to 8 bits internally, "
-                      f"so 10-bit encoding would only waste bitrate (256 distinct "
-                      f"levels per channel instead of 1024).")
-                self.status.emit("Denoise active → H.265 output forced to 8-bit")
-                _effective_h265_bit_depth = 8
-            elif _denoise_will_run and output_codec == "prores":
-                print(f"⚠ Denoise is active with ProRes output. ProRes has no 8-bit "
-                      f"profile, so the file will still be written in 10-bit yuv422p10le "
-                      f"(or yuv444p10le for 4444/4444XQ), but the pixel data carries only "
-                      f"~8 bits of real precision because vt_denoise truncates internally.")
-                self.status.emit("Denoise active → ProRes still 10-bit, but only ~8-bit real precision")
+            # vt_denoise now uses kCVPixelFormatType_64RGBALE (16-bit host-endian
+            # RGB) for lossless 10-bit round-trip, so no bit-depth downgrade is
+            # needed when denoise is active.
 
             # Determine encoder settings using selected encoder type
             if output_codec == "h265":
@@ -7686,28 +7687,20 @@ class VideoProcessor(QThread):
                     pix_fmt_args = ["-pix_fmt", "yuv420p"]
             else:
                 pix_fmt_args = []
-            # Preserve input color space tags in output.
-            # Default to BT.709 when source tags are missing (GoPro .360 always
-            # records BT.709 but some containers omit the tags).
-            _out_trc = _src_color_trc or "bt709"
-            _out_primaries = _src_color_primaries or "bt709"
-            _out_space = _src_color_space or "bt709"
-            _out_range = _src_color_range or "pc"
-            # hevc_videotoolbox and prores_videotoolbox/prores_ks all drop the
-            # -color_trc / -color_primaries / -colorspace flags. The workaround
-            # that works for all three is the `setparams` video filter, which
-            # stamps the tags onto AVFrames before the encoder — both VT (via
-            # the VUI) and ProRes (via frame header) propagate them correctly.
-            _color_vf = (f"setparams=range={_out_range}"
-                         f":color_primaries={_out_primaries}"
-                         f":color_trc={_out_trc}"
-                         f":colorspace={_out_space}")
-            _color_args = ["-color_range", _out_range,
-                           "-colorspace", _out_space,
-                           "-color_trc", _out_trc,
-                           "-color_primaries", _out_primaries]
-            # Tell FFmpeg the raw input color range matches the source
-            _raw_input_color = ["-color_range", _out_range]
+            # Color space: intentionally leave transfer/primaries untagged.
+            # Mac players default to BT.709 for HEVC (correct), while Windows
+            # and Quest treat untagged as passthrough (also correct — avoids
+            # unwanted BT.709 EOTF application that shifts colors on those
+            # platforms). Only pass through color_range and colorspace (matrix
+            # coefficients) which are needed for correct YUV↔RGB conversion.
+            _color_args = []
+            if _src_color_range:
+                _color_args += ["-color_range", _src_color_range]
+            if _src_color_space:
+                _color_args += ["-colorspace", _src_color_space]
+            _raw_input_color = []
+            if _src_color_range:
+                _raw_input_color += ["-color_range", _src_color_range]
 
             # ── MV-HEVC direct-encode path ───────────────────────────────
             # When the user picks "Vision Pro MV-HEVC" the bytes that would
@@ -7771,7 +7764,6 @@ class VideoProcessor(QThread):
                     "-i", "-",
                 ] + audio_input_args + [
                     "-map", "0:v",
-                    "-vf", _color_vf,
                     "-f", "mov"
                 ] + pix_fmt_args + _color_args + audio_args + enc + [str(cfg.output_path)]
 
@@ -8198,8 +8190,69 @@ class VideoProcessor(QThread):
                                 proc_B.wait()
                                 t_B.join(timeout=5)
 
+                    def _decode_sbs_denoise():
+                        """Decode full SBS frame via FFmpeg, pipe through vt_denoise, crop eyes."""
+                        vt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vt_denoise')
+                        cx_a, cy_a, cw_a, ch_a = _sbs_crop_A
+                        cx_b, cy_b, cw_b, ch_b = _sbs_crop_B
+                        _dn_frame_size = width * height * 6  # full SBS BGR48LE
+                        for seg_idx in range(len(decode_segment_list)):
+                            if self._cancelled:
+                                break
+                            seg_info = decode_segment_list[seg_idx]
+                            seg_path = seg_info[1]
+                            local_ss = seg_info[2]
+                            local_t = seg_info[3]
+                            _seg_max = _seg_max_frames[seg_idx]
+                            if _seg_max is not None and _seg_max <= 0:
+                                continue
+                            # Full SBS frame (no crop) — FFmpeg -ss/-t handles trim
+                            _dn_cmd = _build_decode_cmd(seg_path, local_ss, local_t)
+                            ffmpeg_proc = subprocess.Popen(_dn_cmd, stdout=subprocess.PIPE,
+                                                            stderr=subprocess.DEVNULL,
+                                                            creationflags=get_subprocess_flags())
+                            denoise_proc = subprocess.Popen(
+                                [vt_path, '--pipe', '--width', str(width), '--height', str(height),
+                                 '--strength', str(cfg.denoise_strength)],
+                                stdin=ffmpeg_proc.stdout, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+                            ffmpeg_proc.stdout.close()
+                            try:
+                                _queued = 0
+                                while not self._cancelled:
+                                    raw = denoise_proc.stdout.read(_dn_frame_size)
+                                    if len(raw) < _dn_frame_size:
+                                        break
+                                    if _seg_max is not None and _queued >= _seg_max:
+                                        break
+                                    full = np.frombuffer(raw, dtype=np.uint16).reshape((height, width, 3))
+                                    arr_A = full[cy_a:cy_a+ch_a, cx_a:cx_a+cw_a].copy()
+                                    arr_B = full[cy_b:cy_b+ch_b, cx_b:cx_b+cw_b].copy()
+                                    decode_queue.put((arr_A, arr_B))
+                                    _queued += 1
+                            finally:
+                                denoise_proc.stdout.close()
+                                for p in [denoise_proc, ffmpeg_proc]:
+                                    try: p.wait(timeout=5)
+                                    except: pass
+
+                    _use_sbs_denoise = (sys.platform == 'darwin' and cfg.denoise_strength > 0.01
+                                        and not cfg.is_360_input
+                                        and os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vt_denoise')))
                     try:
-                        if HAS_AV:
+                        if _use_sbs_denoise:
+                            try:
+                                print(f"[DECODE] Using vt_denoise pipe for SBS (strength={cfg.denoise_strength:.2f})")
+                                _decode_tag_ref[0] = "VT Denoise"
+                                _decode_sbs_denoise()
+                            except Exception as _dn_err:
+                                print(f"⚠ vt_denoise failed ({_dn_err}), falling back")
+                                _decode_tag_ref[0] = "PyAV (fallback)"
+                                if HAS_AV:
+                                    _decode_sbs_pyav()
+                                else:
+                                    _decode_sbs_subprocess()
+                        elif HAS_AV:
                             try:
                                 print("[DECODE] Using PyAV for SBS parallel decode")
                                 _decode_sbs_pyav()
@@ -9242,13 +9295,250 @@ class IntSliderWithSpinBox(QWidget):
         self.valueChanged.emit(value)
 
 
+class DenoisePreviewWorker(QThread):
+    """Extract N consecutive frames around a timestamp, pipe them through
+    vt_denoise, and emit the middle denoised frame. This gives a real WYSIWYG
+    preview of temporal denoise (which needs past + future frames to work).
+
+    For .360: denoises s0 and s4 streams separately (matches export), then
+    assembles lens crosses + remaps to equirect. Emits (frame, crossA, crossB).
+    For SBS: denoises full SBS frames. Emits (frame, None, None)."""
+    frame_ready = pyqtSignal(object)  # (rgb uint16, crossA or None, crossB or None)
+    error = pyqtSignal(str)
+
+    N_FRAMES = 7  # window size; filter uses prev=1, next=2 so 7 gives headroom
+
+    def __init__(self, video_path, timestamp, fps, strength, is_360, eac_out_w, eac_out_h):
+        super().__init__()
+        self.video_path = str(video_path)
+        self.timestamp = float(timestamp)
+        self.fps = float(fps)
+        self.strength = float(strength)
+        self.is_360 = bool(is_360)
+        self.eac_out_w = int(eac_out_w)
+        self.eac_out_h = int(eac_out_h)
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            self._do_work()
+        except Exception as e:
+            if not self._cancelled:
+                import traceback
+                traceback.print_exc()
+                self.error.emit(str(e))
+
+    def _do_work(self):
+        if not HAS_AV:
+            self.error.emit("PyAV not available")
+            return
+        vt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vt_denoise')
+        if not os.path.isfile(vt_path):
+            self.error.emit("vt_denoise helper not found")
+            return
+        self._vt_path = vt_path
+
+        start_ts = max(0.0, self.timestamp - 3.0 / self.fps)
+        if self.is_360:
+            self._do_work_360(start_ts)
+        else:
+            self._do_work_sbs(start_ts)
+
+    def _pipe_through_vt(self, frames_rgb):
+        """Pipe a list of RGB uint16 frames through vt_denoise and return the
+        middle denoised frame (as RGB uint16). Returns None on failure."""
+        if not frames_rgb:
+            return None
+        h, w = frames_rgb[0].shape[:2]
+        raw_parts = [np.ascontiguousarray(f[:, :, ::-1]).tobytes() for f in frames_rgb]
+        raw_in = b''.join(raw_parts)
+        proc = subprocess.Popen(
+            [self._vt_path, '--pipe', '--width', str(w), '--height', str(h),
+             '--strength', str(self.strength)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        try:
+            out, _ = proc.communicate(raw_in, timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return None
+        frame_size = w * h * 6
+        n_out = len(out) // frame_size
+        if n_out == 0:
+            return None
+        mid_idx = min(n_out // 2, n_out - 1)
+        mid_start = mid_idx * frame_size
+        mid_bgr = np.frombuffer(out[mid_start:mid_start + frame_size],
+                                 dtype='<u2').reshape(h, w, 3)
+        return np.ascontiguousarray(mid_bgr[:, :, ::-1])
+
+    def _do_work_sbs(self, start_ts):
+        frames = self._extract_n_sbs_frames(start_ts)
+        if self._cancelled or not frames:
+            self.error.emit("No frames extracted")
+            return
+        out_frame = self._pipe_through_vt(frames)
+        if out_frame is None:
+            self.error.emit("vt_denoise produced no output")
+            return
+        print(f"[DenoisePreview SBS] {len(frames)} in, 1 mid out, "
+              f"shape={out_frame.shape}")
+        if not self._cancelled:
+            self.frame_ready.emit((out_frame, None, None))
+
+    def _do_work_360(self, start_ts):
+        """Extract N s0 + N s4 frames, denoise each stream separately (matches
+        export), assemble lens crosses from the middle pair, remap to equirect."""
+        s0_frames, s4_frames = self._extract_n_360_streams(start_ts)
+        if self._cancelled:
+            return
+        if not s0_frames or not s4_frames:
+            self.error.emit("Could not extract .360 frame pairs")
+            return
+        # Match lengths by trimming to shorter
+        n = min(len(s0_frames), len(s4_frames))
+        s0_frames = s0_frames[:n]
+        s4_frames = s4_frames[:n]
+        # Denoise each stream separately
+        s0_mid = self._pipe_through_vt(s0_frames)
+        if self._cancelled:
+            return
+        s4_mid = self._pipe_through_vt(s4_frames)
+        if self._cancelled:
+            return
+        if s0_mid is None or s4_mid is None:
+            self.error.emit("vt_denoise pipe failed")
+            return
+        # Assemble crosses from denoised middle pair
+        crossA = FrameExtractor._assemble_lensA(s0_mid, s4_mid)
+        crossB = FrameExtractor._assemble_lensB(s0_mid, s4_mid)
+        combined = np.zeros((3936 + 2 + 3936, 3936, 3), dtype=np.uint16)
+        combined[:3936] = crossA
+        combined[3938:] = crossB
+        map_x, map_y = FrameExtractor._get_eac_remap_tables(
+            self.eac_out_w, self.eac_out_h)
+        eq = cv2.remap(combined, map_x, map_y, cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        print(f"[DenoisePreview 360] {n} s0+s4 frame pairs denoised, "
+              f"crosses assembled, equirect shape={eq.shape}")
+        if not self._cancelled:
+            self.frame_ready.emit((eq, crossA, crossB))
+
+    def _extract_n_sbs_frames(self, start_ts):
+        """Extract N consecutive full SBS frames starting at start_ts."""
+        import av
+        container = None
+        if sys.platform == 'darwin':
+            try:
+                from av.codec.hwaccel import HWAccel
+                _hw = HWAccel(device_type='videotoolbox', allow_software_fallback=True)
+                container = av.open(self.video_path, hwaccel=_hw)
+            except Exception:
+                container = None
+        if container is None:
+            container = av.open(self.video_path)
+        out_frames = []
+        try:
+            try:
+                container.seek(int(start_ts * 1_000_000))
+            except Exception:
+                pass
+            vs = container.streams.video[0]
+            vs.thread_type = 'AUTO'
+            # Force gbrp16le workaround when 10-bit or hwaccel is active.
+            _src_fmt = vs.codec_context.pix_fmt or ''
+            _is_hwaccel = bool(getattr(vs.codec_context, 'is_hwaccel', False))
+            _use_gbrp = _is_hwaccel or ('yuv' in _src_fmt and '10' in _src_fmt)
+            collected = 0
+            for frame in container.decode(vs):
+                if self._cancelled:
+                    return out_frames
+                if frame is None or frame.pts is None:
+                    continue
+                frame_time = float(frame.pts * frame.time_base)
+                if frame_time < start_ts - 0.001:
+                    continue
+                if _use_gbrp:
+                    _rgb = frame.reformat(format='gbrp16le').to_ndarray()
+                else:
+                    # bgr48le → flip to RGB to match gbrp16le output
+                    _rgb = frame.reformat(format='bgr48le').to_ndarray()[:, :, ::-1].copy()
+                out_frames.append(_rgb)
+                collected += 1
+                if collected >= self.N_FRAMES:
+                    break
+            return out_frames
+        finally:
+            try: container.close()
+            except Exception: pass
+
+    def _extract_n_360_streams(self, start_ts):
+        """Extract N consecutive s0 + N consecutive s4 frames. Returns
+        (s0_list, s4_list) as raw RGB uint16 ndarrays (unstitched, 5952x1920)."""
+        import av
+        container = None
+        if sys.platform == 'darwin':
+            try:
+                from av.codec.hwaccel import HWAccel
+                _hw = HWAccel(device_type='videotoolbox', allow_software_fallback=True)
+                container = av.open(self.video_path, hwaccel=_hw)
+            except Exception:
+                container = None
+        if container is None:
+            container = av.open(self.video_path)
+        s0_list = []
+        s4_list = []
+        try:
+            try:
+                container.seek(int(start_ts * 1_000_000))
+            except Exception:
+                pass
+            if len(container.streams.video) < 2:
+                return s0_list, s4_list
+            vs0 = container.streams.video[0]
+            vs1 = container.streams.video[1]
+            vs0.thread_type = 'AUTO'
+            vs1.thread_type = 'AUTO'
+            _vs0_index = vs0.index
+            _vs1_index = vs1.index
+            for packet in container.demux(vs0, vs1):
+                if self._cancelled:
+                    return s0_list, s4_list
+                _idx = packet.stream.index if packet.stream is not None else -1
+                slot = 0 if _idx == _vs0_index else (1 if _idx == _vs1_index else -1)
+                if slot < 0:
+                    continue
+                for frame in packet.decode():
+                    if frame is None or frame.pts is None:
+                        continue
+                    ftime = float(frame.pts * frame.time_base)
+                    if ftime < start_ts - 0.001:
+                        continue
+                    rgb = frame.reformat(format='gbrp16le').to_ndarray()
+                    if slot == 0 and len(s0_list) < self.N_FRAMES:
+                        s0_list.append(rgb)
+                    elif slot == 1 and len(s4_list) < self.N_FRAMES:
+                        s4_list.append(rgb)
+                    if len(s0_list) >= self.N_FRAMES and len(s4_list) >= self.N_FRAMES:
+                        return s0_list, s4_list
+            return s0_list, s4_list
+        finally:
+            try: container.close()
+            except Exception: pass
+
+
 class VR180ProcessorGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.config = ProcessingConfig()
         self.original_frame = None
         self.cached_raw_frame = None  # Cache unprocessed frame for instant adjustments
+        self.cached_raw_frame_pristine = None  # Pre-denoise copy for fast restore
         self.cached_timestamp = None  # Timestamp of cached frame
+        self._denoise_preview_worker = None  # DenoisePreviewWorker instance
         self._gyro_stabilizer = None  # GyroStabilizer instance for preview
         self.video_duration = 0.0
         self.preview_timestamp = 0.0
@@ -9264,6 +9554,11 @@ class VR180ProcessorGUI(QMainWindow):
         self.preview_timer = QTimer()
         self.preview_timer.setSingleShot(True)
         self.preview_timer.timeout.connect(self._on_preview_timer)
+        # Denoise preview debounce timer — avoids firing the worker on every
+        # intermediate slider value during drag. Fires 400ms after last change.
+        self.denoise_timer = QTimer()
+        self.denoise_timer.setSingleShot(True)
+        self.denoise_timer.timeout.connect(self._request_denoise_preview)
 
         # Enable drag and drop
         self.setAcceptDrops(True)
@@ -9745,19 +10040,18 @@ class VR180ProcessorGUI(QMainWindow):
         output_layout.addWidget(self.resolution_label, 9, 0)
         output_layout.addWidget(self.resolution_combo, 9, 1)
 
-        # Temporal denoise (VideoToolbox, macOS 26+ only)
-        output_layout.addWidget(QLabel("Denoise:"), 10, 0)
+        # Temporal denoise (VideoToolbox, macOS 26+ only — hidden on Windows)
         self.denoise_slider = SliderWithSpinBox(0, 100, 0, decimals=0, step=1, suffix="%")
-        self.denoise_slider.setToolTip(
-            "VideoToolbox temporal noise filter (macOS 26+).\n"
-            "Uses past & future frames for hardware-accelerated noise reduction.\n"
-            "0% = off, 50% = moderate, 100% = maximum.\n"
-            "Applied before all other processing for best quality."
-        )
-        if sys.platform != 'darwin':
-            self.denoise_slider.setEnabled(False)
-            self.denoise_slider.setToolTip("Temporal denoise requires macOS 26+")
-        output_layout.addWidget(self.denoise_slider, 10, 1)
+        if sys.platform == 'darwin':
+            self._denoise_label = QLabel("Denoise:")
+            output_layout.addWidget(self._denoise_label, 10, 0)
+            self.denoise_slider.setToolTip(
+                "VideoToolbox temporal noise filter (macOS 26+).\n"
+                "Uses past & future frames for hardware-accelerated noise reduction.\n"
+                "0% = off, 50% = moderate, 100% = maximum.\n"
+                "Applied before all other processing for best quality."
+            )
+            output_layout.addWidget(self.denoise_slider, 10, 1)
 
         # Equirectangular-aware sharpening
         output_layout.addWidget(QLabel("Sharpen:"), 11, 0)
@@ -9972,6 +10266,12 @@ class VR180ProcessorGUI(QMainWindow):
         self.mask_feather_slider.slider.sliderReleased.connect(self._schedule_preview_update)
         self.mask_feather_slider.spinbox.valueChanged.connect(lambda: self._schedule_preview_update())
         self.mask_feather_slider.reset_btn.clicked.connect(self._schedule_preview_update)
+        # Denoise preview: triggered via debounced timer (400ms) so scrubbing
+        # the slider doesn't kick off the 1-3s worker for every intermediate
+        # value — only fires once the user settles.
+        if sys.platform == 'darwin':
+            self.denoise_slider.valueChanged.connect(lambda _v: self.denoise_timer.start(400))
+            self.denoise_slider.reset_btn.clicked.connect(lambda: self.denoise_timer.start(400))
         self.vision_pro_combo.currentIndexChanged.connect(self._update_vision_pro_mode)
         self.eye_toggle_btn.clicked.connect(self._toggle_eye)
         self.preview_mode_combo.currentIndexChanged.connect(self._update_preview_mode_ui)
@@ -10371,6 +10671,23 @@ class VR180ProcessorGUI(QMainWindow):
                 print(f"GEOC parse warning: {geoc_err}")
 
             self.status_bar.showMessage(f"Auto-loaded gyro data from .360{seg_info}: {len(frames)} frames")
+            # Restore final gopro_status (was overwritten by loading step messages)
+            if gyro_data.get('cori_is_vqf'):
+                bias = gyro_data.get('gyro_bias_deg_s', (0,0,0))
+                self.gopro_status.setText(
+                    f"Auto-loaded from .360{seg_info}: {len(frames)} frames ({duration:.1f}s)\n"
+                    f"No firmware RS detected — RS (1,1,1) both eyes\n"
+                    f"Gyro bias: [{bias[0]:.3f}, {bias[1]:.3f}, {bias[2]:.3f}] deg/s"
+                )
+                self.gopro_status.setStyleSheet("QLabel { color: #cc6600; }")
+            else:
+                self.gopro_status.setText(
+                    f"Auto-loaded from .360{seg_info}: {len(frames)} frames ({duration:.1f}s)\n"
+                    f"CORI range: R[{min(cori_rolls):.1f}°,{max(cori_rolls):.1f}°] "
+                    f"P[{min(cori_pitches):.1f}°,{max(cori_pitches):.1f}°] "
+                    f"Y[{min(cori_yaws):.1f}°,{max(cori_yaws):.1f}°]"
+                )
+                self.gopro_status.setStyleSheet("QLabel { color: #009900; }")
             self._schedule_preview_update()
 
         except Exception as e:
@@ -10859,13 +11176,83 @@ class VR180ProcessorGUI(QMainWindow):
     def _on_raw_frame_extracted(self, frame):
         """Callback when raw frame is extracted - cache it and apply filters"""
         self.cached_raw_frame = frame
+        self.cached_raw_frame_pristine = frame  # undenoised reference
         self.cached_timestamp = self.preview_timestamp
         # Cache individual crosses for .360 per-eye remap (avoids lens mixing at boundary)
         if self.config.is_360_input and hasattr(self, 'extractor') and hasattr(self.extractor, 'crossA'):
             self.cached_crossA = self.extractor.crossA
             self.cached_crossB = self.extractor.crossB
+            self.cached_crossA_pristine = self.extractor.crossA
+            self.cached_crossB_pristine = self.extractor.crossB
         self.status_bar.showMessage(f"Frame loaded - adjustments are now instant")
         self._apply_preview_filters_to_cached_frame()
+        # Auto-trigger denoise preview if slider is already non-zero
+        if getattr(self, 'denoise_slider', None) is not None:
+            if self.denoise_slider.value() > 0 and sys.platform == 'darwin':
+                self._request_denoise_preview()
+
+    def _request_denoise_preview(self):
+        """Run vt_denoise on a 7-frame window around the current timestamp
+        and use the middle denoised frame as the cached preview frame.
+        Triggered on denoise slider release (not during drag)."""
+        if sys.platform != 'darwin':
+            return
+        if not self.config.input_path or self.cached_raw_frame_pristine is None:
+            return
+        strength = self.denoise_slider.value() / 100.0
+        if strength <= 0.01:
+            # Denoise off — restore pristine frame (and crosses for .360)
+            self.cached_raw_frame = self.cached_raw_frame_pristine
+            if hasattr(self, 'cached_crossA_pristine'):
+                self.cached_crossA = self.cached_crossA_pristine
+                self.cached_crossB = self.cached_crossB_pristine
+            self._apply_preview_filters_to_cached_frame()
+            self.status_bar.showMessage("Denoise off (preview restored)")
+            return
+        # Kill any previous worker so slider spam doesn't stack up
+        if hasattr(self, '_denoise_preview_worker') and self._denoise_preview_worker is not None:
+            try:
+                self._denoise_preview_worker.cancel()
+                self._denoise_preview_worker.wait(500)
+            except Exception:
+                pass
+        # Resolve which segment file to seek into (multi-segment aware)
+        input_path, local_ts = self._resolve_segment_timestamp(self.preview_timestamp)
+        fps = 30.0
+        try:
+            if self.config.gyro_data and self.config.gyro_data.get('fps'):
+                fps = float(self.config.gyro_data['fps'])
+        except Exception:
+            pass
+        self._denoise_preview_worker = DenoisePreviewWorker(
+            video_path=input_path, timestamp=local_ts, fps=fps,
+            strength=strength, is_360=self.config.is_360_input,
+            eac_out_w=self.config.eac_out_w, eac_out_h=self.config.eac_out_h,
+        )
+        self._denoise_preview_worker.frame_ready.connect(self._on_denoise_preview_ready)
+        self._denoise_preview_worker.error.connect(self._on_denoise_preview_error)
+        self.status_bar.showMessage(f"Denoising preview at strength {strength:.2f}...")
+        self._denoise_preview_worker.start()
+
+    def _on_denoise_preview_ready(self, payload):
+        # payload is (frame_rgb, crossA_or_None, crossB_or_None)
+        frame_rgb, crossA, crossB = payload
+        self.cached_raw_frame = frame_rgb
+        # For .360: also replace cached crosses so the per-eye remap in the
+        # filter pipeline uses denoised data (it bypasses cached_raw_frame
+        # and reads crossA/B directly).
+        if crossA is not None and crossB is not None:
+            self.cached_crossA = crossA
+            self.cached_crossB = crossB
+        self._apply_preview_filters_to_cached_frame()
+        self.status_bar.showMessage("Denoise preview updated")
+
+    def _on_denoise_preview_error(self, msg):
+        self.status_bar.showMessage(f"Denoise preview error: {msg}")
+        # Fall back to pristine preview on error
+        if self.cached_raw_frame_pristine is not None:
+            self.cached_raw_frame = self.cached_raw_frame_pristine
+            self._apply_preview_filters_to_cached_frame()
 
     def _apply_preview_filters_to_cached_frame(self):
         """Apply adjustments to cached frame using OpenCV (instant preview)"""
@@ -12438,46 +12825,11 @@ class VR180ProcessorGUI(QMainWindow):
         super().closeEvent(event)
 
 
-_bt709_colorspace = None  # Cached NSColorSpace, loaded once
-
-def _setup_bt709_window_colorspace(window):
-    """Set the main NSWindow's color space to BT.709 for display-accurate preview."""
-    global _bt709_colorspace
-    if sys.platform != 'darwin':
-        return
-    try:
-        from AppKit import NSApplication, NSColorSpace
-        from Foundation import NSData
-        if _bt709_colorspace is None:
-            icc_path = '/System/Library/ColorSync/Profiles/ITU-709.icc'
-            if not os.path.exists(icc_path):
-                return
-            with open(icc_path, 'rb') as f:
-                icc_data = f.read()
-            ns_data = NSData.dataWithBytes_length_(icc_data, len(icc_data))
-            _bt709_colorspace = NSColorSpace.alloc().initWithICCProfileData_(ns_data)
-            if _bt709_colorspace is None:
-                return
-            print("[ColorMgmt] BT.709 NSColorSpace loaded")
-        for nswindow in NSApplication.sharedApplication().windows():
-            nswindow.setColorSpace_(_bt709_colorspace)
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"[ColorMgmt] Failed: {e}")
-
-
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = VR180ProcessorGUI()
     window.show()
-    # Set BT.709 BEFORE the first paint event. window.show() creates the
-    # NSWindow synchronously but doesn't paint until app.exec() runs the
-    # event loop. By setting the color space here (no processEvents!),
-    # the very first paint is already under BT.709 — no sRGB widget cache
-    # is ever created, so there's nothing stale to flicker against.
-    _setup_bt709_window_colorspace(window)
     sys.exit(app.exec())
 
 if __name__ == "__main__":
