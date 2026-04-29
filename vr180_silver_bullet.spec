@@ -11,26 +11,20 @@ block_cipher = None
 IS_WINDOWS = sys.platform == 'win32'
 IS_MACOS = sys.platform == 'darwin'
 
-# Collect SciPy — only the submodules we actually use (scipy.ndimage.gaussian_filter1d)
+# SciPy was previously bundled but is no longer used (gaussian_filter1d
+# was imported but never called). Removed to reduce bundle size by ~50 MB.
 scipy_datas = []
 scipy_binaries = []
 scipy_hiddenimports = []
-for _scipy_mod in ['scipy', 'scipy._lib', 'scipy.ndimage']:
-    try:
-        tmp_datas, tmp_binaries, tmp_hiddenimports = collect_all(_scipy_mod)
-        scipy_datas += tmp_datas
-        scipy_binaries += tmp_binaries
-        scipy_hiddenimports += tmp_hiddenimports
-    except Exception:
-        pass
-print(f"✓ Collected SciPy (targeted): {len(scipy_binaries)} binaries, {len(scipy_datas)} data files")
 
 # Collect MLX (macOS only — Apple Silicon GPU acceleration)
 mlx_datas = []
 mlx_binaries = []
 mlx_hiddenimports = []
 if IS_MACOS:
-    for _mlx_mod in ['mlx', 'mlx.core', 'mlx.core.fast', 'mlx.nn']:
+    # Note: mlx.nn / mlx.utils are NOT collected — we use mlx.core + mlx.core.fast
+    # only (custom Metal kernels). mlx.nn pulls in the neural-net helpers (~few MB).
+    for _mlx_mod in ['mlx', 'mlx.core', 'mlx.core.fast']:
         try:
             tmp_datas, tmp_binaries, tmp_hiddenimports = collect_all(_mlx_mod)
             mlx_datas += tmp_datas
@@ -201,12 +195,6 @@ a = Analysis(
         'numpy._core._methods',
         'numpy._core.multiarray',
         'numpy._core._multiarray_umath',
-        'scipy',
-        'scipy.ndimage',
-        'scipy.ndimage._filters',
-        'scipy.ndimage._interpolation',
-        'scipy._lib',
-        'scipy._lib.messagestream',
         'spatialmedia',
         'spatialmedia.metadata_utils',
         'spatialmedia.mpeg',
@@ -225,7 +213,7 @@ a = Analysis(
         'av.container',
         'parse_gyro_raw',
         'pyvqf',
-    ] + (['mlx', 'mlx.core', 'mlx.core.fast', 'mlx.nn', 'mlx.utils'] if IS_MACOS else [])
+    ] + (['mlx', 'mlx.core', 'mlx.core.fast'] if IS_MACOS else [])
       + cv2_hiddenimports + scipy_hiddenimports + mlx_hiddenimports,
     hookspath=[],
     hooksconfig={},

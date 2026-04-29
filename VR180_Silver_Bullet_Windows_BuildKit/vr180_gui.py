@@ -13,6 +13,124 @@ if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
     except Exception:
         pass
 
+# ── stdout/stderr → log file + in-app viewer ─────────────────────────────
+# .app bundles launched from Finder have no attached terminal, so prints
+# vanish. Tee everything to a log file AND keep a ring buffer that the
+# in-app log viewer can subscribe to. Installed before any heavy imports
+# so MLX / Numba / PyAV startup messages are captured.
+import os as _os_early
+import datetime as _dt_early
+from pathlib import Path as _Path_early
+
+if sys.platform == 'darwin':
+    _LOG_DIR = _Path_early.home() / "Library" / "Logs" / "VR180SilverBullet"
+elif sys.platform == 'win32':
+    _LOG_DIR = _Path_early(_os_early.environ.get('APPDATA', _Path_early.home())) / "VR180SilverBullet" / "Logs"
+else:
+    _LOG_DIR = _Path_early.home() / ".local" / "share" / "VR180SilverBullet" / "logs"
+
+LOG_FILE_PATH = None
+_log_fh = None
+try:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_FILE_PATH = _LOG_DIR / "app.log"
+    # Roll over if larger than 5 MB
+    try:
+        if LOG_FILE_PATH.exists() and LOG_FILE_PATH.stat().st_size > 5_000_000:
+            LOG_FILE_PATH.replace(LOG_FILE_PATH.with_suffix('.log.old'))
+    except Exception:
+        pass
+    _log_fh = open(LOG_FILE_PATH, 'a', encoding='utf-8', errors='replace', buffering=1)
+    _log_fh.write(f"\n===== Session start: {_dt_early.datetime.now().isoformat(timespec='seconds')} =====\n")
+except Exception:
+    _log_fh = None
+    LOG_FILE_PATH = None
+
+
+class _StreamTee:
+    """Splits writes between the original stream (if any), a log file, and
+    in-process subscribers. Subscribers receive every chunk written and a
+    rolling tail buffer is kept for late subscribers (the log viewer)."""
+    _BUF_MAX = 200_000  # characters of tail kept for late subscribers
+    _subscribers = []   # list[callable(str)->None]
+    _buffer = []        # list[str], joined when replayed
+
+    def __init__(self, original, file_handle):
+        self._orig = original
+        self._fh = file_handle
+
+    def write(self, text):
+        if not isinstance(text, str):
+            try:
+                text = text.decode('utf-8', errors='replace')
+            except Exception:
+                text = str(text)
+        if self._orig is not None:
+            try:
+                self._orig.write(text)
+            except Exception:
+                pass
+        if self._fh is not None:
+            try:
+                self._fh.write(text)
+            except Exception:
+                pass
+        if text:
+            _StreamTee._buffer.append(text)
+            # Trim tail
+            total = sum(len(s) for s in _StreamTee._buffer)
+            while total > _StreamTee._BUF_MAX and len(_StreamTee._buffer) > 1:
+                total -= len(_StreamTee._buffer.pop(0))
+            for cb in list(_StreamTee._subscribers):
+                try:
+                    cb(text)
+                except Exception:
+                    pass
+        return len(text) if text else 0
+
+    def flush(self):
+        for s in (self._orig, self._fh):
+            if s is not None:
+                try:
+                    s.flush()
+                except Exception:
+                    pass
+
+    def isatty(self):
+        try:
+            return bool(self._orig and self._orig.isatty())
+        except Exception:
+            return False
+
+    def fileno(self):
+        # Some libs probe fileno() before writing; defer to underlying file.
+        if self._orig is not None and hasattr(self._orig, 'fileno'):
+            return self._orig.fileno()
+        if self._fh is not None:
+            return self._fh.fileno()
+        raise OSError("no fileno")
+
+    @classmethod
+    def subscribe(cls, cb):
+        cls._subscribers.append(cb)
+        return cb
+
+    @classmethod
+    def unsubscribe(cls, cb):
+        try:
+            cls._subscribers.remove(cb)
+        except ValueError:
+            pass
+
+    @classmethod
+    def replay(cls):
+        return ''.join(cls._buffer)
+
+
+sys.stdout = _StreamTee(sys.stdout, _log_fh)
+sys.stderr = _StreamTee(sys.stderr, _log_fh)
+print(f"[log] writing to {LOG_FILE_PATH}" if LOG_FILE_PATH else "[log] file logging unavailable")
+
 import subprocess
 import json
 import os
@@ -42,13 +160,10 @@ except Exception as e:
     HAS_CV2 = False
     print(f"⚠ Warning: OpenCV import failed with error: {e}")
 
-try:
-    from scipy.ndimage import gaussian_filter1d
-    HAS_SCIPY = True
-    print(f"✓ SciPy imported successfully")
-except ImportError:
-    HAS_SCIPY = False
-    print(f"⚠ Warning: SciPy not available - gyro stabilization will be disabled")
+# SciPy was previously imported here for gaussian_filter1d, but the function
+# was never actually called — gyro smoothing uses our own quaternion-aware
+# filters. Removed to drop ~50 MB of unused dependency on Windows.
+HAS_SCIPY = False  # legacy flag kept for the checkbox tooltip branch
 
 try:
     import numba
@@ -270,16 +385,23 @@ if HAS_NUMBA:
                            yaw_coeff, pitch_coeff, roll_coeff,
                            has_Rc, Rc00, Rc01, Rc02, Rc10, Rc11, Rc12, Rc20, Rc21, Rc22,
                            mx_out, my_out, n,
+                           rs_groups, n_groups,
                            klns_c0=numba.float32(0), klns_c1=numba.float32(0),
                            klns_c2=numba.float32(0), klns_c3=numba.float32(0),
                            klns_c4=numba.float32(0),
                            cx_s=numba.float32(0), cy_s=numba.float32(0),
                            cal_d=numba.float32(0), srot_s=numba.float32(0),
                            use_klns=False):
-        """Numba JIT: fused RS pipeline — R×dir → KLNS RS → IORI → cross maps.
-        When use_klns=True, uses KLNS dr/dθ pixel-shift (matches Metal kernel).
-        When False, uses 3D rotation fallback."""
+        """Numba JIT: fused RS pipeline — R×dir → per-scanline RS → IORI → cross maps.
+        rs_groups: (n_groups*3,) flat array, ω samples [yaw,pitch,roll] rad/s × factor
+            at evenly-spaced row-times across the readout window. When n_groups <= 1,
+            falls back to scalar yaw/pitch/roll_coeff.
+        When use_klns=True, uses KLNS dr/dθ pixel-shift (still scalar — KLNS path
+            does not yet implement per-scanline interpolation).
+        """
         TWO_OVER_PI = numba.float32(2.0 / _math.pi)
+        _ng_minus1 = numba.float32(max(n_groups - 1, 1))
+        _use_perscanline = (n_groups > 1) and (srot_s > numba.float32(0)) and (not use_klns)
         for i in prange(n):
             # Step 1: R_sensor × direction → sensor space
             ox = xyz_x[i]; oy = xyz_y[i]; oz = xyz_z[i]
@@ -328,11 +450,30 @@ if HAS_NUMBA:
                 yn = stn * np_y
                 zn = _math.cos(th_n)
             else:
-                # 3D rotation fallback
+                # 3D rotation: per-scanline ω when available, else single-value fallback
                 t = t_offset[i]
-                ya = yaw_coeff * t
-                pa = pitch_coeff * t
-                ra = roll_coeff * t
+                if _use_perscanline:
+                    gf = (t / srot_s + numba.float32(0.5)) * _ng_minus1
+                    if gf < numba.float32(0):
+                        gf = numba.float32(0)
+                    elif gf > _ng_minus1:
+                        gf = _ng_minus1
+                    g0 = int(gf)
+                    g1 = g0 + 1
+                    if g1 > n_groups - 1:
+                        g1 = n_groups - 1
+                    a = gf - numba.float32(g0)
+                    one_a = numba.float32(1) - a
+                    ya_rate = rs_groups[g0*3 + 0] * one_a + rs_groups[g1*3 + 0] * a
+                    pa_rate = rs_groups[g0*3 + 1] * one_a + rs_groups[g1*3 + 1] * a
+                    ra_rate = rs_groups[g0*3 + 2] * one_a + rs_groups[g1*3 + 2] * a
+                else:
+                    ya_rate = yaw_coeff
+                    pa_rate = pitch_coeff
+                    ra_rate = roll_coeff
+                ya = ya_rate * t
+                pa = pa_rate * t
+                ra = ra_rate * t
                 xn = xr + ya * zr - ra * yr
                 yn = yr + ra * xr - pa * zr
                 zn = zr - ya * xr + pa * yr
@@ -639,6 +780,7 @@ if HAS_NUMBA:
                            np.float32(0), np.float32(1), np.float32(0),
                            np.float32(0), np.float32(0), np.float32(1),
                            o, o, n,
+                           np.zeros(96, dtype=np.float32), np.int32(1),
                            np.float32(1), np.float32(0), np.float32(0),
                            np.float32(0), np.float32(0),
                            np.float32(0), np.float32(0),
@@ -671,12 +813,15 @@ if HAS_NUMBA_CUDA:
 
     @_cuda.jit
     def _cuda_cross_remap_rs_bilinear(xyz_x, xyz_y, xyz_z,
-                                       R, t_offset, rs_coeffs,
+                                       R, t_offset, rs_groups,
                                        Rc, has_iori,
                                        cross_img, cross_w, cross_h,
-                                       out_bgr, n, pix_max):
-        """CUDA kernel: fused R×dir → RS → IORI → EAC face → bilinear sample.
-        out_bgr: flat array (n*3), interleaved BGR output. pix_max: 255 for uint8, 65535 for uint16.
+                                       out_bgr, n, pix_max,
+                                       n_groups, srot_s):
+        """CUDA kernel: fused R×dir → per-scanline RS → IORI → EAC face → bilinear.
+        rs_groups: flat (n_groups*3,) ω samples [yaw,pitch,roll] rad/s × factor at
+            evenly-spaced row-times across the readout. Per-pixel linear interp.
+        out_bgr: flat array (n*3), interleaved BGR. pix_max: 255 or 65535.
         cross_img is flat array (H*W*3), row-major BGR."""
         TWO_OVER_PI = 0.6366197723675814  # 2/pi
         idx = _cuda.grid(1)
@@ -689,11 +834,29 @@ if HAS_NUMBA_CUDA:
         yr = R[3]*ox + R[4]*oy + R[5]*oz
         zr = R[6]*ox + R[7]*oy + R[8]*oz
 
-        # Step 2: RS small-angle rotation
+        # Step 2: per-scanline RS (linear interp across n_groups row-time samples)
         t = t_offset[idx]
-        ya = rs_coeffs[0] * t
-        pa = rs_coeffs[1] * t
-        ra = rs_coeffs[2] * t
+        if n_groups > 1 and srot_s > 0.0:
+            gf = (t / srot_s + 0.5) * (n_groups - 1)
+            if gf < 0.0:
+                gf = 0.0
+            elif gf > n_groups - 1:
+                gf = n_groups - 1
+            g0 = int(gf)
+            g1 = g0 + 1
+            if g1 > n_groups - 1:
+                g1 = n_groups - 1
+            a = gf - g0
+            ya_rate = rs_groups[g0*3 + 0] * (1.0 - a) + rs_groups[g1*3 + 0] * a
+            pa_rate = rs_groups[g0*3 + 1] * (1.0 - a) + rs_groups[g1*3 + 1] * a
+            ra_rate = rs_groups[g0*3 + 2] * (1.0 - a) + rs_groups[g1*3 + 2] * a
+        else:
+            ya_rate = rs_groups[0]
+            pa_rate = rs_groups[1]
+            ra_rate = rs_groups[2]
+        ya = ya_rate * t
+        pa = pa_rate * t
+        ra = ra_rate * t
         xn = xr + ya*zr - ra*yr
         yn = yr + ra*xr - pa*zr
         zn = zr - ya*xr + pa*yr
@@ -1188,6 +1351,8 @@ if HAS_NUMBA_CUDA:
             p['d_R_A'] = _cuda.device_array(9, dtype=np.float32)
             p['d_R_B'] = _cuda.device_array(9, dtype=np.float32)
             p['d_rs'] = _cuda.device_array(3, dtype=np.float32)
+            # Per-scanline RS: 32 row-time groups × 3 axes (yaw,pitch,roll)
+            p['d_rs_groups'] = _cuda.device_array(32 * 3, dtype=np.float32)
             p['d_Rc'] = _cuda.device_array(9, dtype=np.float32)
             p['stream_A'] = _cuda.stream()
             p['stream_B'] = _cuda.stream()
@@ -1195,11 +1360,31 @@ if HAS_NUMBA_CUDA:
     # Pre-allocated flat buffers for ravel() avoidance
     _cuda_eye3x3_flat = np.eye(3, dtype=np.float32).ravel()
 
+    _CUDA_RS_N_GROUPS = 32  # must match d_rs_groups size in _cuda_persistent
+
+    def _cuda_upload_rs_groups(rs_coeffs_np, rs_perscanline_mats):
+        """Populate d_rs_groups device buffer with per-row-time ω samples.
+        When rs_perscanline_mats is None, replicates the single rs_coeffs across
+        all 32 groups so per-pixel interp degenerates to the constant value.
+        Returns the number of distinct groups that occupy the front of the buffer."""
+        p = _cuda_persistent
+        if rs_perscanline_mats is not None and rs_perscanline_mats.shape[0] >= 2:
+            n_groups = min(int(rs_perscanline_mats.shape[0]), _CUDA_RS_N_GROUPS)
+            flat = np.zeros(_CUDA_RS_N_GROUPS * 3, dtype=np.float32)
+            flat[:n_groups * 3] = rs_perscanline_mats[:n_groups].astype(np.float32).ravel()
+        else:
+            n_groups = _CUDA_RS_N_GROUPS
+            src = rs_coeffs_np.astype(np.float32) if rs_coeffs_np is not None else np.zeros(3, np.float32)
+            flat = np.tile(src, _CUDA_RS_N_GROUPS).astype(np.float32)
+        p['d_rs_groups'].copy_to_device(flat)
+        return n_groups
+
     def _cuda_process_both_eyes(crossA_np, crossB_np, d_xyz_x, d_xyz_y, d_xyz_z,
                                 R_right_np, R_left_np,
                                 d_t_offset_right, d_t_offset_left,
                                 rs_coeffs_np, R_cross_np, has_iori,
-                                n_pixels, out_h, out_w, result_buf, pix_dtype=np.uint8):
+                                n_pixels, out_h, out_w, result_buf, pix_dtype=np.uint8,
+                                rs_perscanline_mats=None, srot_s=0.0):
         """Process BOTH eyes via CUDA with overlapping streams, writing directly into result_buf.
         pix_dtype: np.uint8 for 8-bit, np.uint16 for 10-bit pipeline."""
         p = _cuda_persistent
@@ -1221,17 +1406,18 @@ if HAS_NUMBA_CUDA:
 
         # RIGHT EYE kernel launch
         if rs_coeffs_np is not None:
-            p['d_rs'].copy_to_device(rs_coeffs_np.astype(np.float32))
+            n_groups = _cuda_upload_rs_groups(rs_coeffs_np, rs_perscanline_mats)
             if has_iori:
                 p['d_Rc'].copy_to_device(R_cross_np.ravel().astype(np.float32))
             else:
                 p['d_Rc'].copy_to_device(_cuda_eye3x3_flat)
             _cuda_cross_remap_rs_bilinear[grid, _CUDA_BLOCK](
                 d_xyz_x, d_xyz_y, d_xyz_z,
-                p['d_R_A'], d_t_offset_right, p['d_rs'],
+                p['d_R_A'], d_t_offset_right, p['d_rs_groups'],
                 p['d_Rc'], has_iori,
                 p['d_cross_A'], cross_w_px, cross_h_px,
-                p['d_out_A'], n_pixels, _pix_max)
+                p['d_out_A'], n_pixels, _pix_max,
+                np.int32(n_groups), np.float32(srot_s))
         else:
             _cuda_cross_remap_rot_bilinear[grid, _CUDA_BLOCK](
                 d_xyz_x, d_xyz_y, d_xyz_z,
@@ -1265,7 +1451,7 @@ if HAS_NUMBA_CUDA:
     def _cuda_process_eye(cross_np, d_xyz_x, d_xyz_y, d_xyz_z,
                           R_np, d_t_offset, rs_coeffs_np,
                           R_cross_np, has_iori, n_pixels, out_h, out_w,
-                          pix_max=255):
+                          pix_max=255, rs_perscanline_mats=None, srot_s=0.0):
         """Process one eye via CUDA (for preview path).
         pix_max: 255 for uint8 pipeline, 65535 for uint16 (Level B preview /
         export). The output dtype follows pix_max; buffer pool is
@@ -1282,17 +1468,18 @@ if HAS_NUMBA_CUDA:
         grid = (n_pixels + _CUDA_BLOCK - 1) // _CUDA_BLOCK
 
         if rs_coeffs_np is not None:
-            p['d_rs'].copy_to_device(rs_coeffs_np.astype(np.float32))
+            n_groups = _cuda_upload_rs_groups(rs_coeffs_np, rs_perscanline_mats)
             if has_iori:
                 p['d_Rc'].copy_to_device(R_cross_np.ravel().astype(np.float32))
             else:
                 p['d_Rc'].copy_to_device(_cuda_eye3x3_flat)
             _cuda_cross_remap_rs_bilinear[grid, _CUDA_BLOCK](
                 d_xyz_x, d_xyz_y, d_xyz_z,
-                p['d_R_A'], d_t_offset, p['d_rs'],
+                p['d_R_A'], d_t_offset, p['d_rs_groups'],
                 p['d_Rc'], has_iori,
                 p['d_cross_A'], cross_w_px, cross_h_px,
-                p['d_out_A'], n_pixels, _pix_max)
+                p['d_out_A'], n_pixels, _pix_max,
+                np.int32(n_groups), np.float32(srot_s))
         else:
             _cuda_cross_remap_rot_bilinear[grid, _CUDA_BLOCK](
                 d_xyz_x, d_xyz_y, d_xyz_z,
@@ -1342,7 +1529,11 @@ if HAS_NUMBA_CUDA:
                             n_pixels, out_h, out_w, result_buf,
                             color_1d_lut, lut_3d, lut_intensity,
                             sharpen_kernel_1d, sharpen_lat, sharpen_amount, sharpen_ksize,
-                            pix_dtype=np.uint8):
+                            pix_dtype=np.uint8,
+                            rs_perscanline_mats=None,
+                            rs_perscanline_mats_left=None,
+                            srot_s=0.0,
+                            no_firmware_rs=False):
         """Fused GPU pipeline: remap → 1D LUT → 3D LUT → sharpen → single download.
         pix_dtype: np.uint8 for 8-bit, np.uint16 for 10-bit pipeline."""
         p = _cuda_persistent
@@ -1373,29 +1564,45 @@ if HAS_NUMBA_CUDA:
         # ── Step 1: Remap both eyes ──
         # Right eye
         if rs_coeffs_np is not None:
-            p['d_rs'].copy_to_device(rs_coeffs_np.astype(np.float32))
+            n_groups = _cuda_upload_rs_groups(rs_coeffs_np, rs_perscanline_mats)
             if has_iori:
                 p['d_Rc'].copy_to_device(R_cross_np.ravel().astype(np.float32))
             else:
                 p['d_Rc'].copy_to_device(_cuda_eye3x3_flat)
             _cuda_cross_remap_rs_bilinear[grid_pix, _CUDA_BLOCK](
                 d_xyz_x, d_xyz_y, d_xyz_z,
-                p['d_R_A'], d_t_offset_right, p['d_rs'],
+                p['d_R_A'], d_t_offset_right, p['d_rs_groups'],
                 p['d_Rc'], has_iori,
                 p['d_cross_A'], cross_w_px, cross_h_px,
-                p['d_out_A'], n_pixels, _pix_max)
+                p['d_out_A'], n_pixels, _pix_max,
+                np.int32(n_groups), np.float32(srot_s))
         else:
             _cuda_cross_remap_rot_bilinear[grid_pix, _CUDA_BLOCK](
                 d_xyz_x, d_xyz_y, d_xyz_z,
                 p['d_R_A'],
                 p['d_cross_A'], cross_w_px, cross_h_px,
                 p['d_out_A'], n_pixels, _pix_max)
-        # Left eye (no RS)
-        _cuda_cross_remap_rot_bilinear[grid_pix, _CUDA_BLOCK](
-            d_xyz_x, d_xyz_y, d_xyz_z,
-            p['d_R_B'],
-            p['d_cross_B'], cross_w_px, cross_h_px,
-            p['d_out_B'], n_pixels, _pix_max)
+        # Left eye: no-firmware-RS mode applies RS here too; otherwise rotation only
+        if no_firmware_rs and rs_coeffs_np is not None:
+            # Re-upload rs_groups for left eye (may differ if caller provides
+            # a separate per-eye buffer; defaults to the right-eye buffer)
+            n_groups_l = _cuda_upload_rs_groups(
+                rs_coeffs_np,
+                rs_perscanline_mats_left if rs_perscanline_mats_left is not None
+                else rs_perscanline_mats)
+            _cuda_cross_remap_rs_bilinear[grid_pix, _CUDA_BLOCK](
+                d_xyz_x, d_xyz_y, d_xyz_z,
+                p['d_R_B'], d_t_offset_left, p['d_rs_groups'],
+                p['d_Rc'], False,  # left eye has no IORI in no-fw-RS
+                p['d_cross_B'], cross_w_px, cross_h_px,
+                p['d_out_B'], n_pixels, _pix_max,
+                np.int32(n_groups_l), np.float32(srot_s))
+        else:
+            _cuda_cross_remap_rot_bilinear[grid_pix, _CUDA_BLOCK](
+                d_xyz_x, d_xyz_y, d_xyz_z,
+                p['d_R_B'],
+                p['d_cross_B'], cross_w_px, cross_h_px,
+                p['d_out_B'], n_pixels, _pix_max)
 
         # After remap: d_out_A = right eye, d_out_B = left eye (on GPU)
         # cur_A/cur_B track which device buffer holds the "current" data
@@ -1624,23 +1831,36 @@ if HAS_MLX:
         float yr = R[3]*ox + R[4]*oy + R[5]*oz;
         float zr = R[6]*ox + R[7]*oy + R[8]*oz;
 
-        // Step 2: 3D rotation RS correction
-        // Small-angle rotation in sensor space. Verified against firmware output
-        // (GoPro Player equirect + raw EAC) — matches firmware RS at all angles
-        // from center (θ=15°) to edge (θ=88°) within 5% (ratio 0.95-1.05).
-        // rs_coeffs[0]=yaw, [1]=pitch, [2]=roll (rate × factor, in rad/s)
-        // t_offset[idx] = precomputed time offset for this pixel's sensor row
+        // Step 2: 3D rotation RS correction (per-scanline ω)
+        // Small-angle rotation in sensor space. Per-pixel angular velocity is
+        // looked up from a 32-group buffer (rs_groups) sampled at evenly-spaced
+        // row-times across the readout window. Linear interpolation between
+        // groups gives the instantaneous ω for each pixel's sensor row.
+        // When per-scanline data is unavailable, all 32 groups carry the same
+        // (smoothed mean) ω, so the kernel degrades to the original behaviour.
+        // rs_groups[g*3+0]=yaw, +1=pitch, +2=roll (rate × factor, rad/s)
+        // params[10]=srot_s, params[11]=n_groups (float, cast to int)
         float xn = xr, yn = yr, zn = zr;
-        float rs_yaw   = rs_coeffs[0];
-        float rs_pitch = rs_coeffs[1];
-        float rs_roll  = rs_coeffs[2];
-        bool has_rs = (rs_pitch != 0.0f || rs_roll != 0.0f || rs_yaw != 0.0f);
+        float srot_s   = params[10];
+        int   n_groups = (int)params[11];
 
-        if (has_rs) {
+        if (n_groups > 1 && srot_s > 0.0f) {
             float t = t_offset[idx];
-            float ya = rs_yaw   * t;
-            float pa = rs_pitch * t;
-            float ra = rs_roll  * t;
+            // Map t ∈ [-srot/2, +srot/2] → group index ∈ [0, n_groups-1]
+            float gf = (t / srot_s + 0.5f) * (float)(n_groups - 1);
+            gf = metal::clamp(gf, 0.0f, (float)(n_groups - 1));
+            int   g0 = (int)metal::floor(gf);
+            int   g1 = metal::min(g0 + 1, n_groups - 1);
+            float a  = gf - (float)g0;
+
+            // Linear interp ω at this pixel's row-time
+            float ya_rate = rs_groups[g0*3 + 0] * (1.0f - a) + rs_groups[g1*3 + 0] * a;
+            float pa_rate = rs_groups[g0*3 + 1] * (1.0f - a) + rs_groups[g1*3 + 1] * a;
+            float ra_rate = rs_groups[g0*3 + 2] * (1.0f - a) + rs_groups[g1*3 + 2] * a;
+
+            float ya = ya_rate * t;
+            float pa = pa_rate * t;
+            float ra = ra_rate * t;
             xn = xr + ya * zr - ra * yr;
             yn = yr + ra * xr - pa * zr;
             zn = zr - ya * xr + pa * yr;
@@ -1723,7 +1943,7 @@ if HAS_MLX:
     _mlx_cross_kernel = _mlx_metal_kernel(
         name="cross_remap_bilinear",
         input_names=["xyz_x", "xyz_y", "xyz_z", "R", "t_offset", "rs_coeffs",
-                     "Rc", "params", "cross_img", "n", "rs_mats"],
+                     "Rc", "params", "cross_img", "n", "rs_groups"],
         output_names=["out"],
         source=_MLX_CROSS_REMAP_SOURCE,
     )
@@ -1813,7 +2033,13 @@ if HAS_MLX:
                          two_step=False, rs_perscanline_mats=None):
         """Run fused Metal kernel for one eye.
         RS correction uses 3D rotation with precomputed t_offset per pixel.
-        rs_coeffs_np: [yaw, pitch, roll] angular velocity × factor in rad/s."""
+        rs_coeffs_np: [yaw, pitch, roll] angular velocity × factor in rad/s
+            (used as fallback when rs_perscanline_mats is None).
+        rs_perscanline_mats: (n_groups, 3) float32 of per-row-time ω samples
+            from raw 800Hz gyro. When provided, the kernel does per-pixel
+            linear interpolation across rows; when None, the single rs_coeffs
+            value is replicated across all groups (degenerates to old behaviour).
+        """
         mlx_R = mx.array(R_np.ravel().astype(np.float32))
         mlx_cross = mx.array(cross_np.ravel())
 
@@ -1821,8 +2047,21 @@ if HAS_MLX:
             mlx_rs = mx.array(rs_coeffs_np.astype(np.float32))
         else:
             mlx_rs = mx.array(np.zeros(3, dtype=np.float32))
-        mlx_rs_mats = _mlx_rs_mats_identity
-        _rs_mode = 0.0
+
+        # ── Build per-scanline ω groups buffer ──
+        # Always 32 groups. When per-scanline data is unavailable, replicate
+        # the single rs_coeffs across all groups so linear-interp gives the
+        # same constant the kernel used to apply uniformly.
+        _RS_N_GROUPS = 32
+        if rs_perscanline_mats is not None and rs_perscanline_mats.shape[0] >= 2:
+            # (n_groups, 3) → flat (n_groups*3,)
+            _rs_groups_flat = rs_perscanline_mats.astype(np.float32).ravel()
+            _n_groups_actual = int(rs_perscanline_mats.shape[0])
+        else:
+            _src = rs_coeffs_np.astype(np.float32) if rs_coeffs_np is not None else np.zeros(3, np.float32)
+            _rs_groups_flat = np.tile(_src, _RS_N_GROUPS).astype(np.float32)
+            _n_groups_actual = _RS_N_GROUPS
+        mlx_rs_groups = mx.array(_rs_groups_flat)
 
         iori_flag = 1.0 if (has_iori and R_cross_np is not None) else 0.0
         if has_iori and R_cross_np is not None:
@@ -1830,17 +2069,18 @@ if HAS_MLX:
         else:
             mlx_Rc = mx.array(np.eye(3, dtype=np.float32).ravel())
 
-        # params: [has_iori, pix_max, c0,c1,c2,c3,c4, cx,cy, cal_dim, srot, rs_mode]
+        # params: [has_iori, pix_max, c0,c1,c2,c3,c4, cx,cy, cal_dim, srot, n_groups]
         _kp = _mlx_klns_params
         mlx_params = mx.array(np.array([iori_flag, float(pix_max),
                                          _kp[0], _kp[1], _kp[2], _kp[3], _kp[4],
-                                         _kp[5], _kp[6], _kp[7], _kp[8], _rs_mode], dtype=np.float32))
+                                         _kp[5], _kp[6], _kp[7], _kp[8],
+                                         float(_n_groups_actual)], dtype=np.float32))
         mlx_n = mx.array(np.array([n_pixels], dtype=np.int32))
         _out_dtype = mx.uint16 if pix_max > 256 else mx.uint8
 
         outputs = _mlx_cross_kernel(
             inputs=[mlx_xyz_x, mlx_xyz_y, mlx_xyz_z, mlx_R, mlx_t_offset,
-                    mlx_rs, mlx_Rc, mlx_params, mlx_cross, mlx_n, mlx_rs_mats],
+                    mlx_rs, mlx_Rc, mlx_params, mlx_cross, mlx_n, mlx_rs_groups],
             output_shapes=[(n_pixels * 3,)],
             output_dtypes=[_out_dtype],
             grid=(n_pixels, 1, 1),
@@ -2036,7 +2276,9 @@ _WGSL_CROSS_REMAP_SOURCE = """
 @group(0) @binding(2) var<storage, read> xyz_z: array<f32>;
 @group(0) @binding(3) var<storage, read> R: array<f32>;
 @group(0) @binding(4) var<storage, read> t_offset: array<f32>;
-@group(0) @binding(5) var<storage, read> rs_coeffs: array<f32>;
+// rs_groups: 32 row-time samples × 3 axes (yaw,pitch,roll) rad/s × factor.
+// params: [iori_flag, srot_s, n_groups]
+@group(0) @binding(5) var<storage, read> rs_groups: array<f32>;
 @group(0) @binding(6) var<storage, read> Rc: array<f32>;
 @group(0) @binding(7) var<storage, read> params: array<f32>;
 @group(0) @binding(8) var<storage, read> cross_img: array<u32>;
@@ -2063,11 +2305,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var yr = R[3]*ox + R[4]*oy + R[5]*oz;
     var zr = R[6]*ox + R[7]*oy + R[8]*oz;
 
-    // Step 2: RS perturbation
+    // Step 2: per-scanline RS perturbation (linear interp across 32 row-time groups)
     let t = t_offset[idx];
-    var xn = xr + rs_coeffs[0]*t*zr - rs_coeffs[2]*t*yr;
-    var yn = yr + rs_coeffs[2]*t*xr - rs_coeffs[1]*t*zr;
-    var zn = zr - rs_coeffs[0]*t*xr + rs_coeffs[1]*t*yr;
+    let srot_s = params[1];
+    let n_groups = i32(params[2]);
+    var ya_rate: f32 = rs_groups[0];
+    var pa_rate: f32 = rs_groups[1];
+    var ra_rate: f32 = rs_groups[2];
+    if (n_groups > 1 && srot_s > 0.0) {
+        var gf = (t / srot_s + 0.5) * f32(n_groups - 1);
+        gf = clamp(gf, 0.0, f32(n_groups - 1));
+        let g0 = i32(floor(gf));
+        let g1 = min(g0 + 1, n_groups - 1);
+        let a  = gf - f32(g0);
+        ya_rate = rs_groups[u32(g0*3 + 0)] * (1.0 - a) + rs_groups[u32(g1*3 + 0)] * a;
+        pa_rate = rs_groups[u32(g0*3 + 1)] * (1.0 - a) + rs_groups[u32(g1*3 + 1)] * a;
+        ra_rate = rs_groups[u32(g0*3 + 2)] * (1.0 - a) + rs_groups[u32(g1*3 + 2)] * a;
+    }
+    var xn = xr + ya_rate*t*zr - ra_rate*t*yr;
+    var yn = yr + ra_rate*t*xr - pa_rate*t*zr;
+    var zn = zr - ya_rate*t*xr + pa_rate*t*yr;
 
     // Step 3: IORI rotation (conditional)
     if (params[0] > 0.5) {
@@ -2333,12 +2590,15 @@ def _wgpu_ensure_cross_pool(n_pixels, xyz_x_buf, xyz_y_buf, xyz_z_buf, t_offset_
     cross_size = (3936 * 3936 * 3 + 3) // 4 * 4  # round up to 4-byte boundary
     cross_n_u32 = cross_size // 4
 
+    # rs_groups: 32 row-time samples × 3 axes (yaw,pitch,roll) rad/s × factor
+    _WGPU_RS_N_GROUPS = 32
     pool = {
         'n_pixels': n_pixels,
         'R_buf': _wgpu_device.create_buffer(size=9*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
-        'rs_buf': _wgpu_device.create_buffer(size=3*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
+        'rs_groups_buf': _wgpu_device.create_buffer(size=_WGPU_RS_N_GROUPS*3*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
         'Rc_buf': _wgpu_device.create_buffer(size=9*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
-        'params_buf': _wgpu_device.create_buffer(size=1*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
+        # params: [iori_flag, srot_s, n_groups] (3 floats)
+        'params_buf': _wgpu_device.create_buffer(size=3*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
         'cross_buf': _wgpu_device.create_buffer(size=cross_n_u32*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
         'n_buf': _wgpu_device.create_buffer(size=4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST),
     }
@@ -2346,9 +2606,10 @@ def _wgpu_ensure_cross_pool(n_pixels, xyz_x_buf, xyz_y_buf, xyz_z_buf, t_offset_
     # Write n_pixels (constant)
     _wgpu_device.queue.write_buffer(pool['n_buf'], 0, np.array([n_pixels], dtype=np.uint32).tobytes())
     # Write default zero values
-    _wgpu_device.queue.write_buffer(pool['rs_buf'], 0, np.zeros(3, dtype=np.float32).tobytes())
+    _wgpu_device.queue.write_buffer(pool['rs_groups_buf'], 0, np.zeros(_WGPU_RS_N_GROUPS*3, dtype=np.float32).tobytes())
     _wgpu_device.queue.write_buffer(pool['Rc_buf'], 0, np.eye(3, dtype=np.float32).ravel().tobytes())
-    _wgpu_device.queue.write_buffer(pool['params_buf'], 0, np.array([0.0], dtype=np.float32).tobytes())
+    _wgpu_device.queue.write_buffer(pool['params_buf'], 0,
+                                     np.array([0.0, 0.0, 0.0], dtype=np.float32).tobytes())
 
     # Create bind group (references buffer objects — contents can change via write_buffer)
     pool['bind_group'] = _wgpu_device.create_bind_group(
@@ -2359,7 +2620,7 @@ def _wgpu_ensure_cross_pool(n_pixels, xyz_x_buf, xyz_y_buf, xyz_z_buf, t_offset_
             {"binding": 2, "resource": {"buffer": xyz_z_buf}},
             {"binding": 3, "resource": {"buffer": pool['R_buf']}},
             {"binding": 4, "resource": {"buffer": t_offset_buf}},
-            {"binding": 5, "resource": {"buffer": pool['rs_buf']}},
+            {"binding": 5, "resource": {"buffer": pool['rs_groups_buf']}},
             {"binding": 6, "resource": {"buffer": pool['Rc_buf']}},
             {"binding": 7, "resource": {"buffer": pool['params_buf']}},
             {"binding": 8, "resource": {"buffer": pool['cross_buf']}},
@@ -2372,25 +2633,35 @@ def _wgpu_ensure_cross_pool(n_pixels, xyz_x_buf, xyz_y_buf, xyz_z_buf, t_offset_
 
 def _wgpu_process_eye(cross_np, xyz_x_buf, xyz_y_buf, xyz_z_buf,
                       R_np, t_offset_buf, rs_coeffs_np,
-                      R_cross_np, has_iori, n_pixels, out_buf):
+                      R_cross_np, has_iori, n_pixels, out_buf,
+                      rs_perscanline_mats=None, srot_s=0.0):
     """Run fused wgpu compute kernel for one eye. Returns (n_pixels*3,) uint8 numpy array.
-    Reuses persistent buffers — only writes changed data per frame."""
+    Reuses persistent buffers — only writes changed data per frame.
+    rs_perscanline_mats: optional (n_groups, 3) per-row-time ω. When None, the
+    single rs_coeffs is replicated across 32 groups (degenerates to constant)."""
     pool = _wgpu_ensure_cross_pool(n_pixels, xyz_x_buf, xyz_y_buf, xyz_z_buf, t_offset_buf, out_buf)
     q = _wgpu_device.queue
 
     # Update per-frame small buffers (tiny writes, ~36-48 bytes)
     q.write_buffer(pool['R_buf'], 0, R_np.ravel().astype(np.float32).tobytes())
 
-    if rs_coeffs_np is not None and np.any(rs_coeffs_np != 0):
-        q.write_buffer(pool['rs_buf'], 0, rs_coeffs_np.astype(np.float32).tobytes())
+    # Build rs_groups buffer (32 groups × 3 axes)
+    _RS_N_GROUPS = 32
+    if rs_perscanline_mats is not None and rs_perscanline_mats.shape[0] >= 2:
+        n_groups = min(int(rs_perscanline_mats.shape[0]), _RS_N_GROUPS)
+        rs_flat = np.zeros(_RS_N_GROUPS * 3, dtype=np.float32)
+        rs_flat[:n_groups * 3] = rs_perscanline_mats[:n_groups].astype(np.float32).ravel()
     else:
-        q.write_buffer(pool['rs_buf'], 0, b'\x00' * 12)
+        n_groups = _RS_N_GROUPS
+        src = rs_coeffs_np.astype(np.float32) if (rs_coeffs_np is not None and np.any(rs_coeffs_np != 0)) else np.zeros(3, np.float32)
+        rs_flat = np.tile(src, _RS_N_GROUPS).astype(np.float32)
+    q.write_buffer(pool['rs_groups_buf'], 0, rs_flat.tobytes())
 
+    iori_flag = 1.0 if (has_iori and R_cross_np is not None) else 0.0
     if has_iori and R_cross_np is not None:
         q.write_buffer(pool['Rc_buf'], 0, R_cross_np.ravel().astype(np.float32).tobytes())
-        q.write_buffer(pool['params_buf'], 0, np.array([1.0], dtype=np.float32).tobytes())
-    else:
-        q.write_buffer(pool['params_buf'], 0, b'\x00' * 4)
+    q.write_buffer(pool['params_buf'], 0,
+                   np.array([iori_flag, float(srot_s), float(n_groups)], dtype=np.float32).tobytes())
 
     # Upload cross image (~46MB — the main cost, but no buffer allocation)
     cross_bytes = np.ascontiguousarray(cross_np).tobytes()
@@ -2580,8 +2851,9 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QSlider, QSpinBox, QDoubleSpinBox,
     QComboBox, QFileDialog, QGroupBox, QProgressBar,
-    QMessageBox, QSplitter, QLineEdit, QStatusBar, QFrame,
-    QScrollArea, QToolButton, QCheckBox, QRadioButton, QButtonGroup, QTextEdit
+    QMessageBox, QSplitter, QLineEdit, QStatusBar,
+    QScrollArea, QToolButton, QCheckBox, QRadioButton, QButtonGroup, QTextEdit,
+    QDialog, QPlainTextEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QPainter
@@ -3224,7 +3496,7 @@ def detect_gopro_segments(file_path: str) -> list:
     return sorted(segments)
 
 
-def concatenate_gyro_data(segment_paths: list) -> dict:
+def concatenate_gyro_data(segment_paths: list, window_ms: float = 1.0) -> dict:
     """Parse and concatenate gyro data from multiple GoPro segments.
 
     Timestamps are adjusted so each segment continues from where the previous ended.
@@ -3304,7 +3576,7 @@ def concatenate_gyro_data(segment_paths: list) -> dict:
                 print(f"  Warning: parse_gopro_gyro_data failed on {seg_path}: {e}")
 
         try:
-            multi_result = vqf_to_cori_quats_multi_segment(segment_paths, n_chapter_frames_list)
+            multi_result = vqf_to_cori_quats_multi_segment(segment_paths, n_chapter_frames_list, window_ms=window_ms)
         except Exception as e:
             print(f"  vqf_to_cori_quats_multi_segment failed: {e}, falling back to per-segment chaining")
             return _concatenate_gyro_data_chaining_fallback(segment_paths)
@@ -3485,7 +3757,7 @@ def concatenate_800hz_gyro(segment_paths: list, fps: float, combined_gyro_data: 
 
 # ─── Full GPMF Gyro Data Parser ─────────────────────────────────────────────
 
-def parse_gopro_gyro_data(file_path: str) -> dict:
+def parse_gopro_gyro_data(file_path: str, window_ms: float = 1.0) -> dict:
     """Parse GoPro .360 file to extract full CORI and IORI quaternion data.
 
     CORI (Camera Orientation): Physical camera orientation (raw motion)
@@ -3828,7 +4100,7 @@ def parse_gopro_gyro_data(file_path: str) -> dict:
             # Pass THIS chapter's frame count, not the full multi-chapter CORI count.
             # vqf_to_cori_quats integrates this file's per-chapter gyro starting from
             # identity; the chaining across chapters is handled by concatenate_gyro_data.
-            vqf_result = vqf_to_cori_quats(file_path, n_video_frames=n_chapter_frames)
+            vqf_result = vqf_to_cori_quats(file_path, n_video_frames=n_chapter_frames, window_ms=window_ms)
             if grav_samples:
                 vqf_result['grav_samples'] = grav_samples
             vqf_result['srot_ms'] = srot_ms
@@ -4994,11 +5266,19 @@ class ProcessingConfig:
     # Rolling shutter correction
     rs_correction_ms: float = 0.0  # Readout time in ms (0 = disabled, typical 10-16ms for GoPro MAX)
     rs_correction_enabled: bool = False  # Whether RS correction is enabled (forced on when gyro is on)
-    rs_yaw_factor: float = 0.0  # Yaw RS factor: body-Z pan → horizontal shear (default 0)
-    rs_pitch_factor: float = 2.0  # Pitch RS factor: undo wrong firmware RS + apply correct
-    rs_roll_factor: float = 2.0  # Roll RS factor: undo wrong firmware RS + apply correct
+    # RS factor defaults are tuned for no-firmware-RS mode (the primary use
+    # case for the yaw-modded camera): apply +1.0× to fully correct RS on
+    # both eyes since firmware applied no correction. Firmware-RS clips get
+    # auto-flipped to (0, 2, 2) at file-load (cori_is_vqf=False branch).
+    rs_yaw_factor: float = 1.0  # No-firmware default (firmware mode flips to 0.0 on load)
+    rs_pitch_factor: float = 1.0  # No-firmware default (firmware mode flips to 2.0 on load)
+    rs_roll_factor: float = 1.0  # No-firmware default (firmware mode flips to 2.0 on load)
     rs_use_cori: bool = False  # True = use CORI angular velocity (better for vibrating platforms)
     no_firmware_rs: bool = False  # True = firmware ERS disabled; apply RS (1,1,1) to BOTH eyes
+    # Gyro averaging window for VQF per-frame CORI (no-firmware-RS mode only).
+    # Range 1ms (point-sample at midpoint, effectively disabled) → 33ms (full frame).
+    # Default 15.224ms = sensor readout time (matches the actual rolling-shutter window).
+    gyro_window_ms: float = 15.224
     # Audio output for .360 input
     audio_ambisonics: bool = False  # True = include ambisonic 4ch PCM; False = stereo AAC only
     # GEOC lens calibration (auto-parsed from .360 file)
@@ -6723,7 +7003,8 @@ class VideoProcessor(QThread):
                         _rs_cx, _rs_cy, _rs_cal_f, _rs_readout_s
                     ]
 
-                def _process_right_eye_cross_rs(crossA, R_sensor, angular_vel, R_cross=None):
+                def _process_right_eye_cross_rs(crossA, R_sensor, angular_vel, R_cross=None,
+                                                rs_perscanline_mats=None):
                     """Combined RS + rotation from EAC cross in a single remap pass (thread).
 
                     Forward: cross → IORI cancel → RS → heading → global+stereo → output
@@ -6731,6 +7012,8 @@ class VideoProcessor(QThread):
 
                     R_sensor = heading × global × stereo (maps d_out to sensor space).
                     R_cross  = IORI (maps sensor space → cross space, applied after RS).
+                    rs_perscanline_mats: optional (n_groups, 3) per-row-time ω samples
+                        (already × factors). When None, falls back to single ω.
                     """
                     R = R_sensor.astype(np.float32)
                     roll_rate  = np.float32(angular_vel[0])
@@ -6742,6 +7025,14 @@ class VideoProcessor(QThread):
 
                     # Skip IORI rotation when R_cross ≈ identity (optimization #6)
                     has_Rc = R_cross is not None and np.max(np.abs(R_cross - np.eye(3, dtype=np.float32))) > 1e-6
+
+                    # Build rs_groups buffer for per-scanline path
+                    if rs_perscanline_mats is not None and rs_perscanline_mats.shape[0] >= 2:
+                        _rs_groups = rs_perscanline_mats.astype(np.float32).ravel()
+                        _n_groups = np.int32(rs_perscanline_mats.shape[0])
+                    else:
+                        _rs_groups = np.zeros(96, dtype=np.float32)
+                        _n_groups = np.int32(1)
 
                     if HAS_NUMBA:
                         if has_Rc:
@@ -6759,7 +7050,13 @@ class VideoProcessor(QThread):
                             Rc[0,0], Rc[0,1], Rc[0,2],
                             Rc[1,0], Rc[1,1], Rc[1,2],
                             Rc[2,0], Rc[2,1], Rc[2,2],
-                            _cmx_r, _cmy_r, xyz_x_r.shape[0])
+                            _cmx_r, _cmy_r, xyz_x_r.shape[0],
+                            _rs_groups, _n_groups,
+                            np.float32(0), np.float32(0), np.float32(0),  # klns_c0..c2
+                            np.float32(0), np.float32(0),                 # klns_c3, c4
+                            np.float32(0), np.float32(0),                 # cx_s, cy_s
+                            np.float32(0), np.float32(_rs_readout_s),     # cal_d, srot_s
+                            False)
                         mx = _cmx_r.reshape(out_height, half_w)
                         my = _cmy_r.reshape(out_height, half_w)
                     else:
@@ -6786,7 +7083,8 @@ class VideoProcessor(QThread):
                                                        _export_interp, borderMode=cv2.BORDER_CONSTANT,
                                                        borderValue=(0, 0, 0))
 
-                def _process_left_eye_cross_rs(crossB, R_sensor, angular_vel, R_cross=None):
+                def _process_left_eye_cross_rs(crossB, R_sensor, angular_vel, R_cross=None,
+                                               rs_perscanline_mats=None):
                     """RS + rotation for left eye (no-firmware-RS mode only).
                     Same as _process_right_eye_cross_rs but uses left-eye grid/buffers."""
                     R = R_sensor.astype(np.float32)
@@ -6794,6 +7092,15 @@ class VideoProcessor(QThread):
                     pitch_coeff = np.float32(angular_vel[1] * rs_pitch_factor) * _rs_deg2rad
                     roll_coeff  = np.float32(angular_vel[0] * rs_roll_factor) * _rs_deg2rad
                     has_Rc = R_cross is not None and np.max(np.abs(R_cross - np.eye(3, dtype=np.float32))) > 1e-6
+
+                    # Build rs_groups buffer for per-scanline path
+                    if rs_perscanline_mats is not None and rs_perscanline_mats.shape[0] >= 2:
+                        _rs_groups = rs_perscanline_mats.astype(np.float32).ravel()
+                        _n_groups = np.int32(rs_perscanline_mats.shape[0])
+                    else:
+                        _rs_groups = np.zeros(96, dtype=np.float32)
+                        _n_groups = np.int32(1)
+
                     if HAS_NUMBA:
                         Rc = R_cross.astype(np.float32) if has_Rc else np.eye(3, dtype=np.float32)
                         _nb_cross_remap_rs(
@@ -6803,7 +7110,13 @@ class VideoProcessor(QThread):
                             yaw_coeff, pitch_coeff, roll_coeff,
                             has_Rc,
                             Rc[0,0], Rc[0,1], Rc[0,2], Rc[1,0], Rc[1,1], Rc[1,2], Rc[2,0], Rc[2,1], Rc[2,2],
-                            _cmx_l, _cmy_l, xyz_x.shape[0])
+                            _cmx_l, _cmy_l, xyz_x.shape[0],
+                            _rs_groups, _n_groups,
+                            np.float32(0), np.float32(0), np.float32(0),
+                            np.float32(0), np.float32(0),
+                            np.float32(0), np.float32(0),
+                            np.float32(0), np.float32(_rs_readout_s),
+                            False)
                         mx = _cmx_l.reshape(out_height, half_w)
                         my = _cmy_l.reshape(out_height, half_w)
                     else:
@@ -6862,7 +7175,8 @@ class VideoProcessor(QThread):
             def process_frame_opencv(frame, gyro_left, gyro_right, angular_vel=None,
                                      rs_R_sensor_right=None, rs_R_cross_right=None,
                                      pre_split_s0=None, pre_split_s4=None,
-                                     pre_split_eyes=None, pre_crosses=None):
+                                     pre_split_eyes=None, pre_crosses=None,
+                                     rs_perscanline_mats=None):
                 """Process a single SBS frame with parallel remap per eye.
 
                 gyro_left/gyro_right: IORI_cancel × heading × global × stereo (for non-RS path).
@@ -6921,7 +7235,8 @@ class VideoProcessor(QThread):
                                 crossA, _mlx_xyz_x, _mlx_xyz_y, _mlx_xyz_z,
                                 rs_R_sensor_right, _mlx_t_offset, rs_c,
                                 rs_R_cross_right if has_Rc else None, has_Rc, _mlx_n_pixels,
-                                pix_max=65535.0)
+                                pix_max=65535.0,
+                                rs_perscanline_mats=rs_perscanline_mats)
                         else:
                             # Right eye: no RS
                             right_out = _mlx_process_eye(
@@ -6934,7 +7249,8 @@ class VideoProcessor(QThread):
                             left_out = _mlx_process_eye(
                                 crossB, _mlx_xyz_x, _mlx_xyz_y, _mlx_xyz_z,
                                 R_left_eye, _mlx_t_offset, rs_c,
-                                None, False, _mlx_n_pixels, pix_max=65535.0)
+                                None, False, _mlx_n_pixels, pix_max=65535.0,
+                                rs_perscanline_mats=rs_perscanline_mats)
                         else:
                             left_out = _mlx_process_eye(
                                 crossB, _mlx_xyz_x, _mlx_xyz_y, _mlx_xyz_z,
@@ -6960,7 +7276,10 @@ class VideoProcessor(QThread):
                                 color_1d_lut, lut_3d, cfg.lut_intensity,
                                 _fused_sharpen_kernel, _fused_sharpen_lat,
                                 _sharpen_amount if _sharpen_enabled else 0.0, _fused_sharpen_ksize,
-                                pix_dtype=np.uint16)
+                                pix_dtype=np.uint16,
+                                rs_perscanline_mats=rs_perscanline_mats,
+                                srot_s=_rs_readout_s,
+                                no_firmware_rs=_no_fw_rs)
                         else:
                             _cuda_fused_process(
                                 crossA, crossB, _cuda_xyz_x, _cuda_xyz_y, _cuda_xyz_z,
@@ -6986,7 +7305,9 @@ class VideoProcessor(QThread):
                                 crossA, _wgpu_xyz_x_buf, _wgpu_xyz_y_buf, _wgpu_xyz_z_buf,
                                 rs_R_sensor_right, _wgpu_t_offset_buf, rs_c,
                                 rs_R_cross_right if has_Rc else None, has_Rc,
-                                _wgpu_n_pixels_render, _wgpu_out_buf)
+                                _wgpu_n_pixels_render, _wgpu_out_buf,
+                                rs_perscanline_mats=rs_perscanline_mats,
+                                srot_s=_rs_readout_s)
                         else:
                             right_out = _wgpu_process_eye(
                                 crossA, _wgpu_xyz_x_buf, _wgpu_xyz_y_buf, _wgpu_xyz_z_buf,
@@ -6997,7 +7318,9 @@ class VideoProcessor(QThread):
                             left_out = _wgpu_process_eye(
                                 crossB, _wgpu_xyz_x_buf, _wgpu_xyz_y_buf, _wgpu_xyz_z_buf,
                                 R_left_eye, _wgpu_t_offset_buf, rs_c,
-                                None, False, _wgpu_n_pixels_render, _wgpu_out_buf)
+                                None, False, _wgpu_n_pixels_render, _wgpu_out_buf,
+                                rs_perscanline_mats=rs_perscanline_mats,
+                                srot_s=_rs_readout_s)
                         else:
                             left_out = _wgpu_process_eye(
                                 crossB, _wgpu_xyz_x_buf, _wgpu_xyz_y_buf, _wgpu_xyz_z_buf,
@@ -7008,9 +7331,11 @@ class VideoProcessor(QThread):
                         # Numba prange uses all cores internally — run eyes sequentially
                         # to avoid concurrent prange crash (workqueue layer not thread-safe)
                         if rs_enabled and angular_vel is not None and rs_R_sensor_right is not None and geoc_klns is not None:
-                            _process_right_eye_cross_rs(crossA, rs_R_sensor_right, angular_vel, rs_R_cross_right)
+                            _process_right_eye_cross_rs(crossA, rs_R_sensor_right, angular_vel, rs_R_cross_right,
+                                                        rs_perscanline_mats=rs_perscanline_mats)
                             if _no_fw_rs:
-                                _process_left_eye_cross_rs(crossB, R_left_eye, angular_vel, None)
+                                _process_left_eye_cross_rs(crossB, R_left_eye, angular_vel, None,
+                                                           rs_perscanline_mats=rs_perscanline_mats)
                             else:
                                 _process_left_eye_cross(crossB, R_left_eye)
                         else:
@@ -7019,10 +7344,13 @@ class VideoProcessor(QThread):
                     elif rs_enabled and angular_vel is not None and rs_R_sensor_right is not None and geoc_klns is not None:
                         t_right = threading.Thread(
                             target=_process_right_eye_cross_rs,
-                            args=(crossA, rs_R_sensor_right, angular_vel, rs_R_cross_right))
+                            kwargs=dict(crossA=crossA, R_sensor=rs_R_sensor_right,
+                                        angular_vel=angular_vel, R_cross=rs_R_cross_right,
+                                        rs_perscanline_mats=rs_perscanline_mats))
                         t_right.start()
                         if _no_fw_rs:
-                            _process_left_eye_cross_rs(crossB, R_left_eye, angular_vel)
+                            _process_left_eye_cross_rs(crossB, R_left_eye, angular_vel,
+                                                       rs_perscanline_mats=rs_perscanline_mats)
                         else:
                             _process_left_eye_cross(crossB, R_left_eye)
                         t_right.join()
@@ -7792,12 +8120,20 @@ class VideoProcessor(QThread):
                 _sharpen_tag = _mlx_sharpen_tag
             _rs_tag = ""
             if rs_enabled:
-                _rs_tag = f" | RS: 3D-rot ({rs_yaw_factor:.1f},{rs_pitch_factor:.1f},{rs_roll_factor:.1f})"
+                # "PS-32" = per-scanline 32-group ω from raw 800Hz gyro;
+                # "1-ω" = single per-frame ω replicated across rows.
+                _rs_mode_tag = "PS-32" if (precomputed is not None and precomputed.get('rs_perscanline') is not None) else "1-ω"
+                _rs_tag = f" | RS: 3D-rot {_rs_mode_tag} ({rs_yaw_factor:.1f},{rs_pitch_factor:.1f},{rs_roll_factor:.1f}) win={cfg.gyro_window_ms:.1f}ms"
+            # Stabilization smoothing tag — confirms the Smooth Window slider is reaching the worker
+            _stab_tag = ""
+            if cfg.gyro_data and cfg.gyro_smooth_ms is not None:
+                _stab_label = "lock" if cfg.gyro_smooth_ms < 1 else f"{cfg.gyro_smooth_ms:.0f}ms"
+                _stab_tag = f" | Stab: {_stab_label}"
             _denoise_tag = f" | Denoise: {cfg.denoise_strength*100:.0f}%" if cfg.denoise_strength > 0.01 else ""
-            self.status.emit(f"Processing frames... [Decode: {_decode_tag_ref[0]} | Remap: {_remap_tag}{_denoise_tag}{_sharpen_tag}{_rs_tag}]")
+            self.status.emit(f"Processing frames... [Decode: {_decode_tag_ref[0]} | Remap: {_remap_tag}{_denoise_tag}{_sharpen_tag}{_stab_tag}{_rs_tag}]")
             self.output_line.emit(
                 f"Export: {total_frames} frames @ {fps:.2f} fps  |  "
-                f"Decode: {_decode_tag_ref[0]}  |  Remap: {_remap_tag}{_sharpen_tag}{_rs_tag}  |  "
+                f"Decode: {_decode_tag_ref[0]}  |  Remap: {_remap_tag}{_sharpen_tag}{_stab_tag}{_rs_tag}  |  "
                 f"Output: {cfg.output_path.name}")
 
             # For .360: decode raw EAC frames. With parallel decode, each stream is
@@ -8522,7 +8858,8 @@ class VideoProcessor(QThread):
                                                      rs_R_sensor_right, rs_R_cross_right,
                                                      pre_split_s0=_pre_s0, pre_split_s4=_pre_s4,
                                                      pre_split_eyes=_dec_eye_pair,
-                                                     pre_crosses=_pre_crosses)
+                                                     pre_crosses=_pre_crosses,
+                                                     rs_perscanline_mats=_rs_perscanline_mats)
 
                     # Fisheye: zero pixels outside circular FOV (cv2.bitwise_and, ~6ms)
                     if _fisheye_mode and _fish_mask_3ch is not None:
@@ -9530,6 +9867,105 @@ class DenoisePreviewWorker(QThread):
             except Exception: pass
 
 
+class LogViewerDialog(QDialog):
+    """Live log viewer — subscribes to the stdout/stderr tee and shows
+    output in real time. Replays the recent buffer on open so users see
+    everything that has been printed during this session."""
+
+    _log_signal = pyqtSignal(str)  # marshals tee writes to the GUI thread
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("VR180 Silver Bullet — Log")
+        self.resize(960, 520)
+        # Tool window: stays on top of parent but doesn't grab focus
+        self.setWindowFlag(Qt.WindowType.Tool, True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        # Path label
+        path_lbl = QLabel(f"Log file: {LOG_FILE_PATH}" if LOG_FILE_PATH else "Log file: (unavailable)")
+        path_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(path_lbl)
+
+        # Text area
+        self.text = QPlainTextEdit(self)
+        self.text.setReadOnly(True)
+        self.text.setMaximumBlockCount(10_000)
+        self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        font = self.text.font()
+        font.setFamily('Menlo' if sys.platform == 'darwin' else 'Consolas')
+        font.setPointSize(10)
+        self.text.setFont(font)
+        layout.addWidget(self.text, 1)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self._auto_scroll = QCheckBox("Auto-scroll")
+        self._auto_scroll.setChecked(True)
+        btn_clear = QPushButton("Clear")
+        btn_clear.clicked.connect(self.text.clear)
+        btn_copy = QPushButton("Copy All")
+        btn_copy.clicked.connect(self._copy_all)
+        btn_reveal = QPushButton("Reveal Log File")
+        btn_reveal.clicked.connect(self._reveal_log_file)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.close)
+        btn_row.addWidget(self._auto_scroll)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_clear)
+        btn_row.addWidget(btn_copy)
+        btn_row.addWidget(btn_reveal)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        # Replay history
+        history = _StreamTee.replay()
+        if history:
+            self.text.setPlainText(history.rstrip('\n'))
+            self._scroll_to_bottom()
+
+        # Live subscribe (signal hop keeps GUI updates on the main thread)
+        self._log_signal.connect(self._append_text)
+        self._cb = self._log_signal.emit
+        _StreamTee.subscribe(self._cb)
+
+    def _append_text(self, text):
+        # Strip a single trailing newline so QPlainTextEdit doesn't insert blanks
+        cur = self.text.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        cur.insertText(text)
+        if self._auto_scroll.isChecked():
+            self._scroll_to_bottom()
+
+    def _scroll_to_bottom(self):
+        sb = self.text.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _copy_all(self):
+        QApplication.clipboard().setText(self.text.toPlainText())
+
+    def _reveal_log_file(self):
+        if LOG_FILE_PATH is None:
+            QMessageBox.information(self, "Log", "Log file is not available.")
+            return
+        try:
+            if sys.platform == 'darwin':
+                subprocess.Popen(['open', '-R', str(LOG_FILE_PATH)])
+            elif sys.platform == 'win32':
+                subprocess.Popen(['explorer', f'/select,{LOG_FILE_PATH}'])
+            else:
+                subprocess.Popen(['xdg-open', str(LOG_FILE_PATH.parent)])
+        except Exception as e:
+            QMessageBox.warning(self, "Log", f"Could not reveal log file:\n{e}")
+
+    def closeEvent(self, ev):
+        _StreamTee.unsubscribe(self._cb)
+        super().closeEvent(ev)
+
+
 class VR180ProcessorGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -9559,6 +9995,11 @@ class VR180ProcessorGUI(QMainWindow):
         self.denoise_timer = QTimer()
         self.denoise_timer.setSingleShot(True)
         self.denoise_timer.timeout.connect(self._request_denoise_preview)
+        # Gyro-window slider debounce — VQF re-run is heavy (~2-4s for multi-segment).
+        # Wait 600ms after the last slider tick before reloading.
+        self.gyro_window_timer = QTimer()
+        self.gyro_window_timer.setSingleShot(True)
+        self.gyro_window_timer.timeout.connect(self._reload_gyro_with_new_window)
 
         # Enable drag and drop
         self.setAcceptDrops(True)
@@ -9567,7 +10008,52 @@ class VR180ProcessorGUI(QMainWindow):
         self._apply_styles()
         self._connect_signals()
         self._load_settings()
-    
+        self._setup_log_menu()
+
+    def _setup_log_menu(self):
+        """Add a Help menu with 'Show Log...' so users can see startup
+        messages, MLX/CUDA detection, FFmpeg subprocess output, etc.
+        without having to launch the binary from a terminal."""
+        from PyQt6.QtGui import QAction, QKeySequence
+        bar = self.menuBar()
+        # On macOS the menu bar lives at the top of the screen; on Windows
+        # / Linux it appears inside the window — both are fine.
+        help_menu = bar.addMenu("&Help")
+
+        act_show = QAction("Show Log…", self)
+        # On macOS, Qt translates Ctrl→Cmd automatically.
+        act_show.setShortcut(QKeySequence("Ctrl+Shift+L"))
+        act_show.triggered.connect(self._show_log_viewer)
+        help_menu.addAction(act_show)
+
+        if LOG_FILE_PATH is not None:
+            act_reveal = QAction("Reveal Log File in Finder…" if sys.platform == 'darwin'
+                                 else "Show Log File…", self)
+            act_reveal.triggered.connect(self._reveal_log_file_external)
+            help_menu.addAction(act_reveal)
+
+        self._log_viewer = None  # lazy
+
+    def _show_log_viewer(self):
+        if self._log_viewer is None:
+            self._log_viewer = LogViewerDialog(self)
+        self._log_viewer.show()
+        self._log_viewer.raise_()
+        self._log_viewer.activateWindow()
+
+    def _reveal_log_file_external(self):
+        if LOG_FILE_PATH is None:
+            return
+        try:
+            if sys.platform == 'darwin':
+                subprocess.Popen(['open', '-R', str(LOG_FILE_PATH)])
+            elif sys.platform == 'win32':
+                subprocess.Popen(['explorer', f'/select,{LOG_FILE_PATH}'])
+            else:
+                subprocess.Popen(['xdg-open', str(LOG_FILE_PATH.parent)])
+        except Exception as e:
+            QMessageBox.warning(self, "Log", f"Could not reveal log file:\n{e}")
+
     def _init_ui(self):
         self.setWindowTitle("VR180 Silver Bullet V1.1")
         self.setMinimumSize(1400, 900)
@@ -9796,10 +10282,10 @@ class VR180ProcessorGUI(QMainWindow):
         gopro_layout.addWidget(self.gyro_load_row)
 
         self.gyro_stabilize_checkbox = QCheckBox("Enable Gyro Stabilization")
-        if HAS_SCIPY:
-            self.gyro_stabilize_checkbox.setToolTip("Use CORI (Camera Orientation) data to smooth camera motion.\nRequires .360 file to be loaded.")
-        else:
-            self.gyro_stabilize_checkbox.setToolTip("Requires scipy package. Install with: pip install scipy")
+        self.gyro_stabilize_checkbox.setToolTip(
+            "Use CORI (Camera Orientation) data to smooth camera motion.\n"
+            "Requires .360 file to be loaded."
+        )
         self.gyro_stabilize_checkbox.setChecked(False)
         self.gyro_stabilize_checkbox.setEnabled(False)
         gopro_layout.addWidget(self.gyro_stabilize_checkbox)
@@ -9887,7 +10373,7 @@ class VR180ProcessorGUI(QMainWindow):
 
         # Yaw RS factor slider (pan around body-Z → horizontal shear)
         rs_grid.addWidget(QLabel("Yaw Factor:"), 1, 0)
-        self.rs_factor_slider = SliderWithSpinBox(-4.0, 4.0, 0.0, 2, 0.01, "")
+        self.rs_factor_slider = SliderWithSpinBox(-4.0, 4.0, 1.0, 2, 0.01, "")
         self.rs_factor_slider.setToolTip(
             "Yaw RS correction factor (pan around body-Z → horizontal shear).\n"
             "Negated internally. Positive = correct. Default = 0."
@@ -9896,7 +10382,7 @@ class VR180ProcessorGUI(QMainWindow):
 
         # Pitch RS factor slider (tilt around body-X → vertical shear)
         rs_grid.addWidget(QLabel("Pitch Factor:"), 2, 0)
-        self.rs_pitch_factor_slider = SliderWithSpinBox(-4.0, 4.0, 2.0, 2, 0.01, "")
+        self.rs_pitch_factor_slider = SliderWithSpinBox(-4.0, 4.0, 1.0, 2, 0.01, "")
         self.rs_pitch_factor_slider.setToolTip(
             "Pitch RS correction factor (tilt around body-X → vertical shear).\n"
             "Positive = cancel firmware's wrong RS. Default = 2.0."
@@ -9905,7 +10391,7 @@ class VR180ProcessorGUI(QMainWindow):
 
         # Roll RS factor slider (roll around body-Y → rotational shear)
         rs_grid.addWidget(QLabel("Roll Factor:"), 3, 0)
-        self.rs_roll_factor_slider = SliderWithSpinBox(-4.0, 4.0, 2.0, 2, 0.01, "")
+        self.rs_roll_factor_slider = SliderWithSpinBox(-4.0, 4.0, 1.0, 2, 0.01, "")
         self.rs_roll_factor_slider.setToolTip(
             "Roll RS correction factor (roll around body-Y → rotational shear).\n"
             "Positive = cancel firmware's wrong RS. Default = 2.0."
@@ -9933,6 +10419,22 @@ class VR180ProcessorGUI(QMainWindow):
         )
         self.rs_no_firmware_checkbox.setChecked(False)
         rs_grid.addWidget(self.rs_no_firmware_checkbox, 5, 0, 1, 2)
+
+        # Gyro averaging window (no-firmware-RS / VQF mode)
+        rs_grid.addWidget(QLabel("Gyro Avg Window:"), 6, 0)
+        self.gyro_window_slider = SliderWithSpinBox(1.0, 33.0, 15.224, 1, 0.5, " ms")
+        self.gyro_window_slider.setToolTip(
+            "Width of the averaging window applied to VQF orientation samples\n"
+            "when computing each frame's CORI (no-firmware-RS mode only).\n\n"
+            "1 ms ≈ point sample at readout midpoint (default — effectively disabled).\n"
+            "15.224 ms = sensor readout time (averages over the actual RS window).\n"
+            "33 ms = full frame time (heaviest averaging, may attenuate high-freq vibration).\n\n"
+            "Default is 1 ms (disabled): the inter-frame Smooth Window slider already\n"
+            "absorbs any per-frame CORI noise, so additional pre-smoothing here adds\n"
+            "phase lag without measurable benefit. Raise it only when experimenting.\n"
+            "Changing this re-runs gyro fusion."
+        )
+        rs_grid.addWidget(self.gyro_window_slider, 6, 1)
 
         advanced_layout.addWidget(self.rs_controls_widget)
         self.advanced_settings_widget.setVisible(False)
@@ -10297,6 +10799,8 @@ class VR180ProcessorGUI(QMainWindow):
         self.rs_pitch_factor_slider.valueChanged.connect(self._schedule_preview_update)
         self.rs_roll_factor_slider.valueChanged.connect(self._schedule_preview_update)
         self.rs_use_cori_checkbox.toggled.connect(self._schedule_preview_update)
+        # Gyro avg window: changing this requires re-running VQF (heavy), so debounce
+        self.gyro_window_slider.valueChanged.connect(self._on_gyro_window_changed)
         self.rs_no_firmware_checkbox.toggled.connect(self._on_no_firmware_rs_toggled)
 
         # Initial state
@@ -10426,11 +10930,13 @@ class VR180ProcessorGUI(QMainWindow):
             self.gopro_status.setStyleSheet("QLabel { color: #0066cc; font-style: italic; }")
             QApplication.processEvents()
 
+            _w_ms = float(self.gyro_window_slider.value())
             if is_multi:
-                gyro_data = concatenate_gyro_data(gyro_segments)
+                gyro_data = concatenate_gyro_data(gyro_segments, window_ms=_w_ms)
             else:
-                gyro_data = parse_gopro_gyro_data(path)
+                gyro_data = parse_gopro_gyro_data(path, window_ms=_w_ms)
             self.config.gyro_data = gyro_data
+            self.config.gyro_window_ms = _w_ms
             # Detect no-firmware-RS mode: VQF fusion was used instead of firmware CORI
             if gyro_data.get('cori_is_vqf', False):
                 self.config.no_firmware_rs = True
@@ -10445,10 +10951,19 @@ class VR180ProcessorGUI(QMainWindow):
                 self.rs_no_firmware_checkbox.setChecked(True)
                 self.rs_no_firmware_checkbox.blockSignals(False)
             else:
+                # Firmware-RS: right eye needs +2.0 to cancel wrong-direction
+                # firmware RS, left eye gets 0 (firmware already correct).
                 self.config.no_firmware_rs = False
+                self.config.rs_yaw_factor = 0.0
+                self.config.rs_pitch_factor = 2.0
+                self.config.rs_roll_factor = 2.0
+                self.rs_factor_slider.setValue(0.0)
+                self.rs_pitch_factor_slider.setValue(2.0)
+                self.rs_roll_factor_slider.setValue(2.0)
                 self.rs_no_firmware_checkbox.blockSignals(True)
                 self.rs_no_firmware_checkbox.setChecked(False)
                 self.rs_no_firmware_checkbox.blockSignals(False)
+                print("Firmware-RS mode: RS factors set to (0,2,2) for right eye only")
             self._rebuild_gyro_stabilizer()
 
             self.gyro_stabilize_checkbox.setEnabled(True)
@@ -10504,9 +11019,15 @@ class VR180ProcessorGUI(QMainWindow):
                 if gyro_times is not None and len(gyro_times) > 0:
                     gyro_data['gyro_angvel_times'] = gyro_times
                     gyro_data['gyro_angvel'] = gyro_angvel
-                    print(f"Loaded 800Hz GYRO angular velocity: {len(gyro_times)} samples")
+                    print(f"[PS] Loaded 800Hz GYRO angular velocity: {len(gyro_times)} samples → per-scanline RS enabled (PS-32)")
+                    # Rebuild stabilizer so it picks up the 800Hz gyro data — required
+                    # for per-scanline RS (precompute_export_matrices checks gyro_angvel).
+                    self._rebuild_gyro_stabilizer()
+                else:
+                    print(f"[PS] 800Hz GYRO load returned empty → falling back to single-ω RS (1-ω)")
             except Exception as e:
-                print(f"Warning: Could not load GYRO angular velocity: {e}")
+                print(f"[PS] Warning: Could not load GYRO angular velocity: {e} → falling back to 1-ω")
+                import traceback; traceback.print_exc()
 
             # Auto-set RS from SROT
             srot_ms = gyro_data.get('srot_ms')
@@ -10556,13 +11077,15 @@ class VR180ProcessorGUI(QMainWindow):
             self.gopro_status.setStyleSheet("QLabel { color: #0066cc; font-style: italic; }")
             QApplication.processEvents()
 
+            _w_ms = float(self.gyro_window_slider.value())
             if is_multi:
                 self.gopro_status.setText(f"Parsing gyro from {len(segments)} segments...")
                 QApplication.processEvents()
-                gyro_data = concatenate_gyro_data(segments)
+                gyro_data = concatenate_gyro_data(segments, window_ms=_w_ms)
             else:
-                gyro_data = parse_gopro_gyro_data(path)
+                gyro_data = parse_gopro_gyro_data(path, window_ms=_w_ms)
             self.config.gyro_data = gyro_data
+            self.config.gyro_window_ms = _w_ms
             if gyro_data.get('cori_is_vqf', False):
                 self.config.no_firmware_rs = True
                 self.config.rs_yaw_factor = 1.0
@@ -10576,10 +11099,19 @@ class VR180ProcessorGUI(QMainWindow):
                 self.rs_no_firmware_checkbox.blockSignals(False)
                 print("No-firmware-RS mode: RS factors set to (1,1,1) for both eyes")
             else:
+                # Firmware-RS: right eye needs +2.0 to cancel wrong-direction
+                # firmware RS, left eye gets 0 (firmware already correct).
                 self.config.no_firmware_rs = False
+                self.config.rs_yaw_factor = 0.0
+                self.config.rs_pitch_factor = 2.0
+                self.config.rs_roll_factor = 2.0
+                self.rs_factor_slider.setValue(0.0)
+                self.rs_pitch_factor_slider.setValue(2.0)
+                self.rs_roll_factor_slider.setValue(2.0)
                 self.rs_no_firmware_checkbox.blockSignals(True)
                 self.rs_no_firmware_checkbox.setChecked(False)
                 self.rs_no_firmware_checkbox.blockSignals(False)
+                print("Firmware-RS mode: RS factors set to (0,2,2) for right eye only")
             # Build stabilizer immediately for IORI compensation (even without gyro/RS enabled)
             self.gopro_status.setText("Building gyro stabilizer...")
             QApplication.processEvents()
@@ -10633,9 +11165,15 @@ class VR180ProcessorGUI(QMainWindow):
                 if gyro_times is not None and len(gyro_times) > 0:
                     gyro_data['gyro_angvel_times'] = gyro_times
                     gyro_data['gyro_angvel'] = gyro_angvel
-                    print(f"Loaded 800Hz GYRO angular velocity: {len(gyro_times)} samples")
+                    print(f"[PS] Loaded 800Hz GYRO angular velocity: {len(gyro_times)} samples → per-scanline RS enabled (PS-32)")
+                    # Rebuild stabilizer so it picks up the 800Hz gyro data — required
+                    # for per-scanline RS (precompute_export_matrices checks gyro_angvel).
+                    self._rebuild_gyro_stabilizer()
+                else:
+                    print(f"[PS] 800Hz GYRO load returned empty → falling back to single-ω RS (1-ω)")
             except Exception as e:
-                print(f"Warning: Could not load GYRO angular velocity: {e}")
+                print(f"[PS] Warning: Could not load GYRO angular velocity: {e} → falling back to 1-ω")
+                import traceback; traceback.print_exc()
 
             # Auto-set RS correction slider from SROT if available
             srot_ms = gyro_data.get('srot_ms')
@@ -10793,6 +11331,52 @@ class VR180ProcessorGUI(QMainWindow):
         if self.gyro_stabilize_checkbox.isChecked() and self.config.gyro_data:
             self._rebuild_gyro_stabilizer()
             self._schedule_preview_update()
+
+    def _on_gyro_window_changed(self, _value=None):
+        """Slider changed: debounce, then re-run VQF with new averaging window.
+        Only meaningful in no-firmware-RS mode (firmware CORI is fixed by the camera)."""
+        if not self.config.no_firmware_rs:
+            # Firmware-RS: VQF isn't run, slider has no effect. Update cfg anyway.
+            self.config.gyro_window_ms = float(self.gyro_window_slider.value())
+            return
+        if self.config.input_path is None:
+            return
+        # Debounce — restart timer on each tick, only fire after slider settles
+        self.gyro_window_timer.start(600)
+
+    def _reload_gyro_with_new_window(self):
+        """Re-parse gyro with the current gyro_window_slider value (no-firmware-RS only).
+        The 800Hz gyro_angvel buffer (used for per-scanline RS) is independent of
+        window_ms and is preserved from the previous gyro_data, so per-scanline
+        mode stays active across slider changes."""
+        if self.config.input_path is None:
+            return
+        window_ms = float(self.gyro_window_slider.value())
+        self.config.gyro_window_ms = window_ms
+        self.gopro_status.setText(f"Re-running VQF with {window_ms:.1f}ms averaging window…")
+        self.gopro_status.setStyleSheet("QLabel { color: #0066cc; font-style: italic; }")
+        QApplication.processEvents()
+        try:
+            old_gyro_data = self.config.gyro_data or {}
+            segments = self.config.segment_paths
+            if segments and len(segments) > 1:
+                gyro_data = concatenate_gyro_data(segments, window_ms=window_ms)
+            else:
+                gyro_data = parse_gopro_gyro_data(str(self.config.input_path), window_ms=window_ms)
+            # Preserve 800Hz angvel (independent of window_ms) — required for per-scanline RS
+            if 'gyro_angvel' in old_gyro_data and old_gyro_data['gyro_angvel'] is not None:
+                gyro_data['gyro_angvel'] = old_gyro_data['gyro_angvel']
+                gyro_data['gyro_angvel_times'] = old_gyro_data.get('gyro_angvel_times')
+            self.config.gyro_data = gyro_data
+            self._rebuild_gyro_stabilizer()
+            self._schedule_preview_update()
+            ps_status = "PS-32" if gyro_data.get('gyro_angvel') is not None else "1-ω"
+            self.gopro_status.setText(f"Gyro re-fused (window={window_ms:.1f}ms, {ps_status})")
+            self.gopro_status.setStyleSheet("QLabel { color: #0a0; }")
+        except Exception as e:
+            self.gopro_status.setText(f"Gyro re-fuse failed: {e}")
+            self.gopro_status.setStyleSheet("QLabel { color: #c00; }")
+            print(f"[GYRO_WINDOW] reload failed: {e}")
 
     def _rebuild_gyro_stabilizer(self):
         """Rebuild the GyroStabilizer with current slider values"""
@@ -11752,6 +12336,7 @@ class VR180ProcessorGUI(QMainWindow):
                         has_Rc,
                         Rc[0,0], Rc[0,1], Rc[0,2], Rc[1,0], Rc[1,1], Rc[1,2], Rc[2,0], Rc[2,1], Rc[2,2],
                         self._pv_mx_r, self._pv_my_r, n_pv,
+                        np.zeros(96, dtype=np.float32), np.int32(1),  # preview: single-ω
                         np.float32(_pv_kl[0]), np.float32(_pv_kl[1]), np.float32(_pv_kl[2]),
                         np.float32(_pv_kl[3]), np.float32(_pv_kl[4]),
                         np.float32(self.config.geoc_cal_dim / 2.0 + self.config.geoc_ctrx) if _pv_use_klns else np.float32(0),
@@ -11839,7 +12424,8 @@ class VR180ProcessorGUI(QMainWindow):
                         _l_yaw_c, _l_pitch_c, _l_roll_c,
                         False,
                         1,0,0, 0,1,0, 0,0,1,
-                        self._pv_mx_l, self._pv_my_l, n_pv)
+                        self._pv_mx_l, self._pv_my_l, n_pv,
+                        np.zeros(96, dtype=np.float32), np.int32(1))  # preview: single-ω
                     l_mx = self._pv_mx_l.reshape(h, half_w)
                     l_my = self._pv_my_l.reshape(h, half_w)
                     left = cv2.remap(_pv_crossB, l_mx, l_my,
@@ -12516,6 +13102,7 @@ class VR180ProcessorGUI(QMainWindow):
             rs_roll_factor=self.rs_roll_factor_slider.value(),
             rs_use_cori=self.rs_use_cori_checkbox.isChecked(),
             no_firmware_rs=self.config.no_firmware_rs,
+            gyro_window_ms=self.gyro_window_slider.value(),
             output_format=["equirect", "fisheye"][self.output_format_combo.currentIndex()],
             audio_ambisonics=self.audio_format_combo.currentData() == "ambisonic",
             geoc_klns=self.config.geoc_klns,

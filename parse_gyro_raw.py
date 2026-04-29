@@ -15,14 +15,56 @@ After integration, quaternion Y↔Z components are swapped to match CORI convent
 (Quaternion multiply is NOT covariant under Y↔Z swap, so integration must
 use correct body frame first, then transform output.)
 """
-import sys, os, struct, subprocess, json, math
+import sys, os, struct, subprocess, json, math, shutil
+from pathlib import Path
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-try:
-    from vr180_gui import get_ffmpeg_path, get_ffprobe_path, get_subprocess_flags
-except ImportError:
-    from vr180_gui_fish import get_ffmpeg_path, get_ffprobe_path, get_subprocess_flags
+
+# ── Local copies of ffmpeg/ffprobe path resolvers ─────────────────────────
+# Previously these were imported from vr180_gui, but that import triggers
+# a second full execution of vr180_gui.py because the running process has
+# vr180_gui registered as `__main__`, not `vr180_gui`. Importing it by name
+# loads it as a separate module and re-runs every top-level side effect
+# (logging tee, Numba compile, MLX init, etc.). Inlined here to break that
+# cycle. Keep these two definitions in sync with vr180_gui.py.
+
+def get_subprocess_flags():
+    """Hide console windows on Windows when spawning ffmpeg/ffprobe."""
+    if sys.platform == 'win32':
+        return subprocess.CREATE_NO_WINDOW
+    return 0
+
+
+def _resolve_bundled_binary(name):
+    """Locate a helper binary inside the PyInstaller bundle, returning None
+    if not bundled (caller falls back to PATH lookup)."""
+    if not getattr(sys, 'frozen', False):
+        return None
+    base = Path(sys._MEIPASS)
+    exe_name = f"{name}.exe" if sys.platform == 'win32' else name
+    p = base / exe_name
+    if p.exists():
+        return str(p)
+    if sys.platform == 'darwin':
+        for sub in ('Resources', 'Frameworks'):
+            p = base.parent / sub / name
+            if p.exists():
+                return str(p)
+    return None
+
+
+def get_ffmpeg_path():
+    p = _resolve_bundled_binary('ffmpeg')
+    if p:
+        return p
+    return shutil.which('ffmpeg') or 'ffmpeg'
+
+
+def get_ffprobe_path():
+    p = _resolve_bundled_binary('ffprobe')
+    if p:
+        return p
+    return shutil.which('ffprobe') or 'ffprobe'
 
 FILE_NEW = "/Users/siyangqi/Downloads/vr180_processor/GS010173.360"
 FILE_OLD = "/Users/siyangqi/Downloads/vr180_processor/GS010172.360"
@@ -1107,7 +1149,7 @@ def gyro_to_cori_quats(file_path, n_video_frames=None):
     }
 
 
-def vqf_to_cori_quats(file_path, n_video_frames=None):
+def vqf_to_cori_quats(file_path, n_video_frames=None, window_ms=1.0):
     """VQF-based IMU fusion: parse raw GYRO + GRAV/ACCL (+ MNOR) → orientation quats.
 
     Uses the VQF (Versatile Quaternion Filter) algorithm with:
@@ -1133,7 +1175,7 @@ def vqf_to_cori_quats(file_path, n_video_frames=None):
         from pyvqf import PyVQF
     except ImportError:
         print("vqf_to_cori_quats: pyvqf not available, falling back to pure gyro integration")
-        return _gyro_integration_to_cori(file_path, n_video_frames)
+        return _gyro_integration_to_cori(file_path, n_video_frames, window_ms=window_ms)
 
     result = parse_gyro_accl_full(file_path)
     gyro_blocks = result['gyro_blocks']
@@ -1175,7 +1217,7 @@ def vqf_to_cori_quats(file_path, n_video_frames=None):
 
     if acc_source == "unknown":
         print("vqf_to_cori_quats: no accelerometer data, falling back to gyro integration")
-        return _gyro_integration_to_cori(file_path, n_video_frames)
+        return _gyro_integration_to_cori(file_path, n_video_frames, window_ms=window_ms)
 
     # Resample accelerometer to gyro rate
     acc_resampled = np.zeros((len(gyro_body_rad), 3))
@@ -1216,14 +1258,16 @@ def vqf_to_cori_quats(file_path, n_video_frames=None):
     bias_est = vqf.getBiasEstimate()
     bias_deg_s = bias_est[0] * 180.0 / np.pi
 
-    # Resample to frame rate by AVERAGING VQF quats over the rolling-shutter
-    # readout window: [i/fps, i/fps + srot]. center = i/fps + srot/2, width = srot.
-    # GoPro MAX SROT = 15.224ms → ~12 samples averaged per frame.
+    # Resample to frame rate by SAMPLING VQF quats around the readout midpoint:
+    # window centered at i/fps + srot/2, width = window_ms. Default 1ms ≈ point
+    # sample (effectively disabled — inter-frame smoother already absorbs noise).
+    # User can widen toward 33ms for heavier pre-smoothing, but adds phase lag.
     SROT_S = 15.224 / 1000.0
+    window_s = max(0.001, window_ms / 1000.0)
     _, frame_quats = resample_quats_to_frames(
         gyro_times, vqf_quats, fps, n_video_frames,
-        time_offset_s=SROT_S / 2.0,  # window centered at mid-readout
-        window_s=SROT_S)              # average across the entire readout window
+        time_offset_s=SROT_S / 2.0,  # midpoint of readout (fixed by sensor)
+        window_s=window_s)            # user-configurable averaging width
 
     # Swap Y↔Z quaternion components to match CORI's native convention
     frame_quats[:, [2, 3]] = frame_quats[:, [3, 2]]
@@ -1243,13 +1287,13 @@ def vqf_to_cori_quats(file_path, n_video_frames=None):
             'iori_euler': zero_euler,
         })
 
-    samples_per_frame = int(SROT_S * len(gyro_times) / gyro_times[-1])
+    samples_per_frame = int(window_s * len(gyro_times) / gyro_times[-1])
     n_mag = len(mnor_body) if (mag_resampled is not None and mnor_body is not None) else 0
     print(f"vqf_to_cori_quats: VQF {'9D' if mag_resampled is not None else '6D'} "
           f"({acc_source}+{mag_source}), {len(gyro_body_rad)} gyro + {len(acc_input)} acc"
           f"{f' + {n_mag} mag' if mag_resampled is not None else ''} samples, "
           f"bias=[{bias_deg_s[0]:.3f}, {bias_deg_s[1]:.3f}, {bias_deg_s[2]:.3f}]°/s, "
-          f"{SROT_S*1000:.2f}ms readout-window averaging (~{samples_per_frame} samples/frame)")
+          f"{window_s*1000:.2f}ms averaging window (~{samples_per_frame} samples/frame)")
 
     return {
         'fps': fps,
@@ -1262,7 +1306,7 @@ def vqf_to_cori_quats(file_path, n_video_frames=None):
     }
 
 
-def _gyro_integration_to_cori(file_path, n_video_frames=None):
+def _gyro_integration_to_cori(file_path, n_video_frames=None, window_ms=1.0):
     """Pure gyro integration fallback when VQF / pyvqf is unavailable.
 
     Same readout-window averaging as the VQF path, but starts the
@@ -1288,10 +1332,11 @@ def _gyro_integration_to_cori(file_path, n_video_frames=None):
     quats = integrate_gyro_to_quats(gyro_times, gyro_body_rad)
 
     SROT_S = 15.224 / 1000.0
+    window_s = max(0.001, window_ms / 1000.0)
     _, frame_quats = resample_quats_to_frames(
         gyro_times, quats, fps, n_video_frames,
         time_offset_s=SROT_S / 2.0,
-        window_s=SROT_S)
+        window_s=window_s)
 
     frame_quats[:, [2, 3]] = frame_quats[:, [3, 2]]
     frame_eulers = quat_to_euler_batch(frame_quats)
@@ -1322,7 +1367,7 @@ def _gyro_integration_to_cori(file_path, n_video_frames=None):
     }
 
 
-def vqf_to_cori_quats_multi_segment(segment_paths, n_chapter_frames_list):
+def vqf_to_cori_quats_multi_segment(segment_paths, n_chapter_frames_list, window_ms=1.0):
     """Multi-segment version of vqf_to_cori_quats: aggregate raw gyro across
     all segments, integrate as ONE continuous stream, then resample to per-
     frame quats. This avoids any discontinuity at segment boundaries that
@@ -1482,10 +1527,11 @@ def vqf_to_cori_quats_multi_segment(segment_paths, n_chapter_frames_list):
 
     # ── Resample to combined frame timestamps with mid-readout averaging ──
     SROT_S = 15.224 / 1000.0
+    window_s = max(0.001, window_ms / 1000.0)
     _, frame_quats = resample_quats_to_frames(
         combined_gyro_times, quats, fps, total_n_frames,
         time_offset_s=SROT_S / 2.0,
-        window_s=SROT_S)
+        window_s=window_s)
 
     # Y↔Z swap to match CORI's native convention
     frame_quats[:, [2, 3]] = frame_quats[:, [3, 2]]
