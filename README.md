@@ -25,7 +25,6 @@ A professional VR180 stereo video processor for the **GoPro Max 2 VR180 Mod**. C
 ### Apple Vision Pro Spatial Video
 - **APMP metadata** — SBS exports tagged with vexu/eyes/proj/pack/cams/hfov atoms for native visionOS 26+ playback
 - **MV-HEVC direct encoder** (macOS only) — Built-in VideoToolbox spatial video encoding, no external dependencies
-- **APAC spatial audio** (macOS only) — Re-encodes the GoPro 4-channel ambisonic track to Apple Positional Audio Codec for true head-tracked spatialisation in visionOS. SA3D-tagged ambisonic AAC works for YouTube VR / Quest Browser but Vision Pro ignores it; APAC is the only audio format Vision Pro spatialises natively.
 - 65mm stereo baseline matching the GoPro Max 2 VR180 Mod lens separation
 
 ### Temporal Denoise (macOS only)
