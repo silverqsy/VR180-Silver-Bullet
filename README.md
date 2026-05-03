@@ -25,6 +25,7 @@ A professional VR180 stereo video processor for the **GoPro Max 2 VR180 Mod**. C
 ### Apple Vision Pro Spatial Video
 - **APMP metadata** — SBS exports tagged with vexu/eyes/proj/pack/cams/hfov atoms for native visionOS 26+ playback
 - **MV-HEVC direct encoder** (macOS only) — Built-in VideoToolbox spatial video encoding, no external dependencies
+- **APAC spatial audio** (macOS only) — Re-encodes the GoPro 4-channel ambisonic track to Apple Positional Audio Codec for true head-tracked spatialisation in visionOS. SA3D-tagged ambisonic AAC works for YouTube VR / Quest Browser but Vision Pro ignores it; APAC is the only audio format Vision Pro spatialises natively.
 - 65mm stereo baseline matching the GoPro Max 2 VR180 Mod lens separation
 
 ### Temporal Denoise (macOS only)
@@ -59,6 +60,15 @@ build_windows.bat
 ```
 **Requirements**: Python 3.10+, FFmpeg in PATH, NVIDIA GPU recommended for NVDEC/NVENC.
 
+#### CUDA (NVIDIA users)
+Numba supports **CUDA 12.x** (preferred) and **CUDA 11.x**. **CUDA 13+ is not supported.**
+
+Recommended download: [CUDA Toolkit 12.6](https://developer.nvidia.com/cuda-12-6-0-download-archive).
+
+The app auto-detects an installed CUDA toolkit at startup, preferring 12.x. If you already have CUDA 13 installed, install 12.6 alongside it — both can coexist and the app will pick 12.x first. Only the runtime libraries are needed (you can skip the compiler / Visual Studio integration in the "Custom" install).
+
+If no compatible CUDA toolkit is found, the app falls back to Numba's CPU JIT path — slower but functional.
+
 ## Building from Source
 
 ### macOS
@@ -71,6 +81,8 @@ swiftc -O -o mvhevc_encode mvhevc_encode.swift \
 swiftc -O -o vt_denoise vt_denoise.swift \
     -framework AVFoundation -framework VideoToolbox \
     -framework CoreMedia -framework CoreVideo
+swiftc -O -o apac_encode apac_encode.swift \
+    -framework AVFoundation -framework CoreMedia -framework AudioToolbox
 # Build app bundle
 python -m PyInstaller --clean vr180_silver_bullet.spec
 ```
