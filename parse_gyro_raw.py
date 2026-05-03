@@ -35,36 +35,20 @@ def get_subprocess_flags():
     return 0
 
 
-def _is_runnable(path):
-    """Cheap sanity check that a binary path can be invoked. Avoids handing
-    back a path that exists but is the wrong arch / wrong extension on
-    Windows (e.g. a Linux-style 'ffmpeg' file from a macOS build)."""
-    try:
-        if not path:
-            return False
-        if not os.path.isfile(path):
-            return False
-        if os.name == 'nt' and not path.lower().endswith('.exe'):
-            return False
-        return True
-    except Exception:
-        return False
-
-
 def _resolve_bundled_binary(name):
     """Locate a helper binary inside the PyInstaller bundle, returning None
-    if not bundled or not runnable (caller falls back to PATH lookup)."""
+    if not bundled (caller falls back to PATH lookup)."""
     if not getattr(sys, 'frozen', False):
         return None
     base = Path(sys._MEIPASS)
     exe_name = f"{name}.exe" if sys.platform == 'win32' else name
     p = base / exe_name
-    if _is_runnable(str(p)):
+    if p.exists():
         return str(p)
     if sys.platform == 'darwin':
         for sub in ('Resources', 'Frameworks'):
             p = base.parent / sub / name
-            if _is_runnable(str(p)):
+            if p.exists():
                 return str(p)
     return None
 
@@ -73,20 +57,14 @@ def get_ffmpeg_path():
     p = _resolve_bundled_binary('ffmpeg')
     if p:
         return p
-    sys_p = shutil.which('ffmpeg')
-    if sys_p and _is_runnable(sys_p):
-        return sys_p
-    return 'ffmpeg'
+    return shutil.which('ffmpeg') or 'ffmpeg'
 
 
 def get_ffprobe_path():
     p = _resolve_bundled_binary('ffprobe')
     if p:
         return p
-    sys_p = shutil.which('ffprobe')
-    if sys_p and _is_runnable(sys_p):
-        return sys_p
-    return 'ffprobe'
+    return shutil.which('ffprobe') or 'ffprobe'
 
 FILE_NEW = "/Users/siyangqi/Downloads/vr180_processor/GS010173.360"
 FILE_OLD = "/Users/siyangqi/Downloads/vr180_processor/GS010172.360"
@@ -109,18 +87,10 @@ GRAV_AXIS_SIGN = (1.0, 1.0, 1.0)
 
 def parse_gpmf_stream(file_path):
     """Extract raw GPMF metadata stream from .360 file."""
-    _ff = get_ffmpeg_path()
-    try:
-        result = subprocess.run([
-            _ff, '-i', str(file_path), '-map', '0:3', '-c', 'copy',
-            '-f', 'rawvideo', '-'
-        ], capture_output=True, creationflags=get_subprocess_flags())
-    except FileNotFoundError as e:
-        raise Exception(
-            f"FFmpeg not runnable: tried '{_ff}'. "
-            f"Install FFmpeg and add it to PATH "
-            f"(https://www.gyan.dev/ffmpeg/builds/) and re-launch the app."
-        ) from e
+    result = subprocess.run([
+        get_ffmpeg_path(), '-i', file_path, '-map', '0:3', '-c', 'copy',
+        '-f', 'rawvideo', '-'
+    ], capture_output=True, creationflags=get_subprocess_flags())
     if result.returncode != 0:
         raise Exception(f"Failed to extract GPMF: {result.stderr.decode()[:200]}")
     return result.stdout
@@ -170,20 +140,10 @@ def parse_gyro_accl_full(file_path):
     data = parse_gpmf_stream(file_path)
 
     # Get video info
-    _fp = get_ffprobe_path()
-    try:
-        probe_result = subprocess.run([
-            _fp, '-v', 'quiet', '-select_streams', 'v:0',
-            '-show_entries', 'stream=r_frame_rate,nb_frames,duration',
-            '-of', 'json', str(file_path)
-        ], capture_output=True, text=True, creationflags=get_subprocess_flags())
-    except FileNotFoundError as e:
-        raise Exception(
-            f"FFprobe not runnable: tried '{_fp}'. "
-            f"FFmpeg full build (which includes ffprobe.exe) must be on PATH. "
-            f"Download from https://www.gyan.dev/ffmpeg/builds/ and add the bin "
-            f"folder to PATH."
-        ) from e
+    probe_result = subprocess.run([
+        get_ffprobe_path(), '-v', 'quiet', '-select_streams', 'v:0',
+        '-show_entries', 'stream=r_frame_rate,nb_frames,duration', '-of', 'json', file_path
+    ], capture_output=True, text=True, creationflags=get_subprocess_flags())
     video_info = json.loads(probe_result.stdout)
     stream = video_info['streams'][0]
     fps_str = stream.get('r_frame_rate', '30/1')
