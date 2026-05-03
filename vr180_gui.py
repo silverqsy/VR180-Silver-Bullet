@@ -245,11 +245,40 @@ if _os.name == 'nt' and HAS_NUMBA:
 
     if not _cuda_found_path:
         import glob as _glob
+        # Skip well-known false-positive directories that ship an ancient
+        # cudart64_*.dll Numba can't use:
+        #   * NVIDIA PhysX SDK (PhysX/Common) ships CUDA 8-era cudart
+        #   * NVIDIA Display.NvContainer / GeForce Experience also bundle stubs
+        # Numba needs cudart from the actual CUDA Toolkit (11.x or 12.x), not
+        # these driver/SDK leftovers. Filtering them up front avoids both a
+        # confusing "Found cudart in PATH" message and the subsequent
+        # "runtime not loadable" error a few lines later.
+        _cudart_skip_patterns = ('physx', 'nvcontainer', 'geforce experience', 'display.driver')
         for _p in _os.environ.get('PATH', '').split(';'):
-            if _glob.glob(_os.path.join(_p, 'cudart64_*.dll')):
+            if not _p:
+                continue
+            _p_lower = _p.lower()
+            if any(s in _p_lower for s in _cudart_skip_patterns):
+                continue
+            _matches = _glob.glob(_os.path.join(_p, 'cudart64_*.dll'))
+            if not _matches:
+                continue
+            # Validate version: cudart64_NN.dll where NN ≥ 110 (CUDA 11.0+).
+            # Older drivers ship cudart64_80.dll (CUDA 8) which Numba rejects.
+            _ok = False
+            for _m in _matches:
+                _bn = _os.path.basename(_m)
+                # cudart64_120.dll (CUDA 12.0), cudart64_110.dll, cudart64_80.dll, ...
+                _digits = ''.join(c for c in _bn if c.isdigit())
+                if _digits and len(_digits) >= 3 and int(_digits[:3]) >= 110:
+                    _ok = True
+                    break
+            if _ok:
                 _cuda_found_path = _p
                 print(f"  Found cudart in PATH: {_p}")
                 break
+            else:
+                print(f"  ⏭ Skipping {_p} — cudart there is too old for Numba (need CUDA 11+)")
         if not _cuda_found_path:
             print("  ⚠ No Numba-compatible CUDA toolkit found")
             print("    Install CUDA 12.6: https://developer.nvidia.com/cuda-12-6-0-download-archive")
@@ -2859,73 +2888,79 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QPainter
 
 
+def _is_runnable(path):
+    """Cheap sanity check that a binary path can actually be invoked.
+    Catches the case where the bundle contains a stub / wrong-arch / Linux
+    binary (no .exe extension on Windows, e.g. when a macOS dev built the
+    package without a Windows ffmpeg in PATH).
+    """
+    try:
+        if not path:
+            return False
+        if not _os.path.isfile(path):
+            return False
+        if _os.name == 'nt' and not path.lower().endswith('.exe'):
+            return False
+        return _os.access(path, _os.X_OK) or _os.path.isfile(path)
+    except Exception:
+        return False
+
+
 def get_ffmpeg_path():
-    """Get the path to bundled ffmpeg or system ffmpeg"""
-    # Check if running from PyInstaller bundle
+    """Get the path to bundled ffmpeg or system ffmpeg.
+
+    Resolution order:
+      1. Bundled binary inside PyInstaller MEIPASS (frozen builds only)
+      2. macOS app bundle Resources/Frameworks dirs (frozen .app)
+      3. System PATH via shutil.which
+      4. Bare 'ffmpeg' (may fail on subprocess.run with WinError 2)
+
+    Each candidate is validated via _is_runnable to avoid handing back a
+    path that doesn't exist or is the wrong architecture/extension.
+    """
+    candidates = []
     if getattr(sys, 'frozen', False):
-        # Running in a bundle - check multiple possible locations
         base_path = Path(sys._MEIPASS)
-
-        # Try _internal folder (Windows/Linux style)
-        # On Windows, add .exe extension
         ffmpeg_name = 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg'
-        ffmpeg_path = base_path / ffmpeg_name
-        if ffmpeg_path.exists():
-            return str(ffmpeg_path)
-
-        # Try macOS app bundle Resources folder
+        candidates.append(str(base_path / ffmpeg_name))
         if sys.platform == 'darwin':
-            # Go up from _MEIPASS to find Resources
-            resources_path = base_path.parent / 'Resources' / 'ffmpeg'
-            if resources_path.exists():
-                return str(resources_path)
+            candidates.append(str(base_path.parent / 'Resources' / 'ffmpeg'))
+            candidates.append(str(base_path.parent / 'Frameworks' / 'ffmpeg'))
+    sys_ffmpeg = shutil.which('ffmpeg')
+    if sys_ffmpeg:
+        candidates.append(sys_ffmpeg)
 
-            # Try Frameworks folder
-            frameworks_path = base_path.parent / 'Frameworks' / 'ffmpeg'
-            if frameworks_path.exists():
-                return str(frameworks_path)
+    for c in candidates:
+        if _is_runnable(c):
+            return c
 
-    # Check for ffmpeg in system PATH
-    ffmpeg = shutil.which('ffmpeg')
-    if ffmpeg:
-        return ffmpeg
-
-    # Last resort: return just 'ffmpeg' and hope it's in PATH
+    # Last resort — bare 'ffmpeg'. If it's not on PATH, subprocess will
+    # raise FileNotFoundError (WinError 2 on Windows). The friendly error
+    # for that case is emitted by the caller (see _auto_load_360_gyro).
     return 'ffmpeg'
 
 
 def get_ffprobe_path():
-    """Get the path to bundled ffprobe or system ffprobe"""
-    # Check if running from PyInstaller bundle
+    """Get the path to bundled ffprobe or system ffprobe.
+
+    Mirrors get_ffmpeg_path's resolution order with executable validation.
+    """
+    candidates = []
     if getattr(sys, 'frozen', False):
-        # Running in a bundle - check multiple possible locations
         base_path = Path(sys._MEIPASS)
-
-        # Try _internal folder (Windows/Linux style)
-        # On Windows, add .exe extension
         ffprobe_name = 'ffprobe.exe' if sys.platform == 'win32' else 'ffprobe'
-        ffprobe_path = base_path / ffprobe_name
-        if ffprobe_path.exists():
-            return str(ffprobe_path)
-
-        # Try macOS app bundle Resources folder
+        candidates.append(str(base_path / ffprobe_name))
         if sys.platform == 'darwin':
-            # Go up from _MEIPASS to find Resources
-            resources_path = base_path.parent / 'Resources' / 'ffprobe'
-            if resources_path.exists():
-                return str(resources_path)
+            candidates.append(str(base_path.parent / 'Resources' / 'ffprobe'))
+            candidates.append(str(base_path.parent / 'Frameworks' / 'ffprobe'))
+    sys_ffprobe = shutil.which('ffprobe')
+    if sys_ffprobe:
+        candidates.append(sys_ffprobe)
 
-            # Try Frameworks folder
-            frameworks_path = base_path.parent / 'Frameworks' / 'ffprobe'
-            if frameworks_path.exists():
-                return str(frameworks_path)
+    for c in candidates:
+        if _is_runnable(c):
+            return c
 
-    # Check for ffprobe in system PATH
-    ffprobe = shutil.which('ffprobe')
-    if ffprobe:
-        return ffprobe
-
-    # Last resort: return just 'ffprobe' and hope it's in PATH
     return 'ffprobe'
 
 
@@ -2954,6 +2989,40 @@ def get_mvhevc_encode_path():
                 return str(candidate)
     # Development: sibling to this script
     dev_path = Path(__file__).resolve().parent / 'mvhevc_encode'
+    if dev_path.exists():
+        return str(dev_path)
+    return None
+
+
+def get_apac_encode_path():
+    """Get the path to the bundled apac_encode helper binary.
+
+    apac_encode is a Swift helper that reads a 4-channel ambisonic PCM
+    audio file (typically a temp WAV produced by ffmpeg from the
+    GoPro MAX 2 .360 4ch ambisonic track) and writes an .mp4 file with
+    a single APAC-encoded audio track. APAC is "Apple Positional Audio
+    Codec" — the only audio codec for which Apple's Vision Pro spatial
+    audio renderer does true head-tracked spatialisation. Standard
+    SA3D-tagged ambisonic AAC works on YouTube VR / Quest but Vision Pro
+    ignores SA3D and falls back to plain stereo.
+
+    macOS only (uses AVAssetWriter + kAudioFormatAPAC). Returns None on
+    other platforms or if the helper isn't present.
+    """
+    if sys.platform != 'darwin':
+        return None
+    # PyInstaller-frozen bundle
+    if getattr(sys, 'frozen', False):
+        base_path = Path(sys._MEIPASS)
+        for candidate in [
+            base_path / 'apac_encode',
+            base_path.parent / 'Resources' / 'apac_encode',
+            base_path.parent / 'Frameworks' / 'apac_encode',
+        ]:
+            if candidate.exists():
+                return str(candidate)
+    # Development: sibling to this script
+    dev_path = Path(__file__).resolve().parent / 'apac_encode'
     if dev_path.exists():
         return str(dev_path)
     return None
@@ -3776,9 +3845,17 @@ def parse_gopro_gyro_data(file_path: str, window_ms: float = 1.0) -> dict:
     import math
 
     # Extract GPMD stream using FFmpeg
-    result = subprocess.run([
-        get_ffmpeg_path(), '-i', file_path, '-map', '0:3', '-c', 'copy', '-f', 'rawvideo', '-'
-    ], capture_output=True, creationflags=get_subprocess_flags())
+    _ff = get_ffmpeg_path()
+    try:
+        result = subprocess.run([
+            _ff, '-i', str(file_path), '-map', '0:3', '-c', 'copy', '-f', 'rawvideo', '-'
+        ], capture_output=True, creationflags=get_subprocess_flags())
+    except FileNotFoundError as e:
+        raise Exception(
+            f"FFmpeg not runnable: tried '{_ff}'. "
+            f"Install FFmpeg full build (https://www.gyan.dev/ffmpeg/builds/) "
+            f"and add the bin folder to PATH, then re-launch the app."
+        ) from e
 
     if result.returncode != 0:
         raise Exception(f"Failed to extract GPMD data: {result.stderr.decode()}")
@@ -3786,10 +3863,18 @@ def parse_gopro_gyro_data(file_path: str, window_ms: float = 1.0) -> dict:
     data = result.stdout
 
     # Get video frame rate
-    probe_result = subprocess.run([
-        get_ffprobe_path(), '-v', 'quiet', '-select_streams', 'v:0',
-        '-show_entries', 'stream=r_frame_rate,nb_frames,duration', '-of', 'json', file_path
-    ], capture_output=True, text=True, creationflags=get_subprocess_flags())
+    _fp = get_ffprobe_path()
+    try:
+        probe_result = subprocess.run([
+            _fp, '-v', 'quiet', '-select_streams', 'v:0',
+            '-show_entries', 'stream=r_frame_rate,nb_frames,duration', '-of', 'json', str(file_path)
+        ], capture_output=True, text=True, creationflags=get_subprocess_flags())
+    except FileNotFoundError as e:
+        raise Exception(
+            f"FFprobe not runnable: tried '{_fp}'. "
+            f"Install FFmpeg full build (includes ffprobe.exe) from "
+            f"https://www.gyan.dev/ffmpeg/builds/ and add bin folder to PATH."
+        ) from e
 
     video_info = json.loads(probe_result.stdout)
     stream = video_info['streams'][0]
@@ -5248,6 +5333,14 @@ class ProcessingConfig:
     gamma: float = 1.0  # Gamma: midtone adjustment via power function
     gain: float = 1.0  # Gain: overall brightness multiplier, affects highlights
     saturation: float = 1.0  # Saturation: 0.0 = grayscale, 1.0 = neutral, 2.0 = max
+    # Tonal-zone adjustments (Resolve-style). Range -1.0 to +1.0 (±100%).
+    shadow: float = 0.0      # Smooth lift/lower of lower third (rolloff into mid)
+    highlight: float = 0.0   # Smooth lift/lower of upper third (rolloff into mid)
+    # White balance (range -1.0 to +1.0 mapped to channel multipliers ~±30%).
+    temperature: float = 0.0  # +warm (more R, less B) / -cool (more B, less R)
+    tint: float = 0.0         # +magenta (less G) / -green (more G)
+    # Mid-detail / clarity: midtone-weighted local-contrast boost. 0..2.0.
+    mid_detail: float = 0.0   # 0 = off, 1 = moderate, 2 = strong
     lift: float = 0.0  # Lift: raises/lowers black level (shadows only, preserves white point)
     h265_bit_depth: int = 8  # 8-bit or 10-bit for H.265
     inject_vr180_metadata: bool = False  # Inject VR180 metadata for YouTube
@@ -5281,6 +5374,8 @@ class ProcessingConfig:
     gyro_window_ms: float = 15.224
     # Audio output for .360 input
     audio_ambisonics: bool = False  # True = include ambisonic 4ch PCM; False = stereo AAC only
+    audio_apac: bool = False  # True = re-encode 4ch ambisonic to APAC for Vision Pro spatial audio
+                              # (requires apac_encode helper; only valid with APMP / MV-HEVC modes)
     # GEOC lens calibration (auto-parsed from .360 file)
     geoc_klns: list = None  # [c0,c1,c2,c3,c4] raw KLNS for right eye (FRNT after yaw mod)
     geoc_ctrx: float = 0.0  # FRNT principal point X offset (pixels)
@@ -6308,8 +6403,17 @@ class VideoProcessor(QThread):
                 except Exception as e:
                     self.status.emit(f"Warning: Failed to load LUT: {e}")
 
-            def build_color_1d_lut(lift, gamma, gain, bit_depth=8):
-                """Build 1D LUT for color adjustments. 256-entry uint8 for preview, 65536-entry uint16 for export."""
+            def build_color_1d_lut(lift, gamma, gain, shadow=0.0, highlight=0.0, bit_depth=8):
+                """Build 1D LUT (single-channel, applied identically to R/G/B) for
+                achromatic luminance adjustments: lift, gain, gamma, plus smooth-rolloff
+                shadow / highlight zone tweaks (Resolve Primary-style).
+
+                Shadow / highlight masks (pivot=0.5 implicit) are smoothstep curves
+                (3t²-2t³) so the falloff is C¹ continuous — closer to Resolve's
+                "naturalistic, no midtone artefacts" character than a hard quadratic.
+                Both apply BEFORE gamma so the final gamma encodes the
+                already-zone-adjusted curve.
+                """
                 n_entries = 256 if bit_depth == 8 else 65536
                 pix_max = 255.0 if bit_depth == 8 else 65535.0
                 x = np.arange(n_entries, dtype=np.float32) / pix_max
@@ -6317,10 +6421,125 @@ class VideoProcessor(QThread):
                     x = x + lift * (1.0 - x)
                 if abs(gain - 1.0) > 0.01:
                     x = x * gain
+                if abs(shadow) > 0.01:
+                    t = np.clip(1.0 - 2.0 * x, 0.0, 1.0)
+                    s_mask = t * t * (3.0 - 2.0 * t)
+                    x = x + shadow * s_mask * 0.6
+                if abs(highlight) > 0.01:
+                    t = np.clip(2.0 * x - 1.0, 0.0, 1.0)
+                    h_mask = t * t * (3.0 - 2.0 * t)
+                    x = x + highlight * h_mask * 0.6
                 x = np.clip(x, 0.0, 1.0)
                 if abs(gamma - 1.0) > 0.01:
                     x = np.power(x, 1.0 / gamma)
                 return np.clip(x * pix_max, 0, pix_max).astype(np.uint8 if bit_depth == 8 else np.uint16)
+
+            # ── Pre-allocated scratch buffers for per-frame post-processing ──
+            # Without these, apply_temp_tint and apply_mid_detail allocate ~2 GB
+            # of float32 / lum buffers PER FRAME, then immediately free them.
+            # Across a 9000-frame export = ~18 TB of allocator churn that just
+            # burns CPU time and memory bandwidth (not RAM). Keeping a pool of
+            # reusable buffers eliminates the churn while preserving the exact
+            # math (same float32 ops, same clip, same cast back).
+            _post_scratch = {}
+            def _get_scratch(shape, dtype=np.float32):
+                key = (shape, dtype.__name__ if hasattr(dtype, '__name__') else str(dtype))
+                buf = _post_scratch.get(key)
+                if buf is None or buf.shape != shape:
+                    buf = np.empty(shape, dtype=dtype)
+                    _post_scratch[key] = buf
+                return buf
+
+            def apply_temp_tint(frame, temperature, tint):
+                """Per-channel BGR multiply for white-balance shifts.
+                temperature: -1..+1 (- = cooler/blue, + = warmer/yellow)
+                tint:        -1..+1 (- = greener,    + = magenta)
+                Operates in display gamma space (no linearization). Cheap,
+                purely per-pixel, no spatial filter. Uses pre-allocated scratch
+                to avoid ~600 MB of per-frame allocation churn."""
+                if abs(temperature) < 0.01 and abs(tint) < 0.01:
+                    return frame
+                # Channel multipliers (0.7..1.3 at slider extremes), BGR order
+                scales = np.array([1.0 - 0.30 * temperature,    # B
+                                   1.0 - 0.30 * tint,            # G
+                                   1.0 + 0.30 * temperature],    # R
+                                  dtype=np.float32)
+                pix_max = 65535 if frame.dtype == np.uint16 else 255
+                f = _get_scratch(frame.shape, np.float32)
+                # uint16 × float32 → float32 (broadcast scalars across channels), in-place
+                np.multiply(frame, scales, out=f, casting='unsafe')
+                np.clip(f, 0, pix_max, out=f)
+                np.copyto(frame, f, casting='unsafe')   # truncates same as .astype(uint16)
+                return frame
+
+            def apply_mid_detail(frame, amount):
+                """Midtone-weighted local contrast (Resolve "Mid/Detail" / Lr "Clarity").
+
+                Optimisations:
+                  1. Blur is on a 1/4-resolution copy then upsampled (lossless for
+                     low-freq Gaussian — same trick Lightroom uses).
+                  2. All working buffers come from a pre-allocated scratch pool —
+                     zero per-frame allocator churn (~1.4 GB/frame saved).
+                  3. All numpy ops use `out=` form so no temporaries are allocated
+                     for the per-pixel arithmetic chain.
+
+                Quality is bit-identical to the previous implementation — same float32
+                math, same Gaussian, same midtone-weight formula, same clip and cast.
+                """
+                if abs(amount) < 0.01:
+                    return frame
+                is_uint16 = frame.dtype == np.uint16
+                pix_max = 65535.0 if is_uint16 else 255.0
+                inv_pix_max = np.float32(1.0 / pix_max)
+                h, w = frame.shape[:2]
+
+                # Full-res float scratch, holds normalised image throughout
+                f = _get_scratch(frame.shape, np.float32)
+                np.multiply(frame, inv_pix_max, out=f, casting='unsafe')
+
+                # ── Downsample → blur → upsample on scratch buffers ──
+                DS = 4
+                dh, dw = max(64, h // DS), max(64, w // DS)
+                f_small = _get_scratch((dh, dw, 3), np.float32)
+                cv2.resize(f, (dw, dh), dst=f_small, interpolation=cv2.INTER_AREA)
+                sigma_small = max(5.0, 0.01 * min(dh, dw))
+                ksize_small = max(3, int(sigma_small * 6) | 1)
+                blurred_small = _get_scratch(((dh, dw, 3), 'blur_small'), np.float32)
+                # cv2.GaussianBlur dst= must be allocated separately (can't be src)
+                cv2.GaussianBlur(f_small, (ksize_small, ksize_small), sigma_small, dst=blurred_small)
+                # Upsample into a separate full-res scratch — used as "detail" below
+                detail = _get_scratch((frame.shape, 'blur_full'), np.float32)
+                cv2.resize(blurred_small, (w, h), dst=detail, interpolation=cv2.INTER_LINEAR)
+                # detail = f - blurred (overwriting blurred into detail)
+                np.subtract(f, detail, out=detail)
+
+                # Luminance (BGR weights), in-place into lum scratch
+                lum = _get_scratch((h, w), np.float32)
+                np.multiply(f[..., 0], np.float32(0.114), out=lum)
+                tmp = _get_scratch((h, w, 'tmp'), np.float32)
+                np.multiply(f[..., 1], np.float32(0.587), out=tmp)
+                lum += tmp
+                np.multiply(f[..., 2], np.float32(0.299), out=tmp)
+                lum += tmp
+
+                # Bell weight: 1 - (2|lum-0.5|)^2, all in-place
+                np.subtract(lum, np.float32(0.5), out=lum)
+                np.abs(lum, out=lum)
+                np.multiply(lum, np.float32(2.0), out=lum)
+                np.multiply(lum, lum, out=lum)
+                np.subtract(np.float32(1.0), lum, out=lum)
+                np.clip(lum, 0, 1, out=lum)
+
+                # f += amount * detail * weight (broadcast lum across 3 channels)
+                np.multiply(detail, lum[..., np.newaxis], out=detail)
+                np.multiply(detail, np.float32(amount), out=detail)
+                np.add(f, detail, out=f)
+                np.clip(f, 0, 1, out=f)
+
+                # Scale back and cast in-place to the original frame buffer
+                np.multiply(f, np.float32(pix_max), out=f)
+                np.copyto(frame, f, casting='unsafe')
+                return frame
 
             def apply_color_1d(frame, lut_1d):
                 """Apply 1D color LUT via cv2.LUT (uint8) or Numba parallel (uint16)."""
@@ -6729,14 +6948,20 @@ class VideoProcessor(QThread):
             # Global adjustment and stereo offset are baked into gyro corrections
             # No separate manual adjustment matrices needed
 
-            # Pre-allocate triple output buffers (out_height × width)
-            # Triple-buffering: process writes to one buffer, encode thread reads another
-            # via memoryview (eliminating tobytes() copy ~13ms/frame at 8K), and a third
-            # buffer is free for the next frame. This allows full pipeline overlap.
+            # Pre-allocate result buffers (out_height × width × 3 uint16 ≈ 192MB each).
+            # Pipeline buffer accounting:
+            #   1 main loop currently filling
+            # + N post_queue holding (handed off, awaiting CPU worker)
+            # + 1 cpu_worker currently post-processing
+            # + M encode_queue holding (post-processed, awaiting FFmpeg)
+            # + 1 encode_thread currently writing to stdin
+            # With post_queue=maxsize=2 and encode_queue=maxsize=4, worst case = 9.
+            # Use 10 for headroom. Memory: 10 × 192 MB = ~1.9 GB additional — trivial
+            # on a 128 GB system, and frees the GPU + CPU stages to overlap fully.
+            _N_RESULT_BUFS = 10
             _result_bufs = [
-                np.empty((out_height, width, 3), dtype=np.uint16),
-                np.empty((out_height, width, 3), dtype=np.uint16),
-                np.empty((out_height, width, 3), dtype=np.uint16),
+                np.empty((out_height, width, 3), dtype=np.uint16)
+                for _ in range(_N_RESULT_BUFS)
             ]
             _result_buf_idx = 0
             result_buf = _result_bufs[0]
@@ -7177,7 +7402,8 @@ class VideoProcessor(QThread):
                                      rs_R_sensor_right=None, rs_R_cross_right=None,
                                      pre_split_s0=None, pre_split_s4=None,
                                      pre_split_eyes=None, pre_crosses=None,
-                                     rs_perscanline_mats=None):
+                                     rs_perscanline_mats=None,
+                                     defer_post=False):
                 """Process a single SBS frame with parallel remap per eye.
 
                 gyro_left/gyro_right: IORI_cancel × heading × global × stereo (for non-RS path).
@@ -7568,53 +7794,65 @@ class VideoProcessor(QThread):
                             t_right.join()
 
                 # Pipeline order (unified across all backends):
-                #   remap → 1D LUT → 3D LUT → sharpen → saturation → edge mask
-                # Saturation is applied LAST (post-LUT, post-sharpen) so the
-                # 3D LUT operates on the original color-graded pixels and the
-                # saturation adjustment only stretches/compresses the final
-                # graded chroma without feeding back into the LUT lookup.
+                #   remap → 1D LUT → 3D LUT → sharpen → [defer point] → temp/tint
+                #   → mid/detail → saturation → edge mask → upside-down → encode
+                #
+                # When defer_post=True (used by the export's CPU pipeline worker),
+                # we return immediately after sharpen so the next frame's GPU work
+                # can start in the main thread while the CPU worker handles
+                # temp/tint, mid/detail, saturation, mask, and rotate on this
+                # frame in parallel. The deferred steps are bit-identical — they
+                # just run on a different thread.
                 if _cuda_fused_done:
-                    # CUDA fused pipeline already ran: remap → 1D LUT → 3D LUT → sharpen
                     result = result_buf
                 else:
-                    # Non-fused CPU / MLX / wgpu path
                     result = apply_color_1d(result_buf, color_1d_lut)
                     result = apply_lut_3d_fast(result, lut_3d, cfg.lut_intensity)
                     result = apply_equirect_sharpen(result, _sharpen_bands)
 
-                # Apply saturation (post-LUT, post-sharpen — cross-channel, can't
-                # be done via 1D LUT). Same formula in both branches.
+                if defer_post:
+                    return result
+
+                return apply_export_post(result)
+
+            def apply_export_post(result):
+                """CPU-side post-processing: temp/tint → mid/detail → saturation
+                → edge mask → upside-down rotate. Operates in-place on `result`.
+                Called from the main thread (defer_post=False) or from the CPU
+                worker (in pipelined mode). Bit-identical either way."""
+                if abs(cfg.temperature) > 0.01 or abs(cfg.tint) > 0.01:
+                    result = apply_temp_tint(result, cfg.temperature, cfg.tint)
+                if abs(cfg.mid_detail) > 0.01:
+                    result = apply_mid_detail(result, cfg.mid_detail)
                 if _has_saturation:
                     gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
                     gray_3ch = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
                     cv2.addWeighted(gray_3ch, 1.0 - _export_saturation, result, _export_saturation, 0, dst=result)
-
-                # Apply circular edge mask per eye (after color/LUT)
                 if _eye_mask is not None:
                     if result.dtype == np.uint16:
-                        # uint16: use uint32 intermediate to avoid overflow
                         result[:, half_w:] = (result[:, half_w:].astype(np.uint32) * _eye_mask >> 8).astype(np.uint16)
                         result[:, :half_w] = (result[:, :half_w].astype(np.uint32) * _eye_mask >> 8).astype(np.uint16)
                     else:
-                        # Fast integer multiply: uint8→uint16 * uint16(0-256) >> 8 → uint8
                         result[:, half_w:] = (result[:, half_w:].astype(np.uint16) * _eye_mask >> 8).astype(np.uint8)
                         result[:, :half_w] = (result[:, :half_w].astype(np.uint16) * _eye_mask >> 8).astype(np.uint8)
                     if not result.flags['C_CONTIGUOUS']:
                         result = np.ascontiguousarray(result)
-
-                # Upside-down mount: rotate 180° (flips image + swaps L/R eyes)
                 if cfg.upside_down:
                     result = cv2.rotate(result, cv2.ROTATE_180)
-
                 return result
 
             # (Global+stereo view adjustment computed above as R_view_left/R_view_right)
 
-            # Precompute 1D color LUT (256 bytes, applied via cv2.LUT = near instant per frame)
-            has_color = abs(cfg.lift) > 0.01 or abs(cfg.gamma - 1.0) > 0.01 or abs(cfg.gain - 1.0) > 0.01
+            # Precompute 1D color LUT (covers lift/gamma/gain + shadow/highlight zones)
+            has_color = (abs(cfg.lift) > 0.01 or abs(cfg.gamma - 1.0) > 0.01 or
+                         abs(cfg.gain - 1.0) > 0.01 or abs(cfg.shadow) > 0.01 or
+                         abs(cfg.highlight) > 0.01)
             if has_color:
                 self.status.emit("Building color adjustment lookup table...")
-                color_1d_lut = build_color_1d_lut(cfg.lift, cfg.gamma, cfg.gain, bit_depth=16)
+                color_1d_lut = build_color_1d_lut(
+                    cfg.lift, cfg.gamma, cfg.gain,
+                    shadow=cfg.shadow, highlight=cfg.highlight,
+                    bit_depth=16)
             else:
                 color_1d_lut = None
             _export_saturation = cfg.saturation
@@ -7996,12 +8234,35 @@ class VideoProcessor(QThread):
                 audio_input_args = ["-ss", str(start_time), "-t", str(duration),
                                     "-i", str(cfg.input_path)]
 
-            # Build audio mapping: stereo AAC (stream 1:1) always,
-            # plus ambisonic PCM (stream 1:5) if requested for .360 input
-            audio_args = ["-map", "1:1", "-c:a", "copy"]
-            if cfg.is_360_input and cfg.audio_ambisonics:
-                audio_args += ["-map", "1:5", "-c:a:1", "copy"]
-            elif not cfg.is_360_input:
+            # APAC post-process detection: when the user picks "APAC" for audio
+            # we strip audio from the main render and re-encode the source
+            # 4-channel ambisonic to APAC (Apple Positional Audio Codec) via
+            # the apac_encode Swift helper. This is the only audio codec for
+            # which Vision Pro does true head-tracked spatialisation; SA3D-
+            # tagged ambisonic AAC works for YouTube VR / Quest Browser but
+            # Vision Pro ignores SA3D and falls back to plain stereo.
+            _apac_post = (cfg.audio_apac and cfg.is_360_input
+                          and sys.platform == 'darwin'
+                          and get_apac_encode_path() is not None)
+
+            # Build audio mapping. For .360 input there are two audio streams:
+            #   1:1 — AAC LC stereo (handler "GoPro AAC")
+            #   1:5 — 4-channel PCM s24le 1st-order ambisonic (handler "GoPro AMB")
+            # When user picks "Ambisonic" we ONLY include the 4ch ambisonic track —
+            # players that support spatial audio (YouTube VR, Quest Browser, etc.)
+            # head-track this track, and the SA3D metadata atom we inject later
+            # tags it as periphonic 1st-order. Including the stereo too would
+            # leave most players defaulting to that and ignoring the ambisonic.
+            if _apac_post:
+                # Strip audio in main render — APAC track is added in
+                # post-process step after the video pipeline finishes.
+                audio_args = ["-an"]
+            elif cfg.is_360_input and cfg.audio_ambisonics:
+                audio_args = ["-map", "1:5", "-c:a", "copy"]
+            elif cfg.is_360_input:
+                # Stereo-only export: standard AAC track for max compatibility
+                audio_args = ["-map", "1:1", "-c:a", "copy"]
+            else:
                 # Non-.360: map all audio streams
                 audio_args = ["-map", "1:a?", "-c:a", "copy"]
 
@@ -8162,7 +8423,19 @@ class VideoProcessor(QThread):
             # can be in the queue + 1 being written by encode thread + 1 being filled by
             # main thread = 3 total. maxsize=2 would allow a race where main thread
             # starts writing to a buffer that encode thread is still writing to stdin.
-            encode_queue = queue.Queue(maxsize=1)   # processed frames waiting to be encoded
+            # ── 2-stage process pipeline ───────────────────────────────────
+            # Main thread: decode → process_frame_opencv(defer_post=True) → post_queue
+            # CPU worker: post_queue → apply_export_post → encode_queue
+            # Encode thread: encode_queue → FFmpeg stdin
+            #
+            # This lets the GPU-heavy stages (remap / 3D LUT / sharpen) of frame N+1
+            # run in the main thread WHILE frame N's CPU post-processing (temp/tint
+            # / mid-detail / saturation / edge mask / rotate) runs on the worker.
+            # Bit-identical output to the prior single-thread path; same operations,
+            # just split across two threads. Maxsize tuned so pipeline stalls if any
+            # stage falls more than 2 frames behind (prevents memory bloat).
+            post_queue = queue.Queue(maxsize=2)     # frames awaiting CPU post-processing
+            encode_queue = queue.Queue(maxsize=4)   # post-processed frames awaiting encode
             pipeline_error = [None]  # shared error state
             _dec_split_non360 = False  # set True below for non-360 pre-split path
             _dec_eye_pool = None
@@ -8695,6 +8968,27 @@ class VideoProcessor(QThread):
                     finally:
                         decode_queue.put(None)  # sentinel
 
+            def cpu_post_worker():
+                """Pull frames awaiting CPU post-processing from post_queue, run
+                temp/tint → mid_detail → saturation → edge mask → rotate, then
+                push to encode_queue. Single worker → FIFO ordering preserved
+                naturally, no reorder buffer needed."""
+                try:
+                    while True:
+                        item = post_queue.get()
+                        if item is None:
+                            encode_queue.put(None, timeout=30)
+                            break
+                        result = apply_export_post(item)
+                        if isinstance(result, np.ndarray) and result.flags['C_CONTIGUOUS']:
+                            encode_queue.put(result, timeout=30)
+                        else:
+                            encode_queue.put(np.ascontiguousarray(result).tobytes(), timeout=30)
+                except Exception as e:
+                    pipeline_error[0] = e
+                    try: encode_queue.put(None, timeout=1)
+                    except Exception: pass
+
             def encode_thread():
                 """Write processed frames to FFmpeg encoder.
                 Accepts either bytes or numpy arrays (written via memoryview to avoid copy)."""
@@ -8705,7 +8999,6 @@ class VideoProcessor(QThread):
                         if data is None:
                             break
                         if isinstance(data, np.ndarray):
-                            # Write directly from numpy buffer via memoryview (avoids tobytes copy)
                             encode_proc.stdin.write(data.data)
                         else:
                             encode_proc.stdin.write(data)
@@ -8717,9 +9010,11 @@ class VideoProcessor(QThread):
                 except Exception as e:
                     pipeline_error[0] = e
 
-            # Start pipeline threads
+            # Start pipeline threads (decode → main loop → cpu_post_worker → encode)
             dec_t = threading.Thread(target=decode_thread, daemon=True)
+            post_t = threading.Thread(target=cpu_post_worker, daemon=True)
             enc_t = threading.Thread(target=encode_thread, daemon=True)
+            post_t.start()
             dec_t.start()
             enc_t.start()
 
@@ -8855,32 +9150,26 @@ class VideoProcessor(QThread):
                         rs_R_sensor_right = None
                         rs_R_cross_right = None
 
+                    # GPU-heavy stages only (defer_post=True): remap + 1D LUT + 3D LUT + sharpen.
+                    # CPU post-processing (temp/tint, mid_detail, saturation, edge mask, rotate)
+                    # runs on cpu_post_worker thread — overlaps with the next frame's GPU work
+                    # in this main loop. Bit-identical output to single-thread mode.
                     processed = process_frame_opencv(frame, gyro_left, gyro_right, angular_vel,
                                                      rs_R_sensor_right, rs_R_cross_right,
                                                      pre_split_s0=_pre_s0, pre_split_s4=_pre_s4,
                                                      pre_split_eyes=_dec_eye_pair,
                                                      pre_crosses=_pre_crosses,
-                                                     rs_perscanline_mats=_rs_perscanline_mats)
-
-                    # Fisheye: zero pixels outside circular FOV (cv2.bitwise_and, ~6ms)
+                                                     rs_perscanline_mats=_rs_perscanline_mats,
+                                                     defer_post=True)
+                    # Fisheye: zero pixels outside circular FOV (cv2.bitwise_and, ~6ms).
                     if _fisheye_mode and _fish_mask_3ch is not None:
                         cv2.bitwise_and(processed[:, half_w:], _fish_mask_3ch, dst=processed[:, half_w:])
                         cv2.bitwise_and(processed[:, :half_w], _fish_mask_3ch, dst=processed[:, :half_w])
-
-                    # Return pre-split eye buffers to pool (data already consumed by GPU/remap)
                     if _dec_eye_pair is not None and _dec_eye_pool is not None:
                         _dec_eye_pool.put(_dec_eye_pair)
-
-                    # Triple-buffer: enqueue current buffer as numpy array (encode thread
-                    # writes via memoryview, avoiding tobytes() copy ~13ms/frame at 8K),
-                    # then cycle to the next buffer for processing.
-                    if processed.flags['C_CONTIGUOUS']:
-                        encode_queue.put(processed, timeout=30)
-                    else:
-                        # Non-contiguous (e.g. after eye mask) — must copy
-                        encode_queue.put(processed.tobytes(), timeout=30)
-                    # Cycle to next result buffer
-                    _result_buf_idx = (_result_buf_idx + 1) % 3
+                    # Hand off to CPU post-processing worker
+                    post_queue.put(processed, timeout=30)
+                    _result_buf_idx = (_result_buf_idx + 1) % _N_RESULT_BUFS
                     result_buf = _result_bufs[_result_buf_idx]
 
                     frame_count += 1
@@ -8901,8 +9190,18 @@ class VideoProcessor(QThread):
                             f"Decode: {_decode_tag_ref[0]}  |  Remap: {_remap_tag}{_sharpen_tag}{_rs_tag}")
                         last_update_frame = frame_count
 
-                # Signal encode thread to finish and wait
-                encode_queue.put(None)
+                # Drain pipeline: post worker → encode → close.
+                # post_worker forwards the None sentinel to encode_queue itself,
+                # so we only need to inject one None at the head of the chain.
+                # Generous timeouts because a slow last-frame mid_detail can
+                # take ~30ms and the encode_queue may be deep.
+                post_queue.put(None, timeout=30)
+                post_t.join(timeout=30)
+                # If post_t died early (worker error path) it may not have
+                # forwarded the encode-stop sentinel. Inject directly as a
+                # belt-and-suspenders measure.
+                try: encode_queue.put_nowait(None)
+                except queue.Full: pass
                 enc_t.join(timeout=10)
                 dec_t.join(timeout=10)
                 try:
@@ -8986,17 +9285,38 @@ class VideoProcessor(QThread):
                     except Exception:
                         pass
 
+                # ── APAC audio post-process ─────────────────────────────
+                # When _apac_post is True the main render wrote the file
+                # video-only (audio_args was "-an"). Now re-encode the
+                # source 4ch ambisonic to APAC and mux it in. Done before
+                # any metadata injection so the post-mux ffmpeg pass
+                # doesn't strip atoms we'd add below.
+                if _apac_post:
+                    self.status.emit("Encoding 4ch ambisonic → APAC for Vision Pro...")
+                    try:
+                        self._apac_postprocess_audio(cfg, audio_input_args)
+                    except Exception as apac_err:
+                        # Non-fatal: leave the file video-only and warn.
+                        # APAC is a "nice to have"; the video path is intact.
+                        self.output_line.emit(f"WARN: APAC audio encode failed — file is video-only. ({apac_err})")
+                        _apac_post = False  # so completion_tags reflect actual state
+
                 self.progress.emit(100)
 
                 # Post-processing: VR180 metadata + Vision Pro
                 completion_tags = []
                 seg_msg = f" from {len(decode_segment_list)} segments" if len(decode_segment_list) > 1 else ""
                 completion_tags.append(f"{frame_count} frames{seg_msg}")
+                if _apac_post:
+                    completion_tags.append("APAC spatial audio")
 
                 if cfg.inject_vr180_metadata:
                     self.status.emit("Injecting VR180 metadata for YouTube...")
                     try:
-                        self._inject_vr180_metadata(cfg.output_path)
+                        # APAC has its own internal channel layout — don't add
+                        # an SA3D atom on top, that would confuse decoders.
+                        _has_amb_meta = cfg.audio_ambisonics and not _apac_post
+                        self._inject_vr180_metadata(cfg.output_path, has_ambisonic=_has_amb_meta)
                         completion_tags.append("YouTube VR180")
                     except Exception as meta_error:
                         completion_tags.append(f"VR180 metadata failed: {meta_error}")
@@ -9291,7 +9611,88 @@ class VideoProcessor(QThread):
     # VideoToolbox-direct MV-HEVC .mov with spatial metadata baked into
     # the format description. Audio is post-muxed with ffmpeg.
 
-    def _inject_vr180_metadata(self, video_path: Path):
+    def _apac_postprocess_audio(self, cfg, audio_input_args):
+        """Replace the audio track in cfg.output_path with an APAC-encoded
+        version of the source 4-channel ambisonic audio.
+
+        APAC (Apple Positional Audio Codec, kAudioFormatAPAC) is the only
+        audio format for which Vision Pro does true head-tracked
+        spatialisation in visionOS 1+. SA3D-tagged ambisonic AAC works for
+        YouTube VR / Quest Browser but Vision Pro ignores SA3D and falls
+        back to plain stereo.
+
+        Pipeline (2 steps):
+          1. ffmpeg extracts source stream 0:5 (4ch PCM s24le ambisonic) to
+             a temp WAV. Honors the same --ss / -t / concat list used by the
+             main render so trim and multi-segment selections match.
+          2. apac_encode (Swift helper, bundled) reads the WAV AND the
+             video-only output, encodes APAC, and muxes both into the final
+             cfg.output_path in a single AVAssetWriter pass. This avoids
+             ffmpeg's mov muxer dropping the APAC `dapa` configuration atom
+             on `-c:a copy` (ffmpeg has no APAC support; it writes a generic
+             sample entry that omits codec-specific sub-atoms).
+
+        Pre-conditions: caller already wrote cfg.output_path with -an (no
+        audio). Post-conditions: cfg.output_path now contains exactly one
+        video stream (passed through bit-exact, sample description and
+        spatial metadata preserved) plus one APAC audio stream with
+        AmbiX channel layout (HOA ACN/SN3D, 1st order, 4 channels).
+        """
+        import tempfile, shutil
+        apac_helper = get_apac_encode_path()
+        if not apac_helper:
+            raise Exception("apac_encode helper not found in app bundle")
+        if not cfg.output_path.exists():
+            raise Exception(f"output file missing: {cfg.output_path}")
+
+        # Step 1: extract 4ch PCM ambisonic via ffmpeg (honors trim/concat)
+        temp_wav = Path(tempfile.mktemp(suffix='_apac_in.wav'))
+        extract_cmd = [
+            get_ffmpeg_path(), "-y", "-loglevel", "error",
+        ] + audio_input_args + [
+            "-map", "0:5", "-c:a", "pcm_s24le", "-vn",
+            str(temp_wav),
+        ]
+        print(f"[APAC] extract: {' '.join(str(x) for x in extract_cmd)}")
+        p = subprocess.run(extract_cmd, capture_output=True,
+                           creationflags=get_subprocess_flags())
+        if p.returncode != 0:
+            err = p.stderr.decode(errors='replace')[-1500:]
+            raise Exception(f"PCM extract failed (code {p.returncode}):\n{err}")
+
+        # Step 2: encode WAV → APAC + mux video passthrough in one Swift pass
+        # We move the existing video-only output aside so we can write to
+        # cfg.output_path; on failure we restore it so the user isn't left
+        # without a file.
+        temp_video = Path(tempfile.mktemp(suffix='_apac_video.mov'))
+        shutil.move(str(cfg.output_path), str(temp_video))
+        encode_cmd = [
+            apac_helper,
+            "--input", str(temp_wav),
+            "--video-input", str(temp_video),
+            "--output", str(cfg.output_path),
+            "--bitrate", "384000",
+        ]
+        print(f"[APAC] encode+mux: {' '.join(str(x) for x in encode_cmd)}")
+        p = subprocess.run(encode_cmd, capture_output=True,
+                           creationflags=get_subprocess_flags())
+        if p.returncode != 0:
+            err = p.stderr.decode(errors='replace')[-1500:]
+            # Restore original on failure
+            try: shutil.move(str(temp_video), str(cfg.output_path))
+            except Exception: pass
+            try: temp_wav.unlink()
+            except Exception: pass
+            raise Exception(f"apac_encode failed (code {p.returncode}):\n{err}")
+
+        # Cleanup temps
+        try: temp_wav.unlink()
+        except Exception: pass
+        try: temp_video.unlink()
+        except Exception: pass
+        print(f"[APAC] done — wrote APAC + video into {cfg.output_path.name}")
+
+    def _inject_vr180_metadata(self, video_path: Path, has_ambisonic: bool = False):
         """Inject VR180 metadata for YouTube using Google's Spatial Media method
 
         VR180 format requirements for YouTube:
@@ -9321,6 +9722,18 @@ class VideoProcessor(QThread):
 
         # Set orientation (default: no rotation)
         metadata.orientation = {"yaw": 0, "pitch": 0, "roll": 0}
+
+        # Spatial audio (SA3D atom) — only when the file has the 4-channel
+        # ambisonic track. Marks the audio as periphonic 1st-order ambisonic
+        # in AmbiX channel order (W, Y, Z, X) so VR-aware players (YouTube,
+        # Quest Browser, etc.) head-track the audio. Without this atom,
+        # players treat the 4 channels as quad surround.
+        if has_ambisonic:
+            metadata.audio = {
+                "ambisonic_type": "periphonic",
+                "ambisonic_order": 1,
+                "head_locked_stereo": False,
+            }
 
         # Create a temporary output file
         temp_file = Path(tempfile.mktemp(suffix='.mov'))
@@ -10516,11 +10929,20 @@ class VR180ProcessorGUI(QMainWindow):
         self.audio_format_label = QLabel("Audio:")
         self.audio_format_combo = QComboBox()
         self.audio_format_combo.addItem("Stereo AAC", "stereo")
-        self.audio_format_combo.addItem("Ambisonic (4ch spatial)", "ambisonic")
+        self.audio_format_combo.addItem("Ambisonic Only (4ch spatial)", "ambisonic")
+        # APAC option is added/removed dynamically based on Vision Pro mode
+        # — see _update_vision_pro_mode(). It only appears for APMP / MV-HEVC
+        # output because APAC is Apple-only and the relevant container is
+        # always .mov from those code paths.
         self.audio_format_combo.setCurrentIndex(0)  # stereo default
         self.audio_format_combo.setToolTip(
-            "Stereo AAC: standard 2-channel audio.\n"
-            "Ambisonic: first-order ambisonics (4ch PCM) from .360 file."
+            "Stereo AAC: standard 2-channel audio (compatible with all players).\n"
+            "Ambisonic Only: 1st-order ambisonic 4-channel PCM (W,Y,Z,X / AmbiX),\n"
+            "  with SA3D metadata atom for VR-aware players (YouTube VR, Quest Browser).\n"
+            "  NOTE: Vision Pro ignores SA3D and falls back to stereo — use APAC instead.\n"
+            "APAC (Vision Pro spatial): re-encodes the 4ch ambisonic track to Apple's\n"
+            "  Positional Audio Codec for true head-tracked spatialisation in visionOS.\n"
+            "  Only available when Vision Pro APMP or MV-HEVC mode is selected."
         )
         self.audio_format_label.setVisible(False)
         self.audio_format_combo.setVisible(False)
@@ -10543,109 +10965,33 @@ class VR180ProcessorGUI(QMainWindow):
         output_layout.addWidget(self.resolution_label, 9, 0)
         output_layout.addWidget(self.resolution_combo, 9, 1)
 
-        # Temporal denoise (VideoToolbox, macOS 26+ only — hidden on Windows)
-        self.denoise_slider = SliderWithSpinBox(0, 100, 0, decimals=0, step=1, suffix="%")
-        if sys.platform == 'darwin':
-            self._denoise_label = QLabel("Denoise:")
-            output_layout.addWidget(self._denoise_label, 10, 0)
-            self.denoise_slider.setToolTip(
-                "VideoToolbox temporal noise filter (macOS 26+).\n"
-                "Uses past & future frames for hardware-accelerated noise reduction.\n"
-                "0% = off, 50% = moderate, 100% = maximum.\n"
-                "Applied before all other processing for best quality."
-            )
-            output_layout.addWidget(self.denoise_slider, 10, 1)
-
-        # Equirectangular-aware sharpening
-        output_layout.addWidget(QLabel("Sharpen:"), 11, 0)
-        self.sharpen_slider = SliderWithSpinBox(0, 300, 0, decimals=0, step=1, suffix="%")
-        self.sharpen_slider.setToolTip(
-            "Equirectangular-aware unsharp mask.\n"
-            "Adapts to latitude: full sharpening at equator, reduced at poles.\n"
-            "0% = off, 50% = subtle, 100% = moderate, 200% = strong, 300% = extreme."
-        )
-        self.sharpen_slider.valueChanged.connect(self._schedule_preview_update)
-        output_layout.addWidget(self.sharpen_slider, 11, 1)
-
-        # Sharpen radius (sigma)
-        output_layout.addWidget(QLabel("Sharpen Radius:"), 12, 0)
-        self.sharpen_radius_slider = SliderWithSpinBox(5, 50, 13, decimals=0, step=1, suffix="")
-        self.sharpen_radius_slider.setToolTip(
-            "Blur radius for unsharp mask (×0.1 = sigma).\n"
-            "5 = fine detail (0.5σ), 15 = default (1.5σ), 50 = coarse structure (5.0σ)."
-        )
-        self.sharpen_radius_slider.valueChanged.connect(self._schedule_preview_update)
-        output_layout.addWidget(self.sharpen_radius_slider, 12, 1)
-
-        # Pre-LUT color adjustments (ASC CDL: Lift, Gamma, Gain)
-        output_layout.addWidget(QLabel("Lift:"), 13, 0)
-        self.lift_slider = SliderWithSpinBox(-100, 100, 0, decimals=0, step=1, suffix="")
-        self.lift_slider.setToolTip("Lift (Offset): Raises/lowers black level, affects shadows most\nNegative = crush blacks, 0 = neutral, Positive = lift shadows")
-        output_layout.addWidget(self.lift_slider, 13, 1)
-
-        output_layout.addWidget(QLabel("Gamma:"), 14, 0)
-        self.gamma_slider = SliderWithSpinBox(10, 300, 100, decimals=0, step=1, suffix="")
-        self.gamma_slider.setToolTip("Gamma (Power): Adjusts midtones while preserving black/white points\n<100 = darker midtones, 100 = neutral, >100 = brighter midtones")
-        output_layout.addWidget(self.gamma_slider, 14, 1)
-
-        output_layout.addWidget(QLabel("Gain:"), 15, 0)
-        self.gain_slider = SliderWithSpinBox(50, 200, 100, decimals=0, step=1, suffix="")
-        self.gain_slider.setToolTip("Gain (Slope): Overall brightness multiplier, affects highlights most\n<100 = darker, 100 = neutral, >100 = brighter")
-        output_layout.addWidget(self.gain_slider, 15, 1)
-
-        output_layout.addWidget(QLabel("Saturation:"), 16, 0)
-        self.saturation_slider = SliderWithSpinBox(0, 200, 100, decimals=0, step=1, suffix="")
-        self.saturation_slider.setToolTip("Saturation: Controls color intensity\n0 = grayscale, 100 = neutral, 200 = double saturation")
-        output_layout.addWidget(self.saturation_slider, 16, 1)
-
-        # LUT file selection (spanning both columns for more space)
-        output_layout.addWidget(QLabel("LUT File:"), 17, 0)
-        lut_file_layout = QHBoxLayout()
-        self.lut_path_edit = QLineEdit()
-        self.lut_path_edit.setPlaceholderText("Optional: .cube LUT file")
-        self.lut_path_edit.setReadOnly(True)
-        lut_file_layout.addWidget(self.lut_path_edit, 1)
-        self.lut_browse_btn = QPushButton("Browse")
-        self.lut_browse_btn.setMinimumWidth(80)
-        lut_file_layout.addWidget(self.lut_browse_btn)
-        self.lut_clear_btn = QPushButton("Clear")
-        self.lut_clear_btn.setMinimumWidth(70)
-        lut_file_layout.addWidget(self.lut_clear_btn)
-        output_layout.addLayout(lut_file_layout, 17, 1)
-
-        # LUT intensity slider
-        output_layout.addWidget(QLabel("LUT Intensity:"), 18, 0)
-        self.lut_intensity_slider = SliderWithSpinBox(0, 100, 100, 0, 1, "%")
-        self.lut_intensity_slider.setToolTip("Blend strength: 0% = no LUT, 100% = full LUT")
-        output_layout.addWidget(self.lut_intensity_slider, 18, 1)
-
         # Edge mask controls
-        output_layout.addWidget(QLabel("Mask Size:"), 19, 0)
+        output_layout.addWidget(QLabel("Mask Size:"), 10, 0)
         self.mask_size_slider = SliderWithSpinBox(50, 100, 100, decimals=0, step=1, suffix="%")
         self.mask_size_slider.setToolTip("Circular mask radius as % of half-width\n100% = no mask (full frame), lower = tighter crop circle")
-        output_layout.addWidget(self.mask_size_slider, 19, 1)
+        output_layout.addWidget(self.mask_size_slider, 10, 1)
 
-        output_layout.addWidget(QLabel("Mask Feather:"), 20, 0)
+        output_layout.addWidget(QLabel("Mask Feather:"), 11, 0)
         self.mask_feather_slider = SliderWithSpinBox(0, 50, 0, decimals=0, step=1, suffix="%")
         self.mask_feather_slider.setToolTip("Feather width as % of half-width\n0% = hard edge, higher = softer fade to black")
-        output_layout.addWidget(self.mask_feather_slider, 20, 1)
+        output_layout.addWidget(self.mask_feather_slider, 11, 1)
 
 
         # VR180 metadata checkbox for YouTube
         self.vr180_metadata_checkbox = QCheckBox("Inject VR180 Metadata for YouTube")
         self.vr180_metadata_checkbox.setToolTip("Add VR180 spherical metadata for YouTube upload\n"
                                                  "Uses Spherical Video V2 specification (fast, no re-encode)")
-        output_layout.addWidget(self.vr180_metadata_checkbox, 21, 0)
+        output_layout.addWidget(self.vr180_metadata_checkbox, 12, 0)
 
         self.inject_only_btn = QPushButton("Inject Only (Output)")
         self.inject_only_btn.setToolTip("Skip all processing — just inject VR180 YouTube metadata\n"
                                          "into the output file as-is")
         self.inject_only_btn.clicked.connect(self._inject_only_output)
-        output_layout.addWidget(self.inject_only_btn, 21, 1)
+        output_layout.addWidget(self.inject_only_btn, 12, 1)
 
         # Vision Pro / Apple compatibility mode (macOS only)
         if IS_MACOS:
-            output_layout.addWidget(QLabel("Vision Pro Mode:"), 22, 0)
+            output_layout.addWidget(QLabel("Vision Pro Mode:"), 13, 0)
             self.vision_pro_combo = QComboBox()
             self.vision_pro_combo.addItems([
                 "Standard (no special metadata)",
@@ -10657,13 +11003,148 @@ class VR180ProcessorGUI(QMainWindow):
                 "VR180 APMP: Inject VR180 stereo metadata for Vision Pro (instant, no re-encode, visionOS 26+)\n"
                 "MV-HEVC: Direct spatial video encode via VideoToolbox — single pass, no external tools. Requires macOS 26+."
             )
-            output_layout.addWidget(self.vision_pro_combo, 22, 1)
+            output_layout.addWidget(self.vision_pro_combo, 13, 1)
         else:
             # Windows: Create dummy combo for compatibility
             self.vision_pro_combo = QComboBox()
             self.vision_pro_combo.addItem("Standard (no special metadata)")
             self.vision_pro_combo.setVisible(False)
 
+        # ── Color & Look group ─────────────────────────────────────────────
+        # All color/look controls live here, separate from Output Settings.
+        # Pipeline order applied in render: 1D LUT (LGG + shadow + highlight)
+        # → 3D LUT → temp/tint → sharpen → mid/detail → saturation.
+        color_group = QGroupBox("Color && Look")
+        color_layout = QGridLayout(color_group)
+        _crow = 0
+
+        # Temporal denoise (VideoToolbox, macOS 26+ only — hidden on Windows)
+        self.denoise_slider = SliderWithSpinBox(0, 100, 0, decimals=0, step=1, suffix="%")
+        if sys.platform == 'darwin':
+            self._denoise_label = QLabel("Denoise:")
+            color_layout.addWidget(self._denoise_label, _crow, 0)
+            self.denoise_slider.setToolTip(
+                "VideoToolbox temporal noise filter (macOS 26+).\n"
+                "Uses past & future frames for hardware-accelerated noise reduction.\n"
+                "0% = off, 50% = moderate, 100% = maximum.\n"
+                "Applied before all other processing for best quality."
+            )
+            color_layout.addWidget(self.denoise_slider, _crow, 1)
+            _crow += 1
+
+        # ASC-CDL primary corrections
+        color_layout.addWidget(QLabel("Lift:"), _crow, 0)
+        self.lift_slider = SliderWithSpinBox(-100, 100, 0, decimals=0, step=1, suffix="")
+        self.lift_slider.setToolTip("Lift (Offset): Raises/lowers black level, affects shadows most\nNegative = crush blacks, 0 = neutral, Positive = lift shadows")
+        color_layout.addWidget(self.lift_slider, _crow, 1); _crow += 1
+
+        color_layout.addWidget(QLabel("Gamma:"), _crow, 0)
+        self.gamma_slider = SliderWithSpinBox(10, 300, 100, decimals=0, step=1, suffix="")
+        self.gamma_slider.setToolTip("Gamma (Power): Adjusts midtones while preserving black/white points\n<100 = darker midtones, 100 = neutral, >100 = brighter midtones")
+        color_layout.addWidget(self.gamma_slider, _crow, 1); _crow += 1
+
+        color_layout.addWidget(QLabel("Gain:"), _crow, 0)
+        self.gain_slider = SliderWithSpinBox(50, 200, 100, decimals=0, step=1, suffix="")
+        self.gain_slider.setToolTip("Gain (Slope): Overall brightness multiplier, affects highlights most\n<100 = darker, 100 = neutral, >100 = brighter")
+        color_layout.addWidget(self.gain_slider, _crow, 1); _crow += 1
+
+        # Tonal-zone (Resolve-style smooth-rolloff zones)
+        color_layout.addWidget(QLabel("Shadow:"), _crow, 0)
+        self.shadow_slider = SliderWithSpinBox(-100, 100, 0, decimals=0, step=1, suffix="")
+        self.shadow_slider.setToolTip(
+            "Shadow zone (Resolve-style smooth rolloff into midtones).\n"
+            "Negative = deepen shadows, Positive = lift shadows.\n"
+            "Affects lower third of luminance range with quadratic falloff."
+        )
+        color_layout.addWidget(self.shadow_slider, _crow, 1); _crow += 1
+
+        color_layout.addWidget(QLabel("Highlight:"), _crow, 0)
+        self.highlight_slider = SliderWithSpinBox(-100, 100, 0, decimals=0, step=1, suffix="")
+        self.highlight_slider.setToolTip(
+            "Highlight zone (Resolve-style smooth rolloff into midtones).\n"
+            "Negative = recover highlights, Positive = boost highlights.\n"
+            "Affects upper third of luminance range with quadratic falloff."
+        )
+        color_layout.addWidget(self.highlight_slider, _crow, 1); _crow += 1
+
+        # White balance
+        color_layout.addWidget(QLabel("Temperature:"), _crow, 0)
+        self.temperature_slider = SliderWithSpinBox(-100, 100, 0, decimals=0, step=1, suffix="")
+        self.temperature_slider.setToolTip(
+            "Color temperature (white balance).\n"
+            "Negative = cooler (more blue), Positive = warmer (more yellow/red).\n"
+            "Per-channel multiplier applied post-LUT."
+        )
+        color_layout.addWidget(self.temperature_slider, _crow, 1); _crow += 1
+
+        color_layout.addWidget(QLabel("Tint:"), _crow, 0)
+        self.tint_slider = SliderWithSpinBox(-100, 100, 0, decimals=0, step=1, suffix="")
+        self.tint_slider.setToolTip(
+            "Color tint (green↔magenta balance).\n"
+            "Negative = more green, Positive = more magenta.\n"
+            "Per-channel multiplier applied post-LUT."
+        )
+        color_layout.addWidget(self.tint_slider, _crow, 1); _crow += 1
+
+        # Mid/Detail (local contrast)
+        color_layout.addWidget(QLabel("Mid / Detail:"), _crow, 0)
+        self.mid_detail_slider = SliderWithSpinBox(0, 200, 0, decimals=0, step=1, suffix="%")
+        self.mid_detail_slider.setToolTip(
+            "Local contrast / clarity (Resolve-style Mid/Detail).\n"
+            "Midtone-weighted unsharp mask with large radius — boosts texture\n"
+            "and structure while leaving shadows and highlights intact.\n"
+            "0% = off, 100% = moderate, 200% = strong (slower export)."
+        )
+        color_layout.addWidget(self.mid_detail_slider, _crow, 1); _crow += 1
+
+        # Saturation
+        color_layout.addWidget(QLabel("Saturation:"), _crow, 0)
+        self.saturation_slider = SliderWithSpinBox(0, 200, 100, decimals=0, step=1, suffix="")
+        self.saturation_slider.setToolTip("Saturation: Controls color intensity\n0 = grayscale, 100 = neutral, 200 = double saturation")
+        color_layout.addWidget(self.saturation_slider, _crow, 1); _crow += 1
+
+        # Equirectangular-aware sharpening
+        color_layout.addWidget(QLabel("Sharpen:"), _crow, 0)
+        self.sharpen_slider = SliderWithSpinBox(0, 300, 0, decimals=0, step=1, suffix="%")
+        self.sharpen_slider.setToolTip(
+            "Equirectangular-aware unsharp mask.\n"
+            "Adapts to latitude: full sharpening at equator, reduced at poles.\n"
+            "0% = off, 50% = subtle, 100% = moderate, 200% = strong, 300% = extreme."
+        )
+        self.sharpen_slider.valueChanged.connect(self._schedule_preview_update)
+        color_layout.addWidget(self.sharpen_slider, _crow, 1); _crow += 1
+
+        # Sharpen radius (sigma)
+        color_layout.addWidget(QLabel("Sharpen Radius:"), _crow, 0)
+        self.sharpen_radius_slider = SliderWithSpinBox(5, 50, 13, decimals=0, step=1, suffix="")
+        self.sharpen_radius_slider.setToolTip(
+            "Blur radius for unsharp mask (×0.1 = sigma).\n"
+            "5 = fine detail (0.5σ), 15 = default (1.5σ), 50 = coarse structure (5.0σ)."
+        )
+        self.sharpen_radius_slider.valueChanged.connect(self._schedule_preview_update)
+        color_layout.addWidget(self.sharpen_radius_slider, _crow, 1); _crow += 1
+
+        # 3D LUT (.cube file) — the creative grade
+        color_layout.addWidget(QLabel("LUT File:"), _crow, 0)
+        lut_file_layout = QHBoxLayout()
+        self.lut_path_edit = QLineEdit()
+        self.lut_path_edit.setPlaceholderText("Optional: .cube LUT file")
+        self.lut_path_edit.setReadOnly(True)
+        lut_file_layout.addWidget(self.lut_path_edit, 1)
+        self.lut_browse_btn = QPushButton("Browse")
+        self.lut_browse_btn.setMinimumWidth(80)
+        lut_file_layout.addWidget(self.lut_browse_btn)
+        self.lut_clear_btn = QPushButton("Clear")
+        self.lut_clear_btn.setMinimumWidth(70)
+        lut_file_layout.addWidget(self.lut_clear_btn)
+        color_layout.addLayout(lut_file_layout, _crow, 1); _crow += 1
+
+        color_layout.addWidget(QLabel("LUT Intensity:"), _crow, 0)
+        self.lut_intensity_slider = SliderWithSpinBox(0, 100, 100, 0, 1, "%")
+        self.lut_intensity_slider.setToolTip("Blend strength: 0% = no LUT, 100% = full LUT")
+        color_layout.addWidget(self.lut_intensity_slider, _crow, 1); _crow += 1
+
+        controls_layout.addWidget(color_group)
         controls_layout.addWidget(output_group)
         
         controls_layout.addStretch()
@@ -10762,6 +11243,13 @@ class VR180ProcessorGUI(QMainWindow):
         self.saturation_slider.slider.sliderReleased.connect(self._schedule_preview_update)
         self.saturation_slider.spinbox.valueChanged.connect(lambda: self._schedule_preview_update())
         self.saturation_slider.reset_btn.clicked.connect(self._schedule_preview_update)
+        # New tonal-zone, white-balance, and local-contrast sliders
+        for _slider in (self.shadow_slider, self.highlight_slider,
+                         self.temperature_slider, self.tint_slider,
+                         self.mid_detail_slider):
+            _slider.slider.sliderReleased.connect(self._schedule_preview_update)
+            _slider.spinbox.valueChanged.connect(lambda: self._schedule_preview_update())
+            _slider.reset_btn.clicked.connect(self._schedule_preview_update)
         self.lut_intensity_slider.slider.sliderReleased.connect(self._schedule_preview_update)
         self.mask_size_slider.slider.sliderReleased.connect(self._schedule_preview_update)
         self.mask_size_slider.spinbox.valueChanged.connect(lambda: self._schedule_preview_update())
@@ -11230,9 +11718,32 @@ class VR180ProcessorGUI(QMainWindow):
             self._schedule_preview_update()
 
         except Exception as e:
-            self.gopro_status.setText(f"Gyro auto-load error: {str(e)}")
+            # WinError 2 / FileNotFoundError = subprocess could not find an
+            # executable. Tell the user exactly which binary we tried so they
+            # can either install it or re-bundle. Most common cause on
+            # Windows: ffprobe missing from a build done on a machine that
+            # only had ffmpeg in PATH (PyInstaller bundles whatever
+            # `shutil.which` returned at build time).
+            _msg = str(e)
+            _is_win_err_2 = ('WinError 2' in _msg or 'No such file' in _msg
+                             or isinstance(e, FileNotFoundError))
+            if _is_win_err_2:
+                _ff = get_ffmpeg_path()
+                _fp = get_ffprobe_path()
+                _ff_ok = _is_runnable(_ff) if _ff != 'ffmpeg' else bool(shutil.which('ffmpeg'))
+                _fp_ok = _is_runnable(_fp) if _fp != 'ffprobe' else bool(shutil.which('ffprobe'))
+                _diag = (f"ffmpeg: {_ff} (runnable={_ff_ok}); "
+                         f"ffprobe: {_fp} (runnable={_fp_ok})")
+                self.gopro_status.setText(
+                    f"Gyro auto-load error: ffmpeg/ffprobe not executable.\n{_diag}")
+                print(f"Failed to auto-load gyro from .360: {e}")
+                print(f"  Diagnostic: {_diag}")
+                print(f"  Fix: install FFmpeg and add it to PATH, or rebuild the app "
+                      f"on a machine that has ffmpeg/ffprobe in PATH.")
+            else:
+                self.gopro_status.setText(f"Gyro auto-load error: {_msg}")
+                print(f"Failed to auto-load gyro from .360: {e}")
             self.gopro_status.setStyleSheet("QLabel { color: #cc0000; }")
-            print(f"Failed to auto-load gyro from .360: {e}")
 
     def _clear_gopro_gyro_data(self):
         """Clear the loaded GoPro gyro data and GEOC calibration"""
@@ -11438,13 +11949,31 @@ class VR180ProcessorGUI(QMainWindow):
 
     def _update_vision_pro_mode(self):
         """Gray out YouTube metadata checkbox when APMP or MV-HEVC is selected.
-        APMP strips st3d/sv3d atoms that YouTube injection adds, so they conflict."""
+        APMP strips st3d/sv3d atoms that YouTube injection adds, so they conflict.
+        Also show/hide the "APAC (Vision Pro spatial)" audio option — APAC is
+        Apple-only and only meaningful for Vision Pro output paths."""
         if IS_MACOS:
             vp_idx = self.vision_pro_combo.currentIndex()
             is_vp_mode = vp_idx >= 1  # APMP (1) or MV-HEVC (2)
             self.vr180_metadata_checkbox.setEnabled(not is_vp_mode)
             if is_vp_mode:
                 self.vr180_metadata_checkbox.setChecked(False)
+
+            # Add/remove APAC option in audio combo. We modify items rather
+            # than just enabling/disabling so the dropdown stays clean for
+            # users on non-Apple workflows.
+            apac_helper_exists = get_apac_encode_path() is not None
+            apac_idx = self.audio_format_combo.findData("apac")
+            if is_vp_mode and apac_helper_exists:
+                if apac_idx == -1:
+                    self.audio_format_combo.addItem("APAC (Vision Pro spatial)", "apac")
+            else:
+                if apac_idx != -1:
+                    # If APAC was selected but is no longer available, fall
+                    # back to stereo (safest default for non-VP output).
+                    if self.audio_format_combo.currentIndex() == apac_idx:
+                        self.audio_format_combo.setCurrentIndex(0)
+                    self.audio_format_combo.removeItem(apac_idx)
 
     def _update_preview_mode_ui(self):
         """Show/hide eye toggle button based on preview mode"""
@@ -11794,13 +12323,35 @@ class VR180ProcessorGUI(QMainWindow):
             self._apply_preview_filters_to_cached_frame()
             self.status_bar.showMessage("Denoise off (preview restored)")
             return
-        # Kill any previous worker so slider spam doesn't stack up
-        if hasattr(self, '_denoise_preview_worker') and self._denoise_preview_worker is not None:
+        # Retire any previous worker WITHOUT blocking — slider spam stacked up the
+        # old non-blocking pattern (wait(500) → timeout → replace reference → C++
+        # QThread destructor fires while run() is still in its epilogue → crash with
+        # "QThread: Destroyed while thread '' is still running"). Instead: cancel,
+        # disconnect signals so its late frame_ready can't overwrite our cache, and
+        # keep a strong ref in _dying_workers until the thread actually emits
+        # finished. Then deleteLater + drop the ref. Non-blocking, crash-free.
+        if not hasattr(self, '_dying_workers'):
+            self._dying_workers = []
+        old = getattr(self, '_denoise_preview_worker', None)
+        if old is not None:
             try:
-                self._denoise_preview_worker.cancel()
-                self._denoise_preview_worker.wait(500)
+                old.cancel()
             except Exception:
                 pass
+            for sig in (getattr(old, 'frame_ready', None), getattr(old, 'error', None)):
+                try:
+                    if sig is not None:
+                        sig.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+            self._dying_workers.append(old)
+            def _retire_worker(w=old):
+                try:
+                    self._dying_workers.remove(w)
+                except ValueError:
+                    pass
+                w.deleteLater()
+            old.finished.connect(_retire_worker)
         # Resolve which segment file to seek into (multi-segment aware)
         input_path, local_ts = self._resolve_segment_timestamp(self.preview_timestamp)
         fps = 30.0
@@ -12574,17 +13125,29 @@ class VR180ProcessorGUI(QMainWindow):
         lift = self.lift_slider.value() / 100.0
         gamma = self.gamma_slider.value() / 100.0
         gain = self.gain_slider.value() / 100.0
+        shadow = self.shadow_slider.value() / 100.0 if hasattr(self, 'shadow_slider') else 0.0
+        highlight = self.highlight_slider.value() / 100.0 if hasattr(self, 'highlight_slider') else 0.0
 
-        if abs(lift) > 0.01 or abs(gamma - 1.0) > 0.01 or abs(gain - 1.0) > 0.01:
+        if (abs(lift) > 0.01 or abs(gamma - 1.0) > 0.01 or abs(gain - 1.0) > 0.01
+                or abs(shadow) > 0.01 or abs(highlight) > 0.01):
             # Cache key includes dtype so a late switch between pipelines
             # wouldn't reuse a wrong-width LUT.
-            color_key = (round(lift, 3), round(gamma, 3), round(gain, 3), 'u16')
+            color_key = (round(lift, 3), round(gamma, 3), round(gain, 3),
+                         round(shadow, 3), round(highlight, 3), 'u16')
             if not hasattr(self, '_color_lut_cache') or not hasattr(self, '_color_lut_cache_key') or self._color_lut_cache_key != color_key:
                 lut_1d = np.arange(65536, dtype=np.float32) / 65535.0
                 if abs(lift) > 0.01:
                     lut_1d = lut_1d + lift * (1.0 - lut_1d)
                 if abs(gain - 1.0) > 0.01:
                     lut_1d = lut_1d * gain
+                if abs(shadow) > 0.01:
+                    t = np.clip(1.0 - 2.0 * lut_1d, 0.0, 1.0)
+                    s_mask = t * t * (3.0 - 2.0 * t)
+                    lut_1d = lut_1d + shadow * s_mask * 0.6
+                if abs(highlight) > 0.01:
+                    t = np.clip(2.0 * lut_1d - 1.0, 0.0, 1.0)
+                    h_mask = t * t * (3.0 - 2.0 * t)
+                    lut_1d = lut_1d + highlight * h_mask * 0.6
                 lut_1d = np.clip(lut_1d, 0.0, 1.0)
                 if abs(gamma - 1.0) > 0.01:
                     lut_1d = np.power(lut_1d, 1.0 / gamma)
@@ -12768,6 +13331,47 @@ class VR180ProcessorGUI(QMainWindow):
                     _pv_lat = (0.5 - _pv_rows) * np.float32(np.pi)
                     _pv_w = np.clip(np.cos(_pv_lat) * sharpen_amt, 0.02, 4.0).astype(np.float32)[:, np.newaxis, np.newaxis]
                     result = np.clip(result_f + _pv_w * diff, 0, _pv_pix_max).astype(result.dtype)
+
+        # Apply temperature / tint (per-channel multiply; matches export).
+        # NOTE: preview frame is RGB here (export is BGR). We swap channel
+        # multipliers accordingly so the visual effect is the same.
+        temperature = self.temperature_slider.value() / 100.0 if hasattr(self, 'temperature_slider') else 0.0
+        tint = self.tint_slider.value() / 100.0 if hasattr(self, 'tint_slider') else 0.0
+        if (abs(temperature) > 0.01 or abs(tint) > 0.01) and result is not None:
+            mult_r = np.float32(1.0 + 0.30 * temperature)
+            mult_g = np.float32(1.0 - 0.30 * tint)
+            mult_b = np.float32(1.0 - 0.30 * temperature)
+            _pv_pix_max = 65535 if result.dtype == np.uint16 else 255
+            f = result.astype(np.float32)
+            f[..., 0] *= mult_r
+            f[..., 1] *= mult_g
+            f[..., 2] *= mult_b
+            np.clip(f, 0, _pv_pix_max, out=f)
+            result = f.astype(result.dtype)
+
+        # Apply mid/detail (local contrast, midtone-weighted USM).
+        # Optimised: blur on 1/4-res copy + upsample. Same visual result, ~6× faster.
+        mid_detail = self.mid_detail_slider.value() / 100.0 if hasattr(self, 'mid_detail_slider') else 0.0
+        if abs(mid_detail) > 0.01 and result is not None:
+            is_uint16 = result.dtype == np.uint16
+            _md_pix_max = 65535.0 if is_uint16 else 255.0
+            f = result.astype(np.float32) * (1.0 / _md_pix_max)
+            h_md, w_md = f.shape[:2]
+            DS = 4
+            dh_md, dw_md = max(64, h_md // DS), max(64, w_md // DS)
+            f_small = cv2.resize(f, (dw_md, dh_md), interpolation=cv2.INTER_AREA)
+            sigma_small = max(5.0, 0.01 * min(dh_md, dw_md))  # ≈ 1% of image dim (≈ 41px @ 4K full-res)
+            ksize_small = max(3, int(sigma_small * 6) | 1)
+            blurred_small = cv2.GaussianBlur(f_small, (ksize_small, ksize_small), sigma_small)
+            blurred_md = cv2.resize(blurred_small, (w_md, h_md), interpolation=cv2.INTER_LINEAR)
+            detail_md = f - blurred_md
+            # Preview is RGB; weights are 0.299R + 0.587G + 0.114B
+            lum = 0.299 * f[..., 0] + 0.587 * f[..., 1] + 0.114 * f[..., 2]
+            weight = 1.0 - (2.0 * np.abs(lum - 0.5)) ** 2
+            np.clip(weight, 0, 1, out=weight)
+            f += mid_detail * detail_md * weight[..., np.newaxis]
+            np.clip(f, 0, 1, out=f)
+            result = (f * _md_pix_max).astype(result.dtype)
 
         # Apply saturation (post-LUT, post-sharpen — matches export pipeline)
         saturation = self.saturation_slider.value() / 100.0
@@ -13045,6 +13649,30 @@ class VR180ProcessorGUI(QMainWindow):
             metadata.clip_left_right = 1073741823
             metadata.orientation = {"yaw": 0, "pitch": 0, "roll": 0}
 
+            # Auto-detect 4-channel ambisonic audio in the input file.
+            # If present, also inject the SA3D atom so VR players head-track it.
+            try:
+                _probe = subprocess.run(
+                    [get_ffprobe_path(), "-v", "error", "-select_streams", "a",
+                     "-show_entries", "stream=channels,channel_layout",
+                     "-of", "json", str(input_file)],
+                    capture_output=True, text=True,
+                    creationflags=get_subprocess_flags()
+                )
+                _audio_streams = json.loads(_probe.stdout).get("streams", [])
+                _has_ambisonic = any(
+                    s.get("channels") == 4 or "ambisonic" in (s.get("channel_layout") or "").lower()
+                    for s in _audio_streams
+                )
+                if _has_ambisonic:
+                    metadata.audio = {
+                        "ambisonic_type": "periphonic",
+                        "ambisonic_order": 1,
+                        "head_locked_stereo": False,
+                    }
+            except Exception:
+                pass  # If probe fails, skip audio metadata — video tags still get injected
+
             metadata_utils.inject_metadata(str(input_file), str(output_file), metadata, lambda msg: None)
 
             self.statusBar().showMessage("VR180 metadata injected successfully")
@@ -13084,6 +13712,11 @@ class VR180ProcessorGUI(QMainWindow):
             lift=self.lift_slider.value() / 100.0,
             gamma=self.gamma_slider.value() / 100.0,
             gain=self.gain_slider.value() / 100.0,
+            shadow=self.shadow_slider.value() / 100.0,
+            highlight=self.highlight_slider.value() / 100.0,
+            temperature=self.temperature_slider.value() / 100.0,
+            tint=self.tint_slider.value() / 100.0,
+            mid_detail=self.mid_detail_slider.value() / 100.0,
             h265_bit_depth=10 if self.h265_bit_depth_combo.currentIndex() == 1 else 8,
             inject_vr180_metadata=self.vr180_metadata_checkbox.isChecked(),
             vision_pro_mode=["standard", "hvc1", "mvhevc"][self.vision_pro_combo.currentIndex()],
@@ -13106,6 +13739,7 @@ class VR180ProcessorGUI(QMainWindow):
             gyro_window_ms=self.gyro_window_slider.value(),
             output_format=["equirect", "fisheye"][self.output_format_combo.currentIndex()],
             audio_ambisonics=self.audio_format_combo.currentData() == "ambisonic",
+            audio_apac=self.audio_format_combo.currentData() == "apac",
             geoc_klns=self.config.geoc_klns,
             geoc_ctrx=self.config.geoc_ctrx,
             geoc_ctry=self.config.geoc_ctry,
@@ -13192,6 +13826,11 @@ class VR180ProcessorGUI(QMainWindow):
         self.gamma_slider.setValue(self.settings.value("gamma", 100, type=int))
         self.gain_slider.setValue(self.settings.value("gain", 100, type=int))
         self.saturation_slider.setValue(self.settings.value("saturation", 100, type=int))
+        self.shadow_slider.setValue(self.settings.value("shadow", 0, type=int))
+        self.highlight_slider.setValue(self.settings.value("highlight", 0, type=int))
+        self.temperature_slider.setValue(self.settings.value("temperature", 0, type=int))
+        self.tint_slider.setValue(self.settings.value("tint", 0, type=int))
+        self.mid_detail_slider.setValue(self.settings.value("mid_detail", 0, type=int))
 
         # Load VR180 metadata setting
         self.vr180_metadata_checkbox.setChecked(self.settings.value("vr180_metadata", False, type=bool))
@@ -13258,6 +13897,11 @@ class VR180ProcessorGUI(QMainWindow):
         self.settings.setValue("gamma", self.gamma_slider.value())
         self.settings.setValue("gain", self.gain_slider.value())
         self.settings.setValue("saturation", self.saturation_slider.value())
+        self.settings.setValue("shadow", self.shadow_slider.value())
+        self.settings.setValue("highlight", self.highlight_slider.value())
+        self.settings.setValue("temperature", self.temperature_slider.value())
+        self.settings.setValue("tint", self.tint_slider.value())
+        self.settings.setValue("mid_detail", self.mid_detail_slider.value())
 
         # Save VR180 metadata setting
         self.settings.setValue("vr180_metadata", self.vr180_metadata_checkbox.isChecked())
@@ -13408,6 +14052,27 @@ class VR180ProcessorGUI(QMainWindow):
         if hasattr(self, 'extractor') and self.extractor and self.extractor.isRunning():
             self.extractor.cancel()  # Kill FFmpeg process properly
             self.extractor.wait(1000)
+
+        # Stop any in-flight denoise preview workers (current + dying queue).
+        # Here we DO need to block because the app is about to exit — a still-
+        # running QThread at app exit triggers the same destructor-while-running
+        # crash. Wait reasonably (vt_denoise pipe ≤ 5s), then terminate as a
+        # last resort to ensure clean exit rather than a crash.
+        _denoise_workers_to_stop = []
+        if hasattr(self, '_denoise_preview_worker') and self._denoise_preview_worker is not None:
+            _denoise_workers_to_stop.append(self._denoise_preview_worker)
+        if hasattr(self, '_dying_workers'):
+            _denoise_workers_to_stop.extend(self._dying_workers)
+        for w in _denoise_workers_to_stop:
+            try:
+                if w.isRunning():
+                    w.cancel()
+                    w.wait(5000)
+                    if w.isRunning():
+                        w.terminate()
+                        w.wait(500)
+            except Exception:
+                pass
 
         self._save_settings()
         super().closeEvent(event)

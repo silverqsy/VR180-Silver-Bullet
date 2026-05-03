@@ -136,6 +136,20 @@ if IS_MACOS:
     else:
         print("⚠ Warning: vt_denoise helper not found - temporal denoise will not work")
 
+# Bundle apac_encode helper for Apple Positional Audio Codec (Vision Pro
+# spatial audio). Re-encodes 4ch ambisonic PCM to APAC via AVAssetWriter.
+# Build: swiftc -O -o apac_encode apac_encode.swift \
+#            -framework AVFoundation -framework CoreMedia -framework AudioToolbox
+if IS_MACOS:
+    apac_encode_helper = Path('apac_encode')
+    if apac_encode_helper.exists():
+        binaries.append((str(apac_encode_helper), '.'))
+        print(f"✓ Bundled apac_encode helper: {apac_encode_helper}")
+    else:
+        print("⚠ Warning: apac_encode helper not found - APAC spatial audio will not work")
+        print("  Build with: swiftc -O -o apac_encode apac_encode.swift \\")
+        print("      -framework AVFoundation -framework CoreMedia -framework AudioToolbox")
+
 # Collect PyAV (av) for fast video decode
 av_datas = []
 av_binaries = []
