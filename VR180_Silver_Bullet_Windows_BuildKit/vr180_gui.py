@@ -5688,17 +5688,18 @@ class FrameExtractor(QThread):
         #                [left]   [center] [right]    rows 1008-2927
         #                [corner] [bottom] [corner]   rows 2928-3935
 
-        # ── Seam fixes: replicate inner-face edge pixels over boundary pixels ──
+        # ── Seam fixes: replicate inner-face edge pixels over CORNER pixels ──
         # Bilinear interpolation samples floor(coord) and floor(coord)+1, so
-        # we need 1 pixel of padding at every face↔face and face↔corner boundary.
-
-        # Center face ↔ adjacent faces (horizontal seams at rows 1007/1008 and 2927/2928)
-        cross[1007, 1008:2928] = cross[1008, 1008:2928]   # top↔center
-        cross[2928, 1008:2928] = cross[2927, 1008:2928]   # center↔bottom
-
-        # Center face ↔ adjacent faces (vertical seams at cols 1007/1008 and 2927/2928)
-        cross[1008:2928, 1007] = cross[1008:2928, 1008]   # left↔center
-        cross[1008:2928, 2928] = cross[1008:2928, 2927]   # center↔right
+        # we need 1 pixel of padding where a face borders an UNFILLED corner
+        # region (corners contain replicated junk, not real EAC data).
+        #
+        # Face↔face boundaries (center↔left/right/top/bottom) are NOT padded —
+        # the GoPro EAC layout places adjacent faces in adjacent source columns
+        # of s0/s4, so the natural assembly is already pixel-continuous across
+        # those boundaries. Replicating across face↔face creates a synthetic
+        # 1-pixel discontinuity (skipping over the source's natural boundary
+        # column) which appears as a visible vertical/horizontal seam at
+        # azimuth ±45° / elevation ±45° in the output.
 
         # Top/Bottom face ↔ corner areas (vertical seams).
         # Without these, bilinear interpolation at the Top face's right edge
