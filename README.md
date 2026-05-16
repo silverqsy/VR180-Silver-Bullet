@@ -1,107 +1,74 @@
-# VR180 Silver Bullet
+# VR180 Silver Bullet — Neo
 
-A professional VR180 stereo video processor for the **GoPro Max 2 VR180 Mod**. Converts .360 EAC dual-track footage into side-by-side VR180 with gyro stabilization, rolling shutter correction, color grading, and Apple Vision Pro spatial video output.
+A clean-room Rust rewrite of the [VR180 Silver Bullet](../vr180_processor/)
+GoPro Max 2 VR180 mod processor.
 
-## Features
+## Why a rewrite
 
-### True 10-bit End-to-End Pipeline
-- Full uint16 processing — decode, remap, LUT, sharpen, saturation, color grading all at 16-bit
-- PyAV hardware decode (VideoToolbox on macOS, NVDEC on Windows)
-- No 8-bit truncation anywhere in the pipeline
+The Python/PyQt6 app shipped on `main` works, but its architecture
+constrains us:
 
-### GoPro .360 Processing
-- Dual HEVC stream decode (s0 + s4) with EAC cross assembly
-- Per-lens GEOC calibration (FRNT/BACK KLNS from camera metadata)
-- Half-equirectangular and native fisheye output projections
-- Multi-segment recording support with automatic chapter detection
+| Pain point in the Python app | Root cause | Neo fix |
+|---|---|---|
+| 3 GB Windows install | PyQt6 + Numba + cv2 + av + Python 3.11 | Single ~80 MB native binary |
+| "WinError 2 / cudart in PhysX" | Bundled-binary path detection + Numba CUDA toolkit hunt | `ffmpeg-next` links libav in-process; `wgpu` needs no CUDA toolkit |
+| "could not broadcast (944,1920) → (1008,1920)" | Hardcoded `5952×1920` stream dimensions in 7+ places | `EacDims` struct derived from `ffprobe` once, type-checked everywhere |
+| ~8 fps export with `Decode: FFmpeg (fallback)` | subprocess pipe + Python per-frame overhead | In-process libav + zero-copy GPU = 3–10× faster |
+| MLX / Numba CUDA / Numba CPU dispatch maze | Three GPU stacks, each with edge cases | `wgpu` = one path, runtime-selects Metal / Vulkan / DX12 |
+| SA3D `KeyError`, scipy phantom import | Python loose typing + duck-typed metadata dicts | Rust enums + `?` propagate errors at compile time |
 
-### Gyro Stabilization & Rolling Shutter Correction
-- CORI/IORI quaternion parsing from GPMF metadata
-- 800Hz GYRO-based rolling shutter correction with per-pixel fisheye time mapping
-- GRAV-based gravity alignment for horizon lock
-- No-ERS firmware support — VQF 9-axis IMU fusion for cameras with disabled electronic rolling shutter
-- Configurable smoothing, max correction, and per-axis RS factors
+Architecture mirrors [SLRStudioNeo](../SLRStudioNeo/) and
+[Gyroflow](https://github.com/gyroflow/gyroflow): pure-Rust headless core,
+in-process libav for video I/O (`ffmpeg-next 8.1`), `wgpu` for GPU
+compute. The Mac-native Swift helpers (`mvhevc_encode`, `apac_encode`,
+`vt_denoise`) carry over unchanged — they're already optimal and the
+Rust pipeline spawns them as external processes, same pattern
+SLRStudioNeo uses for its `slr-render` worker.
 
-### Apple Vision Pro Spatial Video
-- **APMP metadata** — SBS exports tagged with vexu/eyes/proj/pack/cams/hfov atoms for native visionOS 26+ playback
-- **MV-HEVC direct encoder** (macOS only) — Built-in VideoToolbox spatial video encoding, no external dependencies
-- 65mm stereo baseline matching the GoPro Max 2 VR180 Mod lens separation
+## Workspace layout
 
-### Temporal Denoise (macOS only)
-- VTTemporalNoiseFilter with genuine 10-bit processing via 64RGBALE intermediate
-- Hardware-accelerated multi-frame motion-compensated noise reduction
-- Requires macOS 26+ on Apple Silicon
-
-### Color Grading
-- .cube 3D LUT support with intensity control
-- ASC CDL: Lift, Gamma, Gain, Saturation
-- Bundled Recommended LUT for GoPro LOG (auto-loads for .360 input)
-
-### Output
-- H.265 10-bit (VideoToolbox / NVENC / libx265)
-- ProRes 422 (Proxy through 4444XQ)
-- MV-HEVC spatial video for Apple Vision Pro
-- Proper BT.709 color tagging on all codecs
-- Trim with frame-accurate in/out points
-
-## Downloads
-
-### macOS
-Download the signed and notarized app from [Releases](https://github.com/silverqsy/VR180-Silver-Bullet/releases).
-
-**Requirements**: macOS 14+ (Sonnet), Apple Silicon recommended. Temporal denoise requires macOS 26+.
-
-### Windows
-Clone the repo and use the build kit:
 ```
-cd VR180_Silver_Bullet_Windows_BuildKit
-build_windows.bat
-```
-**Requirements**: Python 3.10+, FFmpeg in PATH, NVIDIA GPU recommended for NVDEC/NVENC.
+crates/
+├── vr180-core/      # pure Rust: gyro/VQF, EAC math, GEOC, color math,
+│                    # project config, GPMF / SA3D / sv3d atom writing
+├── vr180-pipeline/  # ffmpeg-next decode/encode + wgpu kernels +
+│                    # Swift helper spawn glue
+└── vr180-render/    # CLI binary: reads JSON config → renders → exits.
+                     # The existing Python GUI on `main` will eventually
+                     # shell out to this for the heavy work.
 
-#### CUDA (NVIDIA users)
-Numba supports **CUDA 12.x** (preferred) and **CUDA 11.x**. **CUDA 13+ is not supported.**
+apps/                # (reserved) Tauri UI shell — comes after render
+                     # CLI is at parity with the Python export pipeline.
 
-Recommended download: [CUDA Toolkit 12.6](https://developer.nvidia.com/cuda-12-6-0-download-archive).
-
-The app auto-detects an installed CUDA toolkit at startup, preferring 12.x. If you already have CUDA 13 installed, install 12.6 alongside it — both can coexist and the app will pick 12.x first. Only the runtime libraries are needed (you can skip the compiler / Visual Studio integration in the "Custom" install).
-
-If no compatible CUDA toolkit is found, the app falls back to Numba's CPU JIT path — slower but functional.
-
-## Building from Source
-
-### macOS
-```bash
-pip install -r requirements.txt
-# Build Swift helpers
-swiftc -O -o mvhevc_encode mvhevc_encode.swift \
-    -framework AVFoundation -framework VideoToolbox \
-    -framework CoreMedia -framework CoreVideo -framework Accelerate
-swiftc -O -o vt_denoise vt_denoise.swift \
-    -framework AVFoundation -framework VideoToolbox \
-    -framework CoreMedia -framework CoreVideo
-swiftc -O -o apac_encode apac_encode.swift \
-    -framework AVFoundation -framework CoreMedia -framework AudioToolbox
-# Build app bundle
-python -m PyInstaller --clean vr180_silver_bullet.spec
+helpers/swift/       # macOS VideoToolbox / AVFoundation helpers
+                     #   mvhevc_encode  — MV-HEVC spatial video encoder
+                     #   vt_denoise     — VTTemporalNoiseFilter
+                     #   apac_encode    — Apple Positional Audio Codec
+                     # Build via helpers/build_swift.sh
 ```
 
-### Windows
-```
-pip install -r requirements.txt
-python -m PyInstaller --clean vr180_silver_bullet.spec
-```
+## Status
 
-## GPU Acceleration
+**Phase 0.1 — skeleton.** Workspace compiles, no functionality yet.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the phased plan and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design notes.
 
-| Backend | Platform | Used For |
-|---------|----------|----------|
-| MLX Metal | macOS (Apple Silicon) | EAC remap, 3D LUT, sharpen |
-| CUDA/Numba | Windows (NVIDIA) | EAC remap, 3D LUT |
-| VideoToolbox | macOS | Decode, H.265/ProRes encode, MV-HEVC, denoise |
-| NVENC/NVDEC | Windows | Decode, H.265 encode |
-| Numba CPU | All | Fallback for remap, LUT, sharpen |
+## Build
+
+See [docs/BUILD.md](docs/BUILD.md) for the FFmpeg / `FFMPEG_DIR`
+prereqs. Once those are in place:
+
+```sh
+# Native build
+cargo build --release
+
+# CLI invocation (placeholder for now)
+./target/release/vr180-render --help
+
+# macOS Swift helpers
+./helpers/build_swift.sh
+```
 
 ## License
 
-MIT
+MIT.

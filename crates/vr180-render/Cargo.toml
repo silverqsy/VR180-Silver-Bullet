@@ -1,0 +1,21 @@
+[package]
+name = "vr180-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI render binary for VR180 Silver Bullet Neo."
+
+[[bin]]
+name = "vr180-render"
+path = "src/main.rs"
+
+[dependencies]
+vr180-core = { workspace = true }
+vr180-pipeline = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,79 +1,28 @@
-# Build artifacts
-build/
-dist/
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-*.spec.bak
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock.bak
 
-# IDE
+# Compiled Swift helper binaries — these are built by helpers/build_swift.sh,
+# not committed. (Source .swift files ARE committed.)
+/helpers/bin/
+helpers/swift/mvhevc_encode
+helpers/swift/vt_denoise
+helpers/swift/apac_encode
+
+# OS detritus
+.DS_Store
+Thumbs.db
+
+# Editor
 .vscode/
 .idea/
 *.swp
-*.swo
-.DS_Store
 
-# Video files
-*.360
-*.mp4
-*.MP4
-*.mov
-*.MOV
-*.LRV
-*.osv
-*.CRM
+# Local override / experiment files
+/scratch/
+/local-config.json
 
-# Test/debug artifacts
-*.csv
-*.mp3
-*.jpg
-*.png
-debug_steps*/
-
-# Virtual environments
-venv/
-.venv/
-env/
-.Python
-
-# Backup copies
-vr180_gui\ copy*.py
-vr180_gui_*.py
-vt_denoise.bak.*
-vt_denoise\ copy*
-
-# Test/analysis scripts
-analyse_*.py
-analyze_*.py
-test_*.py
-diag_*.py
-debug_*.py
-check_*.py
-compare_*.py
-imu_*.py
-gyro_*.py
-validate_*.py
-verify_*.py
-assemble_*.py
-show_*.py
-find_*.py
-gen_*.py
-export_360_data.py
-extract_rect_via_equirect.py
-full_pipeline.py
-output_sbs_fisheye.py
-reanalyze_geoc.py
-rs_test_pattern.html
-rs_analyse/
-
-# Distribution zips (not tracked, too large)
-*.zip
-
-# Claude memory / local settings
-memory/
-.claude/settings.local.json
-
-# Firmware / update files
-UPDATE/
-LABS_*
+# avbuild / ffmpeg distribution (kept out of git; user points FFMPEG_DIR at it)
+/ffmpeg/

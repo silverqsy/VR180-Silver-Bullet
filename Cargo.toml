@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vr180-core",
+    "crates/vr180-pipeline",
+    "crates/vr180-render",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+license = "MIT"
+authors = ["VR180 Silver Bullet Team"]
+
+[workspace.dependencies]
+# Serialization — project JSON, automation sidecar, IPC with the GUI shim
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Errors / logging
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Numerics
+nalgebra = "0.33"     # 3x3 / quaternion math (CORI/IORI/GRAV/MNOR pipeline)
+
+# In-process libav. Same version SLRStudioNeo uses (Gyroflow-proven).
+# Build requires FFMPEG_DIR pointing at an avbuild distribution + libclang.
+# See docs/BUILD.md.
+ffmpeg-next = "8.1"
+
+# GPU compute — single backend (Metal / Vulkan / DX12 via wgpu).
+# Replaces the MLX / Numba CUDA / Numba CPU trichotomy from the Python app.
+wgpu = "0.20"
+pollster = "0.4"
+bytemuck = { version = "1.21", features = ["derive"] }
+
+# Internal crates
+vr180-core = { path = "crates/vr180-core", version = "0.1.0" }
+vr180-pipeline = { path = "crates/vr180-pipeline", version = "0.1.0" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Dev profile: faster compile during iteration
+[profile.dev]
+opt-level = 0
+debug = 1

@@ -1,0 +1,33 @@
+[package]
+name = "vr180-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "I/O + GPU pipeline for VR180 Silver Bullet Neo: ffmpeg-next decode/encode, wgpu compute, Swift helper spawn."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+vr180-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# In-process libav decode/encode. Pinned to match SLRStudioNeo.
+ffmpeg-next = { workspace = true }
+
+# GPU compute
+wgpu = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }
+
+[features]
+default = []
+# Lets us compile without an FFmpeg dev install during very early
+# scaffolding work (only the GPU side stays available). Drop once
+# Phase 0.4 lands.
+no-ffmpeg = []
