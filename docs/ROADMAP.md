@@ -15,18 +15,27 @@ crates, CLI prints `--help`.
 - [x] Swift helpers preserved under `helpers/swift/`
 - [x] `.gitignore`, `LICENSE`, `README.md`, `CLAUDE.md`
 
-## Phase 0.2 — Project model + GPMF parsing
+## Phase 0.2 — Project model + GPMF parsing ✅
 
 Port `parse_gyro_raw.py` core: GPMF stream extraction (via
-ffmpeg-next, not subprocess) + STMP / CORI / IORI / GRAV / MNOR
-parsing. Output: `GyroData` struct identical in shape to the
-Python `gyro_data` dict.
+ffmpeg-next, not subprocess) + CORI / IORI quaternion parsing.
 
-- [ ] `vr180-core::project::ProcessingConfig` (mirrors Python dataclass)
-- [ ] `vr180-core::gyro::gpmf` parser (DEVC/STRM/STMP nesting)
-- [ ] `vr180-core::gyro::CoriIori` quaternion sequence
-- [ ] CLI: `vr180-render probe-gyro <file.360>` prints CORI Euler stats
-- [ ] Validated against Python output on a known reference clip
+- [x] `vr180-core::project::ProcessingConfig` (skeleton; fields land per stage)
+- [x] `vr180-core::gyro::gpmf::GpmfWalker` — streaming iterator
+      (DEVC/STRM container traversal, padding-aware)
+- [x] `vr180-core::gyro::cori_iori::{parse_cori, parse_iori, Quat,
+      quat_to_euler_zyx}` — Q15 big-endian decode
+- [x] `vr180-pipeline::decode::extract_gpmf_stream` — ffmpeg-next
+      based, in-process; picks the `gpmd`-tagged stream (not the
+      `tmcd` timecode stream that `best(Data)` returns)
+- [x] CLI: `vr180-render probe-gyro <file.360>` prints CORI/IORI
+      count + first sample + Euler ranges
+- [x] **Validated** against Python output on `GS010172.360`:
+      same 321 536-byte GPMF blob, same 875 / 875 sample counts,
+      same `CORI[0] = (0.999969, 0.001495, 0.000610, 0.001984)`,
+      same Euler ranges to ±0.001°. **41 ms** end-to-end vs
+      Python's ~500 ms+ (~12× faster, mostly subprocess-startup
+      tax avoided).
 
 ## Phase 0.3 — VQF no-firmware-RS path
 

@@ -26,3 +26,11 @@ Thumbs.db
 
 # avbuild / ffmpeg distribution (kept out of git; user points FFMPEG_DIR at it)
 /ffmpeg/
+
+# Reference / sample footage (multi-GB .360 files for local validation;
+# never tracked — too large for git, and not redistributable anyway).
+/test 360 files/
+/samples/
+/*.360
+/*.mp4
+/*.mov
