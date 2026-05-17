@@ -29,10 +29,18 @@ pub struct Device {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     eac_to_equirect: EacToEquirectPipeline,
+    lut3d: Lut3DPipeline,
 }
 
 #[derive(Debug)]
 struct EacToEquirectPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+#[derive(Debug)]
+struct Lut3DPipeline {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -76,7 +84,8 @@ impl Device {
             .await
             .map_err(|e| Error::Wgpu(format!("request_device: {e}")))?;
         let eac_to_equirect = EacToEquirectPipeline::create(&device);
-        Ok(Self { instance, adapter, device, queue, eac_to_equirect })
+        let lut3d = Lut3DPipeline::create(&device);
+        Ok(Self { instance, adapter, device, queue, eac_to_equirect, lut3d })
     }
 
     /// Project one EAC cross (`cross_w × cross_w × RGB8`) to a half-
@@ -304,3 +313,268 @@ impl EacToEquirectPipeline {
 ///
 /// Ported from `FrameExtractor.build_cross_remap` in `vr180_gui.py`.
 const EAC_TO_EQUIRECT_WGSL: &str = include_str!("shaders/eac_to_equirect.wgsl");
+
+const LUT3D_WGSL: &str = include_str!("shaders/lut3d.wgsl");
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Lut3DUniforms {
+    size: u32,
+    intensity: f32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+impl Lut3DPipeline {
+    fn create(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("lut3d"),
+            source: wgpu::ShaderSource::Wgsl(LUT3D_WGSL.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lut3d_bgl"),
+            entries: &[
+                // 0: input 2D texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 1: LUT 3D texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 2: sampler (trilinear)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // 3: output 2D storage texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                // 4: uniforms
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("lut3d_pll"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("lut3d_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("lut3d_smp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        Self { pipeline, bind_group_layout, sampler }
+    }
+}
+
+impl Device {
+    /// Apply a 3D .cube LUT to an RGB8 image. Trilinear sampling on
+    /// the GPU; one shader dispatch. `intensity` is the blend factor
+    /// from the original image (0.0) to the fully-graded image (1.0).
+    pub fn apply_lut3d(
+        &self,
+        input_rgb: &[u8],
+        w: u32, h: u32,
+        lut: &vr180_core::color::Cube3DLut,
+        intensity: f32,
+    ) -> Result<Vec<u8>> {
+        // Upload input as rgba8unorm 2D texture.
+        let input_rgba = rgb_to_rgba(input_rgb, w as usize, h as usize);
+        let input_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("lut3d_input"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &input_tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+            },
+            &input_rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+
+        // Upload LUT as 3D rgba8unorm texture.
+        let lut_bytes = lut.to_rgba8_for_upload();
+        let lut_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("lut3d_cube"),
+            size: wgpu::Extent3d {
+                width: lut.size, height: lut.size, depth_or_array_layers: lut.size,
+            },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &lut_tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+            },
+            &lut_bytes,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(lut.size * 4),
+                rows_per_image: Some(lut.size),
+            },
+            wgpu::Extent3d {
+                width: lut.size, height: lut.size, depth_or_array_layers: lut.size,
+            },
+        );
+
+        // Output storage texture.
+        let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("lut3d_output"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        // Uniforms.
+        let uniforms = Lut3DUniforms {
+            size: lut.size,
+            intensity,
+            _pad0: 0, _pad1: 0,
+        };
+        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lut3d_uniforms"),
+            size: std::mem::size_of::<Lut3DUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+
+        // Bind group.
+        let input_view = input_tex.create_view(&Default::default());
+        let lut_view = lut_tex.create_view(&Default::default());
+        let output_view = output_tex.create_view(&Default::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lut3d_bg"),
+            layout: &self.lut3d.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&input_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&lut_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.lut3d.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&output_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: uniform_buf.as_entire_binding() },
+            ],
+        });
+
+        // Dispatch.
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("lut3d_enc"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("lut3d_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.lut3d.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let wg_x = (w + 7) / 8;
+            let wg_y = (h + 7) / 8;
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+
+        // Readback (same staging buffer dance as project_cross_to_equirect).
+        let bpp = 4u32;
+        let unpadded_row_bytes = w * bpp;
+        let padded_row_bytes = (unpadded_row_bytes + 255) & !255;
+        let buf_size = (padded_row_bytes * h) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lut3d_staging"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &output_tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
+            .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
+        let mapped = slice.get_mapped_range();
+        let mut out_rgb = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            let row_off = (y * padded_row_bytes) as usize;
+            for x in 0..w {
+                let px_off = row_off + (x * 4) as usize;
+                out_rgb.extend_from_slice(&mapped[px_off..px_off + 3]);
+            }
+        }
+        drop(mapped);
+        staging.unmap();
+        Ok(out_rgb)
+    }
+}

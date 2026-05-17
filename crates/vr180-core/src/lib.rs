@@ -18,6 +18,8 @@ pub mod geoc;
 pub mod color;
 pub mod atoms;
 
+pub use color::Cube3DLut;
+
 /// Top-level error type for the core crate. Pipeline + render
 /// layers map their own errors into / from this via `From` impls.
 #[derive(Debug, thiserror::Error)]

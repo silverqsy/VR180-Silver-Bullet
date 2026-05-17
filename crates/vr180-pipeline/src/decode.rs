@@ -442,6 +442,204 @@ impl BenchResult {
     }
 }
 
+/// Open a `.360`, return a streaming iterator that yields one
+/// [`StreamPair`] per video-time-step (one frame from each of the two
+/// HEVC streams, packed RGB8). Used by Phase 0.8's multi-frame `export`.
+///
+/// All the codec / hwaccel setup lives in [`StreamPairIter::new`]; the
+/// iterator itself is just decoder.send_packet → receive_frame → swscale
+/// → repack RGB8. Stops at EOF or after `n_frames` if non-zero.
+pub fn iter_stream_pairs(path: &Path, hw: HwDecode, n_frames: u32) -> Result<StreamPairIter> {
+    StreamPairIter::new(path, hw, n_frames)
+}
+
+pub struct StreamPairIter {
+    ictx: ffmpeg_next::format::context::Input,
+    video_indices: Vec<usize>,
+    decoders: Vec<ffmpeg_next::codec::decoder::Video>,
+    scalers: Vec<Option<ffmpeg_next::software::scaling::Context>>,
+    hw_active: [bool; 2],
+    dims: vr180_core::eac::Dims,
+    decode_path: DecodePath,
+    frame_limit: u32,
+    frames_yielded: u32,
+}
+
+impl StreamPairIter {
+    pub fn new(path: &Path, hw: HwDecode, frame_limit: u32) -> Result<Self> {
+        init();
+        let mut ictx = ffmpeg_next::format::input(path)
+            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+
+        let video_indices: Vec<usize> = ictx
+            .streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+            .map(|s| s.index())
+            .collect();
+        if video_indices.len() < 2 {
+            return Err(Error::Ffmpeg(format!(
+                "expected 2 video streams in .360 file, found {}",
+                video_indices.len()
+            )));
+        }
+        let mut decoders = Vec::with_capacity(2);
+        let mut hw_active = [false, false];
+        for (i, &idx) in video_indices.iter().take(2).enumerate() {
+            let stream = ictx.stream(idx).unwrap();
+            let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+                .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+            #[cfg(target_os = "macos")]
+            {
+                let want_vt = matches!(hw, HwDecode::Auto | HwDecode::VideoToolbox);
+                if want_vt {
+                    if try_enable_videotoolbox_decode(&mut codec_ctx) {
+                        hw_active[i] = true;
+                    } else if matches!(hw, HwDecode::VideoToolbox) {
+                        return Err(Error::Ffmpeg("VT requested but unavailable".into()));
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (i, hw);
+                if matches!(hw, HwDecode::VideoToolbox) {
+                    return Err(Error::Ffmpeg("VT is macOS-only".into()));
+                }
+            }
+            decoders.push(codec_ctx.decoder().video()
+                .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?);
+        }
+
+        let (w0, h0) = (decoders[0].width(), decoders[0].height());
+        let (w1, h1) = (decoders[1].width(), decoders[1].height());
+        if (w0, h0) != (w1, h1) {
+            return Err(Error::Ffmpeg(format!(
+                "video streams disagree on dimensions: {w0}x{h0} vs {w1}x{h1}"
+            )));
+        }
+        let dims = vr180_core::eac::Dims::new(w0, h0);
+        if !dims.is_valid() {
+            return Err(Error::Ffmpeg(format!(
+                "stream width {w0} not a valid EAC layout"
+            )));
+        }
+        let decode_path = if hw_active.iter().all(|&a| a) {
+            DecodePath::VideoToolbox
+        } else {
+            DecodePath::Software
+        };
+        Ok(Self {
+            ictx, video_indices, decoders,
+            scalers: vec![None, None],
+            hw_active, dims, decode_path,
+            frame_limit,
+            frames_yielded: 0,
+        })
+    }
+
+    pub fn dims(&self) -> vr180_core::eac::Dims { self.dims }
+    pub fn decode_path(&self) -> DecodePath { self.decode_path }
+
+    /// Pull the next `StreamPair` (one frame from each video stream).
+    /// Returns `Ok(None)` at EOF or after the frame limit is hit.
+    pub fn next_pair(&mut self) -> Result<Option<StreamPair>> {
+        if self.frame_limit > 0 && self.frames_yielded >= self.frame_limit {
+            return Ok(None);
+        }
+        let mut frames: [Option<Vec<u8>>; 2] = [None, None];
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        let mut sw_storage = ffmpeg_next::frame::Video::empty();
+
+        // Try receiving leftover-buffered frames first (the HEVC decoder
+        // often has prepared frames from previous packets).
+        for pos in 0..2 {
+            if frames[pos].is_some() { continue; }
+            let dec = &mut self.decoders[pos];
+            if dec.receive_frame(&mut decoded).is_ok() {
+                frames[pos] = Some(repack_to_rgb8(
+                    &mut decoded, &mut sw_storage,
+                    self.hw_active[pos], &mut self.scalers[pos],
+                )?);
+            }
+        }
+
+        // Then drive the packet loop until both slots are filled or EOF.
+        if frames.iter().any(|f| f.is_none()) {
+            loop {
+                let res = self.ictx.packets().next();
+                let (stream, packet) = match res {
+                    Some(x) => x,
+                    None => break,
+                };
+                let pos = match self.video_indices.iter().position(|&i| i == stream.index()) {
+                    Some(p) if frames[p].is_none() => p,
+                    _ => continue,
+                };
+                let dec = &mut self.decoders[pos];
+                if dec.send_packet(&packet).is_err() { continue; }
+                while dec.receive_frame(&mut decoded).is_ok() {
+                    if frames[pos].is_some() { break; }
+                    frames[pos] = Some(repack_to_rgb8(
+                        &mut decoded, &mut sw_storage,
+                        self.hw_active[pos], &mut self.scalers[pos],
+                    )?);
+                    if frames.iter().all(|f| f.is_some()) { break; }
+                }
+                if frames.iter().all(|f| f.is_some()) { break; }
+            }
+        }
+
+        let (Some(s0), Some(s4)) = (frames[0].take(), frames[1].take()) else {
+            return Ok(None);  // EOF before both streams had a frame
+        };
+        self.frames_yielded += 1;
+        Ok(Some(StreamPair { s0, s4, dims: self.dims, decode_path: self.decode_path }))
+    }
+}
+
+/// Shared frame → packed-RGB8 conversion used by both single-frame and
+/// streaming code paths.
+fn repack_to_rgb8(
+    decoded: &mut ffmpeg_next::frame::Video,
+    sw_storage: &mut ffmpeg_next::frame::Video,
+    hw_active: bool,
+    scaler: &mut Option<ffmpeg_next::software::scaling::Context>,
+) -> Result<Vec<u8>> {
+    let frame_ref: &ffmpeg_next::frame::Video = if hw_active
+        && decoded.format() == ffmpeg_next::format::Pixel::VIDEOTOOLBOX
+    {
+        download_hw_frame(decoded, sw_storage)?;
+        sw_storage
+    } else {
+        decoded
+    };
+    let s = match scaler {
+        Some(s) => s,
+        None => {
+            *scaler = Some(ffmpeg_next::software::scaling::Context::get(
+                frame_ref.format(),
+                frame_ref.width(), frame_ref.height(),
+                ffmpeg_next::format::Pixel::RGB24,
+                frame_ref.width(), frame_ref.height(),
+                ffmpeg_next::software::scaling::Flags::BILINEAR,
+            ).map_err(|e| Error::Ffmpeg(format!("scaler: {e}")))?);
+            scaler.as_mut().unwrap()
+        }
+    };
+    let mut rgb = ffmpeg_next::frame::Video::empty();
+    s.run(frame_ref, &mut rgb).map_err(|e| Error::Ffmpeg(format!("scaler run: {e}")))?;
+    let w = rgb.width() as usize;
+    let h = rgb.height() as usize;
+    let src = rgb.data(0);
+    let src_stride = rgb.stride(0);
+    let mut out = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        let row = &src[y * src_stride..y * src_stride + w * 3];
+        out.extend_from_slice(row);
+    }
+    Ok(out)
+}
+
 /// Multi-frame decode benchmark: decode `n_frames` from the FIRST video
 /// stream as fast as possible, **no swscale RGB conversion**, returning
 /// per-stream timing. This measures the steady-state decode throughput

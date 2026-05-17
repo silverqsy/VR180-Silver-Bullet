@@ -204,30 +204,115 @@ NVDEC + cudarc + Vulkan external images. Another ~500 lines, only
 meaningful on the Windows builds. Out of scope until 0.9 wires up
 Windows builds in CI.
 
-## Phase 0.7 — Color pipeline + LUT + tonal zones
+## Phase 0.7 — 3D LUT color pipeline ✅
 
-Port the entire pre-LUT / post-LUT color pipeline as one fused
-wgpu pass. Order matters — port the validated order from the
-Python `apply_export_post`.
+The headline color feature first; CDL knobs follow.
 
-- [ ] `tonal_zones.wgsl` (shadow/highlight smoothstep masks)
-- [ ] `color_grade.wgsl` (lift / gamma / gain / sat / temp / tint)
-- [ ] `lut3d.wgsl` (trilinear .cube LUT)
-- [ ] `mid_detail.wgsl` (downsample-blur-upsample clarity)
-- [ ] CLI: `--lut`, `--shadow`, `--highlight`, `--temp`, `--tint`,
-      `--mid-detail` flags
+- [x] `vr180-core::color::Cube3DLut` — full `.cube` parser
+      (LUT_3D_SIZE / TITLE / DOMAIN_MIN/MAX / data triplets,
+      permissive on whitespace and unknown headers).
+      5 unit tests including a smoke test against the bundled
+      `assets/Recommended Lut GPLOG.cube` (33³).
+- [x] `shaders/lut3d.wgsl` — trilinear sample of an RGBA8 3D
+      texture with half-texel correction so input 0.0 → texel 0
+      and 1.0 → texel size-1.
+- [x] `Device::apply_lut3d(input_rgb, w, h, lut, intensity)` —
+      uploads input as 2D + LUT as 3D, one dispatch, repacks output
+      to RGB8. Pipeline / sampler / bind-group-layout built once at
+      `Device::new` (same caching pattern as eac_to_equirect).
+- [x] CLI: `--lut <path>` or `--lut bundled` + `--lut-intensity`
+      on `probe-eac` / `export`.
 
-## Phase 0.8 — Encode + Swift helper spawn
+**Visually verified** on `GS010172.360` with the bundled GP-Log
+LUT — subtle warm→neutral shift on the laptop screen + slight
+contrast bump in the corners. Math matches Python.
 
-ffmpeg-next encode (h265, prores) + spawning `mvhevc_encode` /
-`apac_encode` / `vt_denoise` from Rust.
+### Deferred to 0.7.5
 
-- [ ] `vr180-pipeline::encode::Encoder` (h265 / prores)
-- [ ] `vr180-pipeline::helpers::spawn_mvhevc_encode`
-- [ ] `vr180-pipeline::helpers::spawn_apac_encode`
-- [ ] `vr180-pipeline::helpers::spawn_vt_denoise`
-- [ ] `vr180-core::atoms` — sv3d / st3d / SA3D writers (replaces
-      Google's `spatialmedia` Python package)
+- 1D LUT for CDL (lift/gamma/gain + shadow/highlight smoothstep
+  zone masks). Easy port (~50 lines Rust + ~30 lines WGSL) but
+  needs a UI / flag plumbing decision first.
+- Temp/tint per-channel multiply, saturation. Trivial — one combined
+  pass with the above.
+- Mid-detail "clarity" (downsample → Gaussian blur → upsample →
+  high-pass → midtone-bell weighting). Multi-pass + needs a
+  pre-allocated scratch buffer pool. Cheap output, moderate code.
+
+## Phase 0.8 — H.265 encode + multi-frame export ✅
+
+- [x] `vr180-pipeline::encode::H265Encoder` — `libx265` software
+      encode wrapper. Packed RGB8 in → mp4/mov out. Handles
+      `hvc1` codec tag for Apple/Vision Pro compat, `GLOBAL_HEADER`
+      flag for the mov muxer, rational fps approximation,
+      PTS/DTS rescale, Drop-guarded `finish()`.
+- [x] `vr180-pipeline::decode::StreamPairIter` — streaming
+      iterator that yields one `StreamPair` per video-time-step,
+      shares the hwaccel setup + repack helper with the single-
+      shot `extract_first_stream_pair_with`.
+- [x] `export` CLI subcommand:
+      ```
+      vr180-render export <in.360> <out.mp4>
+          [--eye-w N] [--frames N] [--fps F] [--bitrate K]
+          [--lut bundled|<path>] [--lut-intensity F]
+          [--hw-accel auto|sw|vt]
+      ```
+      Full pipeline: VT decode → EAC assembly → GPU equirect projection
+      → GPU LUT → libx265 encode → mp4.
+
+**End-to-end test** (60 frames, GS010172.360, eye_w=2048,
+GP-Log LUT, VT decode):
+
+```
+Export: ... → /tmp/neo_out/export_test.mp4
+  source : 5952 × 1920 @ 30 fps
+  output : 4096 × 2048 @ 30 fps  H.265 12000 kbps
+  LUT    : 33^3 @ intensity 1.00
+  decode : VideoToolbox
+Done: 60 frames in 11.82s (5.08 fps)
+Output size: 2.7 MB
+[mp4 has hvc1 codec tag, plays in QuickTime / Vision Pro]
+```
+
+**The bottleneck is now libx265 software encode** (~12s for 60 frames).
+VT decode is essentially free at this scale.
+
+### Deferred to 0.8.5
+
+- `hevc_videotoolbox` hardware encode — ~5-8× faster than libx265
+  on Apple Silicon. Wires identically to the decode-side hwaccel
+  pattern (raw `ffmpeg_sys_next` FFI for `hw_device_ctx`,
+  `setup_videotoolbox_hwframes` from SLRStudioNeo).
+- 10-bit Main10 output (currently 8-bit yuv420p). Need to switch
+  the swscale src format from RGB24 → RGB48 and pix_fmt to
+  yuv420p10le. The GPU side is already 10-bit-ready.
+- Audio passthrough from the source `.360` (`audio_args = ["-c:a",
+  "copy"]` equivalent via libav demux+remux).
+
+### Deferred to 0.8.6 — Swift helper spawning
+
+The three macOS-native helpers already exist as compiled binaries
+in `helpers/swift/`. The Rust pipeline just needs spawn glue
+(stdin BGR48 frames, stderr line stream into `tracing` logs,
+exit-code → `pipeline::Error::Helper` mapping). Roughly mirrors
+how the Python app already calls them; not hard, just plumbing.
+
+- [ ] `vr180-pipeline::helpers::spawn_mvhevc_encode` — MV-HEVC
+      spatial video for Vision Pro
+- [ ] `vr180-pipeline::helpers::spawn_apac_encode` — ambisonic
+      audio re-encode (Apple Positional Audio Codec)
+- [ ] `vr180-pipeline::helpers::spawn_vt_denoise` — VTTemporal-
+      NoiseFilter, true 10-bit through denoise
+
+### Deferred to 0.8.7 — Atom writers
+
+Port the spherical / stereo / ambisonic metadata atoms into
+`vr180-core::atoms`. Replaces Python's `spatialmedia` package
+(which we patched twice this session for the
+`KeyError: 'ambisonic_channel_ordering'` bug). Three writers,
+all <100 bytes each on disk:
+- [ ] `sv3d` — spherical projection (equirectangular)
+- [ ] `st3d` — stereo mode (left-right SBS)
+- [ ] `SA3D` — ambisonic audio metadata (Google spec)
 
 ## Phase 0.9 — Full export parity + CLI sidecar mode
 

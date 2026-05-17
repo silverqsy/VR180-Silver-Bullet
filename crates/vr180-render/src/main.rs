@@ -82,6 +82,15 @@ enum Cmd {
         /// (force software), or vt (force VideoToolbox, macOS only).
         #[arg(long, value_enum, default_value_t = HwAccel::Auto)]
         hw_accel: HwAccel,
+        /// Optional .cube 3D LUT to apply after the equirect projection.
+        /// On macOS the bundled GoPro GP-Log LUT at
+        /// `assets/Recommended Lut GPLOG.cube` is a sensible default;
+        /// pass `--lut bundled` to use it.
+        #[arg(long)]
+        lut: Option<String>,
+        /// LUT blend factor [0..1]. 0 = original, 1 = full LUT.
+        #[arg(long, default_value_t = 1.0)]
+        lut_intensity: f32,
     },
 
     /// Phase 0.6 decode-throughput benchmark. Decode the first N frames
@@ -99,12 +108,35 @@ enum Cmd {
         hw_accel: HwAccel,
     },
 
-    /// (placeholder) Render the project described by a JSON config.
+    /// Phase 0.8 export: decode → assemble → equirect → (LUT) → H.265 mp4.
+    /// Single-codec libx265 software encode (Phase 0.8 baseline).
     Export {
-        /// Path to the export JSON config (schema matches what the
-        /// Python GUI writes).
+        /// Input `.360` file.
+        input: PathBuf,
+        /// Output `.mov` / `.mp4` file.
+        output: PathBuf,
+        /// Half-equirect width per eye. Final SBS frame is `2 * eye_w × eye_w`.
+        #[arg(long, default_value_t = 2048)]
+        eye_w: u32,
+        /// Number of frames to export (0 = all).
+        #[arg(short = 'n', long, default_value_t = 0)]
+        frames: u32,
+        /// Output FPS. Defaults to the source clip's FPS.
         #[arg(long)]
-        config: PathBuf,
+        fps: Option<f32>,
+        /// libx265 target bitrate in kbps.
+        #[arg(long, default_value_t = 12_000)]
+        bitrate: u32,
+        /// Optional .cube 3D LUT. `bundled` = the GP-Log LUT from
+        /// `assets/`.
+        #[arg(long)]
+        lut: Option<String>,
+        /// LUT blend factor [0..1].
+        #[arg(long, default_value_t = 1.0)]
+        lut_intensity: f32,
+        /// Hardware-accelerated decode: auto / sw / vt.
+        #[arg(long, value_enum, default_value_t = HwAccel::Auto)]
+        hw_accel: HwAccel,
     },
 }
 
@@ -138,15 +170,129 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Cmd::ProbeGyro { path, vqf }) => probe_gyro(&path, vqf),
-        Some(Cmd::ProbeEac { path, out, equirect, eye_w, hw_accel }) =>
-            probe_eac(&path, out.as_deref(), equirect.as_deref(), eye_w, hw_accel.into()),
+        Some(Cmd::ProbeEac { path, out, equirect, eye_w, hw_accel, lut, lut_intensity }) =>
+            probe_eac(&path, out.as_deref(), equirect.as_deref(), eye_w,
+                      hw_accel.into(), lut.as_deref(), lut_intensity),
         Some(Cmd::BenchDecode { path, frames, hw_accel }) =>
             bench_decode(&path, frames, hw_accel.into()),
-        Some(Cmd::Export { config }) => {
-            tracing::warn!(?config, "export: not implemented (Phase 0.9)");
-            Ok(())
+        Some(Cmd::Export { input, output, eye_w, frames, fps, bitrate, lut, lut_intensity, hw_accel }) =>
+            export(&input, &output, eye_w, frames, fps, bitrate,
+                   lut.as_deref(), lut_intensity, hw_accel.into()),
+    }
+}
+
+fn export(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    eye_w: u32,
+    n_frames: u32,
+    fps: Option<f32>,
+    bitrate_kbps: u32,
+    lut_spec: Option<&str>,
+    lut_intensity: f32,
+    hw: vr180_pipeline::decode::HwDecode,
+) -> anyhow::Result<()> {
+    use vr180_core::eac::{assemble_lens_a, assemble_lens_b};
+    use vr180_pipeline::decode::{iter_stream_pairs, probe_video};
+    use vr180_pipeline::encode::H265Encoder;
+    use vr180_pipeline::gpu::Device;
+
+    let probe = probe_video(input)?;
+    let out_w = eye_w * 2;
+    let out_h = eye_w;
+    let fps = fps.unwrap_or(probe.fps);
+
+    println!("Export: {} → {}", input.display(), output.display());
+    println!("  source : {} × {}  @ {:.3} fps  ({:.1}s)",
+        probe.width, probe.height, probe.fps, probe.duration_sec);
+    println!("  output : {} × {}  @ {:.3} fps  H.265 {} kbps",
+        out_w, out_h, fps, bitrate_kbps);
+
+    let lut = match lut_spec {
+        Some("bundled") => Some(vr180_core::Cube3DLut::from_file(
+            &resolve_bundled_lut().ok_or_else(|| anyhow::anyhow!("bundled LUT not found"))?
+        )?),
+        Some(p) => Some(vr180_core::Cube3DLut::from_file(std::path::Path::new(p))?),
+        None => None,
+    };
+    if let Some(l) = &lut { println!("  LUT    : {}^3 @ intensity {:.2}", l.size, lut_intensity); }
+
+    let device = Device::new()?;
+    let mut decoder = iter_stream_pairs(input, hw, n_frames)?;
+    let dims = decoder.dims();
+    let cw = dims.cross_w() as usize;
+    println!("  decode : {} (probed {}×{}, EAC tile_w={})",
+        decoder.decode_path(), dims.stream_w, dims.stream_h, dims.tile_w());
+
+    let mut encoder = H265Encoder::create(output, out_w, out_h, fps, bitrate_kbps)?;
+    let mut cross_a = vec![0u8; cw * cw * 3];
+    let mut cross_b = vec![0u8; cw * cw * 3];
+
+    let t_start = std::time::Instant::now();
+    let mut frame_idx: u32 = 0;
+    let mut last_print = std::time::Instant::now();
+    while let Some(pair) = decoder.next_pair()? {
+        assemble_lens_a(&pair.s0, &pair.s4, dims, &mut cross_a);
+        assemble_lens_b(&pair.s0, &pair.s4, dims, &mut cross_b);
+
+        let mut left  = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, out_h)?;
+        let mut right = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, out_h)?;
+        if let Some(lut) = &lut {
+            left  = device.apply_lut3d(&left,  eye_w, out_h, lut, lut_intensity)?;
+            right = device.apply_lut3d(&right, eye_w, out_h, lut, lut_intensity)?;
+        }
+
+        // Stitch L | R side-by-side.
+        let mut sbs = vec![0u8; (out_w * out_h * 3) as usize];
+        let row_l = (eye_w * 3) as usize;
+        let row_sbs = (out_w * 3) as usize;
+        for y in 0..out_h as usize {
+            sbs[y * row_sbs..y * row_sbs + row_l]
+                .copy_from_slice(&left[y * row_l..y * row_l + row_l]);
+            sbs[y * row_sbs + row_l..y * row_sbs + row_l * 2]
+                .copy_from_slice(&right[y * row_l..y * row_l + row_l]);
+        }
+        encoder.encode_frame(&sbs)?;
+        frame_idx += 1;
+
+        if last_print.elapsed().as_secs_f32() > 1.0 {
+            let avg_fps = frame_idx as f32 / t_start.elapsed().as_secs_f32();
+            print!("\r  frame {frame_idx}  @ {avg_fps:.2} fps  ");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            last_print = std::time::Instant::now();
         }
     }
+    encoder.finish()?;
+    let total = t_start.elapsed();
+    let avg_fps = frame_idx as f32 / total.as_secs_f32();
+    println!("\nDone: {frame_idx} frames in {total:.2?} ({avg_fps:.2} fps)");
+
+    let size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
+    println!("Output size: {:.1} MB", size as f64 / 1_048_576.0);
+    Ok(())
+}
+
+/// Locate `assets/Recommended Lut GPLOG.cube` relative to either the
+/// workspace root (dev runs) or the running binary (release builds).
+fn resolve_bundled_lut() -> Option<std::path::PathBuf> {
+    // Dev: walk up from CWD looking for the assets dir.
+    let mut p = std::env::current_dir().ok()?;
+    for _ in 0..6 {
+        let candidate = p.join("assets/Recommended Lut GPLOG.cube");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        p = p.parent()?.to_path_buf();
+    }
+    // Release: next to the exe.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("Recommended Lut GPLOG.cube");
+            if p.is_file() { return Some(p); }
+        }
+    }
+    None
 }
 
 fn bench_decode(
@@ -171,6 +317,8 @@ fn probe_eac(
     equirect: Option<&std::path::Path>,
     eye_w: u32,
     hw: vr180_pipeline::decode::HwDecode,
+    lut_spec: Option<&str>,
+    lut_intensity: f32,
 ) -> anyhow::Result<()> {
     use vr180_core::eac::{Dims, assemble_lens_a, assemble_lens_b};
     use vr180_pipeline::decode::{extract_first_stream_pair_with, probe_video};
@@ -232,10 +380,33 @@ fn probe_eac(
         let device = Device::new()?;
         let device_t = t.elapsed();
 
+        // Resolve LUT path: `bundled` → assets path; anything else → as-is.
+        let lut = if let Some(spec) = lut_spec {
+            let path = if spec == "bundled" {
+                resolve_bundled_lut().ok_or_else(|| anyhow::anyhow!(
+                    "--lut bundled but assets/Recommended Lut GPLOG.cube not found"
+                ))?
+            } else {
+                std::path::PathBuf::from(spec)
+            };
+            let t = std::time::Instant::now();
+            let lut = vr180_core::Cube3DLut::from_file(&path)?;
+            println!("loaded LUT:       {}^3 from {}  ({:?})",
+                lut.size, path.display(), t.elapsed());
+            Some(lut)
+        } else { None };
+
         let t = std::time::Instant::now();
-        let left_eye = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, eye_h)?;
-        let right_eye = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, eye_h)?;
+        let mut left_eye = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, eye_h)?;
+        let mut right_eye = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, eye_h)?;
         let gpu_t = t.elapsed();
+
+        if let Some(lut) = &lut {
+            let t = std::time::Instant::now();
+            left_eye = device.apply_lut3d(&left_eye, eye_w, eye_h, lut, lut_intensity)?;
+            right_eye = device.apply_lut3d(&right_eye, eye_w, eye_h, lut, lut_intensity)?;
+            println!("applied LUT (2x): {:?}", t.elapsed());
+        }
 
         // Stitch L | R side-by-side.
         let sbs_w = eye_w * 2;
