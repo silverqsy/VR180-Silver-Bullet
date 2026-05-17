@@ -37,6 +37,7 @@ pub struct Device {
     sharpen_combine: SharpenCombinePipeline,
     mid_detail_combine: MidDetailCombinePipeline,
     downsample_4x: Downsample4xPipeline,
+    compose_sbs: ComposeSbsPipeline,
     bilinear_sampler: wgpu::Sampler,
 }
 
@@ -104,6 +105,15 @@ struct Downsample4xPipeline {
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
+/// SBS composition: 2 input textures (left + right) + 1 storage out
+/// (Rgba8Unorm view of a BGRA-byte-order IOSurface) + 1 uniform (eye_w).
+/// Final pass of the zero-copy-encode path.
+#[derive(Debug)]
+struct ComposeSbsPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
 impl Device {
     /// Create a wgpu device using the best available adapter.
     /// Backend is picked by wgpu (Metal on macOS, DX12/Vulkan on Win).
@@ -163,6 +173,7 @@ impl Device {
         let sharpen_combine = SharpenCombinePipeline::create(&device);
         let mid_detail_combine = MidDetailCombinePipeline::create(&device);
         let downsample_4x = Downsample4xPipeline::create(&device);
+        let compose_sbs = ComposeSbsPipeline::create(&device);
         let bilinear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("bilinear"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -178,6 +189,7 @@ impl Device {
             eac_to_equirect, lut3d, nv12_to_eac,
             cdl, color_grade,
             gaussian_blur, sharpen_combine, mid_detail_combine, downsample_4x,
+            compose_sbs,
             bilinear_sampler,
         })
     }
@@ -416,6 +428,16 @@ const GAUSSIAN_BLUR_1D_WGSL: &str = include_str!("shaders/gaussian_blur_1d.wgsl"
 const SHARPEN_COMBINE_WGSL: &str = include_str!("shaders/sharpen_combine.wgsl");
 const MID_DETAIL_COMBINE_WGSL: &str = include_str!("shaders/mid_detail_combine.wgsl");
 const DOWNSAMPLE_4X_WGSL: &str = include_str!("shaders/downsample_4x.wgsl");
+const COMPOSE_SBS_BGRA_WGSL: &str = include_str!("shaders/compose_sbs_bgra.wgsl");
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ComposeSbsUniforms {
+    eye_w: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -2362,6 +2384,242 @@ impl Device {
 struct Lut3DResources {
     tex: wgpu::Texture,
     size: u32,
+}
+
+// ===== Phase 0.7.5.6: zero-copy encode SBS composition =====
+
+impl ComposeSbsPipeline {
+    fn create(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("compose_sbs"),
+            source: wgpu::ShaderSource::Wgsl(COMPOSE_SBS_BGRA_WGSL.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("compose_sbs_bgl"),
+            entries: &[
+                bgle_tex(0),  // left
+                bgle_tex(1),  // right
+                bgle_storage_out(2),  // SBS dst (Rgba8Unorm view of BGRA IOSurface)
+                bgle_uniform(3, std::mem::size_of::<ComposeSbsUniforms>() as u64),
+            ],
+        });
+        let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("compose_sbs_pll"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("compose_sbs_pipeline"),
+            layout: Some(&pll),
+            module: &shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+        Self { pipeline, bind_group_layout }
+    }
+}
+
+impl Device {
+    /// Compose two equirect textures (left + right eye, RGBA8) into one
+    /// SBS texture in BGRA byte order. The destination is typically an
+    /// IOSurface-backed wgpu::Texture (viewed as Rgba8Unorm) that's
+    /// about to be handed to the VideoToolbox encoder.
+    ///
+    /// This is the LAST GPU step on the zero-copy-encode path —
+    /// `Device::poll(Maintain::Wait)` after submit ensures the IOSurface
+    /// bytes are fully written before VT reads them.
+    ///
+    /// The full chained color stack + SBS compose runs in one encoder:
+    /// `apply_color_stack_to_sbs_bgra(left_eq, right_eq, dst, plan)`.
+    pub fn apply_color_stack_to_sbs_bgra(
+        &self,
+        left_eq: &wgpu::Texture,
+        right_eq: &wgpu::Texture,
+        dst_bgra: &wgpu::Texture,
+        eye_w: u32, eye_h: u32,
+        plan: &ColorStackPlan,
+    ) -> Result<()> {
+        let t_total = Instant::now();
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("color_stack_sbs_enc"),
+        });
+        // Pre-allocate the LUT resources (if any) so they outlive the encoder.
+        let lut_resources = if let Some((ref lut, _)) = plan.lut {
+            Some(self.upload_lut3d_resources(lut))
+        } else { None };
+
+        // Run the color stack on each eye into a shared `intermediates`
+        // Vec. Each `record_color_stack` returns `Option<usize>` —
+        // an index into intermediates pointing at the final per-eye
+        // texture, or `None` meaning "no stages ran, use the source
+        // texture directly".
+        let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(16);
+        let left_idx = self.record_color_stack(
+            &mut encoder, left_eq, eye_w, eye_h, plan, &lut_resources, &mut intermediates,
+            "stack_l",
+        );
+        let right_idx = self.record_color_stack(
+            &mut encoder, right_eq, eye_w, eye_h, plan, &lut_resources, &mut intermediates,
+            "stack_r",
+        );
+        let left_final = match left_idx {
+            Some(i) => &intermediates[i],
+            None => left_eq,
+        };
+        let right_final = match right_idx {
+            Some(i) => &intermediates[i],
+            None => right_eq,
+        };
+
+        // Final pass: compose to SBS BGRA.
+        let uni = self.write_uniform("compose_sbs_u",
+            &ComposeSbsUniforms { eye_w, _pad0: 0, _pad1: 0, _pad2: 0 });
+        {
+            let l_v = left_final.create_view(&Default::default());
+            let r_v = right_final.create_view(&Default::default());
+            let d_v = dst_bgra.create_view(&Default::default());
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("compose_sbs_bg"),
+                layout: &self.compose_sbs.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&l_v) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r_v) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&d_v) },
+                    wgpu::BindGroupEntry { binding: 3, resource: uni.as_entire_binding() },
+                ],
+            });
+            let out_w = eye_w * 2;
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("compose_sbs_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compose_sbs.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (eye_h + 7) / 8, 1);
+        }
+        // Submit and wait so the IOSurface is fully written before
+        // VideoToolbox starts reading. `Maintain::Wait` blocks the calling
+        // thread until the GPU has completed every submitted command.
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        tracing::debug!(elapsed=?t_total.elapsed(), "apply_color_stack_to_sbs_bgra");
+        Ok(())
+    }
+
+    /// Run one eye's worth of the color stack into the encoder.
+    /// Returns the index into `intermediates` of the final per-eye
+    /// texture, or `None` if every stage was identity (in which case
+    /// the caller should use `src` directly).
+    ///
+    /// Helper for `apply_color_stack_to_sbs_bgra` — same recipe as the
+    /// body of `apply_color_stack_texture` but factored out so both
+    /// eyes share one encoder + one intermediates Vec.
+    fn record_color_stack(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        w: u32, h: u32,
+        plan: &ColorStackPlan,
+        lut_resources: &Option<Lut3DResources>,
+        intermediates: &mut Vec<wgpu::Texture>,
+        eye_label: &str,
+    ) -> Option<usize> {
+        let mut current_idx: Option<usize> = None;
+
+        // Stage 1: CDL.
+        if !plan.cdl.is_identity() {
+            let next = make_rw_texture(&self.device,
+                &format!("{eye_label}_cdl"), w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING);
+            let prev = match current_idx {
+                Some(i) => &intermediates[i],
+                None => src,
+            };
+            self.record_cdl(encoder, prev, &next, plan.cdl);
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
+        // Stage 2: 3D LUT.
+        if let (Some((_, intensity)), Some(ref lr)) = (&plan.lut, lut_resources) {
+            let next = make_rw_texture(&self.device,
+                &format!("{eye_label}_lut"), w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING);
+            let prev = match current_idx {
+                Some(i) => &intermediates[i],
+                None => src,
+            };
+            self.record_lut3d(encoder, prev, &next, lr, *intensity, w, h);
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
+        // Stage 3: sharpen.
+        if !plan.sharpen.is_identity() {
+            let next = make_rw_texture(&self.device,
+                &format!("{eye_label}_sharp"), w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING);
+            let blur_h = make_rw_texture(&self.device,
+                &format!("{eye_label}_sharp_bh"), w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            let blur_v = make_rw_texture(&self.device,
+                &format!("{eye_label}_sharp_bv"), w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            let prev = match current_idx {
+                Some(i) => &intermediates[i],
+                None => src,
+            };
+            self.record_sharpen(encoder, prev, &blur_h, &blur_v, &next, w, h, plan.sharpen);
+            intermediates.push(blur_h);
+            intermediates.push(blur_v);
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
+        // Stage 4: mid-detail.
+        if !plan.mid_detail.is_identity() {
+            let next = make_rw_texture(&self.device,
+                &format!("{eye_label}_mid"), w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            let sw = (w + 3) / 4;
+            let sh = (h + 3) / 4;
+            let small = make_rw_texture(&self.device,
+                &format!("{eye_label}_mid_s"), sw, sh,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            let small_h = make_rw_texture(&self.device,
+                &format!("{eye_label}_mid_sh"), sw, sh,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            let small_v = make_rw_texture(&self.device,
+                &format!("{eye_label}_mid_sv"), sw, sh,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            let prev = match current_idx {
+                Some(i) => &intermediates[i],
+                None => src,
+            };
+            self.record_mid_detail(encoder, prev,
+                &small, &small_h, &small_v, &next, w, h, sw, sh, plan.mid_detail);
+            intermediates.push(small);
+            intermediates.push(small_h);
+            intermediates.push(small_v);
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
+        // Stage 5: color grade.
+        if !plan.color_grade.is_identity() {
+            let next = make_rw_texture(&self.device,
+                &format!("{eye_label}_grade"), w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            let prev = match current_idx {
+                Some(i) => &intermediates[i],
+                None => src,
+            };
+            self.record_color_grade(encoder, prev, &next, plan.color_grade);
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
+        // Index of the final stage's output texture, or None for
+        // "every stage was identity, caller should use src".
+        current_idx
+    }
 }
 
 // ----- Phase 0.7.5 smoke tests -----

@@ -62,9 +62,19 @@ impl EncoderBackend {
 /// }
 /// enc.finish()?;
 /// ```
+///
+/// Phase 0.7.5.6: when `encode_path` is `EncodePath::ZeroCopyVt`, the
+/// `scaler` field is unused and `encode_pixel_buffer` is the entry
+/// point (instead of `encode_frame`). The encoder context has
+/// `hw_device_ctx` + `hw_frames_ctx` set so it accepts AVFrames with
+/// `format = AV_PIX_FMT_VIDEOTOOLBOX` and `data[3] = CVPixelBufferRef`.
 pub struct H265Encoder {
     octx: ffmpeg::format::context::Output,
     encoder: ffmpeg::codec::encoder::Video,
+    /// Used only by the CPU-input path (`encode_frame`). On the
+    /// zero-copy-VT path, we feed AVFrames with format=VIDEOTOOLBOX
+    /// directly and skip swscale entirely; a 1×1 placeholder scaler
+    /// fills the field so the struct shape stays uniform.
     scaler: ffmpeg::software::scaling::Context,
     stream_index: usize,
     time_base: ffmpeg::Rational,
@@ -72,6 +82,18 @@ pub struct H265Encoder {
     w: u32,
     h: u32,
     finished: bool,
+    encode_path: EncodePath,
+}
+
+/// Which `encode_*` entry point this encoder was configured for.
+/// `CpuInput` is the legacy path (`encode_frame(&[u8])`); `ZeroCopyVt`
+/// is the Phase 0.7.5.6 path (`encode_pixel_buffer(&EncodePixelBuffer)`).
+/// Mixing them is a bug — methods of the wrong kind return `Err`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodePath {
+    CpuInput,
+    #[cfg(target_os = "macos")]
+    ZeroCopyVt,
 }
 
 impl H265Encoder {
@@ -200,6 +222,7 @@ impl H265Encoder {
         Ok(Self {
             octx, encoder, scaler, stream_index, time_base,
             frame_count: 0, w, h, finished: false,
+            encode_path: EncodePath::CpuInput,
         })
     }
 
@@ -267,6 +290,91 @@ impl H265Encoder {
         Ok(())
     }
 
+    /// Encode an IOSurface-backed BGRA pixel buffer directly via the
+    /// hardware encoder — Phase 0.7.5.6 zero-copy path. The encoder
+    /// must have been created with `create_zero_copy_vt`. The
+    /// underlying CVPixelBuffer is `CFRetain`'d for the encoder's
+    /// lifetime needs; an AVBufferRef with a `cv_release_cb`
+    /// callback releases the retain when the AVFrame is freed.
+    ///
+    /// Caller is responsible for ensuring all wgpu writes to the
+    /// IOSurface have completed before this call (e.g. via
+    /// `device.poll(Maintain::Wait)`). Without that the encoder may
+    /// see partially-written pixels.
+    #[cfg(target_os = "macos")]
+    pub fn encode_pixel_buffer(
+        &mut self,
+        pb: &crate::interop_macos::EncodePixelBuffer,
+    ) -> Result<()> {
+        if self.encode_path != EncodePath::ZeroCopyVt {
+            return Err(Error::Ffmpeg(
+                "encode_pixel_buffer requires create_zero_copy_vt".into()
+            ));
+        }
+        use ffmpeg::ffi::*;
+        // Allocate frame, set up hw-frame fields.
+        unsafe {
+            let frame = av_frame_alloc();
+            if frame.is_null() {
+                return Err(Error::Ffmpeg("av_frame_alloc failed".into()));
+            }
+            (*frame).format = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32;
+            (*frame).width  = self.w as i32;
+            (*frame).height = self.h as i32;
+            (*frame).pts    = self.frame_count;
+
+            // Reference the encoder's hw_frames_ctx (av_buffer_ref takes
+            // a +1 on the buffer). Required for VT to identify the frame
+            // as a hardware frame.
+            let enc_raw = self.encoder.as_mut_ptr();
+            let hwf_ref = (*enc_raw).hw_frames_ctx;
+            if hwf_ref.is_null() {
+                av_frame_free(&mut (frame as *mut _));
+                return Err(Error::Ffmpeg(
+                    "encoder has no hw_frames_ctx (zero-copy VT init failed)".into()
+                ));
+            }
+            (*frame).hw_frames_ctx = av_buffer_ref(hwf_ref);
+
+            // CFRetain the CVPixelBuffer for the frame's lifetime. The
+            // av_buffer_create call below installs a release callback
+            // that drops this retain when the AVFrame is unref'd.
+            let pb_raw = pb.pixel_buffer.as_raw();
+            cf_retain(pb_raw as *const _);
+
+            // Bring-your-own-buffer: data[3] is the CVPixelBufferRef.
+            (*frame).data[3] = pb_raw as *mut u8;
+
+            // buf[0] is an AVBufferRef whose free callback releases our
+            // +1 retain on the CVPixelBuffer.
+            let buf = av_buffer_create(
+                std::ptr::null_mut(), 0,
+                Some(cv_pixel_buffer_release_callback),
+                pb_raw as *mut std::ffi::c_void,
+                AV_BUFFER_FLAG_READONLY as i32,
+            );
+            if buf.is_null() {
+                cf_release(pb_raw as *const _);
+                av_buffer_unref(&mut (*frame).hw_frames_ctx);
+                av_frame_free(&mut (frame as *mut _));
+                return Err(Error::Ffmpeg("av_buffer_create failed".into()));
+            }
+            (*frame).buf[0] = buf;
+
+            self.frame_count += 1;
+
+            // Send + drain.
+            let ret = avcodec_send_frame(enc_raw, frame);
+            if ret < 0 {
+                av_frame_free(&mut (frame as *mut _));
+                return Err(Error::Ffmpeg(format!("avcodec_send_frame: {ret}")));
+            }
+            av_frame_free(&mut (frame as *mut _));
+        }
+        self.drain_packets()?;
+        Ok(())
+    }
+
     /// Flush the encoder, write the trailer, and close the file.
     /// Must be called or the output `.mp4` will be unplayable.
     pub fn finish(mut self) -> Result<()> {
@@ -290,6 +398,189 @@ impl Drop for H265Encoder {
         // Best-effort flush if user forgot to call .finish() — keeps
         // the output file at least partially playable.
         let _ = self.finish_inner();
+    }
+}
+
+// ===== Phase 0.7.5.6: zero-copy VT encode constructor + FFI =====
+
+#[cfg(target_os = "macos")]
+impl H265Encoder {
+    /// Create an `hevc_videotoolbox` encoder that accepts AVFrames
+    /// with `format = AV_PIX_FMT_VIDEOTOOLBOX` and `data[3] =
+    /// CVPixelBufferRef`. Use `encode_pixel_buffer` to feed it.
+    ///
+    /// Internally:
+    /// - Creates a VideoToolbox hardware device context
+    ///   (`av_hwdevice_ctx_create`).
+    /// - Creates a hwframes context (`av_hwframe_ctx_alloc` +
+    ///   `av_hwframe_ctx_init`) with `format=VIDEOTOOLBOX` /
+    ///   `sw_format=BGRA` matching the IOSurfaces we'll produce.
+    /// - Configures the codec with `pix_fmt=VIDEOTOOLBOX`,
+    ///   `hw_device_ctx`, `hw_frames_ctx`, plus the same VT private
+    ///   options as the CPU-input VT path (realtime=0, allow_sw=0,
+    ///   profile=main, power_efficient=0).
+    pub fn create_zero_copy_vt(
+        path: &Path,
+        w: u32, h: u32,
+        fps: f32,
+        bitrate_kbps: u32,
+    ) -> Result<Self> {
+        crate::decode::init();
+        use ffmpeg::ffi::*;
+
+        let mut octx = ffmpeg::format::output(&path)
+            .map_err(|e| Error::Ffmpeg(format!("output ctx {path:?}: {e}")))?;
+
+        let codec = ffmpeg::codec::encoder::find_by_name("hevc_videotoolbox")
+            .ok_or_else(|| Error::Ffmpeg(
+                "hevc_videotoolbox encoder not available in this FFmpeg build".into()
+            ))?;
+
+        let stream_index = {
+            let stream = octx.add_stream(codec)
+                .map_err(|e| Error::Ffmpeg(format!("add_stream: {e}")))?;
+            stream.index()
+        };
+
+        let (num, den) = approx_rational(fps);
+        let time_base = ffmpeg::Rational(den, num);
+
+        let mut enc_ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
+
+        // hw_device_ctx — VideoToolbox device.
+        let hw_device: *mut AVBufferRef = unsafe {
+            let mut d: *mut AVBufferRef = std::ptr::null_mut();
+            let ret = av_hwdevice_ctx_create(
+                &mut d,
+                AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+                std::ptr::null(), std::ptr::null_mut(), 0,
+            );
+            if ret < 0 || d.is_null() {
+                return Err(Error::Ffmpeg(format!(
+                    "av_hwdevice_ctx_create VIDEOTOOLBOX (encode) failed: ret={ret}"
+                )));
+            }
+            d
+        };
+
+        // hw_frames_ctx — pool descriptor (we don't actually use the
+        // pool since we bring our own CVPixelBuffers, but the encoder
+        // requires this to be set so it knows the input format).
+        let hw_frames: *mut AVBufferRef = unsafe {
+            let f = av_hwframe_ctx_alloc(hw_device);
+            if f.is_null() {
+                av_buffer_unref(&mut (hw_device as *mut _));
+                return Err(Error::Ffmpeg("av_hwframe_ctx_alloc failed".into()));
+            }
+            let frames_ctx = (*f).data as *mut AVHWFramesContext;
+            (*frames_ctx).format    = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
+            (*frames_ctx).sw_format = AVPixelFormat::AV_PIX_FMT_BGRA;
+            (*frames_ctx).width     = w as i32;
+            (*frames_ctx).height    = h as i32;
+            // initial_pool_size=0 → no pre-allocation; we feed our own
+            // CVPixelBuffers per frame.
+            (*frames_ctx).initial_pool_size = 0;
+            let ret = av_hwframe_ctx_init(f);
+            if ret < 0 {
+                av_buffer_unref(&mut (f as *mut _));
+                av_buffer_unref(&mut (hw_device as *mut _));
+                return Err(Error::Ffmpeg(format!(
+                    "av_hwframe_ctx_init failed: ret={ret}"
+                )));
+            }
+            f
+        };
+
+        unsafe {
+            let raw = enc_ctx.as_mut_ptr();
+            (*raw).width = w as i32;
+            (*raw).height = h as i32;
+            (*raw).pix_fmt = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
+            (*raw).time_base = time_base.into();
+            (*raw).framerate = ffmpeg::Rational(num, den).into();
+            (*raw).bit_rate = (bitrate_kbps as i64) * 1000;
+            (*raw).gop_size = 60;
+            (*raw).codec_tag = u32::from_le_bytes(*b"hvc1");
+            if octx.format().flags()
+                .contains(ffmpeg::format::flag::Flags::GLOBAL_HEADER)
+            {
+                (*raw).flags |= AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+            }
+            (*raw).hw_device_ctx = hw_device;
+            (*raw).hw_frames_ctx = hw_frames;
+
+            // Same VT private-data tuning as the CPU-input path.
+            set_opt(raw, "realtime",        "0")?;
+            set_opt(raw, "allow_sw",        "0")?;
+            set_opt(raw, "profile",         "main")?;
+            set_opt(raw, "power_efficient", "0")?;
+        }
+
+        let encoder = enc_ctx.encoder().video()
+            .map_err(|e| Error::Ffmpeg(format!("video encoder context: {e}")))?
+            .open_as(codec)
+            .map_err(|e| Error::Ffmpeg(format!("open hevc_videotoolbox (zero-copy): {e}")))?;
+
+        {
+            let mut stream = octx.stream_mut(stream_index)
+                .ok_or_else(|| Error::Ffmpeg("output stream vanished".into()))?;
+            stream.set_parameters(&encoder);
+            stream.set_time_base(time_base);
+        }
+
+        // Placeholder scaler — never used on this path. We still need
+        // *some* Context::get to satisfy the field type; 1×1 RGB→YUV
+        // is the cheapest possible.
+        let scaler = ffmpeg::software::scaling::Context::get(
+            ffmpeg::format::Pixel::RGB24, 1, 1,
+            ffmpeg::format::Pixel::YUV420P, 1, 1,
+            ffmpeg::software::scaling::Flags::BICUBIC,
+        ).map_err(|e| Error::Ffmpeg(format!("placeholder scaler: {e}")))?;
+
+        octx.write_header()
+            .map_err(|e| Error::Ffmpeg(format!("write_header (zero-copy): {e}")))?;
+
+        Ok(Self {
+            octx, encoder, scaler, stream_index, time_base,
+            frame_count: 0, w, h, finished: false,
+            encode_path: EncodePath::ZeroCopyVt,
+        })
+    }
+}
+
+/// CFRetain stub linked into encode.rs without pulling in the full
+/// interop_macos module's FFI declarations. CoreFoundation is already
+/// linked by other modules; the symbol resolves at link time.
+#[cfg(target_os = "macos")]
+unsafe fn cf_retain(p: *const std::ffi::c_void) {
+    extern "C" {
+        fn CFRetain(cf: *const std::ffi::c_void) -> *const std::ffi::c_void;
+    }
+    let _ = CFRetain(p);
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn cf_release(p: *const std::ffi::c_void) {
+    extern "C" {
+        fn CFRelease(cf: *const std::ffi::c_void);
+    }
+    CFRelease(p);
+}
+
+/// `av_buffer_create` callback: release the CVPixelBuffer retain we
+/// took in `encode_pixel_buffer`. Called when the AVBufferRef's
+/// refcount drops to zero (typically when the encoder is done with
+/// the frame).
+///
+/// `_data` is the FFmpeg-side buffer (null because we passed null to
+/// av_buffer_create); `opaque` is the CVPixelBufferRef we stashed.
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn cv_pixel_buffer_release_callback(
+    opaque: *mut std::ffi::c_void,
+    _data: *mut u8,
+) {
+    if !opaque.is_null() {
+        cf_release(opaque as *const _);
     }
 }
 

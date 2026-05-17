@@ -452,12 +452,6 @@ host↔device transfer schedule changes. No PSNR cost for the speedup.
 
 ### Known limitations
 
-- 4096×2048 ≠ real-time for the heavy-grade case (24.79 fps vs 30 fps
-  target). The next obvious lever is **eliminating the final readback**:
-  pass the GPU texture directly to a `hevc_videotoolbox` encoder via
-  CVPixelBuffer interop instead of going to host RAM. That would
-  remove the only remaining staging-buffer round-trip per frame.
-  Defer until needed.
 - The 5 intermediate textures (one per active stage + the sharpen /
   mid-detail scratch) allocate fresh wgpu textures every frame. A
   per-Device texture pool keyed by `(w, h, format, usage)` would amortize
@@ -473,6 +467,95 @@ doesn't change. The chained pipeline is well-positioned for this lift:
 every intermediate texture is allocated in one place
 (`apply_color_stack_texture`), so swapping the format threads through
 the whole stack with no per-shader edits.
+
+## Phase 0.7.5.6 — Zero-copy encode (IOSurface → VT) ✅
+
+Phase 0.7.5.5 still had one host-memory hop per frame: the chained
+color stack's final readback. The VT encoder then received that
+`Vec<u8>` and ran swscale RGB→YUV on the CPU before HW encode. This
+phase closes that loop too: the color stack writes directly to an
+IOSurface-backed BGRA CVPixelBuffer that `hevc_videotoolbox` reads
+in place — no readback, no swscale.
+
+- [x] `interop_macos::EncodePixelBuffer` — RAII wrapper around a
+      CVPixelBuffer + its IOSurface + a wgpu::Texture view of the
+      bytes. Built by `create_bgra_encode_buffer(device, w, h)` which
+      calls `CVPixelBufferCreate` with
+      `kCVPixelBufferIOSurfacePropertiesKey` → IOSurface backing.
+- [x] `RetainedCVPixelBuffer` — `+1`-retain RAII (CFRetain / CFRelease).
+- [x] `build_iosurface_attrs` raw-FFI helper that builds the
+      single-key CFDictionary required by `CVPixelBufferCreate` —
+      avoids a heavyweight core-foundation typed-builder dependency.
+- [x] `compose_sbs_bgra.wgsl` — takes left + right RGBA8 equirect
+      textures, writes to one SBS texture with channels swapped
+      (`(r,g,b,a) → store as (b,g,r,a)`). The destination wgpu texture
+      is viewed as Rgba8Unorm but its underlying IOSurface bytes are
+      labeled `32BGRA`, so VT reads correct colors without us needing
+      the wgpu `BGRA8UNORM_STORAGE` feature (which not every Vulkan/
+      DX12 adapter supports — keeps the code path uniform across
+      backends if/when the feature eventually lands cross-platform).
+- [x] `Device::apply_color_stack_to_sbs_bgra(left, right, dst, eye_w,
+      eye_h, plan)` — one encoder, both eyes' color stacks + SBS
+      compose + submit + `device.poll(Maintain::Wait)` so the IOSurface
+      bytes are visible to VT before the encoder reads them.
+- [x] `H265Encoder::create_zero_copy_vt(path, w, h, fps, kbps)` —
+      dedicated constructor that wires
+      `av_hwdevice_ctx_create(VIDEOTOOLBOX)` + `av_hwframe_ctx_alloc/init`
+      with `format=VIDEOTOOLBOX, sw_format=BGRA`. `pix_fmt =
+      VIDEOTOOLBOX`. Same private-data options as the CPU-input VT
+      path (realtime=0, allow_sw=0, profile=main, power_efficient=0).
+- [x] `H265Encoder::encode_pixel_buffer(&pb)` — builds an AVFrame with
+      `format=AV_PIX_FMT_VIDEOTOOLBOX, data[3]=cvpixelbuffer_ref,
+      hw_frames_ctx=av_buffer_ref(enc.hw_frames_ctx),
+      buf[0]=av_buffer_create(.., cv_pixel_buffer_release_callback, pb)`.
+      The release callback `CFRelease`s our +1 retain when the AVFrame
+      is unref'd by the encoder, so the CVPixelBuffer lives exactly as
+      long as the encoder needs it.
+- [x] CLI: `--zero-copy-encode` flag. Requires `--zero-copy --encoder vt`.
+      Errors out clearly otherwise.
+
+**Benchmark** (200 frames, `NO firmware RS No IORI.360`, 4096×2048
+SBS, M-series Apple Silicon):
+
+| Configuration                              | 0.7.5.5 fps | **0.7.5.6 fps** | Speedup |
+|--------------------------------------------|-------------|-----------------|---------|
+| Identity (no color tools)                  | 30.71       | **66.14**       | **2.15×** |
+| Heavy grade (CDL + sharpen + clarity + grade) | 24.79       | **45.44**       | **1.83×** |
+| Heavy grade + bundled 3D LUT (5 stages)    | 24.02       | **43.19**       | **1.80×** |
+
+**All three cases are now well above real-time (30 fps) on 4K SBS.**
+The identity case at 66 fps is 2.2× real-time — even with five color
+tools active we maintain 43 fps. The bottleneck has moved off the
+GPU/CPU transfer path entirely; remaining time is dominated by the VT
+encoder + decoder themselves, which already run on dedicated HW.
+
+**Output validation**: PSNR(0.7.5.6 zero-copy-encode vs 0.7.5.5
+readback) Y=49.2 dB, U=51.4 dB, V=49.4 dB on the same heavy-grade
+input. The slight delta (vs Phase 0.7.5.5's PSNR=∞ chaining match)
+comes from VT doing BGRA→YUV internally with slightly different
+coefficients than swscale's RGB→YUV path. 49 dB Y is comfortably above
+the standard "visually identical" threshold of 40 dB; the difference
+is invisible to the eye and within the variability of independent VT
+encoder runs.
+
+### Known limitations / follow-ups
+
+- **CPU-input encode path unchanged.** `--zero-copy-encode` requires
+  `--encoder vt`; libx265 still needs the host-RAM readback +
+  swscale. There's no way around that — libx265 is software-only and
+  has no IOSurface ingress.
+- **Per-frame CVPixelBuffer allocation.** Each frame creates a fresh
+  CVPixelBuffer (and its wgpu::Texture view). On Apple Silicon this is
+  ~100 µs which is well under the per-frame budget at 30 fps, but a
+  CVPixelBufferPool would amortize it; estimated 1–2 fps win, deferred.
+- **Colorspace tags.** The output has `color_space=unknown` (same as
+  the 0.7.5.5 readback path). Adding explicit BT.709 tags via
+  `AVCodecContext::colorspace/color_primaries/color_trc` is a one-line
+  cleanup, not done yet because the Python app on `main` doesn't
+  tag either — keeping parity for now.
+- **Windows NVENC equivalent.** The same architectural pattern works
+  on Windows with NVENC + CUDA-shared Vulkan image; tracked under
+  Phase 0.6.8 / 0.8.5+W.
 
 ## Phase 0.8 — H.265 encode + multi-frame export ✅
 

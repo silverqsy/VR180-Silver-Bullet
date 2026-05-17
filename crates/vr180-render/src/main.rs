@@ -193,6 +193,14 @@ enum Cmd {
         /// Forces `--hw-accel vt`.
         #[arg(long, default_value_t = false)]
         zero_copy: bool,
+        /// Also skip the GPU→host readback on the encode side: the
+        /// color stack writes directly to an IOSurface-backed BGRA
+        /// CVPixelBuffer that `hevc_videotoolbox` reads in place.
+        /// **macOS only, requires `--zero-copy --encoder vt`.** Drops
+        /// the staging-buffer readback + swscale RGB→YUV from every
+        /// frame, ~1.5× faster end-to-end on graded exports.
+        #[arg(long, default_value_t = false)]
+        zero_copy_encode: bool,
 
         // --- CDL (ASC Color Decision List) ---
         /// CDL lift: black-point shift. 0 = no change, +1 pushes blacks
@@ -284,7 +292,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::ProbeIosurface { path }) => probe_iosurface(&path),
         Some(Cmd::Export {
             input, output, eye_w, frames, fps, bitrate,
-            lut, lut_intensity, hw_accel, encoder, zero_copy,
+            lut, lut_intensity, hw_accel, encoder, zero_copy, zero_copy_encode,
             cdl_lift, cdl_gamma, cdl_gain, cdl_shadow, cdl_highlight,
             temperature, tint, saturation,
             sharpen, sharpen_sigma,
@@ -314,7 +322,7 @@ fn main() -> anyhow::Result<()> {
             };
             export(&input, &output, eye_w, frames, fps, bitrate,
                    lut.as_deref(), lut_intensity, hw_accel.into(),
-                   encoder.resolve(), zero_copy, plan_template)
+                   encoder.resolve(), zero_copy, zero_copy_encode, plan_template)
         }
     }
 }
@@ -331,6 +339,7 @@ fn export(
     hw: vr180_pipeline::decode::HwDecode,
     encoder: vr180_pipeline::encode::EncoderBackend,
     zero_copy: bool,
+    zero_copy_encode: bool,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
 ) -> anyhow::Result<()> {
     if zero_copy && !cfg!(target_os = "macos") {
@@ -347,10 +356,28 @@ fn export(
              Use --encoder sw (libx265) on Windows / Linux."
         );
     }
+    if zero_copy_encode {
+        if !cfg!(target_os = "macos") {
+            anyhow::bail!("--zero-copy-encode is macOS-only.");
+        }
+        if !zero_copy {
+            anyhow::bail!(
+                "--zero-copy-encode requires --zero-copy \
+                 (full GPU pipeline from decode to encode)."
+            );
+        }
+        if encoder != vr180_pipeline::encode::EncoderBackend::VideoToolbox {
+            anyhow::bail!(
+                "--zero-copy-encode requires --encoder vt (hevc_videotoolbox). \
+                 libx265 cannot accept IOSurface-backed input frames."
+            );
+        }
+    }
     if zero_copy {
         #[cfg(target_os = "macos")]
         return export_zero_copy(input, output, eye_w, n_frames, fps, bitrate_kbps,
-                                lut_spec, lut_intensity, encoder, plan_template);
+                                lut_spec, lut_intensity, encoder,
+                                zero_copy_encode, plan_template);
         #[cfg(not(target_os = "macos"))]
         unreachable!()
     } else {
@@ -429,9 +456,13 @@ fn export_cpu_assemble(
     Ok(())
 }
 
-/// Phase 0.6.6 + 0.7.5.5 path: IOSurface → wgpu zero-copy → GPU EAC
-/// assembly + equirect projection texture + chained color stack →
-/// readback → HEVC. macOS only.
+/// Phase 0.6.6 + 0.7.5.5 + 0.7.5.6 path: IOSurface → wgpu zero-copy →
+/// GPU EAC assembly + equirect projection texture + chained color
+/// stack → (readback OR IOSurface-encode) → HEVC. macOS only.
+///
+/// When `zero_copy_encode = true`, the color stack writes directly to
+/// an IOSurface-backed BGRA CVPixelBuffer that `hevc_videotoolbox`
+/// reads in place — no GPU→host readback, no swscale RGB→YUV.
 #[cfg(target_os = "macos")]
 fn export_zero_copy(
     input: &std::path::Path,
@@ -443,11 +474,13 @@ fn export_zero_copy(
     lut_spec: Option<&str>,
     lut_intensity: f32,
     encoder_backend: vr180_pipeline::encode::EncoderBackend,
+    zero_copy_encode: bool,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
 ) -> anyhow::Result<()> {
     use vr180_pipeline::decode::{ZeroCopyStreamPairIter, probe_video};
     use vr180_pipeline::encode::H265Encoder;
     use vr180_pipeline::gpu::{Device, Lens};
+    use vr180_pipeline::interop_macos::create_bgra_encode_buffer;
 
     let probe = probe_video(input)?;
     let out_w = eye_w * 2;
@@ -460,7 +493,11 @@ fn export_zero_copy(
         probe.width, probe.height, probe.fps, probe.duration_sec);
     println!("  output : {} × {}  @ {:.3} fps  H.265 ({}) {} kbps",
         out_w, out_h, fps, enc_label, bitrate_kbps);
-    println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → equirect_tex → color stack) → {}", enc_label);
+    if zero_copy_encode {
+        println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → equirect_tex → color stack → SBS BGRA IOSurface) → VT encoder (zero-copy)");
+    } else {
+        println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → equirect_tex → color stack) → readback → {}", enc_label);
+    }
 
     let plan = build_color_plan(plan_template, lut_spec, lut_intensity)?;
     print_color_stack(&plan);
@@ -471,7 +508,15 @@ fn export_zero_copy(
     println!("  decode : VideoToolbox (probed {}×{}, EAC tile_w={})",
         dims.stream_w, dims.stream_h, dims.tile_w());
 
-    let mut encoder = H265Encoder::create(output, out_w, out_h, fps, bitrate_kbps, encoder_backend)?;
+    // Encoder construction differs by path. Zero-copy-encode uses a
+    // dedicated constructor that wires hw_device_ctx + hw_frames_ctx so
+    // the encoder accepts AVFrames in AV_PIX_FMT_VIDEOTOOLBOX format.
+    let mut encoder = if zero_copy_encode {
+        H265Encoder::create_zero_copy_vt(output, out_w, out_h, fps, bitrate_kbps)?
+    } else {
+        H265Encoder::create(output, out_w, out_h, fps, bitrate_kbps, encoder_backend)?
+    };
+
     let t_start = std::time::Instant::now();
     let mut frame_idx: u32 = 0;
     let mut last_print = std::time::Instant::now();
@@ -488,13 +533,28 @@ fn export_zero_copy(
             Lens::B, dims,
         )?;
 
-        // Cross texture → equirect texture → chained color stack → RGB8.
-        // Everything stays GPU-resident until the final readback.
+        // Cross texture → equirect texture → color stack.
         let left_tex  = device.project_cross_texture_to_equirect_texture(&cross_a, eye_w, out_h)?;
         let right_tex = device.project_cross_texture_to_equirect_texture(&cross_b, eye_w, out_h)?;
-        let left  = device.apply_color_stack_texture(&left_tex,  eye_w, out_h, &plan)?;
-        let right = device.apply_color_stack_texture(&right_tex, eye_w, out_h, &plan)?;
-        encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
+
+        if zero_copy_encode {
+            // Allocate a fresh IOSurface-backed BGRA CVPixelBuffer. The
+            // color stack writes through to its bytes; VT encoder reads
+            // them in place. CVPixelBuffer is retained by encode_pixel_buffer
+            // for the encoder's lifetime needs; our local `pb` can drop
+            // at end of iteration (the retain on the encoder side keeps
+            // the surface alive while VT is using it).
+            let pb = create_bgra_encode_buffer(&device.device, out_w, out_h)?;
+            device.apply_color_stack_to_sbs_bgra(
+                &left_tex, &right_tex, &pb.wgpu_tex, eye_w, out_h, &plan,
+            )?;
+            encoder.encode_pixel_buffer(&pb)?;
+        } else {
+            let left  = device.apply_color_stack_texture(&left_tex,  eye_w, out_h, &plan)?;
+            let right = device.apply_color_stack_texture(&right_tex, eye_w, out_h, &plan)?;
+            encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
+        }
+
         // Drop the zero-copy pair AFTER the kernel dispatch is done —
         // releases the IOSurface retains so the VT decoder can recycle
         // the underlying CVPixelBuffer for the next frame.
