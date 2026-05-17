@@ -173,14 +173,19 @@ pub fn vqf_cori_equivalent_stream(
     fps: f32,
     n_frames: usize,
 ) -> Result<Vec<Quat>> {
-    use vr180_core::gyro::{vqf, resample::{resample_quats_to_frames, cori_swap_yz, SROT_S}};
+    use vr180_core::gyro::{
+        vqf,
+        resample::{resample_quats_to_frames_timed, build_imu_sample_times, cori_swap_yz, SROT_S},
+        cori_iori::parse_cori_with_stmps,
+    };
+    use crate::decode::{extract_gpmf_stream, probe_video};
 
     // 1. Prep the IMU arrays (ZXY → body remap, GRAV/ACCL source pick,
     //    mag resample at gyro rate). Reuses Phase 0.3 input prep.
     let prep = prepare_for_vqf(input)?;
     let vqf_fps = 1.0 / prep.gyr_ts.max(1e-6);
     tracing::info!(
-        "VQF: {} gyro samples @ {:.2} Hz, acc_source={:?}, mag_source={:?}",
+        "VQF: {} gyro samples @ {:.2} Hz nominal, acc_source={:?}, mag_source={:?}",
         prep.gyro_body.len(), vqf_fps, prep.acc_source, prep.mag_source,
     );
 
@@ -201,15 +206,47 @@ pub fn vqf_cori_equivalent_stream(
     //    on one axis.
     let cori_equiv: Vec<Quat> = run.quats.into_iter().map(cori_swap_yz).collect();
 
-    // 4. Resample to per-video-frame quaternions. Window-average over
-    //    SROT centered at each frame's readout midpoint.
-    Ok(resample_quats_to_frames(
+    // 4. Build per-sample timestamps using STMP-based drift correction.
+    //    Falls back to uniform spacing if STMPs are missing. This is
+    //    the critical fix for "shake grows over time": the IMU clock
+    //    runs ~1 ms/s faster than the video clock; without CORI-STMP
+    //    anchoring, the VQF→frame mapping drifts linearly.
+    let gpmf = extract_gpmf_stream(input)?;
+    let (_cori_q, cori_stmps) = parse_cori_with_stmps(&gpmf);
+    let raw = vr180_core::gyro::raw::parse_raw_imu(&gpmf);
+    let probe = probe_video(input)?;
+    let sample_times = build_imu_sample_times(
+        &raw.gyro, &cori_stmps, fps, probe.duration_sec as f32,
+    );
+    if sample_times.len() != cori_equiv.len() {
+        tracing::warn!(
+            "VQF: per-sample time count ({}) != VQF sample count ({}); \
+             falling back to uniform-rate resample (drift not corrected)",
+            sample_times.len(), cori_equiv.len(),
+        );
+        // Fallback to the legacy uniform-rate path.
+        use vr180_core::gyro::resample::resample_quats_to_frames;
+        return Ok(resample_quats_to_frames(
+            &cori_equiv, vqf_fps, fps, n_frames, SROT_S * 0.5, SROT_S,
+        ));
+    }
+    tracing::info!(
+        "VQF: STMP-anchored timing — {} samples spanning {:.3}s (avg {:.2} Hz effective)",
+        sample_times.len(),
+        sample_times.last().copied().unwrap_or(0.0),
+        sample_times.len() as f32 / sample_times.last().copied().unwrap_or(1.0).max(1e-3),
+    );
+
+    // 5. Resample to per-video-frame quaternions. Window-average over
+    //    SROT centered at each frame's readout midpoint, using the
+    //    STMP-anchored sample timestamps.
+    Ok(resample_quats_to_frames_timed(
+        &sample_times,
         &cori_equiv,
-        vqf_fps,
         fps,
         n_frames,
-        SROT_S * 0.5,    // sample at center of readout
-        SROT_S,          // average over readout window
+        SROT_S * 0.5,
+        SROT_S,
     ))
 }
 

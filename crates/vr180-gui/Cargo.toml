@@ -1,0 +1,36 @@
+[package]
+name = "vr180-gui"
+version = "0.1.0"
+description = "VR180 Silver Bullet Neo — egui+wgpu native GUI"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "vr180-gui"
+path = "src/main.rs"
+
+[dependencies]
+# eframe 0.28 ships with wgpu 0.20 — same major as our workspace
+# `wgpu = "0.20"` pin. Matching versions is non-negotiable: sharing
+# `wgpu::Texture` between our pipeline and eframe-wgpu's renderer
+# requires that both sides instantiate the same wgpu type layout.
+eframe = { version = "0.28", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui = "0.28"
+egui-wgpu = "0.28"
+wgpu = { workspace = true }
+
+# Native file picker.
+rfd = "0.14"
+
+# Threading + sync.
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+
+# Errors / logging.
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Our pipeline + core.
+vr180-core = { workspace = true }
+vr180-pipeline = { workspace = true }

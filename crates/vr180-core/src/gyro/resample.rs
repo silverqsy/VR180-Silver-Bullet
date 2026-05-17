@@ -166,6 +166,223 @@ fn sample_window_average(src: &[Quat], dt: f32, center: f32, window_s: f32) -> Q
     }
 }
 
+/// Build per-sample timestamps for raw IMU blocks (gyro, accel, etc.)
+/// in **video time-base seconds** (where 0.0 = the start of the first
+/// CORI block).
+///
+/// Mirrors `parse_gyro_raw.py::gyro_to_timestamps`. The hard part is
+/// the **IMU-clock drift correction**: the GoPro IMU ticks ~1 ms/s
+/// faster than the video clock, so naive `i / src_fps` mapping
+/// accumulates linear drift (35 ms over a 35 s clip). Result: the
+/// VQF quaternion at "video time t" is actually for a slightly later
+/// physical time, and the stabilization heading lags more and more
+/// as the clip plays. Visible symptom: "footage becomes more and more
+/// shaky as time goes" on long VQF runs.
+///
+/// Algorithm:
+/// 1. Build a piecewise-linear mapping `stmp_s → video_s` from the
+///    CORI block STMPs (treat each CORI block as N frames at the
+///    nominal `fps`).
+/// 2. For each IMU block: generate `n_samples` evenly-spaced sample
+///    times in STMP-seconds (from this block's STMP to the next
+///    block's STMP), then map them through the CORI mapping to land
+///    in video-seconds.
+///
+/// Returns one `f32` time per sample, in video-time seconds. Length
+/// matches the total number of samples across all `imu_blocks`.
+///
+/// Fallback: when `cori_stmps` is empty (no CORI in the file), the
+/// returned times use uniform `duration_s / total_samples` spacing.
+/// This is the same fallback Python uses (legacy behavior).
+pub fn build_imu_sample_times(
+    imu_blocks: &[super::raw::ImuBlock],
+    cori_stmps: &[super::cori_iori::CoriBlockStmp],
+    fps: f32,
+    fallback_duration_s: f32,
+) -> Vec<f32> {
+    let total_samples: usize = imu_blocks.iter().map(|b| b.samples.len()).sum();
+    if total_samples == 0 {
+        return Vec::new();
+    }
+
+    // Are all IMU blocks STMP-tagged? If any are missing, we can't
+    // trust the STMP path — fall back to uniform spacing.
+    let all_stmp = imu_blocks.iter().all(|b| b.stmp_us.is_some());
+
+    if !all_stmp || cori_stmps.is_empty() {
+        // Uniform-spacing fallback (matches Python's legacy `else` arm).
+        let mut out = Vec::with_capacity(total_samples);
+        let dt = fallback_duration_s / total_samples as f32;
+        for i in 0..total_samples {
+            out.push(i as f32 * dt);
+        }
+        return out;
+    }
+
+    // Build the STMP→video mapping anchored on CORI block starts.
+    // Each CORI block boundary maps `stmp_s = (stmp_us - cori_start_us)/1e6`
+    // to `frame_s = cumulative_frames / fps`. We also append an
+    // "end of last block" anchor so samples past the last CORI block
+    // don't clamp to a flat value.
+    let cori_start_us = cori_stmps[0].stmp_us;
+    let mut anchor_stmp_s: Vec<f32> = Vec::with_capacity(cori_stmps.len() + 1);
+    let mut anchor_frame_s: Vec<f32> = Vec::with_capacity(cori_stmps.len() + 1);
+    let mut cumulative_frames: u32 = 0;
+    for c in cori_stmps {
+        let stmp_s = (c.stmp_us.saturating_sub(cori_start_us)) as f64 / 1e6;
+        let frame_s = cumulative_frames as f64 / fps as f64;
+        anchor_stmp_s.push(stmp_s as f32);
+        anchor_frame_s.push(frame_s as f32);
+        cumulative_frames += c.n_samples;
+    }
+    // End-of-last-block anchor.
+    if let Some(last) = cori_stmps.last() {
+        let end_stmp_s = (last.stmp_us.saturating_sub(cori_start_us)) as f64 / 1e6
+            + last.n_samples as f64 / fps as f64;
+        let end_frame_s = cumulative_frames as f64 / fps as f64;
+        anchor_stmp_s.push(end_stmp_s as f32);
+        anchor_frame_s.push(end_frame_s as f32);
+    }
+
+    // Per-sample STMP-space times, then mapped through the anchors.
+    let mut out = Vec::with_capacity(total_samples);
+    let n_blocks = imu_blocks.len();
+    for (i, blk) in imu_blocks.iter().enumerate() {
+        let n = blk.samples.len();
+        let stmp_s = (blk.stmp_us.unwrap().saturating_sub(cori_start_us)) as f64 / 1e6;
+        let next_stmp_s = if i + 1 < n_blocks {
+            (imu_blocks[i + 1].stmp_us.unwrap().saturating_sub(cori_start_us)) as f64 / 1e6
+        } else if i > 0 {
+            // Last block: extrapolate using the previous gap.
+            let prev_stmp_s = (imu_blocks[i - 1].stmp_us.unwrap().saturating_sub(cori_start_us)) as f64 / 1e6;
+            stmp_s + (stmp_s - prev_stmp_s)
+        } else {
+            stmp_s + n as f64 / 800.0   // ~800 Hz nominal fallback for single-block clips
+        };
+        for j in 0..n {
+            let t_stmp = stmp_s + (next_stmp_s - stmp_s) * (j as f64 / n as f64);
+            let t_video = linear_interp(t_stmp as f32, &anchor_stmp_s, &anchor_frame_s);
+            out.push(t_video);
+        }
+    }
+    out
+}
+
+/// Resample a quaternion stream to per-frame quaternions using
+/// **per-sample timestamps** (instead of uniform-rate spacing).
+///
+/// Required when the source's effective sample rate drifts relative
+/// to video time — most notably the GoPro IMU at ~1 ms/s drift.
+/// Same shape as [`resample_quats_to_frames`] but the `src_times`
+/// parameter carries each sample's video-time. Sign-continuity pass
+/// runs across the input before sampling.
+pub fn resample_quats_to_frames_timed(
+    src_times: &[f32],
+    src_quats: &[Quat],
+    dst_fps: f32,
+    n_frames: usize,
+    time_offset_s: f32,
+    window_s: f32,
+) -> Vec<Quat> {
+    assert_eq!(src_times.len(), src_quats.len(),
+        "src_times and src_quats must have the same length");
+    if src_quats.is_empty() || n_frames == 0 {
+        return Vec::new();
+    }
+    let dt_dst = 1.0 / dst_fps.max(1e-6);
+
+    // Pre-flip for sign continuity (do it once on the whole input).
+    let mut aligned: Vec<Quat> = Vec::with_capacity(src_quats.len());
+    aligned.push(src_quats[0]);
+    for j in 1..src_quats.len() {
+        let mut q = src_quats[j];
+        if q.dot(aligned[j - 1]) < 0.0 {
+            q = Quat { w: -q.w, x: -q.x, y: -q.y, z: -q.z };
+        }
+        aligned.push(q);
+    }
+
+    let mut out = Vec::with_capacity(n_frames);
+    for i in 0..n_frames {
+        let t = i as f32 * dt_dst + time_offset_s;
+        let q = if window_s <= 0.0 {
+            sample_linear_timed(&aligned, src_times, t)
+        } else {
+            sample_window_average_timed(&aligned, src_times, t, window_s)
+        };
+        out.push(q.normalize());
+    }
+    out
+}
+
+/// Linear time-interpolation: find the two source samples whose
+/// timestamps bracket `t` and lerp between them. Edge-clamp.
+fn sample_linear_timed(src: &[Quat], times: &[f32], t: f32) -> Quat {
+    let n = src.len();
+    if t <= times[0] { return src[0]; }
+    if t >= times[n - 1] { return src[n - 1]; }
+    // Binary search for the upper-bound index.
+    let hi = match times.binary_search_by(|x| x.partial_cmp(&t).unwrap_or(std::cmp::Ordering::Equal)) {
+        Ok(i)  => i,
+        Err(i) => i,
+    };
+    let hi = hi.max(1).min(n - 1);
+    let lo = hi - 1;
+    let span = (times[hi] - times[lo]).max(1e-9);
+    let frac = ((t - times[lo]) / span).clamp(0.0, 1.0);
+    let a = src[lo];
+    let b = src[hi];
+    Quat {
+        w: a.w + frac * (b.w - a.w),
+        x: a.x + frac * (b.x - a.x),
+        y: a.y + frac * (b.y - a.y),
+        z: a.z + frac * (b.z - a.z),
+    }
+}
+
+/// Window-average around `t` over `±window_s/2` seconds. Uses
+/// `binary_search` to find the index range, then mean of the
+/// pre-sign-aligned quats in that range.
+fn sample_window_average_timed(src: &[Quat], times: &[f32], t: f32, window_s: f32) -> Quat {
+    let half = window_s * 0.5;
+    let lo_idx = lower_bound(times, t - half);
+    let hi_idx = upper_bound(times, t + half);
+    if hi_idx <= lo_idx {
+        return sample_linear_timed(src, times, t);
+    }
+    let mut acc = Quat { w: 0.0, x: 0.0, y: 0.0, z: 0.0 };
+    let count = (hi_idx - lo_idx) as f32;
+    for i in lo_idx..hi_idx {
+        let q = src[i];
+        acc.w += q.w; acc.x += q.x; acc.y += q.y; acc.z += q.z;
+    }
+    Quat {
+        w: acc.w / count, x: acc.x / count,
+        y: acc.y / count, z: acc.z / count,
+    }
+}
+
+fn lower_bound(times: &[f32], t: f32) -> usize {
+    times.partition_point(|x| *x < t)
+}
+fn upper_bound(times: &[f32], t: f32) -> usize {
+    times.partition_point(|x| *x <= t)
+}
+
+/// 1-D linear interpolation through a sorted (xs, ys) lookup table.
+/// Edge-clamps; assumes `xs.len() == ys.len()` and `xs` is sorted.
+fn linear_interp(x: f32, xs: &[f32], ys: &[f32]) -> f32 {
+    if xs.is_empty() { return x; }
+    if x <= xs[0] { return ys[0]; }
+    let n = xs.len();
+    if x >= xs[n - 1] { return ys[n - 1]; }
+    let hi = xs.partition_point(|v| *v <= x).max(1).min(n - 1);
+    let lo = hi - 1;
+    let span = (xs[hi] - xs[lo]).max(1e-9);
+    let frac = (x - xs[lo]) / span;
+    ys[lo] + frac * (ys[hi] - ys[lo])
+}
+
 /// Swap the `y` and `z` components of an on-disk CORI quaternion to
 /// recover the standard `(w, x, y, z)` convention used by rotation-
 /// matrix math. The GoPro `.360` GPMF stores CORI in `(w, x, Z, Y)`

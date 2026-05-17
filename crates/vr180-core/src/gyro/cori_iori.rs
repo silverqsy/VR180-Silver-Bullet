@@ -165,22 +165,74 @@ pub fn parse_iori(gpmf: &[u8]) -> Vec<Quat> {
     parse_quaternion(gpmf, IORI)
 }
 
+/// One CORI record's STMP anchor: the microsecond timestamp of the
+/// first sample in the block, paired with the number of quaternion
+/// samples in the block. Used by [`crate::gyro::raw`] timing helpers
+/// to correct ~1 ms/s GoPro IMU clock drift relative to video time.
+#[derive(Debug, Clone, Copy)]
+pub struct CoriBlockStmp {
+    pub stmp_us: u64,
+    pub n_samples: u32,
+}
+
+/// Parse CORI returning per-block STMP anchors **and** the quaternion
+/// samples themselves. Use this when you need to align downstream
+/// sample timestamps (e.g. for VQF resampling) to video frame time.
+///
+/// Returns `(quats, block_stmps)` — `quats` is concatenated across
+/// blocks just like [`parse_cori`]; `block_stmps` has one entry per
+/// CORI record (typically one per second of footage).
+pub fn parse_cori_with_stmps(gpmf: &[u8]) -> (Vec<Quat>, Vec<CoriBlockStmp>) {
+    parse_quaternion_with_stmps(gpmf, CORI)
+}
+
 fn parse_quaternion(gpmf: &[u8], want: FourCC) -> Vec<Quat> {
+    parse_quaternion_with_stmps(gpmf, want).0
+}
+
+fn parse_quaternion_with_stmps(gpmf: &[u8], want: FourCC) -> (Vec<Quat>, Vec<CoriBlockStmp>) {
     let mut out = Vec::new();
+    let mut blocks = Vec::new();
+    // Track the most recent STMP record we've seen — GPMF emits STMP
+    // before each block in the same STRM container. We reset on STRM
+    // entry to avoid leaking timestamps from one stream to another.
+    let stmp_fourcc = FourCC::new(b"STMP");
+    let strm_fourcc = FourCC::new(b"STRM");
+    let mut current_stmp: Option<u64> = None;
+
     for entry in GpmfWalker::new(gpmf) {
+        if entry.fourcc == strm_fourcc {
+            current_stmp = None;
+            continue;
+        }
+        if entry.fourcc == stmp_fourcc {
+            current_stmp = parse_stmp(entry.type_char, entry.struct_size, entry.payload);
+            continue;
+        }
         if entry.fourcc != want { continue; }
         // Defense against false positives (e.g. "CORI" appearing inside
         // an unrelated payload): require type='s', struct_size=8.
         if entry.type_char != b's' || entry.struct_size != 8 { continue; }
         let want_bytes = entry.repeat as usize * 8;
         if entry.payload.len() < want_bytes { continue; }
+        if let Some(stmp_us) = current_stmp {
+            blocks.push(CoriBlockStmp { stmp_us, n_samples: entry.repeat as u32 });
+        }
         for i in 0..entry.repeat as usize {
             let off = i * 8;
             let chunk: &[u8; 8] = entry.payload[off..off + 8].try_into().unwrap();
             out.push(Quat::from_q15_be(chunk));
         }
     }
-    out
+    (out, blocks)
+}
+
+fn parse_stmp(type_char: u8, struct_size: u8, payload: &[u8]) -> Option<u64> {
+    match (type_char, struct_size) {
+        (b'J', 8) if payload.len() >= 8 => Some(u64::from_be_bytes(payload[..8].try_into().ok()?)),
+        (b'L', 4) if payload.len() >= 4 => Some(u32::from_be_bytes(payload[..4].try_into().ok()?) as u64),
+        _ => None,
+    }
 }
 
 /// Convert a quaternion to intrinsic ZYX Euler angles `(roll, pitch, yaw)`

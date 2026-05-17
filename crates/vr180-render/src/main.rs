@@ -250,19 +250,6 @@ enum Cmd {
         /// extreme motion. Python default: 15.0. `0` disables the cap.
         #[arg(long, default_value_t = 15.0)]
         max_corr_deg: f32,
-        /// Phase C+: horizon lock. Decomposes the smoothed CORI via
-        /// swing-twist around the camera forward axis (+Z) and drops
-        /// the Z-twist (roll) before computing the per-frame heading
-        /// correction. Net effect: the rendered horizon stays level
-        /// even during slow camera pans that the smoother would
-        /// otherwise carry along (e.g. holding the camera with a
-        /// constant 10° tilt while panning). Best combined with
-        /// `--stabilize` so GRAV alignment anchors world-up to true
-        /// gravity at the start of the clip. Rolling around the
-        /// view direction is symmetric in a VR180 half-equirect, so
-        /// horizon-lock never crops the rendered hemisphere.
-        #[arg(long, default_value_t = false)]
-        horizon_lock: bool,
         /// Phase E: pick the source of the camera orientation stream
         /// feeding the stabilization smoother. `direct` (default):
         /// GPMF CORI verbatim (right for firmware-stabilized clips).
@@ -419,7 +406,7 @@ fn main() -> anyhow::Result<()> {
             input, output, eye_w, frames, fps, bitrate,
             lut, lut_intensity, hw_accel, encoder, zero_copy, zero_copy_encode,
             apac_audio, apac_bitrate, apmp, stabilize,
-            gyro_smooth_ms, gyro_responsiveness, max_corr_deg, horizon_lock,
+            gyro_smooth_ms, gyro_responsiveness, max_corr_deg,
             cori_source,
             rs_correct, rs_mode, rs_readout_ms,
             rs_pitch_factor, rs_roll_factor, rs_yaw_factor,
@@ -459,7 +446,6 @@ fn main() -> anyhow::Result<()> {
                     ..Default::default()
                 },
                 max_corr_deg,
-                horizon_lock,
                 cori_source,
             };
             let rs = RsParams::from_mode(
@@ -500,7 +486,6 @@ fn run_render_from_config(config_path: &std::path::Path) -> anyhow::Result<()> {
             ..Default::default()
         },
         max_corr_deg: cfg.max_corr_deg,
-        horizon_lock: cfg.horizon_lock,
         cori_source,
     };
     let rs_mode = match cfg.rs_mode {
@@ -540,13 +525,6 @@ struct StabilizeParams {
     enabled: bool,
     smooth: vr180_core::gyro::SmoothParams,
     max_corr_deg: f32,
-    /// Phase C+: drop the Z-twist (roll) component of the smoothed
-    /// CORI before computing the per-frame heading. Net effect: the
-    /// rendered horizon stays level even when the camera was rolled
-    /// during a pan that the smoother would otherwise carry along.
-    /// Off by default — GRAV alignment alone is sufficient for clips
-    /// where the camera is held roughly level throughout.
-    horizon_lock: bool,
     /// Phase E: which quaternion stream to use as the input camera
     /// orientation. `Direct` reads CORI from GPMF (correct for
     /// firmware-stabilized clips). `Vqf` runs the VQF 9D fusion
@@ -579,7 +557,6 @@ impl Default for StabilizeParams {
             enabled: false,
             smooth: vr180_core::gyro::SmoothParams::default(),
             max_corr_deg: 15.0,
-            horizon_lock: false,
             cori_source: CoriSource::Direct,
         }
     }
@@ -728,7 +705,7 @@ fn compute_per_eye_frames(
 ) -> anyhow::Result<PerFrameEyeFrames> {
     use vr180_core::gyro::{
         parse_cori, parse_iori, parse_raw_imu, Quat,
-        bidirectional_smooth, per_eye_rotations_horizon_lock,
+        bidirectional_smooth, per_eye_rotations,
         gravity_alignment_quat, apply_gravity_alignment_inplace,
         compute_per_frame_omega, SMOOTH_WINDOW_S,
     };
@@ -826,21 +803,20 @@ fn compute_per_eye_frames(
         // Step 2: bidirectional SLERP smoothing.
         let smoothed = bidirectional_smooth(&cori, fps, &stab.smooth);
         println!(
-            "Stabilization: {} CORI frames, {} IORI frames, smoothed (τ_calm={} ms, τ_fast={} ms, resp={:.2}), horizon_lock={}",
+            "Stabilization: {} CORI frames, {} IORI frames, smoothed (τ_calm={} ms, τ_fast={} ms, resp={:.2})",
             cori.len(), iori.len(),
             stab.smooth.smooth_ms, stab.smooth.fast_ms, stab.smooth.responsiveness,
-            stab.horizon_lock,
         );
 
-        // Step 3: per-frame heading + horizon-lock + IORI per-eye split.
+        // Step 3: per-frame heading + IORI per-eye split.
         let n = cori.len();
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let raw = cori[i];
             let smooth = smoothed[i];
             let iori_q = iori.get(i).copied().unwrap_or(Quat::IDENTITY);
-            let (q_left, q_right) = per_eye_rotations_horizon_lock(
-                raw, smooth, iori_q, stab.max_corr_deg, stab.horizon_lock,
+            let (q_left, q_right) = per_eye_rotations(
+                raw, smooth, iori_q, stab.max_corr_deg,
             );
             out.push((
                 EquirectRotation::from_quat(q_left),

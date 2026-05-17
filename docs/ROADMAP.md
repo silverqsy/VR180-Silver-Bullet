@@ -949,36 +949,17 @@ extreme camera moves no longer crop past the image boundary.
 - User-confirmed: horizon stays level, intentional camera pans
   preserved, no roll-axis direction issues.
 
-## Phase C+ — Horizon-lock toggle (swing-twist decomposition) ✅
+## Phase C+ — Horizon-lock (deleted)
 
-The GRAV alignment we shipped in Phase C is the always-on baseline
-(world +Y = true gravity at clip start). Phase C+ adds an explicit
-`--horizon-lock` mode that **zeros out the roll component of the
-heading correction every frame** — the horizon stays level even
-during slow camera tilts that the smoother would otherwise carry
-along.
-
-- [x] `vr180_core::gyro::stabilize::swing_twist(q, axis)` — standard
-      swing-twist decomposition. `q = swing · twist`; twist is the
-      rotation around `axis`, swing is perpendicular. Falls back to
-      identity twist when `q`'s vector part is perpendicular to
-      `axis` (degenerate case).
-- [x] `per_eye_rotations_horizon_lock(raw, smoothed, iori,
-      max_corr_deg, horizon_lock)` — when `horizon_lock = true`,
-      drops the Z-twist of `smoothed_clamped` via `swing_twist(.,
-      [0, 0, 1])` before computing the heading. The result carries
-      the full Z-twist of `raw`, which the shader's `R · dir_world`
-      un-rolls.
-- [x] Soft clamp runs BEFORE swing-twist so it bounds pitch/yaw
-      over-correction without fighting horizon-lock (horizon-lock
-      never crops a VR180 half-equirect — rolling around the view
-      direction is symmetric).
-- [x] 3 new unit tests: `swing_twist_roundtrip_recovers_q`,
-      `swing_twist_pure_z_rotation_has_identity_swing`,
-      `horizon_lock_zeroes_smoothed_roll`,
-      `horizon_lock_preserves_smoothed_yaw_pan`. All pass.
-- [x] CLI flag `--horizon-lock` on `export`.
-- [x] JSON `ExportConfig.horizon_lock: bool` field.
+Originally shipped as a swing-twist decomposition + `--horizon-lock`
+toggle. **Removed** when the GUI rewrite started: in practice GRAV
+alignment alone (Phase C) plus the smoother give a good-enough
+horizon on every test clip we have, and the swing-twist + double-
+correction interaction was a footgun (broke with VQF until we added
+a reference-frame anchor). If we ever need a true horizon lock back,
+prefer a gravity-vector-per-frame approach over swing-twist —
+matches Gyroflow's behaviour and avoids the +Z-as-forward convention
+trap.
 
 ## Phase D — Per-pixel rolling-shutter warp ✅
 

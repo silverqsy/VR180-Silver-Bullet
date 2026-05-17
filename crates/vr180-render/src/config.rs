@@ -119,13 +119,6 @@ pub struct ExportConfig {
     /// Python default: 15.0. `0` disables.
     #[serde(default = "default_max_corr_deg")]
     pub max_corr_deg: f32,
-    /// Phase C+: horizon lock. Drops the Z-twist (roll) of the
-    /// smoothed CORI before computing the per-frame heading, so
-    /// the rendered horizon stays level regardless of how the
-    /// camera was rolled during a pan. Off by default.
-    #[serde(default)]
-    pub horizon_lock: bool,
-
     /// Phase E: source of the camera orientation stream feeding
     /// stabilization. `"direct"` (default) reads GPMF CORI verbatim
     /// — correct for firmware-stabilized clips. `"vqf"` runs the VQF
@@ -421,7 +414,6 @@ mod tests {
             "zero_copy": true,
             "zero_copy_encode": true,
             "stabilize": true,
-            "horizon_lock": true,
             "cori_source": "auto",
             "rs_correct": true,
             "rs_mode": "firmware",
@@ -450,8 +442,8 @@ mod tests {
         assert_eq!(cfg.mid_detail.amount, -0.4);
         assert_eq!(cfg.lut.as_deref(), Some("bundled"));
         assert!(cfg.apac_audio && cfg.apmp);
-        // Phase C+ / D / E fields.
-        assert!(cfg.stabilize && cfg.horizon_lock);
+        // Phase D / E fields.
+        assert!(cfg.stabilize);
         assert!(matches!(cfg.cori_source, CoriSourceStr::Auto));
         assert!(cfg.rs_correct);
         assert!(matches!(cfg.rs_mode, RsModeStr::Firmware));

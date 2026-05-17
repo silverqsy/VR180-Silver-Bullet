@@ -25,9 +25,9 @@ use std::time::Instant;
 #[derive(Debug)]
 pub struct Device {
     pub instance: wgpu::Instance,
-    pub adapter: wgpu::Adapter,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+    pub adapter: std::sync::Arc<wgpu::Adapter>,
+    pub device: std::sync::Arc<wgpu::Device>,
+    pub queue: std::sync::Arc<wgpu::Queue>,
     eac_to_equirect: EacToEquirectPipeline,
     lut3d: Lut3DPipeline,
     nv12_to_eac: Nv12ToEacPipeline,
@@ -121,6 +121,60 @@ impl Device {
         pollster::block_on(Self::new_async())
     }
 
+    /// Build a `Device` on top of an **existing** wgpu instance /
+    /// adapter / device / queue. Used by host applications (egui,
+    /// Slint, …) that already own a wgpu device for their own
+    /// renderer — sharing the device lets us pass `wgpu::Texture`s
+    /// from our pipeline straight into the host UI with **zero
+    /// copies** (cross-device texture handoff is otherwise gated
+    /// on platform-specific external-memory extensions).
+    ///
+    /// The host MUST have requested at least `TEXTURE_FORMAT_16BIT_NORM`
+    /// in its device features if it plans to feed 10-bit (P010)
+    /// HEVC into this pipeline. For 8-bit-only workflows the feature
+    /// is optional.
+    pub fn from_existing(
+        instance: wgpu::Instance,
+        adapter: std::sync::Arc<wgpu::Adapter>,
+        device: std::sync::Arc<wgpu::Device>,
+        queue: std::sync::Arc<wgpu::Queue>,
+    ) -> Result<Self> {
+        let eac_to_equirect = EacToEquirectPipeline::create(&device);
+        let lut3d = Lut3DPipeline::create(&device);
+        let nv12_to_eac = Nv12ToEacPipeline::create(&device);
+        let cdl = PerPixelPipeline::create(
+            &device, "cdl", CDL_WGSL,
+            std::mem::size_of::<CdlUniforms>() as u64,
+        );
+        let color_grade = PerPixelPipeline::create(
+            &device, "color_grade", COLOR_GRADE_WGSL,
+            std::mem::size_of::<ColorGradeUniforms>() as u64,
+        );
+        let gaussian_blur = GaussianBlur1dPipeline::create(&device);
+        let sharpen_combine = SharpenCombinePipeline::create(&device);
+        let mid_detail_combine = MidDetailCombinePipeline::create(&device);
+        let downsample_4x = Downsample4xPipeline::create(&device);
+        let compose_sbs = ComposeSbsPipeline::create(&device);
+        let bilinear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("bilinear"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        Ok(Self {
+            instance, adapter, device, queue,
+            eac_to_equirect, lut3d, nv12_to_eac,
+            cdl, color_grade,
+            gaussian_blur, sharpen_combine, mid_detail_combine, downsample_4x,
+            compose_sbs,
+            bilinear_sampler,
+        })
+    }
+
     async fn new_async() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
@@ -158,40 +212,12 @@ impl Device {
             )
             .await
             .map_err(|e| Error::Wgpu(format!("request_device: {e}")))?;
-        let eac_to_equirect = EacToEquirectPipeline::create(&device);
-        let lut3d = Lut3DPipeline::create(&device);
-        let nv12_to_eac = Nv12ToEacPipeline::create(&device);
-        let cdl = PerPixelPipeline::create(
-            &device, "cdl", CDL_WGSL,
-            std::mem::size_of::<CdlUniforms>() as u64,
-        );
-        let color_grade = PerPixelPipeline::create(
-            &device, "color_grade", COLOR_GRADE_WGSL,
-            std::mem::size_of::<ColorGradeUniforms>() as u64,
-        );
-        let gaussian_blur = GaussianBlur1dPipeline::create(&device);
-        let sharpen_combine = SharpenCombinePipeline::create(&device);
-        let mid_detail_combine = MidDetailCombinePipeline::create(&device);
-        let downsample_4x = Downsample4xPipeline::create(&device);
-        let compose_sbs = ComposeSbsPipeline::create(&device);
-        let bilinear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("bilinear"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-        Ok(Self {
-            instance, adapter, device, queue,
-            eac_to_equirect, lut3d, nv12_to_eac,
-            cdl, color_grade,
-            gaussian_blur, sharpen_combine, mid_detail_combine, downsample_4x,
-            compose_sbs,
-            bilinear_sampler,
-        })
+        Self::from_existing(
+            instance,
+            std::sync::Arc::new(adapter),
+            std::sync::Arc::new(device),
+            std::sync::Arc::new(queue),
+        )
     }
 
     /// Project one EAC cross (`cross_w × cross_w × RGB8`) to a half-
