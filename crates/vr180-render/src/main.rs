@@ -581,8 +581,14 @@ fn export_cpu_assemble(
         // Cross → equirect texture → chained color stack → RGB8.
         // The equirect texture stays GPU-resident through every color
         // stage; only the final readback hits host memory.
-        let left_tex  = device.project_cross_to_equirect_texture(&cross_a, dims.cross_w(), eye_w, out_h)?;
-        let right_tex = device.project_cross_to_equirect_texture(&cross_b, dims.cross_w(), eye_w, out_h)?;
+        //
+        // Eye assignment (matches Python convention + project memory):
+        //   Lens A (s0/FRNT) → RIGHT eye
+        //   Lens B (s4/BACK) → LEFT eye
+        // (After the yaw mod, the lens labeled A is physically on
+        // the right side of the user's head.)
+        let left_tex  = device.project_cross_to_equirect_texture(&cross_b, dims.cross_w(), eye_w, out_h)?;
+        let right_tex = device.project_cross_to_equirect_texture(&cross_a, dims.cross_w(), eye_w, out_h)?;
         let left  = device.apply_color_stack_texture(&left_tex,  eye_w, out_h, &plan)?;
         let right = device.apply_color_stack_texture(&right_tex, eye_w, out_h, &plan)?;
         encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
@@ -674,8 +680,12 @@ fn export_zero_copy(
         )?;
 
         // Cross texture → equirect texture → color stack.
-        let left_tex  = device.project_cross_texture_to_equirect_texture(&cross_a, eye_w, out_h)?;
-        let right_tex = device.project_cross_texture_to_equirect_texture(&cross_b, eye_w, out_h)?;
+        // Eye assignment: Lens A → RIGHT eye, Lens B → LEFT eye
+        // (matches Python convention + project memory; after yaw mod
+        // the lens labeled A is physically on the right side of the
+        // user's head).
+        let left_tex  = device.project_cross_texture_to_equirect_texture(&cross_b, eye_w, out_h)?;
+        let right_tex = device.project_cross_texture_to_equirect_texture(&cross_a, eye_w, out_h)?;
 
         if zero_copy_encode {
             // Allocate a fresh IOSurface-backed BGRA CVPixelBuffer. The
@@ -1031,9 +1041,10 @@ fn probe_eac(
             Some(lut)
         } else { None };
 
+        // Eye assignment: Lens A → RIGHT, Lens B → LEFT (yaw-mod convention).
         let t = std::time::Instant::now();
-        let mut left_eye = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, eye_h)?;
-        let mut right_eye = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, eye_h)?;
+        let mut left_eye = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, eye_h)?;
+        let mut right_eye = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, eye_h)?;
         let gpu_t = t.elapsed();
 
         if let Some(lut) = &lut {

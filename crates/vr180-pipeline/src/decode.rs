@@ -454,20 +454,36 @@ impl ZeroCopyStreamPairIter {
         }
 
         // Then pump packets.
+        //
+        // Invariant: every packet for a video stream we care about
+        // gets forwarded to its decoder, even if we already have a
+        // frame for that stream this iteration. Otherwise the dropped
+        // packet's frame is lost forever, and that stream falls behind
+        // the other one — pairing (s0_K, s4_K+1) etc. — which shows up
+        // visually as EAC faces sourced from different temporal frames.
+        //
+        // We only need to `receive_frame` from streams we're still
+        // missing; the dropped packets pile up in the decoder's queue
+        // and feed the NEXT next_pair call's `drain pre-buffered` step.
         if frames.iter().any(|f| f.is_none()) {
             loop {
                 let (stream, packet) = match self.ictx.packets().next() {
                     Some(x) => x, None => break,
                 };
                 let pos = match self.video_indices.iter().position(|&i| i == stream.index()) {
-                    Some(p) if frames[p].is_none() => p,
-                    _ => continue,
+                    Some(p) => p,
+                    None => continue,  // not one of our video streams (audio/data/etc.)
                 };
+                // Always feed the packet to its decoder. Send errors
+                // are non-fatal — the decoder might be flushing.
                 if self.decoders[pos].send_packet(&packet).is_err() { continue; }
-                while self.decoders[pos].receive_frame(&mut decoded).is_ok() {
-                    if frames[pos].is_some() { break; }
-                    frames[pos] = Some(std::mem::replace(&mut decoded, ffmpeg_next::frame::Video::empty()));
-                    if frames.iter().all(|f| f.is_some()) { break; }
+                // Only consume a frame from this decoder if we still
+                // need it this iteration. Extras stay queued for next call.
+                if frames[pos].is_none()
+                    && self.decoders[pos].receive_frame(&mut decoded).is_ok()
+                {
+                    frames[pos] = Some(std::mem::replace(
+                        &mut decoded, ffmpeg_next::frame::Video::empty()));
                 }
                 if frames.iter().all(|f| f.is_some()) { break; }
             }
@@ -786,6 +802,13 @@ impl StreamPairIter {
         }
 
         // Then drive the packet loop until both slots are filled or EOF.
+        //
+        // Same invariant as ZeroCopyStreamPairIter::next_pair: every
+        // packet for a video stream we care about must be forwarded to
+        // its decoder, even if we already have a frame for that stream
+        // this iteration. Dropping packets causes that stream to fall
+        // behind the other → pairing s0_K with s4_K+1 → EAC faces from
+        // different temporal frames in the same output.
         if frames.iter().any(|f| f.is_none()) {
             loop {
                 let res = self.ictx.packets().next();
@@ -794,18 +817,21 @@ impl StreamPairIter {
                     None => break,
                 };
                 let pos = match self.video_indices.iter().position(|&i| i == stream.index()) {
-                    Some(p) if frames[p].is_none() => p,
-                    _ => continue,
+                    Some(p) => p,
+                    None => continue,
                 };
                 let dec = &mut self.decoders[pos];
                 if dec.send_packet(&packet).is_err() { continue; }
-                while dec.receive_frame(&mut decoded).is_ok() {
-                    if frames[pos].is_some() { break; }
+                // Only repack a frame from this decoder if we still
+                // need it this iteration. Extras stay in the decoder's
+                // queue and feed the next next_pair call.
+                if frames[pos].is_none()
+                    && dec.receive_frame(&mut decoded).is_ok()
+                {
                     frames[pos] = Some(repack_to_rgb8(
                         &mut decoded, &mut sw_storage,
                         self.hw_active[pos], &mut self.scalers[pos],
                     )?);
-                    if frames.iter().all(|f| f.is_some()) { break; }
                 }
                 if frames.iter().all(|f| f.is_some()) { break; }
             }
