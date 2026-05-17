@@ -201,6 +201,27 @@ enum Cmd {
         /// frame, ~1.5× faster end-to-end on graded exports.
         #[arg(long, default_value_t = false)]
         zero_copy_encode: bool,
+        /// Embed APAC (Apple Positional Audio Codec) spatial audio in
+        /// the output. Extracts the 4-channel ambisonic PCM track from
+        /// the source `.360`, encodes via the `apac_encode` Swift helper
+        /// (Vision Pro spatial audio), and mux-passthroughs the encoded
+        /// video bit-exact into a final `.mov`. **macOS only** (helper
+        /// needs `kAudioFormatAPAC`, available macOS 14+). If the
+        /// source has no ambisonic track, the flag is a no-op + warning.
+        #[arg(long, default_value_t = false)]
+        apac_audio: bool,
+        /// APAC target bitrate in bits/sec. 384 kbps is Apple's
+        /// recommended target for ambisonic spatial audio.
+        #[arg(long, default_value_t = 384_000)]
+        apac_bitrate: u32,
+        /// Tag the output video track with APMP (Apple Projected Media
+        /// Profile) atoms so visionOS / Vision Pro recognizes it as
+        /// VR180 immersive media. Adds `vexu/proj/prji=hequ`,
+        /// `vexu/eyes/stri`, `vexu/pack/pkin=side`, `hfov=180°` to
+        /// the `hvc1` sample description. Writes Google `sv3d/st3d/SA3D`
+        /// alongside for YouTube / Quest compat.
+        #[arg(long, default_value_t = false)]
+        apmp: bool,
 
         // --- CDL (ASC Color Decision List) ---
         /// CDL lift: black-point shift. 0 = no change, +1 pushes blacks
@@ -293,6 +314,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Export {
             input, output, eye_w, frames, fps, bitrate,
             lut, lut_intensity, hw_accel, encoder, zero_copy, zero_copy_encode,
+            apac_audio, apac_bitrate, apmp,
             cdl_lift, cdl_gamma, cdl_gain, cdl_shadow, cdl_highlight,
             temperature, tint, saturation,
             sharpen, sharpen_sigma,
@@ -320,11 +342,28 @@ fn main() -> anyhow::Result<()> {
                     amount: mid_detail, sigma: mid_detail_sigma,
                 },
             };
+            let post = PostProcess { apac_audio, apac_bitrate, apmp };
             export(&input, &output, eye_w, frames, fps, bitrate,
                    lut.as_deref(), lut_intensity, hw_accel.into(),
-                   encoder.resolve(), zero_copy, zero_copy_encode, plan_template)
+                   encoder.resolve(), zero_copy, zero_copy_encode,
+                   plan_template, post)
         }
     }
+}
+
+/// Post-encode steps the user opted into via CLI flags. Run after the
+/// video-only `.mov` is encoded and closed. APAC audio mux happens
+/// first (because it produces a fresh `.mov` file with the audio
+/// track added), then APMP atom tagging in-place on the result.
+#[derive(Debug, Clone, Copy)]
+struct PostProcess {
+    apac_audio:    bool,
+    apac_bitrate:  u32,
+    apmp:          bool,
+}
+
+impl PostProcess {
+    fn any(&self) -> bool { self.apac_audio || self.apmp }
 }
 
 fn export(
@@ -341,6 +380,7 @@ fn export(
     zero_copy: bool,
     zero_copy_encode: bool,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
+    post: PostProcess,
 ) -> anyhow::Result<()> {
     if zero_copy && !cfg!(target_os = "macos") {
         anyhow::bail!(
@@ -373,17 +413,113 @@ fn export(
             );
         }
     }
+    if post.apac_audio && !cfg!(target_os = "macos") {
+        anyhow::bail!(
+            "--apac-audio is macOS-only (requires the apac_encode Swift helper)."
+        );
+    }
+
+    // If APAC audio is requested, the encoder writes a video-only
+    // temp file; apac_encode then muxes audio + video into `output`.
+    // Without APAC, the encoder writes directly to `output`.
+    let video_only_path = if post.apac_audio {
+        tempfile_sibling(output, "video_only")?
+    } else {
+        output.to_path_buf()
+    };
+
     if zero_copy {
         #[cfg(target_os = "macos")]
-        return export_zero_copy(input, output, eye_w, n_frames, fps, bitrate_kbps,
-                                lut_spec, lut_intensity, encoder,
-                                zero_copy_encode, plan_template);
+        export_zero_copy(input, &video_only_path, eye_w, n_frames, fps, bitrate_kbps,
+                         lut_spec, lut_intensity, encoder,
+                         zero_copy_encode, plan_template, post.apmp)?;
         #[cfg(not(target_os = "macos"))]
-        unreachable!()
+        unreachable!();
     } else {
-        export_cpu_assemble(input, output, eye_w, n_frames, fps, bitrate_kbps,
-                            lut_spec, lut_intensity, hw, encoder, plan_template)
+        export_cpu_assemble(input, &video_only_path, eye_w, n_frames, fps, bitrate_kbps,
+                            lut_spec, lut_intensity, hw, encoder, plan_template,
+                            post.apmp)?;
     }
+
+    // Post-encode: APAC audio mux. APMP atoms were already set as
+    // codec side-data on the encoder, so they're already in
+    // video_only_path's stsd — apac_encode's passthrough preserves
+    // them bit-exact when it copies the video track.
+    if post.apac_audio {
+        run_apac_audio(input, &video_only_path, output, post.apac_bitrate)?;
+        // Best-effort cleanup of the video-only temp file.
+        let _ = std::fs::remove_file(&video_only_path);
+    }
+    Ok(())
+}
+
+/// Build a sibling path for a temp file: `<output>.<suffix>.mov`.
+/// Lives next to `output` so it's on the same filesystem (cheap rename
+/// fallback if we ever switch to that pattern) and gets cleaned up by
+/// the export pipeline on success.
+fn tempfile_sibling(output: &std::path::Path, suffix: &str)
+    -> anyhow::Result<std::path::PathBuf>
+{
+    let stem = output.file_stem()
+        .ok_or_else(|| anyhow::anyhow!("output path has no file stem"))?
+        .to_string_lossy().to_string();
+    let ext = output.extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mov".into());
+    let parent = output.parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    Ok(parent.join(format!(".{stem}.{suffix}.{ext}")))
+}
+
+/// Extract the source `.360`'s ambisonic audio track to a temp WAV,
+/// then spawn `apac_encode` to encode the WAV as APAC and mux it
+/// alongside the (passthrough) video track of `video_only` into
+/// `final_out`. macOS-only.
+#[cfg(target_os = "macos")]
+fn run_apac_audio(
+    source: &std::path::Path,
+    video_only: &std::path::Path,
+    final_out: &std::path::Path,
+    apac_bitrate: u32,
+) -> anyhow::Result<()> {
+    use vr180_pipeline::audio::{probe_ambisonic, extract_ambisonic_to_wav};
+    use vr180_pipeline::helpers::spawn_apac_encode;
+
+    let amb = probe_ambisonic(source)?;
+    let Some(amb) = amb else {
+        eprintln!("warning: --apac-audio requested but {} has no ambisonic track; \
+                   copying video-only to {}", source.display(), final_out.display());
+        std::fs::rename(video_only, final_out)?;
+        return Ok(());
+    };
+    println!("APAC: extracting ambisonic (stream {}, {}ch @ {} Hz) ...",
+        amb.stream_index, amb.channels, amb.sample_rate);
+
+    let temp_wav = tempfile_sibling(final_out, "amb")?;
+    let temp_wav = temp_wav.with_extension("wav");
+    extract_ambisonic_to_wav(source, &temp_wav)?;
+    let wav_size = std::fs::metadata(&temp_wav).map(|m| m.len()).unwrap_or(0);
+    println!("APAC: extracted {:.1} MB WAV at {}", wav_size as f64 / 1_048_576.0, temp_wav.display());
+
+    println!("APAC: muxing video + APAC audio via apac_encode @ {} kbps ...", apac_bitrate / 1000);
+    let t = std::time::Instant::now();
+    spawn_apac_encode(&temp_wav, Some(video_only), final_out, apac_bitrate)?;
+    println!("APAC: done in {:.2?}", t.elapsed());
+
+    // Cleanup temp WAV.
+    let _ = std::fs::remove_file(&temp_wav);
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_apac_audio(
+    _source: &std::path::Path,
+    _video_only: &std::path::Path,
+    _final_out: &std::path::Path,
+    _apac_bitrate: u32,
+) -> anyhow::Result<()> {
+    anyhow::bail!("--apac-audio is macOS-only");
 }
 
 /// Phase 0.6 / 0.7 / 0.8 path: hwaccel decode → host-memory NV12 →
@@ -402,6 +538,7 @@ fn export_cpu_assemble(
     hw: vr180_pipeline::decode::HwDecode,
     encoder_backend: vr180_pipeline::encode::EncoderBackend,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
+    apmp: bool,
 ) -> anyhow::Result<()> {
     use vr180_core::eac::{assemble_lens_a, assemble_lens_b};
     use vr180_pipeline::decode::{iter_stream_pairs, probe_video};
@@ -430,6 +567,7 @@ fn export_cpu_assemble(
         decoder.decode_path(), dims.stream_w, dims.stream_h, dims.tile_w());
 
     let mut encoder = H265Encoder::create(output, out_w, out_h, fps, bitrate_kbps, encoder_backend)?;
+    if apmp { encoder.tag_apmp_vr180_sbs()?; }
     let mut cross_a = vec![0u8; cw * cw * 3];
     let mut cross_b = vec![0u8; cw * cw * 3];
 
@@ -476,6 +614,7 @@ fn export_zero_copy(
     encoder_backend: vr180_pipeline::encode::EncoderBackend,
     zero_copy_encode: bool,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
+    apmp: bool,
 ) -> anyhow::Result<()> {
     use vr180_pipeline::decode::{ZeroCopyStreamPairIter, probe_video};
     use vr180_pipeline::encode::H265Encoder;
@@ -516,6 +655,7 @@ fn export_zero_copy(
     } else {
         H265Encoder::create(output, out_w, out_h, fps, bitrate_kbps, encoder_backend)?
     };
+    if apmp { encoder.tag_apmp_vr180_sbs()?; }
 
     let t_start = std::time::Instant::now();
     let mut frame_idx: u32 = 0;

@@ -83,6 +83,10 @@ pub struct H265Encoder {
     h: u32,
     finished: bool,
     encode_path: EncodePath,
+    /// Deferred to first encode call so post-construction setters
+    /// (`tag_apmp_vr180_sbs`) can modify the stream's codecpar
+    /// side-data before the muxer writes the moov header.
+    header_written: bool,
 }
 
 /// Which `encode_*` entry point this encoder was configured for.
@@ -216,18 +220,30 @@ impl H265Encoder {
             ffmpeg::software::scaling::Flags::BICUBIC,
         ).map_err(|e| Error::Ffmpeg(format!("rgb→yuv scaler: {e}")))?;
 
-        octx.write_header()
-            .map_err(|e| Error::Ffmpeg(format!("write_header: {e}")))?;
-
         Ok(Self {
             octx, encoder, scaler, stream_index, time_base,
             frame_count: 0, w, h, finished: false,
             encode_path: EncodePath::CpuInput,
+            header_written: false,
         })
+    }
+
+    /// Write the moov header if it hasn't been written yet. Called
+    /// before the first encode dispatch on every path. Header writes
+    /// are deferred from `create()` to here so post-construction
+    /// setters (like `tag_apmp_vr180_sbs`) can modify the stream's
+    /// codecpar side-data before the muxer locks in the moov.
+    fn ensure_header_written(&mut self) -> Result<()> {
+        if self.header_written { return Ok(()); }
+        self.octx.write_header()
+            .map_err(|e| Error::Ffmpeg(format!("write_header: {e}")))?;
+        self.header_written = true;
+        Ok(())
     }
 
     /// Encode one packed RGB8 frame. Length must equal `w * h * 3`.
     pub fn encode_frame(&mut self, rgb8: &[u8]) -> Result<()> {
+        self.ensure_header_written()?;
         let want = (self.w as usize) * (self.h as usize) * 3;
         if rgb8.len() != want {
             return Err(Error::Ffmpeg(format!(
@@ -311,6 +327,7 @@ impl H265Encoder {
                 "encode_pixel_buffer requires create_zero_copy_vt".into()
             ));
         }
+        self.ensure_header_written()?;
         use ffmpeg::ffi::*;
         // Allocate frame, set up hw-frame fields.
         unsafe {
@@ -383,12 +400,195 @@ impl H265Encoder {
 
     fn finish_inner(&mut self) -> Result<()> {
         if self.finished { return Ok(()); }
+        self.ensure_header_written()?;
         self.encoder.send_eof()
             .map_err(|e| Error::Ffmpeg(format!("send_eof: {e}")))?;
         self.drain_packets()?;
         self.octx.write_trailer()
             .map_err(|e| Error::Ffmpeg(format!("write_trailer: {e}")))?;
         self.finished = true;
+        Ok(())
+    }
+}
+
+// ===== Phase 0.8.6: AVSphericalMapping (re-declared) =====
+//
+// `AVSphericalMapping` is defined in `libavutil/spherical.h` but
+// ffmpeg-sys-next 8.1's bindgen header set doesn't include that file,
+// so the type isn't available via `ffmpeg::ffi`. The C ABI is stable
+// (the struct hasn't changed since FFmpeg 3.1 added it), so we
+// re-declare it locally with the `M` prefix to avoid name clashes if
+// ffmpeg-sys-next ever ships its own version. Field ordering and
+// types must match `libavutil/spherical.h` exactly — verified
+// against FFmpeg 7.x.
+//
+// `AVSphericalProjection` enum values match the C enum:
+//   EQUIRECTANGULAR      = 0
+//   CUBEMAP              = 1
+//   EQUIRECTANGULAR_TILE = 2
+//   HALF_EQUIRECTANGULAR = 3   ← what APMP "hequ" maps from
+//   FISHEYE              = 4
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct MAVSphericalMapping {
+    /// AVSphericalProjection (C enum, sized as `c_int` = i32).
+    projection:   i32,
+    /// Rotation in 16.16 fixed-point degrees (per AVSphericalMapping
+    /// docs). 0 = identity orientation, which is what we want — gyro
+    /// stabilization has already aligned the frame upstream.
+    yaw:          i32,
+    pitch:        i32,
+    roll:         i32,
+    /// 0.32 fixed-point fractional bounds (0 = no crop / full image).
+    bound_left:   u32,
+    bound_top:    u32,
+    bound_right:  u32,
+    bound_bottom: u32,
+    /// Padding-frame count for cubemaps; 0 for equi / half-equi.
+    padding:      u32,
+}
+
+const M_AV_SPHERICAL_HALF_EQUIRECTANGULAR: i32 = 3;
+
+// ===== Phase 0.8.6: APMP atom side-data injection =====
+//
+// FFmpeg's mov muxer writes the Apple Projected Media Profile atom
+// tree (vexu/proj/prji/eyes/stri/pack/pkin + hfov) when:
+//   (a) `strict_std_compliance ≤ FF_COMPLIANCE_UNOFFICIAL` (= -1), AND
+//   (b) the output stream's `codecpar->coded_side_data` carries
+//       both `AV_PKT_DATA_STEREO3D` and `AV_PKT_DATA_SPHERICAL`
+//       entries with the right field values.
+//
+// We piggy-back on FFmpeg's writer rather than hand-rolling the box
+// tree, because FFmpeg's writer is already validated against
+// AVFoundation. The exact box layout is in
+// `libavformat/movenc.c::mov_write_vexu_tag` and friends; the spec
+// (Apple's QuickTime + ISOBMFF Spatial Media Extensions, v1.9.8 Beta)
+// matches FFmpeg's output bit-for-bit.
+//
+// We side-step the AV_FRAME_DATA path (per-frame side-data) and set
+// the side-data on the output stream's codecpar once at setup time —
+// the muxer reads it when finalizing the moov atom.
+
+impl H265Encoder {
+    /// Tag the video track for VR180 SBS recognition by visionOS /
+    /// Vision Pro. Adds APMP atoms (`vexu/proj/prji=hequ`,
+    /// `vexu/eyes/stri=0x03`, `vexu/pack/pkin=side`, `hfov=180°`) to
+    /// the `hvc1` sample description, plus Google sv3d/st3d for
+    /// YouTube / Quest compat.
+    ///
+    /// Implementation: set side-data on the output stream's
+    /// `codecpar->coded_side_data` via `av_packet_side_data_new`.
+    /// FFmpeg's mov muxer reads from there when writing the moov.
+    ///
+    /// MUST be called before the first `encode_*` (the header write
+    /// is deferred to first encode for exactly this reason).
+    ///
+    /// Requires FFmpeg ≥ 7.0 for the `av_packet_side_data_new` API
+    /// on the codecpar array. ffmpeg-next 8.1's bundled `ffmpeg-sys-next`
+    /// 8.1 binds against libavformat ≥ 62, which has this. Older
+    /// FFmpegs (≤ 6.x) would compile but the atoms wouldn't show up
+    /// (the muxer ignores side-data it doesn't recognize).
+    pub fn tag_apmp_vr180_sbs(&mut self) -> Result<()> {
+        if self.header_written {
+            return Err(Error::Ffmpeg(
+                "tag_apmp_vr180_sbs must be called before the first encode()".into()
+            ));
+        }
+        use ffmpeg::ffi::*;
+
+        // 1. Allow unofficial extensions on the codec (needed by the
+        //    muxer's APMP write path). Set strict_std_compliance =
+        //    FF_COMPLIANCE_UNOFFICIAL on the encoder context.
+        const FF_COMPLIANCE_UNOFFICIAL: i32 = -1;
+        unsafe {
+            let raw = self.encoder.as_mut_ptr();
+            (*raw).strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
+        }
+
+        // 2. Get the output stream's codec parameters. The mov muxer
+        //    reads side-data from here at write_trailer time.
+        let codecpar = unsafe {
+            let mut stream = self.octx.stream_mut(self.stream_index)
+                .ok_or_else(|| Error::Ffmpeg("output stream missing".into()))?;
+            // ffmpeg-next's Stream::parameters() returns a wrapper;
+            // we need the raw AVCodecParameters* to use the
+            // av_packet_side_data_new API.
+            (*stream.as_mut_ptr()).codecpar
+        };
+        if codecpar.is_null() {
+            return Err(Error::Ffmpeg("stream has no codecpar".into()));
+        }
+
+        // 3. AV_PKT_DATA_STEREO3D — frame-packed side-by-side, view=packed.
+        unsafe {
+            // AVStereo3D layout (libavutil/stereo3d.h). We zero-init
+            // and set the fields the muxer needs. Don't use
+            // av_stereo3d_alloc() — that returns a heap pointer we'd
+            // have to free; av_packet_side_data_new gives us a buffer
+            // of the right size to memcpy into.
+            let mut stereo: AVStereo3D = std::mem::zeroed();
+            stereo.type_ = AVStereo3DType::AV_STEREO3D_SIDEBYSIDE;
+            stereo.view  = AVStereo3DView::AV_STEREO3D_VIEW_PACKED;
+            // Optional: primary_eye=LEFT, baseline=0 (we don't know
+            // the GoPro Max IPD precisely; AVFoundation accepts 0).
+            stereo.primary_eye = AVStereo3DPrimaryEye::AV_PRIMARY_EYE_LEFT;
+
+            let entry = av_packet_side_data_new(
+                &mut (*codecpar).coded_side_data,
+                &mut (*codecpar).nb_coded_side_data,
+                AVPacketSideDataType::AV_PKT_DATA_STEREO3D,
+                std::mem::size_of::<AVStereo3D>(),
+                0,
+            );
+            if entry.is_null() {
+                return Err(Error::Ffmpeg(
+                    "av_packet_side_data_new STEREO3D returned NULL".into()
+                ));
+            }
+            std::ptr::copy_nonoverlapping(
+                &stereo as *const _ as *const u8,
+                (*entry).data,
+                std::mem::size_of::<AVStereo3D>(),
+            );
+        }
+
+        // 4. AV_PKT_DATA_SPHERICAL — half-equirectangular (VR180).
+        // `AVSphericalMapping` is in libavutil/spherical.h but not
+        // exposed by ffmpeg-sys-next 8.1's bindgen header set. The
+        // C ABI is stable, so we re-declare it locally — see the
+        // module note above (`MAVSphericalMapping` etc.).
+        unsafe {
+            let mut sph = MAVSphericalMapping {
+                projection: M_AV_SPHERICAL_HALF_EQUIRECTANGULAR,
+                yaw: 0, pitch: 0, roll: 0,
+                bound_left: 0, bound_top: 0, bound_right: 0, bound_bottom: 0,
+                padding: 0,
+            };
+            // Half-equirect for VR180. FFmpeg movenc.c maps this to
+            // prji.projection_kind = 'hequ' (the APMP code).
+
+            let entry = av_packet_side_data_new(
+                &mut (*codecpar).coded_side_data,
+                &mut (*codecpar).nb_coded_side_data,
+                AVPacketSideDataType::AV_PKT_DATA_SPHERICAL,
+                std::mem::size_of::<MAVSphericalMapping>(),
+                0,
+            );
+            if entry.is_null() {
+                return Err(Error::Ffmpeg(
+                    "av_packet_side_data_new SPHERICAL returned NULL".into()
+                ));
+            }
+            std::ptr::copy_nonoverlapping(
+                &mut sph as *mut _ as *const u8,
+                (*entry).data,
+                std::mem::size_of::<MAVSphericalMapping>(),
+            );
+        }
+
+        tracing::info!("APMP VR180 SBS tagging applied to stream {}", self.stream_index);
         Ok(())
     }
 }
@@ -537,13 +737,11 @@ impl H265Encoder {
             ffmpeg::software::scaling::Flags::BICUBIC,
         ).map_err(|e| Error::Ffmpeg(format!("placeholder scaler: {e}")))?;
 
-        octx.write_header()
-            .map_err(|e| Error::Ffmpeg(format!("write_header (zero-copy): {e}")))?;
-
         Ok(Self {
             octx, encoder, scaler, stream_index, time_base,
             frame_count: 0, w, h, finished: false,
             encode_path: EncodePath::ZeroCopyVt,
+            header_written: false,
         })
     }
 }

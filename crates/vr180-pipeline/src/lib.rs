@@ -8,6 +8,7 @@
 
 #![warn(missing_debug_implementations)]
 
+pub mod audio;
 pub mod decode;
 pub mod encode;
 pub mod gpu;

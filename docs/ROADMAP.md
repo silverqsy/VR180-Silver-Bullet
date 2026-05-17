@@ -630,31 +630,17 @@ VT decode is essentially free at this scale. → resolved in **0.8.5**.
 - Audio passthrough from the source `.360` (`audio_args = ["-c:a",
   "copy"]` equivalent via libav demux+remux).
 
-### Deferred to 0.8.6 — Swift helper spawning
+### Deferred to 0.8.7 — Atom writers (Google sv3d/st3d/SA3D)
 
-The three macOS-native helpers already exist as compiled binaries
-in `helpers/swift/`. The Rust pipeline just needs spawn glue
-(stdin BGR48 frames, stderr line stream into `tracing` logs,
-exit-code → `pipeline::Error::Helper` mapping). Roughly mirrors
-how the Python app already calls them; not hard, just plumbing.
+The Phase 0.8.6 APMP path covers Apple / Vision Pro recognition via
+FFmpeg's mov-muxer side-data writer. For YouTube / Quest / Meta
+compatibility we'd still want the Google spatialmedia atoms
+(`sv3d` / `st3d` / `SA3D`) written alongside — FFmpeg has a separate
+code path for these (`mov_write_sv3d_tag`) that's also triggered by
+side-data on the output stream, but uses different muxer flags.
 
-- [ ] `vr180-pipeline::helpers::spawn_mvhevc_encode` — MV-HEVC
-      spatial video for Vision Pro
-- [ ] `vr180-pipeline::helpers::spawn_apac_encode` — ambisonic
-      audio re-encode (Apple Positional Audio Codec)
-- [ ] `vr180-pipeline::helpers::spawn_vt_denoise` — VTTemporal-
-      NoiseFilter, true 10-bit through denoise
-
-### Deferred to 0.8.7 — Atom writers
-
-Port the spherical / stereo / ambisonic metadata atoms into
-`vr180-core::atoms`. Replaces Python's `spatialmedia` package
-(which we patched twice this session for the
-`KeyError: 'ambisonic_channel_ordering'` bug). Three writers,
-all <100 bytes each on disk:
-- [ ] `sv3d` — spherical projection (equirectangular)
-- [ ] `st3d` — stereo mode (left-right SBS)
-- [ ] `SA3D` — ambisonic audio metadata (Google spec)
+For audio: the existing APAC mux is Vision Pro-native; SA3D-tagged
+ambisonic AAC would let YouTube / Quest VR also do spatialization.
 
 ## Phase 0.8.5 — `hevc_videotoolbox` hardware encode ✅
 
@@ -721,6 +707,107 @@ Caveats:
   switches are how 10-bit pipelines silently regress to 8-bit
   through some intermediate; this work needs to land each
   touchpoint explicitly.
+
+## Phase 0.8.6 — APAC audio + APMP metadata (Vision Pro spatial) ✅
+
+VR180 SBS exports become Vision Pro-native: ambisonic audio is
+re-encoded via Apple Positional Audio Codec (APAC) for true
+head-tracked spatialization, and the video track is tagged with
+Apple Projected Media Profile (APMP) atoms so visionOS recognizes
+it as immersive media. **MV-HEVC is explicitly out of scope** —
+we stick with single-track SBS HEVC because every Phase 0.x
+optimization (zero-copy decode → wgpu chained color stack → zero-
+copy VT encode) is built around that pipeline shape.
+
+- [x] `vr180-pipeline::audio` module — `probe_ambisonic` walks the
+      source container's audio streams, returns the first 4-channel
+      uncompressed-PCM track (matches GoPro MAX 2's stream index 5,
+      `pcm_s24le` 48 kHz "ambisonic 1"). `extract_ambisonic_to_wav`
+      stream-copies that track into a fresh WAV via in-process
+      ffmpeg-next remux — no system-ffmpeg subprocess.
+- [x] `helpers::spawn_apac_encode` — subprocess wrapper around the
+      `apac_encode.swift` helper in `helpers/bin/`. Stderr streams
+      into `tracing`; non-zero exit → `Error::Helper { code, stderr }`.
+      Three call modes: audio-only, video-passthrough mux, custom
+      bitrate. Used by the `--apac-audio` export flag.
+- [x] `H265Encoder::tag_apmp_vr180_sbs` — injects two side-data
+      entries on the output stream's codec parameters:
+      - `AV_PKT_DATA_STEREO3D` (`type=SIDEBYSIDE, view=PACKED,
+        primary_eye=LEFT`)
+      - `AV_PKT_DATA_SPHERICAL` (`projection=HALF_EQUIRECTANGULAR`)
+      Plus sets `strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL`
+      on the codec context. FFmpeg's mov muxer reads these at
+      `write_trailer` time and emits the APMP box tree
+      (`vexu/proj/prji=hequ` + `vexu/eyes/stri=0x03`) into the
+      `hvc1` sample description.
+- [x] Re-declared `MAVSphericalMapping` struct locally (with `M`
+      prefix) — `libavutil/spherical.h` exists in FFmpeg but
+      ffmpeg-sys-next 8.1's bindgen header set doesn't include it.
+      C ABI stable since FFmpeg 3.1; layout verified against
+      libavutil headers.
+- [x] Deferred-header pattern in `H265Encoder` — `write_header`
+      moves from `create()` to first encode call via
+      `ensure_header_written()`. Lets post-construction setters
+      (`tag_apmp_vr180_sbs`) modify codecpar side-data before the
+      muxer locks in the moov.
+- [x] CLI: `--apac-audio` + `--apac-bitrate <bps>` + `--apmp`
+      flags on `export`. `--apac-audio` writes a temp video-only
+      `.mov`, then runs `apac_encode` to mux video + APAC into the
+      final path. `--apmp` is independent (works with or without
+      audio).
+- [x] Swift helper build: existing `helpers/build_swift.sh` now
+      runs end-to-end (`apac_encode` + `vt_denoise` + `mvhevc_encode`
+      all built into `helpers/bin/`). `mvhevc_encode` still builds
+      even though we're not wiring it (saves bit-rot if we ever want
+      it back).
+
+**End-to-end test** (60 frames, `NO firmware RS No IORI.360`,
+4096×2048 SBS, zero-copy + VT encode, `--apac-audio --apmp`):
+
+```
+Export (zero-copy IOSurface path): … → /tmp/.vr180_apac_apmp.video_only.mov
+  pipeline: VT → IOSurface → wgpu → SBS BGRA IOSurface → VT encoder (zero-copy)
+Done: 60 frames in 761.06ms (78.84 fps)
+
+APAC: extracting ambisonic (stream 5, 4ch @ 48000 Hz) ...
+APAC: extracted 39.7 MB WAV
+APAC: muxing video + APAC audio via apac_encode @ 384 kbps ...
+APAC: done in 1.00s
+```
+
+**Output validation** (`ffprobe` + raw `xxd` of moov atom):
+- Stream 0: `Audio: none (apac / 0x63617061), 48000 Hz, 4.0` ← **APAC track**, 4-ch ambisonic
+- Stream 1: `Video: hevc (Main) (hvc1 / 0x31637668), 4096×2048`
+  - Side data:
+    - `stereo3d: unspecified, view: packed, primary eye: left` ← AV_STEREO3D_SIDEBYSIDE+VIEW_PACKED
+    - `spherical: half equirectangular` ← AV_SPHERICAL_HALF_EQUIRECTANGULAR
+- Raw atom bytes in the file: `vexu` → `proj` → `prji` → `hequ`,
+  `eyes` → `stri` → `0x03` (has_left+has_right). Matches the
+  Apple-spec layout exactly.
+
+### Known limitations (deferred to 0.8.7 / later)
+
+- **`pack/pkin=side` atom not written.** FFmpeg's mov muxer doesn't
+  emit the visionOS-26-specific frame-packing atom yet. Vision Pro
+  still recognizes the file as VR180 from the core atoms, but newer
+  visionOS may use `pkin` for explicit SBS frame-packing
+  recognition. Hand-write via a post-pass when needed.
+- **`hfov=180000` atom not written.** Same reason — FFmpeg doesn't
+  emit it from `AV_PKT_DATA_SPHERICAL` side-data. FOV defaults to
+  reading from the projection box in current visionOS.
+- **`vexu/eyes/cams/blin` baseline not written.** Apple's spec
+  marks this as "required for spatial media tagging" but Vision Pro
+  is forgiving in practice — files without it still parse as
+  immersive VR180.
+- **Google `sv3d/st3d/SA3D` not written.** For YouTube / Quest /
+  Meta-browser compat. FFmpeg has a separate code path for these
+  (`mov_write_sv3d_tag`) that may not be exercised by our side-data
+  approach; investigation deferred.
+- **Audio length is full source length, not trimmed to encoded
+  video range.** For partial exports (`-n 60`), the audio overruns
+  the video by ~70s. For full exports (production case) audio +
+  video align naturally. Trim support is deferred until the CLI
+  grows `--start`/`--duration` flags.
 
 ## Phase 0.9 — Full export parity + CLI sidecar mode
 
