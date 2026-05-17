@@ -232,28 +232,66 @@ and the Metal device. The bridge itself takes microseconds. The
 matching `queue.write_texture` upload from Phase 0.6's path are
 both gone.
 
-### Phase 0.6.6 — Pipeline integration (next session)
+## Phase 0.6.6 — Pipeline integration of the zero-copy substrate ✅
 
-The substrate is in place; the pipeline doesn't use it yet. To
-make Phase 0.6.5's speedup show up in `vr180-render export`:
+The substrate from 0.6.5 now drives the export pipeline.
 
-- [ ] `nv12_to_rgba.wgsl` — one compute pass that reads
-      `Y (R8Unorm) + UV (Rg8Unorm)` and writes
-      `Rgba8Unorm` with BT.709 YUV→RGB matrix.
-- [ ] Or, better: an `eac_assemble_from_nv12.wgsl` kernel that
-      does EAC tile slicing + YUV→RGB in one pass, writing the
-      assembled cross directly as `Rgba8Unorm`. Skips the CPU
-      `assemble_lens_a` / `assemble_lens_b` + the cross upload
-      to GPU entirely.
-- [ ] New decode path in `StreamPairIter::next_pair_zero_copy`
-      that returns `(IOSurfacePlaneTexture, IOSurfacePlaneTexture)`
-      tuples (Y, UV) per stream instead of repacked RGB8.
-- [ ] `--zero-copy` flag on `export` (default-on for macOS once stable).
+- [x] `shaders/nv12_to_eac_cross.wgsl` — one compute pass: read Y
+      (R16Unorm) + UV (Rg16Unorm) plane textures, do per-pixel
+      EAC tile-source mapping (LEFT/CENTER/RIGHT from s0,
+      rotated TOP/BOTTOM from s4 with un-rotated coordinates),
+      sample with bilinear filtering, BT.709 limited-range
+      **P010** YUV→RGB, write to an `Rgba8Unorm` cross texture.
+      Corner regions edge-replicate from the nearest side face.
+- [x] `Device::nv12_to_eac_cross(...)` Rust wrapper, one dispatch
+      per lens (uniform picks Lens A vs Lens B layout).
+- [x] `Device::project_cross_texture_to_equirect(...)` — variant
+      of `project_cross_to_equirect` that takes a `wgpu::Texture`
+      directly (skips the RGB upload step). Reuses the cached
+      `eac_to_equirect` pipeline + sampler with a fresh bind group.
+- [x] `decode::ZeroCopyStreamPairIter` — streaming iterator that
+      yields `ZeroCopyStreamPair { s0_y, s0_uv, s4_y, s4_uv }`
+      tuples of `IOSurfacePlaneTexture`s per video-time-step.
+      Independent retains per plane so dropping the tuple releases
+      the IOSurfaces cleanly after the kernel finishes.
+- [x] `--zero-copy` flag on `vr180-render export` (macOS only;
+      errors with a helpful message elsewhere — Phase 0.6.8 will
+      land the Windows equivalent).
+- [x] `TEXTURE_FORMAT_16BIT_NORM` wgpu feature requested at device
+      init so R16Unorm / Rg16Unorm work for P010 plane textures.
 
-Expected gain: at 8K dual-stream, the upload stage drops from
-~200 MB/frame total to essentially zero. Whether end-to-end fps
-moves depends on the encode bottleneck — Phase 0.8.5 (VT HW
-encode) is the matching write-side optimization.
+**P010 vs NV12.** GoPro Max records HEVC Main10 (10-bit) so
+VideoToolbox produces P010 IOSurfaces (10-bit Y in upper 10 of a
+16-bit container). The shader's YUV→RGB does the BT.709 limited-
+range 10-bit expansion inline. 8-bit NV12 GoPro footage (if any
+exists in the wild) needs an R8Unorm/Rg8Unorm variant — deferred
+to 0.6.6.5 until someone shows up with one.
+
+**Validated** end-to-end on `GS010172.360`, 60 frames, eye_w=2048,
+bundled LUT:
+
+|                        | QP   | Output size | fps |
+|------------------------|------|-------------|-----|
+| CPU-assemble path      | 25.94 | 2.7 MB      | 5.03 |
+| Zero-copy IOSurface    | 25.89 | 2.7 MB      | 9.80 |
+
+QP / file size are identical (encoder sees the same image entropy
+either way → output is pixel-equivalent), throughput **~2× faster**
+end-to-end. The remaining bottleneck is libx265 software encode
+(unchanged between the two paths); Phase 0.8.5's `hevc_videotoolbox`
+swap removes that.
+
+Extracted frame 30 from each mp4 is visually identical.
+
+### Deferred to Phase 0.6.6.5 — 8-bit NV12 path
+
+The current shader assumes P010. If a user shows up with 8-bit
+HEVC GoPro footage, we need:
+- Detect bit depth from `IOSurfaceGetBytesPerRowOfPlane(s, 0)` —
+  bpr==stream_w → 8-bit, bpr==2*stream_w → 10-bit.
+- R8Unorm + Rg8Unorm formats and the 8-bit BT.709 limited-range
+  YUV→RGB constants. ~30 lines in the shader + a format-selector
+  parameter on the Rust wrapper.
 
 ### Deferred to Phase 0.6.7 — Windows CUDA↔Vulkan interop
 

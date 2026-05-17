@@ -24,6 +24,13 @@ ffmpeg-next = { workspace = true }
 wgpu = { workspace = true }
 pollster = { workspace = true }
 bytemuck = { workspace = true }
+
+# IOSurface↔Metal↔wgpu zero-copy interop deps (macOS only).
+# Gated as target-specific so Windows / Linux builds don't try to
+# compile them. The consuming module (`src/interop_macos.rs`) is
+# `#![cfg(target_os = "macos")]` so the user-visible types don't
+# leak either.
+[target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.28"
 core-foundation = "0.9"
 objc = "0.2"

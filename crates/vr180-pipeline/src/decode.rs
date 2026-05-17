@@ -351,13 +351,186 @@ pub fn extract_first_stream_pair_with(path: &Path, hw: HwDecode) -> Result<Strea
     Ok(StreamPair { s0, s4, dims, decode_path })
 }
 
+/// Phase 0.6.6 streaming zero-copy decoder. Yields one
+/// `(s0_iosurface, s4_iosurface)` tuple per frame from a `.360` file,
+/// **without** crossing host memory at any point — every IOSurface is
+/// wrapped as a `wgpu::Texture` ready for the `nv12_to_eac_cross`
+/// kernel.
+///
+/// **macOS-only.** On Windows / Linux this struct can't be built;
+/// callers should use [`StreamPairIter`] (CPU path) instead.
+#[cfg(target_os = "macos")]
+pub struct ZeroCopyStreamPairIter {
+    ictx: ffmpeg_next::format::context::Input,
+    video_indices: Vec<usize>,
+    decoders: Vec<ffmpeg_next::codec::decoder::Video>,
+    dims: vr180_core::eac::Dims,
+    frame_limit: u32,
+    frames_yielded: u32,
+}
+
+/// One zero-copy NV12 plane tuple — two `IOSurfacePlaneTexture`s
+/// per stream (Y + UV). Hold onto the returned tuple while the kernel
+/// dispatch is in flight; dropping it releases the IOSurface retains.
+#[cfg(target_os = "macos")]
+pub struct ZeroCopyStreamPair {
+    pub s0_y:  crate::interop_macos::IOSurfacePlaneTexture,
+    pub s0_uv: crate::interop_macos::IOSurfacePlaneTexture,
+    pub s4_y:  crate::interop_macos::IOSurfacePlaneTexture,
+    pub s4_uv: crate::interop_macos::IOSurfacePlaneTexture,
+    pub dims:  vr180_core::eac::Dims,
+}
+
+#[cfg(target_os = "macos")]
+impl ZeroCopyStreamPairIter {
+    /// Open `path`, force VideoToolbox decode, validate two HEVC streams
+    /// of matching dimensions, return an iterator that produces zero-
+    /// copy `(s0, s4)` IOSurface texture pairs.
+    pub fn new(path: &Path, frame_limit: u32) -> Result<Self> {
+        init();
+        let mut ictx = ffmpeg_next::format::input(path)
+            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+
+        let video_indices: Vec<usize> = ictx
+            .streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+            .map(|s| s.index())
+            .collect();
+        if video_indices.len() < 2 {
+            return Err(Error::Ffmpeg(format!(
+                "expected 2 video streams in .360, found {}", video_indices.len()
+            )));
+        }
+
+        let mut decoders = Vec::with_capacity(2);
+        for &idx in video_indices.iter().take(2) {
+            let stream = ictx.stream(idx).unwrap();
+            let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+                .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+            if !try_enable_videotoolbox_decode(&mut codec_ctx) {
+                return Err(Error::Ffmpeg(format!(
+                    "zero-copy path requires VideoToolbox hwaccel — VT setup failed on stream {idx}"
+                )));
+            }
+            decoders.push(codec_ctx.decoder().video()
+                .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?);
+        }
+        let (w0, h0) = (decoders[0].width(), decoders[0].height());
+        let (w1, h1) = (decoders[1].width(), decoders[1].height());
+        if (w0, h0) != (w1, h1) {
+            return Err(Error::Ffmpeg(format!(
+                "streams disagree on dims: {w0}x{h0} vs {w1}x{h1}"
+            )));
+        }
+        let dims = vr180_core::eac::Dims::new(w0, h0);
+        if !dims.is_valid() {
+            return Err(Error::Ffmpeg(format!("stream width {w0} not a valid EAC layout")));
+        }
+        Ok(Self { ictx, video_indices, decoders, dims, frame_limit, frames_yielded: 0 })
+    }
+
+    pub fn dims(&self) -> vr180_core::eac::Dims { self.dims }
+
+    /// Pull the next zero-copy `(s0, s4)` IOSurface pair. Returns
+    /// `Ok(None)` at EOF or frame limit. Each call may issue multiple
+    /// packets to the decoder before both streams yield a frame.
+    pub fn next_pair(&mut self, wgpu_device: &wgpu::Device) -> Result<Option<ZeroCopyStreamPair>> {
+        use crate::interop_macos::{
+            extract_iosurface_from_vt_frame, wgpu_texture_from_iosurface_plane,
+            IOSurfaceNv12Descriptor,
+        };
+        if self.frame_limit > 0 && self.frames_yielded >= self.frame_limit {
+            return Ok(None);
+        }
+        let mut frames: [Option<ffmpeg_next::frame::Video>; 2] = [None, None];
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+
+        // Drain any pre-buffered frames first.
+        for pos in 0..2 {
+            if frames[pos].is_some() { continue; }
+            if self.decoders[pos].receive_frame(&mut decoded).is_ok() {
+                frames[pos] = Some(std::mem::replace(&mut decoded, ffmpeg_next::frame::Video::empty()));
+            }
+        }
+
+        // Then pump packets.
+        if frames.iter().any(|f| f.is_none()) {
+            loop {
+                let (stream, packet) = match self.ictx.packets().next() {
+                    Some(x) => x, None => break,
+                };
+                let pos = match self.video_indices.iter().position(|&i| i == stream.index()) {
+                    Some(p) if frames[p].is_none() => p,
+                    _ => continue,
+                };
+                if self.decoders[pos].send_packet(&packet).is_err() { continue; }
+                while self.decoders[pos].receive_frame(&mut decoded).is_ok() {
+                    if frames[pos].is_some() { break; }
+                    frames[pos] = Some(std::mem::replace(&mut decoded, ffmpeg_next::frame::Video::empty()));
+                    if frames.iter().all(|f| f.is_some()) { break; }
+                }
+                if frames.iter().all(|f| f.is_some()) { break; }
+            }
+        }
+
+        let (Some(f0), Some(f4)) = (frames[0].take(), frames[1].take()) else {
+            return Ok(None);
+        };
+
+        // Both frames are VT-format; extract IOSurfaces and wrap planes.
+        let surf0 = extract_iosurface_from_vt_frame(&f0)?;
+        let desc0 = IOSurfaceNv12Descriptor::new(surf0)?;
+        let s0_y_surf  = unsafe { crate::interop_macos::RetainedIOSurface::retain(desc0.surface.as_raw()) };
+        let s0_uv_surf = unsafe { crate::interop_macos::RetainedIOSurface::retain(desc0.surface.as_raw()) };
+        // GoPro Max records 10-bit HEVC → VideoToolbox produces P010
+        // IOSurfaces (16-bit per channel, 10 bits used). Wrap as
+        // R16Unorm + Rg16Unorm. The nv12_to_eac_cross shader knows how
+        // to expand 10-bits-in-upper-10 to BT.709 limited-range.
+        // 8-bit (NV12) input would use R8Unorm + Rg8Unorm + a different
+        // YUV→RGB scaler — not yet implemented (no 8-bit GoPro footage
+        // in the test set).
+        let s0_y = wgpu_texture_from_iosurface_plane(
+            wgpu_device, s0_y_surf, 0,
+            metal::MTLPixelFormat::R16Unorm,  wgpu::TextureFormat::R16Unorm,
+            desc0.width, desc0.height, "s0_y",
+        )?;
+        let s0_uv = wgpu_texture_from_iosurface_plane(
+            wgpu_device, s0_uv_surf, 1,
+            metal::MTLPixelFormat::RG16Unorm, wgpu::TextureFormat::Rg16Unorm,
+            desc0.width / 2, desc0.height / 2, "s0_uv",
+        )?;
+        // Drop the descriptor's retain explicitly so we don't leak — the
+        // two plane textures each hold their own retain via `retain()` above.
+        drop(desc0);
+
+        let surf4 = extract_iosurface_from_vt_frame(&f4)?;
+        let desc4 = IOSurfaceNv12Descriptor::new(surf4)?;
+        let s4_y_surf  = unsafe { crate::interop_macos::RetainedIOSurface::retain(desc4.surface.as_raw()) };
+        let s4_uv_surf = unsafe { crate::interop_macos::RetainedIOSurface::retain(desc4.surface.as_raw()) };
+        let s4_y = wgpu_texture_from_iosurface_plane(
+            wgpu_device, s4_y_surf, 0,
+            metal::MTLPixelFormat::R16Unorm,  wgpu::TextureFormat::R16Unorm,
+            desc4.width, desc4.height, "s4_y",
+        )?;
+        let s4_uv = wgpu_texture_from_iosurface_plane(
+            wgpu_device, s4_uv_surf, 1,
+            metal::MTLPixelFormat::RG16Unorm, wgpu::TextureFormat::Rg16Unorm,
+            desc4.width / 2, desc4.height / 2, "s4_uv",
+        )?;
+        drop(desc4);
+
+        self.frames_yielded += 1;
+        Ok(Some(ZeroCopyStreamPair { s0_y, s0_uv, s4_y, s4_uv, dims: self.dims }))
+    }
+}
+
 /// Decode the first video frame using VideoToolbox hwaccel and return
 /// it **without** running `av_hwframe_transfer_data`. The frame's
 /// `format == AV_PIX_FMT_VIDEOTOOLBOX` and `data[3]` is the live
 /// CVPixelBuffer the IOSurface lives inside.
 ///
-/// Used by Phase 0.6.5's IOSurface demo (`probe-iosurface`) and will be
-/// the entry point for the Phase 0.6.6 zero-copy compute path.
+/// Used by Phase 0.6.5's IOSurface demo (`probe-iosurface`) and is the
+/// single-frame analogue of `ZeroCopyStreamPairIter::next_pair` above.
 #[cfg(target_os = "macos")]
 pub fn decode_first_vt_frame(path: &Path) -> Result<ffmpeg_next::frame::Video> {
     init();

@@ -147,6 +147,12 @@ enum Cmd {
         /// Hardware-accelerated decode: auto / sw / vt.
         #[arg(long, value_enum, default_value_t = HwAccel::Auto)]
         hw_accel: HwAccel,
+        /// Skip host-memory hop entirely: VideoToolbox decoder's IOSurface
+        /// goes straight to wgpu via the Metal HAL escape, EAC assembly
+        /// happens on the GPU (`nv12_to_eac_cross.wgsl`). **macOS only.**
+        /// Forces `--hw-accel vt`.
+        #[arg(long, default_value_t = false)]
+        zero_copy: bool,
     },
 }
 
@@ -187,13 +193,45 @@ fn main() -> anyhow::Result<()> {
             bench_decode(&path, frames, hw_accel.into()),
         #[cfg(target_os = "macos")]
         Some(Cmd::ProbeIosurface { path }) => probe_iosurface(&path),
-        Some(Cmd::Export { input, output, eye_w, frames, fps, bitrate, lut, lut_intensity, hw_accel }) =>
+        Some(Cmd::Export { input, output, eye_w, frames, fps, bitrate, lut, lut_intensity, hw_accel, zero_copy }) =>
             export(&input, &output, eye_w, frames, fps, bitrate,
-                   lut.as_deref(), lut_intensity, hw_accel.into()),
+                   lut.as_deref(), lut_intensity, hw_accel.into(), zero_copy),
     }
 }
 
 fn export(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    eye_w: u32,
+    n_frames: u32,
+    fps: Option<f32>,
+    bitrate_kbps: u32,
+    lut_spec: Option<&str>,
+    lut_intensity: f32,
+    hw: vr180_pipeline::decode::HwDecode,
+    zero_copy: bool,
+) -> anyhow::Result<()> {
+    if zero_copy && !cfg!(target_os = "macos") {
+        anyhow::bail!(
+            "--zero-copy is macOS-only (requires IOSurface↔Metal interop). \
+             Phase 0.6.8 will add the Windows CUDA↔Vulkan equivalent."
+        );
+    }
+    if zero_copy {
+        #[cfg(target_os = "macos")]
+        return export_zero_copy(input, output, eye_w, n_frames, fps, bitrate_kbps,
+                                lut_spec, lut_intensity);
+        #[cfg(not(target_os = "macos"))]
+        unreachable!()
+    } else {
+        export_cpu_assemble(input, output, eye_w, n_frames, fps, bitrate_kbps,
+                            lut_spec, lut_intensity, hw)
+    }
+}
+
+/// Phase 0.6 / 0.7 / 0.8 path: hwaccel decode → host-memory NV12 →
+/// swscale RGB → CPU EAC assembly → GPU projection + LUT → libx265.
+fn export_cpu_assemble(
     input: &std::path::Path,
     output: &std::path::Path,
     eye_w: u32,
@@ -214,20 +252,13 @@ fn export(
     let out_h = eye_w;
     let fps = fps.unwrap_or(probe.fps);
 
-    println!("Export: {} → {}", input.display(), output.display());
+    println!("Export (CPU-assemble path): {} → {}", input.display(), output.display());
     println!("  source : {} × {}  @ {:.3} fps  ({:.1}s)",
         probe.width, probe.height, probe.fps, probe.duration_sec);
     println!("  output : {} × {}  @ {:.3} fps  H.265 {} kbps",
         out_w, out_h, fps, bitrate_kbps);
 
-    let lut = match lut_spec {
-        Some("bundled") => Some(vr180_core::Cube3DLut::from_file(
-            &resolve_bundled_lut().ok_or_else(|| anyhow::anyhow!("bundled LUT not found"))?
-        )?),
-        Some(p) => Some(vr180_core::Cube3DLut::from_file(std::path::Path::new(p))?),
-        None => None,
-    };
-    if let Some(l) = &lut { println!("  LUT    : {}^3 @ intensity {:.2}", l.size, lut_intensity); }
+    let lut = load_lut(lut_spec, lut_intensity)?;
 
     let device = Device::new()?;
     let mut decoder = iter_stream_pairs(input, hw, n_frames)?;
@@ -249,37 +280,136 @@ fn export(
 
         let mut left  = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, out_h)?;
         let mut right = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, out_h)?;
-        if let Some(lut) = &lut {
-            left  = device.apply_lut3d(&left,  eye_w, out_h, lut, lut_intensity)?;
-            right = device.apply_lut3d(&right, eye_w, out_h, lut, lut_intensity)?;
+        if let Some((lut, intensity)) = &lut {
+            left  = device.apply_lut3d(&left,  eye_w, out_h, lut, *intensity)?;
+            right = device.apply_lut3d(&right, eye_w, out_h, lut, *intensity)?;
         }
-
-        // Stitch L | R side-by-side.
-        let mut sbs = vec![0u8; (out_w * out_h * 3) as usize];
-        let row_l = (eye_w * 3) as usize;
-        let row_sbs = (out_w * 3) as usize;
-        for y in 0..out_h as usize {
-            sbs[y * row_sbs..y * row_sbs + row_l]
-                .copy_from_slice(&left[y * row_l..y * row_l + row_l]);
-            sbs[y * row_sbs + row_l..y * row_sbs + row_l * 2]
-                .copy_from_slice(&right[y * row_l..y * row_l + row_l]);
-        }
-        encoder.encode_frame(&sbs)?;
+        encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
         frame_idx += 1;
-
-        if last_print.elapsed().as_secs_f32() > 1.0 {
-            let avg_fps = frame_idx as f32 / t_start.elapsed().as_secs_f32();
-            print!("\r  frame {frame_idx}  @ {avg_fps:.2} fps  ");
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-            last_print = std::time::Instant::now();
-        }
+        progress_tick(frame_idx, t_start, &mut last_print);
     }
     encoder.finish()?;
+    finish_export(output, frame_idx, t_start)?;
+    Ok(())
+}
+
+/// Phase 0.6.6 path: IOSurface → wgpu zero-copy → GPU EAC assembly +
+/// equirect projection + (LUT) → readback → libx265. macOS only.
+#[cfg(target_os = "macos")]
+fn export_zero_copy(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    eye_w: u32,
+    n_frames: u32,
+    fps: Option<f32>,
+    bitrate_kbps: u32,
+    lut_spec: Option<&str>,
+    lut_intensity: f32,
+) -> anyhow::Result<()> {
+    use vr180_pipeline::decode::{ZeroCopyStreamPairIter, probe_video};
+    use vr180_pipeline::encode::H265Encoder;
+    use vr180_pipeline::gpu::{Device, Lens};
+
+    let probe = probe_video(input)?;
+    let out_w = eye_w * 2;
+    let out_h = eye_w;
+    let fps = fps.unwrap_or(probe.fps);
+
+    println!("Export (zero-copy IOSurface path): {} → {}", input.display(), output.display());
+    println!("  source : {} × {}  @ {:.3} fps  ({:.1}s)",
+        probe.width, probe.height, probe.fps, probe.duration_sec);
+    println!("  output : {} × {}  @ {:.3} fps  H.265 {} kbps",
+        out_w, out_h, fps, bitrate_kbps);
+    println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → eac_to_equirect → lut3d) → libx265");
+
+    let lut = load_lut(lut_spec, lut_intensity)?;
+    let device = Device::new()?;
+    let mut decoder = ZeroCopyStreamPairIter::new(input, n_frames)?;
+    let dims = decoder.dims();
+    println!("  decode : VideoToolbox (probed {}×{}, EAC tile_w={})",
+        dims.stream_w, dims.stream_h, dims.tile_w());
+
+    let mut encoder = H265Encoder::create(output, out_w, out_h, fps, bitrate_kbps)?;
+    let t_start = std::time::Instant::now();
+    let mut frame_idx: u32 = 0;
+    let mut last_print = std::time::Instant::now();
+    while let Some(pair) = decoder.next_pair(&device.device)? {
+        // GPU EAC assembly: NV12 plane textures → RGB cross texture.
+        let cross_a = device.nv12_to_eac_cross(
+            &pair.s0_y.texture, &pair.s0_uv.texture,
+            &pair.s4_y.texture, &pair.s4_uv.texture,
+            Lens::A, dims,
+        )?;
+        let cross_b = device.nv12_to_eac_cross(
+            &pair.s0_y.texture, &pair.s0_uv.texture,
+            &pair.s4_y.texture, &pair.s4_uv.texture,
+            Lens::B, dims,
+        )?;
+
+        let mut left  = device.project_cross_texture_to_equirect(&cross_a, eye_w, out_h)?;
+        let mut right = device.project_cross_texture_to_equirect(&cross_b, eye_w, out_h)?;
+        if let Some((lut, intensity)) = &lut {
+            left  = device.apply_lut3d(&left,  eye_w, out_h, lut, *intensity)?;
+            right = device.apply_lut3d(&right, eye_w, out_h, lut, *intensity)?;
+        }
+        encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
+        // Drop the zero-copy pair AFTER the kernel dispatch is done —
+        // releases the IOSurface retains so the VT decoder can recycle
+        // the underlying CVPixelBuffer for the next frame.
+        drop(pair);
+        frame_idx += 1;
+        progress_tick(frame_idx, t_start, &mut last_print);
+    }
+    encoder.finish()?;
+    finish_export(output, frame_idx, t_start)?;
+    Ok(())
+}
+
+fn load_lut(
+    lut_spec: Option<&str>, intensity: f32,
+) -> anyhow::Result<Option<(vr180_core::Cube3DLut, f32)>> {
+    let path = match lut_spec {
+        Some("bundled") => resolve_bundled_lut()
+            .ok_or_else(|| anyhow::anyhow!("bundled LUT not found"))?,
+        Some(p) => std::path::PathBuf::from(p),
+        None => return Ok(None),
+    };
+    let lut = vr180_core::Cube3DLut::from_file(&path)?;
+    println!("  LUT    : {}^3 @ intensity {:.2} ({})",
+        lut.size, intensity, path.display());
+    Ok(Some((lut, intensity)))
+}
+
+fn stitch_sbs(left: &[u8], right: &[u8], eye_w: u32, eye_h: u32) -> Vec<u8> {
+    let out_w = eye_w * 2;
+    let row_l = (eye_w * 3) as usize;
+    let row_sbs = (out_w * 3) as usize;
+    let mut sbs = vec![0u8; (out_w * eye_h * 3) as usize];
+    for y in 0..eye_h as usize {
+        sbs[y * row_sbs..y * row_sbs + row_l]
+            .copy_from_slice(&left[y * row_l..y * row_l + row_l]);
+        sbs[y * row_sbs + row_l..y * row_sbs + row_l * 2]
+            .copy_from_slice(&right[y * row_l..y * row_l + row_l]);
+    }
+    sbs
+}
+
+fn progress_tick(frame_idx: u32, t_start: std::time::Instant, last: &mut std::time::Instant) {
+    if last.elapsed().as_secs_f32() > 1.0 {
+        let avg_fps = frame_idx as f32 / t_start.elapsed().as_secs_f32();
+        print!("\r  frame {frame_idx}  @ {avg_fps:.2} fps  ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        *last = std::time::Instant::now();
+    }
+}
+
+fn finish_export(output: &std::path::Path, frame_idx: u32, t_start: std::time::Instant)
+    -> anyhow::Result<()>
+{
     let total = t_start.elapsed();
     let avg_fps = frame_idx as f32 / total.as_secs_f32();
     println!("\nDone: {frame_idx} frames in {total:.2?} ({avg_fps:.2} fps)");
-
     let size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
     println!("Output size: {:.1} MB", size as f64 / 1_048_576.0);
     Ok(())
