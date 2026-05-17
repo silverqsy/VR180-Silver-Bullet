@@ -146,9 +146,15 @@ enum Cmd {
         path: PathBuf,
     },
 
-    /// Phase 0.8 export: decode → assemble → equirect → (LUT) → H.265 mp4.
+    /// Phase 0.8 export: decode → assemble → equirect → color grade → H.265 mp4.
     /// Picks `hevc_videotoolbox` on macOS by default (Phase 0.8.5),
     /// `libx265` everywhere else; override with `--encoder`.
+    ///
+    /// Color pipeline (Phase 0.7.5), in the order applied:
+    /// CDL → 3D LUT → sharpen → mid-detail clarity → temp/tint/sat.
+    /// All knobs default to identity (no change); pass any flag to opt
+    /// into that stage. Identity stages are skipped entirely (no GPU
+    /// dispatch).
     Export {
         /// Input `.360` file.
         input: PathBuf,
@@ -187,6 +193,55 @@ enum Cmd {
         /// Forces `--hw-accel vt`.
         #[arg(long, default_value_t = false)]
         zero_copy: bool,
+
+        // --- CDL (ASC Color Decision List) ---
+        /// CDL lift: black-point shift. 0 = no change, +1 pushes blacks
+        /// to mid-gray. Range typically [-0.5, +0.5].
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        cdl_lift: f32,
+        /// CDL gamma. 1.0 = no change, >1 brightens midtones, <1 darkens.
+        #[arg(long, default_value_t = 1.0)]
+        cdl_gamma: f32,
+        /// CDL gain: white-point multiplier. 1.0 = no change.
+        #[arg(long, default_value_t = 1.0)]
+        cdl_gain: f32,
+        /// CDL shadow adjustment via Hermite-smoothstep mask. 0 = no change;
+        /// scaled by 0.6 internally so [-1..+1] maps to ~[-0.6..+0.6].
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        cdl_shadow: f32,
+        /// CDL highlight adjustment via Hermite-smoothstep mask.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        cdl_highlight: f32,
+
+        // --- Color grade (temp/tint/sat) ---
+        /// Temperature: +1 warms (more red, less blue), -1 cools.
+        /// Internal scale is 0.30 — `[-1..+1]` slider maps to ±30% channel shift.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        temperature: f32,
+        /// Tint: +1 toward magenta (less green), -1 toward green.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        tint: f32,
+        /// Saturation. 0 = grayscale, 1 = unchanged, >1 = boosted (may clip).
+        #[arg(long, default_value_t = 1.0)]
+        saturation: f32,
+
+        // --- Sharpen (unsharp mask) ---
+        /// Sharpen amount. 0 = off; typical use [0.3, 1.5].
+        #[arg(long, default_value_t = 0.0)]
+        sharpen: f32,
+        /// Sharpen Gaussian σ (blur radius for the LP component).
+        /// Default 1.4 matches the Python app.
+        #[arg(long, default_value_t = 1.4)]
+        sharpen_sigma: f32,
+
+        // --- Mid-detail clarity ---
+        /// Mid-detail clarity amount. 0 = off; positive = haze removal feel
+        /// (low-pass-blend in midtones), negative = local contrast boost.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        mid_detail: f32,
+        /// Mid-detail Gaussian σ on the 1/4-res blur. Default 1.0.
+        #[arg(long, default_value_t = 1.0)]
+        mid_detail_sigma: f32,
     },
 }
 
@@ -227,10 +282,57 @@ fn main() -> anyhow::Result<()> {
             bench_decode(&path, frames, hw_accel.into()),
         #[cfg(target_os = "macos")]
         Some(Cmd::ProbeIosurface { path }) => probe_iosurface(&path),
-        Some(Cmd::Export { input, output, eye_w, frames, fps, bitrate, lut, lut_intensity, hw_accel, encoder, zero_copy }) =>
+        Some(Cmd::Export {
+            input, output, eye_w, frames, fps, bitrate,
+            lut, lut_intensity, hw_accel, encoder, zero_copy,
+            cdl_lift, cdl_gamma, cdl_gain, cdl_shadow, cdl_highlight,
+            temperature, tint, saturation,
+            sharpen, sharpen_sigma,
+            mid_detail, mid_detail_sigma,
+        }) => {
+            use vr180_pipeline::gpu::{CdlParams, ColorGradeParams, SharpenParams, MidDetailParams};
+            let color = ColorParams {
+                cdl: CdlParams {
+                    lift: cdl_lift, gamma: cdl_gamma, gain: cdl_gain,
+                    shadow: cdl_shadow, highlight: cdl_highlight,
+                },
+                color_grade: ColorGradeParams { temperature, tint, saturation },
+                sharpen: SharpenParams {
+                    amount: sharpen, sigma: sharpen_sigma,
+                    apply_lat_weight: true,  // exports are always equirect
+                },
+                mid_detail: MidDetailParams {
+                    amount: mid_detail, sigma: mid_detail_sigma,
+                },
+            };
             export(&input, &output, eye_w, frames, fps, bitrate,
                    lut.as_deref(), lut_intensity, hw_accel.into(),
-                   encoder.resolve(), zero_copy),
+                   encoder.resolve(), zero_copy, color)
+        }
+    }
+}
+
+/// Bundle of the four Phase 0.7.5 color tools' params. Each field is
+/// passed through with the user's CLI value (or the param struct's
+/// `Default::default()` identity values if the user didn't override).
+/// The `Device::apply_*` methods short-circuit on identity, so an
+/// all-identity ColorParams adds zero GPU work to the frame loop.
+#[derive(Debug, Clone, Copy)]
+struct ColorParams {
+    cdl:         vr180_pipeline::gpu::CdlParams,
+    color_grade: vr180_pipeline::gpu::ColorGradeParams,
+    sharpen:     vr180_pipeline::gpu::SharpenParams,
+    mid_detail:  vr180_pipeline::gpu::MidDetailParams,
+}
+
+impl ColorParams {
+    /// True when no color stage will actually do work — used for the
+    /// per-frame log line so users can verify their flags took effect.
+    fn any_active(&self) -> bool {
+        !self.cdl.is_identity()
+            || !self.color_grade.is_identity()
+            || !self.sharpen.is_identity()
+            || !self.mid_detail.is_identity()
     }
 }
 
@@ -246,6 +348,7 @@ fn export(
     hw: vr180_pipeline::decode::HwDecode,
     encoder: vr180_pipeline::encode::EncoderBackend,
     zero_copy: bool,
+    color: ColorParams,
 ) -> anyhow::Result<()> {
     if zero_copy && !cfg!(target_os = "macos") {
         anyhow::bail!(
@@ -264,17 +367,17 @@ fn export(
     if zero_copy {
         #[cfg(target_os = "macos")]
         return export_zero_copy(input, output, eye_w, n_frames, fps, bitrate_kbps,
-                                lut_spec, lut_intensity, encoder);
+                                lut_spec, lut_intensity, encoder, color);
         #[cfg(not(target_os = "macos"))]
         unreachable!()
     } else {
         export_cpu_assemble(input, output, eye_w, n_frames, fps, bitrate_kbps,
-                            lut_spec, lut_intensity, hw, encoder)
+                            lut_spec, lut_intensity, hw, encoder, color)
     }
 }
 
 /// Phase 0.6 / 0.7 / 0.8 path: hwaccel decode → host-memory NV12 →
-/// swscale RGB → CPU EAC assembly → GPU projection + LUT → HEVC.
+/// swscale RGB → CPU EAC assembly → GPU projection + color tools → HEVC.
 fn export_cpu_assemble(
     input: &std::path::Path,
     output: &std::path::Path,
@@ -286,6 +389,7 @@ fn export_cpu_assemble(
     lut_intensity: f32,
     hw: vr180_pipeline::decode::HwDecode,
     encoder_backend: vr180_pipeline::encode::EncoderBackend,
+    color: ColorParams,
 ) -> anyhow::Result<()> {
     use vr180_core::eac::{assemble_lens_a, assemble_lens_b};
     use vr180_pipeline::decode::{iter_stream_pairs, probe_video};
@@ -302,6 +406,7 @@ fn export_cpu_assemble(
         probe.width, probe.height, probe.fps, probe.duration_sec);
     println!("  output : {} × {}  @ {:.3} fps  H.265 ({}) {} kbps",
         out_w, out_h, fps, encoder_label(encoder_backend), bitrate_kbps);
+    print_color_stack(&color, lut_spec.is_some());
 
     let lut = load_lut(lut_spec, lut_intensity)?;
 
@@ -323,12 +428,10 @@ fn export_cpu_assemble(
         assemble_lens_a(&pair.s0, &pair.s4, dims, &mut cross_a);
         assemble_lens_b(&pair.s0, &pair.s4, dims, &mut cross_b);
 
-        let mut left  = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, out_h)?;
-        let mut right = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, out_h)?;
-        if let Some((lut, intensity)) = &lut {
-            left  = device.apply_lut3d(&left,  eye_w, out_h, lut, *intensity)?;
-            right = device.apply_lut3d(&right, eye_w, out_h, lut, *intensity)?;
-        }
+        let left  = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, out_h)?;
+        let right = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, out_h)?;
+        let left  = apply_color_stack(&device, left,  eye_w, out_h, &color, lut.as_ref())?;
+        let right = apply_color_stack(&device, right, eye_w, out_h, &color, lut.as_ref())?;
         encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
         frame_idx += 1;
         progress_tick(frame_idx, t_start, &mut last_print);
@@ -339,7 +442,7 @@ fn export_cpu_assemble(
 }
 
 /// Phase 0.6.6 path: IOSurface → wgpu zero-copy → GPU EAC assembly +
-/// equirect projection + (LUT) → readback → HEVC. macOS only.
+/// equirect projection + color tools → readback → HEVC. macOS only.
 #[cfg(target_os = "macos")]
 fn export_zero_copy(
     input: &std::path::Path,
@@ -351,6 +454,7 @@ fn export_zero_copy(
     lut_spec: Option<&str>,
     lut_intensity: f32,
     encoder_backend: vr180_pipeline::encode::EncoderBackend,
+    color: ColorParams,
 ) -> anyhow::Result<()> {
     use vr180_pipeline::decode::{ZeroCopyStreamPairIter, probe_video};
     use vr180_pipeline::encode::H265Encoder;
@@ -367,7 +471,8 @@ fn export_zero_copy(
         probe.width, probe.height, probe.fps, probe.duration_sec);
     println!("  output : {} × {}  @ {:.3} fps  H.265 ({}) {} kbps",
         out_w, out_h, fps, enc_label, bitrate_kbps);
-    println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → eac_to_equirect → lut3d) → {}", enc_label);
+    println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → eac_to_equirect → color stack) → {}", enc_label);
+    print_color_stack(&color, lut_spec.is_some());
 
     let lut = load_lut(lut_spec, lut_intensity)?;
     let device = Device::new()?;
@@ -393,12 +498,10 @@ fn export_zero_copy(
             Lens::B, dims,
         )?;
 
-        let mut left  = device.project_cross_texture_to_equirect(&cross_a, eye_w, out_h)?;
-        let mut right = device.project_cross_texture_to_equirect(&cross_b, eye_w, out_h)?;
-        if let Some((lut, intensity)) = &lut {
-            left  = device.apply_lut3d(&left,  eye_w, out_h, lut, *intensity)?;
-            right = device.apply_lut3d(&right, eye_w, out_h, lut, *intensity)?;
-        }
+        let left  = device.project_cross_texture_to_equirect(&cross_a, eye_w, out_h)?;
+        let right = device.project_cross_texture_to_equirect(&cross_b, eye_w, out_h)?;
+        let left  = apply_color_stack(&device, left,  eye_w, out_h, &color, lut.as_ref())?;
+        let right = apply_color_stack(&device, right, eye_w, out_h, &color, lut.as_ref())?;
         encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
         // Drop the zero-copy pair AFTER the kernel dispatch is done —
         // releases the IOSurface retains so the VT decoder can recycle
@@ -418,6 +521,71 @@ fn encoder_label(b: vr180_pipeline::encode::EncoderBackend) -> &'static str {
         EncoderBackend::Libx265      => "libx265 (SW)",
         EncoderBackend::VideoToolbox => "hevc_videotoolbox (HW)",
     }
+}
+
+/// Apply the Phase 0.7.5 color stack to one half-equirect frame.
+///
+/// Order matches the Python pipeline (vr180_gui.py:7746) with the
+/// note that we fuse temp/tint+sat into one `color_grade` pass and
+/// apply it AFTER mid-detail (Python applies sat after mid-detail too;
+/// temp/tint moves up but the effect on a non-extreme grade is
+/// imperceptible). Each apply_* short-circuits on identity params.
+///
+///   input (equirect from `project_*_to_equirect`)
+///     → CDL                       (lift / gain / shadow / highlight / gamma)
+///     → 3D LUT                    (existing Phase 0.7)
+///     → sharpen                   (USM, latitude-weighted for equirect)
+///     → mid-detail clarity        (downsample-blur-upsample)
+///     → color grade               (temp / tint / sat)
+///     → output
+fn apply_color_stack(
+    device: &vr180_pipeline::gpu::Device,
+    rgb: Vec<u8>,
+    w: u32, h: u32,
+    color: &ColorParams,
+    lut: Option<&(vr180_core::Cube3DLut, f32)>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut buf = device.apply_cdl(&rgb, w, h, color.cdl)?;
+    if let Some((lut, intensity)) = lut {
+        buf = device.apply_lut3d(&buf, w, h, lut, *intensity)?;
+    }
+    buf = device.apply_sharpen(&buf, w, h, color.sharpen)?;
+    buf = device.apply_mid_detail(&buf, w, h, color.mid_detail)?;
+    buf = device.apply_color_grade(&buf, w, h, color.color_grade)?;
+    Ok(buf)
+}
+
+/// Print a one-line summary of which color tools will actually run.
+/// Helps the user confirm their CLI flags landed without spelunking
+/// the param struct in trace logs.
+fn print_color_stack(color: &ColorParams, has_lut: bool) {
+    if !color.any_active() && !has_lut {
+        println!("  color  : (none — no CDL / grade / sharpen / mid-detail / LUT)");
+        return;
+    }
+    let mut stages: Vec<String> = Vec::new();
+    if !color.cdl.is_identity() {
+        let c = color.cdl;
+        stages.push(format!(
+            "cdl(lift={:.2}, gamma={:.2}, gain={:.2}, sh={:.2}, hl={:.2})",
+            c.lift, c.gamma, c.gain, c.shadow, c.highlight));
+    }
+    if has_lut { stages.push("lut3d".into()); }
+    if !color.sharpen.is_identity() {
+        let s = color.sharpen;
+        stages.push(format!("sharpen(amount={:.2}, σ={:.2})", s.amount, s.sigma));
+    }
+    if !color.mid_detail.is_identity() {
+        let m = color.mid_detail;
+        stages.push(format!("mid_detail(amount={:.2}, σ={:.2})", m.amount, m.sigma));
+    }
+    if !color.color_grade.is_identity() {
+        let g = color.color_grade;
+        stages.push(format!(
+            "color_grade(temp={:+.2}, tint={:+.2}, sat={:.2})",
+            g.temperature, g.tint, g.saturation));
+    }
+    println!("  color  : {}", stages.join(" → "));
 }
 
 fn load_lut(

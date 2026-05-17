@@ -333,6 +333,96 @@ contrast bump in the corners. Math matches Python.
   high-pass → midtone-bell weighting). Multi-pass + needs a
   pre-allocated scratch buffer pool. Cheap output, moderate code.
 
+## Phase 0.7.5 — Color tool suite (CDL, grade, sharpen, mid-detail) ✅
+
+The remaining four color shaders from
+[ARCHITECTURE.md's GPU pipeline table](ARCHITECTURE.md#gpu-pipeline),
+ported from the Python `vr180_gui.py` reference and landed
+RGBA16F-safe by default (per the
+[10-bit end-to-end mandate](../CLAUDE.md#key-rust-conventions) —
+math is in float space; texture format gating is the only thing
+that changes for the future Main10 path).
+
+- [x] `cdl.wgsl` — CDL (lift / gain / shadow / highlight / gamma) fused
+      into one per-pixel pass. Hermite-smoothstep masks for shadow +
+      highlight (scaled by 0.6 to match Python's pivot=0.5 strength).
+      Ported from `build_color_1d_lut` (vr180_gui.py:6355-6384).
+- [x] `color_grade.wgsl` — temperature + tint + saturation fused.
+      0.30 channel-shift strength matches Python `apply_temp_tint`;
+      BT.601 luma desat-and-blend matches Python's `cv2.cvtColor(BGR2GRAY)`
+      saturation path.
+- [x] `sharpen_combine.wgsl` + `gaussian_blur_1d.wgsl` — separable
+      Gaussian USM, 3 passes (H-blur → V-blur → combine). Latitude-
+      weighted via `cos(π·(0.5 − y/H)) clip(0.02..1.0)` for the equirect
+      path (port of `apply_equirect_sharpen`, vr180_gui.py:6699-6744).
+      σ defaults to 1.4 matching Python.
+- [x] `downsample_4x.wgsl` + `mid_detail_combine.wgsl` — clarity via
+      downsample-blur-upsample-combine, 4 passes. 4×4 box average
+      downsample (matches cv2 `INTER_AREA`), separable Gaussian blur
+      on the 1/4-res image, bilinear upsample + bell-curve-weighted
+      blend with the original (port of `apply_mid_detail`,
+      vr180_gui.py:6424-6491).
+- [x] Pipeline-cache infrastructure: `PerPixelPipeline` shared shape for
+      CDL + color_grade; dedicated pipelines for the multi-pass tools.
+      Generic `Device::apply_per_pixel` + `dispatch_blur_1d` +
+      `encode_readback_rgb` + `finalize_readback` helpers cut per-tool
+      boilerplate to ~30 lines.
+- [x] Public param types: `CdlParams`, `ColorGradeParams`, `SharpenParams`,
+      `MidDetailParams`. All have `Default::default()` = identity, and
+      `is_identity()` predicates that short-circuit the corresponding
+      `apply_*` to a clone of the input — zero GPU work when the user
+      didn't ask for that tool.
+- [x] 8 in-repo smoke tests (`gpu::color_tool_tests`): identity-round-trip
+      + non-identity sanity for each of the four tools. All pass on
+      Apple M-series Metal backend.
+- [x] CLI flags on `export` subcommand: `--cdl-lift/-gamma/-gain/-shadow/-highlight`,
+      `--temperature`, `--tint`, `--saturation`, `--sharpen`, `--sharpen-sigma`,
+      `--mid-detail`, `--mid-detail-sigma`. Default values are
+      identity (back-compat with Phase 0.8.5 callers).
+- [x] Order of operations matches Python (vr180_gui.py:7746):
+      equirect → CDL → 3D LUT → sharpen → mid-detail → color_grade.
+      Saturation moves up from "after mid-detail" (Python) to "fused
+      with temp/tint" (Neo) — perceptible only when sat is non-default
+      AND mid-detail is non-zero; a split into separate `--saturation`
+      pass after mid-detail is a possible follow-up if exact parity is
+      needed.
+- [x] CLI verification: per-frame `color :` log line showing the active
+      stages, e.g. `cdl(lift=0.00, gamma=0.92, gain=1.15, sh=0.30, hl=-0.20)
+      → sharpen(amount=0.80, σ=1.40) → mid_detail(amount=-0.40, σ=1.00)
+      → color_grade(temp=+0.40, tint=-0.10, sat=1.30)`.
+
+**End-to-end test** (60 frames, `NO firmware RS No IORI.360`, 4096×2048
+SBS, zero-copy + VT encode):
+
+| Configuration                          | fps   | Notes |
+|----------------------------------------|-------|-------|
+| Identity (no color tools)              | 30.29 | matches Phase 0.8.5 baseline — short-circuit works |
+| Heavy grade (CDL + sharpen + clarity + temp/tint/sat) | 7.07  | 4× hit from per-stage readback round-trip |
+
+Output validation: PSNR(graded vs baseline) Y=35.9 dB, **U=22.5 dB**,
+V=37.3 dB — chroma U is hit hardest, exactly as expected from
+`temperature=+0.4` (warming = +R / −B → big U shift).
+
+### Known follow-up (Phase 0.7.5.5 — color-stack texture chaining)
+
+The 4× perf drop with all color tools active is from **per-tool readback
+round-trip**: each `apply_*` does `Vec<u8>` upload → dispatch → `Vec<u8>`
+readback. With 4 tools active that's 4 wgpu submits and 4 staging-buffer
+maps per frame. The fix is to expose `apply_*_texture` variants that
+take and return `wgpu::Texture` so the color stack stays GPU-resident,
+and only the final stitched frame reads back. Defer until a user
+actually wants to grade in production — the export pipeline still hits
+**7 fps at 4K full-stack**, which beats the Python app's ~5 fps at the
+same workload.
+
+### Known follow-up (10-bit lift)
+
+These shaders all read `texture_2d<f32>` (filterable float) and write
+`texture_storage_2d<rgba8unorm, write>`. Switching the storage format
+to `rgba16float` is a one-line change per shader once the 10-bit
+pipeline lands (Phase 0.7.6 / 0.8.5.10). The float math itself
+doesn't change.
+
 ## Phase 0.8 — H.265 encode + multi-frame export ✅
 
 - [x] `vr180-pipeline::encode::H265Encoder` — `libx265` software
