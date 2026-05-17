@@ -13,6 +13,9 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod config;
+pub use config::ExportConfig;
+
 #[derive(Parser, Debug)]
 #[command(name = "vr180-render", version, about)]
 struct Cli {
@@ -272,6 +275,23 @@ enum Cmd {
         #[arg(long, default_value_t = 1.0)]
         mid_detail_sigma: f32,
     },
+
+    /// Phase 0.9: JSON config sidecar mode. Reads an `ExportConfig`
+    /// JSON file with every knob the `export` subcommand's flags
+    /// expose, then runs the same export pipeline.
+    ///
+    /// Intended for the Python GUI on `main`: write the user's
+    /// settings to a JSON, spawn `vr180-render render --config foo.json`,
+    /// get the Neo-speed export pipeline for free.
+    ///
+    /// See `crates/vr180-render/src/config.rs` for the schema.
+    /// Identity defaults everywhere; a minimal config can be just
+    /// `{ "input": "...", "output": "..." }`.
+    Render {
+        /// Path to a JSON config file (see `ExportConfig`).
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 fn init_tracing(verbosity: u8) {
@@ -311,6 +331,7 @@ fn main() -> anyhow::Result<()> {
             bench_decode(&path, frames, hw_accel.into()),
         #[cfg(target_os = "macos")]
         Some(Cmd::ProbeIosurface { path }) => probe_iosurface(&path),
+        Some(Cmd::Render { config }) => run_render_from_config(&config),
         Some(Cmd::Export {
             input, output, eye_w, frames, fps, bitrate,
             lut, lut_intensity, hw_accel, encoder, zero_copy, zero_copy_encode,
@@ -349,6 +370,37 @@ fn main() -> anyhow::Result<()> {
                    plan_template, post)
         }
     }
+}
+
+/// Phase 0.9: dispatch from a JSON `ExportConfig` into the same
+/// `export()` function the CLI-flag path uses. Just a thin adapter —
+/// parse → field-map → call. Every knob exposed in the JSON has an
+/// existing equivalent in the export pipeline.
+fn run_render_from_config(config_path: &std::path::Path) -> anyhow::Result<()> {
+    println!("Loading config: {}", config_path.display());
+    let cfg = ExportConfig::from_json_file(config_path)?;
+    let plan = cfg.build_color_plan();
+    let post = PostProcess {
+        apac_audio: cfg.apac_audio,
+        apac_bitrate: cfg.apac_bitrate,
+        apmp: cfg.apmp,
+    };
+    export(
+        &cfg.input,
+        &cfg.output,
+        cfg.eye_w,
+        cfg.frames,
+        cfg.fps,
+        cfg.bitrate,
+        cfg.lut.as_deref(),
+        cfg.lut_intensity,
+        cfg.hw_accel.into_pipeline(),
+        cfg.encoder.resolve(),
+        cfg.zero_copy,
+        cfg.zero_copy_encode,
+        plan,
+        post,
+    )
 }
 
 /// Post-encode steps the user opted into via CLI flags. Run after the

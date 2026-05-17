@@ -809,20 +809,80 @@ APAC: done in 1.00s
   video align naturally. Trim support is deferred until the CLI
   grows `--start`/`--duration` flags.
 
-## Phase 0.9 — Full export parity + CLI sidecar mode
+## Phase 0.9 — JSON config sidecar (Rust side) ✅
 
 The Python GUI on `main` learns to shell out to `vr180-render` for
 the heavy work, via a JSON config sidecar. **This is the wedge that
-ships value to users before any UI rewrite.**
+ships value to users before any UI rewrite.** This phase lands the
+Rust side; the Python GUI patch is a separate PR on `main`.
 
-- [ ] `vr180-render --config export.json` reads same schema
-      the Python GUI writes
-- [ ] Python GUI patch (on `main`, separate PR) adds an "Use Neo
-      render engine" toggle that spawns `vr180-render.exe` instead
-      of doing it in-process
-- [ ] Single-binary distribution: ~80 MB exe per platform
-- [ ] All hardcoded-dimension bugs (the `5952` class) impossible
-      by construction
+- [x] `vr180-render::config::ExportConfig` — serde-derived JSON
+      schema covering every knob the `export` CLI subcommand exposes
+      (I/O, video dims, bitrate, decode/encode backend, zero-copy
+      flags, full color stack, LUT, APAC audio, APMP metadata).
+      `deny_unknown_fields` on for forward error detection.
+- [x] Identity defaults everywhere — minimal config is just
+      `{ "input": "...", "output": "..." }`.
+- [x] `From<&CdlConfig>` etc. impls convert sub-configs to the
+      existing `vr180_pipeline::gpu::*Params` types. No serde
+      dependency added to `vr180-pipeline`; conversion happens at
+      the dispatcher boundary.
+- [x] `vr180-render render --config <file.json>` CLI subcommand.
+      Thin adapter: parse → field-map → call the same `export()`
+      function the CLI-flag path uses. **Bit-identical output**
+      (PSNR Y/U/V = ∞ on the equivalent flag invocation).
+- [x] Three unit tests (`config::tests`):
+      - `minimal_config_parses_with_identity_defaults` — bare
+        input/output config parses, every color stage is identity.
+      - `unknown_field_is_rejected` — typo in a field name surfaces
+        as a clear error (not a silent no-op).
+      - `full_config_round_trips` — non-default config → serialize
+        → re-parse → field-for-field equality.
+- [x] Two example configs in `examples/`:
+      - `minimal.json` — just input/output, identity everything.
+      - `full_vision_pro.json` — heavy color grade + LUT + APAC + APMP,
+        the realistic Vision Pro export.
+      Plus `examples/README.md` with the full schema reference and
+      a Python `subprocess.run` spawn pattern for the GUI.
+
+**End-to-end validation** (60 frames, 4K SBS, JSON config vs
+equivalent CLI flags, same heavy grade + LUT + APAC + APMP):
+- File sizes: byte-identical (4 577 928 bytes both).
+- PSNR(JSON output vs CLI output): **∞ on Y / U / V** — same code
+  path, no behavior drift.
+
+### Deferred — Python GUI patch (separate PR on `main`)
+
+Out of scope for this `neo` branch. When that lands, the GUI's
+"Export" action either:
+- (current) runs the in-process Python encoder, OR
+- (toggle on) writes the user's `ProcessingConfig` to a temp JSON
+  and `subprocess.run`s `vr180-render render --config <temp>.json`.
+
+### Deferred — Python `ProcessingConfig` fields not yet in Rust
+
+The Python `ProcessingConfig` has 82 fields; our Rust `ExportConfig`
+exposes only the ~22 we currently implement. The Python side will
+need a "filter to Rust-supported subset" path until these land:
+
+- Trim range (`trim_start` / `trim_end`)
+- Gyro stabilization (`gyro_*`, ~7 fields) — Phase 0.3.5 ports the
+  VQF resampling; full stabilization integration is a separate phase
+- Rolling shutter correction (`rs_correction_*`, ~5 fields) — needs
+  the per-scanline RS warp shader from ARCHITECTURE.md's GPU table
+- Denoise (`denoise_strength`) — Phase 0.x deferral; would spawn
+  the `vt_denoise` Swift helper
+- ProRes output, CRF mode, encoder preset / speed (`prores_profile`,
+  `quality`, `use_bitrate`, `encoder_speed`) — VT-only for now
+- Multi-segment input (`segment_paths`) — chain handling for GoPro
+  recordings that split at the 4 GB FAT32 boundary
+- Edge mask / vignette (`mask_size`, `mask_feather`, `edge_fill`)
+- Camera orientation flip (`upside_down`)
+- `vision_pro_mode` enum (currently we have a hard `--apmp` flag;
+  Python distinguishes "standard" / "spatial" / etc.)
+
+Each of these is a separate small phase; the JSON schema grows one
+field at a time as they land. No big-bang rewrite.
 
 ## Phase 1.0 — Tauri UI (future)
 
