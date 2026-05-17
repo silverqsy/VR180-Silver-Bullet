@@ -44,10 +44,19 @@ enum Cmd {
     /// default on a standard Max — smaller on Max 2 variants).
     ProbeEac {
         path: PathBuf,
-        /// Output PNG path. If supplied, decodes the first frame of
-        /// each HEVC stream and writes the assembled cross pair.
+        /// Output PNG path for the raw assembled cross pair (no projection).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Output PNG path for the GPU-projected half-equirect SBS image
+        /// (left eye = Lens A, right eye = Lens B). Triggers the wgpu
+        /// compute kernel.
+        #[arg(long)]
+        equirect: Option<PathBuf>,
+        /// Half-equirect output width per eye (default 2048). Final PNG
+        /// is `2 * eye_w × eye_w` — a square half-equirect per eye,
+        /// stitched side-by-side.
+        #[arg(long, default_value_t = 2048)]
+        eye_w: u32,
     },
 
     /// (placeholder) Render the project described by a JSON config.
@@ -89,7 +98,8 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Cmd::ProbeGyro { path, vqf }) => probe_gyro(&path, vqf),
-        Some(Cmd::ProbeEac { path, out }) => probe_eac(&path, out.as_deref()),
+        Some(Cmd::ProbeEac { path, out, equirect, eye_w }) =>
+            probe_eac(&path, out.as_deref(), equirect.as_deref(), eye_w),
         Some(Cmd::Export { config }) => {
             tracing::warn!(?config, "export: not implemented (Phase 0.9)");
             Ok(())
@@ -97,7 +107,12 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn probe_eac(path: &std::path::Path, out: Option<&std::path::Path>) -> anyhow::Result<()> {
+fn probe_eac(
+    path: &std::path::Path,
+    out: Option<&std::path::Path>,
+    equirect: Option<&std::path::Path>,
+    eye_w: u32,
+) -> anyhow::Result<()> {
     use vr180_core::eac::{Dims, assemble_lens_a, assemble_lens_b};
     use vr180_pipeline::decode::{extract_first_stream_pair, probe_video};
 
@@ -113,11 +128,12 @@ fn probe_eac(path: &std::path::Path, out: Option<&std::path::Path>) -> anyhow::R
             probe.width);
     }
 
-    let Some(out) = out else {
-        println!("(pass --out <file.png> to render the assembled cross pair)");
+    if out.is_none() && equirect.is_none() {
+        println!("(pass --out <png> for the raw cross pair, or --equirect <png> for the GPU projection)");
         return Ok(());
-    };
+    }
 
+    // Decode + assemble once; reuse for both output paths.
     let t0 = std::time::Instant::now();
     let pair = extract_first_stream_pair(path)?;
     let decode_t = t0.elapsed();
@@ -131,26 +147,61 @@ fn probe_eac(path: &std::path::Path, out: Option<&std::path::Path>) -> anyhow::R
     assemble_lens_b(&pair.s0, &pair.s4, dims, &mut cross_b);
     let assemble_t = t1.elapsed();
 
-    // Compose the two crosses vertically into a single PNG so the user
-    // sees both lenses in one file. Width = cw, Height = 2*cw.
-    let combined_w = cw;
-    let combined_h = cw * 2;
-    let mut combined = Vec::with_capacity(combined_w * combined_h * 3);
-    combined.extend_from_slice(&cross_a);
-    combined.extend_from_slice(&cross_b);
-
-    let t2 = std::time::Instant::now();
-    let img = image::RgbImage::from_raw(combined_w as u32, combined_h as u32, combined)
-        .ok_or_else(|| anyhow::anyhow!("RgbImage::from_raw size mismatch"))?;
-    img.save(out)?;
-    let save_t = t2.elapsed();
-
     println!();
     println!("decoded streams:  {decode_t:.2?}  ({} bytes / stream)", pair.s0.len());
     println!("assembled crosses:{assemble_t:.2?}  (2 × {}×{})", cw, cw);
-    println!("wrote PNG:        {save_t:.2?}  → {}", out.display());
-    println!("output dims:      {} × {} (Lens A on top, Lens B on bottom)",
-        combined_w, combined_h);
+
+    if let Some(out) = out {
+        let combined_w = cw;
+        let combined_h = cw * 2;
+        let mut combined = Vec::with_capacity(combined_w * combined_h * 3);
+        combined.extend_from_slice(&cross_a);
+        combined.extend_from_slice(&cross_b);
+        let t = std::time::Instant::now();
+        let img = image::RgbImage::from_raw(combined_w as u32, combined_h as u32, combined)
+            .ok_or_else(|| anyhow::anyhow!("RgbImage::from_raw size mismatch"))?;
+        img.save(out)?;
+        println!("wrote cross PNG:  {:?}  → {}  ({} × {})",
+            t.elapsed(), out.display(), combined_w, combined_h);
+    }
+
+    if let Some(eq) = equirect {
+        use vr180_pipeline::gpu::Device;
+        let eye_h = eye_w; // square half-equirect per eye (±90° × ±90°)
+        let t = std::time::Instant::now();
+        let device = Device::new()?;
+        let device_t = t.elapsed();
+
+        let t = std::time::Instant::now();
+        let left_eye = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, eye_h)?;
+        let right_eye = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, eye_h)?;
+        let gpu_t = t.elapsed();
+
+        // Stitch L | R side-by-side.
+        let sbs_w = eye_w * 2;
+        let sbs_h = eye_h;
+        let mut sbs = vec![0u8; (sbs_w * sbs_h * 3) as usize];
+        let row_l = (eye_w * 3) as usize;
+        let row_sbs = (sbs_w * 3) as usize;
+        for y in 0..eye_h as usize {
+            sbs[y * row_sbs.. y * row_sbs + row_l]
+                .copy_from_slice(&left_eye[y * row_l..y * row_l + row_l]);
+            sbs[y * row_sbs + row_l..y * row_sbs + row_l * 2]
+                .copy_from_slice(&right_eye[y * row_l..y * row_l + row_l]);
+        }
+
+        let t = std::time::Instant::now();
+        let img = image::RgbImage::from_raw(sbs_w, sbs_h, sbs)
+            .ok_or_else(|| anyhow::anyhow!("RgbImage::from_raw size mismatch"))?;
+        img.save(eq)?;
+        let save_t = t.elapsed();
+
+        println!("wgpu device:      {device_t:.2?}");
+        println!("gpu project (2x): {gpu_t:.2?}  (per eye: ~{:.2?})", gpu_t / 2);
+        println!("wrote SBS PNG:    {save_t:.2?}  → {}  ({} × {})",
+            eq.display(), sbs_w, sbs_h);
+    }
+
     Ok(())
 }
 

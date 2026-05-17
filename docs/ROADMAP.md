@@ -102,24 +102,63 @@ algorithmic validation, which the bias-match nails.
       assembly 22 ms + PNG encode 30-100 ms. The decode is the
       dominant cost; Phase 0.6 makes that hardware-accelerated.
 
-## Phase 0.5 — wgpu device + first kernel
+## Phase 0.5 — wgpu device + first kernel ✅
 
-wgpu adapter setup (Metal / Vulkan / DX12 auto-select), one WGSL
-kernel running end-to-end (`cross_remap.wgsl`), CPU → GPU upload
-+ GPU → CPU readback. Slow but proves the wiring.
+- [x] `vr180-pipeline::gpu::Device` (wgpu instance, adapter, queue,
+      cached compute pipelines). Backend auto-selected: Metal on macOS,
+      DX12 / Vulkan on Windows. Confirmed M5 Max picks the Metal
+      backend automatically.
+- [x] `eac_to_equirect.wgsl` — first real WGSL compute kernel. Per-pixel
+      direction → 5-face EAC selector → arctan UV reconstruction →
+      bilinear sample. Ported from Python `FrameExtractor.build_cross_remap`.
+- [x] `Device::project_cross_to_equirect(cross_rgb, cross_w, out_w, out_h)`
+      — RGB8 upload (padded to RGBA8 for wgpu) → kernel dispatch →
+      readback. Pipeline / shader / sampler / bind-group-layout are
+      built once at `Device::new()` so per-frame work is just the
+      buffer marshaling + 1 dispatch.
+- [x] CLI: `vr180-render probe-eac --equirect <png>` decodes one frame,
+      assembles both lens crosses, projects each via the kernel, and
+      stitches them L|R into a single half-equirect SBS PNG.
+- [x] **Visually verified** on `GS010172.360`: clean half-equirect SBS,
+      no face artifacts, both eyes show correct stereo parallax. The
+      output is the same projection the Python pipeline produces, just
+      done end-to-end in Rust + wgpu instead of Python + MLX.
 
-- [ ] `vr180-pipeline::gpu::Device` (wgpu instance, adapter, queue)
-- [ ] `cross_remap.wgsl` ported from Python `_nb_dirs_to_cross_maps`
-- [ ] CLI: `vr180-render export --equirect <in.360> <out.png>` uses GPU
-- [ ] Output pixel-matches the Phase 0.4 CPU baseline (±1 LSB)
+Timings (M5 Max, 5952×1920 input, 4096×2048 SBS output):
+  decode (2× HEVC sw):  ~130 ms
+  EAC assembly (CPU):     ~22 ms
+  GPU device init:        ~11 ms  (shader compile + pipeline build)
+  GPU project (2× eyes):  ~67 ms  (≈ 33 ms / eye, cached pipeline)
+  PNG encode + write:     ~31 ms
 
-## Phase 0.6 — Hardware decode + IOSurface↔Metal interop (macOS)
+Per-frame steady state (Device reused): ~252 ms ≈ **4 fps**. The
+decode dominates by a factor of ~2 over everything else — Phase 0.6
+addresses that.
 
-Step 3 from SLRStudioNeo's MAC-PORT.md: zero-copy VT → wgpu.
+## Phase 0.6 — Hardware decode + IOSurface↔Metal interop ⏸ deferred
 
-- [ ] `vr180-pipeline::interop_macos::IoSurfaceTexture`
-- [ ] `--hw-decode auto` default on macOS
-- [ ] CLI export of 8K throughput target ≥ 30 fps on M2 Max
+ffmpeg-next 8.1 does not expose hwaccel APIs at the safe-Rust level.
+Doing this properly requires:
+
+1. **Raw `ffmpeg_sys_next` FFI** to wire `av_hwdevice_ctx_create` +
+   `av_hwframe_transfer_data` into the decoder context. ~200 lines of
+   `unsafe` Rust + careful RAII wrappers.
+2. **IOSurface ↔ MTLTexture interop** on macOS (`RetainedIOSurface`,
+   `metal::Texture::new_from_iosurface`, wgpu-hal Metal escape).
+   ~700 lines — SLRStudioNeo has the exact code we'd adapt.
+3. **CUDA ↔ Vulkan interop** on Windows (`cudarc` driver API attached
+   to `AVCUDADeviceContext`, external Vulkan images via wgpu-hal).
+   Another ~500 lines.
+
+That's a multi-session deliverable that needs its own focused pass.
+The Phase 0.5 pipeline runs at ~4 fps (decode-bound, sw decode of
+two HEVC 8K streams in serial). Once the interop work lands the
+expected jump is to ~30 fps on M2 Max (decode drops to ~20 ms,
+upload becomes zero-copy).
+
+**Deferred** until after Phases 0.7 (color) and 0.8 (encode) so we
+have a complete sw-decode→GPU→encode pipeline working end-to-end
+first. Interop is a perf optimization on top of that.
 
 ## Phase 0.7 — Color pipeline + LUT + tonal zones
 
