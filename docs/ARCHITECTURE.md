@@ -49,6 +49,36 @@ Frame format on the GPU is always **`Rgba16Float`** to match the
 Python app's true-10-bit pipeline. We never drop to 8-bit
 intermediates.
 
+### 10-bit end-to-end mandate
+
+When `--bit-depth 10` (or equivalent Main10 output) is selected,
+the precision invariant runs the full length of the pipeline:
+
+```
+VT decoder (P010 IOSurface, 10-bit)
+  → wgpu R16Unorm/Rg16Unorm plane textures
+  → nv12_to_eac_cross.wgsl (BT.709 limited-range expansion, float math)
+  → Rgba16Float EAC cross texture
+  → every color stage (LUT3D, CDL, tonal zones, mid-detail, sharpen)
+    — all Rgba16Float in, Rgba16Float out, no 8-bit detour
+  → Rgba16Float half-equirect texture
+  → readback to packed RGB48LE host buffer (Vec<u16>)
+  → swscale RGB48LE → yuv420p10le (libx265) or p010le (VT)
+  → encoder: libx265 main10 / hevc_videotoolbox profile=main10
+  → .mov / .mp4 with Main10 stream
+```
+
+Every box in that chain must be **at least 10 bits per channel**.
+The current `Vec<u8>` RGB24 readback is the 8-bit fast path; a
+parallel `Vec<u16>` RGB48 readback exists for 10-bit. The 8-bit
+path is for fast previews and smaller files; the 10-bit path is
+for shipping. **A new color shader that secretly bounces through
+`Rgba8Unorm` even once is a regression** — the Python app
+fought this for months ("looks the same on the laptop but the
+banding shows up on the Vision Pro") and we are not relitigating
+it. See [CLAUDE.md](../CLAUDE.md#key-rust-conventions) for the
+hard rule.
+
 ## Zero-copy decode → GPU
 
 The Python app does `ffmpeg_subprocess → stdout bytes → np.frombuffer

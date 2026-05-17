@@ -134,6 +134,31 @@ When porting an algorithm:
   against the Python pipeline on a real test file. See the commit
   messages for the specific reference values (CORI[0] quaternion,
   VQF bias, EAC tile_w for various stream widths, etc.).
+- **10-bit end-to-end when 10-bit output is selected** — non-negotiable.
+  GoPro Max records HEVC Main10; the Python app fought hard to keep
+  the pipeline true-10-bit and we are not regressing it. When the
+  user picks a Main10 export, **every stage from VT decoder through
+  encoder input must hold ≥10-bit precision**:
+  - VT decoder → IOSurface (P010, already 10-bit, see Phase 0.6.6)
+  - wgpu textures: `Rgba16Float` (already the standard, never
+    `Rgba8Unorm`)
+  - **Every color tool** (LUT3D, CDL lift/gamma/gain/sat,
+    shadow/highlight, temp/tint, mid-detail clarity, sharpen):
+    `Rgba16Float` in, `Rgba16Float` out. No 8-bit intermediates,
+    not even "for the slider preview." If a new color shader is
+    added that drops to RGBA8 anywhere, that's a regression.
+  - Readback: `Rgba16Float` GPU texture → packed RGB48LE host buffer
+    (one swscale step away from `yuv420p10le`). The current
+    `Vec<u8>` RGB24 readback path is the 8-bit code path; the 10-bit
+    path needs a parallel `Vec<u16>` RGB48 readback.
+  - swscale: RGB48LE → `yuv420p10le` (libx265 Main10) /
+    `p010le` (VT main10).
+  - Encoder: libx265 `--profile main10`, VT
+    `profile=main10` + `pix_fmt=p010le`.
+  Cutting any one of these forces a quantization-and-redither cycle
+  through 8-bit that wipes out the rest. The 8-bit and 10-bit paths
+  coexist (8-bit is the default for fast previews, smaller files);
+  picking 10-bit must deliver real 10-bit, all the way to the file.
 
 ## Doc pointers
 
@@ -160,3 +185,8 @@ When porting an algorithm:
   verifying the underlying API exists on the other platforms. The
   Mac-only paths are FAST paths; the cross-platform fallbacks
   exist deliberately.
+- Don't half-implement the 10-bit pipeline. If a color tool / new
+  shader / new readback path only supports 8-bit, ship it as 8-bit
+  only (clearly labeled) — don't pretend it's part of the 10-bit
+  path with a silent 8-bit detour. See the "10-bit end-to-end"
+  rule in Key Rust conventions.

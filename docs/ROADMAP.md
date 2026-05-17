@@ -373,10 +373,36 @@ VT decode is essentially free at this scale. → resolved in **0.8.5**.
 
 ### Deferred (10-bit + audio)
 
-- 10-bit Main10 output (currently 8-bit yuv420p). Need to switch
-  the swscale src format from RGB24 → RGB48 and pix_fmt to
-  yuv420p10le; on the VT side, also bump the `profile` option from
-  `main` to `main10`. The GPU side is already 10-bit-ready.
+- **10-bit Main10 output — end-to-end, not a one-line pix-fmt
+  switch.** The full mandate is captured in
+  [CLAUDE.md](../CLAUDE.md#key-rust-conventions) ("10-bit end-to-end
+  when 10-bit output is selected") and
+  [ARCHITECTURE.md](ARCHITECTURE.md#10-bit-end-to-end-mandate);
+  every stage from VT decoder through encoder input must hold
+  ≥10 bits/channel. The 8-bit and 10-bit paths coexist (8-bit for
+  fast previews, 10-bit for ship-quality); picking 10-bit delivers
+  real 10-bit all the way to the file.
+  Touchpoints when this lands (call it Phase 0.7.6 / 0.8.5.10):
+  - GPU pipeline: already `Rgba16Float` end-to-end (Phase 0.5+).
+    Nothing to do here.
+  - Color tools (LUT3D today, CDL / tonal zones / mid-detail /
+    sharpen in 0.7.5): already RGBA16F in/out for LUT3D; every
+    future color shader **must land RGBA16F-safe by default** —
+    no per-tool 8-bit detour. This is a hard project rule.
+  - Readback: add `Vec<u16>` packed RGB48 readback path alongside
+    today's `Vec<u8>` RGB24 one. Pick the right one based on the
+    output bit-depth.
+  - swscale: add a second `Context::get` configuration with
+    `RGB48LE` src / `yuv420p10le` (libx265) or `p010le` (VT) dst.
+  - libx265: pass `-x265-params profile=main10` (or set
+    `pix_fmt=yuv420p10le` and let it autodetect Main10).
+  - hevc_videotoolbox: switch our four `av_opt_set` calls so
+    `profile=main10` and set `pix_fmt=p010le` on the encoder context.
+  - CLI: `--bit-depth 8|10` flag (default 8 for back-compat).
+  - Tests: bit-validate against a known Main10 reference clip
+    that the Python app produces. We don't ship 10-bit until we
+    can prove (via 16-bit-aware PSNR) we're not silently
+    quantizing through 8-bit anywhere.
 - Audio passthrough from the source `.360` (`audio_args = ["-c:a",
   "copy"]` equivalent via libav demux+remux).
 
@@ -463,8 +489,14 @@ Caveats:
   there because the bottleneck is the `av_hwframe_transfer_data`
   CPU roundtrip and CPU EAC assembly. Use `--zero-copy` to see the
   full speedup.
-- 10-bit (main10) still deferred — same gating: needs the swscale
-  RGB24→RGB48 + pix_fmt yuv420p10le switch.
+- 10-bit (main10) still deferred — **end-to-end-or-nothing**,
+  see the touchpoint enumeration in
+  [Phase 0.8 Deferred (10-bit + audio)](#deferred-10-bit--audio)
+  above and the hard rule in
+  [CLAUDE.md](../CLAUDE.md#key-rust-conventions). One-line pix-fmt
+  switches are how 10-bit pipelines silently regress to 8-bit
+  through some intermediate; this work needs to land each
+  touchpoint explicitly.
 
 ## Phase 0.9 — Full export parity + CLI sidecar mode
 
