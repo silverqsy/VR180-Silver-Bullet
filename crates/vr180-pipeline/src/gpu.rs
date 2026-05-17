@@ -205,6 +205,7 @@ impl Device {
         cross_w: u32,
         out_w: u32,
         out_h: u32,
+        rotation: EquirectRotation,
     ) -> Result<Vec<u8>> {
         let t_total = Instant::now();
         // 1. Convert packed RGB8 input → RGBA8 (wgpu storage textures
@@ -255,6 +256,8 @@ impl Device {
         // 4. Bind group — uses the pipeline + sampler we built once at Device::new.
         let input_view = input_tex.create_view(&Default::default());
         let output_view = output_tex.create_view(&Default::default());
+        let r_uniform = self.write_uniform("equirect_R",
+            &EquirectUniforms::from_mat3(rotation.0));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("eac_to_equirect_bg"),
             layout: &self.eac_to_equirect.bind_group_layout,
@@ -262,6 +265,7 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&input_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.eac_to_equirect.sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&output_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
             ],
         });
         let pipeline = &self.eac_to_equirect.pipeline;
@@ -384,6 +388,19 @@ impl EacToEquirectPipeline {
                     },
                     count: None,
                 },
+                // R matrix (3 × vec4 std140; 48 bytes).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<EquirectUniforms>() as u64
+                        ),
+                    },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -419,6 +436,60 @@ impl EacToEquirectPipeline {
 ///
 /// Ported from `FrameExtractor.build_cross_remap` in `vr180_gui.py`.
 const EAC_TO_EQUIRECT_WGSL: &str = include_str!("shaders/eac_to_equirect.wgsl");
+
+/// std140 layout for the EAC→equirect shader's R matrix uniform.
+/// 12-scalar layout (3 rows × 3 floats + 1 pad per row) — used in
+/// preference to `mat3x3<f32>` because naga (wgpu 0.20's WGSL parser)
+/// silently rejects struct-field access on matrix uniforms. The
+/// shader reads via individual scalar fields.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct EquirectUniforms {
+    r00: f32, r01: f32, r02: f32, _pad0: f32,
+    r10: f32, r11: f32, r12: f32, _pad1: f32,
+    r20: f32, r21: f32, r22: f32, _pad2: f32,
+}
+
+impl EquirectUniforms {
+    pub const IDENTITY: Self = Self {
+        r00: 1.0, r01: 0.0, r02: 0.0, _pad0: 0.0,
+        r10: 0.0, r11: 1.0, r12: 0.0, _pad1: 0.0,
+        r20: 0.0, r21: 0.0, r22: 1.0, _pad2: 0.0,
+    };
+
+    /// Pack a row-major 3×3 matrix.
+    /// `m` is `[r00, r01, r02, r10, r11, r12, r20, r21, r22]`.
+    fn from_mat3(m: [f32; 9]) -> Self {
+        Self {
+            r00: m[0], r01: m[1], r02: m[2], _pad0: 0.0,
+            r10: m[3], r11: m[4], r12: m[5], _pad1: 0.0,
+            r20: m[6], r21: m[7], r22: m[8], _pad2: 0.0,
+        }
+    }
+}
+
+/// Public type for callers to pass per-frame rotation. Use
+/// `EquirectRotation::IDENTITY` when stabilization is off, or
+/// `EquirectRotation::from_quat(q)` to derive from a CORI / smoothed
+/// quaternion.
+#[derive(Copy, Clone, Debug)]
+pub struct EquirectRotation(pub [f32; 9]);
+
+impl EquirectRotation {
+    pub const IDENTITY: Self = Self([
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0,
+    ]);
+
+    /// Build from a unit quaternion. The quaternion must be in the
+    /// equirect-direction → camera-direction convention (apply this
+    /// rotation to the output equirect direction to get the camera
+    /// frame direction that the EAC was captured in).
+    pub fn from_quat(q: vr180_core::gyro::Quat) -> Self {
+        Self(q.to_mat3_row_major())
+    }
+}
 
 const LUT3D_WGSL: &str = include_str!("shaders/lut3d.wgsl");
 const NV12_TO_EAC_WGSL: &str = include_str!("shaders/nv12_to_eac_cross.wgsl");
@@ -1365,6 +1436,7 @@ impl Device {
         cross_tex: &wgpu::Texture,
         out_w: u32,
         out_h: u32,
+        rotation: EquirectRotation,
     ) -> Result<Vec<u8>> {
         use std::time::Instant;
         let t_total = Instant::now();
@@ -1381,6 +1453,8 @@ impl Device {
 
         let cross_view = cross_tex.create_view(&Default::default());
         let output_view = output_tex.create_view(&Default::default());
+        let r_uniform = self.write_uniform("equirect_R_zc",
+            &EquirectUniforms::from_mat3(rotation.0));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("eac_to_equirect_zc_bg"),
             layout: &self.eac_to_equirect.bind_group_layout,
@@ -1388,6 +1462,7 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&cross_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.eac_to_equirect.sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&output_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
             ],
         });
 
@@ -1938,6 +2013,7 @@ impl Device {
         &self,
         cross_tex: &wgpu::Texture,
         out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
     ) -> Result<wgpu::Texture> {
         let output_tex = make_rw_texture(&self.device, "equirect_tex_out", out_w, out_h,
             wgpu::TextureUsages::TEXTURE_BINDING
@@ -1946,7 +2022,7 @@ impl Device {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("project_tex_enc"),
         });
-        self.record_equirect_project(&mut encoder, cross_tex, &output_tex, out_w, out_h);
+        self.record_equirect_project(&mut encoder, cross_tex, &output_tex, out_w, out_h, rotation);
         self.queue.submit(Some(encoder.finish()));
         Ok(output_tex)
     }
@@ -1959,13 +2035,14 @@ impl Device {
         cross_rgb: &[u8],
         cross_w: u32,
         out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
     ) -> Result<wgpu::Texture> {
         let cross_rgba = rgb_to_rgba(cross_rgb, cross_w as usize, cross_w as usize);
         let cross_tex = make_rw_texture(&self.device, "cross_for_project",
             cross_w, cross_w,
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         self.upload_rgba(&cross_tex, &cross_rgba, cross_w, cross_w);
-        self.project_cross_texture_to_equirect_texture(&cross_tex, out_w, out_h)
+        self.project_cross_texture_to_equirect_texture(&cross_tex, out_w, out_h, rotation)
     }
 
     /// Apply the full Phase 0.7.5 color stack to one equirect texture,
@@ -2113,9 +2190,12 @@ impl Device {
         cross_tex: &wgpu::Texture,
         dst: &wgpu::Texture,
         out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
     ) {
         let cross_v = cross_tex.create_view(&Default::default());
         let dst_v = dst.create_view(&Default::default());
+        let r_uniform = self.write_uniform("equirect_R_record",
+            &EquirectUniforms::from_mat3(rotation.0));
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("equirect_project_bg"),
             layout: &self.eac_to_equirect.bind_group_layout,
@@ -2123,6 +2203,7 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&cross_v) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.eac_to_equirect.sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_v) },
+                wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

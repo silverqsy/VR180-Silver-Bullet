@@ -809,6 +809,99 @@ APAC: done in 1.00s
   video align naturally. Trim support is deferred until the CLI
   grows `--start`/`--duration` flags.
 
+## Phase A — Per-frame CORI rotation (camera-lock stabilization) ✅
+
+Foundation for the full stabilization + RS pipeline. Pulls per-frame
+CORI quaternions from the source's GPMF stream, converts to 3×3
+rotation matrices, uploads as a uniform to the equirect projection
+shader, and rotates the output direction into the camera frame
+before face selection. Net effect with `--stabilize` on: the scene
+locks to the first-frame camera orientation — every per-frame
+jitter is fully compensated.
+
+This is "camera lock" mode — pans and tilts vanish too. Phase B
+adds the velocity-dampened bidirectional SLERP smoother so slow
+intentional camera motion is preserved.
+
+- [x] `vr180-core::gyro::Quat` math additions:
+      `mul`, `conjugate`, `dot`, `norm`, `normalize`, `slerp`,
+      `to_mat3_row_major` (standard 9-element row-major matrix).
+- [x] `vr180-core::gyro::resample` module:
+      `resample_quats_to_frames(src, src_fps, dst_fps, n_frames,
+      time_offset_s, window_s)` — window-averaging resampler with
+      sign-continuity. Window-average mode (Python's RS-friendly
+      mode) integrates over a `SROT_S = 15.224 ms` window centered
+      on each frame's sensor-readout midpoint.
+- [x] `vr180-core::gyro::cori_swap_yz` — GoPro stores CORI as
+      `(w, x, Z_disk, Y_disk)`; we preserve on-disk order in
+      `parse_cori` and apply the swap here at the math boundary.
+- [x] `eac_to_equirect.wgsl` — new `EquirectUniforms` binding (12
+      `f32` scalars in std140 layout, 48 bytes). Direction vector
+      rotated by `R * dir_world` before max-axis face test.
+      (Naga gotcha: `mat3x3<f32>` and `array<vec4,3>` uniforms had
+      parser issues with field access; plain scalar fields work
+      reliably. Also: uniform name must not shadow the local `let u
+      = (x + 0.5) / width` for the equirect U coord — renamed to `equ`.)
+- [x] `vr180_pipeline::gpu::EquirectRotation` public type +
+      `IDENTITY` constant + `from_quat(Quat)` constructor.
+      All four `Device::project_*_to_equirect_*` methods + the
+      internal `record_equirect_project` helper now take an
+      `EquirectRotation` parameter.
+- [x] `--stabilize` CLI flag on `export` + `stabilize: bool`
+      field on `ExportConfig` JSON schema.
+- [x] `compute_stabilization_rotations` precomputes a `Vec<EquirectRotation>`
+      from the source's GPMF at start of export; `rotation_for_frame`
+      indexes into it per-frame (defaults to identity when empty).
+
+**Validation** (full file `NO firmware RS No IORI.360`, 2169 frames,
+4K SBS, zero-copy + VT):
+
+| Configuration   | Time   | fps     |
+|-----------------|--------|---------|
+| Unstabilized    | 41 s   | 52.3    |
+| `--stabilize`   | 42.7 s | **50.79** |
+
+Performance overhead is in the noise (~3% from the uniform upload
+per frame). Output stays full-quality.
+
+### Phase A scope limits / follow-up phases
+
+- **No smoothing.** Phase A applies raw CORI directly → every per-
+  frame jitter is "corrected" → intentional pans and tilts also
+  vanish. For useful real-world stabilization, **Phase B** adds the
+  velocity-dampened bidirectional SLERP smoother (the Python's
+  `smooth()` function's core: forward+backward exponential SLERP
+  with `tau` adapting from `gyro_smooth_ms` (calm) to `fast_ms`
+  (>200°/s motion), then `q_heading = q_raw × q_smooth⁻¹` per frame).
+- **No IORI per-eye stereo.** Phase A uses one R for both eyes.
+  **Phase B** adds `q_left = q_iori × q_heading`, `q_right = q_iori⁻¹
+  × q_heading` — the Python's smooth() split for files that have
+  non-identity IORI (in-camera stabilization already applied).
+- **No gravity / horizon lock.** Phase A locks to the FIRST FRAME's
+  orientation, which may be tilted relative to gravity. **Phase C**
+  adds the GRAV-based alignment: compute `q_g` from average of
+  first 10 GRAV samples, right-multiply every CORI by `q_g⁻¹` so
+  the world frame has Y-down = gravity-down. Plus the swing-twist
+  decomposition for explicit `--horizon-lock` mode and the soft
+  elastic `max_corr_deg` cap (default 15°, prevents black borders
+  on extreme motion).
+- **No per-scanline RS warp.** GoPro Max with firmware-on records
+  ERS, but the yaw-mod reverses that for the right lens, so the
+  right eye needs full RS correction even on firmware-RS clips.
+  **Phase D** adds the per-scanline RS pass: 32 row-groups
+  spanning the SROT window, 800 Hz raw GYRO interpolation per
+  group, KLNS fisheye time map for per-pixel sensor-row → time
+  mapping, and the 3D small-angle displacement per pixel.
+- **No no-firmware-RS path.** When CORI is bias-drifting (the test
+  clip!), the firmware RS hasn't actually been applied — both eyes
+  need full RS correction. **Phase E** integrates the existing
+  `vqf_to_cori_quats` path (already ported as
+  `vr180-core::gyro::vqf::run`) — produces a CORI-equivalent per-
+  frame quaternion stream from the 800 Hz GYRO + GRAV + MNOR.
+
+Each is a separate phase; they compose cleanly. Phase A is the
+shader-integration scaffold every later phase builds on.
+
 ## Phase 0.9 — JSON config sidecar (Rust side) ✅
 
 The Python GUI on `main` learns to shell out to `vr180-render` for

@@ -102,6 +102,14 @@ pub struct ExportConfig {
     /// `vexu/proj/prji=hequ` + `eyes/stri` atoms.
     #[serde(default)]
     pub apmp: bool,
+
+    /// Phase A camera-lock stabilization using source CORI quaternions.
+    /// Locks the output to the first-frame orientation; per-frame
+    /// jitter is fully compensated, but slow pans/tilts also vanish.
+    /// Phase B/C/D will add smoothing, IORI per-eye, GRAV horizon lock,
+    /// and per-scanline rolling-shutter correction.
+    #[serde(default)]
+    pub stabilize: bool,
 }
 
 // ─── Color-tool sub-configs ─────────────────────────────────────────

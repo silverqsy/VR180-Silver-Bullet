@@ -51,6 +51,101 @@ impl Quat {
             z: z as f32 * INV,
         }
     }
+
+    /// Quaternion multiplication. `a * b` represents the composition
+    /// "rotate by `b` first, then by `a`" when used to rotate a vector
+    /// via `q.rotate(v)`.
+    #[inline]
+    pub fn mul(self, b: Quat) -> Quat {
+        Quat {
+            w: self.w * b.w - self.x * b.x - self.y * b.y - self.z * b.z,
+            x: self.w * b.x + self.x * b.w + self.y * b.z - self.z * b.y,
+            y: self.w * b.y - self.x * b.z + self.y * b.w + self.z * b.x,
+            z: self.w * b.z + self.x * b.y - self.y * b.x + self.z * b.w,
+        }
+    }
+
+    /// Conjugate — for a unit quaternion, this equals the inverse
+    /// (i.e. the rotation in the opposite direction).
+    #[inline]
+    pub fn conjugate(self) -> Quat {
+        Quat { w: self.w, x: -self.x, y: -self.y, z: -self.z }
+    }
+
+    /// L2 norm (typically very close to 1 for a unit quaternion).
+    #[inline]
+    pub fn norm(self) -> f32 {
+        (self.w * self.w + self.x * self.x
+            + self.y * self.y + self.z * self.z).sqrt()
+    }
+
+    /// Re-normalize. Useful after a sequence of mul / slerp ops
+    /// where accumulated f32 error has drifted the norm off 1.
+    #[inline]
+    pub fn normalize(self) -> Quat {
+        let n = self.norm();
+        if n < 1e-12 { return Quat::IDENTITY; }
+        Quat { w: self.w / n, x: self.x / n, y: self.y / n, z: self.z / n }
+    }
+
+    /// Dot product. Used for slerp and quaternion-distance metrics.
+    #[inline]
+    pub fn dot(self, b: Quat) -> f32 {
+        self.w * b.w + self.x * b.x + self.y * b.y + self.z * b.z
+    }
+
+    /// Spherical linear interpolation. `t ∈ [0, 1]` blends from
+    /// `self` to `b`. Uses the short-arc rule (flips `b` if dot < 0)
+    /// to avoid the "wrong way around" interpolation when the two
+    /// quaternions are on opposite hemispheres.
+    pub fn slerp(self, mut b: Quat, t: f32) -> Quat {
+        let mut d = self.dot(b);
+        if d < 0.0 {
+            // Take the short arc by negating b (same rotation, opposite hemi).
+            b = Quat { w: -b.w, x: -b.x, y: -b.y, z: -b.z };
+            d = -d;
+        }
+        // Numerical safety: when the quats are nearly parallel, fall
+        // back to lerp (avoids div-by-zero in sin(θ)).
+        if d > 0.9995 {
+            let r = Quat {
+                w: self.w + t * (b.w - self.w),
+                x: self.x + t * (b.x - self.x),
+                y: self.y + t * (b.y - self.y),
+                z: self.z + t * (b.z - self.z),
+            };
+            return r.normalize();
+        }
+        let theta = d.clamp(-1.0, 1.0).acos();
+        let sin_theta = theta.sin();
+        let s1 = ((1.0 - t) * theta).sin() / sin_theta;
+        let s2 = (t * theta).sin() / sin_theta;
+        Quat {
+            w: s1 * self.w + s2 * b.w,
+            x: s1 * self.x + s2 * b.x,
+            y: s1 * self.y + s2 * b.y,
+            z: s1 * self.z + s2 * b.z,
+        }
+    }
+
+    /// Convert to a 3×3 rotation matrix (row-major).
+    /// Standard derivation; result is the matrix that, applied to a
+    /// column vector `v`, gives the rotated vector `R·v`.
+    ///
+    /// Returns `[r00, r01, r02, r10, r11, r12, r20, r21, r22]` —
+    /// row-major. For wgpu uniform upload, the caller pads each row
+    /// to 4 floats (std140 mat3 layout).
+    pub fn to_mat3_row_major(self) -> [f32; 9] {
+        let Quat { w, x, y, z } = self;
+        let xx = x * x; let yy = y * y; let zz = z * z;
+        let xy = x * y; let xz = x * z; let yz = y * z;
+        let wx = w * x; let wy = w * y; let wz = w * z;
+        [
+            1.0 - 2.0 * (yy + zz),   2.0 * (xy - wz),         2.0 * (xz + wy),
+            2.0 * (xy + wz),         1.0 - 2.0 * (xx + zz),   2.0 * (yz - wx),
+            2.0 * (xz - wy),         2.0 * (yz + wx),         1.0 - 2.0 * (xx + yy),
+        ]
+    }
 }
 
 const CORI: FourCC = FourCC::new(b"CORI");

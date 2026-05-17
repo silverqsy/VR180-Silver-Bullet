@@ -225,6 +225,14 @@ enum Cmd {
         /// alongside for YouTube / Quest compat.
         #[arg(long, default_value_t = false)]
         apmp: bool,
+        /// Phase A stabilization: lock output to the first-frame
+        /// camera orientation using the source's CORI quaternions.
+        /// "Camera lock" mode — every per-frame jitter is compensated;
+        /// pans and tilts vanish too. Future phases add gyro smoothing
+        /// (preserve slow motion), IORI per-eye, gravity horizon lock,
+        /// and per-scanline rolling-shutter correction.
+        #[arg(long, default_value_t = false)]
+        stabilize: bool,
 
         // --- CDL (ASC Color Decision List) ---
         /// CDL lift: black-point shift. 0 = no change, +1 pushes blacks
@@ -335,7 +343,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Export {
             input, output, eye_w, frames, fps, bitrate,
             lut, lut_intensity, hw_accel, encoder, zero_copy, zero_copy_encode,
-            apac_audio, apac_bitrate, apmp,
+            apac_audio, apac_bitrate, apmp, stabilize,
             cdl_lift, cdl_gamma, cdl_gain, cdl_shadow, cdl_highlight,
             temperature, tint, saturation,
             sharpen, sharpen_sigma,
@@ -367,7 +375,7 @@ fn main() -> anyhow::Result<()> {
             export(&input, &output, eye_w, frames, fps, bitrate,
                    lut.as_deref(), lut_intensity, hw_accel.into(),
                    encoder.resolve(), zero_copy, zero_copy_encode,
-                   plan_template, post)
+                   plan_template, post, stabilize)
         }
     }
 }
@@ -400,7 +408,53 @@ fn run_render_from_config(config_path: &std::path::Path) -> anyhow::Result<()> {
         cfg.zero_copy_encode,
         plan,
         post,
+        cfg.stabilize,
     )
+}
+
+/// Compute per-frame stabilization rotations from the source's CORI
+/// stream. One rotation per source frame (GoPro Max emits exactly one
+/// CORI quaternion per video frame — 1:1 mapping, no resampling
+/// needed for the standard 30 fps case).
+///
+/// Phase A "camera lock" mode: applies the raw CORI directly (no
+/// smoothing, no gravity alignment, no per-eye IORI split). The
+/// output equirect direction gets multiplied by `R = quat_to_mat3(q)`
+/// before face selection, so the EAC sample lands where the scene
+/// physically was at capture time → scene appears locked to the
+/// first-frame orientation.
+///
+/// Phase B/C/D will replace this with: smoothed quaternion path,
+/// per-eye IORI, GRAV horizon lock, per-scanline RS warp.
+fn compute_stabilization_rotations(
+    input: &std::path::Path,
+) -> anyhow::Result<Vec<vr180_pipeline::gpu::EquirectRotation>> {
+    use vr180_core::gyro::{parse_cori, cori_swap_yz};
+    use vr180_pipeline::decode::extract_gpmf_stream;
+    use vr180_pipeline::gpu::EquirectRotation;
+
+    let gpmf = extract_gpmf_stream(input)?;
+    let cori = parse_cori(&gpmf);
+    if cori.is_empty() {
+        eprintln!("warning: --stabilize requested but source has no CORI \
+                   stream; falling back to identity rotation (no stabilization)");
+    }
+    let rotations: Vec<EquirectRotation> = cori.into_iter()
+        .map(|q| EquirectRotation::from_quat(cori_swap_yz(q)))
+        .collect();
+    println!("Stabilization: loaded {} per-frame CORI quaternions", rotations.len());
+    Ok(rotations)
+}
+
+/// Look up the rotation for a given frame index. Returns identity if
+/// out of range — defensive against CORI / video frame-count mismatch
+/// (which shouldn't happen but isn't worth crashing over).
+fn rotation_for_frame(
+    rotations: &[vr180_pipeline::gpu::EquirectRotation],
+    frame_idx: u32,
+) -> vr180_pipeline::gpu::EquirectRotation {
+    rotations.get(frame_idx as usize).copied()
+        .unwrap_or(vr180_pipeline::gpu::EquirectRotation::IDENTITY)
 }
 
 /// Post-encode steps the user opted into via CLI flags. Run after the
@@ -433,6 +487,7 @@ fn export(
     zero_copy_encode: bool,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
     post: PostProcess,
+    stabilize: bool,
 ) -> anyhow::Result<()> {
     if zero_copy && !cfg!(target_os = "macos") {
         anyhow::bail!(
@@ -480,17 +535,25 @@ fn export(
         output.to_path_buf()
     };
 
+    // Precompute per-frame stabilization rotations once. Empty vec
+    // when stabilize=false → rotation_for_frame returns IDENTITY.
+    let rotations = if stabilize {
+        compute_stabilization_rotations(input)?
+    } else {
+        Vec::new()
+    };
+
     if zero_copy {
         #[cfg(target_os = "macos")]
         export_zero_copy(input, &video_only_path, eye_w, n_frames, fps, bitrate_kbps,
                          lut_spec, lut_intensity, encoder,
-                         zero_copy_encode, plan_template, post.apmp)?;
+                         zero_copy_encode, plan_template, post.apmp, &rotations)?;
         #[cfg(not(target_os = "macos"))]
         unreachable!();
     } else {
         export_cpu_assemble(input, &video_only_path, eye_w, n_frames, fps, bitrate_kbps,
                             lut_spec, lut_intensity, hw, encoder, plan_template,
-                            post.apmp)?;
+                            post.apmp, &rotations)?;
     }
 
     // Post-encode: APAC audio mux. APMP atoms were already set as
@@ -591,6 +654,7 @@ fn export_cpu_assemble(
     encoder_backend: vr180_pipeline::encode::EncoderBackend,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
     apmp: bool,
+    rotations: &[vr180_pipeline::gpu::EquirectRotation],
 ) -> anyhow::Result<()> {
     use vr180_core::eac::{assemble_lens_a, assemble_lens_b};
     use vr180_pipeline::decode::{iter_stream_pairs, probe_video};
@@ -639,8 +703,9 @@ fn export_cpu_assemble(
         //   Lens B (s4/BACK) → LEFT eye
         // (After the yaw mod, the lens labeled A is physically on
         // the right side of the user's head.)
-        let left_tex  = device.project_cross_to_equirect_texture(&cross_b, dims.cross_w(), eye_w, out_h)?;
-        let right_tex = device.project_cross_to_equirect_texture(&cross_a, dims.cross_w(), eye_w, out_h)?;
+        let r = rotation_for_frame(rotations, frame_idx);
+        let left_tex  = device.project_cross_to_equirect_texture(&cross_b, dims.cross_w(), eye_w, out_h, r)?;
+        let right_tex = device.project_cross_to_equirect_texture(&cross_a, dims.cross_w(), eye_w, out_h, r)?;
         let left  = device.apply_color_stack_texture(&left_tex,  eye_w, out_h, &plan)?;
         let right = device.apply_color_stack_texture(&right_tex, eye_w, out_h, &plan)?;
         encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
@@ -673,6 +738,7 @@ fn export_zero_copy(
     zero_copy_encode: bool,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
     apmp: bool,
+    rotations: &[vr180_pipeline::gpu::EquirectRotation],
 ) -> anyhow::Result<()> {
     use vr180_pipeline::decode::{ZeroCopyStreamPairIter, probe_video};
     use vr180_pipeline::encode::H265Encoder;
@@ -736,8 +802,9 @@ fn export_zero_copy(
         // (matches Python convention + project memory; after yaw mod
         // the lens labeled A is physically on the right side of the
         // user's head).
-        let left_tex  = device.project_cross_texture_to_equirect_texture(&cross_b, eye_w, out_h)?;
-        let right_tex = device.project_cross_texture_to_equirect_texture(&cross_a, eye_w, out_h)?;
+        let r = rotation_for_frame(rotations, frame_idx);
+        let left_tex  = device.project_cross_texture_to_equirect_texture(&cross_b, eye_w, out_h, r)?;
+        let right_tex = device.project_cross_texture_to_equirect_texture(&cross_a, eye_w, out_h, r)?;
 
         if zero_copy_encode {
             // Allocate a fresh IOSurface-backed BGRA CVPixelBuffer. The
@@ -1094,9 +1161,11 @@ fn probe_eac(
         } else { None };
 
         // Eye assignment: Lens A → RIGHT, Lens B → LEFT (yaw-mod convention).
+        // probe-eac is a single-frame inspection tool — no stabilization here.
         let t = std::time::Instant::now();
-        let mut left_eye = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, eye_h)?;
-        let mut right_eye = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, eye_h)?;
+        let id_rot = vr180_pipeline::gpu::EquirectRotation::IDENTITY;
+        let mut left_eye = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, eye_h, id_rot)?;
+        let mut right_eye = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, eye_h, id_rot)?;
         let gpu_t = t.elapsed();
 
         if let Some(lut) = &lut {

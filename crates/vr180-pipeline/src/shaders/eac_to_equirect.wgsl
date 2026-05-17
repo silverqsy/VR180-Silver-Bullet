@@ -4,24 +4,44 @@
 //   binding(0): the EAC cross texture (cross_w × cross_w, rgba8unorm)
 //   binding(1): bilinear sampler
 //   binding(2): storage texture for the equirect output (rgba8unorm)
+//   binding(3): EquirectUniforms — per-frame R matrix for stabilization
 //
 // One thread per output pixel. The math mirrors the Python
 // `FrameExtractor.build_cross_remap`:
 //
 //   * convert (u, v) ∈ [0,1]² to (lon, lat) ∈ [-π/2, π/2]²
 //   * recover unit direction vector (xn, yn, zn)
+//   * **apply per-frame rotation R** (Phase A stabilization).
 //   * pick one of 5 EAC faces (front / right / left / top / bottom)
 //     by max-axis test
 //   * within the chosen face, recover (u_eac, v_eac) via arctan
 //   * scale to the absolute pixel coordinate in the assembled cross
 //   * sample with bilinear filtering
 //
-// Phase 0.5: no per-pixel rotation (identity orientation). Phase 0.7
-// will accept a 3×3 R matrix uniform and pre-multiply the direction.
+// Per-frame R uniform: when stabilization is off, R = identity and
+// this is a no-op. When on, R = quat_to_mat3(CORI_frame_i) — rotates
+// the output direction into the camera frame at frame i, so the EAC
+// face sample lands where the scene actually was when that pixel was
+// captured. Net effect: scene appears stationary while the camera
+// pans/tilts/rolls.
 
 @group(0) @binding(0) var cross_tex: texture_2d<f32>;
 @group(0) @binding(1) var cross_smp: sampler;
 @group(0) @binding(2) var out_tex: texture_storage_2d<rgba8unorm, write>;
+// std140 layout for a row-major 3×3 rotation matrix. We use 12
+// individual `f32` fields (3 rows × 4 — the 4th column per row is
+// std140 padding) because naga (wgpu 0.20's WGSL parser) silently
+// rejects struct field access on `mat3x3<f32>` and `array<vec4<f32>, 3>`
+// uniforms. Plain scalar fields parse fine in every wgpu version
+// we've tested.
+struct EquirectUniforms {
+    r00: f32, r01: f32, r02: f32, _pad0: f32,
+    r10: f32, r11: f32, r12: f32, _pad1: f32,
+    r20: f32, r21: f32, r22: f32, _pad2: f32,
+}
+// Renamed to `equ` to avoid shadowing the local `let u = ...` below
+// for the equirect U coordinate.
+@group(0) @binding(3) var<uniform> equ: EquirectUniforms;
 
 const PI: f32 = 3.14159265359;
 const HALF_PI: f32 = 1.57079632679;
@@ -52,12 +72,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lon = (u - 0.5) * PI;
     let lat = (0.5 - v) * PI;
 
-    // Unit direction in camera frame. (Phase 0.7 will rotate this
-    // by a per-frame R matrix before face selection.)
+    // Unit direction in equirect (output) frame, then rotated into
+    // camera (input) frame by the per-frame R uniform. When
+    // stabilization is off R = identity and these two frames are the
+    // same.
     let cos_lat = cos(lat);
-    let xn = cos_lat * sin(lon);
-    let yn = sin(lat);
-    let zn = cos_lat * cos(lon);
+    let dir_world = vec3<f32>(
+        cos_lat * sin(lon),
+        sin(lat),
+        cos_lat * cos(lon),
+    );
+    // R · dir — manual row-vector dot products. 12-scalar uniform
+    // layout (see EquirectUniforms above); each row is 3 floats +
+    // 1 pad.
+    let xn = equ.r00 * dir_world.x + equ.r01 * dir_world.y + equ.r02 * dir_world.z;
+    let yn = equ.r10 * dir_world.x + equ.r11 * dir_world.y + equ.r12 * dir_world.z;
+    let zn = equ.r20 * dir_world.x + equ.r21 * dir_world.y + equ.r22 * dir_world.z;
 
     let ax = abs(xn);
     let ay = abs(yn);

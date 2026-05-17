@@ -14,8 +14,10 @@
 pub mod gpmf;
 pub mod cori_iori;
 pub mod raw;
+pub mod resample;
 pub mod vqf;
 
 pub use cori_iori::{Quat, parse_cori, parse_iori, quat_to_euler_zyx};
 pub use gpmf::{GpmfEntry, GpmfWalker, FourCC};
 pub use raw::{ImuBlock, RawImu, parse_raw_imu};
+pub use resample::{resample_quats_to_frames, cori_swap_yz, SROT_S};
