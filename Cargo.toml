@@ -4,6 +4,7 @@ members = [
     "crates/vr180-core",
     "crates/vr180-pipeline",
     "crates/vr180-render",
+    "crates/vr180-app",
 ]
 
 [workspace.package]

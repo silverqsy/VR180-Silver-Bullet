@@ -1125,16 +1125,113 @@ at t=0), e.g. the "NO firmware RS" reference clip.
 - All 8 stabilize unit tests still pass; 3 config tests still pass
   including a new round-trip assertion for the C+/D/E knobs.
 
+## Phase F — Multi-segment chain handling + SROT auto-detect ✅
+
+GoPro splits long recordings into ~4 GB chapter files at the FAT32
+boundary (`GS010172.360`, `GS020172.360`, ...). Phase F detects the
+chain from any one segment's path and runs the export pipeline
+through a single shared encoder so the output is one continuous
+mov/mp4. SROT is read from the GPMF tail block instead of the
+hardcoded 15.224 ms constant.
+
+### Multi-segment chain
+
+- **`vr180-core::segments::detect_segments(path)`** — walks the
+  parent directory looking for chapter siblings matching the
+  `G[SHXLP]{cc}{IIII}.{ext}` pattern (case-insensitive). Returns
+  the sorted chain; single-file fallback for non-GoPro inputs.
+  Stops after 5 consecutive missing chapters past the input
+  (gap tolerance). 5 unit tests.
+
+- **Export pipeline refactor** — `export()` in `vr180-render` now
+  detects segments at the top, sums per-segment durations + frame
+  counts, and processes all segments through a SHARED
+  `H265Encoder` (one `create` + one `finish` across the whole
+  chain). Per-segment `export_zero_copy` / `export_cpu_assemble`
+  bodies take `&mut H265Encoder` + `frame_offset: u32` so the
+  per-eye rotation lookup uses the global frame index.
+
+- **GPMF aggregation across segments** — `compute_per_eye_frames`
+  concatenates the GPMF byte streams from every segment before
+  parsing CORI / IORI / GYRO. Naive byte concat works because
+  GPMF records are self-delimiting and the parsers walk through
+  them sequentially.
+
+- **GEOC / SROT pulled from last segment** — Python convention.
+  GoPro embeds the same calibration in every chapter, but the
+  last segment is the canonical choice in the reference code.
+
+### SROT auto-detect
+
+- **`vr180-core::geoc::find_srot_ms(bytes)`** — searches a byte
+  slice (either a GPMF stream or a file tail) for the `SROT`
+  marker. Handles the three GoPro encodings:
+  - `'J'` / 8 bytes: uint64 microseconds → ms (÷ 1000)
+  - `'L'` / 4 bytes: uint32 microseconds → ms
+  - `'f'` / 4 bytes: float32 ms (with `> 1000` → μs heuristic)
+
+- **`vr180-core::geoc::lookup_srot_s(path, gpmf_bytes)`** — full
+  lookup: try the optional GPMF bytes first, fall back to reading
+  512 KiB of file tail. Returns SROT in seconds, `None` when
+  absent (caller falls back to the user-supplied `--rs-readout-ms`
+  or the 15.224 ms default).
+
+- **Wired into `compute_per_eye_frames`** — the detected SROT
+  drives both `compute_per_frame_omega`'s sample offset (= SROT/2)
+  and the per-eye `EquirectRsParams.srot_s`. Status print
+  annotates auto-detected vs user-default. Validated on both
+  reference clips (both report 15.224 ms exactly).
+
 ### Still deferred
 
-- **Per-segment chain** — multi-segment GoPro recordings (split at
-  4 GB FAT32 boundaries). Both `vqf_to_cori_quats_multi_segment`
-  and the GEOC tail-of-last-segment lookup need to land before we
-  can run Neo end-to-end on chapter-split clips.
-- **Auto-detect SROT from GPMF** — Phase D currently uses the
-  fixed `15.224 ms` constant. Python reads SROT from the GPMF tail
-  block (one-line addition to `parse_geoc` once we know the
-  fourcc layout for `SROT`).
+- **Multi-segment VQF stream** — `vqf_cori_equivalent_stream`
+  currently consumes only the first segment. Needs the multi-
+  segment integration glue from `vr180_gui.py::
+  vqf_to_cori_quats_multi_segment` (aggregate raw GYRO across
+  segments and integrate as one continuous stream — avoids
+  orientation discontinuity at segment boundaries).
+
+## Phase G — Tauri 2 desktop GUI (in progress) 🚧
+
+The new GUI. Tauri 2 shell + vanilla HTML/JS frontend (React/Vue
+swap-in later when feature set stabilizes). Target: full feature
+parity with the Python PyQt6 GUI plus a live 30 fps playback mode
+the Python app never had.
+
+### What landed in the scaffold session
+
+- **`crates/vr180-app/`** workspace crate:
+  - Tauri 2 shell + window (`cargo tauri dev` opens a window).
+  - Six Tauri commands wrapping the existing pipeline:
+    `version_info`, `probe_clip`, `detect_segments`, `probe_geoc`,
+    `lookup_srot_ms`, `extract_preview_frame`.
+  - Capabilities: dialog (file picker) + fs (open user-selected
+    paths from `$HOME`, `/Volumes`, `/tmp`).
+- **Vanilla HTML/JS UI** in `ui/`:
+  - Dark editor theme, hand-rolled CSS.
+  - Sidebar with Source / Stabilization / Rolling shutter / Color
+    / Output panels. Sliders + readouts; not yet wired to preview.
+  - Preview stage shows the current first-frame half-equirect SBS.
+  - Statusbar shows path / dims / chain count / SROT.
+  - File picker + drag-drop both work.
+- Release binary builds clean (10 MB native arm64 on Apple
+  Silicon).
+
+### Roadmap (planned, in order)
+
+1. **Export button → backend pipeline call** with progress events.
+   Reuse the same `export()` function the CLI uses.
+2. **Scrub timeline → preview** — `time_s` parameter plumbed
+   through the decoder seek, preview re-renders on scrub release.
+3. **Param plumbing** — wire the sidebar sliders to the preview's
+   ColorStackPlan + StabilizeParams + RsParams so users see their
+   edits live (debounced ~250 ms).
+4. **Live playback @ 30 fps** — decode + render + display loop.
+5. **Multi-segment chain UI** — show all detected siblings, allow
+   user to start at a specific chapter.
+6. **Trim range** — set in/out points on the timeline.
+7. **Remaining Python parity** — edge mask, vignette, anaglyph
+   preview, vision-pro modes, multi-camera, etc.
 
 ## Phase 0.9 — JSON config sidecar (Rust side) ✅
 

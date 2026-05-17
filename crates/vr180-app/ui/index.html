@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VR180 Silver Bullet Neo</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!--
+    Layout:
+      header       — app title + version
+      sidebar      — file open + params (collapsed by default panels)
+      main         — preview canvas + transport
+      statusbar    — info line (path, dims, fps, chain count, srot)
+  -->
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-mark">▶</span>
+      <span class="brand-name">VR180 Silver Bullet Neo</span>
+      <span class="brand-version" id="version-info">…</span>
+    </div>
+    <nav class="header-actions">
+      <button id="btn-open" class="primary">Open .360</button>
+      <button id="btn-export" disabled>Export</button>
+    </nav>
+  </header>
+
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <section class="panel">
+        <h2>Source</h2>
+        <div id="source-info" class="panel-body source-info">
+          <div class="hint">No file loaded. Drop a <code>.360</code> here or click Open.</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Stabilization</h2>
+        <div class="panel-body">
+          <label class="row">
+            <input type="checkbox" id="cb-stabilize" />
+            <span>Enable stabilization</span>
+          </label>
+          <label class="row">
+            <input type="checkbox" id="cb-horizon-lock" />
+            <span>Horizon lock</span>
+          </label>
+          <label class="row">
+            <span class="lbl">CORI source</span>
+            <select id="sel-cori-source">
+              <option value="direct">direct</option>
+              <option value="vqf">vqf</option>
+              <option value="auto" selected>auto</option>
+            </select>
+          </label>
+          <label class="row">
+            <span class="lbl">Smooth (ms)</span>
+            <input type="number" id="num-smooth-ms" value="1000" min="0" max="5000" step="50" />
+          </label>
+          <label class="row">
+            <span class="lbl">Max corr (°)</span>
+            <input type="number" id="num-max-corr" value="15" min="0" max="90" step="1" />
+          </label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Rolling shutter</h2>
+        <div class="panel-body">
+          <label class="row">
+            <input type="checkbox" id="cb-rs-correct" />
+            <span>Enable RS correction</span>
+          </label>
+          <label class="row">
+            <span class="lbl">RS mode</span>
+            <select id="sel-rs-mode">
+              <option value="firmware" selected>firmware</option>
+              <option value="no-firmware">no-firmware</option>
+            </select>
+          </label>
+          <label class="row">
+            <span class="lbl">SROT (ms)</span>
+            <input type="text" id="txt-srot" value="—" readonly />
+          </label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Color</h2>
+        <div class="panel-body">
+          <label class="row">
+            <span class="lbl">Temperature</span>
+            <input type="range" id="rng-temp" value="0" min="-1" max="1" step="0.05" />
+            <span class="value" id="val-temp">+0.00</span>
+          </label>
+          <label class="row">
+            <span class="lbl">Tint</span>
+            <input type="range" id="rng-tint" value="0" min="-1" max="1" step="0.05" />
+            <span class="value" id="val-tint">+0.00</span>
+          </label>
+          <label class="row">
+            <span class="lbl">Saturation</span>
+            <input type="range" id="rng-sat" value="1" min="0" max="2" step="0.05" />
+            <span class="value" id="val-sat">1.00</span>
+          </label>
+          <label class="row">
+            <span class="lbl">Sharpen</span>
+            <input type="range" id="rng-sharp" value="0" min="0" max="2" step="0.05" />
+            <span class="value" id="val-sharp">0.00</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Output</h2>
+        <div class="panel-body">
+          <label class="row">
+            <span class="lbl">Eye width</span>
+            <select id="sel-eye-w">
+              <option value="2048" selected>2048 (4K SBS)</option>
+              <option value="4096">4096 (8K SBS)</option>
+              <option value="1024">1024 (2K, preview)</option>
+            </select>
+          </label>
+          <label class="row">
+            <span class="lbl">Bitrate (kbps)</span>
+            <input type="number" id="num-bitrate" value="12000" min="1000" max="100000" step="1000" />
+          </label>
+          <label class="row">
+            <input type="checkbox" id="cb-apmp" checked />
+            <span>APMP (Vision Pro tags)</span>
+          </label>
+          <label class="row">
+            <input type="checkbox" id="cb-apac" />
+            <span>APAC spatial audio</span>
+          </label>
+        </div>
+      </section>
+    </aside>
+
+    <main class="preview">
+      <div class="preview-stage" id="preview-stage">
+        <div class="preview-placeholder" id="preview-placeholder">
+          <div class="placeholder-icon">🎬</div>
+          <div class="placeholder-text">Preview will appear here once a clip is loaded.</div>
+        </div>
+        <img id="preview-img" alt="preview frame" hidden />
+      </div>
+
+      <div class="transport">
+        <button id="btn-play" disabled title="Live playback (coming soon)">▶</button>
+        <input type="range" id="rng-scrub" min="0" max="1000" value="0" disabled />
+        <span class="time-readout" id="time-readout">00:00 / 00:00</span>
+        <button id="btn-refresh-preview" disabled title="Re-render preview frame">↻</button>
+      </div>
+    </main>
+  </div>
+
+  <footer class="statusbar" id="statusbar">
+    <span id="status-msg">Ready.</span>
+    <span class="spacer"></span>
+    <span id="status-dims">—</span>
+    <span class="sep">·</span>
+    <span id="status-chain">—</span>
+    <span class="sep">·</span>
+    <span id="status-srot">SROT —</span>
+  </footer>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>

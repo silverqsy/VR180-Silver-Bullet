@@ -1,0 +1,42 @@
+[package]
+name = "vr180-app"
+version = "0.1.0"
+description = "VR180 Silver Bullet Neo — desktop GUI (Tauri)"
+edition = "2021"
+publish = false
+
+# Tauri v2 layout: a library that holds the Tauri command handlers
+# plus a thin binary that wires the library into a `tauri::Builder`.
+# Keeping the commands in a lib makes them easy to test with plain
+# cargo test (no Tauri runtime required at unit-test time).
+[lib]
+name = "vr180_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Our workspace crates. Pipeline + core give us probe/decode/render;
+# we re-use them directly to avoid spawning the CLI per call.
+vr180-core = { path = "../vr180-core" }
+vr180-pipeline = { path = "../vr180-pipeline" }
+# Image encoding for preview frames (PNG → base64 → IPC → <img>).
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+
+[features]
+default = ["custom-protocol"]
+# When the app is bundled (`tauri build`), Tauri serves the frontend
+# via a custom URI scheme instead of a dev server. The feature is
+# automatically enabled by tauri-cli at bundle time.
+custom-protocol = ["tauri/custom-protocol"]
