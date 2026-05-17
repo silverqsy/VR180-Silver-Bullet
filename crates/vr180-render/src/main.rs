@@ -719,11 +719,12 @@ type PerFrameEyeFrames = Vec<(EquirectEyeFrame, EquirectEyeFrame)>;
 /// Returns a `Vec<(left_frame, right_frame)>`. Empty if neither
 /// stabilization nor RS is on.
 fn compute_per_eye_frames(
-    input: &std::path::Path,
+    segments: &[std::path::PathBuf],
     stab: &StabilizeParams,
     rs: &RsParams,
     fps: f32,
     n_frames_video: usize,
+    total_duration_s: f64,
 ) -> anyhow::Result<PerFrameEyeFrames> {
     use vr180_core::gyro::{
         parse_cori, parse_iori, parse_raw_imu, Quat,
@@ -731,14 +732,22 @@ fn compute_per_eye_frames(
         gravity_alignment_quat, apply_gravity_alignment_inplace,
         compute_per_frame_omega, SMOOTH_WINDOW_S,
     };
-    use vr180_pipeline::decode::{extract_gpmf_stream, probe_video};
+    use vr180_pipeline::decode::extract_gpmf_stream;
     use vr180_pipeline::gpu::{EquirectRotation, EquirectRsParams};
 
     if !stab.enabled && !rs.enabled {
         return Ok(Vec::new());
     }
+    let primary = segments.first()
+        .ok_or_else(|| anyhow::anyhow!("compute_per_eye_frames: no segments"))?;
 
-    let gpmf = extract_gpmf_stream(input)?;
+    // Aggregate GPMF across all segments. CORI / IORI / GYRO blocks
+    // from later segments simply append to the parsed lists — naive
+    // byte concat works because GPMF records are self-delimiting.
+    let mut gpmf: Vec<u8> = Vec::new();
+    for seg in segments {
+        gpmf.extend_from_slice(&extract_gpmf_stream(seg)?);
+    }
     let mut cori = parse_cori(&gpmf);
     let iori   = parse_iori(&gpmf);
     let raw_imu = parse_raw_imu(&gpmf);
@@ -761,8 +770,13 @@ fn compute_per_eye_frames(
                 if stab.cori_source == CoriSource::Auto {
                     " — detected bias drift in raw CORI"
                 } else { "" });
+            // VQF only consumes the first segment for now — extending
+            // vqf_cori_equivalent_stream to chain segments is tracked
+            // separately. For single-segment files this is the full
+            // clip; for multi-segment, this is a known limitation
+            // (Phase E follow-up).
             cori = vr180_pipeline::imu::vqf_cori_equivalent_stream(
-                input, fps, n_frames_video,
+                primary, fps, n_frames_video,
             )?;
             // Reference-correct: VQF emits orientation relative to its
             // own gravity-aligned world frame, so cori[0] is typically
@@ -844,7 +858,12 @@ fn compute_per_eye_frames(
 
     // RS branch: build the per-eye RS params list (one per VIDEO frame).
     let rs_eyes: Vec<(EquirectRsParams, EquirectRsParams)> = if rs.enabled {
-        let geoc = vr180_core::geoc::parse_geoc(input)
+        // GEOC: use the LAST segment's calibration. GoPro embeds GEOC
+        // in every chapter (same camera = same lens cal), but Python
+        // uses the last-segment convention since that's where geometry
+        // refinement runs in the firmware.
+        let last_seg = segments.last().expect("at least one segment");
+        let geoc = vr180_core::geoc::parse_geoc(last_seg)
             .map_err(|e| anyhow::anyhow!("GEOC parse io error: {e}"))?
             .ok_or_else(|| anyhow::anyhow!(
                 "--rs-correct requested but the source `.360` has no GEOC \
@@ -854,33 +873,41 @@ fn compute_per_eye_frames(
             "GEOC missing FRNT lens calibration; cannot apply RS to right eye"))?;
         let back  = geoc.back.as_ref().ok_or_else(|| anyhow::anyhow!(
             "GEOC missing BACK lens calibration; cannot apply RS to left eye"))?;
+        // SROT: auto-detected from GPMF / file tail. Falls back to the
+        // user-supplied `rs.srot_s` if not found anywhere.
+        let srot_s = vr180_core::geoc::lookup_srot_s(last_seg, Some(&gpmf))
+            .map_err(|e| anyhow::anyhow!("SROT lookup io error: {e}"))?
+            .unwrap_or(rs.srot_s);
         println!(
             "RS correction: GEOC OK (cal_dim={}, FRNT c0={:.2}, BACK c0={:.2}), \
-             SROT={:.3} ms, mode={}, factors L=({:.2},{:.2},{:.2}) R=({:.2},{:.2},{:.2})",
+             SROT={:.3} ms{}, mode={}, factors L=({:.2},{:.2},{:.2}) R=({:.2},{:.2},{:.2})",
             geoc.cal_dim, front.klns[0], back.klns[0],
-            rs.srot_s * 1000.0,
+            srot_s * 1000.0,
+            if (srot_s - rs.srot_s).abs() > 1e-5 { " (auto-detected)" } else { "" },
             if rs.right_factor.pitch != 0.0 && rs.left_factor.pitch == 0.0 { "firmware" } else { "no-firmware" },
             rs.left_factor.pitch, rs.left_factor.roll, rs.left_factor.yaw,
             rs.right_factor.pitch, rs.right_factor.roll, rs.right_factor.yaw,
         );
 
-        // Per-frame ω in shader frame (rad/s), sampled at frame center.
-        let probe = probe_video(input)?;
-        let duration_s = probe.duration_sec as f32;
+        // Per-frame ω in shader frame (rad/s), sampled at frame
+        // center. `total_duration_s` is the sum across all segments,
+        // giving the right dt = duration / total_gyro_samples.
+        let duration_s = total_duration_s as f32;
         let n = n_frames_video;
         let omegas = compute_per_frame_omega(
             &raw_imu.gyro, n, fps, duration_s,
-            rs.srot_s * 0.5,    // sample at center of readout window
+            srot_s * 0.5,    // sample at center of readout window
             SMOOTH_WINDOW_S,
         );
 
         // Pre-build per-eye RsParams shells (everything except omega +
-        // srot_s is constant across frames).
+        // srot_s is constant across frames). Note: `srot_s` here is
+        // the auto-detected value (or the user override fallback).
         let mut out: Vec<(EquirectRsParams, EquirectRsParams)> = Vec::with_capacity(n);
         for i in 0..n {
             let om = omegas[i];
-            let left = make_rs_params(om, rs.left_factor,  rs.srot_s, back,  geoc.cal_dim);
-            let right = make_rs_params(om, rs.right_factor, rs.srot_s, front, geoc.cal_dim);
+            let left = make_rs_params(om, rs.left_factor,  srot_s, back,  geoc.cal_dim);
+            let right = make_rs_params(om, rs.right_factor, srot_s, front, geoc.cal_dim);
             out.push((left, right));
         }
         out
@@ -1060,32 +1087,100 @@ fn export(
         output.to_path_buf()
     };
 
-    // Precompute per-frame, per-eye stabilization + RS bundles once.
-    // Empty vec when both stab and rs are off → per_eye_frame_for_frame
-    // returns IDLE for every frame.
-    let probe = vr180_pipeline::decode::probe_video(input)?;
+    // Detect chapter chain. `GS010172.360` may auto-find GS02...,
+    // GS03..., etc. For single-segment files this returns just
+    // `[input]`. All segments share one combined gyro stream and one
+    // encoder so the output is one continuous mov/mp4.
+    let segments = vr180_core::segments::detect_segments(input);
+    if segments.len() > 1 {
+        println!("Detected {} chapter segments:", segments.len());
+        for s in &segments {
+            println!("  - {}", s.display());
+        }
+    }
+
+    // Probe each segment for duration; sum for total clip length.
+    let mut per_segment_frames: Vec<u32> = Vec::with_capacity(segments.len());
+    let mut total_duration_s: f64 = 0.0;
+    let mut probe_first: Option<vr180_pipeline::decode::VideoProbe> = None;
+    for seg in &segments {
+        let p = vr180_pipeline::decode::probe_video(seg)?;
+        let seg_frames = (p.duration_sec * p.fps as f64).round() as u32;
+        total_duration_s += p.duration_sec;
+        per_segment_frames.push(seg_frames);
+        if probe_first.is_none() { probe_first = Some(p); }
+    }
+    let probe = probe_first.expect("at least one segment");
     let actual_fps = fps.unwrap_or(probe.fps);
-    // Best-guess total frame count. probe.duration_sec × fps is the
-    // common case; capped by --frames if the user limited the export.
     let total_frames = if n_frames > 0 {
         n_frames as usize
     } else {
-        (probe.duration_sec as f64 * actual_fps as f64).round() as usize
+        (total_duration_s * actual_fps as f64).round() as usize
     };
-    let frames = compute_per_eye_frames(input, &stab, &rs, actual_fps, total_frames)?;
 
-    if zero_copy {
+    // Precompute per-frame, per-eye stabilization + RS bundles once
+    // across all segments. Empty vec → callers use IDLE per frame.
+    let frames = compute_per_eye_frames(
+        &segments, &stab, &rs, actual_fps, total_frames, total_duration_s,
+    )?;
+
+    // Open the encoder once for all segments.
+    let out_w = eye_w * 2;
+    let out_h = eye_w;
+    let mut encoder_owned = if zero_copy_encode {
         #[cfg(target_os = "macos")]
-        export_zero_copy(input, &video_only_path, eye_w, n_frames, fps, bitrate_kbps,
-                         lut_spec, lut_intensity, encoder,
-                         zero_copy_encode, plan_template, post.apmp, &frames)?;
+        { vr180_pipeline::encode::H265Encoder::create_zero_copy_vt(
+            &video_only_path, out_w, out_h, actual_fps, bitrate_kbps,
+        )? }
         #[cfg(not(target_os = "macos"))]
-        unreachable!();
+        unreachable!()
     } else {
-        export_cpu_assemble(input, &video_only_path, eye_w, n_frames, fps, bitrate_kbps,
-                            lut_spec, lut_intensity, hw, encoder, plan_template,
-                            post.apmp, &frames)?;
+        vr180_pipeline::encode::H265Encoder::create(
+            &video_only_path, out_w, out_h, actual_fps, bitrate_kbps, encoder,
+        )?
+    };
+    if post.apmp { encoder_owned.tag_apmp_vr180_sbs()?; }
+
+    let t_start = std::time::Instant::now();
+    let mut frames_remaining: u32 = if n_frames > 0 { n_frames } else { u32::MAX };
+    let mut frame_offset_so_far: u32 = 0;
+    for (seg_idx, seg_path) in segments.iter().enumerate() {
+        let seg_total = per_segment_frames[seg_idx];
+        let seg_budget = seg_total.min(frames_remaining);
+        if seg_budget == 0 { break; }
+        if segments.len() > 1 {
+            println!("\n=== Segment {}/{}: {} ({} frames) ===",
+                seg_idx + 1, segments.len(),
+                seg_path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                seg_budget);
+        }
+        if zero_copy {
+            #[cfg(target_os = "macos")]
+            export_zero_copy(seg_path, eye_w, seg_budget, actual_fps,
+                             lut_spec, lut_intensity,
+                             zero_copy_encode, plan_template.clone(),
+                             &frames, frame_offset_so_far,
+                             &mut encoder_owned, t_start)?;
+            #[cfg(not(target_os = "macos"))]
+            unreachable!();
+        } else {
+            export_cpu_assemble(seg_path, eye_w, seg_budget, actual_fps, bitrate_kbps,
+                                lut_spec, lut_intensity, hw, encoder,
+                                plan_template.clone(),
+                                &frames, frame_offset_so_far,
+                                &mut encoder_owned, t_start)?;
+        }
+        frames_remaining = frames_remaining.saturating_sub(seg_budget);
+        frame_offset_so_far += seg_budget;
+        if frames_remaining == 0 { break; }
     }
+    encoder_owned.finish()?;
+    let total = t_start.elapsed();
+    let avg_fps = frame_offset_so_far as f32 / total.as_secs_f32().max(1e-6);
+    println!("\nDone: {} frames in {:.2?} ({:.2} fps)",
+        frame_offset_so_far, total, avg_fps);
+    let size = std::fs::metadata(&video_only_path).map(|m| m.len()).unwrap_or(0);
+    println!("Output size: {:.1} MB", size as f64 / 1_048_576.0);
 
     // Post-encode: APAC audio mux. APMP atoms were already set as
     // codec side-data on the encoder, so they're already in
@@ -1174,30 +1269,29 @@ fn run_apac_audio(
 /// GPU through the entire color chain (one submit, one readback).
 fn export_cpu_assemble(
     input: &std::path::Path,
-    output: &std::path::Path,
     eye_w: u32,
     n_frames: u32,
-    fps: Option<f32>,
+    fps: f32,
     bitrate_kbps: u32,
     lut_spec: Option<&str>,
     lut_intensity: f32,
     hw: vr180_pipeline::decode::HwDecode,
     encoder_backend: vr180_pipeline::encode::EncoderBackend,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
-    apmp: bool,
     frames: &PerFrameEyeFrames,
+    frame_offset: u32,
+    encoder: &mut vr180_pipeline::encode::H265Encoder,
+    t_start: std::time::Instant,
 ) -> anyhow::Result<()> {
     use vr180_core::eac::{assemble_lens_a, assemble_lens_b};
     use vr180_pipeline::decode::{iter_stream_pairs, probe_video};
-    use vr180_pipeline::encode::H265Encoder;
     use vr180_pipeline::gpu::Device;
 
     let probe = probe_video(input)?;
     let out_w = eye_w * 2;
     let out_h = eye_w;
-    let fps = fps.unwrap_or(probe.fps);
 
-    println!("Export (CPU-assemble path): {} → {}", input.display(), output.display());
+    println!("Export (CPU-assemble path) segment: {}", input.display());
     println!("  source : {} × {}  @ {:.3} fps  ({:.1}s)",
         probe.width, probe.height, probe.fps, probe.duration_sec);
     println!("  output : {} × {}  @ {:.3} fps  H.265 ({}) {} kbps",
@@ -1213,12 +1307,9 @@ fn export_cpu_assemble(
     println!("  decode : {} (probed {}×{}, EAC tile_w={})",
         decoder.decode_path(), dims.stream_w, dims.stream_h, dims.tile_w());
 
-    let mut encoder = H265Encoder::create(output, out_w, out_h, fps, bitrate_kbps, encoder_backend)?;
-    if apmp { encoder.tag_apmp_vr180_sbs()?; }
     let mut cross_a = vec![0u8; cw * cw * 3];
     let mut cross_b = vec![0u8; cw * cw * 3];
 
-    let t_start = std::time::Instant::now();
     let mut frame_idx: u32 = 0;
     let mut last_print = std::time::Instant::now();
     while let Some(pair) = decoder.next_pair()? {
@@ -1234,7 +1325,8 @@ fn export_cpu_assemble(
         //   Lens B (s4/BACK) → LEFT eye
         // (After the yaw mod, the lens labeled A is physically on
         // the right side of the user's head.)
-        let (f_left, f_right) = per_eye_frame_for_frame(frames, frame_idx);
+        let global_idx = frame_offset + frame_idx;
+        let (f_left, f_right) = per_eye_frame_for_frame(frames, global_idx);
         let left_tex  = device.project_cross_to_equirect_texture(
             &cross_b, dims.cross_w(), eye_w, out_h, f_left.rotation, f_left.rs)?;
         let right_tex = device.project_cross_to_equirect_texture(
@@ -1243,10 +1335,9 @@ fn export_cpu_assemble(
         let right = device.apply_color_stack_texture(&right_tex, eye_w, out_h, &plan)?;
         encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
         frame_idx += 1;
-        progress_tick(frame_idx, t_start, &mut last_print);
+        progress_tick(global_idx + 1, t_start, &mut last_print);
+        if frame_idx >= n_frames { break; }
     }
-    encoder.finish()?;
-    finish_export(output, frame_idx, t_start)?;
     Ok(())
 }
 
@@ -1260,39 +1351,34 @@ fn export_cpu_assemble(
 #[cfg(target_os = "macos")]
 fn export_zero_copy(
     input: &std::path::Path,
-    output: &std::path::Path,
     eye_w: u32,
     n_frames: u32,
-    fps: Option<f32>,
-    bitrate_kbps: u32,
+    fps: f32,
     lut_spec: Option<&str>,
     lut_intensity: f32,
-    encoder_backend: vr180_pipeline::encode::EncoderBackend,
     zero_copy_encode: bool,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
-    apmp: bool,
     frames: &PerFrameEyeFrames,
+    frame_offset: u32,
+    encoder: &mut vr180_pipeline::encode::H265Encoder,
+    t_start: std::time::Instant,
 ) -> anyhow::Result<()> {
     use vr180_pipeline::decode::{ZeroCopyStreamPairIter, probe_video};
-    use vr180_pipeline::encode::H265Encoder;
     use vr180_pipeline::gpu::{Device, Lens};
     use vr180_pipeline::interop_macos::create_bgra_encode_buffer;
 
     let probe = probe_video(input)?;
     let out_w = eye_w * 2;
     let out_h = eye_w;
-    let fps = fps.unwrap_or(probe.fps);
-    let enc_label = encoder_label(encoder_backend);
 
-    println!("Export (zero-copy IOSurface path): {} → {}", input.display(), output.display());
+    println!("Export (zero-copy IOSurface path) segment: {}", input.display());
     println!("  source : {} × {}  @ {:.3} fps  ({:.1}s)",
         probe.width, probe.height, probe.fps, probe.duration_sec);
-    println!("  output : {} × {}  @ {:.3} fps  H.265 ({}) {} kbps",
-        out_w, out_h, fps, enc_label, bitrate_kbps);
+    println!("  output : {} × {}  @ {:.3} fps", out_w, out_h, fps);
     if zero_copy_encode {
         println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → equirect_tex → color stack → SBS BGRA IOSurface) → VT encoder (zero-copy)");
     } else {
-        println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → equirect_tex → color stack) → readback → {}", enc_label);
+        println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → equirect_tex → color stack) → readback → HEVC");
     }
 
     let plan = build_color_plan(plan_template, lut_spec, lut_intensity)?;
@@ -1304,17 +1390,6 @@ fn export_zero_copy(
     println!("  decode : VideoToolbox (probed {}×{}, EAC tile_w={})",
         dims.stream_w, dims.stream_h, dims.tile_w());
 
-    // Encoder construction differs by path. Zero-copy-encode uses a
-    // dedicated constructor that wires hw_device_ctx + hw_frames_ctx so
-    // the encoder accepts AVFrames in AV_PIX_FMT_VIDEOTOOLBOX format.
-    let mut encoder = if zero_copy_encode {
-        H265Encoder::create_zero_copy_vt(output, out_w, out_h, fps, bitrate_kbps)?
-    } else {
-        H265Encoder::create(output, out_w, out_h, fps, bitrate_kbps, encoder_backend)?
-    };
-    if apmp { encoder.tag_apmp_vr180_sbs()?; }
-
-    let t_start = std::time::Instant::now();
     let mut frame_idx: u32 = 0;
     let mut last_print = std::time::Instant::now();
     while let Some(pair) = decoder.next_pair(&device.device)? {
@@ -1335,7 +1410,8 @@ fn export_zero_copy(
         // (matches Python convention + project memory; after yaw mod
         // the lens labeled A is physically on the right side of the
         // user's head).
-        let (f_left, f_right) = per_eye_frame_for_frame(frames, frame_idx);
+        let global_idx = frame_offset + frame_idx;
+        let (f_left, f_right) = per_eye_frame_for_frame(frames, global_idx);
         let left_tex  = device.project_cross_texture_to_equirect_texture(
             &cross_b, eye_w, out_h, f_left.rotation, f_left.rs)?;
         let right_tex = device.project_cross_texture_to_equirect_texture(
@@ -1364,10 +1440,9 @@ fn export_zero_copy(
         // the underlying CVPixelBuffer for the next frame.
         drop(pair);
         frame_idx += 1;
-        progress_tick(frame_idx, t_start, &mut last_print);
+        progress_tick(global_idx + 1, t_start, &mut last_print);
+        if frame_idx >= n_frames { break; }
     }
-    encoder.finish()?;
-    finish_export(output, frame_idx, t_start)?;
     Ok(())
 }
 

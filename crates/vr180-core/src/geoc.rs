@@ -87,6 +87,93 @@ pub fn parse_geoc(path: &Path) -> std::io::Result<Option<Geoc>> {
     Ok(parse_geoc_bytes(&tail))
 }
 
+/// Locate the SROT (Sensor Read-Out Time) value in raw bytes.
+///
+/// SROT can live in either the GPMF telemetry stream (between samples
+/// from a given stream) or in the file tail's geometry-calibration
+/// block (alongside GEOC). Both encodings are GPMF-style records:
+///
+/// - `'J'` / 8 bytes: uint64 microseconds → ms (÷ 1000)
+/// - `'L'` / 4 bytes: uint32 microseconds → ms (÷ 1000)
+/// - `'f'` / 4 bytes: float32 ms (or μs if `> 1000`)
+///
+/// Returns the SROT in **milliseconds** if found; `None` otherwise.
+/// Caller divides by 1000 for seconds.
+///
+/// Mirrors `vr180_gui.py::parse_srot` (lines 3939-3978).
+pub fn find_srot_ms(data: &[u8]) -> Option<f32> {
+    let mut idx = 0usize;
+    while idx + 8 <= data.len() {
+        let Some(found) = find_subslice(&data[idx..], b"SROT") else { return None; };
+        let pos = idx + found;
+        if pos + 8 > data.len() {
+            return None;
+        }
+        let type_char = data[pos + 4];
+        let struct_size = data[pos + 5] as usize;
+        let count = u16::from_be_bytes([data[pos + 6], data[pos + 7]]) as usize;
+
+        if count < 1 || pos + 8 + struct_size > data.len() {
+            idx = pos + 1;
+            continue;
+        }
+        let payload = &data[pos + 8..pos + 8 + struct_size];
+
+        match (type_char, struct_size) {
+            (b'J', 8) => {
+                let micros = u64::from_be_bytes(payload.try_into().ok()?);
+                return Some(micros as f32 / 1000.0);  // μs → ms
+            }
+            (b'L', 4) => {
+                let micros = u32::from_be_bytes(payload.try_into().ok()?);
+                return Some(micros as f32 / 1000.0);
+            }
+            (b'f', 4) => {
+                let v = f32::from_be_bytes(payload.try_into().ok()?);
+                // Heuristic from Python: > 1000 implies μs were
+                // mis-typed as ms, divide; otherwise the value is
+                // already ms.
+                return Some(if v > 1000.0 { v / 1000.0 } else { v });
+            }
+            _ => {
+                // Some other field happens to spell `SROT`; keep
+                // searching past this position.
+                idx = pos + 1;
+                continue;
+            }
+        }
+    }
+    None
+}
+
+/// Look up the SROT for one .360 file. Tries (in order):
+/// 1. The optional GPMF bytes (cheap — caller usually already has them).
+/// 2. The last 512 KiB of the file (where GEOC lives).
+///
+/// Returns SROT in **seconds**. `None` if not found in either place;
+/// caller should fall back to a sensible default (15.224 ms = the
+/// GoPro Max constant).
+pub fn lookup_srot_s(
+    path: &Path,
+    gpmf: Option<&[u8]>,
+) -> std::io::Result<Option<f32>> {
+    if let Some(g) = gpmf {
+        if let Some(ms) = find_srot_ms(g) {
+            return Ok(Some(ms / 1000.0));
+        }
+    }
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_SIZE: u64 = 512 * 1024;
+    let mut f = std::fs::File::open(path)?;
+    let file_size = f.metadata()?.len();
+    let read_size = TAIL_SIZE.min(file_size);
+    let start = file_size - read_size;
+    f.seek(SeekFrom::Start(start))?;
+    let mut tail = vec![0u8; read_size as usize];
+    f.read_exact(&mut tail)?;
+    Ok(find_srot_ms(&tail).map(|ms| ms / 1000.0))
+}
+
 /// Parse GEOC from raw tail bytes. Returns `None` if no `GEOC` marker
 /// is found. Public to make unit testing easy without touching disk.
 pub fn parse_geoc_bytes(tail: &[u8]) -> Option<Geoc> {
@@ -277,6 +364,58 @@ mod tests {
     fn no_geoc_returns_none() {
         let buf = vec![0u8; 4096];
         assert!(parse_geoc_bytes(&buf).is_none());
+    }
+
+    #[test]
+    fn find_srot_uint64_microseconds() {
+        // Build a record: "SROT" + 'J' (uint64) + struct_size=8 +
+        // count=1 + payload = 15224 μs (15.224 ms).
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&[0u8; 16]);  // some prefix junk
+        buf.extend_from_slice(b"SROT");
+        buf.push(b'J');
+        buf.push(8);
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        buf.extend_from_slice(&(15224u64).to_be_bytes());
+        let ms = find_srot_ms(&buf).expect("should find SROT");
+        assert!((ms - 15.224).abs() < 1e-3, "got {} ms", ms);
+    }
+
+    #[test]
+    fn find_srot_float_ms_direct() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"SROT");
+        buf.push(b'f');
+        buf.push(4);
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        buf.extend_from_slice(&(12.5_f32).to_be_bytes());
+        let ms = find_srot_ms(&buf).expect("should find SROT");
+        assert!((ms - 12.5).abs() < 1e-4, "got {} ms", ms);
+    }
+
+    #[test]
+    fn find_srot_returns_none_when_absent() {
+        let buf = vec![0u8; 4096];
+        assert!(find_srot_ms(&buf).is_none());
+    }
+
+    #[test]
+    fn find_srot_skips_invalid_match() {
+        // "SROT" appearing in junk bytes (not as a real GPMF record).
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"SROT");
+        buf.push(b'Z');   // unknown type
+        buf.push(99);
+        buf.extend_from_slice(&[0u8, 0u8]);
+        buf.extend_from_slice(&[0u8; 100]);
+        // Then a real SROT entry.
+        buf.extend_from_slice(b"SROT");
+        buf.push(b'L');
+        buf.push(4);
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        buf.extend_from_slice(&(20000u32).to_be_bytes()); // 20 ms
+        let ms = find_srot_ms(&buf).expect("should find real SROT past junk");
+        assert!((ms - 20.0).abs() < 1e-4);
     }
 
     fn emit_record(

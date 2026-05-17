@@ -15,6 +15,7 @@ pub mod project;
 pub mod gyro;
 pub mod eac;
 pub mod geoc;
+pub mod segments;
 pub mod color;
 pub mod atoms;
 
