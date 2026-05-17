@@ -403,17 +403,65 @@ Output validation: PSNR(graded vs baseline) Y=35.9 dB, **U=22.5 dB**,
 V=37.3 dB — chroma U is hit hardest, exactly as expected from
 `temperature=+0.4` (warming = +R / −B → big U shift).
 
-### Known follow-up (Phase 0.7.5.5 — color-stack texture chaining)
+## Phase 0.7.5.5 — Color-stack texture chaining ✅
 
-The 4× perf drop with all color tools active is from **per-tool readback
-round-trip**: each `apply_*` does `Vec<u8>` upload → dispatch → `Vec<u8>`
-readback. With 4 tools active that's 4 wgpu submits and 4 staging-buffer
-maps per frame. The fix is to expose `apply_*_texture` variants that
-take and return `wgpu::Texture` so the color stack stays GPU-resident,
-and only the final stitched frame reads back. Defer until a user
-actually wants to grade in production — the export pipeline still hits
-**7 fps at 4K full-stack**, which beats the Python app's ~5 fps at the
-same workload.
+The Phase 0.7.5 color tools each ran their own upload → dispatch →
+readback cycle, so a 4-tool grade meant 4 wgpu submits + 4 GPU sync
+waits + 4 staging-buffer memcpys per frame. This phase keeps the
+equirect texture GPU-resident through every active color stage —
+one encoder, one submit, one readback per frame regardless of how
+many tools are on.
+
+- [x] `record_*` internal helpers (`record_cdl`, `record_color_grade`,
+      `record_lut3d`, `record_sharpen`, `record_mid_detail`,
+      `record_equirect_project`) — each records dispatches into a
+      caller-supplied `wgpu::CommandEncoder`, never submits, never
+      reads back.
+- [x] `project_cross_to_equirect_texture` + `project_cross_texture_to_equirect_texture`
+      — texture-returning variants of the existing `project_*` methods.
+      Both export paths use these now; the original `Vec<u8>`-returning
+      methods stay for any one-off callers.
+- [x] `ColorStackPlan` — public param bundle (CDL + LUT + sharpen +
+      mid-detail + color_grade). `any_active()` predicate for the
+      log-line check.
+- [x] `Device::apply_color_stack_texture(&Texture, w, h, &plan) -> Vec<u8>`
+      — the new primary API. Builds one encoder, allocates a fresh
+      intermediate texture per active stage (identity stages are
+      skipped and allocate nothing), records every dispatch, submits
+      once, reads back the final texture. Used by both
+      `export_cpu_assemble` and `export_zero_copy`.
+- [x] `main.rs` refactored to thread `ColorStackPlan` end-to-end
+      instead of the per-stage `ColorParams` + `apply_color_stack`
+      helper. CLI flags unchanged; user-visible behavior is identical
+      apart from the speed.
+
+**Benchmark** (200 frames, `NO firmware RS No IORI.360`, 4096×2048
+SBS, `--zero-copy` + VT encode, M-series Apple Silicon):
+
+| Configuration                              | 0.7.5 fps | **0.7.5.5 fps** | Speedup |
+|--------------------------------------------|-----------|-----------------|---------|
+| Identity (no color tools)                  | 30.29     | 30.71           | (within noise — nothing to optimize) |
+| Heavy grade (CDL + sharpen + clarity + grade) | 7.07      | **24.79**       | **3.5×** |
+| Heavy grade + bundled 3D LUT (5 stages)    | n/a       | **24.02**       | — |
+
+**Bit-validation**: PSNR(0.7.5.5 chained vs 0.7.5 per-stage) =
+**∞ on Y / U / V** (frame-perfect match on 60 frames of the same heavy
+grade params). The texture-chaining refactor preserves the math
+exactly — same shaders, same dispatch order, same uniforms — only the
+host↔device transfer schedule changes. No PSNR cost for the speedup.
+
+### Known limitations
+
+- 4096×2048 ≠ real-time for the heavy-grade case (24.79 fps vs 30 fps
+  target). The next obvious lever is **eliminating the final readback**:
+  pass the GPU texture directly to a `hevc_videotoolbox` encoder via
+  CVPixelBuffer interop instead of going to host RAM. That would
+  remove the only remaining staging-buffer round-trip per frame.
+  Defer until needed.
+- The 5 intermediate textures (one per active stage + the sharpen /
+  mid-detail scratch) allocate fresh wgpu textures every frame. A
+  per-Device texture pool keyed by `(w, h, format, usage)` would amortize
+  the allocator cost; estimated 0.5–1 fps win, deferred until needed.
 
 ### Known follow-up (10-bit lift)
 
@@ -421,7 +469,10 @@ These shaders all read `texture_2d<f32>` (filterable float) and write
 `texture_storage_2d<rgba8unorm, write>`. Switching the storage format
 to `rgba16float` is a one-line change per shader once the 10-bit
 pipeline lands (Phase 0.7.6 / 0.8.5.10). The float math itself
-doesn't change.
+doesn't change. The chained pipeline is well-positioned for this lift:
+every intermediate texture is allocated in one place
+(`apply_color_stack_texture`), so swapping the format threads through
+the whole stack with no per-shader edits.
 
 ## Phase 0.8 — H.265 encode + multi-frame export ✅
 

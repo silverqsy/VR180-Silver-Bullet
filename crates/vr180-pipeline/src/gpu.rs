@@ -1850,6 +1850,520 @@ fn bgle_uniform(binding: u32, size_bytes: u64) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+// ===== Phase 0.7.5.5: GPU texture chaining =====
+//
+// The pre-0.7.5.5 `apply_*` methods each ran their own
+// upload → dispatch → readback cycle. With four color stages active
+// (CDL + sharpen + mid-detail + color_grade) that's 4 wgpu submits, 4
+// GPU sync waits, and 4 staging-buffer memcpys per frame — the entire
+// color pipeline is bottlenecked on host↔device transfers.
+//
+// The fix here is to:
+// (a) project the EAC cross to an equirect *texture* instead of a
+//     `Vec<u8>` (`project_*_to_equirect_texture` below),
+// (b) chain every active color stage into one shared encoder via
+//     `record_*` helpers — each one records dispatches but does NOT
+//     submit and does NOT read back,
+// (c) submit the whole thing once and read back only the final
+//     texture (`apply_color_stack_texture`).
+//
+// Net: 1 submit, 1 staging-buffer round-trip per frame, regardless of
+// how many color tools are active.
+
+/// Param bundle for the full Phase 0.7.5 color stack — what
+/// `apply_color_stack_texture` consumes. Mirrors `ColorParams` in
+/// `vr180-render` but lives in `vr180-pipeline` so the chained API
+/// can be called by anything (not just the CLI).
+#[derive(Debug, Clone)]
+pub struct ColorStackPlan {
+    pub cdl:         CdlParams,
+    pub lut:         Option<(vr180_core::color::Cube3DLut, f32)>,
+    pub sharpen:     SharpenParams,
+    pub mid_detail:  MidDetailParams,
+    pub color_grade: ColorGradeParams,
+}
+
+impl Default for ColorStackPlan {
+    fn default() -> Self {
+        Self {
+            cdl: CdlParams::default(),
+            lut: None,
+            sharpen: SharpenParams::default(),
+            mid_detail: MidDetailParams::default(),
+            color_grade: ColorGradeParams::default(),
+        }
+    }
+}
+
+impl ColorStackPlan {
+    pub fn any_active(&self) -> bool {
+        !self.cdl.is_identity()
+            || self.lut.is_some()
+            || !self.sharpen.is_identity()
+            || !self.mid_detail.is_identity()
+            || !self.color_grade.is_identity()
+    }
+}
+
+impl Device {
+    /// Project an EAC cross (`cross_w × cross_w`, Rgba8Unorm, on the GPU
+    /// already) to a half-equirect texture (`out_w × out_h`, Rgba8Unorm,
+    /// also on the GPU). No readback — caller chains into the color
+    /// stack and reads back at the end.
+    ///
+    /// Texture-resident sibling of `project_cross_texture_to_equirect`.
+    pub fn project_cross_texture_to_equirect_texture(
+        &self,
+        cross_tex: &wgpu::Texture,
+        out_w: u32, out_h: u32,
+    ) -> Result<wgpu::Texture> {
+        let output_tex = make_rw_texture(&self.device, "equirect_tex_out", out_w, out_h,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("project_tex_enc"),
+        });
+        self.record_equirect_project(&mut encoder, cross_tex, &output_tex, out_w, out_h);
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// CPU-input version of the above: takes a packed RGB8 cross,
+    /// uploads it as an Rgba8Unorm texture, projects, returns the
+    /// projected texture (no readback). For the CPU-assemble path.
+    pub fn project_cross_to_equirect_texture(
+        &self,
+        cross_rgb: &[u8],
+        cross_w: u32,
+        out_w: u32, out_h: u32,
+    ) -> Result<wgpu::Texture> {
+        let cross_rgba = rgb_to_rgba(cross_rgb, cross_w as usize, cross_w as usize);
+        let cross_tex = make_rw_texture(&self.device, "cross_for_project",
+            cross_w, cross_w,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        self.upload_rgba(&cross_tex, &cross_rgba, cross_w, cross_w);
+        self.project_cross_texture_to_equirect_texture(&cross_tex, out_w, out_h)
+    }
+
+    /// Apply the full Phase 0.7.5 color stack to one equirect texture,
+    /// reading back the final result as packed RGB8.
+    ///
+    /// One encoder, one submit, one readback regardless of how many
+    /// color stages are active. Stages with identity params are skipped
+    /// (no GPU work, no allocated intermediate texture).
+    ///
+    /// Order matches Phase 0.7.5 / Python: CDL → LUT3D → sharpen →
+    /// mid-detail → color_grade.
+    pub fn apply_color_stack_texture(
+        &self,
+        equirect_tex: &wgpu::Texture,
+        w: u32, h: u32,
+        plan: &ColorStackPlan,
+    ) -> Result<Vec<u8>> {
+        let t_total = Instant::now();
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("color_stack_enc"),
+        });
+        // intermediates owns each newly-created stage output. We hand
+        // out `&wgpu::Texture` to `record_*` calls and to the readback
+        // step; NLL lets us push into the Vec right after the borrow
+        // ends.
+        let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(5);
+
+        // LUT3D resources outlive the encoder; allocate them in the
+        // outer scope so the textures + sampler stay live until submit.
+        let lut_resources = if let Some((ref lut, _)) = plan.lut {
+            Some(self.upload_lut3d_resources(lut))
+        } else { None };
+
+        // Stage 1: CDL.
+        if !plan.cdl.is_identity() {
+            let next = make_rw_texture(&self.device, "stack_cdl_out", w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC);
+            let prev = intermediates.last().unwrap_or(equirect_tex);
+            self.record_cdl(&mut encoder, prev, &next, plan.cdl);
+            intermediates.push(next);
+        }
+
+        // Stage 2: 3D LUT.
+        if let (Some((_, intensity)), Some(ref lr)) = (&plan.lut, &lut_resources) {
+            let next = make_rw_texture(&self.device, "stack_lut_out", w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC);
+            let prev = intermediates.last().unwrap_or(equirect_tex);
+            self.record_lut3d(&mut encoder, prev, &next, lr, *intensity, w, h);
+            intermediates.push(next);
+        }
+
+        // Stage 3: sharpen (3 internal dispatches).
+        if !plan.sharpen.is_identity() {
+            let next = make_rw_texture(&self.device, "stack_sharpen_out", w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC);
+            let prev = intermediates.last().unwrap_or(equirect_tex);
+            // Need full-frame intermediate textures for the H-blur and V-blur.
+            // They're allocated here so they stay alive until submit, and they
+            // can't be shared across stages (sharpen vs mid-detail might run
+            // concurrently in a future fused pass, so we keep them local).
+            let blur_h = make_rw_texture(&self.device, "stack_sharp_blur_h", w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            let blur_v = make_rw_texture(&self.device, "stack_sharp_blur_v", w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            self.record_sharpen(&mut encoder, prev, &blur_h, &blur_v, &next,
+                w, h, plan.sharpen);
+            intermediates.push(blur_h);   // keep alive
+            intermediates.push(blur_v);   // keep alive
+            intermediates.push(next);
+        }
+
+        // Stage 4: mid-detail (4 internal dispatches).
+        if !plan.mid_detail.is_identity() {
+            let next = make_rw_texture(&self.device, "stack_mid_out", w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC);
+            let prev = intermediates.last().unwrap_or(equirect_tex);
+            let sw = (w + 3) / 4;
+            let sh = (h + 3) / 4;
+            let small = make_rw_texture(&self.device, "stack_mid_small", sw, sh,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            let small_h = make_rw_texture(&self.device, "stack_mid_small_h", sw, sh,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            let small_v = make_rw_texture(&self.device, "stack_mid_small_v", sw, sh,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            self.record_mid_detail(&mut encoder, prev,
+                &small, &small_h, &small_v, &next,
+                w, h, sw, sh, plan.mid_detail);
+            intermediates.push(small);
+            intermediates.push(small_h);
+            intermediates.push(small_v);
+            intermediates.push(next);
+        }
+
+        // Stage 5: color grade (temp/tint/sat).
+        if !plan.color_grade.is_identity() {
+            let next = make_rw_texture(&self.device, "stack_grade_out", w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC);
+            let prev = intermediates.last().unwrap_or(equirect_tex);
+            self.record_color_grade(&mut encoder, prev, &next, plan.color_grade);
+            intermediates.push(next);
+        }
+
+        // Pick the final stage output (or fall back to the equirect input
+        // if every stage was identity — in which case we're just doing a
+        // GPU→host download of the equirect).
+        // Filter out intermediates that aren't valid readback sources
+        // (the blur scratch textures lack COPY_SRC); use the last one
+        // we pushed that DID get COPY_SRC, which is the "_out" texture
+        // of the most recent active stage. We keep a parallel index for
+        // this — simpler than annotating each push.
+        // Trick: only the *_out textures got COPY_SRC. Walk backwards
+        // looking for one we explicitly named with "_out".
+        let final_tex = intermediates.iter().rev()
+            .find(|t| {
+                // wgpu::Texture exposes its usage; check COPY_SRC.
+                t.usage().contains(wgpu::TextureUsages::COPY_SRC)
+            })
+            .unwrap_or(equirect_tex);
+
+        let rb = self.encode_readback_rgb(&mut encoder, final_tex, w, h)?;
+        self.queue.submit(Some(encoder.finish()));
+        let result = self.finalize_readback(rb)?;
+        tracing::debug!(elapsed=?t_total.elapsed(),
+            stages = intermediates.len(),
+            "apply_color_stack_texture");
+        Ok(result)
+    }
+
+    // ----- record_* helpers — encode into a caller-supplied encoder, -----
+    // ----- no submit, no readback. The dst texture must outlive the encoder.
+
+    fn record_equirect_project(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        cross_tex: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        out_w: u32, out_h: u32,
+    ) {
+        let cross_v = cross_tex.create_view(&Default::default());
+        let dst_v = dst.create_view(&Default::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("equirect_project_bg"),
+            layout: &self.eac_to_equirect.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&cross_v) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.eac_to_equirect.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_v) },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("equirect_project_pass"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.eac_to_equirect.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+    }
+
+    fn record_cdl(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        params: CdlParams,
+    ) {
+        let uniforms = CdlUniforms {
+            lift: params.lift, gamma: params.gamma, gain: params.gain,
+            shadow: params.shadow, highlight: params.highlight,
+            _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
+        };
+        let uni = self.write_uniform("cdl_chain_u", &uniforms);
+        let dims = (dst.width(), dst.height());
+        self.record_per_pixel(encoder, "cdl_chain", &self.cdl, src, dst, &uni, dims);
+    }
+
+    fn record_color_grade(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        params: ColorGradeParams,
+    ) {
+        let uniforms = ColorGradeUniforms {
+            temperature: params.temperature,
+            tint: params.tint,
+            saturation: params.saturation,
+            _pad: 0.0,
+        };
+        let uni = self.write_uniform("grade_chain_u", &uniforms);
+        let dims = (dst.width(), dst.height());
+        self.record_per_pixel(encoder, "grade_chain", &self.color_grade, src, dst, &uni, dims);
+    }
+
+    fn record_per_pixel(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        pipeline: &PerPixelPipeline,
+        src: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        uni: &wgpu::Buffer,
+        (w, h): (u32, u32),
+    ) {
+        let bg_label = format!("{label}_bg");
+        let pass_label = format!("{label}_pass");
+        let src_v = src.create_view(&Default::default());
+        let dst_v = dst.create_view(&Default::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&bg_label),
+            layout: &pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&dst_v) },
+                wgpu::BindGroupEntry { binding: 2, resource: uni.as_entire_binding() },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(&pass_label), timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+    }
+
+    fn record_sharpen(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        blur_h: &wgpu::Texture,
+        blur_v: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        w: u32, h: u32,
+        params: SharpenParams,
+    ) {
+        let blur_h_u = self.write_uniform("sharp_chain_h_u",
+            &GaussianBlur1dUniforms { sigma: params.sigma, direction: 0, _pad0: 0, _pad1: 0 });
+        let blur_v_u = self.write_uniform("sharp_chain_v_u",
+            &GaussianBlur1dUniforms { sigma: params.sigma, direction: 1, _pad0: 0, _pad1: 0 });
+        let combine_u = self.write_uniform("sharp_chain_c_u",
+            &SharpenCombineUniforms {
+                amount: params.amount,
+                apply_lat_weight: if params.apply_lat_weight { 1 } else { 0 },
+                _pad0: 0, _pad1: 0,
+            });
+        self.dispatch_blur_1d(encoder, "sharp_chain_h", src,   blur_h, &blur_h_u, w, h);
+        self.dispatch_blur_1d(encoder, "sharp_chain_v", blur_h, blur_v, &blur_v_u, w, h);
+        let src_v   = src.create_view(&Default::default());
+        let blur_vv = blur_v.create_view(&Default::default());
+        let dst_v   = dst.create_view(&Default::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sharp_chain_combine_bg"),
+            layout: &self.sharpen_combine.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&blur_vv) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_v) },
+                wgpu::BindGroupEntry { binding: 3, resource: combine_u.as_entire_binding() },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("sharp_chain_combine_pass"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.sharpen_combine.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+    }
+
+    fn record_mid_detail(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        small: &wgpu::Texture,
+        small_h: &wgpu::Texture,
+        small_v: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        w: u32, h: u32, sw: u32, sh: u32,
+        params: MidDetailParams,
+    ) {
+        let blur_h_u = self.write_uniform("mid_chain_h_u",
+            &GaussianBlur1dUniforms { sigma: params.sigma, direction: 0, _pad0: 0, _pad1: 0 });
+        let blur_v_u = self.write_uniform("mid_chain_v_u",
+            &GaussianBlur1dUniforms { sigma: params.sigma, direction: 1, _pad0: 0, _pad1: 0 });
+        let combine_u = self.write_uniform("mid_chain_c_u",
+            &MidDetailCombineUniforms { amount: params.amount, _pad0: 0.0, _pad1: 0.0, _pad2: 0.0 });
+
+        // Pass 1: 4× downsample.
+        {
+            let src_v   = src.create_view(&Default::default());
+            let small_v = small.create_view(&Default::default());
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mid_chain_ds_bg"),
+                layout: &self.downsample_4x.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&small_v) },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mid_chain_ds_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.downsample_4x.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((sw + 7) / 8, (sh + 7) / 8, 1);
+        }
+        // Passes 2 + 3: blur the small image.
+        self.dispatch_blur_1d(encoder, "mid_chain_h", small,   small_h, &blur_h_u, sw, sh);
+        self.dispatch_blur_1d(encoder, "mid_chain_v", small_h, small_v, &blur_v_u, sw, sh);
+        // Pass 4: upsample-combine to full-res output.
+        {
+            let src_v       = src.create_view(&Default::default());
+            let smallv_view = small_v.create_view(&Default::default());
+            let dst_v       = dst.create_view(&Default::default());
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mid_chain_combine_bg"),
+                layout: &self.mid_detail_combine.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&smallv_view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.bilinear_sampler) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dst_v) },
+                    wgpu::BindGroupEntry { binding: 4, resource: combine_u.as_entire_binding() },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mid_chain_combine_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.mid_detail_combine.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+        }
+    }
+
+    /// Upload the LUT texture + sampler. Held by the caller for the
+    /// duration of the encoder. Same content as `apply_lut3d` builds
+    /// inside its own scope.
+    fn upload_lut3d_resources(&self, lut: &vr180_core::color::Cube3DLut) -> Lut3DResources {
+        let lut_bytes = lut.to_rgba8_for_upload();
+        let lut_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("stack_lut3d"),
+            size: wgpu::Extent3d {
+                width: lut.size, height: lut.size, depth_or_array_layers: lut.size,
+            },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &lut_tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+            },
+            &lut_bytes,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(lut.size * 4),
+                rows_per_image: Some(lut.size),
+            },
+            wgpu::Extent3d {
+                width: lut.size, height: lut.size, depth_or_array_layers: lut.size,
+            },
+        );
+        Lut3DResources { tex: lut_tex, size: lut.size }
+    }
+
+    fn record_lut3d(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        lut_res: &Lut3DResources,
+        intensity: f32,
+        w: u32, h: u32,
+    ) {
+        let uniforms = Lut3DUniforms {
+            size: lut_res.size,
+            intensity,
+            _pad0: 0, _pad1: 0,
+        };
+        let uni = self.write_uniform("lut3d_chain_u", &uniforms);
+        let src_v = src.create_view(&Default::default());
+        let lut_v = lut_res.tex.create_view(&Default::default());
+        let dst_v = dst.create_view(&Default::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lut3d_chain_bg"),
+            layout: &self.lut3d.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&lut_v) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.lut3d.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dst_v) },
+                wgpu::BindGroupEntry { binding: 4, resource: uni.as_entire_binding() },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("lut3d_chain_pass"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.lut3d.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+    }
+}
+
+/// Outlives the encoder that uses it — the LUT texture + its size.
+/// (No sampler held here; `Device::lut3d.sampler` is the shared one.)
+struct Lut3DResources {
+    tex: wgpu::Texture,
+    size: u32,
+}
+
 // ----- Phase 0.7.5 smoke tests -----
 //
 // Synthetic 8×8 inputs, exercise each color tool's identity case

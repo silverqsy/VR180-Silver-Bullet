@@ -290,12 +290,19 @@ fn main() -> anyhow::Result<()> {
             sharpen, sharpen_sigma,
             mid_detail, mid_detail_sigma,
         }) => {
-            use vr180_pipeline::gpu::{CdlParams, ColorGradeParams, SharpenParams, MidDetailParams};
-            let color = ColorParams {
+            use vr180_pipeline::gpu::{
+                CdlParams, ColorGradeParams, SharpenParams, MidDetailParams,
+                ColorStackPlan,
+            };
+            // Build the color plan from the CLI knobs. The LUT field is
+            // filled in inside each export function (after the .cube file
+            // is parsed) so the plan can be cloned per-frame cheaply.
+            let plan_template = ColorStackPlan {
                 cdl: CdlParams {
                     lift: cdl_lift, gamma: cdl_gamma, gain: cdl_gain,
                     shadow: cdl_shadow, highlight: cdl_highlight,
                 },
+                lut: None,
                 color_grade: ColorGradeParams { temperature, tint, saturation },
                 sharpen: SharpenParams {
                     amount: sharpen, sigma: sharpen_sigma,
@@ -307,32 +314,8 @@ fn main() -> anyhow::Result<()> {
             };
             export(&input, &output, eye_w, frames, fps, bitrate,
                    lut.as_deref(), lut_intensity, hw_accel.into(),
-                   encoder.resolve(), zero_copy, color)
+                   encoder.resolve(), zero_copy, plan_template)
         }
-    }
-}
-
-/// Bundle of the four Phase 0.7.5 color tools' params. Each field is
-/// passed through with the user's CLI value (or the param struct's
-/// `Default::default()` identity values if the user didn't override).
-/// The `Device::apply_*` methods short-circuit on identity, so an
-/// all-identity ColorParams adds zero GPU work to the frame loop.
-#[derive(Debug, Clone, Copy)]
-struct ColorParams {
-    cdl:         vr180_pipeline::gpu::CdlParams,
-    color_grade: vr180_pipeline::gpu::ColorGradeParams,
-    sharpen:     vr180_pipeline::gpu::SharpenParams,
-    mid_detail:  vr180_pipeline::gpu::MidDetailParams,
-}
-
-impl ColorParams {
-    /// True when no color stage will actually do work — used for the
-    /// per-frame log line so users can verify their flags took effect.
-    fn any_active(&self) -> bool {
-        !self.cdl.is_identity()
-            || !self.color_grade.is_identity()
-            || !self.sharpen.is_identity()
-            || !self.mid_detail.is_identity()
     }
 }
 
@@ -348,7 +331,7 @@ fn export(
     hw: vr180_pipeline::decode::HwDecode,
     encoder: vr180_pipeline::encode::EncoderBackend,
     zero_copy: bool,
-    color: ColorParams,
+    plan_template: vr180_pipeline::gpu::ColorStackPlan,
 ) -> anyhow::Result<()> {
     if zero_copy && !cfg!(target_os = "macos") {
         anyhow::bail!(
@@ -367,17 +350,19 @@ fn export(
     if zero_copy {
         #[cfg(target_os = "macos")]
         return export_zero_copy(input, output, eye_w, n_frames, fps, bitrate_kbps,
-                                lut_spec, lut_intensity, encoder, color);
+                                lut_spec, lut_intensity, encoder, plan_template);
         #[cfg(not(target_os = "macos"))]
         unreachable!()
     } else {
         export_cpu_assemble(input, output, eye_w, n_frames, fps, bitrate_kbps,
-                            lut_spec, lut_intensity, hw, encoder, color)
+                            lut_spec, lut_intensity, hw, encoder, plan_template)
     }
 }
 
 /// Phase 0.6 / 0.7 / 0.8 path: hwaccel decode → host-memory NV12 →
-/// swscale RGB → CPU EAC assembly → GPU projection + color tools → HEVC.
+/// swscale RGB → CPU EAC assembly → GPU projection + chained color
+/// stack → HEVC. As of Phase 0.7.5.5 the equirect output stays on the
+/// GPU through the entire color chain (one submit, one readback).
 fn export_cpu_assemble(
     input: &std::path::Path,
     output: &std::path::Path,
@@ -389,7 +374,7 @@ fn export_cpu_assemble(
     lut_intensity: f32,
     hw: vr180_pipeline::decode::HwDecode,
     encoder_backend: vr180_pipeline::encode::EncoderBackend,
-    color: ColorParams,
+    plan_template: vr180_pipeline::gpu::ColorStackPlan,
 ) -> anyhow::Result<()> {
     use vr180_core::eac::{assemble_lens_a, assemble_lens_b};
     use vr180_pipeline::decode::{iter_stream_pairs, probe_video};
@@ -406,9 +391,9 @@ fn export_cpu_assemble(
         probe.width, probe.height, probe.fps, probe.duration_sec);
     println!("  output : {} × {}  @ {:.3} fps  H.265 ({}) {} kbps",
         out_w, out_h, fps, encoder_label(encoder_backend), bitrate_kbps);
-    print_color_stack(&color, lut_spec.is_some());
 
-    let lut = load_lut(lut_spec, lut_intensity)?;
+    let plan = build_color_plan(plan_template, lut_spec, lut_intensity)?;
+    print_color_stack(&plan);
 
     let device = Device::new()?;
     let mut decoder = iter_stream_pairs(input, hw, n_frames)?;
@@ -428,10 +413,13 @@ fn export_cpu_assemble(
         assemble_lens_a(&pair.s0, &pair.s4, dims, &mut cross_a);
         assemble_lens_b(&pair.s0, &pair.s4, dims, &mut cross_b);
 
-        let left  = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, out_h)?;
-        let right = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, out_h)?;
-        let left  = apply_color_stack(&device, left,  eye_w, out_h, &color, lut.as_ref())?;
-        let right = apply_color_stack(&device, right, eye_w, out_h, &color, lut.as_ref())?;
+        // Cross → equirect texture → chained color stack → RGB8.
+        // The equirect texture stays GPU-resident through every color
+        // stage; only the final readback hits host memory.
+        let left_tex  = device.project_cross_to_equirect_texture(&cross_a, dims.cross_w(), eye_w, out_h)?;
+        let right_tex = device.project_cross_to_equirect_texture(&cross_b, dims.cross_w(), eye_w, out_h)?;
+        let left  = device.apply_color_stack_texture(&left_tex,  eye_w, out_h, &plan)?;
+        let right = device.apply_color_stack_texture(&right_tex, eye_w, out_h, &plan)?;
         encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
         frame_idx += 1;
         progress_tick(frame_idx, t_start, &mut last_print);
@@ -441,8 +429,9 @@ fn export_cpu_assemble(
     Ok(())
 }
 
-/// Phase 0.6.6 path: IOSurface → wgpu zero-copy → GPU EAC assembly +
-/// equirect projection + color tools → readback → HEVC. macOS only.
+/// Phase 0.6.6 + 0.7.5.5 path: IOSurface → wgpu zero-copy → GPU EAC
+/// assembly + equirect projection texture + chained color stack →
+/// readback → HEVC. macOS only.
 #[cfg(target_os = "macos")]
 fn export_zero_copy(
     input: &std::path::Path,
@@ -454,7 +443,7 @@ fn export_zero_copy(
     lut_spec: Option<&str>,
     lut_intensity: f32,
     encoder_backend: vr180_pipeline::encode::EncoderBackend,
-    color: ColorParams,
+    plan_template: vr180_pipeline::gpu::ColorStackPlan,
 ) -> anyhow::Result<()> {
     use vr180_pipeline::decode::{ZeroCopyStreamPairIter, probe_video};
     use vr180_pipeline::encode::H265Encoder;
@@ -471,10 +460,11 @@ fn export_zero_copy(
         probe.width, probe.height, probe.fps, probe.duration_sec);
     println!("  output : {} × {}  @ {:.3} fps  H.265 ({}) {} kbps",
         out_w, out_h, fps, enc_label, bitrate_kbps);
-    println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → eac_to_equirect → color stack) → {}", enc_label);
-    print_color_stack(&color, lut_spec.is_some());
+    println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → equirect_tex → color stack) → {}", enc_label);
 
-    let lut = load_lut(lut_spec, lut_intensity)?;
+    let plan = build_color_plan(plan_template, lut_spec, lut_intensity)?;
+    print_color_stack(&plan);
+
     let device = Device::new()?;
     let mut decoder = ZeroCopyStreamPairIter::new(input, n_frames)?;
     let dims = decoder.dims();
@@ -498,10 +488,12 @@ fn export_zero_copy(
             Lens::B, dims,
         )?;
 
-        let left  = device.project_cross_texture_to_equirect(&cross_a, eye_w, out_h)?;
-        let right = device.project_cross_texture_to_equirect(&cross_b, eye_w, out_h)?;
-        let left  = apply_color_stack(&device, left,  eye_w, out_h, &color, lut.as_ref())?;
-        let right = apply_color_stack(&device, right, eye_w, out_h, &color, lut.as_ref())?;
+        // Cross texture → equirect texture → chained color stack → RGB8.
+        // Everything stays GPU-resident until the final readback.
+        let left_tex  = device.project_cross_texture_to_equirect_texture(&cross_a, eye_w, out_h)?;
+        let right_tex = device.project_cross_texture_to_equirect_texture(&cross_b, eye_w, out_h)?;
+        let left  = device.apply_color_stack_texture(&left_tex,  eye_w, out_h, &plan)?;
+        let right = device.apply_color_stack_texture(&right_tex, eye_w, out_h, &plan)?;
         encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
         // Drop the zero-copy pair AFTER the kernel dispatch is done —
         // releases the IOSurface retains so the VT decoder can recycle
@@ -523,84 +515,59 @@ fn encoder_label(b: vr180_pipeline::encode::EncoderBackend) -> &'static str {
     }
 }
 
-/// Apply the Phase 0.7.5 color stack to one half-equirect frame.
-///
-/// Order matches the Python pipeline (vr180_gui.py:7746) with the
-/// note that we fuse temp/tint+sat into one `color_grade` pass and
-/// apply it AFTER mid-detail (Python applies sat after mid-detail too;
-/// temp/tint moves up but the effect on a non-extreme grade is
-/// imperceptible). Each apply_* short-circuits on identity params.
-///
-///   input (equirect from `project_*_to_equirect`)
-///     → CDL                       (lift / gain / shadow / highlight / gamma)
-///     → 3D LUT                    (existing Phase 0.7)
-///     → sharpen                   (USM, latitude-weighted for equirect)
-///     → mid-detail clarity        (downsample-blur-upsample)
-///     → color grade               (temp / tint / sat)
-///     → output
-fn apply_color_stack(
-    device: &vr180_pipeline::gpu::Device,
-    rgb: Vec<u8>,
-    w: u32, h: u32,
-    color: &ColorParams,
-    lut: Option<&(vr180_core::Cube3DLut, f32)>,
-) -> anyhow::Result<Vec<u8>> {
-    let mut buf = device.apply_cdl(&rgb, w, h, color.cdl)?;
-    if let Some((lut, intensity)) = lut {
-        buf = device.apply_lut3d(&buf, w, h, lut, *intensity)?;
+/// Fill the LUT field of a partially-built ColorStackPlan from the
+/// CLI `--lut <path>` argument. Resolves `bundled` → assets path.
+/// The plan template carries the rest of the user knobs unchanged.
+fn build_color_plan(
+    mut plan: vr180_pipeline::gpu::ColorStackPlan,
+    lut_spec: Option<&str>,
+    lut_intensity: f32,
+) -> anyhow::Result<vr180_pipeline::gpu::ColorStackPlan> {
+    if let Some(spec) = lut_spec {
+        let path = match spec {
+            "bundled" => resolve_bundled_lut()
+                .ok_or_else(|| anyhow::anyhow!("bundled LUT not found"))?,
+            s => std::path::PathBuf::from(s),
+        };
+        let lut = vr180_core::Cube3DLut::from_file(&path)?;
+        println!("  LUT    : {}^3 @ intensity {:.2} ({})",
+            lut.size, lut_intensity, path.display());
+        plan.lut = Some((lut, lut_intensity));
     }
-    buf = device.apply_sharpen(&buf, w, h, color.sharpen)?;
-    buf = device.apply_mid_detail(&buf, w, h, color.mid_detail)?;
-    buf = device.apply_color_grade(&buf, w, h, color.color_grade)?;
-    Ok(buf)
+    Ok(plan)
 }
 
 /// Print a one-line summary of which color tools will actually run.
 /// Helps the user confirm their CLI flags landed without spelunking
 /// the param struct in trace logs.
-fn print_color_stack(color: &ColorParams, has_lut: bool) {
-    if !color.any_active() && !has_lut {
-        println!("  color  : (none — no CDL / grade / sharpen / mid-detail / LUT)");
+fn print_color_stack(plan: &vr180_pipeline::gpu::ColorStackPlan) {
+    if !plan.any_active() {
+        println!("  color  : (none — no CDL / LUT / sharpen / mid-detail / grade)");
         return;
     }
     let mut stages: Vec<String> = Vec::new();
-    if !color.cdl.is_identity() {
-        let c = color.cdl;
+    if !plan.cdl.is_identity() {
+        let c = plan.cdl;
         stages.push(format!(
             "cdl(lift={:.2}, gamma={:.2}, gain={:.2}, sh={:.2}, hl={:.2})",
             c.lift, c.gamma, c.gain, c.shadow, c.highlight));
     }
-    if has_lut { stages.push("lut3d".into()); }
-    if !color.sharpen.is_identity() {
-        let s = color.sharpen;
+    if plan.lut.is_some() { stages.push("lut3d".into()); }
+    if !plan.sharpen.is_identity() {
+        let s = plan.sharpen;
         stages.push(format!("sharpen(amount={:.2}, σ={:.2})", s.amount, s.sigma));
     }
-    if !color.mid_detail.is_identity() {
-        let m = color.mid_detail;
+    if !plan.mid_detail.is_identity() {
+        let m = plan.mid_detail;
         stages.push(format!("mid_detail(amount={:.2}, σ={:.2})", m.amount, m.sigma));
     }
-    if !color.color_grade.is_identity() {
-        let g = color.color_grade;
+    if !plan.color_grade.is_identity() {
+        let g = plan.color_grade;
         stages.push(format!(
             "color_grade(temp={:+.2}, tint={:+.2}, sat={:.2})",
             g.temperature, g.tint, g.saturation));
     }
     println!("  color  : {}", stages.join(" → "));
-}
-
-fn load_lut(
-    lut_spec: Option<&str>, intensity: f32,
-) -> anyhow::Result<Option<(vr180_core::Cube3DLut, f32)>> {
-    let path = match lut_spec {
-        Some("bundled") => resolve_bundled_lut()
-            .ok_or_else(|| anyhow::anyhow!("bundled LUT not found"))?,
-        Some(p) => std::path::PathBuf::from(p),
-        None => return Ok(None),
-    };
-    let lut = vr180_core::Cube3DLut::from_file(&path)?;
-    println!("  LUT    : {}^3 @ intensity {:.2} ({})",
-        lut.size, intensity, path.display());
-    Ok(Some((lut, intensity)))
 }
 
 fn stitch_sbs(left: &[u8], right: &[u8], eye_w: u32, eye_h: u32) -> Vec<u8> {
