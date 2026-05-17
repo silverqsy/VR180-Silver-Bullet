@@ -99,6 +99,29 @@ fn sample_nv12(
 // Returns `vec3<f32>(stream_x, stream_y, stream_idx)` where stream_idx
 // is 0.0 for s0, 1.0 for s4. Returns negative stream_idx if the pixel
 // is outside any face (caller writes the corner-replicate color).
+//
+// Tile layout per lens (matches Python's _assemble_lensA / _assemble_lensB
+// in vr180_gui.py:5758-5795 — see crates/vr180-core/src/eac/assemble.rs
+// for the byte-for-byte equivalent CPU implementation).
+//
+//   LENS A (right eye):
+//     middle band: all three faces from s0 contiguously at col cx+tw
+//       LEFT   cross[tw:tw+sh, 0:tw]        ← s0[:, tw:2tw]
+//       CENTER cross[tw:tw+cn, tw:tw+cn]    ← s0[:, 2tw:2tw+cn]
+//       RIGHT  cross[tw:tw+sh, tw+cn:cw]    ← s0[:, 2tw+cn:3tw+cn]
+//     TOP / BOTTOM from s4 rotated 90 CW (different tiles)
+//
+//   LENS B (left eye):
+//     LEFT   cross[tw:tw+sh, 0:tw]        ← s0[:, sw-tw:sw]  (outer-right s0)
+//     CENTER cross[tw:tw+cn, tw:tw+cn]    ← s4_rot middle, NOT s0
+//     RIGHT  cross[tw:tw+sh, tw+cn:cw]    ← s0[:, 0:tw]      (outer-left s0)
+//     TOP / CENTER / BOTTOM all from s4_rot = s4[:, tw:sw-tw] rotated 90 CCW
+//
+// For Lens B, the entire cx ∈ [tw, tw+cn) column band (regardless of cy
+// band) maps to s4_rot — TOP/CENTER/BOTTOM share one formula:
+//   s4[cx-tw, tw + (cw - 1 - cy)]
+// derived from forward CCW dst[i,j] = src[j, w-1-i] where w = cw is the
+// pre-rotation source width.
 fn cross_to_stream(cx: u32, cy: u32) -> vec3<f32> {
     let tw   = i32(uni.tile_w);
     let cn   = i32(uni.center_w);
@@ -111,98 +134,77 @@ fn cross_to_stream(cx: u32, cy: u32) -> vec3<f32> {
     let center_top = tw;
     let center_bot = tw + cn;
 
-    // Middle row band: LEFT / CENTER / RIGHT faces from s0.
+    // ── Middle row band (cy ∈ [tw, tw+cn)) — Lens-dependent ──
     if (i_cy >= center_top && i_cy < center_bot) {
-        let y_in = i_cy - tw;   // row inside the face band
-        if (i_cx < tw) {
-            // LEFT face: s0[y_in, cx + tw]
-            return vec3<f32>(f32(i_cx + tw), f32(y_in), 0.0);
-        } else if (i_cx < tw + cn) {
-            // CENTER face: s0[y_in, (cx - tw) + 2*tw] = s0[y_in, cx + tw]
-            return vec3<f32>(f32(i_cx + tw), f32(y_in), 0.0);
-        } else if (i_cx < cw) {
-            // RIGHT face: s0[y_in, (cx - (tw+cn)) + 2*tw + cn] = s0[y_in, cx + tw]
-            return vec3<f32>(f32(i_cx + tw), f32(y_in), 0.0);
+        let y_in = i_cy - tw;
+        if (uni.lens == 0u) {
+            // Lens A: all three faces from s0 with one unified formula.
+            // (Python: cross[tw:tw+sh, 0:cw] = horiz-concat of
+            //  s0[:, tw:2tw], s0[:, 2tw:2tw+cn], s0[:, 2tw+cn:3tw+cn].)
+            if (i_cx < cw) {
+                return vec3<f32>(f32(i_cx + tw), f32(y_in), 0.0);
+            }
+        } else {
+            // Lens B: three different sources for the three middle faces.
+            if (i_cx < tw) {
+                // LEFT  ← s0[:, sw-tw:sw]
+                return vec3<f32>(f32((sw - tw) + i_cx), f32(y_in), 0.0);
+            } else if (i_cx < tw + cn) {
+                // CENTER ← s4_rot — same formula as Lens-B TOP / BOTTOM.
+                let s_x = tw + (cw - 1 - i_cy);
+                let s_y = i_cx - tw;
+                return vec3<f32>(f32(s_x), f32(s_y), 1.0);
+            } else if (i_cx < cw) {
+                // RIGHT ← s0[:, 0:tw]
+                return vec3<f32>(f32(i_cx - tw - cn), f32(y_in), 0.0);
+            }
         }
     }
-    // TOP band (rows < tw): rotated tile from s4.
+
+    // ── TOP band (cy < tw, cx ∈ [tw, tw+cn)) — rotated s4 tile ──
     if (i_cy < center_top && i_cx >= center_top && i_cx < center_bot) {
-        // Lens A: source is s4[:, sw-tw .. sw] rotated 90 CW.
-        //   In cross local coords (row=cy, col=cx-tw),
-        //     dst[r, c] = src[sh-1-c, r]  (forward rot)
-        //   so src local = (sh-1-(cx-tw), cy)
-        //   src abs = s4[sh-1-(cx-tw), (sw-tw)+cy]
-        // Lens B: source is s4[:, tw .. sw-tw] (middle 3*tw+cn=cw wide)
-        //   rotated 90 CCW. Inverse:
-        //     dst[r, c] = src[c, w-1-r]  (forward CCW for src (h=sh, w=sw-2tw=cw))
-        //   so src local = (cx-tw, cw-1-r)? Actually for Lens B's TOP,
-        //   the cross top tile is s4_rot[0..tw, :] where s4_rot is the
-        //   90-CCW rotation. Let me re-derive in shader using the
-        //   forward direction: s4_rot has shape (sw-2tw, sh) = (cw, sh).
-        //   s4_rot[i_cy, i_cx-tw] is the top tile pixel. After inverse
-        //   rotation (CCW → CW): src[r, c] = s4_rot_src[h-1-c, r]
-        //     where s4_rot_src is shape (sh, cw=sw-2tw).
-        //   That src is s4[:, tw..sw-tw] with rows = sh, cols = cw.
-        //   So s4_rot[i_cy, i_cx-tw] = s4[sh-1-(i_cx-tw), tw + i_cy].
-        //   Wait that's the same formula as Lens A. Let me recheck.
         if (uni.lens == 0u) {
+            // Lens A: s4[:, sw-tw:sw] rotated 90 CW.
+            // Forward CW: dst[r, c] = src[sh-1-c, r]   for src(h=sh, w=tw)
+            // Inverse:    src[r, c] = dst[c, h-1-r]
+            // For dst(local r=cy, c=cx-tw): src_local = (sh-1-(cx-tw), cy)
+            // → s4[sh-1-(cx-tw), (sw-tw) + cy]
             let s_y = sh - 1 - (i_cx - tw);
             let s_x = (sw - tw) + i_cy;
             return vec3<f32>(f32(s_x), f32(s_y), 1.0);
         } else {
-            // Lens B TOP — rotated 90 CCW from s4[:, tw..sw-tw]
-            // s4_rot (CCW) of (h=sh, w=cw): dst[r, c] = src[c, w-1-r]
-            // So inverse: src[r, c] = dst[w-1-c, r] where dst dims (w, h) = (cw, sh)
-            // dst is rows of cross top = [0..tw], cols [tw..tw+cn]
-            // dst local (r=cy, c=cx-tw): src local (cy_src = (cw-1)-(cx-tw), cx_src = cy)
-            // Wait — this is getting tangled. The cleanest direction:
-            //   Forward CCW: dst[w-1-c, r] = src[r, c]
-            //   So dst[i, j] = src[j, w-1-i]  (substituting r=j, c=w-1-i)
-            //   For our case w = cw (source width before rot), j is col in dst, i is row.
-            //   Source local: (row, col) = (j, w-1-i) = (cx-tw, cw-1-cy)
-            //   Then absolute s4: s4[(cx-tw), tw + (cw-1-cy)]
-            //   But cx-tw needs to map to a stream Y coord... and cw-1-cy to a stream X coord.
-            //   Hmm, the source slice for Lens B is s4[:, tw..sw-tw] which has dim (sh, cw).
-            //   So "row in source" maps to s4_y, "col in source" maps to s4_x - tw.
-            //   s4_y = cx - tw  (which is in [0, cn) = [0, sh) since cn==sh)
-            //   s4_x = tw + (cw - 1 - cy)
+            // Lens B: s4_rot[0:tw, :] — s4[cx-tw, tw + (cw-1-cy)].
+            // Forward CCW of src(h=sh, w=cw): dst[i, j] = src[j, w-1-i]
+            // s4_rot[cy, cx-tw] = s4_slice[cx-tw, cw-1-cy]
+            //                   = s4[cx-tw, tw + (cw-1-cy)]
             let s_y = i_cx - tw;
             let s_x = tw + (cw - 1 - i_cy);
             return vec3<f32>(f32(s_x), f32(s_y), 1.0);
         }
     }
-    // BOTTOM band (rows >= center_bot): rotated tile from s4.
+
+    // ── BOTTOM band (cy ≥ tw+cn, cx ∈ [tw, tw+cn)) — rotated s4 tile ──
     if (i_cy >= center_bot && i_cx >= center_top && i_cx < center_bot) {
-        let local_row = i_cy - center_bot;  // in [0, tw)
+        let local_row = i_cy - center_bot;
         if (uni.lens == 0u) {
-            // Lens A BOTTOM: s4[:, 0..tw] rotated 90 CW
-            //   dst[r, c] = src[sh-1-c, r]
-            //   src local = (sh-1-(cx-tw), local_row)
-            //   src abs = s4[sh-1-(cx-tw), 0 + local_row]
+            // Lens A: s4[:, 0:tw] rotated 90 CW.
+            // src_local = (sh-1-(cx-tw), local_row)
+            // → s4[sh-1-(cx-tw), local_row]
             let s_y = sh - 1 - (i_cx - tw);
             let s_x = local_row;
             return vec3<f32>(f32(s_x), f32(s_y), 1.0);
         } else {
-            // Lens B BOTTOM: s4_rot[tw+sh .. tw+sh+tw, :] which is
-            //   s4_rot rows [center_bot, center_bot+tw) of the CCW rotation.
-            //   Using the same forward-CCW formula as above with the local
-            //   row shifted: dst[i, j] = src[j, w-1-i]  but i is offset by
-            //   (tw+sh) in s4_rot indexing.
-            //   For our slice: dst local i = local_row + (tw + sh)?
-            //   Wait — s4_rot is shape (cw, sh) total. The cross uses
-            //     top: s4_rot[0..tw, :]
-            //     center: s4_rot[tw..tw+sh, :]
-            //     bottom: s4_rot[tw+sh..tw+sh+tw, :]
-            //   So our bottom-tile dst row = local_row + (tw + sh)
-            //   src local: (j, w-1-i) = (cx-tw, cw-1-(local_row+tw+sh))
-            //   s4_y = cx - tw
-            //   s4_x = tw + (cw - 1 - (local_row + tw + sh))
+            // Lens B: s4_rot[tw+cn..cw, :] — same formula as TOP/CENTER
+            // (s4_rot is one big rotated chunk; only the row range
+            // differs, but the dst→src formula uses cy directly which
+            // already encodes the row offset).
             let s_y = i_cx - tw;
-            let s_x = tw + (cw - 1 - (local_row + tw + sh));
+            let s_x = tw + (cw - 1 - i_cy);
             return vec3<f32>(f32(s_x), f32(s_y), 1.0);
         }
     }
-    // Corner regions: signal "out of face" via negative stream_idx.
+
+    // ── Corner regions: signal "out of face" via negative stream_idx ──
     return vec3<f32>(0.0, 0.0, -1.0);
 }
 
