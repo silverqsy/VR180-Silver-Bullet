@@ -38,6 +38,18 @@ enum Cmd {
         vqf: bool,
     },
 
+    /// Probe the EAC layout of a .360 file: stream dimensions, derived
+    /// tile width, cross size. With `--out <file.png>` also writes the
+    /// assembled Lens-A + Lens-B EAC crosses (3936×7872 RGB PNG by
+    /// default on a standard Max — smaller on Max 2 variants).
+    ProbeEac {
+        path: PathBuf,
+        /// Output PNG path. If supplied, decodes the first frame of
+        /// each HEVC stream and writes the assembled cross pair.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
     /// (placeholder) Render the project described by a JSON config.
     Export {
         /// Path to the export JSON config (schema matches what the
@@ -77,11 +89,69 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Cmd::ProbeGyro { path, vqf }) => probe_gyro(&path, vqf),
+        Some(Cmd::ProbeEac { path, out }) => probe_eac(&path, out.as_deref()),
         Some(Cmd::Export { config }) => {
             tracing::warn!(?config, "export: not implemented (Phase 0.9)");
             Ok(())
         }
     }
+}
+
+fn probe_eac(path: &std::path::Path, out: Option<&std::path::Path>) -> anyhow::Result<()> {
+    use vr180_core::eac::{Dims, assemble_lens_a, assemble_lens_b};
+    use vr180_pipeline::decode::{extract_first_stream_pair, probe_video};
+
+    let probe = probe_video(path)?;
+    let dims = Dims::new(probe.width, probe.height);
+    println!("file:        {}", path.display());
+    println!("stream:      {} × {}  ({:.3} fps, {:.2}s)",
+        probe.width, probe.height, probe.fps, probe.duration_sec);
+    println!("EAC tile_w:  {} px  (formula: (w-1920)/4)", dims.tile_w());
+    println!("EAC cross:   {0} × {0}  (per lens)", dims.cross_w());
+    if !dims.is_valid() {
+        anyhow::bail!("stream width {} is not a valid EAC layout (need (w-1920) % 4 == 0)",
+            probe.width);
+    }
+
+    let Some(out) = out else {
+        println!("(pass --out <file.png> to render the assembled cross pair)");
+        return Ok(());
+    };
+
+    let t0 = std::time::Instant::now();
+    let pair = extract_first_stream_pair(path)?;
+    let decode_t = t0.elapsed();
+    let dims = pair.dims;
+    let cw = dims.cross_w() as usize;
+
+    let t1 = std::time::Instant::now();
+    let mut cross_a = vec![0u8; cw * cw * 3];
+    let mut cross_b = vec![0u8; cw * cw * 3];
+    assemble_lens_a(&pair.s0, &pair.s4, dims, &mut cross_a);
+    assemble_lens_b(&pair.s0, &pair.s4, dims, &mut cross_b);
+    let assemble_t = t1.elapsed();
+
+    // Compose the two crosses vertically into a single PNG so the user
+    // sees both lenses in one file. Width = cw, Height = 2*cw.
+    let combined_w = cw;
+    let combined_h = cw * 2;
+    let mut combined = Vec::with_capacity(combined_w * combined_h * 3);
+    combined.extend_from_slice(&cross_a);
+    combined.extend_from_slice(&cross_b);
+
+    let t2 = std::time::Instant::now();
+    let img = image::RgbImage::from_raw(combined_w as u32, combined_h as u32, combined)
+        .ok_or_else(|| anyhow::anyhow!("RgbImage::from_raw size mismatch"))?;
+    img.save(out)?;
+    let save_t = t2.elapsed();
+
+    println!();
+    println!("decoded streams:  {decode_t:.2?}  ({} bytes / stream)", pair.s0.len());
+    println!("assembled crosses:{assemble_t:.2?}  (2 × {}×{})", cw, cw);
+    println!("wrote PNG:        {save_t:.2?}  → {}", out.display());
+    println!("output dims:      {} × {} (Lens A on top, Lens B on bottom)",
+        combined_w, combined_h);
+    Ok(())
 }
 
 fn probe_gyro(path: &std::path::Path, do_vqf: bool) -> anyhow::Result<()> {

@@ -130,3 +130,134 @@ pub fn probe_video(path: &Path) -> Result<VideoProbe> {
         duration_sec,
     })
 }
+
+/// One decoded frame from each of the two HEVC streams in a .360 file,
+/// converted to packed RGB8 host memory. The dimensions are probed from
+/// the streams themselves — no hardcoded `5952×1920`.
+#[derive(Debug)]
+pub struct StreamPair {
+    /// Packed RGB8 bytes, `stream_h × stream_w × 3`, from the first
+    /// HEVC stream (`s0` in the Python code).
+    pub s0: Vec<u8>,
+    /// Same shape, from the second HEVC stream (`s4`).
+    pub s4: Vec<u8>,
+    /// Dimensions probed from the streams. Caller asserts the two
+    /// streams agree on size — they always do on real GoPro footage.
+    pub dims: vr180_core::eac::Dims,
+}
+
+/// Extract the first decoded video frame from each of the two HEVC
+/// streams. Single-frame, software decode, no hwaccel — Phase 0.4
+/// CPU baseline. Replaces the Python pipeline's PyAV-or-subprocess
+/// dual-path with one in-process libav call.
+pub fn extract_first_stream_pair(path: &Path) -> Result<StreamPair> {
+    init();
+    let mut ictx = ffmpeg_next::format::input(path)
+        .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+
+    // Find both HEVC video streams. GoPro .360 always has exactly two
+    // (s0 + s4 in Python notation).
+    let video_indices: Vec<usize> = ictx
+        .streams()
+        .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+        .map(|s| s.index())
+        .collect();
+    if video_indices.len() < 2 {
+        return Err(Error::Ffmpeg(format!(
+            "expected 2 video streams in .360 file, found {}",
+            video_indices.len()
+        )));
+    }
+
+    // Set up a decoder per stream. We hold these as Vec<_> so the
+    // borrow rules play nicely with the packet-read loop below.
+    let mut decoders: Vec<ffmpeg_next::codec::decoder::Video> = video_indices
+        .iter()
+        .map(|&idx| {
+            let stream = ictx.stream(idx).unwrap();
+            let codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+                .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+            codec_ctx.decoder().video()
+                .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Both streams must agree on dimensions on real GoPro footage.
+    let (w0, h0) = (decoders[0].width(), decoders[0].height());
+    let (w1, h1) = (decoders[1].width(), decoders[1].height());
+    if (w0, h0) != (w1, h1) {
+        return Err(Error::Ffmpeg(format!(
+            "video streams disagree on dimensions: {w0}x{h0} vs {w1}x{h1}"
+        )));
+    }
+    let dims = vr180_core::eac::Dims::new(w0, h0);
+    if !dims.is_valid() {
+        return Err(Error::Ffmpeg(format!(
+            "stream width {w0} not a valid EAC layout (need (w-1920) % 4 == 0)"
+        )));
+    }
+
+    // One scaler per stream: YUV (whatever pixel format the decoder
+    // produces, typically yuv420p / p010le) → RGB24.
+    let mut scalers: Vec<Option<ffmpeg_next::software::scaling::Context>> = vec![None, None];
+
+    // Receive loop: keep reading packets until we have one frame from
+    // each stream. ffmpeg's HEVC decoder may need a few packets of
+    // buffering before it can emit a frame, hence the loop.
+    let mut frames: [Option<Vec<u8>>; 2] = [None, None];
+    'outer: for (stream, packet) in ictx.packets() {
+        let pos = match video_indices.iter().position(|&i| i == stream.index()) {
+            Some(p) if frames[p].is_none() => p,
+            _ => continue,
+        };
+        let dec = &mut decoders[pos];
+        if dec.send_packet(&packet).is_err() { continue; }
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        while dec.receive_frame(&mut decoded).is_ok() {
+            // Lazily build the scaler now that we know the actual pixel format.
+            let scaler = match &mut scalers[pos] {
+                Some(s) => s,
+                None => {
+                    let s = ffmpeg_next::software::scaling::Context::get(
+                        decoded.format(),
+                        decoded.width(),
+                        decoded.height(),
+                        ffmpeg_next::format::Pixel::RGB24,
+                        decoded.width(),
+                        decoded.height(),
+                        ffmpeg_next::software::scaling::Flags::BILINEAR,
+                    ).map_err(|e| Error::Ffmpeg(format!("scaler: {e}")))?;
+                    scalers[pos] = Some(s);
+                    scalers[pos].as_mut().unwrap()
+                }
+            };
+            let mut rgb = ffmpeg_next::frame::Video::empty();
+            scaler.run(&decoded, &mut rgb)
+                .map_err(|e| Error::Ffmpeg(format!("scaler run: {e}")))?;
+            // swscale gives us a frame whose row stride may exceed
+            // width*3 (padded to 16/32 for SIMD). Repack to tightly
+            // packed RGB8 for downstream simplicity.
+            let w = rgb.width() as usize;
+            let h = rgb.height() as usize;
+            let src = rgb.data(0);
+            let src_stride = rgb.stride(0);
+            let mut out = Vec::with_capacity(w * h * 3);
+            for y in 0..h {
+                let row = &src[y * src_stride..y * src_stride + w * 3];
+                out.extend_from_slice(row);
+            }
+            frames[pos] = Some(out);
+            if frames.iter().all(|f| f.is_some()) {
+                break 'outer;
+            }
+            break; // got a frame for this stream; move to next packet
+        }
+    }
+
+    let (Some(s0), Some(s4)) = (frames[0].take(), frames[1].take()) else {
+        return Err(Error::Ffmpeg(
+            "EOF reached before both streams produced a decoded frame".into()
+        ));
+    };
+    Ok(StreamPair { s0, s4, dims })
+}

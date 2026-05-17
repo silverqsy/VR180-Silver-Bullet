@@ -68,17 +68,39 @@ on-disk component order. These are presentation concerns — needed
 when we wire the gyro pipeline into the export render but not for
 algorithmic validation, which the bias-match nails.
 
-## Phase 0.4 — Decode + EAC assembly (CPU baseline)
+## Phase 0.4 — Decode + EAC assembly (CPU baseline) ✅
 
-ffmpeg-next decode (software path first), `Rgba16Float` frame in
-host memory, EAC cross assembly from s0+s4 streams. No GPU yet.
-
-- [ ] `vr180-pipeline::decode::Decoder` (ffmpeg-next, sw decode)
-- [ ] `vr180-core::eac::Dims::from_probe(&format)` — runtime sizes,
-      no hardcoded 5952×1920 anywhere
-- [ ] `vr180-core::eac::assemble_lens_a` / `assemble_lens_b`
-- [ ] CLI: `vr180-render export --equirect --cpu <in.360> <out.png>`
-      writes a single frame for sanity check
+- [x] `vr180-pipeline::decode::extract_first_stream_pair` — ffmpeg-next
+      software decode of both HEVC streams in a `.360`, returns a
+      `StreamPair { s0, s4, dims }` of packed RGB8 host buffers.
+      Stream dimensions are **probed at runtime** (no hardcoded 5952).
+      Replaces both the Python pipeline's PyAV path AND the legacy
+      ffmpeg-subprocess fallback path.
+- [x] `vr180-core::eac::Dims { stream_w, stream_h }` with the corrected
+      `tile_w = (stream_w - 1920) / 4` formula. Unit-tested on Max
+      (5952 → tw=1008), Max 2 5888 (tw=992), and Max 2 5696
+      (tw=944, **the value that broke the Python hardcoded slice
+      for one user this session**). `is_valid()` rejects widths whose
+      `(w-1920) % 4 != 0` with a clear error message rather than
+      crashing mid-assembly.
+- [x] `vr180-core::eac::{assemble_lens_a, assemble_lens_b,
+      fill_cross_corners, rotate_90_cw, rotate_90_ccw}` — pure-Rust
+      assembly on packed RGB8. All slice offsets derived from
+      `tile_w`; corner replication + 1-px seam fix match the Python
+      `_fill_cross_corners`. `blit_rect` helper deliberately omits
+      a `copy_w` parameter to make the dst-x / copy-w swap that
+      bit me in development impossible at the call site.
+- [x] CLI: `vr180-render probe-eac <file.360> [--out <file.png>]`
+      prints stream + EAC layout numbers, and when `--out` is supplied,
+      decodes the first frame of each HEVC stream, assembles both lens
+      crosses, and writes them stacked (Lens A on top, Lens B on
+      bottom) to one PNG for visual sanity check.
+- [x] **Visually verified** on the three test clips — indoor static
+      scene, kitchen scene, outdoor NYC. Crosses are tight; corners
+      filled; no visible discontinuities at face boundaries.
+- [x] Timings: decode 80-250 ms (two HEVC streams, sw decode) +
+      assembly 22 ms + PNG encode 30-100 ms. The decode is the
+      dominant cost; Phase 0.6 makes that hardware-accelerated.
 
 ## Phase 0.5 — wgpu device + first kernel
 
