@@ -144,13 +144,60 @@ pub struct StreamPair {
     /// Dimensions probed from the streams. Caller asserts the two
     /// streams agree on size — they always do on real GoPro footage.
     pub dims: vr180_core::eac::Dims,
+    /// Which decode path actually produced this frame (after `Auto`
+    /// resolution + any silent fallback).
+    pub decode_path: DecodePath,
+}
+
+/// User-facing hwaccel selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HwDecode {
+    /// Pick the platform default: VideoToolbox on macOS, software
+    /// elsewhere. Silently falls back to software if hwaccel setup fails.
+    Auto,
+    /// Force software decode (CPU only).
+    Software,
+    /// Force VideoToolbox (macOS only). Returns an error if hwaccel
+    /// setup fails — use [`HwDecode::Auto`] for graceful fallback.
+    VideoToolbox,
+}
+
+/// Which decode path actually ran (after fallback resolution).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodePath {
+    Software,
+    VideoToolbox,
+}
+
+impl std::fmt::Display for DecodePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodePath::Software => f.write_str("software"),
+            DecodePath::VideoToolbox => f.write_str("VideoToolbox"),
+        }
+    }
 }
 
 /// Extract the first decoded video frame from each of the two HEVC
-/// streams. Single-frame, software decode, no hwaccel — Phase 0.4
-/// CPU baseline. Replaces the Python pipeline's PyAV-or-subprocess
-/// dual-path with one in-process libav call.
+/// streams. Defaults to platform-best hwaccel via [`HwDecode::Auto`].
 pub fn extract_first_stream_pair(path: &Path) -> Result<StreamPair> {
+    extract_first_stream_pair_with(path, HwDecode::Auto)
+}
+
+/// Same as [`extract_first_stream_pair`] but with explicit hwaccel
+/// control. On macOS, `Auto` and `VideoToolbox` both wire VT decode
+/// via `av_hwdevice_ctx_create` + a custom `get_format` callback that
+/// returns `AV_PIX_FMT_VIDEOTOOLBOX`. Decoded hwframes are downloaded
+/// to host memory via `av_hwframe_transfer_data` (typically NV12 for
+/// 8-bit, P010 for 10-bit), then swscale converts to RGB24.
+///
+/// **Phase 0.6 scope:** decode path is hardware-accelerated end-to-end,
+/// but frames still go through host memory before reaching the GPU
+/// compositor. The zero-copy IOSurface↔Metal interop fast path
+/// (skipping `av_hwframe_transfer_data` + the wgpu upload) is deferred
+/// to Phase 0.6.5 — needs ~700 lines of objc/IOSurface bridging that's
+/// its own focused work.
+pub fn extract_first_stream_pair_with(path: &Path, hw: HwDecode) -> Result<StreamPair> {
     init();
     let mut ictx = ffmpeg_next::format::input(path)
         .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
@@ -169,18 +216,48 @@ pub fn extract_first_stream_pair(path: &Path) -> Result<StreamPair> {
         )));
     }
 
-    // Set up a decoder per stream. We hold these as Vec<_> so the
-    // borrow rules play nicely with the packet-read loop below.
-    let mut decoders: Vec<ffmpeg_next::codec::decoder::Video> = video_indices
-        .iter()
-        .map(|&idx| {
-            let stream = ictx.stream(idx).unwrap();
-            let codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
-                .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
-            codec_ctx.decoder().video()
-                .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    // Set up a decoder per stream + optionally attach the VT hwaccel.
+    // We hold decoders as Vec<_> so borrow rules play nicely with the
+    // packet-read loop below.
+    let mut decoders: Vec<ffmpeg_next::codec::decoder::Video> = Vec::with_capacity(2);
+    let mut hw_active_per_stream = [false, false];
+    for (i, &idx) in video_indices.iter().take(2).enumerate() {
+        let stream = ictx.stream(idx).unwrap();
+        let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+            .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+
+        // Attempt to attach VT hwaccel BEFORE turning the Context into a
+        // decoder — once the decoder is built we'd need its raw codec
+        // context pointer to install `hw_device_ctx` / `get_format`.
+        #[cfg(target_os = "macos")]
+        {
+            let want_vt = matches!(hw, HwDecode::Auto | HwDecode::VideoToolbox);
+            if want_vt {
+                if try_enable_videotoolbox_decode(&mut codec_ctx) {
+                    hw_active_per_stream[i] = true;
+                } else if matches!(hw, HwDecode::VideoToolbox) {
+                    return Err(Error::Ffmpeg(format!(
+                        "stream {idx}: --hw-accel videotoolbox requested but \
+                         av_hwdevice_ctx_create failed (no VT support on this system)"
+                    )));
+                }
+                // else: Auto + setup failed → silently fall back to sw
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (i, hw); // mark used so cfg gating doesn't warn
+            if matches!(hw, HwDecode::VideoToolbox) {
+                return Err(Error::Ffmpeg(
+                    "--hw-accel videotoolbox is macOS-only".into()
+                ));
+            }
+        }
+
+        let decoder = codec_ctx.decoder().video()
+            .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
+        decoders.push(decoder);
+    }
 
     // Both streams must agree on dimensions on real GoPro footage.
     let (w0, h0) = (decoders[0].width(), decoders[0].height());
@@ -197,13 +274,11 @@ pub fn extract_first_stream_pair(path: &Path) -> Result<StreamPair> {
         )));
     }
 
-    // One scaler per stream: YUV (whatever pixel format the decoder
-    // produces, typically yuv420p / p010le) → RGB24.
+    // Lazy scaler per stream: built once we see the actual sw-frame
+    // pixel format (which differs depending on hwaccel: NV12/P010 after
+    // VT transfer, yuv420p/p010le from sw decode).
     let mut scalers: Vec<Option<ffmpeg_next::software::scaling::Context>> = vec![None, None];
 
-    // Receive loop: keep reading packets until we have one frame from
-    // each stream. ffmpeg's HEVC decoder may need a few packets of
-    // buffering before it can emit a frame, hence the loop.
     let mut frames: [Option<Vec<u8>>; 2] = [None, None];
     'outer: for (stream, packet) in ictx.packets() {
         let pos = match video_indices.iter().position(|&i| i == stream.index()) {
@@ -214,17 +289,28 @@ pub fn extract_first_stream_pair(path: &Path) -> Result<StreamPair> {
         if dec.send_packet(&packet).is_err() { continue; }
         let mut decoded = ffmpeg_next::frame::Video::empty();
         while dec.receive_frame(&mut decoded).is_ok() {
-            // Lazily build the scaler now that we know the actual pixel format.
+            // Hardware frame? Download to host memory via av_hwframe_transfer_data.
+            // sw_frame ends up NV12 (8-bit) or P010 (10-bit) — swscale handles both.
+            let mut sw_storage = ffmpeg_next::frame::Video::empty();
+            let frame_ref: &ffmpeg_next::frame::Video = if hw_active_per_stream[pos]
+                && decoded.format() == ffmpeg_next::format::Pixel::VIDEOTOOLBOX
+            {
+                download_hw_frame(&decoded, &mut sw_storage)?;
+                &sw_storage
+            } else {
+                &decoded
+            };
+
             let scaler = match &mut scalers[pos] {
                 Some(s) => s,
                 None => {
                     let s = ffmpeg_next::software::scaling::Context::get(
-                        decoded.format(),
-                        decoded.width(),
-                        decoded.height(),
+                        frame_ref.format(),
+                        frame_ref.width(),
+                        frame_ref.height(),
                         ffmpeg_next::format::Pixel::RGB24,
-                        decoded.width(),
-                        decoded.height(),
+                        frame_ref.width(),
+                        frame_ref.height(),
                         ffmpeg_next::software::scaling::Flags::BILINEAR,
                     ).map_err(|e| Error::Ffmpeg(format!("scaler: {e}")))?;
                     scalers[pos] = Some(s);
@@ -232,11 +318,9 @@ pub fn extract_first_stream_pair(path: &Path) -> Result<StreamPair> {
                 }
             };
             let mut rgb = ffmpeg_next::frame::Video::empty();
-            scaler.run(&decoded, &mut rgb)
+            scaler.run(frame_ref, &mut rgb)
                 .map_err(|e| Error::Ffmpeg(format!("scaler run: {e}")))?;
-            // swscale gives us a frame whose row stride may exceed
-            // width*3 (padded to 16/32 for SIMD). Repack to tightly
-            // packed RGB8 for downstream simplicity.
+            // swscale row stride may exceed width*3 (SIMD padding).
             let w = rgb.width() as usize;
             let h = rgb.height() as usize;
             let src = rgb.data(0);
@@ -250,7 +334,7 @@ pub fn extract_first_stream_pair(path: &Path) -> Result<StreamPair> {
             if frames.iter().all(|f| f.is_some()) {
                 break 'outer;
             }
-            break; // got a frame for this stream; move to next packet
+            break;
         }
     }
 
@@ -259,5 +343,180 @@ pub fn extract_first_stream_pair(path: &Path) -> Result<StreamPair> {
             "EOF reached before both streams produced a decoded frame".into()
         ));
     };
-    Ok(StreamPair { s0, s4, dims })
+    let decode_path = if hw_active_per_stream.iter().all(|&a| a) {
+        DecodePath::VideoToolbox
+    } else {
+        DecodePath::Software
+    };
+    Ok(StreamPair { s0, s4, dims, decode_path })
+}
+
+// ─── VideoToolbox hwaccel plumbing (macOS only) ────────────────────────
+
+/// Wire VideoToolbox hardware decode onto a codec context.
+///
+/// Returns `true` if the hwaccel was successfully attached. Mirrors
+/// `SLRStudioNeo::try_enable_videotoolbox_decode`. The codec context
+/// takes ownership of the `AVBufferRef` and will free it; we deliberately
+/// don't hold an independent clone here since this Phase 0.6 pipeline
+/// only decodes one frame per stream and exits.
+#[cfg(target_os = "macos")]
+fn try_enable_videotoolbox_decode(
+    dec_ctx: &mut ffmpeg_next::codec::context::Context,
+) -> bool {
+    use ffmpeg_next::ffi::*;
+    let mut hw_device: *mut AVBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        av_hwdevice_ctx_create(
+            &mut hw_device,
+            AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+            std::ptr::null(),     // device name — VT picks the system device
+            std::ptr::null_mut(), // options
+            0,
+        )
+    };
+    if ret < 0 || hw_device.is_null() {
+        tracing::debug!("av_hwdevice_ctx_create VIDEOTOOLBOX returned {ret}");
+        return false;
+    }
+    unsafe {
+        let raw = dec_ctx.as_mut_ptr();
+        (*raw).hw_device_ctx = hw_device;
+        (*raw).get_format = Some(videotoolbox_get_format);
+    }
+    true
+}
+
+/// FFmpeg `get_format` callback: prefer `AV_PIX_FMT_VIDEOTOOLBOX` from
+/// the offered list, fall through to the first software format otherwise
+/// so a codec VT can't accelerate still decodes (just on the CPU).
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn videotoolbox_get_format(
+    _ctx: *mut ffmpeg_next::ffi::AVCodecContext,
+    pix_fmts: *const ffmpeg_next::ffi::AVPixelFormat,
+) -> ffmpeg_next::ffi::AVPixelFormat {
+    use ffmpeg_next::ffi::AVPixelFormat::*;
+    let mut p = pix_fmts;
+    while unsafe { *p } != AV_PIX_FMT_NONE {
+        if unsafe { *p } == AV_PIX_FMT_VIDEOTOOLBOX {
+            return AV_PIX_FMT_VIDEOTOOLBOX;
+        }
+        p = unsafe { p.add(1) };
+    }
+    unsafe { *pix_fmts }
+}
+
+/// Download a hardware-resident frame (VideoToolbox CVPixelBuffer) to
+/// host system memory via `av_hwframe_transfer_data`. The destination
+/// frame's pixel format is determined by FFmpeg — typically `NV12` for
+/// 8-bit HEVC/H.264 and `P010` for 10-bit Main10.
+fn download_hw_frame(
+    hw_frame: &ffmpeg_next::frame::Video,
+    sw_frame: &mut ffmpeg_next::frame::Video,
+) -> Result<()> {
+    let ret = unsafe {
+        ffmpeg_next::ffi::av_hwframe_transfer_data(
+            sw_frame.as_mut_ptr(),
+            hw_frame.as_ptr(),
+            0,
+        )
+    };
+    if ret < 0 {
+        return Err(Error::Ffmpeg(format!("av_hwframe_transfer_data: {ret}")));
+    }
+    Ok(())
+}
+
+/// Per-stream decode timing for a multi-frame benchmark run.
+#[derive(Debug, Clone, Copy)]
+pub struct BenchResult {
+    pub frames: u32,
+    pub total: std::time::Duration,
+    pub decode_path: DecodePath,
+}
+
+impl BenchResult {
+    pub fn fps(&self) -> f32 {
+        if self.total.is_zero() { 0.0 }
+        else { self.frames as f32 / self.total.as_secs_f32() }
+    }
+}
+
+/// Multi-frame decode benchmark: decode `n_frames` from the FIRST video
+/// stream as fast as possible, **no swscale RGB conversion**, returning
+/// per-stream timing. This measures the steady-state decode throughput
+/// where the single-frame cold-start cost has been amortized away —
+/// which is where any hwaccel speedup actually shows up.
+///
+/// Doesn't assemble crosses; doesn't run the GPU pipeline. Pure decode
+/// throughput test. Useful for the Phase 0.6 sw-vs-VT comparison.
+pub fn bench_decode_throughput(
+    path: &Path,
+    n_frames: u32,
+    hw: HwDecode,
+) -> Result<BenchResult> {
+    init();
+    let mut ictx = ffmpeg_next::format::input(path)
+        .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+
+    let stream_idx = ictx
+        .streams()
+        .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+        .next()
+        .ok_or_else(|| Error::Ffmpeg("no video stream".into()))?
+        .index();
+
+    let stream = ictx.stream(stream_idx).unwrap();
+    let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+        .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+
+    let mut hw_active = false;
+    #[cfg(target_os = "macos")]
+    {
+        let want_vt = matches!(hw, HwDecode::Auto | HwDecode::VideoToolbox);
+        if want_vt {
+            if try_enable_videotoolbox_decode(&mut codec_ctx) {
+                hw_active = true;
+            } else if matches!(hw, HwDecode::VideoToolbox) {
+                return Err(Error::Ffmpeg(
+                    "VT hwaccel requested but unavailable on this system".into()
+                ));
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = hw;
+        if matches!(hw, HwDecode::VideoToolbox) {
+            return Err(Error::Ffmpeg("VT is macOS-only".into()));
+        }
+    }
+
+    let mut decoder = codec_ctx.decoder().video()
+        .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
+
+    let mut decoded = ffmpeg_next::frame::Video::empty();
+    let mut sw_storage = ffmpeg_next::frame::Video::empty();
+    let mut count: u32 = 0;
+    let t_start = std::time::Instant::now();
+
+    'outer: for (stream, packet) in ictx.packets() {
+        if stream.index() != stream_idx { continue; }
+        if decoder.send_packet(&packet).is_err() { continue; }
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            // For hwframes, do the transfer so we measure the full
+            // "frames usable in host memory" throughput (matching real
+            // pipeline usage). Skip if you want raw decode throughput.
+            if hw_active
+                && decoded.format() == ffmpeg_next::format::Pixel::VIDEOTOOLBOX
+            {
+                download_hw_frame(&decoded, &mut sw_storage)?;
+            }
+            count += 1;
+            if count >= n_frames { break 'outer; }
+        }
+    }
+    let total = t_start.elapsed();
+    let decode_path = if hw_active { DecodePath::VideoToolbox } else { DecodePath::Software };
+    Ok(BenchResult { frames: count, total, decode_path })
 }

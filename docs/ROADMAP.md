@@ -135,30 +135,74 @@ Per-frame steady state (Device reused): ~252 ms ≈ **4 fps**. The
 decode dominates by a factor of ~2 over everything else — Phase 0.6
 addresses that.
 
-## Phase 0.6 — Hardware decode + IOSurface↔Metal interop ⏸ deferred
+## Phase 0.6 — Hardware decode (host-memory path) ✅
 
-ffmpeg-next 8.1 does not expose hwaccel APIs at the safe-Rust level.
-Doing this properly requires:
+VideoToolbox decode wired via raw `ffmpeg_sys_next` FFI (the
+ffmpeg-next 8.1 safe wrapper doesn't expose hwaccel). Frames are
+transferred from VT-managed memory to host via `av_hwframe_transfer_data`,
+then go through the same swscale → RGB path the sw decoder uses.
 
-1. **Raw `ffmpeg_sys_next` FFI** to wire `av_hwdevice_ctx_create` +
-   `av_hwframe_transfer_data` into the decoder context. ~200 lines of
-   `unsafe` Rust + careful RAII wrappers.
-2. **IOSurface ↔ MTLTexture interop** on macOS (`RetainedIOSurface`,
-   `metal::Texture::new_from_iosurface`, wgpu-hal Metal escape).
-   ~700 lines — SLRStudioNeo has the exact code we'd adapt.
-3. **CUDA ↔ Vulkan interop** on Windows (`cudarc` driver API attached
-   to `AVCUDADeviceContext`, external Vulkan images via wgpu-hal).
-   Another ~500 lines.
+- [x] `vr180-pipeline::decode::HwDecode` enum (`Auto` / `Software` /
+      `VideoToolbox`) + `DecodePath` (which path actually ran after
+      Auto / fallback resolution).
+- [x] `try_enable_videotoolbox_decode(codec_ctx)` — calls
+      `av_hwdevice_ctx_create(AV_HWDEVICE_TYPE_VIDEOTOOLBOX)`, attaches
+      the device on the codec context, installs a `get_format`
+      callback that prefers `AV_PIX_FMT_VIDEOTOOLBOX`. Mirrors
+      [SLRStudioNeo](../../SLRStudioNeo/)'s exact pattern.
+- [x] `download_hw_frame` — wraps `av_hwframe_transfer_data` for
+      hwframe → NV12/P010 host memory.
+- [x] `bench_decode_throughput` — pure-decode throughput micro-bench
+      with optional hwaccel.
+- [x] `extract_first_stream_pair_with(path, HwDecode)` — full pipeline
+      that lazily picks scaler params based on the actual sw-frame
+      format after transfer.
+- [x] CLI: `--hw-accel {auto|sw|vt}` on `probe-eac`, new `bench-decode`
+      subcommand for A/B perf comparison.
 
-That's a multi-session deliverable that needs its own focused pass.
-The Phase 0.5 pipeline runs at ~4 fps (decode-bound, sw decode of
-two HEVC 8K streams in serial). Once the interop work lands the
-expected jump is to ~30 fps on M2 Max (decode drops to ~20 ms,
-upload becomes zero-copy).
+**Measured speedup on M5 Max, HEVC 5952×1920** (`bench-decode`):
 
-**Deferred** until after Phases 0.7 (color) and 0.8 (encode) so we
-have a complete sw-decode→GPU→encode pipeline working end-to-end
-first. Interop is a perf optimization on top of that.
+| Clip | Software | VideoToolbox | Speedup |
+|---|---|---|---|
+| GS010172.360 (30 s, 100 frames)        | 14.9 fps (67 ms/frame) | 152.9 fps (6.5 ms/frame) | **10.2×** |
+| firmware RS+IORI.360 (4 min, 300 frames) | 11.7 fps (86 ms/frame) | 132.2 fps (7.6 ms/frame) | **11.3×** |
+
+That's the entire HEVC decode (one stream) including the
+host-memory transfer, but excluding any RGB conversion. With both
+streams in flight in series the effective full-pipeline throughput
+should land near ~75 fps before EAC assembly + GPU project + encode.
+
+### Deferred to Phase 0.6.5 — zero-copy IOSurface↔Metal interop
+
+The current path still hops through host memory:
+
+```text
+   VT decoder           CPU                      wgpu compute
+       │                  │                            ▲
+   CVPixelBuffer ────► NV12 frame ──► RGB packed ──► texture upload
+                  av_hwframe_                            queue.
+                  transfer_data                          write_texture
+```
+
+The zero-copy fast path (Step 3 in SLRStudioNeo's `MAC-PORT.md`)
+keeps the IOSurface alive end-to-end: the VT decoder's
+`CVPixelBuffer` exposes its backing `IOSurface`, we wrap it as a
+`MTLTexture` via `newTextureWithDescriptor:iosurface:plane:`, then
+hand that `MTLTexture` to wgpu via the wgpu-hal Metal escape
+(`Device::texture_from_raw`). NV12 stays on the GPU; no host-
+memory hop. Saves the `av_hwframe_transfer_data` memcpy (~12 MB at
+4K, ~50 MB at 8K) AND the `queue.write_texture` upload of the same
+size — back-of-envelope ~3-4× faster than the current path for the
+upload stage.
+
+That's ~700 lines of objc/IOSurface FFI + wgpu-hal escape. Adapted
+from SLRStudioNeo's `interop_macos.rs`. Deferred to its own session.
+
+### Deferred to Phase 0.6.6 — Windows CUDA↔Vulkan interop
+
+NVDEC + cudarc + Vulkan external images. Another ~500 lines, only
+meaningful on the Windows builds. Out of scope until 0.9 wires up
+Windows builds in CI.
 
 ## Phase 0.7 — Color pipeline + LUT + tonal zones
 

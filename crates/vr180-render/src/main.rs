@@ -24,6 +24,27 @@ struct Cli {
     command: Option<Cmd>,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum HwAccel {
+    /// Platform default: VideoToolbox on macOS, software elsewhere
+    /// (silently falls back to software if hwaccel init fails).
+    Auto,
+    /// Force software decode.
+    Sw,
+    /// Force VideoToolbox (macOS only). Errors out if VT unavailable.
+    Vt,
+}
+
+impl From<HwAccel> for vr180_pipeline::decode::HwDecode {
+    fn from(h: HwAccel) -> Self {
+        match h {
+            HwAccel::Auto => Self::Auto,
+            HwAccel::Sw   => Self::Software,
+            HwAccel::Vt   => Self::VideoToolbox,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Probe gyro data from a .360 file: CORI/IORI count + Euler ranges.
@@ -57,6 +78,25 @@ enum Cmd {
         /// stitched side-by-side.
         #[arg(long, default_value_t = 2048)]
         eye_w: u32,
+        /// Hardware-accelerated decode: auto (platform default), sw
+        /// (force software), or vt (force VideoToolbox, macOS only).
+        #[arg(long, value_enum, default_value_t = HwAccel::Auto)]
+        hw_accel: HwAccel,
+    },
+
+    /// Phase 0.6 decode-throughput benchmark. Decode the first N frames
+    /// of one video stream end-to-end (including `av_hwframe_transfer_data`
+    /// when VT is in use) and report fps. Compares software vs VideoToolbox
+    /// hwaccel under steady-state conditions where the single-frame
+    /// cold-start cost has been amortized.
+    BenchDecode {
+        path: PathBuf,
+        /// Number of frames to decode.
+        #[arg(short, long, default_value_t = 100)]
+        frames: u32,
+        /// Hardware decode path: auto, sw, or vt.
+        #[arg(long, value_enum, default_value_t = HwAccel::Auto)]
+        hw_accel: HwAccel,
     },
 
     /// (placeholder) Render the project described by a JSON config.
@@ -98,8 +138,10 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Cmd::ProbeGyro { path, vqf }) => probe_gyro(&path, vqf),
-        Some(Cmd::ProbeEac { path, out, equirect, eye_w }) =>
-            probe_eac(&path, out.as_deref(), equirect.as_deref(), eye_w),
+        Some(Cmd::ProbeEac { path, out, equirect, eye_w, hw_accel }) =>
+            probe_eac(&path, out.as_deref(), equirect.as_deref(), eye_w, hw_accel.into()),
+        Some(Cmd::BenchDecode { path, frames, hw_accel }) =>
+            bench_decode(&path, frames, hw_accel.into()),
         Some(Cmd::Export { config }) => {
             tracing::warn!(?config, "export: not implemented (Phase 0.9)");
             Ok(())
@@ -107,14 +149,31 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+fn bench_decode(
+    path: &std::path::Path,
+    n_frames: u32,
+    hw: vr180_pipeline::decode::HwDecode,
+) -> anyhow::Result<()> {
+    let result = vr180_pipeline::decode::bench_decode_throughput(path, n_frames, hw)?;
+    let ms_per_frame = result.total.as_secs_f32() * 1000.0 / result.frames.max(1) as f32;
+    println!("file:        {}", path.display());
+    println!("frames:      {} (requested {})", result.frames, n_frames);
+    println!("decode path: {}", result.decode_path);
+    println!("total:       {:.2?}", result.total);
+    println!("per frame:   {ms_per_frame:.2} ms");
+    println!("throughput:  {:.2} fps", result.fps());
+    Ok(())
+}
+
 fn probe_eac(
     path: &std::path::Path,
     out: Option<&std::path::Path>,
     equirect: Option<&std::path::Path>,
     eye_w: u32,
+    hw: vr180_pipeline::decode::HwDecode,
 ) -> anyhow::Result<()> {
     use vr180_core::eac::{Dims, assemble_lens_a, assemble_lens_b};
-    use vr180_pipeline::decode::{extract_first_stream_pair, probe_video};
+    use vr180_pipeline::decode::{extract_first_stream_pair_with, probe_video};
 
     let probe = probe_video(path)?;
     let dims = Dims::new(probe.width, probe.height);
@@ -135,7 +194,7 @@ fn probe_eac(
 
     // Decode + assemble once; reuse for both output paths.
     let t0 = std::time::Instant::now();
-    let pair = extract_first_stream_pair(path)?;
+    let pair = extract_first_stream_pair_with(path, hw)?;
     let decode_t = t0.elapsed();
     let dims = pair.dims;
     let cw = dims.cross_w() as usize;
@@ -148,7 +207,8 @@ fn probe_eac(
     let assemble_t = t1.elapsed();
 
     println!();
-    println!("decoded streams:  {decode_t:.2?}  ({} bytes / stream)", pair.s0.len());
+    println!("decoded streams:  {decode_t:.2?}  ({} bytes / stream)  [path: {}]",
+        pair.s0.len(), pair.decode_path);
     println!("assembled crosses:{assemble_t:.2?}  (2 × {}×{})", cw, cw);
 
     if let Some(out) = out {
