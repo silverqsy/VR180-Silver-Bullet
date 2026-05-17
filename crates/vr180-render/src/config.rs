@@ -119,6 +119,66 @@ pub struct ExportConfig {
     /// Python default: 15.0. `0` disables.
     #[serde(default = "default_max_corr_deg")]
     pub max_corr_deg: f32,
+    /// Phase C+: horizon lock. Drops the Z-twist (roll) of the
+    /// smoothed CORI before computing the per-frame heading, so
+    /// the rendered horizon stays level regardless of how the
+    /// camera was rolled during a pan. Off by default.
+    #[serde(default)]
+    pub horizon_lock: bool,
+
+    /// Phase E: source of the camera orientation stream feeding
+    /// stabilization. `"direct"` (default) reads GPMF CORI verbatim
+    /// — correct for firmware-stabilized clips. `"vqf"` runs the VQF
+    /// 9D fusion pipeline (GYRO+GRAV+MNOR) — needed for bias-drifting
+    /// CORI. `"auto"` picks based on a CORI[0] xyz-norm probe.
+    #[serde(default)]
+    pub cori_source: CoriSourceStr,
+
+    // ─── Phase D: rolling-shutter correction ────────────────────────
+    /// Enable per-pixel rolling-shutter correction in the equirect
+    /// projection shader. Requires the source `.360` to have a GEOC
+    /// calibration block. Off by default.
+    #[serde(default)]
+    pub rs_correct: bool,
+    /// RS mode: `"firmware"` (default) → right eye gets +2.5 factors
+    /// to cancel firmware's reversed correction. `"no-firmware"` →
+    /// both eyes get 1.0 factors (rare; for clips recorded with
+    /// firmware RS disabled).
+    #[serde(default)]
+    pub rs_mode: RsModeStr,
+    /// Sensor readout time in milliseconds. Default 15.224 (GoPro MAX).
+    #[serde(default = "default_rs_readout_ms")]
+    pub rs_readout_ms: f32,
+    /// Override the per-axis RS factors (set to `null` to use the
+    /// `rs_mode` defaults).
+    #[serde(default)]
+    pub rs_pitch_factor: Option<f32>,
+    #[serde(default)]
+    pub rs_roll_factor:  Option<f32>,
+    #[serde(default)]
+    pub rs_yaw_factor:   Option<f32>,
+}
+
+/// RS mode picker. Serialized as lowercase strings matching the CLI
+/// `--rs-mode` enum (`"firmware"` / `"no-firmware"`).
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RsModeStr {
+    #[default]
+    Firmware,
+    NoFirmware,
+}
+
+/// Phase E: CORI source picker for stabilization. Serialized as
+/// lowercase strings matching the CLI `--cori-source` enum
+/// (`"direct"` / `"vqf"` / `"auto"`).
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoriSourceStr {
+    #[default]
+    Direct,
+    Vqf,
+    Auto,
 }
 
 // ─── Color-tool sub-configs ─────────────────────────────────────────
@@ -308,6 +368,7 @@ fn default_apac_bitrate() -> u32 { 384_000 }
 fn default_sharpen_sigma() -> f32 { 1.4 }
 fn default_smooth_ms() -> f32 { 1000.0 }
 fn default_max_corr_deg() -> f32 { 15.0 }
+fn default_rs_readout_ms() -> f32 { vr180_core::gyro::SROT_S * 1000.0 }
 fn one() -> f32 { 1.0 }
 
 #[cfg(test)]
@@ -359,6 +420,12 @@ mod tests {
             "encoder": "vt",
             "zero_copy": true,
             "zero_copy_encode": true,
+            "stabilize": true,
+            "horizon_lock": true,
+            "cori_source": "auto",
+            "rs_correct": true,
+            "rs_mode": "firmware",
+            "rs_readout_ms": 15.224,
             "cdl": {
                 "lift": 0.0, "gamma": 0.92, "gain": 1.15,
                 "shadow": 0.3, "highlight": -0.2
@@ -383,11 +450,19 @@ mod tests {
         assert_eq!(cfg.mid_detail.amount, -0.4);
         assert_eq!(cfg.lut.as_deref(), Some("bundled"));
         assert!(cfg.apac_audio && cfg.apmp);
+        // Phase C+ / D / E fields.
+        assert!(cfg.stabilize && cfg.horizon_lock);
+        assert!(matches!(cfg.cori_source, CoriSourceStr::Auto));
+        assert!(cfg.rs_correct);
+        assert!(matches!(cfg.rs_mode, RsModeStr::Firmware));
+        assert!((cfg.rs_readout_ms - 15.224).abs() < 1e-4);
 
         // Round-trip: serialize back, re-parse, all fields still match.
         let serialized = serde_json::to_string(&cfg).unwrap();
         let cfg2: ExportConfig = serde_json::from_str(&serialized).expect("re-parse");
         assert_eq!(cfg.cdl.gain, cfg2.cdl.gain);
         assert_eq!(cfg.apac_bitrate, cfg2.apac_bitrate);
+        assert!(matches!(cfg2.cori_source, CoriSourceStr::Auto));
+        assert!(cfg2.rs_correct);
     }
 }

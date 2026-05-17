@@ -16,6 +16,7 @@
 use crate::{Error, Result};
 use std::path::Path;
 use vr180_core::gyro::raw::{parse_raw_imu, RawImu, ImuBlock};
+use vr180_core::gyro::cori_iori::Quat;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccSource { Grav, Raw, None }
@@ -143,6 +144,73 @@ fn pick_acc_source(raw: &RawImu, gyro_len: usize)
         return (resampled, AccSource::Raw, n_input);
     }
     (vec![[0.0; 3]; gyro_len], AccSource::None, 0)
+}
+
+/// Run the full VQF pipeline (input prep + 9D fusion + Y↔Z swap +
+/// resample to video frame rate) and return a per-video-frame
+/// quaternion stream that is **CORI-equivalent in component order**.
+///
+/// This is the Phase E entry point. The per-frame quaternions can be
+/// substituted for the GPMF-stream `parse_cori(...)` output in any
+/// downstream code (gravity alignment, bidirectional smoothing,
+/// per-eye heading split) — they are in the same `(w, x, Z_stored,
+/// Y_stored)` "on-disk byte order" convention that the rest of the
+/// stabilization pipeline assumes (see `vr180_core::gyro::resample::
+/// cori_swap_yz` doc-comment for why Y↔Z is necessary here).
+///
+/// # Sampling convention
+///
+/// VQF emits one quaternion per gyro sample (~798 Hz). We resample to
+/// `n_frames` outputs at `fps` Hz using a **window-averaging** sampler
+/// centered on each frame's SROT-midpoint, matching Python's
+/// `resample_quats_to_frames(..., time_offset_s=SROT/2,
+/// window_s=SROT)` — appropriate when RS correction (Phase D) is on
+/// downstream, and a safe default otherwise (the average over a
+/// short window collapses to point-sample when the rotation is
+/// slow-varying).
+pub fn vqf_cori_equivalent_stream(
+    input: &Path,
+    fps: f32,
+    n_frames: usize,
+) -> Result<Vec<Quat>> {
+    use vr180_core::gyro::{vqf, resample::{resample_quats_to_frames, cori_swap_yz, SROT_S}};
+
+    // 1. Prep the IMU arrays (ZXY → body remap, GRAV/ACCL source pick,
+    //    mag resample at gyro rate). Reuses Phase 0.3 input prep.
+    let prep = prepare_for_vqf(input)?;
+    let vqf_fps = 1.0 / prep.gyr_ts.max(1e-6);
+    tracing::info!(
+        "VQF: {} gyro samples @ {:.2} Hz, acc_source={:?}, mag_source={:?}",
+        prep.gyro_body.len(), vqf_fps, prep.acc_source, prep.mag_source,
+    );
+
+    // 2. Run VQF — 9D when mag present, 6D otherwise. Matches Python's
+    //    parameter choices (mag_dist_rejection_enabled=false, tau_mag=5.0).
+    let run = vqf::run(
+        &prep.gyro_body, &prep.acc_body, prep.mag_body.as_deref(), prep.gyr_ts,
+    );
+    tracing::info!(
+        "VQF: bias_deg_s=[{:.3}, {:.3}, {:.3}] σ={:.4} rad/s",
+        run.bias_deg_s()[0], run.bias_deg_s()[1], run.bias_deg_s()[2],
+        run.bias_sigma,
+    );
+
+    // 3. Apply Y↔Z swap to each output so the result is in CORI's
+    //    on-disk component order. Without this, downstream
+    //    `quat_to_rotation_matrix` builds a rotation that's reflected
+    //    on one axis.
+    let cori_equiv: Vec<Quat> = run.quats.into_iter().map(cori_swap_yz).collect();
+
+    // 4. Resample to per-video-frame quaternions. Window-average over
+    //    SROT centered at each frame's readout midpoint.
+    Ok(resample_quats_to_frames(
+        &cori_equiv,
+        vqf_fps,
+        fps,
+        n_frames,
+        SROT_S * 0.5,    // sample at center of readout
+        SROT_S,          // average over readout window
+    ))
 }
 
 fn pick_mag_source(raw: &RawImu, gyro_len: usize)

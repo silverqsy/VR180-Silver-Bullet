@@ -24,6 +24,12 @@
 //!   per-eye `q_left = q_iori · q_heading`, `q_right = q_iori⁻¹ ·
 //!   q_heading`. When IORI = identity (our test files), both eyes
 //!   end up with the same matrix and this is a no-op.
+//! - **Horizon lock** (Phase C+). Swing-twist decomposition of the
+//!   smoothed quat around the camera forward axis (+Z) drops the
+//!   Z-twist before computing the heading. Net result: the roll
+//!   component of the rendered output is always taken from raw,
+//!   so the horizon stays level even during slow camera pans
+//!   that the smoother would otherwise carry along.
 //!
 //! Math ports `smooth()` in `vr180_gui.py:4434-4721` (the heart of
 //! `GyroStabilizer`). Coordinate-frame conventions follow the Python
@@ -159,17 +165,103 @@ pub fn soft_elastic_clamp(raw: Quat, smoothed: Quat, max_corr_deg: f32) -> Quat 
 ///
 /// Returns `(q_left, q_right)` quaternions — caller converts to
 /// rotation matrices for the GPU.
+///
+/// Equivalent to [`per_eye_rotations_horizon_lock`] with
+/// `horizon_lock = false`. Kept as a thin wrapper for back-compat
+/// with code that doesn't care about horizon lock yet.
 pub fn per_eye_rotations(
     raw: Quat,
     smoothed: Quat,
     iori: Quat,
     max_corr_deg: f32,
 ) -> (Quat, Quat) {
+    per_eye_rotations_horizon_lock(raw, smoothed, iori, max_corr_deg, false)
+}
+
+/// Like [`per_eye_rotations`] but with an explicit horizon-lock toggle.
+///
+/// When `horizon_lock = true`, the smoothed quat is decomposed via
+/// swing-twist around the camera forward axis (+Z) and only the
+/// **swing** (pitch + yaw) survives. The Z-**twist** (roll) is
+/// dropped from `smoothed`, so:
+///
+/// ```text
+///   q_heading = q_raw · swing_z(smoothed_clamped)⁻¹
+/// ```
+///
+/// carries the full Z-twist of `q_raw`. Applied via the equirect
+/// shader's `R` uniform, that Z-twist un-rolls the output. Effect:
+/// the rendered horizon stays level regardless of how the camera
+/// was tilted around its optical axis (provided GRAV alignment is
+/// also on, which anchors world-up to true gravity at clip start).
+///
+/// Note: rolling around the **view direction** never crops a VR180
+/// half-equirect (it's symmetric under Z-rotation by definition),
+/// so the soft-clamp does not need to fight horizon-lock. We keep
+/// the clamp active on the **swing** part to still bound pitch+yaw
+/// over-correction on extreme moves.
+pub fn per_eye_rotations_horizon_lock(
+    raw: Quat,
+    smoothed: Quat,
+    iori: Quat,
+    max_corr_deg: f32,
+    horizon_lock: bool,
+) -> (Quat, Quat) {
+    // Clamp first (against the original smoothed). The clamp is about
+    // the heading angle a user perceives — we measure it before
+    // touching the roll component.
     let smoothed_clamped = soft_elastic_clamp(raw, smoothed, max_corr_deg);
-    let q_heading = raw.mul(smoothed_clamped.conjugate());
+    // Horizon-lock pass: drop the Z-twist of the smoothed quat so the
+    // resulting heading captures `raw`'s roll verbatim.
+    let smoothed_final = if horizon_lock {
+        let (swing, _twist) = swing_twist(smoothed_clamped, [0.0, 0.0, 1.0]);
+        swing
+    } else {
+        smoothed_clamped
+    };
+    let q_heading = raw.mul(smoothed_final.conjugate());
     let q_left  = iori.mul(q_heading);
     let q_right = iori.conjugate().mul(q_heading);
     (q_left, q_right)
+}
+
+/// Swing-twist decomposition of a unit quaternion `q` around the
+/// unit `axis`. Returns `(swing, twist)` such that
+/// `q = swing · twist` (twist applied first, then swing) where
+/// **twist** is a rotation purely around `axis` and **swing** is
+/// a rotation perpendicular to `axis`.
+///
+/// Algorithm (standard):
+/// 1. Project the quat's `(x, y, z)` component onto `axis`.
+/// 2. `twist_raw = (w, axis · projection)`.
+/// 3. Normalize → `twist`.
+/// 4. `swing = q · twist⁻¹`.
+///
+/// Degenerate case: when `q`'s vector part is purely perpendicular
+/// to `axis`, `twist_raw` has zero vector part and could fail to
+/// normalize. We fall back to identity twist (all rotation is
+/// swing) in that case.
+pub fn swing_twist(q: Quat, axis: [f32; 3]) -> (Quat, Quat) {
+    let p_dot_a = q.x * axis[0] + q.y * axis[1] + q.z * axis[2];
+    let twist_raw = Quat {
+        w: q.w,
+        x: axis[0] * p_dot_a,
+        y: axis[1] * p_dot_a,
+        z: axis[2] * p_dot_a,
+    };
+    let n = twist_raw.norm();
+    let twist = if n < 1e-6 {
+        Quat::IDENTITY
+    } else {
+        Quat {
+            w: twist_raw.w / n,
+            x: twist_raw.x / n,
+            y: twist_raw.y / n,
+            z: twist_raw.z / n,
+        }
+    };
+    let swing = q.mul(twist.conjugate());
+    (swing, twist)
 }
 
 /// Compute the gravity-alignment quaternion from the first `n` GRAV
@@ -347,6 +439,96 @@ mod tests {
         assert!(g.x.abs() < 1e-4);
         assert!(g.y.abs() < 1e-4);
         assert!(g.z.abs() < 1e-4);
+    }
+
+    #[test]
+    fn swing_twist_roundtrip_recovers_q() {
+        // Pick a quat with both a Z-twist and an off-axis swing.
+        let half_z = 20.0_f32.to_radians() * 0.5;
+        let twist_only = q(half_z.cos(), 0.0, 0.0, half_z.sin());
+        let half_x = 30.0_f32.to_radians() * 0.5;
+        let swing_only = q(half_x.cos(), half_x.sin(), 0.0, 0.0);
+        // swing applied after twist: q = swing · twist
+        let qfull = swing_only.mul(twist_only);
+        let (s, t) = swing_twist(qfull, [0.0, 0.0, 1.0]);
+        // s · t should equal qfull bit-for-bit (modulo numerical error).
+        let recon = s.mul(t);
+        assert!((recon.w - qfull.w).abs() < 1e-5, "w: {} vs {}", recon.w, qfull.w);
+        assert!((recon.x - qfull.x).abs() < 1e-5);
+        assert!((recon.y - qfull.y).abs() < 1e-5);
+        assert!((recon.z - qfull.z).abs() < 1e-5);
+        // The twist should be pure-Z (x, y components zero).
+        assert!(t.x.abs() < 1e-4, "twist x = {}", t.x);
+        assert!(t.y.abs() < 1e-4, "twist y = {}", t.y);
+        // The swing should have no Z-twist component.
+        let (_, t2) = swing_twist(s, [0.0, 0.0, 1.0]);
+        assert!((t2.w.abs() - 1.0).abs() < 1e-4, "swing has residual twist (w={})", t2.w);
+    }
+
+    #[test]
+    fn swing_twist_pure_z_rotation_has_identity_swing() {
+        // q = pure rotation around Z by 30°.
+        let half = 15.0_f32.to_radians();
+        let qz = q(half.cos(), 0.0, 0.0, half.sin());
+        let (swing, twist) = swing_twist(qz, [0.0, 0.0, 1.0]);
+        // Swing should be identity.
+        assert!((swing.w - 1.0).abs() < 1e-4);
+        assert!(swing.x.abs() < 1e-4);
+        assert!(swing.y.abs() < 1e-4);
+        assert!(swing.z.abs() < 1e-4);
+        // Twist should equal qz.
+        assert!((twist.w - qz.w).abs() < 1e-4);
+        assert!((twist.z - qz.z).abs() < 1e-4);
+    }
+
+    #[test]
+    fn horizon_lock_zeroes_smoothed_roll() {
+        // raw = identity (no jitter).  smoothed = pure 20° roll around Z.
+        // Without horizon-lock: q_heading = raw · smoothed⁻¹ = smoothed⁻¹
+        //   → carries the 20° un-roll.
+        // With horizon-lock: smoothed's Z-twist is dropped, so
+        //   smoothed_for_heading = identity, q_heading = identity
+        //   → NO un-rolling happens; the rendered output keeps
+        //   raw's roll, which (since raw = identity) is zero. So
+        //   output horizon stays level WITHOUT any correction.
+        // Either way the rendered horizon ends up level, but the
+        // mechanism differs. Check the right one fires.
+        let half = 10.0_f32.to_radians();
+        let smoothed = q(half.cos(), 0.0, 0.0, half.sin()); // 20° around Z
+        let raw = Quat::IDENTITY;
+
+        // Without horizon-lock: q_heading has roll.
+        let (l_off, _) = per_eye_rotations_horizon_lock(
+            raw, smoothed, Quat::IDENTITY, 0.0, false,
+        );
+        assert!(l_off.z.abs() > 0.05, "expected z-twist in heading without lock; got {}", l_off.z);
+
+        // With horizon-lock: q_heading is identity.
+        let (l_on, r_on) = per_eye_rotations_horizon_lock(
+            raw, smoothed, Quat::IDENTITY, 0.0, true,
+        );
+        assert!((l_on.w - 1.0).abs() < 1e-3, "expected identity heading w with lock; got {}", l_on.w);
+        assert!(l_on.x.abs() < 1e-3);
+        assert!(l_on.y.abs() < 1e-3);
+        assert!(l_on.z.abs() < 1e-3);
+        // Both eyes still match (IORI identity).
+        assert!((l_on.w - r_on.w).abs() < 1e-5);
+    }
+
+    #[test]
+    fn horizon_lock_preserves_smoothed_yaw_pan() {
+        // raw = 10° yaw, smoothed = 10° yaw (steady pan).
+        // Either way q_heading should be ~identity (yaw matches),
+        // because swing-twist around Z leaves Y-rotation in the swing.
+        let half = 5.0_f32.to_radians();
+        let qy = q(half.cos(), 0.0, half.sin(), 0.0);
+        let (l, _) = per_eye_rotations_horizon_lock(
+            qy, qy, Quat::IDENTITY, 0.0, true,
+        );
+        assert!((l.w - 1.0).abs() < 1e-3, "yaw pan should produce identity heading; got w={}", l.w);
+        assert!(l.x.abs() < 1e-3);
+        assert!(l.y.abs() < 1e-3);
+        assert!(l.z.abs() < 1e-3);
     }
 
     #[test]

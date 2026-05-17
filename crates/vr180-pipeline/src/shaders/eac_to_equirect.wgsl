@@ -5,6 +5,7 @@
 //   binding(1): bilinear sampler
 //   binding(2): storage texture for the equirect output (rgba8unorm)
 //   binding(3): EquirectUniforms — per-frame R matrix for stabilization
+//   binding(4): RsUniforms — per-frame RS correction data (Phase D)
 //
 // One thread per output pixel. The math mirrors the Python
 // `FrameExtractor.build_cross_remap`:
@@ -12,6 +13,7 @@
 //   * convert (u, v) ∈ [0,1]² to (lon, lat) ∈ [-π/2, π/2]²
 //   * recover unit direction vector (xn, yn, zn)
 //   * **apply per-frame rotation R** (Phase A stabilization).
+//   * **apply per-pixel RS small-angle rotation** (Phase D)
 //   * pick one of 5 EAC faces (front / right / left / top / bottom)
 //     by max-axis test
 //   * within the chosen face, recover (u_eac, v_eac) via arctan
@@ -24,6 +26,19 @@
 // face sample lands where the scene actually was when that pixel was
 // captured. Net effect: scene appears stationary while the camera
 // pans/tilts/rolls.
+//
+// Phase D RS uniform: when `rs.srot_s == 0` the RS correction collapses
+// to a no-op. When non-zero, for each pixel we:
+//   1. Compute the polar angle θ from the optical axis (+Z).
+//   2. Evaluate the KLNS polynomial `r = c0·θ + c1·θ³ + ... + c4·θ⁹`
+//      to recover the original fisheye radius (in sensor pixels).
+//   3. Recover the sensor Y coordinate from the direction's Y
+//      component: `sensor_y = (cal_dim/2 + ctry) - r·y/sin(θ)`.
+//   4. Normalize to a time offset in `[-SROT/2, +SROT/2]` seconds.
+//   5. Apply a small-angle 3D rotation by `ω · t_offset` (the
+//      pre-multiplied effective angular velocity in shader frame).
+// This compensates for the yaw-modded right eye's reversed firmware
+// RS — same math as `apply_rs_correction` in the Python reference.
 
 @group(0) @binding(0) var cross_tex: texture_2d<f32>;
 @group(0) @binding(1) var cross_smp: sampler;
@@ -42,6 +57,20 @@ struct EquirectUniforms {
 // Renamed to `equ` to avoid shadowing the local `let u = ...` below
 // for the equirect U coordinate.
 @group(0) @binding(3) var<uniform> equ: EquirectUniforms;
+
+// RS uniforms — 12 individual scalars in std140 layout (3 × vec4
+// alignment, 48 bytes total). `srot_s == 0` disables.
+// `omega.{x,y,z}` are pre-multiplied effective angular velocities
+// (already × pitch/yaw/roll factors) in rad/s, shader frame.
+// `klns_c0..c4` are the Kannala-Brandt polynomial coefficients of
+// this eye's lens. `ctry` is the principal-point Y offset (pixels),
+// `cal_dim` is the calibration sensor dimension (pixels, square).
+struct RsUniforms {
+    omega_x: f32, omega_y: f32, omega_z: f32, srot_s: f32,
+    klns_c0: f32, klns_c1: f32, klns_c2: f32, klns_c3: f32,
+    klns_c4: f32, ctry: f32, cal_dim: f32, _pad: f32,
+}
+@group(0) @binding(4) var<uniform> rs: RsUniforms;
 
 const PI: f32 = 3.14159265359;
 const HALF_PI: f32 = 1.57079632679;
@@ -85,9 +114,50 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // R · dir — manual row-vector dot products. 12-scalar uniform
     // layout (see EquirectUniforms above); each row is 3 floats +
     // 1 pad.
-    let xn = equ.r00 * dir_world.x + equ.r01 * dir_world.y + equ.r02 * dir_world.z;
-    let yn = equ.r10 * dir_world.x + equ.r11 * dir_world.y + equ.r12 * dir_world.z;
-    let zn = equ.r20 * dir_world.x + equ.r21 * dir_world.y + equ.r22 * dir_world.z;
+    let xr = equ.r00 * dir_world.x + equ.r01 * dir_world.y + equ.r02 * dir_world.z;
+    let yr = equ.r10 * dir_world.x + equ.r11 * dir_world.y + equ.r12 * dir_world.z;
+    let zr = equ.r20 * dir_world.x + equ.r21 * dir_world.y + equ.r22 * dir_world.z;
+
+    // Phase D: per-pixel rolling-shutter small-angle rotation. When
+    // `rs.srot_s == 0`, skip entirely — the (xn, yn, zn) below equal
+    // (xr, yr, zr) and this is a pure pass-through.
+    var xn: f32 = xr;
+    var yn: f32 = yr;
+    var zn: f32 = zr;
+    if (rs.srot_s > 0.0) {
+        // Polar angle from optical axis (+Z).
+        let cos_theta = clamp(zr, -1.0, 1.0);
+        let theta = acos(cos_theta);
+        let sin_theta = sqrt(max(0.0, 1.0 - zr * zr));
+        // KLNS polynomial: r = c0·θ + c1·θ³ + c2·θ⁵ + c3·θ⁷ + c4·θ⁹.
+        // Horner form for stability.
+        let theta2 = theta * theta;
+        let r_klns = theta * (rs.klns_c0
+            + theta2 * (rs.klns_c1
+                + theta2 * (rs.klns_c2
+                    + theta2 * (rs.klns_c3
+                        + theta2 * rs.klns_c4))));
+        // Sensor Y coordinate (row, 0 = top, cal_dim = bottom).
+        // At θ → 0 the limit of r / sin(θ) is c0, so we branch there.
+        let center_y = rs.cal_dim * 0.5 + rs.ctry;
+        var sensor_y: f32;
+        if (sin_theta > 1e-6) {
+            sensor_y = center_y - r_klns * yr / sin_theta;
+        } else {
+            sensor_y = center_y - rs.klns_c0 * yr;
+        }
+        // Normalized time offset ∈ [-0.5, +0.5] → seconds.
+        let t_norm = sensor_y / rs.cal_dim - 0.5;
+        let t = t_norm * rs.srot_s;
+        // Small-angle 3D rotation by ω · t. `omega.*` already includes
+        // the rs factors (multiplied on CPU side).
+        let wx = rs.omega_x * t;
+        let wy = rs.omega_y * t;
+        let wz = rs.omega_z * t;
+        xn = xr + wy * zr - wz * yr;
+        yn = yr + wz * xr - wx * zr;
+        zn = zr - wy * xr + wx * yr;
+    }
 
     let ax = abs(xn);
     let ay = abs(yn);

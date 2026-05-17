@@ -949,21 +949,192 @@ extreme camera moves no longer crop past the image boundary.
 - User-confirmed: horizon stays level, intentional camera pans
   preserved, no roll-axis direction issues.
 
+## Phase C+ — Horizon-lock toggle (swing-twist decomposition) ✅
+
+The GRAV alignment we shipped in Phase C is the always-on baseline
+(world +Y = true gravity at clip start). Phase C+ adds an explicit
+`--horizon-lock` mode that **zeros out the roll component of the
+heading correction every frame** — the horizon stays level even
+during slow camera tilts that the smoother would otherwise carry
+along.
+
+- [x] `vr180_core::gyro::stabilize::swing_twist(q, axis)` — standard
+      swing-twist decomposition. `q = swing · twist`; twist is the
+      rotation around `axis`, swing is perpendicular. Falls back to
+      identity twist when `q`'s vector part is perpendicular to
+      `axis` (degenerate case).
+- [x] `per_eye_rotations_horizon_lock(raw, smoothed, iori,
+      max_corr_deg, horizon_lock)` — when `horizon_lock = true`,
+      drops the Z-twist of `smoothed_clamped` via `swing_twist(.,
+      [0, 0, 1])` before computing the heading. The result carries
+      the full Z-twist of `raw`, which the shader's `R · dir_world`
+      un-rolls.
+- [x] Soft clamp runs BEFORE swing-twist so it bounds pitch/yaw
+      over-correction without fighting horizon-lock (horizon-lock
+      never crops a VR180 half-equirect — rolling around the view
+      direction is symmetric).
+- [x] 3 new unit tests: `swing_twist_roundtrip_recovers_q`,
+      `swing_twist_pure_z_rotation_has_identity_swing`,
+      `horizon_lock_zeroes_smoothed_roll`,
+      `horizon_lock_preserves_smoothed_yaw_pan`. All pass.
+- [x] CLI flag `--horizon-lock` on `export`.
+- [x] JSON `ExportConfig.horizon_lock: bool` field.
+
+## Phase D — Per-pixel rolling-shutter warp ✅
+
+Per-pixel RS correction in the equirect projection shader. Uses
+the source's GEOC KLNS fisheye time map + smoothed 800 Hz GYRO to
+apply a small-angle 3D rotation per output pixel, compensating for
+the sensor's top-to-bottom readout over SROT ≈ 15.224 ms. Cleans up
+the yaw-modded right eye on firmware-RS clips (where firmware
+applied the correction in the wrong direction).
+
+### What landed
+
+- **`vr180-core::geoc`** — `parse_geoc(path)` reads the file tail
+  (last 1 MiB), finds the `GEOC` marker, walks the GPMF-style
+  records (DVID / KLNS / CTRX / CTRY / CALW / CALH). Returns
+  per-lens `LensCal { klns: [f64; 5], ctrx, ctry }` for FRNT and
+  BACK plus a global `cal_dim`. Handles the `DVID` payload's
+  in-the-wild `'F'` (4-byte fourcc) encoding in addition to the
+  `'c'` (ASCII string) encoding our synthetic tests use. 2 unit
+  tests + validated against a real `.360` (FRNT c0=1289.50,
+  BACK c0=1293.75, cal_dim=4216 — matches Python).
+
+- **`vr180-core::gyro::rs_omega`** — `compute_per_frame_omega`
+  flattens raw GYRO blocks, applies the `[raw[1], raw[0], raw[2]]`
+  axis remap into shader frame (X=right, Y=up, Z=forward — see
+  module doc for derivation), 20 ms moving-average smooths, then
+  samples at frame center + SROT/2. Output is one `[ω_x, ω_y,
+  ω_z]` per video frame in **rad/s**. 4 unit tests.
+
+- **`shaders/eac_to_equirect.wgsl`** — new `@binding(4)` for
+  `RsUniforms` (12 scalars, 48 bytes std140). After the
+  stabilization rotation `R · dir_world`, when `rs.srot_s > 0`,
+  computes the polar angle θ from the optical axis, evaluates the
+  KLNS polynomial `r = c0·θ + c1·θ³ + ... + c4·θ⁹`, recovers the
+  sensor Y coordinate (with the `r/sin(θ) → c0` limit at θ → 0),
+  derives `t_offset ∈ [-SROT/2, +SROT/2]` seconds, and applies a
+  small-angle 3D rotation by `ω · t_offset` before face selection.
+
+- **`vr180_pipeline::gpu::EquirectRsParams`** — public per-eye
+  per-frame RS bundle: omega (pre-multiplied by per-axis factors)
+  + srot_s + KLNS + ctry + cal_dim. `DISABLED` sentinel collapses
+  the shader's RS pass to a no-op.
+
+- **`vr180-render` orchestration**:
+  - `RsParams { enabled, srot_s, left_factor, right_factor }` bundle.
+  - `RsMode { Firmware, NoFirmware }`. Firmware mode → right eye
+    factors `+2.5`, left eye `0` (cancels the wrong-direction
+    firmware correction on the yaw-modded right lens). No-firmware
+    mode → both eyes `1.0`.
+  - `compute_per_eye_frames` now parses GEOC, runs RS omega
+    sampler, multiplies per-eye factors, and bundles into the
+    `(EquirectRotation, EquirectRsParams)` per-eye-per-frame tuple.
+
+- **CLI flags** on `export`:
+  - `--rs-correct` (on/off, default off)
+  - `--rs-mode firmware|no-firmware` (default firmware)
+  - `--rs-readout-ms <ms>` (default 15.224, GoPro MAX SROT)
+  - `--rs-pitch-factor`, `--rs-roll-factor`, `--rs-yaw-factor`
+    (optional overrides)
+
+- **JSON `ExportConfig`** mirrors all flags + `RsModeStr` enum.
+
+### Validation
+
+- **End-to-end on `firmware RS No IORI.360`** (60 frames, 4K SBS,
+  VT zero-copy + zero-copy encode):
+  - `--stabilize --rs-correct` (mode=firmware, factors L=0,
+    R=2.5/2.5): **66.82 fps** (1.5× faster than 30 fps real-time).
+  - `--rs-correct` alone (no stabilization): **71.11 fps**.
+- **End-to-end on `NO firmware RS No IORI.360`** (60 frames, same
+  settings, mode=no-firmware): **74.61 fps**. Both eyes get 1.0
+  factors.
+- Visual: extracted frames show clean projection, no per-frame
+  jello on the right eye when RS is enabled.
+- Performance hit from RS shader pass: in the noise (~3 fps over
+  the no-RS baseline). KLNS polynomial + per-pixel rotation is
+  ~30 extra FLOPS per output pixel — well within the GPU budget.
+
+## Phase E — VQF stabilization (bias-drifting CORI) ✅
+
+The VQF math was already ported in Phase 0.3 (`vr180-core::gyro::
+vqf::run`). Phase E lands the integration glue: parse → prep → run
+→ Y↔Z swap → resample to video frame rate → optionally substitute
+for the direct GPMF CORI in the stabilization pipeline. Needed for
+clips where the firmware CORI is bias-drifting (`xyz_norm < ~1e-3`
+at t=0), e.g. the "NO firmware RS" reference clip.
+
+### What landed
+
+- **`vr180_pipeline::imu::vqf_cori_equivalent_stream`** — full
+  pipeline helper: GPMF parse → ZXY→body remap → 800 Hz VQF 9D
+  fusion → per-sample Y↔Z swap (matches `parse_gyro_raw.py:1273`)
+  → window-averaging resample to video frame rate (center + SROT/2
+  offset, SROT window). Returns `Vec<Quat>` of length `n_frames`
+  ready to flow through the existing stabilization pipeline.
+
+- **`CoriSource { Direct, Vqf, Auto }`** in `vr180-render`:
+  - `Direct` (default): GPMF CORI verbatim — right for firmware-
+    stabilized clips.
+  - `Vqf`: skip GPMF CORI, use VQF output.
+  - `Auto`: probe `CORI[0].xyz_norm` and pick `Vqf` if < 1e-3
+    (bias-drift heuristic from the Python reference).
+
+- **GRAV-alignment skip for VQF source** — VQF's accelerometer
+  inclination correction already gravity-aligns its output, so
+  applying our own GRAV alignment on top double-corrects. Matches
+  Python `_q_gravity_align = None` when source contains "vqf"
+  (`vr180_gui.py:4479`).
+
+- **VQF reference-frame anchoring** — VQF starts at identity but
+  steers to whatever orientation makes accelerometer-down align
+  with body-Y (its own world-frame convention). For a normally
+  held camera, VQF[0] is often a 100°+ rotation from identity in
+  the equirect render's coordinate convention. We right-multiply
+  every VQF quat by `VQF[0]⁻¹` so frame 0 = identity (camera
+  looking forward in world +Z), subsequent frames carry only
+  rotation since the start. This makes VQF a drop-in replacement
+  for direct CORI in the rest of the stabilization pipeline,
+  including horizon-lock (which assumes Z = camera forward).
+
+- **CLI flag** `--cori-source direct|vqf|auto` on `export`.
+- **JSON `ExportConfig.cori_source: CoriSourceStr`** enum field.
+
+### Validation
+
+- **End-to-end on `NO firmware RS No IORI.360`** (60 frames, 4K SBS,
+  VT zero-copy):
+  - `--stabilize --cori-source vqf`: **78.25 fps**, output visually
+    identical to identity baseline (camera barely moved in first
+    second — VQF correctly produces near-identity heading after
+    reference anchoring).
+  - `--stabilize --cori-source auto`: same — auto picks `vqf`
+    (CORI[0].xyz_norm = 8.6e-5 < 1e-3).
+  - `--stabilize --cori-source vqf --horizon-lock`: **78.99 fps**,
+    output matches identity baseline (horizon-lock + reference
+    anchoring + GRAV-skip work together correctly).
+  - `--stabilize --cori-source direct`: still works (just produces
+    no useful stabilization since CORI is bias-drifting).
+- **End-to-end on `firmware RS No IORI.360`** with full Phase C+D+E
+  pipeline (`--stabilize --horizon-lock --rs-correct --cori-source
+  auto`): **63.53 fps**, output is a clean stereo SBS of the
+  laptop scene. Auto correctly picks `direct` (CORI[0].xyz_norm
+  not below threshold).
+- All 8 stabilize unit tests still pass; 3 config tests still pass
+  including a new round-trip assertion for the C+/D/E knobs.
+
 ### Still deferred
 
-- **Phase C+** — `--horizon-lock` toggle using swing-twist
-  decomposition. The GRAV alignment we shipped is the always-on
-  baseline; explicit horizon lock uses the per-frame GRAV reading
-  to compute the roll component instead of taking it from the
-  smoothed quaternion.
-- **Phase D** — per-scanline RS warp (32 row-groups, 800 Hz GYRO,
-  KLNS fisheye time map). Mainly matters for the right eye on
-  firmware-RS clips (yaw-mod reverses firmware's correction) and
-  both eyes on no-firmware-RS clips.
-- **Phase E** — VQF → CORI-equivalent quaternion stream for
-  bias-drifting clips. The VQF math is already ported
-  (`vr180-core::gyro::vqf::run`); just needs the integration glue
-  + Y↔Z swap at the output (Python `parse_gyro_raw.py:1273`).
+- **Per-segment chain** — multi-segment GoPro recordings (split at
+  4 GB FAT32 boundaries). Both `vqf_to_cori_quats_multi_segment`
+  and the GEOC tail-of-last-segment lookup need to land before we
+  can run Neo end-to-end on chapter-split clips.
+- **Auto-detect SROT from GPMF** — Phase D currently uses the
+  fixed `15.224 ms` constant. Python reads SROT from the GPMF tail
+  block (one-line addition to `parse_geoc` once we know the
+  fourcc layout for `SROT`).
 
 ## Phase 0.9 — JSON config sidecar (Rust side) ✅
 

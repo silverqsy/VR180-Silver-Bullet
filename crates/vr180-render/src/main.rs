@@ -250,6 +250,64 @@ enum Cmd {
         /// extreme motion. Python default: 15.0. `0` disables the cap.
         #[arg(long, default_value_t = 15.0)]
         max_corr_deg: f32,
+        /// Phase C+: horizon lock. Decomposes the smoothed CORI via
+        /// swing-twist around the camera forward axis (+Z) and drops
+        /// the Z-twist (roll) before computing the per-frame heading
+        /// correction. Net effect: the rendered horizon stays level
+        /// even during slow camera pans that the smoother would
+        /// otherwise carry along (e.g. holding the camera with a
+        /// constant 10° tilt while panning). Best combined with
+        /// `--stabilize` so GRAV alignment anchors world-up to true
+        /// gravity at the start of the clip. Rolling around the
+        /// view direction is symmetric in a VR180 half-equirect, so
+        /// horizon-lock never crops the rendered hemisphere.
+        #[arg(long, default_value_t = false)]
+        horizon_lock: bool,
+        /// Phase E: pick the source of the camera orientation stream
+        /// feeding the stabilization smoother. `direct` (default):
+        /// GPMF CORI verbatim (right for firmware-stabilized clips).
+        /// `vqf`: run the VQF 9D fusion pipeline on raw
+        /// GYRO+GRAV+MNOR (right for bias-drifting CORI). `auto`:
+        /// probe the first CORI sample and pick `vqf` if its xyz
+        /// norm is < 1e-3 (a sign of bias drift), else `direct`.
+        #[arg(long, value_enum, default_value_t = CoriSource::Direct)]
+        cori_source: CoriSource,
+
+        // --- Phase D: rolling-shutter correction ---
+        /// Phase D: enable per-pixel rolling-shutter correction in
+        /// the equirect projection shader. Uses the source's GEOC
+        /// KLNS fisheye time map + smoothed 800 Hz GYRO to apply a
+        /// small-angle per-pixel rotation, compensating for the
+        /// sensor's top-to-bottom readout over SROT≈15.2 ms. Required
+        /// to clean up the yaw-modded right eye on firmware-RS clips
+        /// (where firmware applied the wrong-direction correction).
+        /// Requires the source `.360` to have a GEOC block at the
+        /// file tail (true for all GoPro Max calibrated `.360`s).
+        #[arg(long, default_value_t = false)]
+        rs_correct: bool,
+        /// RS mode: `firmware` (default, most common) → right eye
+        /// gets +2.5 factors to cancel firmware's reversed correction,
+        /// left eye gets none. `no-firmware` → both eyes get 1.0
+        /// factors. The mode picks default per-axis factors; you can
+        /// override any axis with `--rs-pitch-factor` etc.
+        #[arg(long, value_enum, default_value_t = RsMode::Firmware)]
+        rs_mode: RsMode,
+        /// Sensor readout time in milliseconds. Default 15.224 (GoPro
+        /// MAX SROT). `0` disables RS regardless of `--rs-correct`.
+        #[arg(long, default_value_t = vr180_core::gyro::SROT_S * 1000.0)]
+        rs_readout_ms: f32,
+        /// Override the pitch RS factor (X axis). Default depends on
+        /// `--rs-mode`. Applies to whichever eye(s) the mode enables.
+        #[arg(long, allow_hyphen_values = true)]
+        rs_pitch_factor: Option<f32>,
+        /// Override the roll RS factor (Z axis). Default depends on
+        /// `--rs-mode`.
+        #[arg(long, allow_hyphen_values = true)]
+        rs_roll_factor: Option<f32>,
+        /// Override the yaw RS factor (Y axis). Default 0.0 (Python's
+        /// `rs_yaw_factor` is also 0 — yaw has negligible RS effect).
+        #[arg(long, allow_hyphen_values = true)]
+        rs_yaw_factor: Option<f32>,
 
         // --- CDL (ASC Color Decision List) ---
         /// CDL lift: black-point shift. 0 = no change, +1 pushes blacks
@@ -361,7 +419,10 @@ fn main() -> anyhow::Result<()> {
             input, output, eye_w, frames, fps, bitrate,
             lut, lut_intensity, hw_accel, encoder, zero_copy, zero_copy_encode,
             apac_audio, apac_bitrate, apmp, stabilize,
-            gyro_smooth_ms, gyro_responsiveness, max_corr_deg,
+            gyro_smooth_ms, gyro_responsiveness, max_corr_deg, horizon_lock,
+            cori_source,
+            rs_correct, rs_mode, rs_readout_ms,
+            rs_pitch_factor, rs_roll_factor, rs_yaw_factor,
             cdl_lift, cdl_gamma, cdl_gain, cdl_shadow, cdl_highlight,
             temperature, tint, saturation,
             sharpen, sharpen_sigma,
@@ -398,11 +459,17 @@ fn main() -> anyhow::Result<()> {
                     ..Default::default()
                 },
                 max_corr_deg,
+                horizon_lock,
+                cori_source,
             };
+            let rs = RsParams::from_mode(
+                rs_correct, rs_mode, rs_readout_ms / 1000.0,
+                rs_pitch_factor, rs_roll_factor, rs_yaw_factor,
+            );
             export(&input, &output, eye_w, frames, fps, bitrate,
                    lut.as_deref(), lut_intensity, hw_accel.into(),
                    encoder.resolve(), zero_copy, zero_copy_encode,
-                   plan_template, post, stab)
+                   plan_template, post, stab, rs)
         }
     }
 }
@@ -420,6 +487,11 @@ fn run_render_from_config(config_path: &std::path::Path) -> anyhow::Result<()> {
         apac_bitrate: cfg.apac_bitrate,
         apmp: cfg.apmp,
     };
+    let cori_source = match cfg.cori_source {
+        config::CoriSourceStr::Direct => CoriSource::Direct,
+        config::CoriSourceStr::Vqf    => CoriSource::Vqf,
+        config::CoriSourceStr::Auto   => CoriSource::Auto,
+    };
     let stab = StabilizeParams {
         enabled: cfg.stabilize,
         smooth: vr180_core::gyro::SmoothParams {
@@ -428,7 +500,17 @@ fn run_render_from_config(config_path: &std::path::Path) -> anyhow::Result<()> {
             ..Default::default()
         },
         max_corr_deg: cfg.max_corr_deg,
+        horizon_lock: cfg.horizon_lock,
+        cori_source,
     };
+    let rs_mode = match cfg.rs_mode {
+        config::RsModeStr::Firmware   => RsMode::Firmware,
+        config::RsModeStr::NoFirmware => RsMode::NoFirmware,
+    };
+    let rs = RsParams::from_mode(
+        cfg.rs_correct, rs_mode, cfg.rs_readout_ms / 1000.0,
+        cfg.rs_pitch_factor, cfg.rs_roll_factor, cfg.rs_yaw_factor,
+    );
     export(
         &cfg.input,
         &cfg.output,
@@ -445,6 +527,7 @@ fn run_render_from_config(config_path: &std::path::Path) -> anyhow::Result<()> {
         plan,
         post,
         stab,
+        rs,
     )
 }
 
@@ -457,6 +540,37 @@ struct StabilizeParams {
     enabled: bool,
     smooth: vr180_core::gyro::SmoothParams,
     max_corr_deg: f32,
+    /// Phase C+: drop the Z-twist (roll) component of the smoothed
+    /// CORI before computing the per-frame heading. Net effect: the
+    /// rendered horizon stays level even when the camera was rolled
+    /// during a pan that the smoother would otherwise carry along.
+    /// Off by default — GRAV alignment alone is sufficient for clips
+    /// where the camera is held roughly level throughout.
+    horizon_lock: bool,
+    /// Phase E: which quaternion stream to use as the input camera
+    /// orientation. `Direct` reads CORI from GPMF (correct for
+    /// firmware-stabilized clips). `Vqf` runs the VQF 9D fusion
+    /// pipeline on raw GYRO+GRAV+MNOR (needed for bias-drifting
+    /// CORI, e.g. no-firmware-RS clips). `Auto` picks `Vqf` when
+    /// the first CORI sample has near-zero xyz norm (a signature
+    /// of bias drift), else `Direct`.
+    cori_source: CoriSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CoriSource {
+    /// GPMF CORI stream verbatim (default; correct when firmware
+    /// stabilization is on, e.g. all 3 of our reference clips).
+    Direct,
+    /// VQF 9D fusion (GYRO+GRAV+MNOR → orientation), then Y↔Z swap
+    /// at the boundary to match CORI's on-disk component order.
+    /// Use this for clips where CORI is bias-drifting (`xyz_norm <
+    /// ~0.001` at t=0).
+    Vqf,
+    /// Probe the first CORI sample; if its xyz norm is below ~1e-3
+    /// (indicating bias-drifting firmware), substitute VQF output.
+    /// Otherwise use the direct CORI stream.
+    Auto,
 }
 
 impl Default for StabilizeParams {
@@ -465,21 +579,125 @@ impl Default for StabilizeParams {
             enabled: false,
             smooth: vr180_core::gyro::SmoothParams::default(),
             max_corr_deg: 15.0,
+            horizon_lock: false,
+            cori_source: CoriSource::Direct,
         }
     }
 }
 
-/// One per-frame per-eye rotation pair. Empty Vec → no stabilization
-/// → callers use `(IDENTITY, IDENTITY)` for every frame.
-type PerFrameEyeRotations = Vec<(
-    vr180_pipeline::gpu::EquirectRotation,
-    vr180_pipeline::gpu::EquirectRotation,
-)>;
-
-/// Compute per-frame, per-eye stabilization rotations from the
-/// source's GPMF.
+/// Phase D — rolling-shutter correction parameters.
 ///
-/// Pipeline (matches the Python `GyroStabilizer.smooth()` reference):
+/// Off by default. When `enabled = true`, the equirect projection
+/// shader runs the per-pixel KLNS-fisheye time map and applies a
+/// small-angle 3D rotation by the per-frame angular velocity scaled
+/// by the per-pixel `t_offset`. Per-eye factors decide which eye
+/// gets the correction; the no-firmware-RS case uses 1.0 for both,
+/// the firmware-RS case uses +2.5 for the right eye only (the
+/// yaw-modded lens whose firmware correction is reversed).
+#[derive(Debug, Clone, Copy)]
+struct RsParams {
+    enabled: bool,
+    /// Sensor readout time in seconds. Default: 0.015224 (GoPro Max SROT).
+    srot_s: f32,
+    /// Per-axis RS factors for the left eye (BACK lens).
+    /// Firmware mode default: 0.0 (no correction).
+    /// No-firmware mode default: 1.0.
+    left_factor:  RsFactor,
+    /// Per-axis RS factors for the right eye (FRNT lens, yaw-modded).
+    /// Firmware mode default: 2.5 (cancels firmware's reversed correction).
+    /// No-firmware mode default: 1.0.
+    right_factor: RsFactor,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RsFactor {
+    pitch: f32,
+    roll:  f32,
+    yaw:   f32,
+}
+
+impl RsFactor {
+    const ZERO:           Self = Self { pitch: 0.0, roll: 0.0, yaw: 0.0 };
+    const NO_FIRMWARE:    Self = Self { pitch: 1.0, roll: 1.0, yaw: 0.0 };
+    const FIRMWARE_RIGHT: Self = Self { pitch: 2.5, roll: 2.5, yaw: 0.0 };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RsMode {
+    /// Most common case: GoPro firmware already applied its RS
+    /// correction. Right eye (yaw-modded FRNT lens) gets +2.5 factors
+    /// to cancel the wrong-direction firmware correction; left eye
+    /// gets no further correction.
+    Firmware,
+    /// Footage with firmware RS disabled (rare — usually requires the
+    /// "no firmware RS" mod or a custom recording profile). Both eyes
+    /// get factors of 1.0.
+    NoFirmware,
+}
+
+impl RsParams {
+    fn from_mode(enabled: bool, mode: RsMode, srot_s: f32,
+                 pitch_override: Option<f32>, roll_override: Option<f32>,
+                 yaw_override: Option<f32>) -> Self {
+        let (left_default, right_default) = match mode {
+            RsMode::Firmware   => (RsFactor::ZERO,        RsFactor::FIRMWARE_RIGHT),
+            RsMode::NoFirmware => (RsFactor::NO_FIRMWARE, RsFactor::NO_FIRMWARE),
+        };
+        // Per-axis CLI overrides — apply uniformly to both eyes if set.
+        let apply_override = |def: RsFactor| RsFactor {
+            pitch: pitch_override.unwrap_or(def.pitch),
+            roll:  roll_override.unwrap_or(def.roll),
+            yaw:   yaw_override.unwrap_or(def.yaw),
+        };
+        let mut left  = left_default;
+        let mut right = right_default;
+        // Overrides only apply to whichever eye(s) are already non-zero
+        // so the user's `--rs-pitch-factor 1.5` doesn't accidentally
+        // turn on RS for the LEFT eye in firmware mode (where it
+        // should stay off).
+        if left.pitch != 0.0 || left.roll != 0.0 || left.yaw != 0.0 {
+            left = apply_override(left);
+        }
+        if right.pitch != 0.0 || right.roll != 0.0 || right.yaw != 0.0 {
+            right = apply_override(right);
+        }
+        Self { enabled, srot_s, left_factor: left, right_factor: right }
+    }
+}
+
+impl Default for RsParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            srot_s: vr180_core::gyro::SROT_S,
+            left_factor:  RsFactor::ZERO,
+            right_factor: RsFactor::ZERO,
+        }
+    }
+}
+
+/// One per-frame per-eye projection bundle (rotation + RS params).
+/// Empty Vec → both stabilization and RS are off → callers use
+/// `(IDENTITY, DISABLED)` for every frame.
+#[derive(Clone, Copy, Debug)]
+struct EquirectEyeFrame {
+    rotation: vr180_pipeline::gpu::EquirectRotation,
+    rs:       vr180_pipeline::gpu::EquirectRsParams,
+}
+
+impl EquirectEyeFrame {
+    const IDLE: Self = Self {
+        rotation: vr180_pipeline::gpu::EquirectRotation::IDENTITY,
+        rs:       vr180_pipeline::gpu::EquirectRsParams::DISABLED,
+    };
+}
+
+type PerFrameEyeFrames = Vec<(EquirectEyeFrame, EquirectEyeFrame)>;
+
+/// Compute per-frame, per-eye projection bundles (rotation + RS) from
+/// the source's GPMF.
+///
+/// Stabilization pipeline (matches the Python `GyroStabilizer.smooth()`):
 /// 1. Parse CORI, IORI, GRAV from GPMF.
 /// 2. Compute the gravity-alignment quaternion `g` from the first
 ///    10 GRAV samples (if any). Right-multiply every CORI by `g⁻¹`
@@ -488,93 +706,278 @@ type PerFrameEyeRotations = Vec<(
 ///    (aligned) CORI stream. Calm spans get heavy smoothing
 ///    (`smooth_ms`); fast spans get light (`fast_ms`).
 /// 4. Per-frame: heading = raw · smooth⁻¹, soft-clamped against
-///    `max_corr_deg`, then split per-eye with IORI:
-///       q_left  = q_iori · q_heading
-///       q_right = q_iori⁻¹ · q_heading
+///    `max_corr_deg`, swing-twist horizon-locked if requested,
+///    then split per-eye with IORI.
 ///
-/// Returns a `Vec<(left, right)>` of per-eye `EquirectRotation`s.
-fn compute_stabilization_rotations(
+/// RS pipeline (Phase D): if `rs.enabled`:
+/// 1. Parse GEOC (KLNS / CTRY / CAL_DIM) from file tail.
+/// 2. Smooth 800 Hz GYRO with a 20 ms moving average.
+/// 3. Per-frame sample at video time → effective ω in shader frame.
+/// 4. Multiply ω by per-axis RS factors per eye.
+/// 5. Bundle into `EquirectRsParams` alongside the rotation.
+///
+/// Returns a `Vec<(left_frame, right_frame)>`. Empty if neither
+/// stabilization nor RS is on.
+fn compute_per_eye_frames(
     input: &std::path::Path,
-    params: &StabilizeParams,
+    stab: &StabilizeParams,
+    rs: &RsParams,
     fps: f32,
-) -> anyhow::Result<PerFrameEyeRotations> {
+    n_frames_video: usize,
+) -> anyhow::Result<PerFrameEyeFrames> {
     use vr180_core::gyro::{
         parse_cori, parse_iori, parse_raw_imu, Quat,
-        bidirectional_smooth, per_eye_rotations,
+        bidirectional_smooth, per_eye_rotations_horizon_lock,
         gravity_alignment_quat, apply_gravity_alignment_inplace,
+        compute_per_frame_omega, SMOOTH_WINDOW_S,
     };
-    use vr180_pipeline::decode::extract_gpmf_stream;
-    use vr180_pipeline::gpu::EquirectRotation;
+    use vr180_pipeline::decode::{extract_gpmf_stream, probe_video};
+    use vr180_pipeline::gpu::{EquirectRotation, EquirectRsParams};
+
+    if !stab.enabled && !rs.enabled {
+        return Ok(Vec::new());
+    }
 
     let gpmf = extract_gpmf_stream(input)?;
     let mut cori = parse_cori(&gpmf);
     let iori   = parse_iori(&gpmf);
     let raw_imu = parse_raw_imu(&gpmf);
 
-    if cori.is_empty() {
-        eprintln!("warning: --stabilize requested but source has no CORI \
-                   stream; falling back to identity rotation");
+    // Phase E: optionally substitute the VQF-derived stream for the
+    // direct GPMF CORI. Done BEFORE gravity alignment so the VQF
+    // output flows through the same downstream pipeline as direct
+    // CORI — modulo the GRAV-alignment skip below.
+    let mut used_vqf = false;
+    if stab.enabled {
+        let want_vqf = match stab.cori_source {
+            CoriSource::Direct => false,
+            CoriSource::Vqf    => true,
+            CoriSource::Auto   => is_cori_bias_drifting(&cori),
+        };
+        if want_vqf {
+            println!("Stabilization: substituting VQF-derived CORI-equivalent stream \
+                      (source={:?}{})",
+                stab.cori_source,
+                if stab.cori_source == CoriSource::Auto {
+                    " — detected bias drift in raw CORI"
+                } else { "" });
+            cori = vr180_pipeline::imu::vqf_cori_equivalent_stream(
+                input, fps, n_frames_video,
+            )?;
+            // Reference-correct: VQF emits orientation relative to its
+            // own gravity-aligned world frame, so cori[0] is typically
+            // 100°+ from identity for a normally-held camera (the
+            // camera's body-Z axis is not aligned with VQF's world
+            // axis). Direct GPMF CORI starts at ~identity by firmware
+            // convention. Right-multiply everything by cori[0]⁻¹ so
+            // our VQF output behaves like direct CORI: frame 0 is
+            // identity (camera looking forward in the equirect world
+            // frame), subsequent frames carry only the rotation that
+            // happened since the start of the clip. Required for
+            // horizon-lock (which assumes +Z = camera forward) to do
+            // the right thing.
+            if let Some(ref0) = cori.first().copied() {
+                let ref_inv = ref0.conjugate();
+                for q in cori.iter_mut() {
+                    *q = q.mul(ref_inv);
+                }
+                println!("Stabilization: VQF reference frame (cori[0]) anchored to identity");
+            }
+            used_vqf = true;
+        }
+    }
+
+    // Stabilization branch: build the per-eye rotation list.
+    let rotations: Vec<(EquirectRotation, EquirectRotation)> = if stab.enabled && !cori.is_empty() {
+        // NOTE: do NOT call `cori_swap_yz` — see Phase A "stabilize"
+        // fix commit for the long-form explanation of why removing the
+        // swap matches Python's output.
+
+        // Step 1: gravity alignment. Skipped when the CORI source is
+        // VQF — VQF's accelerometer-based inclination correction
+        // already produces gravity-aligned quaternions. Applying our
+        // own GRAV alignment on top double-corrects and produces a
+        // garbage heading (matches Python `_q_gravity_align = None`
+        // when source contains "vqf").
+        if used_vqf {
+            println!("Stabilization: GRAV alignment skipped (VQF already gravity-aligned)");
+        } else if let Some(first_grav) = raw_imu.grav.first() {
+            let g = gravity_alignment_quat(&first_grav.samples, first_grav.scal, 10);
+            apply_gravity_alignment_inplace(&mut cori, g.conjugate());
+            println!("Stabilization: GRAV alignment {:?}", g);
+        } else {
+            println!("Stabilization: no GRAV stream — skipping gravity alignment");
+        }
+
+        // Step 2: bidirectional SLERP smoothing.
+        let smoothed = bidirectional_smooth(&cori, fps, &stab.smooth);
+        println!(
+            "Stabilization: {} CORI frames, {} IORI frames, smoothed (τ_calm={} ms, τ_fast={} ms, resp={:.2}), horizon_lock={}",
+            cori.len(), iori.len(),
+            stab.smooth.smooth_ms, stab.smooth.fast_ms, stab.smooth.responsiveness,
+            stab.horizon_lock,
+        );
+
+        // Step 3: per-frame heading + horizon-lock + IORI per-eye split.
+        let n = cori.len();
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let raw = cori[i];
+            let smooth = smoothed[i];
+            let iori_q = iori.get(i).copied().unwrap_or(Quat::IDENTITY);
+            let (q_left, q_right) = per_eye_rotations_horizon_lock(
+                raw, smooth, iori_q, stab.max_corr_deg, stab.horizon_lock,
+            );
+            out.push((
+                EquirectRotation::from_quat(q_left),
+                EquirectRotation::from_quat(q_right),
+            ));
+        }
+        out
+    } else {
+        if stab.enabled {
+            eprintln!("warning: --stabilize requested but source has no CORI \
+                       stream; falling back to identity rotation");
+        }
+        Vec::new()
+    };
+
+    // RS branch: build the per-eye RS params list (one per VIDEO frame).
+    let rs_eyes: Vec<(EquirectRsParams, EquirectRsParams)> = if rs.enabled {
+        let geoc = vr180_core::geoc::parse_geoc(input)
+            .map_err(|e| anyhow::anyhow!("GEOC parse io error: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!(
+                "--rs-correct requested but the source `.360` has no GEOC \
+                 calibration block; cannot build a KLNS time map"
+            ))?;
+        let front = geoc.front.as_ref().ok_or_else(|| anyhow::anyhow!(
+            "GEOC missing FRNT lens calibration; cannot apply RS to right eye"))?;
+        let back  = geoc.back.as_ref().ok_or_else(|| anyhow::anyhow!(
+            "GEOC missing BACK lens calibration; cannot apply RS to left eye"))?;
+        println!(
+            "RS correction: GEOC OK (cal_dim={}, FRNT c0={:.2}, BACK c0={:.2}), \
+             SROT={:.3} ms, mode={}, factors L=({:.2},{:.2},{:.2}) R=({:.2},{:.2},{:.2})",
+            geoc.cal_dim, front.klns[0], back.klns[0],
+            rs.srot_s * 1000.0,
+            if rs.right_factor.pitch != 0.0 && rs.left_factor.pitch == 0.0 { "firmware" } else { "no-firmware" },
+            rs.left_factor.pitch, rs.left_factor.roll, rs.left_factor.yaw,
+            rs.right_factor.pitch, rs.right_factor.roll, rs.right_factor.yaw,
+        );
+
+        // Per-frame ω in shader frame (rad/s), sampled at frame center.
+        let probe = probe_video(input)?;
+        let duration_s = probe.duration_sec as f32;
+        let n = n_frames_video;
+        let omegas = compute_per_frame_omega(
+            &raw_imu.gyro, n, fps, duration_s,
+            rs.srot_s * 0.5,    // sample at center of readout window
+            SMOOTH_WINDOW_S,
+        );
+
+        // Pre-build per-eye RsParams shells (everything except omega +
+        // srot_s is constant across frames).
+        let mut out: Vec<(EquirectRsParams, EquirectRsParams)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let om = omegas[i];
+            let left = make_rs_params(om, rs.left_factor,  rs.srot_s, back,  geoc.cal_dim);
+            let right = make_rs_params(om, rs.right_factor, rs.srot_s, front, geoc.cal_dim);
+            out.push((left, right));
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
+    // Combine: zip stabilization + RS into per-eye frames. Use the
+    // longer of the two (typical: stabilization has CORI-count
+    // frames, RS has video-frame count; they should match for a
+    // well-formed clip, but be defensive).
+    let n_out = rotations.len().max(rs_eyes.len());
+    if n_out == 0 {
         return Ok(Vec::new());
     }
-
-    // NOTE: do NOT call `cori_swap_yz` — the Python reference's
-    // `quat_to_rotation_matrix(*q)` consumes CORI verbatim from the
-    // file's (w, x, Z_stored, Y_stored) byte order. Same for IORI.
-    // See the Phase A "stabilize" fix commit for the long-form
-    // explanation of why removing the swap matches Python's output.
-
-    // Step 1: gravity alignment (Phase C). Use the first GRAV block's
-    // samples (typically ~30 per block, more than enough).
-    let mut g_inv = Quat::IDENTITY;
-    if let Some(first_grav) = raw_imu.grav.first() {
-        let g = gravity_alignment_quat(&first_grav.samples, first_grav.scal, 10);
-        g_inv = g.conjugate();
-        apply_gravity_alignment_inplace(&mut cori, g_inv);
-        println!("Stabilization: GRAV alignment {:?}", g);
-    } else {
-        println!("Stabilization: no GRAV stream — skipping gravity alignment");
-    }
-    let _ = g_inv; // suppress unused-warning (held for future RS work)
-
-    // Step 2: bidirectional SLERP smoothing (Phase B core).
-    let smoothed = bidirectional_smooth(&cori, fps, &params.smooth);
-    println!(
-        "Stabilization: {} CORI frames, {} IORI frames, smoothed (τ_calm={} ms, τ_fast={} ms, resp={:.2})",
-        cori.len(), iori.len(),
-        params.smooth.smooth_ms, params.smooth.fast_ms, params.smooth.responsiveness,
-    );
-
-    // Step 3: per-frame heading correction + IORI per-eye split.
-    let n = cori.len();
-    let mut out: PerFrameEyeRotations = Vec::with_capacity(n);
-    for i in 0..n {
-        let raw = cori[i];
-        let smooth = smoothed[i];
-        let iori_q = iori.get(i).copied().unwrap_or(Quat::IDENTITY);
-        let (q_left, q_right) = per_eye_rotations(
-            raw, smooth, iori_q, params.max_corr_deg,
-        );
+    let mut out: PerFrameEyeFrames = Vec::with_capacity(n_out);
+    for i in 0..n_out {
+        let (r_l, r_r) = rotations.get(i).copied().unwrap_or((
+            EquirectRotation::IDENTITY, EquirectRotation::IDENTITY,
+        ));
+        let (rs_l, rs_r) = rs_eyes.get(i).copied().unwrap_or((
+            EquirectRsParams::DISABLED, EquirectRsParams::DISABLED,
+        ));
         out.push((
-            EquirectRotation::from_quat(q_left),
-            EquirectRotation::from_quat(q_right),
+            EquirectEyeFrame { rotation: r_l, rs: rs_l },
+            EquirectEyeFrame { rotation: r_r, rs: rs_r },
         ));
     }
     Ok(out)
 }
 
-/// Look up the per-eye rotations for a given frame index. Returns
-/// `(IDENTITY, IDENTITY)` if out of range (defensive against CORI /
+/// Cheap heuristic: is the source's CORI stream bias-drifting?
+///
+/// On clips where firmware orientation fusion is disabled (some "no
+/// firmware RS" GoPro recording profiles), the CORI quaternions are
+/// emitted as near-identity at t=0 and drift slowly as the IMU's bias
+/// integrates uncorrected. The signature: at sample 0, the imaginary
+/// part `(x, y, z)` has near-zero norm (≪ 1e-3) — a genuine camera
+/// pose would have a small but non-trivial vector part even at the
+/// very start because of mounting tilt.
+///
+/// We use this as the `CoriSource::Auto` decision: bias-drift → use
+/// VQF; otherwise → use direct CORI.
+fn is_cori_bias_drifting(cori: &[vr180_core::gyro::Quat]) -> bool {
+    let Some(q0) = cori.first() else { return false; };
+    let xyz_norm = (q0.x * q0.x + q0.y * q0.y + q0.z * q0.z).sqrt();
+    xyz_norm < 1e-3
+}
+
+/// Build a single eye's `EquirectRsParams` for one frame from the
+/// raw ω, the eye's RS factors, the SROT, and the lens calibration.
+/// Factors apply per axis (degrees/sec → effective rad/sec after the
+/// `× factor` and the implicit `deg2rad`).
+fn make_rs_params(
+    omega_rad_s: [f32; 3],
+    factor: RsFactor,
+    srot_s: f32,
+    cal: &vr180_core::geoc::LensCal,
+    cal_dim: u32,
+) -> vr180_pipeline::gpu::EquirectRsParams {
+    // ω input is in rad/s (shader frame). Factors are unitless
+    // multipliers applied per axis. Matches Python's
+    // `pitch_coeff = pitch_rate * rs_pitch_factor * deg2rad`
+    // when pitch_rate is in deg/s — we pre-convert to rad/s upstream
+    // so the deg2rad is implicit.
+    //
+    // Disable this eye entirely if all factors are zero (the
+    // `srot_s = 0` sentinel makes the shader short-circuit).
+    let all_zero = factor.pitch == 0.0 && factor.roll == 0.0 && factor.yaw == 0.0;
+    let effective_srot = if all_zero { 0.0 } else { srot_s };
+    let klns: [f32; 5] = [
+        cal.klns[0] as f32, cal.klns[1] as f32, cal.klns[2] as f32,
+        cal.klns[3] as f32, cal.klns[4] as f32,
+    ];
+    vr180_pipeline::gpu::EquirectRsParams {
+        omega: [
+            omega_rad_s[0] * factor.pitch,   // shader X axis = pitch
+            omega_rad_s[1] * factor.yaw,     // shader Y axis = yaw
+            omega_rad_s[2] * factor.roll,    // shader Z axis = roll
+        ],
+        srot_s: effective_srot,
+        klns,
+        ctry: cal.ctry,
+        cal_dim: cal_dim as f32,
+    }
+}
+
+/// Look up the per-eye projection bundle for a given frame index.
+/// Returns `(IDLE, IDLE)` if out of range (defensive against CORI /
 /// video frame-count mismatch).
-fn per_eye_rotation_for_frame(
-    rotations: &PerFrameEyeRotations,
+fn per_eye_frame_for_frame(
+    frames: &PerFrameEyeFrames,
     frame_idx: u32,
-) -> (
-    vr180_pipeline::gpu::EquirectRotation,
-    vr180_pipeline::gpu::EquirectRotation,
-) {
-    rotations.get(frame_idx as usize).copied().unwrap_or((
-        vr180_pipeline::gpu::EquirectRotation::IDENTITY,
-        vr180_pipeline::gpu::EquirectRotation::IDENTITY,
+) -> (EquirectEyeFrame, EquirectEyeFrame) {
+    frames.get(frame_idx as usize).copied().unwrap_or((
+        EquirectEyeFrame::IDLE,
+        EquirectEyeFrame::IDLE,
     ))
 }
 
@@ -609,6 +1012,7 @@ fn export(
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
     post: PostProcess,
     stab: StabilizeParams,
+    rs:   RsParams,
 ) -> anyhow::Result<()> {
     if zero_copy && !cfg!(target_os = "macos") {
         anyhow::bail!(
@@ -656,28 +1060,31 @@ fn export(
         output.to_path_buf()
     };
 
-    // Precompute per-frame, per-eye stabilization rotations once.
-    // Empty vec when disabled → per_eye_rotation_for_frame returns
-    // (IDENTITY, IDENTITY).
+    // Precompute per-frame, per-eye stabilization + RS bundles once.
+    // Empty vec when both stab and rs are off → per_eye_frame_for_frame
+    // returns IDLE for every frame.
     let probe = vr180_pipeline::decode::probe_video(input)?;
     let actual_fps = fps.unwrap_or(probe.fps);
-    let rotations = if stab.enabled {
-        compute_stabilization_rotations(input, &stab, actual_fps)?
+    // Best-guess total frame count. probe.duration_sec × fps is the
+    // common case; capped by --frames if the user limited the export.
+    let total_frames = if n_frames > 0 {
+        n_frames as usize
     } else {
-        Vec::new()
+        (probe.duration_sec as f64 * actual_fps as f64).round() as usize
     };
+    let frames = compute_per_eye_frames(input, &stab, &rs, actual_fps, total_frames)?;
 
     if zero_copy {
         #[cfg(target_os = "macos")]
         export_zero_copy(input, &video_only_path, eye_w, n_frames, fps, bitrate_kbps,
                          lut_spec, lut_intensity, encoder,
-                         zero_copy_encode, plan_template, post.apmp, &rotations)?;
+                         zero_copy_encode, plan_template, post.apmp, &frames)?;
         #[cfg(not(target_os = "macos"))]
         unreachable!();
     } else {
         export_cpu_assemble(input, &video_only_path, eye_w, n_frames, fps, bitrate_kbps,
                             lut_spec, lut_intensity, hw, encoder, plan_template,
-                            post.apmp, &rotations)?;
+                            post.apmp, &frames)?;
     }
 
     // Post-encode: APAC audio mux. APMP atoms were already set as
@@ -778,7 +1185,7 @@ fn export_cpu_assemble(
     encoder_backend: vr180_pipeline::encode::EncoderBackend,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
     apmp: bool,
-    rotations: &PerFrameEyeRotations,
+    frames: &PerFrameEyeFrames,
 ) -> anyhow::Result<()> {
     use vr180_core::eac::{assemble_lens_a, assemble_lens_b};
     use vr180_pipeline::decode::{iter_stream_pairs, probe_video};
@@ -827,9 +1234,11 @@ fn export_cpu_assemble(
         //   Lens B (s4/BACK) → LEFT eye
         // (After the yaw mod, the lens labeled A is physically on
         // the right side of the user's head.)
-        let (r_left, r_right) = per_eye_rotation_for_frame(rotations, frame_idx);
-        let left_tex  = device.project_cross_to_equirect_texture(&cross_b, dims.cross_w(), eye_w, out_h, r_left)?;
-        let right_tex = device.project_cross_to_equirect_texture(&cross_a, dims.cross_w(), eye_w, out_h, r_right)?;
+        let (f_left, f_right) = per_eye_frame_for_frame(frames, frame_idx);
+        let left_tex  = device.project_cross_to_equirect_texture(
+            &cross_b, dims.cross_w(), eye_w, out_h, f_left.rotation, f_left.rs)?;
+        let right_tex = device.project_cross_to_equirect_texture(
+            &cross_a, dims.cross_w(), eye_w, out_h, f_right.rotation, f_right.rs)?;
         let left  = device.apply_color_stack_texture(&left_tex,  eye_w, out_h, &plan)?;
         let right = device.apply_color_stack_texture(&right_tex, eye_w, out_h, &plan)?;
         encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
@@ -862,7 +1271,7 @@ fn export_zero_copy(
     zero_copy_encode: bool,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
     apmp: bool,
-    rotations: &PerFrameEyeRotations,
+    frames: &PerFrameEyeFrames,
 ) -> anyhow::Result<()> {
     use vr180_pipeline::decode::{ZeroCopyStreamPairIter, probe_video};
     use vr180_pipeline::encode::H265Encoder;
@@ -926,9 +1335,11 @@ fn export_zero_copy(
         // (matches Python convention + project memory; after yaw mod
         // the lens labeled A is physically on the right side of the
         // user's head).
-        let (r_left, r_right) = per_eye_rotation_for_frame(rotations, frame_idx);
-        let left_tex  = device.project_cross_texture_to_equirect_texture(&cross_b, eye_w, out_h, r_left)?;
-        let right_tex = device.project_cross_texture_to_equirect_texture(&cross_a, eye_w, out_h, r_right)?;
+        let (f_left, f_right) = per_eye_frame_for_frame(frames, frame_idx);
+        let left_tex  = device.project_cross_texture_to_equirect_texture(
+            &cross_b, eye_w, out_h, f_left.rotation, f_left.rs)?;
+        let right_tex = device.project_cross_texture_to_equirect_texture(
+            &cross_a, eye_w, out_h, f_right.rotation, f_right.rs)?;
 
         if zero_copy_encode {
             // Allocate a fresh IOSurface-backed BGRA CVPixelBuffer. The
@@ -1285,11 +1696,12 @@ fn probe_eac(
         } else { None };
 
         // Eye assignment: Lens A → RIGHT, Lens B → LEFT (yaw-mod convention).
-        // probe-eac is a single-frame inspection tool — no stabilization here.
+        // probe-eac is a single-frame inspection tool — no stabilization, no RS here.
         let t = std::time::Instant::now();
         let id_rot = vr180_pipeline::gpu::EquirectRotation::IDENTITY;
-        let mut left_eye = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, eye_h, id_rot)?;
-        let mut right_eye = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, eye_h, id_rot)?;
+        let id_rs  = vr180_pipeline::gpu::EquirectRsParams::DISABLED;
+        let mut left_eye = device.project_cross_to_equirect(&cross_b, dims.cross_w(), eye_w, eye_h, id_rot, id_rs)?;
+        let mut right_eye = device.project_cross_to_equirect(&cross_a, dims.cross_w(), eye_w, eye_h, id_rot, id_rs)?;
         let gpu_t = t.elapsed();
 
         if let Some(lut) = &lut {

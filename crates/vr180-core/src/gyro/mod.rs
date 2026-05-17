@@ -15,6 +15,7 @@ pub mod gpmf;
 pub mod cori_iori;
 pub mod raw;
 pub mod resample;
+pub mod rs_omega;
 pub mod stabilize;
 pub mod vqf;
 
@@ -22,7 +23,9 @@ pub use cori_iori::{Quat, parse_cori, parse_iori, quat_to_euler_zyx};
 pub use gpmf::{GpmfEntry, GpmfWalker, FourCC};
 pub use raw::{ImuBlock, RawImu, parse_raw_imu};
 pub use resample::{resample_quats_to_frames, cori_swap_yz, SROT_S};
+pub use rs_omega::{compute_per_frame_omega, SMOOTH_WINDOW_S};
 pub use stabilize::{
     SmoothParams, bidirectional_smooth, soft_elastic_clamp,
-    per_eye_rotations, gravity_alignment_quat, apply_gravity_alignment_inplace,
+    per_eye_rotations, per_eye_rotations_horizon_lock, swing_twist,
+    gravity_alignment_quat, apply_gravity_alignment_inplace,
 };

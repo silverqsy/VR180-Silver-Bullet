@@ -206,6 +206,7 @@ impl Device {
         out_w: u32,
         out_h: u32,
         rotation: EquirectRotation,
+        rs: EquirectRsParams,
     ) -> Result<Vec<u8>> {
         let t_total = Instant::now();
         // 1. Convert packed RGB8 input → RGBA8 (wgpu storage textures
@@ -258,6 +259,8 @@ impl Device {
         let output_view = output_tex.create_view(&Default::default());
         let r_uniform = self.write_uniform("equirect_R",
             &EquirectUniforms::from_mat3(rotation.0));
+        let rs_uniform = self.write_uniform("equirect_RS",
+            &RsUniforms::from_params(rs));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("eac_to_equirect_bg"),
             layout: &self.eac_to_equirect.bind_group_layout,
@@ -266,6 +269,7 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.eac_to_equirect.sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&output_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: rs_uniform.as_entire_binding() },
             ],
         });
         let pipeline = &self.eac_to_equirect.pipeline;
@@ -401,6 +405,19 @@ impl EacToEquirectPipeline {
                     },
                     count: None,
                 },
+                // Phase D: RS uniforms (12 × f32, 48 bytes std140).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<RsUniforms>() as u64
+                        ),
+                    },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -489,6 +506,73 @@ impl EquirectRotation {
     pub fn from_quat(q: vr180_core::gyro::Quat) -> Self {
         Self(q.to_mat3_row_major())
     }
+}
+
+/// std140 layout for the EAC→equirect shader's RS uniform (Phase D).
+/// 12 scalars, 48 bytes — matches the WGSL `RsUniforms` struct
+/// exactly. `srot_s == 0` disables the RS pass in the shader.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct RsUniforms {
+    omega_x: f32, omega_y: f32, omega_z: f32, srot_s: f32,
+    klns_c0: f32, klns_c1: f32, klns_c2: f32, klns_c3: f32,
+    klns_c4: f32, ctry: f32, cal_dim: f32, _pad: f32,
+}
+
+impl RsUniforms {
+    /// All-zeros except `cal_dim = 1.0` (avoids divide-by-zero in
+    /// the shader's `sensor_y / cal_dim`). Disables RS regardless
+    /// of any other field because `srot_s = 0`.
+    const DISABLED: Self = Self {
+        omega_x: 0.0, omega_y: 0.0, omega_z: 0.0, srot_s: 0.0,
+        klns_c0: 0.0, klns_c1: 0.0, klns_c2: 0.0, klns_c3: 0.0,
+        klns_c4: 0.0, ctry: 0.0, cal_dim: 1.0, _pad: 0.0,
+    };
+
+    fn from_params(p: EquirectRsParams) -> Self {
+        Self {
+            omega_x: p.omega[0], omega_y: p.omega[1], omega_z: p.omega[2],
+            srot_s: p.srot_s,
+            klns_c0: p.klns[0], klns_c1: p.klns[1], klns_c2: p.klns[2],
+            klns_c3: p.klns[3], klns_c4: p.klns[4],
+            ctry: p.ctry, cal_dim: p.cal_dim,
+            _pad: 0.0,
+        }
+    }
+}
+
+/// Per-eye rolling-shutter correction parameters (Phase D). Caller
+/// builds one per eye per frame; passes it alongside the
+/// `EquirectRotation`. `EquirectRsParams::DISABLED` collapses the
+/// shader's RS pass to a no-op (the right thing for callers that
+/// haven't opted into Phase D).
+#[derive(Copy, Clone, Debug)]
+pub struct EquirectRsParams {
+    /// Effective angular velocity in rad/s (already multiplied by
+    /// per-axis RS factors). Components: (ω_x, ω_y, ω_z) in the
+    /// equirect shader frame — X = right, Y = up, Z = forward.
+    pub omega: [f32; 3],
+    /// Sensor readout time in seconds. `0.0` disables RS for this
+    /// eye/frame regardless of any other field.
+    pub srot_s: f32,
+    /// Kannala-Brandt polynomial coefficients of this eye's lens:
+    /// `r = c0·θ + c1·θ³ + c2·θ⁵ + c3·θ⁷ + c4·θ⁹` (pixels).
+    pub klns: [f32; 5],
+    /// Principal-point Y offset from sensor center, pixels.
+    pub ctry: f32,
+    /// Sensor calibration dimension (pixels, square). 4216 for GoPro Max.
+    pub cal_dim: f32,
+}
+
+impl EquirectRsParams {
+    /// Sentinel value that disables the shader's RS pass. Use this
+    /// for the left eye in firmware-RS mode (firmware's correction
+    /// is already right for the un-modded lens) and for both eyes
+    /// when the user hasn't enabled `--rs-correct`.
+    pub const DISABLED: Self = Self {
+        omega: [0.0; 3], srot_s: 0.0, klns: [0.0; 5],
+        ctry: 0.0, cal_dim: 1.0,
+    };
 }
 
 const LUT3D_WGSL: &str = include_str!("shaders/lut3d.wgsl");
@@ -1437,6 +1521,7 @@ impl Device {
         out_w: u32,
         out_h: u32,
         rotation: EquirectRotation,
+        rs: EquirectRsParams,
     ) -> Result<Vec<u8>> {
         use std::time::Instant;
         let t_total = Instant::now();
@@ -1455,6 +1540,8 @@ impl Device {
         let output_view = output_tex.create_view(&Default::default());
         let r_uniform = self.write_uniform("equirect_R_zc",
             &EquirectUniforms::from_mat3(rotation.0));
+        let rs_uniform = self.write_uniform("equirect_RS_zc",
+            &RsUniforms::from_params(rs));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("eac_to_equirect_zc_bg"),
             layout: &self.eac_to_equirect.bind_group_layout,
@@ -1463,6 +1550,7 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.eac_to_equirect.sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&output_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: rs_uniform.as_entire_binding() },
             ],
         });
 
@@ -2014,6 +2102,7 @@ impl Device {
         cross_tex: &wgpu::Texture,
         out_w: u32, out_h: u32,
         rotation: EquirectRotation,
+        rs: EquirectRsParams,
     ) -> Result<wgpu::Texture> {
         let output_tex = make_rw_texture(&self.device, "equirect_tex_out", out_w, out_h,
             wgpu::TextureUsages::TEXTURE_BINDING
@@ -2022,7 +2111,7 @@ impl Device {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("project_tex_enc"),
         });
-        self.record_equirect_project(&mut encoder, cross_tex, &output_tex, out_w, out_h, rotation);
+        self.record_equirect_project(&mut encoder, cross_tex, &output_tex, out_w, out_h, rotation, rs);
         self.queue.submit(Some(encoder.finish()));
         Ok(output_tex)
     }
@@ -2036,13 +2125,14 @@ impl Device {
         cross_w: u32,
         out_w: u32, out_h: u32,
         rotation: EquirectRotation,
+        rs: EquirectRsParams,
     ) -> Result<wgpu::Texture> {
         let cross_rgba = rgb_to_rgba(cross_rgb, cross_w as usize, cross_w as usize);
         let cross_tex = make_rw_texture(&self.device, "cross_for_project",
             cross_w, cross_w,
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         self.upload_rgba(&cross_tex, &cross_rgba, cross_w, cross_w);
-        self.project_cross_texture_to_equirect_texture(&cross_tex, out_w, out_h, rotation)
+        self.project_cross_texture_to_equirect_texture(&cross_tex, out_w, out_h, rotation, rs)
     }
 
     /// Apply the full Phase 0.7.5 color stack to one equirect texture,
@@ -2191,11 +2281,14 @@ impl Device {
         dst: &wgpu::Texture,
         out_w: u32, out_h: u32,
         rotation: EquirectRotation,
+        rs: EquirectRsParams,
     ) {
         let cross_v = cross_tex.create_view(&Default::default());
         let dst_v = dst.create_view(&Default::default());
         let r_uniform = self.write_uniform("equirect_R_record",
             &EquirectUniforms::from_mat3(rotation.0));
+        let rs_uniform = self.write_uniform("equirect_RS_record",
+            &RsUniforms::from_params(rs));
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("equirect_project_bg"),
             layout: &self.eac_to_equirect.bind_group_layout,
@@ -2204,6 +2297,7 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.eac_to_equirect.sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_v) },
                 wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: rs_uniform.as_entire_binding() },
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
