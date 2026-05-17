@@ -429,7 +429,7 @@ fn run_render_from_config(config_path: &std::path::Path) -> anyhow::Result<()> {
 fn compute_stabilization_rotations(
     input: &std::path::Path,
 ) -> anyhow::Result<Vec<vr180_pipeline::gpu::EquirectRotation>> {
-    use vr180_core::gyro::{parse_cori, cori_swap_yz};
+    use vr180_core::gyro::parse_cori;
     use vr180_pipeline::decode::extract_gpmf_stream;
     use vr180_pipeline::gpu::EquirectRotation;
 
@@ -439,8 +439,21 @@ fn compute_stabilization_rotations(
         eprintln!("warning: --stabilize requested but source has no CORI \
                    stream; falling back to identity rotation (no stabilization)");
     }
+    // NOTE: do NOT apply `cori_swap_yz` here. The Python reference's
+    // `quat_to_rotation_matrix(*q)` consumes CORI verbatim from the
+    // file's `(w, x, Z_stored, Y_stored)` byte order — it treats the
+    // file's Z slot AS the y-component of the math formula, and the
+    // file's Y slot AS the z-component. To match the Python output
+    // bit-for-bit we feed the same file-convention quaternion through
+    // the same math formula. (The user reported "roll axis flipped"
+    // when we applied the swap — that's exactly the symptom of
+    // building the matrix with the wrong axis convention.)
+    //
+    // `cori_swap_yz` is still available for code paths that need a
+    // true-standard-convention quaternion (e.g. composing CORI with
+    // VQF output before the projection stage).
     let rotations: Vec<EquirectRotation> = cori.into_iter()
-        .map(|q| EquirectRotation::from_quat(cori_swap_yz(q)))
+        .map(EquirectRotation::from_quat)
         .collect();
     println!("Stabilization: loaded {} per-frame CORI quaternions", rotations.len());
     Ok(rotations)
