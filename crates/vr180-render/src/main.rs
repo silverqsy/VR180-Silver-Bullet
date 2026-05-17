@@ -225,14 +225,31 @@ enum Cmd {
         /// alongside for YouTube / Quest compat.
         #[arg(long, default_value_t = false)]
         apmp: bool,
-        /// Phase A stabilization: lock output to the first-frame
-        /// camera orientation using the source's CORI quaternions.
-        /// "Camera lock" mode — every per-frame jitter is compensated;
-        /// pans and tilts vanish too. Future phases add gyro smoothing
-        /// (preserve slow motion), IORI per-eye, gravity horizon lock,
-        /// and per-scanline rolling-shutter correction.
+        /// Enable gyro stabilization (Phase A/B/C). Reads CORI per
+        /// frame, optionally smoothes via velocity-dampened
+        /// bidirectional SLERP, applies GRAV-based gravity alignment,
+        /// soft-clamps the heading correction, and splits IORI per eye.
+        /// See `--gyro-smooth-ms`, `--gyro-responsiveness`, and
+        /// `--max-corr-deg` for tuning. Set `--gyro-smooth-ms 0` for
+        /// pure camera-lock mode (Phase A behavior).
         #[arg(long, default_value_t = false)]
         stabilize: bool,
+        /// Smoothing time constant in ms for calm periods (Phase B).
+        /// Higher = more stable but laggier on intentional pans.
+        /// `0` = camera lock (no smoothing). Python default: 1000.
+        #[arg(long, default_value_t = 1000.0)]
+        gyro_smooth_ms: f32,
+        /// Smoothing curve power exponent (Phase B). `1.0` = linear
+        /// blend between smooth (slow) and fast (high-vel) τ;
+        /// `<1` anticipatory; `>1` laggy. Python default: 1.0.
+        #[arg(long, default_value_t = 1.0)]
+        gyro_responsiveness: f32,
+        /// Soft elastic cap on heading correction angle, in degrees
+        /// (Phase C). Beyond this, the smoothed quat is logarithmically
+        /// pulled back toward raw to prevent black borders during
+        /// extreme motion. Python default: 15.0. `0` disables the cap.
+        #[arg(long, default_value_t = 15.0)]
+        max_corr_deg: f32,
 
         // --- CDL (ASC Color Decision List) ---
         /// CDL lift: black-point shift. 0 = no change, +1 pushes blacks
@@ -344,6 +361,7 @@ fn main() -> anyhow::Result<()> {
             input, output, eye_w, frames, fps, bitrate,
             lut, lut_intensity, hw_accel, encoder, zero_copy, zero_copy_encode,
             apac_audio, apac_bitrate, apmp, stabilize,
+            gyro_smooth_ms, gyro_responsiveness, max_corr_deg,
             cdl_lift, cdl_gamma, cdl_gain, cdl_shadow, cdl_highlight,
             temperature, tint, saturation,
             sharpen, sharpen_sigma,
@@ -372,10 +390,19 @@ fn main() -> anyhow::Result<()> {
                 },
             };
             let post = PostProcess { apac_audio, apac_bitrate, apmp };
+            let stab = StabilizeParams {
+                enabled: stabilize,
+                smooth: vr180_core::gyro::SmoothParams {
+                    smooth_ms: gyro_smooth_ms,
+                    responsiveness: gyro_responsiveness,
+                    ..Default::default()
+                },
+                max_corr_deg,
+            };
             export(&input, &output, eye_w, frames, fps, bitrate,
                    lut.as_deref(), lut_intensity, hw_accel.into(),
                    encoder.resolve(), zero_copy, zero_copy_encode,
-                   plan_template, post, stabilize)
+                   plan_template, post, stab)
         }
     }
 }
@@ -393,6 +420,15 @@ fn run_render_from_config(config_path: &std::path::Path) -> anyhow::Result<()> {
         apac_bitrate: cfg.apac_bitrate,
         apmp: cfg.apmp,
     };
+    let stab = StabilizeParams {
+        enabled: cfg.stabilize,
+        smooth: vr180_core::gyro::SmoothParams {
+            smooth_ms: cfg.gyro_smooth_ms,
+            responsiveness: cfg.gyro_responsiveness,
+            ..Default::default()
+        },
+        max_corr_deg: cfg.max_corr_deg,
+    };
     export(
         &cfg.input,
         &cfg.output,
@@ -408,66 +444,138 @@ fn run_render_from_config(config_path: &std::path::Path) -> anyhow::Result<()> {
         cfg.zero_copy_encode,
         plan,
         post,
-        cfg.stabilize,
+        stab,
     )
 }
 
-/// Compute per-frame stabilization rotations from the source's CORI
-/// stream. One rotation per source frame (GoPro Max emits exactly one
-/// CORI quaternion per video frame — 1:1 mapping, no resampling
-/// needed for the standard 30 fps case).
+/// Stabilization knobs the export functions consume. Bundles the
+/// `--stabilize` enable flag, the smoothing parameters, and the
+/// max-correction soft cap into one struct so the export function
+/// signatures don't explode every time a knob is added.
+#[derive(Debug, Clone, Copy)]
+struct StabilizeParams {
+    enabled: bool,
+    smooth: vr180_core::gyro::SmoothParams,
+    max_corr_deg: f32,
+}
+
+impl Default for StabilizeParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            smooth: vr180_core::gyro::SmoothParams::default(),
+            max_corr_deg: 15.0,
+        }
+    }
+}
+
+/// One per-frame per-eye rotation pair. Empty Vec → no stabilization
+/// → callers use `(IDENTITY, IDENTITY)` for every frame.
+type PerFrameEyeRotations = Vec<(
+    vr180_pipeline::gpu::EquirectRotation,
+    vr180_pipeline::gpu::EquirectRotation,
+)>;
+
+/// Compute per-frame, per-eye stabilization rotations from the
+/// source's GPMF.
 ///
-/// Phase A "camera lock" mode: applies the raw CORI directly (no
-/// smoothing, no gravity alignment, no per-eye IORI split). The
-/// output equirect direction gets multiplied by `R = quat_to_mat3(q)`
-/// before face selection, so the EAC sample lands where the scene
-/// physically was at capture time → scene appears locked to the
-/// first-frame orientation.
+/// Pipeline (matches the Python `GyroStabilizer.smooth()` reference):
+/// 1. Parse CORI, IORI, GRAV from GPMF.
+/// 2. Compute the gravity-alignment quaternion `g` from the first
+///    10 GRAV samples (if any). Right-multiply every CORI by `g⁻¹`
+///    so the world frame has Y-down = true gravity.
+/// 3. Bidirectional velocity-dampened SLERP smoothing on the
+///    (aligned) CORI stream. Calm spans get heavy smoothing
+///    (`smooth_ms`); fast spans get light (`fast_ms`).
+/// 4. Per-frame: heading = raw · smooth⁻¹, soft-clamped against
+///    `max_corr_deg`, then split per-eye with IORI:
+///       q_left  = q_iori · q_heading
+///       q_right = q_iori⁻¹ · q_heading
 ///
-/// Phase B/C/D will replace this with: smoothed quaternion path,
-/// per-eye IORI, GRAV horizon lock, per-scanline RS warp.
+/// Returns a `Vec<(left, right)>` of per-eye `EquirectRotation`s.
 fn compute_stabilization_rotations(
     input: &std::path::Path,
-) -> anyhow::Result<Vec<vr180_pipeline::gpu::EquirectRotation>> {
-    use vr180_core::gyro::parse_cori;
+    params: &StabilizeParams,
+    fps: f32,
+) -> anyhow::Result<PerFrameEyeRotations> {
+    use vr180_core::gyro::{
+        parse_cori, parse_iori, parse_raw_imu, Quat,
+        bidirectional_smooth, per_eye_rotations,
+        gravity_alignment_quat, apply_gravity_alignment_inplace,
+    };
     use vr180_pipeline::decode::extract_gpmf_stream;
     use vr180_pipeline::gpu::EquirectRotation;
 
     let gpmf = extract_gpmf_stream(input)?;
-    let cori = parse_cori(&gpmf);
+    let mut cori = parse_cori(&gpmf);
+    let iori   = parse_iori(&gpmf);
+    let raw_imu = parse_raw_imu(&gpmf);
+
     if cori.is_empty() {
         eprintln!("warning: --stabilize requested but source has no CORI \
-                   stream; falling back to identity rotation (no stabilization)");
+                   stream; falling back to identity rotation");
+        return Ok(Vec::new());
     }
-    // NOTE: do NOT apply `cori_swap_yz` here. The Python reference's
+
+    // NOTE: do NOT call `cori_swap_yz` — the Python reference's
     // `quat_to_rotation_matrix(*q)` consumes CORI verbatim from the
-    // file's `(w, x, Z_stored, Y_stored)` byte order — it treats the
-    // file's Z slot AS the y-component of the math formula, and the
-    // file's Y slot AS the z-component. To match the Python output
-    // bit-for-bit we feed the same file-convention quaternion through
-    // the same math formula. (The user reported "roll axis flipped"
-    // when we applied the swap — that's exactly the symptom of
-    // building the matrix with the wrong axis convention.)
-    //
-    // `cori_swap_yz` is still available for code paths that need a
-    // true-standard-convention quaternion (e.g. composing CORI with
-    // VQF output before the projection stage).
-    let rotations: Vec<EquirectRotation> = cori.into_iter()
-        .map(EquirectRotation::from_quat)
-        .collect();
-    println!("Stabilization: loaded {} per-frame CORI quaternions", rotations.len());
-    Ok(rotations)
+    // file's (w, x, Z_stored, Y_stored) byte order. Same for IORI.
+    // See the Phase A "stabilize" fix commit for the long-form
+    // explanation of why removing the swap matches Python's output.
+
+    // Step 1: gravity alignment (Phase C). Use the first GRAV block's
+    // samples (typically ~30 per block, more than enough).
+    let mut g_inv = Quat::IDENTITY;
+    if let Some(first_grav) = raw_imu.grav.first() {
+        let g = gravity_alignment_quat(&first_grav.samples, first_grav.scal, 10);
+        g_inv = g.conjugate();
+        apply_gravity_alignment_inplace(&mut cori, g_inv);
+        println!("Stabilization: GRAV alignment {:?}", g);
+    } else {
+        println!("Stabilization: no GRAV stream — skipping gravity alignment");
+    }
+    let _ = g_inv; // suppress unused-warning (held for future RS work)
+
+    // Step 2: bidirectional SLERP smoothing (Phase B core).
+    let smoothed = bidirectional_smooth(&cori, fps, &params.smooth);
+    println!(
+        "Stabilization: {} CORI frames, {} IORI frames, smoothed (τ_calm={} ms, τ_fast={} ms, resp={:.2})",
+        cori.len(), iori.len(),
+        params.smooth.smooth_ms, params.smooth.fast_ms, params.smooth.responsiveness,
+    );
+
+    // Step 3: per-frame heading correction + IORI per-eye split.
+    let n = cori.len();
+    let mut out: PerFrameEyeRotations = Vec::with_capacity(n);
+    for i in 0..n {
+        let raw = cori[i];
+        let smooth = smoothed[i];
+        let iori_q = iori.get(i).copied().unwrap_or(Quat::IDENTITY);
+        let (q_left, q_right) = per_eye_rotations(
+            raw, smooth, iori_q, params.max_corr_deg,
+        );
+        out.push((
+            EquirectRotation::from_quat(q_left),
+            EquirectRotation::from_quat(q_right),
+        ));
+    }
+    Ok(out)
 }
 
-/// Look up the rotation for a given frame index. Returns identity if
-/// out of range — defensive against CORI / video frame-count mismatch
-/// (which shouldn't happen but isn't worth crashing over).
-fn rotation_for_frame(
-    rotations: &[vr180_pipeline::gpu::EquirectRotation],
+/// Look up the per-eye rotations for a given frame index. Returns
+/// `(IDENTITY, IDENTITY)` if out of range (defensive against CORI /
+/// video frame-count mismatch).
+fn per_eye_rotation_for_frame(
+    rotations: &PerFrameEyeRotations,
     frame_idx: u32,
-) -> vr180_pipeline::gpu::EquirectRotation {
-    rotations.get(frame_idx as usize).copied()
-        .unwrap_or(vr180_pipeline::gpu::EquirectRotation::IDENTITY)
+) -> (
+    vr180_pipeline::gpu::EquirectRotation,
+    vr180_pipeline::gpu::EquirectRotation,
+) {
+    rotations.get(frame_idx as usize).copied().unwrap_or((
+        vr180_pipeline::gpu::EquirectRotation::IDENTITY,
+        vr180_pipeline::gpu::EquirectRotation::IDENTITY,
+    ))
 }
 
 /// Post-encode steps the user opted into via CLI flags. Run after the
@@ -500,7 +608,7 @@ fn export(
     zero_copy_encode: bool,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
     post: PostProcess,
-    stabilize: bool,
+    stab: StabilizeParams,
 ) -> anyhow::Result<()> {
     if zero_copy && !cfg!(target_os = "macos") {
         anyhow::bail!(
@@ -548,10 +656,13 @@ fn export(
         output.to_path_buf()
     };
 
-    // Precompute per-frame stabilization rotations once. Empty vec
-    // when stabilize=false → rotation_for_frame returns IDENTITY.
-    let rotations = if stabilize {
-        compute_stabilization_rotations(input)?
+    // Precompute per-frame, per-eye stabilization rotations once.
+    // Empty vec when disabled → per_eye_rotation_for_frame returns
+    // (IDENTITY, IDENTITY).
+    let probe = vr180_pipeline::decode::probe_video(input)?;
+    let actual_fps = fps.unwrap_or(probe.fps);
+    let rotations = if stab.enabled {
+        compute_stabilization_rotations(input, &stab, actual_fps)?
     } else {
         Vec::new()
     };
@@ -667,7 +778,7 @@ fn export_cpu_assemble(
     encoder_backend: vr180_pipeline::encode::EncoderBackend,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
     apmp: bool,
-    rotations: &[vr180_pipeline::gpu::EquirectRotation],
+    rotations: &PerFrameEyeRotations,
 ) -> anyhow::Result<()> {
     use vr180_core::eac::{assemble_lens_a, assemble_lens_b};
     use vr180_pipeline::decode::{iter_stream_pairs, probe_video};
@@ -716,9 +827,9 @@ fn export_cpu_assemble(
         //   Lens B (s4/BACK) → LEFT eye
         // (After the yaw mod, the lens labeled A is physically on
         // the right side of the user's head.)
-        let r = rotation_for_frame(rotations, frame_idx);
-        let left_tex  = device.project_cross_to_equirect_texture(&cross_b, dims.cross_w(), eye_w, out_h, r)?;
-        let right_tex = device.project_cross_to_equirect_texture(&cross_a, dims.cross_w(), eye_w, out_h, r)?;
+        let (r_left, r_right) = per_eye_rotation_for_frame(rotations, frame_idx);
+        let left_tex  = device.project_cross_to_equirect_texture(&cross_b, dims.cross_w(), eye_w, out_h, r_left)?;
+        let right_tex = device.project_cross_to_equirect_texture(&cross_a, dims.cross_w(), eye_w, out_h, r_right)?;
         let left  = device.apply_color_stack_texture(&left_tex,  eye_w, out_h, &plan)?;
         let right = device.apply_color_stack_texture(&right_tex, eye_w, out_h, &plan)?;
         encoder.encode_frame(&stitch_sbs(&left, &right, eye_w, out_h))?;
@@ -751,7 +862,7 @@ fn export_zero_copy(
     zero_copy_encode: bool,
     plan_template: vr180_pipeline::gpu::ColorStackPlan,
     apmp: bool,
-    rotations: &[vr180_pipeline::gpu::EquirectRotation],
+    rotations: &PerFrameEyeRotations,
 ) -> anyhow::Result<()> {
     use vr180_pipeline::decode::{ZeroCopyStreamPairIter, probe_video};
     use vr180_pipeline::encode::H265Encoder;
@@ -815,9 +926,9 @@ fn export_zero_copy(
         // (matches Python convention + project memory; after yaw mod
         // the lens labeled A is physically on the right side of the
         // user's head).
-        let r = rotation_for_frame(rotations, frame_idx);
-        let left_tex  = device.project_cross_texture_to_equirect_texture(&cross_b, eye_w, out_h, r)?;
-        let right_tex = device.project_cross_texture_to_equirect_texture(&cross_a, eye_w, out_h, r)?;
+        let (r_left, r_right) = per_eye_rotation_for_frame(rotations, frame_idx);
+        let left_tex  = device.project_cross_texture_to_equirect_texture(&cross_b, eye_w, out_h, r_left)?;
+        let right_tex = device.project_cross_texture_to_equirect_texture(&cross_a, eye_w, out_h, r_right)?;
 
         if zero_copy_encode {
             // Allocate a fresh IOSurface-backed BGRA CVPixelBuffer. The

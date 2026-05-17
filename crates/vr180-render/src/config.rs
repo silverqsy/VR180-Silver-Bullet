@@ -103,13 +103,22 @@ pub struct ExportConfig {
     #[serde(default)]
     pub apmp: bool,
 
-    /// Phase A camera-lock stabilization using source CORI quaternions.
-    /// Locks the output to the first-frame orientation; per-frame
-    /// jitter is fully compensated, but slow pans/tilts also vanish.
-    /// Phase B/C/D will add smoothing, IORI per-eye, GRAV horizon lock,
-    /// and per-scanline rolling-shutter correction.
+    /// Enable gyro stabilization (Phase A/B/C). Reads CORI per
+    /// frame, applies bidirectional SLERP smoothing, GRAV gravity
+    /// alignment, soft elastic max-corr cap, and IORI per-eye split.
     #[serde(default)]
     pub stabilize: bool,
+    /// Smoothing time constant in ms for calm periods (Phase B).
+    /// `0` = camera lock (no smoothing). Python default: 1000.
+    #[serde(default = "default_smooth_ms")]
+    pub gyro_smooth_ms: f32,
+    /// Smoothing curve power exponent (Phase B). `1.0` = linear.
+    #[serde(default = "one")]
+    pub gyro_responsiveness: f32,
+    /// Soft elastic cap on heading correction angle, in degrees.
+    /// Python default: 15.0. `0` disables.
+    #[serde(default = "default_max_corr_deg")]
+    pub max_corr_deg: f32,
 }
 
 // ─── Color-tool sub-configs ─────────────────────────────────────────
@@ -297,6 +306,8 @@ fn default_bitrate() -> u32 { 12_000 }
 fn default_intensity() -> f32 { 1.0 }
 fn default_apac_bitrate() -> u32 { 384_000 }
 fn default_sharpen_sigma() -> f32 { 1.4 }
+fn default_smooth_ms() -> f32 { 1000.0 }
+fn default_max_corr_deg() -> f32 { 15.0 }
 fn one() -> f32 { 1.0 }
 
 #[cfg(test)]

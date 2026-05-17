@@ -864,43 +864,106 @@ intentional camera motion is preserved.
 Performance overhead is in the noise (~3% from the uniform upload
 per frame). Output stays full-quality.
 
-### Phase A scope limits / follow-up phases
+### Phase A scope limits — follow-up phases
 
 - **No smoothing.** Phase A applies raw CORI directly → every per-
   frame jitter is "corrected" → intentional pans and tilts also
-  vanish. For useful real-world stabilization, **Phase B** adds the
-  velocity-dampened bidirectional SLERP smoother (the Python's
-  `smooth()` function's core: forward+backward exponential SLERP
-  with `tau` adapting from `gyro_smooth_ms` (calm) to `fast_ms`
-  (>200°/s motion), then `q_heading = q_raw × q_smooth⁻¹` per frame).
+  vanish. **→ shipped in Phase B.**
 - **No IORI per-eye stereo.** Phase A uses one R for both eyes.
-  **Phase B** adds `q_left = q_iori × q_heading`, `q_right = q_iori⁻¹
-  × q_heading` — the Python's smooth() split for files that have
-  non-identity IORI (in-camera stabilization already applied).
+  **→ shipped in Phase B.**
 - **No gravity / horizon lock.** Phase A locks to the FIRST FRAME's
-  orientation, which may be tilted relative to gravity. **Phase C**
-  adds the GRAV-based alignment: compute `q_g` from average of
-  first 10 GRAV samples, right-multiply every CORI by `q_g⁻¹` so
-  the world frame has Y-down = gravity-down. Plus the swing-twist
-  decomposition for explicit `--horizon-lock` mode and the soft
-  elastic `max_corr_deg` cap (default 15°, prevents black borders
-  on extreme motion).
-- **No per-scanline RS warp.** GoPro Max with firmware-on records
-  ERS, but the yaw-mod reverses that for the right lens, so the
-  right eye needs full RS correction even on firmware-RS clips.
-  **Phase D** adds the per-scanline RS pass: 32 row-groups
-  spanning the SROT window, 800 Hz raw GYRO interpolation per
-  group, KLNS fisheye time map for per-pixel sensor-row → time
-  mapping, and the 3D small-angle displacement per pixel.
-- **No no-firmware-RS path.** When CORI is bias-drifting (the test
-  clip!), the firmware RS hasn't actually been applied — both eyes
-  need full RS correction. **Phase E** integrates the existing
-  `vqf_to_cori_quats` path (already ported as
-  `vr180-core::gyro::vqf::run`) — produces a CORI-equivalent per-
-  frame quaternion stream from the 800 Hz GYRO + GRAV + MNOR.
+  orientation, which may be tilted relative to gravity.
+  **→ shipped in Phase C.**
+- **No per-scanline RS warp.** **→ Phase D** (deferred).
+- **No no-firmware-RS path.** **→ Phase E** (deferred).
 
-Each is a separate phase; they compose cleanly. Phase A is the
-shader-integration scaffold every later phase builds on.
+## Phase B/C — Velocity-dampened smoothing + IORI per-eye + GRAV alignment + soft cap ✅
+
+Turns Phase A's "camera lock" into useful real-world stabilization:
+slow pans and tilts survive; per-frame jitter dies; the horizon
+stays level even when the camera wasn't held level at frame 0;
+extreme camera moves no longer crop past the image boundary.
+
+### What landed
+
+- **`vr180-core::gyro::stabilize`** — new module with:
+  - `SmoothParams { smooth_ms, fast_ms, responsiveness, max_vel_deg_s }`
+    (defaults match Python's `ProcessingConfig`: 1000 / 50 / 1.0 / 200).
+  - `bidirectional_smooth(raw, fps, params)` — forward + backward
+    exponential SLERP passes, averaged via mid-SLERP. Per-step
+    `tau` adapts to local angular velocity:
+      `vel_ratio = (vel/max_vel)^responsiveness`
+      `tau = smooth_ms · (1-vel_ratio) + fast_ms · vel_ratio`
+      `alpha = dt / (tau + dt)`
+    Calm spans get heavy smoothing; fast spans get light.
+  - `soft_elastic_clamp(raw, smoothed, max_corr_deg)` — when the
+    heading correction angle exceeds the cap, pulls the smoothed
+    quat back toward raw via logarithmic compression
+    `soft = limit · (1 + ln(angle/limit))`. Bounded effective
+    correction → no black borders even on extreme motion.
+  - `per_eye_rotations(raw, smoothed, iori, max_corr_deg) -> (Quat, Quat)`
+    — combines heading correction (`raw · smoothed⁻¹`), soft clamp,
+    and IORI per-eye split (`q_left = iori · heading`,
+    `q_right = iori⁻¹ · heading`). When IORI is identity, both eyes
+    get the same matrix.
+  - `gravity_alignment_quat(grav_samples, scal, n)` — averages
+    the first N GRAV samples, applies the GoPro GRAV axis remap
+    (`bodyX←raw[0], bodyY←raw[2], bodyZ←raw[1]`), solves the
+    rotation that maps the gravity vector to `(0, 1, 0)`.
+  - `apply_gravity_alignment_inplace(cori, g_inv)` — right-multiply
+    every CORI by `g⁻¹` to align the world frame so Y-down = true
+    gravity. Eliminates "horizon tilted at frame 0".
+  - 8 unit tests covering: smoothing identity, smoothing zero-tau
+    passthrough, smoothing attenuates jitter, soft clamp no-op
+    inside limit, soft clamp softens beyond limit, per-eye with
+    identity IORI matches both eyes, gravity align solves correct
+    rotation. All pass.
+
+- **`vr180-render` orchestration**:
+  - `StabilizeParams { enabled, smooth, max_corr_deg }` bundle.
+  - `compute_stabilization_rotations` now returns
+    `Vec<(EquirectRotation, EquirectRotation)>` (per-eye).
+  - Pipeline order: parse CORI/IORI/GRAV → GRAV align CORI →
+    bidirectional smooth → per-frame heading + clamp + IORI split.
+  - Both `export_cpu_assemble` and `export_zero_copy` updated to
+    call `device.project_*_to_equirect_*` with the per-eye `r_left`
+    and `r_right` matrices.
+
+- **CLI flags** on `export`:
+  - `--gyro-smooth-ms <ms>` (default 1000) — `0` = camera lock
+    (Phase A behavior).
+  - `--gyro-responsiveness <f>` (default 1.0)
+  - `--max-corr-deg <deg>` (default 15.0) — `0` disables the cap.
+
+- **JSON `ExportConfig`** also exposes the same three knobs.
+
+### Validation
+
+- **All 8 unit tests** in `vr180_core::gyro::stabilize` pass.
+- **End-to-end on `firmware RS No IORI.360`** (826 frames, 4K SBS, VT zero-copy):
+  - `--stabilize` (default smoothing): 16.62 s @ **49.70 fps**
+  - `--stabilize --gyro-smooth-ms 0` (camera lock): 16.58 s @ **49.83 fps**
+  - `--stabilize --gyro-smooth-ms 500` (medium): 16.71 s @ **49.43 fps**
+  All three within noise of each other — the smoothing is one-time
+  CPU work at start (sub-ms scale); no per-frame impact.
+- User-confirmed: horizon stays level, intentional camera pans
+  preserved, no roll-axis direction issues.
+
+### Still deferred
+
+- **Phase C+** — `--horizon-lock` toggle using swing-twist
+  decomposition. The GRAV alignment we shipped is the always-on
+  baseline; explicit horizon lock uses the per-frame GRAV reading
+  to compute the roll component instead of taking it from the
+  smoothed quaternion.
+- **Phase D** — per-scanline RS warp (32 row-groups, 800 Hz GYRO,
+  KLNS fisheye time map). Mainly matters for the right eye on
+  firmware-RS clips (yaw-mod reverses firmware's correction) and
+  both eyes on no-firmware-RS clips.
+- **Phase E** — VQF → CORI-equivalent quaternion stream for
+  bias-drifting clips. The VQF math is already ported
+  (`vr180-core::gyro::vqf::run`); just needs the integration glue
+  + Y↔Z swap at the output (Python `parse_gyro_raw.py:1273`).
 
 ## Phase 0.9 — JSON config sidecar (Rust side) ✅
 
