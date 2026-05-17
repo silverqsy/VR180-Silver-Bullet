@@ -37,15 +37,36 @@ ffmpeg-next, not subprocess) + CORI / IORI quaternion parsing.
       Python's ~500 ms+ (~12× faster, mostly subprocess-startup
       tax avoided).
 
-## Phase 0.3 — VQF no-firmware-RS path
+## Phase 0.3 — VQF no-firmware-RS path ✅
 
-Port `pyvqf.py` + `vqf_to_cori_quats_multi_segment`. This is the
-fallback when CORI is bias-drifting (the "VQF MNOR" mode noted in
-project memory).
+- [x] `vr180-core::gyro::raw` — RawImu block parser (GYRO/ACCL/GRAV/MNOR,
+      SCAL + STMP tracking, type/struct_size validation)
+- [x] `vr180-core::gyro::vqf::run` — thin wrapper over the
+      [`vqf-rs`](https://crates.io/crates/vqf-rs) 0.3.0 crate
+      (full 9D PyVQF port, MIT-licensed). Param choices match
+      `vqf_to_cori_quats` (mag → `mag_dist_rejection_enabled=false`
+      + `tau_mag=5.0`).
+- [x] `vr180-pipeline::imu::prepare_for_vqf` — input prep
+      (ZXY → body axis remap, GRAV vs ACCL source pick with magnitude
+      heuristic, proportional resampling to gyro rate)
+- [x] CLI: `vr180-render probe-gyro --vqf <file.360>`
+- [x] **Validated** against Python output on `NO firmware RS No IORI.360`
+      (the bias-drifting reference clip):
+      bias `[-0.097, -0.099, -0.071] °/s` — **bit-identical to 3 decimals**.
+      Total time 94 ms (prep 86 ms + VQF 8 ms) vs Python's ~2-5 s
+      (~25× faster).
+      Also runs successfully on the other two test clips (firmware-RS
+      footage) without crashing — confirming the pipeline doesn't
+      assume bias-drifting input.
 
-- [ ] `vr180-core::gyro::vqf::VQF` 9D filter
-- [ ] CLI: `vr180-render probe-gyro --vqf <file.360>`
-- [ ] Bit-identical bias-detection output on the same reference clip
+### Deferred to a follow-up (0.3.5)
+
+Resample 798 Hz VQF quaternions → 30 fps frame quaternions with the
+SROT-midpoint sampling window the Python `resample_quats_to_frames`
+does, plus the Y↔Z swap that aligns the VQF output to CORI's
+on-disk component order. These are presentation concerns — needed
+when we wire the gyro pipeline into the export render but not for
+algorithmic validation, which the bias-match nails.
 
 ## Phase 0.4 — Decode + EAC assembly (CPU baseline)
 

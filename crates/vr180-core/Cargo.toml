@@ -15,3 +15,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 nalgebra = { workspace = true }
+vqf-rs = { version = "0.3.0", features = ["std", "motion-bias-estimation", "f32"] }

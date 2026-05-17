@@ -12,6 +12,7 @@ pub mod decode;
 pub mod encode;
 pub mod gpu;
 pub mod helpers;
+pub mod imu;
 pub mod render;
 
 #[cfg(target_os = "macos")]

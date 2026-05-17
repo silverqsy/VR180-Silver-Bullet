@@ -30,6 +30,12 @@ enum Cmd {
     ProbeGyro {
         /// Path to the .360 file (or first segment of a chain).
         path: PathBuf,
+        /// Also run the VQF (Versatile Quaternion Filter) 9D fusion
+        /// pipeline (GYRO + GRAV×9.81 + MNOR → quat + bias estimate).
+        /// Use this to validate the no-firmware-RS path on a clip where
+        /// CORI is bias-drifting (xyz_max < ~0.001 at t=0).
+        #[arg(long)]
+        vqf: bool,
     },
 
     /// (placeholder) Render the project described by a JSON config.
@@ -70,7 +76,7 @@ fn main() -> anyhow::Result<()> {
             println!("Try: vr180-render --help");
             Ok(())
         }
-        Some(Cmd::ProbeGyro { path }) => probe_gyro(&path),
+        Some(Cmd::ProbeGyro { path, vqf }) => probe_gyro(&path, vqf),
         Some(Cmd::Export { config }) => {
             tracing::warn!(?config, "export: not implemented (Phase 0.9)");
             Ok(())
@@ -78,7 +84,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn probe_gyro(path: &std::path::Path) -> anyhow::Result<()> {
+fn probe_gyro(path: &std::path::Path, do_vqf: bool) -> anyhow::Result<()> {
     use vr180_core::gyro::{parse_cori, parse_iori, quat_to_euler_zyx};
     use vr180_pipeline::decode::{extract_gpmf_stream, probe_video};
 
@@ -119,5 +125,57 @@ fn probe_gyro(path: &std::path::Path) -> anyhow::Result<()> {
         println!("  yaw  : [{ymin:>8.3}, {ymax:>8.3}]");
     }
     println!("elapsed:       {elapsed:.2?}");
+
+    if do_vqf {
+        probe_gyro_vqf(path)?;
+    }
+    Ok(())
+}
+
+fn probe_gyro_vqf(path: &std::path::Path) -> anyhow::Result<()> {
+    use vr180_core::gyro::vqf;
+    use vr180_pipeline::imu::{prepare_for_vqf, MagSource, AccSource};
+
+    let t0 = std::time::Instant::now();
+    let prep = prepare_for_vqf(path)?;
+    let prep_elapsed = t0.elapsed();
+
+    let acc_label = match prep.acc_source {
+        AccSource::Grav => "GRAV×9.81",
+        AccSource::Raw  => "raw ACCL",
+        AccSource::None => "none",
+    };
+    let mag_label = match prep.mag_source {
+        MagSource::Mnor => "MNOR",
+        MagSource::None => "none",
+    };
+    let mode = if prep.mag_body.is_some() { "9D" } else { "6D" };
+
+    let t1 = std::time::Instant::now();
+    let run = vqf::run(
+        &prep.gyro_body,
+        &prep.acc_body,
+        prep.mag_body.as_deref(),
+        prep.gyr_ts,
+    );
+    let vqf_elapsed = t1.elapsed();
+
+    let bias_deg = run.bias_deg_s();
+    let qf = run.quats.first().copied().unwrap_or(vr180_core::gyro::Quat::IDENTITY);
+    let ql = run.quats.last().copied().unwrap_or(vr180_core::gyro::Quat::IDENTITY);
+
+    println!();
+    println!("VQF {mode} ({acc_label}+{mag_label})");
+    println!("  gyro samples:  {}  ({:.2} Hz)", prep.gyro_body.len(), 1.0 / prep.gyr_ts);
+    println!("  acc input :    {}  → resampled to {}", prep.n_acc_input, prep.acc_body.len());
+    if let Some(ref m) = prep.mag_body {
+        println!("  mag input :    {}  → resampled to {}", prep.n_mag_input, m.len());
+    }
+    println!("  bias deg/s:    [{:.3}, {:.3}, {:.3}]  σ={:.4} rad/s",
+        bias_deg[0], bias_deg[1], bias_deg[2], run.bias_sigma);
+    println!("  quat[ 0]:      w={:.6} x={:.6} y={:.6} z={:.6}", qf.w, qf.x, qf.y, qf.z);
+    println!("  quat[-1]:      w={:.6} x={:.6} y={:.6} z={:.6}", ql.w, ql.x, ql.y, ql.z);
+    println!("  prep elapsed:  {prep_elapsed:.2?}");
+    println!("  vqf  elapsed:  {vqf_elapsed:.2?}");
     Ok(())
 }
