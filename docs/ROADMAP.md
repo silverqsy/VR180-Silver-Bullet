@@ -369,19 +369,14 @@ Output size: 2.7 MB
 ```
 
 **The bottleneck is now libx265 software encode** (~12s for 60 frames).
-VT decode is essentially free at this scale.
+VT decode is essentially free at this scale. → resolved in **0.8.5**.
 
-### Deferred to 0.8.5
+### Deferred (10-bit + audio)
 
-- `hevc_videotoolbox` hardware encode — ~5-8× faster than libx265
-  on Apple Silicon. Wires identically to the decode-side hwaccel
-  pattern (raw `ffmpeg_sys_next` FFI for `hw_device_ctx`, plus a
-  `setup_videotoolbox_hwframes` helper that allocates the encoder's
-  input frame pool with `AV_PIX_FMT_VIDEOTOOLBOX` + the right
-  `sw_format` for 8-bit / Main10).
 - 10-bit Main10 output (currently 8-bit yuv420p). Need to switch
   the swscale src format from RGB24 → RGB48 and pix_fmt to
-  yuv420p10le. The GPU side is already 10-bit-ready.
+  yuv420p10le; on the VT side, also bump the `profile` option from
+  `main` to `main10`. The GPU side is already 10-bit-ready.
 - Audio passthrough from the source `.360` (`audio_args = ["-c:a",
   "copy"]` equivalent via libav demux+remux).
 
@@ -410,6 +405,66 @@ all <100 bytes each on disk:
 - [ ] `sv3d` — spherical projection (equirectangular)
 - [ ] `st3d` — stereo mode (left-right SBS)
 - [ ] `SA3D` — ambisonic audio metadata (Google spec)
+
+## Phase 0.8.5 — `hevc_videotoolbox` hardware encode ✅
+
+The encode-side counterpart of Phase 0.6 (decode hwaccel). libx265
+was the last single-threaded bottleneck in the export pipeline;
+switching to Apple's hardware encoder gets us to **real-time on
+4K SBS output**.
+
+- [x] `vr180-pipeline::encode::EncoderBackend { Libx265, VideoToolbox }`
+      — public enum, both variants buildable on every target. VT
+      variant returns a hard `Err` if `cfg!(target_os = "macos")`
+      is false; no silent fall-through.
+- [x] `H265Encoder::create(.., backend)` — backend-aware constructor.
+      Switches `codec_name` to `hevc_videotoolbox` and sets four
+      private-data options via `av_opt_set` on `priv_data`:
+      `realtime=0` (quality over latency, override the macOS-14+
+      auto-decide default), `allow_sw=0` (refuse libavcodec's silent
+      software fallback), `profile=main` (8-bit baseline; main10
+      deferred with the 10-bit pix-fmt switch), `power_efficient=0`
+      (don't throttle on AC power).
+- [x] Plumbed via a thin `set_opt(ctx, name, value)` helper — uses
+      raw `ffmpeg::ffi::av_opt_set` rather than ffmpeg-next's
+      `Dictionary` wrapper, so option failures surface inline at
+      config time instead of being swallowed by `open_as_with`.
+- [x] CLI: `--encoder auto|sw|vt` flag on `export` subcommand.
+      `auto` resolves to VT on macOS, libx265 elsewhere. Threads
+      through both `export_cpu_assemble` and `export_zero_copy`
+      paths.
+- [x] Runtime guard in `export()`: requesting `--encoder vt` on
+      Windows / Linux yields a clear error message instead of an
+      FFmpeg-internal failure.
+
+**Benchmark** (200 frames, `NO firmware RS No IORI.360`, 4096×2048
+SBS output, 12 Mbps target, zero-copy IOSurface decode path, M-series
+Apple Silicon):
+
+| Encoder | fps  | Output | Profile |
+|---------|------|--------|---------|
+| libx265 (SW)            | 16.15 | 8.1 MB | Main, 10.2 Mbps actual |
+| **hevc_videotoolbox (HW)** | **29.48** | **3.5 MB** | Main, 4.4 Mbps actual |
+
+VT is **1.8× faster** end-to-end and hits real-time (30 fps) on 4K
+SBS. Both outputs decode cleanly, carry the `hvc1` codec tag, and
+play in QuickTime / Vision Pro. VT chose a lower bitrate than the
+12 Mbps hint — its ABR control is permissive by default; the
+`constant_bit_rate=true` option (macOS 13+) would clamp it harder
+if matched-bitrate quality comparison becomes important.
+
+Caveats:
+
+- This is fps in the **export** pipeline (decode → assembly → projection
+  → LUT → encode). The encoder alone is much faster than 30 fps; the
+  GPU stages now dominate.
+- The CPU-assemble path (`--encoder vt` without `--zero-copy`) runs
+  at ~7.5 fps — moving the encoder from libx265 to VT doesn't help
+  there because the bottleneck is the `av_hwframe_transfer_data`
+  CPU roundtrip and CPU EAC assembly. Use `--zero-copy` to see the
+  full speedup.
+- 10-bit (main10) still deferred — same gating: needs the swscale
+  RGB24→RGB48 + pix_fmt yuv420p10le switch.
 
 ## Phase 0.9 — Full export parity + CLI sidecar mode
 

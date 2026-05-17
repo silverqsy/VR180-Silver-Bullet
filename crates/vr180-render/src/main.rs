@@ -45,6 +45,34 @@ impl From<HwAccel> for vr180_pipeline::decode::HwDecode {
     }
 }
 
+/// Which HEVC encoder to use on the export side.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum Encoder {
+    /// Platform default: VideoToolbox on macOS, libx265 elsewhere.
+    Auto,
+    /// libx265 software encode. Cross-platform, slower (~5-10 fps on
+    /// 4K@30 single-core), quality-tunable via bitrate.
+    Sw,
+    /// hevc_videotoolbox hardware encode. macOS only. Several times
+    /// faster than libx265, refuses to fall back to software.
+    Vt,
+}
+
+impl Encoder {
+    /// Resolve `Auto` to a concrete backend for the current platform.
+    fn resolve(self) -> vr180_pipeline::encode::EncoderBackend {
+        use vr180_pipeline::encode::EncoderBackend;
+        match self {
+            Encoder::Auto => {
+                if cfg!(target_os = "macos") { EncoderBackend::VideoToolbox }
+                else                          { EncoderBackend::Libx265 }
+            }
+            Encoder::Sw => EncoderBackend::Libx265,
+            Encoder::Vt => EncoderBackend::VideoToolbox,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Probe gyro data from a .360 file: CORI/IORI count + Euler ranges.
@@ -119,7 +147,8 @@ enum Cmd {
     },
 
     /// Phase 0.8 export: decode → assemble → equirect → (LUT) → H.265 mp4.
-    /// Single-codec libx265 software encode (Phase 0.8 baseline).
+    /// Picks `hevc_videotoolbox` on macOS by default (Phase 0.8.5),
+    /// `libx265` everywhere else; override with `--encoder`.
     Export {
         /// Input `.360` file.
         input: PathBuf,
@@ -134,7 +163,8 @@ enum Cmd {
         /// Output FPS. Defaults to the source clip's FPS.
         #[arg(long)]
         fps: Option<f32>,
-        /// libx265 target bitrate in kbps.
+        /// HEVC target bitrate in kbps (libx265 ABR target /
+        /// VT `bit_rate` field; both backends honor it).
         #[arg(long, default_value_t = 12_000)]
         bitrate: u32,
         /// Optional .cube 3D LUT. `bundled` = the GP-Log LUT from
@@ -147,6 +177,10 @@ enum Cmd {
         /// Hardware-accelerated decode: auto / sw / vt.
         #[arg(long, value_enum, default_value_t = HwAccel::Auto)]
         hw_accel: HwAccel,
+        /// HEVC encoder backend: auto (VT on macOS, libx265 elsewhere) /
+        /// sw (force libx265) / vt (force VideoToolbox, macOS only).
+        #[arg(long, value_enum, default_value_t = Encoder::Auto)]
+        encoder: Encoder,
         /// Skip host-memory hop entirely: VideoToolbox decoder's IOSurface
         /// goes straight to wgpu via the Metal HAL escape, EAC assembly
         /// happens on the GPU (`nv12_to_eac_cross.wgsl`). **macOS only.**
@@ -193,9 +227,10 @@ fn main() -> anyhow::Result<()> {
             bench_decode(&path, frames, hw_accel.into()),
         #[cfg(target_os = "macos")]
         Some(Cmd::ProbeIosurface { path }) => probe_iosurface(&path),
-        Some(Cmd::Export { input, output, eye_w, frames, fps, bitrate, lut, lut_intensity, hw_accel, zero_copy }) =>
+        Some(Cmd::Export { input, output, eye_w, frames, fps, bitrate, lut, lut_intensity, hw_accel, encoder, zero_copy }) =>
             export(&input, &output, eye_w, frames, fps, bitrate,
-                   lut.as_deref(), lut_intensity, hw_accel.into(), zero_copy),
+                   lut.as_deref(), lut_intensity, hw_accel.into(),
+                   encoder.resolve(), zero_copy),
     }
 }
 
@@ -209,6 +244,7 @@ fn export(
     lut_spec: Option<&str>,
     lut_intensity: f32,
     hw: vr180_pipeline::decode::HwDecode,
+    encoder: vr180_pipeline::encode::EncoderBackend,
     zero_copy: bool,
 ) -> anyhow::Result<()> {
     if zero_copy && !cfg!(target_os = "macos") {
@@ -217,20 +253,28 @@ fn export(
              Phase 0.6.8 will add the Windows CUDA↔Vulkan equivalent."
         );
     }
+    if encoder == vr180_pipeline::encode::EncoderBackend::VideoToolbox
+        && !cfg!(target_os = "macos")
+    {
+        anyhow::bail!(
+            "--encoder vt (hevc_videotoolbox) is macOS-only. \
+             Use --encoder sw (libx265) on Windows / Linux."
+        );
+    }
     if zero_copy {
         #[cfg(target_os = "macos")]
         return export_zero_copy(input, output, eye_w, n_frames, fps, bitrate_kbps,
-                                lut_spec, lut_intensity);
+                                lut_spec, lut_intensity, encoder);
         #[cfg(not(target_os = "macos"))]
         unreachable!()
     } else {
         export_cpu_assemble(input, output, eye_w, n_frames, fps, bitrate_kbps,
-                            lut_spec, lut_intensity, hw)
+                            lut_spec, lut_intensity, hw, encoder)
     }
 }
 
 /// Phase 0.6 / 0.7 / 0.8 path: hwaccel decode → host-memory NV12 →
-/// swscale RGB → CPU EAC assembly → GPU projection + LUT → libx265.
+/// swscale RGB → CPU EAC assembly → GPU projection + LUT → HEVC.
 fn export_cpu_assemble(
     input: &std::path::Path,
     output: &std::path::Path,
@@ -241,6 +285,7 @@ fn export_cpu_assemble(
     lut_spec: Option<&str>,
     lut_intensity: f32,
     hw: vr180_pipeline::decode::HwDecode,
+    encoder_backend: vr180_pipeline::encode::EncoderBackend,
 ) -> anyhow::Result<()> {
     use vr180_core::eac::{assemble_lens_a, assemble_lens_b};
     use vr180_pipeline::decode::{iter_stream_pairs, probe_video};
@@ -255,8 +300,8 @@ fn export_cpu_assemble(
     println!("Export (CPU-assemble path): {} → {}", input.display(), output.display());
     println!("  source : {} × {}  @ {:.3} fps  ({:.1}s)",
         probe.width, probe.height, probe.fps, probe.duration_sec);
-    println!("  output : {} × {}  @ {:.3} fps  H.265 {} kbps",
-        out_w, out_h, fps, bitrate_kbps);
+    println!("  output : {} × {}  @ {:.3} fps  H.265 ({}) {} kbps",
+        out_w, out_h, fps, encoder_label(encoder_backend), bitrate_kbps);
 
     let lut = load_lut(lut_spec, lut_intensity)?;
 
@@ -267,7 +312,7 @@ fn export_cpu_assemble(
     println!("  decode : {} (probed {}×{}, EAC tile_w={})",
         decoder.decode_path(), dims.stream_w, dims.stream_h, dims.tile_w());
 
-    let mut encoder = H265Encoder::create(output, out_w, out_h, fps, bitrate_kbps)?;
+    let mut encoder = H265Encoder::create(output, out_w, out_h, fps, bitrate_kbps, encoder_backend)?;
     let mut cross_a = vec![0u8; cw * cw * 3];
     let mut cross_b = vec![0u8; cw * cw * 3];
 
@@ -294,7 +339,7 @@ fn export_cpu_assemble(
 }
 
 /// Phase 0.6.6 path: IOSurface → wgpu zero-copy → GPU EAC assembly +
-/// equirect projection + (LUT) → readback → libx265. macOS only.
+/// equirect projection + (LUT) → readback → HEVC. macOS only.
 #[cfg(target_os = "macos")]
 fn export_zero_copy(
     input: &std::path::Path,
@@ -305,6 +350,7 @@ fn export_zero_copy(
     bitrate_kbps: u32,
     lut_spec: Option<&str>,
     lut_intensity: f32,
+    encoder_backend: vr180_pipeline::encode::EncoderBackend,
 ) -> anyhow::Result<()> {
     use vr180_pipeline::decode::{ZeroCopyStreamPairIter, probe_video};
     use vr180_pipeline::encode::H265Encoder;
@@ -314,13 +360,14 @@ fn export_zero_copy(
     let out_w = eye_w * 2;
     let out_h = eye_w;
     let fps = fps.unwrap_or(probe.fps);
+    let enc_label = encoder_label(encoder_backend);
 
     println!("Export (zero-copy IOSurface path): {} → {}", input.display(), output.display());
     println!("  source : {} × {}  @ {:.3} fps  ({:.1}s)",
         probe.width, probe.height, probe.fps, probe.duration_sec);
-    println!("  output : {} × {}  @ {:.3} fps  H.265 {} kbps",
-        out_w, out_h, fps, bitrate_kbps);
-    println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → eac_to_equirect → lut3d) → libx265");
+    println!("  output : {} × {}  @ {:.3} fps  H.265 ({}) {} kbps",
+        out_w, out_h, fps, enc_label, bitrate_kbps);
+    println!("  pipeline: VT → IOSurface → wgpu (nv12_to_eac_cross → eac_to_equirect → lut3d) → {}", enc_label);
 
     let lut = load_lut(lut_spec, lut_intensity)?;
     let device = Device::new()?;
@@ -329,7 +376,7 @@ fn export_zero_copy(
     println!("  decode : VideoToolbox (probed {}×{}, EAC tile_w={})",
         dims.stream_w, dims.stream_h, dims.tile_w());
 
-    let mut encoder = H265Encoder::create(output, out_w, out_h, fps, bitrate_kbps)?;
+    let mut encoder = H265Encoder::create(output, out_w, out_h, fps, bitrate_kbps, encoder_backend)?;
     let t_start = std::time::Instant::now();
     let mut frame_idx: u32 = 0;
     let mut last_print = std::time::Instant::now();
@@ -363,6 +410,14 @@ fn export_zero_copy(
     encoder.finish()?;
     finish_export(output, frame_idx, t_start)?;
     Ok(())
+}
+
+fn encoder_label(b: vr180_pipeline::encode::EncoderBackend) -> &'static str {
+    use vr180_pipeline::encode::EncoderBackend;
+    match b {
+        EncoderBackend::Libx265      => "libx265 (SW)",
+        EncoderBackend::VideoToolbox => "hevc_videotoolbox (HW)",
+    }
 }
 
 fn load_lut(

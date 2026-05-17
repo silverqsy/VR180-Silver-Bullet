@@ -1,27 +1,62 @@
-//! H.265 software encode via `ffmpeg-next` + `libx265`.
+//! H.265 encode via `ffmpeg-next`. Two backends:
 //!
-//! Phase 0.8 deliverable: a minimal write-side wrapper that takes
-//! packed RGB8 frames and produces a playable `.mov` / `.mp4`.
+//! - **`Libx265`** — software, cross-platform, slow but quality-controllable
+//!   via a bitrate target.
+//! - **`VideoToolbox`** — macOS-only hardware encode (`hevc_videotoolbox`).
+//!   Phase 0.8.5 deliverable. 3-5× faster than libx265 on Apple Silicon at
+//!   matched bitrate; refuses to fall back to software (`allow_sw=0`) so a
+//!   missing HW encoder surfaces as a hard error instead of a silent perf
+//!   cliff.
 //!
-//! Deferred to 0.8.5:
-//! - VideoToolbox HEVC hardware encode (`hevc_videotoolbox`) for the
-//!   ~5-8× speedup vs libx265 on Apple Silicon.
-//! - The Swift helpers (`mvhevc_encode` for spatial video, `apac_encode`
-//!   for ambisonic audio, `vt_denoise` for temporal denoise). The
-//!   binaries already exist in `helpers/swift/`; just need spawn glue.
-//! - 10-bit Main10 output (currently 8-bit yuv420p).
-//! - Audio passthrough from the source `.360`.
-//! - sv3d / st3d / SA3D atom writers (replaces Python `spatialmedia`).
+//! Both backends produce a `.mov` / `.mp4` with `hvc1` codec tag (Apple /
+//! Vision Pro compat) and an 8-bit yuv420p stream.
+//!
+//! Deferred to later phases:
+//! - 10-bit Main10 output (would require `p010le` input plumbing).
+//! - The Swift helpers (`mvhevc_encode` for MV-HEVC stereo, `apac_encode`
+//!   for ambisonic audio, `vt_denoise`). Binaries exist in `helpers/swift/`;
+//!   just need spawn glue (Phase 0.8.6).
+//! - Audio passthrough from the source `.360` (Phase 0.8.6 too).
+//! - sv3d / st3d / SA3D atom writers (Phase 0.8.7).
 
 use crate::{Error, Result};
 use ffmpeg_next as ffmpeg;
+use std::ffi::CString;
 use std::path::Path;
 
-/// One-shot H.265 software encoder for `Rgba8`-style packed RGB8 frames.
+/// Which encoder backend `H265Encoder` should use.
+///
+/// `VideoToolbox` is selectable on every target so the CLI can give a
+/// uniform error ("vt is macOS-only") on Windows / Linux rather than
+/// not compiling the variant — but `create` will refuse to open it
+/// outside macOS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderBackend {
+    /// `libx265` software encoder. Cross-platform, quality-tunable.
+    Libx265,
+    /// `hevc_videotoolbox` Apple hardware encoder. macOS only.
+    VideoToolbox,
+}
+
+impl EncoderBackend {
+    fn codec_name(self) -> &'static str {
+        match self {
+            EncoderBackend::Libx265      => "libx265",
+            EncoderBackend::VideoToolbox => "hevc_videotoolbox",
+        }
+    }
+}
+
+/// One-shot H.265 encoder for `Rgba8`-style packed RGB8 frames.
+/// Backend is libx265 (cross-platform software) or hevc_videotoolbox
+/// (macOS hardware) — see `EncoderBackend`.
 ///
 /// Usage:
 /// ```ignore
-/// let mut enc = H265Encoder::create(out_path, w, h, 30.0, 8000)?;
+/// let mut enc = H265Encoder::create(
+///     out_path, w, h, 30.0, 8000,
+///     EncoderBackend::VideoToolbox,
+/// )?;
 /// for frame in frames {
 ///     enc.encode_frame(&frame)?;
 /// }
@@ -44,24 +79,36 @@ impl H265Encoder {
     /// Container is picked from the file extension; HEVC-in-MP4 needs
     /// the `hvc1` codec tag (set automatically).
     ///
-    /// `bitrate_kbps` is hint-only — libx265 also respects `--crf`-style
-    /// quality control via `x265-params`; we use a single bitrate target
-    /// for now since Phase 0.8 is just proving the wiring.
+    /// `bitrate_kbps` is the target average bitrate, honored by both
+    /// backends (libx265 maps it to its 1-pass ABR mode; VT maps it to
+    /// the `bit_rate` AVCodecContext field).
+    ///
+    /// `backend` picks the codec. `VideoToolbox` is macOS-only and will
+    /// return an `Err` on other platforms.
     pub fn create(
         path: &Path,
         w: u32, h: u32,
         fps: f32,
         bitrate_kbps: u32,
+        backend: EncoderBackend,
     ) -> Result<Self> {
         crate::decode::init(); // shared one-time ffmpeg_init
+
+        if backend == EncoderBackend::VideoToolbox && !cfg!(target_os = "macos") {
+            return Err(Error::Ffmpeg(
+                "hevc_videotoolbox is macOS-only. Use EncoderBackend::Libx265 \
+                 on Windows / Linux (NVENC + Vulkan interop arrive in Phase 0.8.5+W).".into()
+            ));
+        }
 
         let mut octx = ffmpeg::format::output(&path)
             .map_err(|e| Error::Ffmpeg(format!("output ctx {path:?}: {e}")))?;
 
-        let codec = ffmpeg::codec::encoder::find_by_name("libx265")
-            .ok_or_else(|| Error::Ffmpeg(
-                "libx265 encoder not available in this FFmpeg build".into()
-            ))?;
+        let codec_name = backend.codec_name();
+        let codec = ffmpeg::codec::encoder::find_by_name(codec_name)
+            .ok_or_else(|| Error::Ffmpeg(format!(
+                "{codec_name} encoder not available in this FFmpeg build"
+            )))?;
 
         // Add the output stream up front so we can finalize its params
         // after the encoder is opened. We grab the index here and drop
@@ -94,12 +141,40 @@ impl H265Encoder {
             {
                 (*raw).flags |= ffmpeg::ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
             }
+
+            // Backend-specific private-data tuning. Set via av_opt_set on
+            // priv_data so we don't depend on ffmpeg-next's `Dictionary`
+            // wrapper (whose API drifts between releases).
+            match backend {
+                EncoderBackend::VideoToolbox => {
+                    // realtime=0: prioritize quality over latency. The default
+                    // is "auto", which on macOS 14+ VT decides per-frame and
+                    // usually picks fast → quality regression. Pin to 0.
+                    set_opt(raw, "realtime",      "0")?;
+                    // allow_sw=0: refuse the libavcodec→libx265 silent fallback
+                    // if VT init fails for any reason. We want a hard error so
+                    // the user knows the HW path is broken.
+                    set_opt(raw, "allow_sw",      "0")?;
+                    // profile=main: 8-bit, baseline of Apple decoders. main10
+                    // would require p010le input; deferred until we wire the
+                    // 10-bit RGB16Float→P010 swscale path.
+                    set_opt(raw, "profile",       "main")?;
+                    // power_efficient=0: don't let VT throttle to save battery
+                    // when we're plugged in and want max throughput.
+                    set_opt(raw, "power_efficient", "0")?;
+                }
+                EncoderBackend::Libx265 => {
+                    // libx265 defaults are fine — ABR at the configured
+                    // bit_rate, medium preset. Could expose --preset
+                    // and --crf knobs later if we want a quality dial.
+                }
+            }
         }
 
         let encoder = enc_ctx.encoder().video()
             .map_err(|e| Error::Ffmpeg(format!("video encoder context: {e}")))?
             .open_as(codec)
-            .map_err(|e| Error::Ffmpeg(format!("open libx265: {e}")))?;
+            .map_err(|e| Error::Ffmpeg(format!("open {codec_name}: {e}")))?;
 
         // Hand the configured codec parameters to the output stream so
         // the muxer writes the correct sample description.
@@ -216,6 +291,40 @@ impl Drop for H265Encoder {
         // the output file at least partially playable.
         let _ = self.finish_inner();
     }
+}
+
+/// Set a string-valued option on an AVCodecContext's encoder private data
+/// (e.g. `realtime` / `allow_sw` / `profile` on `hevc_videotoolbox`).
+///
+/// We go through `av_opt_set` rather than ffmpeg-next's `Dictionary`
+/// wrapper because we already hold the raw `AVCodecContext*` and want
+/// errors surfaced inline at config time, not silently swallowed by
+/// `open_as_with`.
+///
+/// # Safety
+/// Caller must pass a valid `AVCodecContext*` that has not been opened
+/// yet. The option name must be one the encoder actually recognizes;
+/// passing an unknown name returns `AVERROR_OPTION_NOT_FOUND`.
+unsafe fn set_opt(
+    ctx: *mut ffmpeg::ffi::AVCodecContext,
+    name: &str, value: &str,
+) -> Result<()> {
+    let name_c  = CString::new(name).unwrap();
+    let value_c = CString::new(value).unwrap();
+    // search_flags=AV_OPT_SEARCH_CHILDREN so we hit the encoder's priv_data
+    // options (which live one level below the AVCodecContext options).
+    let ret = ffmpeg::ffi::av_opt_set(
+        (*ctx).priv_data,
+        name_c.as_ptr(),
+        value_c.as_ptr(),
+        0,
+    );
+    if ret < 0 {
+        return Err(Error::Ffmpeg(format!(
+            "av_opt_set({name}={value}) failed: ret={ret}"
+        )));
+    }
+    Ok(())
 }
 
 /// Approximate an f32 fps as a rational (num/den).
