@@ -14,18 +14,28 @@
 //! stream) PLUS the `queue.write_texture` upload of the same size — a
 //! couple-hundred-MB-per-frame bandwidth win at 8K dual-stream.
 //!
-//! The NV12-aware EAC assembly kernel that consumes these textures is
-//! deferred to Phase 0.6.6 (this module's bridge is the prerequisite).
+//! The NV12-aware EAC assembly kernel that consumes these textures
+//! lands in Phase 0.6.6 (`nv12_to_eac_cross.wgsl`).
 //!
-//! ## Credits
+//! ## Implementation notes
 //!
-//! The FFI declarations + `RetainedIOSurface` RAII + Metal-HAL escape
-//! pattern are adapted from
-//! [SLRStudioNeo](../../SLRStudioNeo/crates/mosaic-pipeline/src/interop_macos.rs)
-//! (same author, same `metal = "0.28"` / `wgpu = "0.20"` pin). That
-//! codebase has the field-tested edge cases (CFRetain lifetime past
-//! AVFrame reuse, Cocoa "new" prefix returning +1 retained objects,
-//! storage-mode shared on Apple Silicon unified memory).
+//! - `RetainedIOSurface` retains past the AVFrame's recycle window —
+//!   VideoToolbox-decoded `AVFrame`s own their CVPixelBuffer only for
+//!   the lifetime of the frame; once the frame is reused for the
+//!   next decoded packet, the CVPixelBuffer (and its IOSurface) are
+//!   gone unless we hold our own retain.
+//! - The Cocoa "new" prefix on `newTextureWithDescriptor:iosurface:plane:`
+//!   means the returned MTLTexture is `+1` retained — we wrap with
+//!   `metal::Texture::from_ptr` which DOESN'T add another retain.
+//! - On Apple Silicon's unified memory, `MTLStorageMode::Shared` is
+//!   the right storage mode for IOSurface-backed textures: writes
+//!   from VideoToolbox / Metal compute / wgpu-hal are all visible to
+//!   each other without explicit synchronisation barriers.
+//! - The `metal = "0.28"` and `wgpu = "0.20"` pins are not arbitrary —
+//!   they MUST match what wgpu-hal's Metal layer expects internally,
+//!   otherwise the `metal::Texture` type we pass into
+//!   `Device::texture_from_raw` fails to round-trip and the hal escape
+//!   silently produces a broken `wgpu::Texture`.
 
 #![cfg(target_os = "macos")]
 

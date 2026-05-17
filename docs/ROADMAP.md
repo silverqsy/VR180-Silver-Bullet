@@ -1,8 +1,9 @@
 # Roadmap
 
-Mirrors SLRStudioNeo's phased shipping plan. Each phase ends with
-a tag and a `cargo run -p vr180-render -- …` demo that exercises
-the new capability end-to-end.
+Each phase ends with a commit and a `cargo run -p vr180-render -- …`
+demo that exercises the new capability end-to-end. The numbering
+leaves room for half-step phases (0.6.5, 0.6.6, …) so deferred
+sub-features can land without renumbering the whole tree.
 
 ## Phase 0.1 — Workspace skeleton ✅
 **Done when:** `cargo build --release` succeeds with three empty
@@ -148,8 +149,7 @@ then go through the same swscale → RGB path the sw decoder uses.
 - [x] `try_enable_videotoolbox_decode(codec_ctx)` — calls
       `av_hwdevice_ctx_create(AV_HWDEVICE_TYPE_VIDEOTOOLBOX)`, attaches
       the device on the codec context, installs a `get_format`
-      callback that prefers `AV_PIX_FMT_VIDEOTOOLBOX`. Mirrors
-      [SLRStudioNeo](../../SLRStudioNeo/)'s exact pattern.
+      callback that prefers `AV_PIX_FMT_VIDEOTOOLBOX`.
 - [x] `download_hw_frame` — wraps `av_hwframe_transfer_data` for
       hwframe → NV12/P010 host memory.
 - [x] `bench_decode_throughput` — pure-decode throughput micro-bench
@@ -193,11 +193,9 @@ Substrate for skipping the host-memory hop on the decode side:
 - [x] `vr180-pipeline::interop_macos` — `RetainedIOSurface` RAII +
       raw FFI to `CoreFoundation` (`CFRetain` / `CFRelease`),
       `CoreVideo` (`CVPixelBufferGetIOSurface`), `IOSurface`
-      (plane count/dims/strides). Adapted from
-      [SLRStudioNeo](../../SLRStudioNeo/crates/mosaic-pipeline/src/interop_macos.rs)
-      (same `metal = "0.28"` pin so the `metal::Texture` we pass into
-      `Device::texture_from_raw` is the same crate type wgpu-hal
-      expects internally).
+      (plane count/dims/strides). The `metal = "0.28"` pin is
+      load-bearing — wgpu-hal's Metal layer internally expects that
+      exact `metal::Texture` type, so any drift breaks the hal escape.
 - [x] `extract_iosurface_from_vt_frame(AVFrame) -> RetainedIOSurface`
       — pulls the IOSurface from `AVFrame::data[3]` (FFmpeg's VT
       hwaccel convention) and retains so the surface outlives the
@@ -377,8 +375,10 @@ VT decode is essentially free at this scale.
 
 - `hevc_videotoolbox` hardware encode — ~5-8× faster than libx265
   on Apple Silicon. Wires identically to the decode-side hwaccel
-  pattern (raw `ffmpeg_sys_next` FFI for `hw_device_ctx`,
-  `setup_videotoolbox_hwframes` from SLRStudioNeo).
+  pattern (raw `ffmpeg_sys_next` FFI for `hw_device_ctx`, plus a
+  `setup_videotoolbox_hwframes` helper that allocates the encoder's
+  input frame pool with `AV_PIX_FMT_VIDEOTOOLBOX` + the right
+  `sw_format` for 8-bit / Main10).
 - 10-bit Main10 output (currently 8-bit yuv420p). Need to switch
   the swscale src format from RGB24 → RGB48 and pix_fmt to
   yuv420p10le. The GPU side is already 10-bit-ready.
@@ -428,5 +428,11 @@ ships value to users before any UI rewrite.**
 
 ## Phase 1.0 — Tauri UI (future)
 
-Only after 0.9 is shipping. Tauri shell replaces PyQt6 entirely.
-SLRStudioNeo's `apps/mosaic-ui/` is the template.
+Only after 0.9 is shipping. Tauri shell replaces PyQt6 entirely:
+- Rust backend (`vr180-render` invoked in-process or as a sidecar)
+- Web frontend (HTML/TS) for the UI — playback, mask overlays,
+  transport controls, color sliders, export queue.
+- `bundle.externalBin` packs `vr180-render.exe` next to the app on
+  Windows; on macOS the binary sits in the `.app` Resources.
+- Mac code-signing + notarisation handled by the Tauri bundler;
+  Windows code-signing optional.

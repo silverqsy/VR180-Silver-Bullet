@@ -17,13 +17,12 @@ constrains us:
 | MLX / Numba CUDA / Numba CPU dispatch maze | Three GPU stacks, each with edge cases | `wgpu` = one path, runtime-selects Metal / Vulkan / DX12 |
 | SA3D `KeyError`, scipy phantom import | Python loose typing + duck-typed metadata dicts | Rust enums + `?` propagate errors at compile time |
 
-Architecture mirrors [SLRStudioNeo](../SLRStudioNeo/) and
-[Gyroflow](https://github.com/gyroflow/gyroflow): pure-Rust headless core,
-in-process libav for video I/O (`ffmpeg-next 8.1`), `wgpu` for GPU
-compute. The Mac-native Swift helpers (`mvhevc_encode`, `apac_encode`,
-`vt_denoise`) carry over unchanged — they're already optimal and the
-Rust pipeline spawns them as external processes, same pattern
-SLRStudioNeo uses for its `slr-render` worker.
+Architecture mirrors [Gyroflow](https://github.com/gyroflow/gyroflow):
+pure-Rust headless core, in-process libav for video I/O
+(`ffmpeg-next 8.1`), `wgpu` for GPU compute. The Mac-native Swift
+helpers (`mvhevc_encode`, `apac_encode`, `vt_denoise`) carry over
+unchanged from the Python app — they're already optimal and the
+Rust pipeline spawns them as external processes.
 
 ## Workspace layout
 

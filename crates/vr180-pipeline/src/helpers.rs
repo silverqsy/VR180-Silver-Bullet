@@ -1,6 +1,6 @@
 //! Mac-native helper subprocess glue.
 //!
-//! Spawn pattern follows SLRStudioNeo's `slr-render` integration:
+//! Spawn pattern:
 //! - resolve helper binary path (next to `vr180-render` in release,
 //!   `helpers/bin/` in dev)
 //! - spawn with stdin/stdout/stderr piped

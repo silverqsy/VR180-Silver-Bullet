@@ -15,8 +15,8 @@ crates/vr180-pipeline/  I/O + GPU
 ├── decode             ffmpeg-next hwaccel decode (VT / NVDEC)
 ├── encode             ffmpeg-next encode (h265 / prores) + Swift helper spawn
 ├── gpu                wgpu device + WGSL kernel orchestration
-├── interop_macos      IOSurface ↔ MTLTexture zero-copy (Step 3 from SLRNeo)
-├── interop_windows    CUDA ↔ Vulkan zero-copy (Step 3 from SLRNeo)
+├── interop_macos      IOSurface ↔ MTLTexture zero-copy (Phases 0.6.5 + 0.6.6)
+├── interop_windows    CUDA ↔ Vulkan zero-copy (Phase 0.6.8, planned)
 └── render             frame-loop glue: decode → assemble → kernel → encode
 
 crates/vr180-render/    binary
@@ -56,7 +56,7 @@ The Python app does `ffmpeg_subprocess → stdout bytes → np.frombuffer
 CPU memory at full resolution. At 8K that's hundreds of MB/sec per
 frame of pure memory bandwidth tax.
 
-Neo follows SLRStudioNeo's interop pattern:
+Neo's interop pattern per platform:
 
 - **macOS:** VideoToolbox decode → `IOSurface` → wrap as `MTLTexture` →
   hand to wgpu as a `wgpu::Texture` via `wgpu::hal::metal::Device::texture_from_raw`.
@@ -65,9 +65,10 @@ Neo follows SLRStudioNeo's interop pattern:
 - **Windows:** NVDEC frames stay on the CUDA device via `cudarc`
   attached to FFmpeg's `AVCUDADeviceContext`; exported to wgpu as
   a Vulkan external image via the wgpu-hal Vulkan escape.
+  (Planned — Phase 0.6.8.)
 
-Both paths are gated behind `--hw-decode auto`; software decode is
-the fallback when interop fails.
+Both paths are gated behind `--zero-copy`; software decode + CPU
+EAC assembly is the cross-platform default fallback.
 
 ## Swift helpers
 

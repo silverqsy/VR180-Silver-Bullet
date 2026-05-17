@@ -11,8 +11,8 @@ GoPro Max VR180 mod processor that lives on the `main` branch
 **Cross-platform: macOS + Windows.** Single self-contained binary
 per platform, no Python.
 
-Architecture mirrors [SLRStudioNeo](../SLRStudioNeo/) (which mirrors
-Gyroflow): pure-Rust headless core, in-process libav for video I/O
+Architecture mirrors [Gyroflow](https://github.com/gyroflow/gyroflow):
+pure-Rust headless core, in-process libav for video I/O
 (`ffmpeg-next 8.1`), `wgpu` for GPU compute. One GPU backend
 abstraction (`wgpu`), no fallback chain.
 

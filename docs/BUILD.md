@@ -118,11 +118,11 @@ break, the rest of the pipeline still works.
 ## Cross-compile
 
 Not in scope for the current phase. CI will build natively per
-platform when we get there (same as SLRStudioNeo). If you need to
-cross-compile sooner, the FFmpeg side is the hard part: you need
-a sysroot with libavformat / libavcodec / libavutil for the target
-triple. `cargo-zigbuild` + a vendored avbuild is the path others
-have taken (see Gyroflow's CI).
+platform when we get there. If you need to cross-compile sooner,
+the FFmpeg side is the hard part: you need a sysroot with
+libavformat / libavcodec / libavutil for the target triple.
+`cargo-zigbuild` + a vendored avbuild is the path others have
+taken (see Gyroflow's CI).
 
 ## Troubleshooting
 

@@ -17,7 +17,9 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-# In-process libav decode/encode. Pinned to match SLRStudioNeo.
+# In-process libav decode/encode. Pinned at 8.1.x to match the
+# avbuild distributions most Windows users build against; see
+# `docs/BUILD.md` for the dev install steps per platform.
 ffmpeg-next = { workspace = true }
 
 # GPU compute

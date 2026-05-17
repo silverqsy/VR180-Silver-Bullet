@@ -578,11 +578,10 @@ pub fn decode_first_vt_frame(path: &Path) -> Result<ffmpeg_next::frame::Video> {
 
 /// Wire VideoToolbox hardware decode onto a codec context.
 ///
-/// Returns `true` if the hwaccel was successfully attached. Mirrors
-/// `SLRStudioNeo::try_enable_videotoolbox_decode`. The codec context
-/// takes ownership of the `AVBufferRef` and will free it; we deliberately
-/// don't hold an independent clone here since this Phase 0.6 pipeline
-/// only decodes one frame per stream and exits.
+/// Returns `true` if the hwaccel was successfully attached. The codec
+/// context takes ownership of the `AVBufferRef` and will free it; we
+/// deliberately don't hold an independent clone here since this
+/// Phase 0.6 pipeline only decodes one frame per stream and exits.
 #[cfg(target_os = "macos")]
 fn try_enable_videotoolbox_decode(
     dec_ctx: &mut ffmpeg_next::codec::context::Context,

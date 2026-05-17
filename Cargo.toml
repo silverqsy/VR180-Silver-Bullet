@@ -30,8 +30,9 @@ clap = { version = "4.5", features = ["derive"] }
 # Numerics
 nalgebra = "0.33"     # 3x3 / quaternion math (CORI/IORI/GRAV/MNOR pipeline)
 
-# In-process libav. Same version SLRStudioNeo uses (Gyroflow-proven).
-# Build requires FFMPEG_DIR pointing at an avbuild distribution + libclang.
+# In-process libav. 8.1.x is the Gyroflow-proven pin (matches the
+# avbuild distributions most Windows users build against). Build
+# requires FFMPEG_DIR pointing at an avbuild distribution + libclang.
 # See docs/BUILD.md.
 ffmpeg-next = "8.1"
 
@@ -43,11 +44,12 @@ bytemuck = { version = "1.21", features = ["derive"] }
 
 # macOS IOSurface ↔ Metal interop dependencies (Phase 0.6.5).
 # Versions pinned to match what wgpu 0.20's hal-metal layer ships, so the
-# `metal::Texture` we pass into `Device::texture_from_raw` is the same
-# crate type wgpu-hal expects internally (same constraint as SLRStudioNeo's
-# `metal = "0.28"` pin). objc / foreign-types come in transitively via the
-# `metal` crate but we're explicit so the `msg_send!` / `ForeignType` paths
-# we use directly stay pinned independent of metal's manifest drift.
+# `metal::Texture` we pass into `Device::texture_from_raw` is the exact
+# crate type wgpu-hal expects internally — if these drift away from
+# wgpu's internal pins, the wgpu-hal escape silently fails at runtime.
+# objc / foreign-types come in transitively via the `metal` crate but
+# we list them explicitly so the `msg_send!` / `ForeignType` paths we
+# use directly stay pinned independent of metal's manifest drift.
 metal = "0.28"
 core-foundation = "0.9"
 objc = "0.2"
