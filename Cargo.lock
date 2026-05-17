@@ -1524,7 +1524,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "core-foundation",
  "ffmpeg-next",
+ "foreign-types",
+ "metal",
+ "objc",
  "pollster",
  "serde",
  "serde_json",
@@ -1541,12 +1545,14 @@ dependencies = [
  "anyhow",
  "clap",
  "image",
+ "metal",
  "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
  "vr180-core",
  "vr180-pipeline",
+ "wgpu",
 ]
 
 [[package]]

@@ -41,6 +41,18 @@ wgpu = "0.20"
 pollster = "0.4"
 bytemuck = { version = "1.21", features = ["derive"] }
 
+# macOS IOSurface ↔ Metal interop dependencies (Phase 0.6.5).
+# Versions pinned to match what wgpu 0.20's hal-metal layer ships, so the
+# `metal::Texture` we pass into `Device::texture_from_raw` is the same
+# crate type wgpu-hal expects internally (same constraint as SLRStudioNeo's
+# `metal = "0.28"` pin). objc / foreign-types come in transitively via the
+# `metal` crate but we're explicit so the `msg_send!` / `ForeignType` paths
+# we use directly stay pinned independent of metal's manifest drift.
+metal = "0.28"
+core-foundation = "0.9"
+objc = "0.2"
+foreign-types = "0.5"
+
 # Internal crates
 vr180-core = { path = "crates/vr180-core", version = "0.1.0" }
 vr180-pipeline = { path = "crates/vr180-pipeline", version = "0.1.0" }

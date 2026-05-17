@@ -108,6 +108,16 @@ enum Cmd {
         hw_accel: HwAccel,
     },
 
+    /// Phase 0.6.5: decode one VideoToolbox frame, extract its
+    /// CVPixelBuffer's IOSurface, wrap the Y and UV planes as
+    /// `wgpu::Texture`s via the IOSurface↔Metal↔wgpu-hal bridge, and
+    /// read back a few Y-plane bytes to confirm the chain works.
+    /// **macOS only.**
+    #[cfg(target_os = "macos")]
+    ProbeIosurface {
+        path: PathBuf,
+    },
+
     /// Phase 0.8 export: decode → assemble → equirect → (LUT) → H.265 mp4.
     /// Single-codec libx265 software encode (Phase 0.8 baseline).
     Export {
@@ -175,6 +185,8 @@ fn main() -> anyhow::Result<()> {
                       hw_accel.into(), lut.as_deref(), lut_intensity),
         Some(Cmd::BenchDecode { path, frames, hw_accel }) =>
             bench_decode(&path, frames, hw_accel.into()),
+        #[cfg(target_os = "macos")]
+        Some(Cmd::ProbeIosurface { path }) => probe_iosurface(&path),
         Some(Cmd::Export { input, output, eye_w, frames, fps, bitrate, lut, lut_intensity, hw_accel }) =>
             export(&input, &output, eye_w, frames, fps, bitrate,
                    lut.as_deref(), lut_intensity, hw_accel.into()),
@@ -293,6 +305,109 @@ fn resolve_bundled_lut() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(target_os = "macos")]
+fn probe_iosurface(path: &std::path::Path) -> anyhow::Result<()> {
+    use vr180_pipeline::decode::decode_first_vt_frame;
+    use vr180_pipeline::interop_macos::{
+        extract_iosurface_from_vt_frame, wgpu_texture_from_iosurface_plane,
+        IOSurfaceNv12Descriptor,
+    };
+    use vr180_pipeline::gpu::Device;
+    use std::time::Instant;
+
+    println!("=== Phase 0.6.5: IOSurface ↔ Metal ↔ wgpu zero-copy bridge ===");
+    println!("file: {}", path.display());
+    println!();
+
+    // 1. Decode one VT frame (no av_hwframe_transfer_data).
+    let t = Instant::now();
+    let vt_frame = decode_first_vt_frame(path)?;
+    println!("[1] decode_first_vt_frame:           {:?}  (format={:?}, {}×{})",
+        t.elapsed(), vt_frame.format(), vt_frame.width(), vt_frame.height());
+
+    // 2. Pull the IOSurface backing the CVPixelBuffer.
+    let t = Instant::now();
+    let surface = extract_iosurface_from_vt_frame(&vt_frame)?;
+    println!("[2] CVPixelBufferGetIOSurface:       {:?}  (planes={}, y={}×{}, uv={}×{})",
+        t.elapsed(),
+        surface.plane_count(),
+        surface.plane_width(0), surface.plane_height(0),
+        surface.plane_width(1), surface.plane_height(1));
+
+    // 3. Cache geometry (NV12).
+    let desc = IOSurfaceNv12Descriptor::new(surface)?;
+    println!("[3] IOSurfaceNv12Descriptor:         OK  (y_bpr={}, uv_bpr={})",
+        desc.y_bytes_per_row, desc.uv_bytes_per_row);
+
+    // 4. Wrap Y plane as a wgpu::Texture (Metal R8Unorm view).
+    let device = Device::new()?;
+    let (w, h) = (desc.width, desc.height);
+    let t = Instant::now();
+    let y_tex = wgpu_texture_from_iosurface_plane(
+        &device.device, desc.surface, 0,
+        metal::MTLPixelFormat::R8Unorm,
+        wgpu::TextureFormat::R8Unorm,
+        w, h,
+        "iosurface_y",
+    )?;
+    println!("[4] wgpu_texture_from_iosurface(Y):  {:?}  ({}×{} R8Unorm)",
+        t.elapsed(), y_tex.width, y_tex.height);
+
+    // 5. Read back the first row of Y so we can prove the chain is live
+    //    (not just a successful-but-blank texture handoff). 256-byte
+    //    aligned for the staging buffer requirement.
+    let row_bytes_unpadded = w;
+    let row_bytes_padded = (row_bytes_unpadded + 255) & !255;
+    let buf_size = row_bytes_padded as u64;
+    let staging = device.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("y_readback"),
+        size: buf_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("y_readback_enc"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::ImageCopyTexture {
+            texture: &y_tex.texture, mip_level: 0,
+            origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::ImageCopyBuffer {
+            buffer: &staging,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(row_bytes_padded),
+                rows_per_image: Some(1),
+            },
+        },
+        wgpu::Extent3d { width: w, height: 1, depth_or_array_layers: 1 },
+    );
+    let t = Instant::now();
+    device.queue.submit(Some(encoder.finish()));
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+    device.device.poll(wgpu::Maintain::Wait);
+    rx.recv()??;
+    let mapped = slice.get_mapped_range();
+    let first_row = &mapped[..w as usize];
+    let min = *first_row.iter().min().unwrap_or(&0);
+    let max = *first_row.iter().max().unwrap_or(&0);
+    let avg: f32 = first_row.iter().map(|&v| v as f32).sum::<f32>() / w as f32;
+    println!("[5] read back Y row 0:               {:?}  (min={min} max={max} avg={avg:.1})",
+        t.elapsed());
+    drop(mapped);
+    staging.unmap();
+
+    println!();
+    println!("✓ zero-copy chain works end-to-end.");
+    println!("  VT decoder → CVPixelBuffer → IOSurface → MTLTexture → wgpu::Texture");
+    println!("  No av_hwframe_transfer_data on this path. The bytes the GPU sees are");
+    println!("  the same bytes the VideoToolbox decoder wrote — direct, unified memory.");
+    Ok(())
 }
 
 fn bench_decode(

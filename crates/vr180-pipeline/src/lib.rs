@@ -17,6 +17,11 @@ pub mod render;
 
 #[cfg(target_os = "macos")]
 pub mod interop_macos;
+#[cfg(target_os = "macos")]
+pub use interop_macos::{
+    RetainedIOSurface, IOSurfaceNv12Descriptor, IOSurfacePlaneTexture,
+    extract_iosurface_from_vt_frame, wgpu_texture_from_iosurface_plane,
+};
 
 #[cfg(target_os = "windows")]
 pub mod interop_windows;

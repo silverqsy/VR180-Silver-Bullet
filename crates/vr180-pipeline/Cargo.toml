@@ -24,6 +24,10 @@ ffmpeg-next = { workspace = true }
 wgpu = { workspace = true }
 pollster = { workspace = true }
 bytemuck = { workspace = true }
+metal = "0.28"
+core-foundation = "0.9"
+objc = "0.2"
+foreign-types = "0.5"
 
 [features]
 default = []

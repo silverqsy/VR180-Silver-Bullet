@@ -172,33 +172,92 @@ host-memory transfer, but excluding any RGB conversion. With both
 streams in flight in series the effective full-pipeline throughput
 should land near ~75 fps before EAC assembly + GPU project + encode.
 
-### Deferred to Phase 0.6.5 — zero-copy IOSurface↔Metal interop
+## Phase 0.6.5 — IOSurface↔Metal↔wgpu zero-copy bridge ✅
 
-The current path still hops through host memory:
+Substrate for skipping the host-memory hop on the decode side:
 
 ```text
-   VT decoder           CPU                      wgpu compute
-       │                  │                            ▲
-   CVPixelBuffer ────► NV12 frame ──► RGB packed ──► texture upload
-                  av_hwframe_                            queue.
-                  transfer_data                          write_texture
+  Phase 0.6 path:                    Phase 0.6.5 bridge:
+  VT → CVPixelBuffer                 VT → CVPixelBuffer
+       │                                  │
+       ▼ av_hwframe_transfer_data         ▼ CVPixelBufferGetIOSurface (Get-Rule)
+   NV12 host                          IOSurface (CFRetain'd)
+       │                                  │
+       ▼ swscale                          ▼ newTextureWithDescriptor:iosurface:plane:
+   packed RGB host                    MTLTexture (Y as R8Unorm)
+       │                                  │
+       ▼ queue.write_texture              ▼ wgpu-hal Metal escape
+   wgpu compute                        wgpu::Texture (zero memcpy)
 ```
 
-The zero-copy fast path (Step 3 in SLRStudioNeo's `MAC-PORT.md`)
-keeps the IOSurface alive end-to-end: the VT decoder's
-`CVPixelBuffer` exposes its backing `IOSurface`, we wrap it as a
-`MTLTexture` via `newTextureWithDescriptor:iosurface:plane:`, then
-hand that `MTLTexture` to wgpu via the wgpu-hal Metal escape
-(`Device::texture_from_raw`). NV12 stays on the GPU; no host-
-memory hop. Saves the `av_hwframe_transfer_data` memcpy (~12 MB at
-4K, ~50 MB at 8K) AND the `queue.write_texture` upload of the same
-size — back-of-envelope ~3-4× faster than the current path for the
-upload stage.
+- [x] `vr180-pipeline::interop_macos` — `RetainedIOSurface` RAII +
+      raw FFI to `CoreFoundation` (`CFRetain` / `CFRelease`),
+      `CoreVideo` (`CVPixelBufferGetIOSurface`), `IOSurface`
+      (plane count/dims/strides). Adapted from
+      [SLRStudioNeo](../../SLRStudioNeo/crates/mosaic-pipeline/src/interop_macos.rs)
+      (same `metal = "0.28"` pin so the `metal::Texture` we pass into
+      `Device::texture_from_raw` is the same crate type wgpu-hal
+      expects internally).
+- [x] `extract_iosurface_from_vt_frame(AVFrame) -> RetainedIOSurface`
+      — pulls the IOSurface from `AVFrame::data[3]` (FFmpeg's VT
+      hwaccel convention) and retains so the surface outlives the
+      AVFrame's recycle window.
+- [x] `metal_texture_from_iosurface_plane(...)` —
+      `MTLDevice.newTextureWithDescriptor:iosurface:plane:` via
+      `objc::msg_send!` (metal-rs 0.28 doesn't expose this selector).
+- [x] `wgpu_texture_from_iosurface_plane(...)` — full chain
+      `IOSurface plane → MTLTexture → wgpu-hal Metal Texture →
+      wgpu::Texture` with the correct usage flags
+      (TEXTURE_BINDING + STORAGE_BINDING + COPY_SRC/DST).
+- [x] `decode_first_vt_frame(path) -> AVFrame` — decode helper that
+      stops at the VT-format frame (no `av_hwframe_transfer_data`).
+- [x] CLI: `vr180-render probe-iosurface <file.360>` — runs the
+      full chain and reads back the first Y-plane row to prove the
+      GPU sees the actual decoder output bytes.
 
-That's ~700 lines of objc/IOSurface FFI + wgpu-hal escape. Adapted
-from SLRStudioNeo's `interop_macos.rs`. Deferred to its own session.
+**End-to-end probe on `GS010172.360`** (M5 Max, macOS 14+):
 
-### Deferred to Phase 0.6.6 — Windows CUDA↔Vulkan interop
+```
+[1] decode_first_vt_frame:           76.28 ms  (VIDEOTOOLBOX, 5952×1920)
+[2] CVPixelBufferGetIOSurface:        583 ns   (planes=2, y=5952×1920, uv=2976×960)
+[3] IOSurfaceNv12Descriptor:         OK       (y_bpr=11904, uv_bpr=11904)
+[4] wgpu_texture_from_iosurface(Y):  41.5 µs  (5952×1920 R8Unorm)
+[5] read back Y row 0:               5.28 ms  (min=0 max=192 avg=105.4)
+```
+
+The bytes the GPU sees ARE the bytes VideoToolbox wrote — same
+backing IOSurface, unified-memory shared between the VT decoder
+and the Metal device. The bridge itself takes microseconds. The
+~50 MB per-stream `av_hwframe_transfer_data` memcpy + the
+matching `queue.write_texture` upload from Phase 0.6's path are
+both gone.
+
+### Phase 0.6.6 — Pipeline integration (next session)
+
+The substrate is in place; the pipeline doesn't use it yet. To
+make Phase 0.6.5's speedup show up in `vr180-render export`:
+
+- [ ] `nv12_to_rgba.wgsl` — one compute pass that reads
+      `Y (R8Unorm) + UV (Rg8Unorm)` and writes
+      `Rgba8Unorm` with BT.709 YUV→RGB matrix.
+- [ ] Or, better: an `eac_assemble_from_nv12.wgsl` kernel that
+      does EAC tile slicing + YUV→RGB in one pass, writing the
+      assembled cross directly as `Rgba8Unorm`. Skips the CPU
+      `assemble_lens_a` / `assemble_lens_b` + the cross upload
+      to GPU entirely.
+- [ ] New decode path in `StreamPairIter::next_pair_zero_copy`
+      that returns `(IOSurfacePlaneTexture, IOSurfacePlaneTexture)`
+      tuples (Y, UV) per stream instead of repacked RGB8.
+- [ ] `--zero-copy` flag on `export` (default-on for macOS once stable).
+
+Expected gain: at 8K dual-stream, the upload stage drops from
+~200 MB/frame total to essentially zero. Whether end-to-end fps
+moves depends on the encode bottleneck — Phase 0.8.5 (VT HW
+encode) is the matching write-side optimization.
+
+### Deferred to Phase 0.6.7 — Windows CUDA↔Vulkan interop
+
+### Deferred to Phase 0.6.8 — Windows CUDA↔Vulkan interop
 
 NVDEC + cudarc + Vulkan external images. Another ~500 lines, only
 meaningful on the Windows builds. Out of scope until 0.9 wires up

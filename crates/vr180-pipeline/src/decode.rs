@@ -351,6 +351,56 @@ pub fn extract_first_stream_pair_with(path: &Path, hw: HwDecode) -> Result<Strea
     Ok(StreamPair { s0, s4, dims, decode_path })
 }
 
+/// Decode the first video frame using VideoToolbox hwaccel and return
+/// it **without** running `av_hwframe_transfer_data`. The frame's
+/// `format == AV_PIX_FMT_VIDEOTOOLBOX` and `data[3]` is the live
+/// CVPixelBuffer the IOSurface lives inside.
+///
+/// Used by Phase 0.6.5's IOSurface demo (`probe-iosurface`) and will be
+/// the entry point for the Phase 0.6.6 zero-copy compute path.
+#[cfg(target_os = "macos")]
+pub fn decode_first_vt_frame(path: &Path) -> Result<ffmpeg_next::frame::Video> {
+    init();
+    let mut ictx = ffmpeg_next::format::input(path)
+        .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+
+    let stream_idx = ictx
+        .streams()
+        .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+        .next()
+        .ok_or_else(|| Error::Ffmpeg("no video stream".into()))?
+        .index();
+
+    let stream = ictx.stream(stream_idx).unwrap();
+    let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+        .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+
+    if !try_enable_videotoolbox_decode(&mut codec_ctx) {
+        return Err(Error::Ffmpeg(
+            "VideoToolbox hwaccel setup failed — IOSurface path needs VT".into()
+        ));
+    }
+    let mut decoder = codec_ctx.decoder().video()
+        .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
+
+    for (stream, packet) in ictx.packets() {
+        if stream.index() != stream_idx { continue; }
+        if decoder.send_packet(&packet).is_err() { continue; }
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        if decoder.receive_frame(&mut decoded).is_ok() {
+            if decoded.format() == ffmpeg_next::format::Pixel::VIDEOTOOLBOX {
+                return Ok(decoded);
+            } else {
+                return Err(Error::Ffmpeg(format!(
+                    "expected VIDEOTOOLBOX pixel format, decoder produced {:?}",
+                    decoded.format()
+                )));
+            }
+        }
+    }
+    Err(Error::Ffmpeg("EOF before first frame decoded".into()))
+}
+
 // ─── VideoToolbox hwaccel plumbing (macOS only) ────────────────────────
 
 /// Wire VideoToolbox hardware decode onto a codec context.
