@@ -2850,7 +2850,7 @@ def get_subprocess_flags():
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QSlider, QSpinBox, QDoubleSpinBox,
-    QComboBox, QFileDialog, QGroupBox, QProgressBar,
+    QComboBox, QFileDialog, QGroupBox, QProgressBar, QProgressDialog,
     QMessageBox, QSplitter, QLineEdit, QStatusBar,
     QScrollArea, QToolButton, QCheckBox, QRadioButton, QButtonGroup, QTextEdit,
     QDialog, QPlainTextEdit
@@ -10239,6 +10239,15 @@ class VR180ProcessorGUI(QMainWindow):
         offset_layout.addWidget(QLabel("Roll:"), 2, 0)
         self.stereo_roll_offset = SliderWithSpinBox(-10, 10, 0, 3, 0.1, "°")
         offset_layout.addWidget(self.stereo_roll_offset, 2, 1)
+        self.auto_align_btn = QPushButton("✨ Auto Align Stereo")
+        self.auto_align_btn.setToolTip(
+            "Analyse the clip and automatically compute the Stereo Offset that\n"
+            "aligns the two eyes into a comfortable VR180 image:\n"
+            "  • removes vertical disparity (pitch) and roll mismatch\n"
+            "  • converges the stereo window onto the scene (yaw)\n"
+            "Samples several frames across the video and refines in two passes.\n"
+            "Requires a loaded video and OpenCV.")
+        offset_layout.addWidget(self.auto_align_btn, 3, 0, 1, 2)
         controls_layout.addWidget(offset_group)
 
         # GoPro Gyro Stabilization section
@@ -10742,6 +10751,7 @@ class VR180ProcessorGUI(QMainWindow):
         self.stereo_yaw_offset.valueChanged.connect(self._on_adjustment_changed)
         self.stereo_pitch_offset.valueChanged.connect(self._on_adjustment_changed)
         self.stereo_roll_offset.valueChanged.connect(self._on_adjustment_changed)
+        self.auto_align_btn.clicked.connect(self._auto_align_stereo)
         self.reset_all_btn.clicked.connect(self._reset_all)
         self.process_btn.clicked.connect(self._start_processing)
         self.cancel_btn.clicked.connect(self._cancel_processing)
@@ -11306,6 +11316,359 @@ class VR180ProcessorGUI(QMainWindow):
             self._rebuild_gyro_stabilizer()
         self._schedule_preview_update()
 
+    def _auto_align_stereo(self):
+        """Sample frames across the clip, measure the residual misalignment
+        between the left and right eyes, and fill in the Stereo Offset
+        yaw/pitch/roll so the stereo pair forms a comfortable VR180 image.
+
+        Corrects vertical disparity (pitch) and roll mismatch, and converges
+        the stereo window (yaw). The measured residual is applied as half the
+        eye-to-eye offset because Stereo Offset is applied oppositely per eye.
+        """
+        if not self.config.input_path:
+            QMessageBox.information(self, "Auto Align Stereo",
+                                    "Load a video before running auto-align.")
+            return
+        if not HAS_CV2:
+            QMessageBox.warning(self, "Auto Align Stereo",
+                                "OpenCV (cv2) is required for auto-alignment "
+                                "but is not available in this build.")
+            return
+        if self.video_duration <= 0:
+            QMessageBox.warning(self, "Auto Align Stereo",
+                                "Video duration is unknown — cannot sample frames.")
+            return
+
+        N = 5                 # frames sampled per pass
+        MAX_PASSES = 2        # refinement corrections
+        CONVERGED_DEG = 0.03  # stop early when the residual is below this
+
+        # Sample timestamps spread across the trim range (or the whole clip)
+        t0 = self.trim_start if (self.trim_start and self.trim_start > 0) else 0.0
+        t1 = self.trim_end if (self.trim_end and self.trim_end > 0) else self.video_duration
+        if t1 - t0 < 0.05:
+            t0, t1 = 0.0, self.video_duration
+        span = t1 - t0
+        sample_times = [t0 + span * (i + 1) / (N + 1) for i in range(N)]
+
+        # Detach any in-flight preview extraction so it doesn't fight for the file
+        self._retire_current_extractor()
+
+        # Snapshot every piece of decode/cache state we are about to mutate
+        snap = {
+            'cached_raw_frame': self.cached_raw_frame,
+            'cached_raw_frame_pristine': self.cached_raw_frame_pristine,
+            'cached_timestamp': self.cached_timestamp,
+            'preview_timestamp': self.preview_timestamp,
+            'original_frame': self.original_frame,
+            'cached_crossA': getattr(self, 'cached_crossA', None),
+            'cached_crossB': getattr(self, 'cached_crossB', None),
+            'cached_crossA_pristine': getattr(self, 'cached_crossA_pristine', None),
+            'cached_crossB_pristine': getattr(self, 'cached_crossB_pristine', None),
+            'timeline': self.timeline_slider.value(),
+        }
+        start_offsets = (self.stereo_yaw_offset.value(),
+                         self.stereo_pitch_offset.value(),
+                         self.stereo_roll_offset.value())
+
+        progress = QProgressDialog("Sampling frames for stereo alignment…",
+                                   "Cancel", 0, (MAX_PASSES + 1) * N, self)
+        progress.setWindowTitle("Auto Align Stereo")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        self.auto_align_btn.setEnabled(False)
+        step = 0
+        first_residual = None
+        last_residual = None
+        n_frames_used = 0
+        cancelled = False
+        error_msg = None
+        try:
+            for pass_i in range(MAX_PASSES + 1):
+                per_frame = []
+                for t in sample_times:
+                    if progress.wasCanceled():
+                        cancelled = True
+                        break
+                    progress.setLabelText(
+                        f"Pass {pass_i + 1} of {MAX_PASSES + 1} — "
+                        f"analysing frame at {t:.1f}s")
+                    pair = self._render_eye_pair_at(t)
+                    if pair is not None:
+                        m = self._measure_eye_misalignment(pair[0], pair[1])
+                        if m is not None:
+                            per_frame.append(m)
+                    step += 1
+                    progress.setValue(step)
+                    QApplication.processEvents()
+                if cancelled:
+                    break
+
+                valid = [m for m in per_frame if m[3] >= 20]
+                if len(valid) < max(2, N // 3):
+                    if pass_i == 0:
+                        error_msg = ("Not enough matching detail between the "
+                                     "eyes to measure alignment.\n\nTry a "
+                                     "sharper, more textured section of the "
+                                     "clip, and check the Global Panomap "
+                                     "Adjustment so both eyes frame the same "
+                                     "scene.")
+                    break  # otherwise keep the correction from earlier passes
+
+                yaw = float(np.median([m[0] for m in valid]))
+                pitch = float(np.median([m[1] for m in valid]))
+                roll = float(np.median([m[2] for m in valid]))
+                mean_inliers = float(np.mean([m[3] for m in valid]))
+                last_residual = (yaw, pitch, roll, mean_inliers)
+                n_frames_used = len(valid)
+                if first_residual is None:
+                    first_residual = last_residual
+
+                # Implausibly large → not a residual-alignment problem
+                if pass_i == 0 and max(abs(yaw), abs(pitch), abs(roll)) > 25.0:
+                    error_msg = (f"Measured a very large eye misalignment "
+                                 f"(yaw {yaw:.1f}°, pitch {pitch:.1f}°, "
+                                 f"roll {roll:.1f}°).\n\nAuto-align corrects "
+                                 f"small residual errors. Set the Global "
+                                 f"Panomap Adjustment and confirm the eyes are "
+                                 f"not swapped, then try again.")
+                    break
+
+                if max(abs(yaw), abs(pitch), abs(roll)) < CONVERGED_DEG:
+                    break
+                if pass_i == MAX_PASSES:
+                    break  # measured for the report; no further correction
+
+                # Stereo Offset is applied oppositely to each eye, so each
+                # control moves half the measured eye-to-eye residual. Yaw and
+                # pitch map to image translation (negative coefficient), roll
+                # maps to image rotation (positive coefficient) — hence the
+                # opposite sign on the roll term.
+                self._set_stereo_offsets(
+                    self.stereo_yaw_offset.value() - yaw / 2.0,
+                    self.stereo_pitch_offset.value() - pitch / 2.0,
+                    self.stereo_roll_offset.value() + roll / 2.0)
+            progress.setValue((MAX_PASSES + 1) * N)
+        finally:
+            self.cached_raw_frame = snap['cached_raw_frame']
+            self.cached_raw_frame_pristine = snap['cached_raw_frame_pristine']
+            self.cached_timestamp = snap['cached_timestamp']
+            self.preview_timestamp = snap['preview_timestamp']
+            self.original_frame = snap['original_frame']
+            for k in ('cached_crossA', 'cached_crossB',
+                      'cached_crossA_pristine', 'cached_crossB_pristine'):
+                if snap[k] is not None:
+                    setattr(self, k, snap[k])
+                elif hasattr(self, k):
+                    delattr(self, k)
+            self.timeline_slider.blockSignals(True)
+            self.timeline_slider.setValue(snap['timeline'])
+            self.timeline_slider.blockSignals(False)
+            progress.close()
+            self.auto_align_btn.setEnabled(True)
+
+        if error_msg:
+            self._set_stereo_offsets(*start_offsets)
+            self._on_adjustment_changed()
+            QMessageBox.warning(self, "Auto Align Stereo", error_msg)
+            self.status_bar.showMessage("Auto Align: alignment not applied")
+            return
+
+        if cancelled:
+            self._set_stereo_offsets(*start_offsets)
+            self._on_adjustment_changed()
+            self.status_bar.showMessage(
+                "Auto Align cancelled — Stereo Offset unchanged")
+            return
+
+        # Rebuild the stabilizer (offsets are baked in) and refresh the preview
+        self._on_adjustment_changed()
+
+        if first_residual is None:
+            return
+
+        f, l = first_residual, last_residual
+        applied = (self.stereo_yaw_offset.value(),
+                   self.stereo_pitch_offset.value(),
+                   self.stereo_roll_offset.value())
+        changed = any(abs(applied[i] - start_offsets[i]) > 1e-4 for i in range(3))
+        if not changed:
+            QMessageBox.information(self, "Auto Align Stereo",
+                f"The eyes are already well aligned (residual "
+                f"yaw {f[0]:+.2f}°, pitch {f[1]:+.2f}°, roll {f[2]:+.2f}°).\n\n"
+                "No change was made.")
+            self.status_bar.showMessage("Auto Align: eyes already aligned")
+            return
+
+        QMessageBox.information(self, "Auto Align Stereo",
+            f"Stereo eyes aligned using {n_frames_used} of {N} sampled frames.\n\n"
+            f"Residual eye misalignment (before → after):\n"
+            f"  Convergence (yaw):   {f[0]:+.2f}°  →  {l[0]:+.2f}°\n"
+            f"  Vertical (pitch):    {f[1]:+.2f}°  →  {l[1]:+.2f}°\n"
+            f"  Roll:                {f[2]:+.2f}°  →  {l[2]:+.2f}°\n\n"
+            f"Stereo Offset applied:\n"
+            f"  Yaw {applied[0]:+.2f}°   Pitch {applied[1]:+.2f}°   "
+            f"Roll {applied[2]:+.2f}°")
+        self.status_bar.showMessage("Auto Align complete — Stereo Offset updated")
+
+    def _set_stereo_offsets(self, yaw, pitch, roll):
+        """Set the three Stereo Offset controls without emitting valueChanged
+        (the caller refreshes the preview once when finished)."""
+        for widget, val in ((self.stereo_yaw_offset, yaw),
+                             (self.stereo_pitch_offset, pitch),
+                             (self.stereo_roll_offset, roll)):
+            widget.blockSignals(True)
+            widget.setValue(float(val))
+            widget.blockSignals(False)
+
+    def _render_eye_pair_at(self, timestamp):
+        """Decode and render the left/right eye images at a timestamp using the
+        current settings. Returns (left, right) arrays in the half-equirect
+        preview projection, or None on failure.
+
+        Mutates cached_* / timeline state — _auto_align_stereo snapshots and
+        restores it.
+        """
+        input_path, local_ts = self._resolve_segment_timestamp(timestamp)
+        captured = {}
+        try:
+            fe = FrameExtractor(input_path, local_ts, extract_raw=True,
+                                is_360=self.config.is_360_input)
+            fe.raw_frame_ready.connect(
+                lambda fr: captured.__setitem__('frame', fr),
+                Qt.ConnectionType.DirectConnection)
+            fe.error.connect(
+                lambda er: captured.__setitem__('error', er),
+                Qt.ConnectionType.DirectConnection)
+            fe.run()  # synchronous — executes on the GUI thread
+        except Exception as e:
+            print(f"[auto-align] decode failed at {timestamp:.2f}s: {e}")
+            return None
+
+        frame = captured.get('frame')
+        if frame is None:
+            print(f"[auto-align] no frame at {timestamp:.2f}s "
+                  f"({captured.get('error', 'unknown error')})")
+            return None
+
+        self.cached_raw_frame = frame
+        self.cached_raw_frame_pristine = frame
+        self.cached_timestamp = timestamp
+        self.preview_timestamp = timestamp
+        if self.config.is_360_input and getattr(fe, 'crossA', None) is not None:
+            self.cached_crossA = fe.crossA
+            self.cached_crossB = fe.crossB
+            self.cached_crossA_pristine = fe.crossA
+            self.cached_crossB_pristine = fe.crossB
+
+        # Drive gyro / rolling-shutter sampling to this timestamp
+        if self.video_duration > 0:
+            sv = int(round(timestamp / self.video_duration * 1000.0))
+            self.timeline_slider.blockSignals(True)
+            self.timeline_slider.setValue(max(0, min(1000, sv)))
+            self.timeline_slider.blockSignals(False)
+
+        try:
+            self._apply_preview_filters_to_cached_frame()
+        except Exception as e:
+            print(f"[auto-align] render failed at {timestamp:.2f}s: {e}")
+            return None
+
+        fr = self.original_frame
+        if fr is None or fr.ndim != 3 or fr.shape[1] < 4:
+            return None
+        # Upside-down mount renders the SBS rotated 180° (which swaps the eye
+        # halves). Undo it so the split below is the canonical [left, right]
+        # the Stereo Offset math assumes.
+        if self.upside_down_checkbox.isChecked():
+            fr = cv2.rotate(fr, cv2.ROTATE_180)
+        hw = fr.shape[1] // 2
+        return fr[:, :hw].copy(), fr[:, hw:].copy()
+
+    def _measure_eye_misalignment(self, left, right):
+        """Feature-match the left/right eye images and estimate the rotational
+        misalignment between them.
+
+        Both images are in the same half-equirect projection (width spans 180°
+        of longitude, height spans 180° of latitude), so a small inter-eye
+        rotation appears as a similarity transform.
+
+        Returns (yaw_deg, pitch_deg, roll_deg, inliers) — how the RIGHT eye is
+        offset relative to the LEFT (the full eye-to-eye residual) — or None if
+        matching was not reliable.
+        """
+        import math
+
+        def _gray_u8(img):
+            if img.dtype == np.uint16:
+                img = ((img.astype(np.uint32) * 255 + 32767) // 65535).astype(np.uint8)
+            elif img.dtype != np.uint8:
+                img = np.clip(img, 0, 255).astype(np.uint8)
+            if img.ndim == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            return img
+
+        gl = _gray_u8(left)
+        gr = _gray_u8(right)
+        h, w = gl.shape[:2]
+
+        # Downscale large frames — the similarity estimate is unaffected and
+        # ORB on a ~1600px image is much faster. Translations are rescaled back.
+        scale = 1.0
+        max_dim = 1600
+        if max(h, w) > max_dim:
+            scale = max_dim / float(max(h, w))
+            gl = cv2.resize(gl, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            gr = cv2.resize(gr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+        try:
+            orb = cv2.ORB_create(nfeatures=3000)
+            kl, dl = orb.detectAndCompute(gl, None)
+            kr, dr = orb.detectAndCompute(gr, None)
+        except Exception as e:
+            print(f"[auto-align] feature detection failed: {e}")
+            return None
+        if dl is None or dr is None or len(kl) < 12 or len(kr) < 12:
+            return None
+
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+        good = []
+        for pair in bf.knnMatch(dl, dr, k=2):
+            if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance:
+                good.append(pair[0])
+        if len(good) < 12:
+            return None
+
+        pts_l = np.float32([kl[m.queryIdx].pt for m in good]).reshape(-1, 2)
+        pts_r = np.float32([kr[m.trainIdx].pt for m in good]).reshape(-1, 2)
+
+        # Similarity transform mapping RIGHT-eye points onto LEFT-eye points:
+        #   p_left ≈ Rot(roll) · p_right + (tx, ty)
+        M, inliers = cv2.estimateAffinePartial2D(
+            pts_r, pts_l, method=cv2.RANSAC, ransacReprojThreshold=3.0,
+            maxIters=5000, confidence=0.99)
+        if M is None or inliers is None:
+            return None
+        n_in = int(inliers.sum())
+        if n_in < 10:
+            return None
+
+        a, b = float(M[0, 0]), float(M[1, 0])
+        tx, ty = float(M[0, 2]), float(M[1, 2])
+        s = math.hypot(a, b)
+        if s < 1e-6 or abs(s - 1.0) > 0.15:
+            return None  # implausible scale → unreliable match
+
+        roll_deg = math.degrees(math.atan2(b, a))  # scale-independent
+        tx /= scale  # translations back to full-resolution pixels
+        ty /= scale
+        # Half-equirect: full width = 180° longitude, full height = 180° latitude
+        yaw_deg = tx * (180.0 / float(w))
+        pitch_deg = ty * (180.0 / float(h))
+        return (yaw_deg, pitch_deg, roll_deg, n_in)
+
     def _on_horizon_lock_toggled(self, checked):
         """Toggle horizon lock."""
         self._on_gyro_param_changed()
@@ -11598,11 +11961,38 @@ class VR180ProcessorGUI(QMainWindow):
             return Path(seg_path), dur - 0.01
         return self.config.input_path, timestamp
 
+    def _retire_current_extractor(self):
+        """Detach the active frame extractor (if any) so it finishes decoding
+        in the background. PyAV decode cannot be interrupted by cancel(), so we
+        must not drop the QThread reference while it runs (that causes the
+        'QThread destroyed while thread is still running' warning) nor block
+        the UI waiting on it. Its signals are disconnected so a late frame
+        cannot overwrite the cache."""
+        ex = getattr(self, 'extractor', None)
+        if ex is None or not ex.isRunning():
+            return
+        ex.cancel()  # kills the FFmpeg subprocess on the legacy decode path
+        for sig in (ex.raw_frame_ready, ex.error):
+            try:
+                sig.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+        if not hasattr(self, '_retiring_extractors'):
+            self._retiring_extractors = []
+        self._retiring_extractors.append(ex)
+        ex.finished.connect(self._on_retiring_extractor_finished)
+        self.extractor = None
+
+    def _on_retiring_extractor_finished(self):
+        """Drop references to background extractors that have finished, so
+        their QThread objects can be garbage-collected safely."""
+        if hasattr(self, '_retiring_extractors'):
+            self._retiring_extractors = [
+                e for e in self._retiring_extractors if e.isRunning()]
+
     def _extract_frame(self, timestamp, force_filter=False):
         if not self.config.input_path: return
-        if hasattr(self, 'extractor') and self.extractor and self.extractor.isRunning():
-            self.extractor.cancel()  # Kill FFmpeg process properly
-            self.extractor.wait(500)  # Wait longer for cleanup
+        self._retire_current_extractor()
         self.preview_timestamp = timestamp
 
         # If we have cached frame at this timestamp, apply OpenCV filters directly
@@ -13404,10 +13794,22 @@ class VR180ProcessorGUI(QMainWindow):
                 self.processor.terminate()
                 self.processor.wait(1000)
 
-        # Stop any frame extraction
-        if hasattr(self, 'extractor') and self.extractor and self.extractor.isRunning():
-            self.extractor.cancel()  # Kill FFmpeg process properly
-            self.extractor.wait(1000)
+        # Stop any frame extraction, including extractors still finishing in
+        # the background. PyAV decode cannot be interrupted, so wait generously
+        # before terminate() — which is acceptable only because we are exiting.
+        extractors = []
+        if hasattr(self, 'extractor') and self.extractor:
+            extractors.append(self.extractor)
+        extractors.extend(getattr(self, '_retiring_extractors', []))
+        for ex in extractors:
+            if ex.isRunning():
+                ex.cancel()
+        for ex in extractors:
+            if ex.isRunning():
+                ex.wait(5000)
+                if ex.isRunning():
+                    ex.terminate()
+                    ex.wait(1000)
 
         self._save_settings()
         super().closeEvent(event)
