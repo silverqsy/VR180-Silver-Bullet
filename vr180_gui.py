@@ -2856,7 +2856,7 @@ from PyQt6.QtWidgets import (
     QDialog, QPlainTextEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QImage, QPixmap, QPainter
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPalette
 
 
 def get_ffmpeg_path():
@@ -9433,7 +9433,8 @@ class PreviewWidget(QLabel):
         super().__init__()
         self.setMinimumSize(800, 400)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet("QLabel { background-color: #e0e0e0; border: 2px solid #cccccc; border-radius: 4px; }")
+        # Styled by the theme stylesheet via this object name (see _theme_qss)
+        self.setObjectName("previewArea")
         self.processed_pixmap = None
         self.zoom_level = 1.0
         self.pan_offset_x = 0
@@ -10356,10 +10357,8 @@ class VR180ProcessorGUI(QMainWindow):
         self.advanced_toggle_btn.setArrowType(Qt.ArrowType.RightArrow)
         self.advanced_toggle_btn.setCheckable(True)
         self.advanced_toggle_btn.setChecked(False)
-        self.advanced_toggle_btn.setStyleSheet(
-            "QToolButton { border: none; font-weight: bold; color: #555; padding: 4px 0; }"
-            "QToolButton:hover { color: #0066cc; }"
-        )
+        # Styled by the theme stylesheet via this object name (see _theme_qss)
+        self.advanced_toggle_btn.setObjectName("advancedToggle")
         gopro_layout.addWidget(self.advanced_toggle_btn)
 
         # Advanced settings container (RS controls, hidden by default)
@@ -10714,8 +10713,79 @@ class VR180ProcessorGUI(QMainWindow):
         self.status_bar.showMessage("Ready")
     
     def _apply_styles(self):
-        self.setStyleSheet("""
-            QMainWindow { background-color: #ffffff; }
+        # Object names let the theme stylesheet target specific widgets.
+        self.process_btn.setObjectName("processBtn")
+        self._theme_is_dark = None  # sentinel — forces the first _apply_theme
+        self._apply_theme()
+        # Follow live OS light/dark switches (Qt 6.5+ emits colorSchemeChanged;
+        # older Qt is covered by the ApplicationPaletteChange path below).
+        try:
+            sh = QApplication.instance().styleHints()
+            if hasattr(sh, 'colorSchemeChanged'):
+                sh.colorSchemeChanged.connect(lambda *_: self._apply_theme())
+        except Exception:
+            pass
+
+    def _apply_theme(self, *_args):
+        """Apply the light or dark theme to match the OS color scheme.
+
+        Idempotent: it only re-styles when the scheme actually changed, which
+        also stops the app.setPalette() call below from recursing through the
+        ApplicationPaletteChange event handled in changeEvent()."""
+        dark = _system_is_dark()
+        if dark == getattr(self, '_theme_is_dark', None):
+            return
+        self._theme_is_dark = dark
+        app = QApplication.instance()
+        if app is not None:
+            # Palette covers widgets the stylesheet doesn't reach: QMessageBox,
+            # QFileDialog, QProgressDialog, menus, tooltips.
+            app.setPalette(_build_palette(dark))
+        self.setStyleSheet(self._theme_qss(dark))
+
+    def changeEvent(self, event):
+        """Re-apply the theme when the OS color scheme changes. Fallback path
+        for Qt builds without the colorSchemeChanged signal — Qt still delivers
+        ApplicationPaletteChange on a system theme switch."""
+        try:
+            from PyQt6.QtCore import QEvent
+            if event.type() == QEvent.Type.ApplicationPaletteChange:
+                self._apply_theme()
+        except Exception:
+            pass
+        super().changeEvent(event)
+
+    def _theme_qss(self, dark):
+        """Return the Qt stylesheet for the dark or light theme."""
+        if dark:
+            return """
+            QMainWindow, QDialog { background-color: #1e1e1e; }
+            QWidget { color: #e6e6e6; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
+            QGroupBox { font-weight: bold; border: 1px solid #3c3c3c; border-radius: 6px; margin-top: 12px; padding: 12px; background: #262626; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 8px; color: #4ea3ff; }
+            QPushButton { background: #3a3a3a; border: 1px solid #555; border-radius: 4px; padding: 6px 16px; }
+            QPushButton:hover { background: #464646; border-color: #4ea3ff; }
+            QPushButton:disabled { background: #2a2a2a; color: #6b6b6b; }
+            QPushButton#processBtn { background: #0066cc; color: white; font-weight: bold; }
+            QPushButton#processBtn:disabled { background: #2a4a6e; color: #9bb6d4; }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: #2d2d2d; color: #e6e6e6; border: 1px solid #555; border-radius: 4px; padding: 6px; }
+            QComboBox QAbstractItemView { background: #2d2d2d; color: #e6e6e6; selection-background-color: #0a84ff; }
+            QSlider::groove:horizontal { height: 6px; background: #3c3c3c; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #4ea3ff; width: 16px; height: 16px; margin: -5px 0; border-radius: 8px; }
+            QProgressBar { border: 1px solid #555; border-radius: 4px; text-align: center; background: #2d2d2d; }
+            QProgressBar::chunk { background: #0066cc; border-radius: 3px; }
+            QToolButton { background: #3a3a3a; border: 1px solid #555; border-radius: 4px; }
+            QToolButton#advancedToggle { background: transparent; border: none; font-weight: bold; color: #a0a0a0; padding: 4px 0; }
+            QToolButton#advancedToggle:hover { color: #4ea3ff; }
+            QLabel#previewArea { background-color: #262626; border: 2px solid #3c3c3c; border-radius: 4px; }
+            QMenuBar { background: #262626; }
+            QMenuBar::item:selected { background: #3a3a3a; }
+            QMenu { background: #2d2d2d; border: 1px solid #555; }
+            QMenu::item:selected { background: #0a84ff; }
+            QToolTip { background: #2d2d2d; color: #e6e6e6; border: 1px solid #555; }
+        """
+        return """
+            QMainWindow, QDialog { background-color: #ffffff; }
             QWidget { color: #1a1a1a; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
             QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 6px; margin-top: 12px; padding: 12px; background: #f8f8f8; }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 8px; color: #0066cc; }
@@ -10729,9 +10799,11 @@ class VR180ProcessorGUI(QMainWindow):
             QProgressBar { border: 1px solid #ccc; border-radius: 4px; text-align: center; background: #f0f0f0; }
             QProgressBar::chunk { background: #0066cc; border-radius: 3px; }
             QToolButton { background: #f0f0f0; border: 1px solid #ccc; border-radius: 4px; }
-        """)
-        self.process_btn.setObjectName("processBtn")
-    
+            QToolButton#advancedToggle { background: transparent; border: none; font-weight: bold; color: #555; padding: 4px 0; }
+            QToolButton#advancedToggle:hover { color: #0066cc; }
+            QLabel#previewArea { background-color: #e0e0e0; border: 2px solid #cccccc; border-radius: 4px; }
+        """
+
     def _connect_signals(self):
         self.browse_input_btn.clicked.connect(self._browse_input)
         self.load_gyro_360_btn.clicked.connect(self._browse_gyro_360)
@@ -13813,6 +13885,65 @@ class VR180ProcessorGUI(QMainWindow):
 
         self._save_settings()
         super().closeEvent(event)
+
+
+def _system_is_dark():
+    """Best-effort detection of the OS color scheme. Returns True for dark.
+
+    Prefers Qt's colorScheme() (Qt 6.5+); falls back to the Windows registry
+    so the app still themes correctly on older Qt builds."""
+    try:
+        app = QApplication.instance()
+        if app is not None:
+            sh = app.styleHints()
+            if hasattr(sh, 'colorScheme'):
+                return sh.colorScheme() == Qt.ColorScheme.Dark
+    except Exception:
+        pass
+    if sys.platform == 'win32':
+        try:
+            import winreg
+            with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+                return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+        except Exception:
+            pass
+    return False
+
+
+def _build_palette(dark):
+    """Build a QPalette so widgets the stylesheet doesn't reach (QMessageBox,
+    QFileDialog, QProgressDialog, menus, tooltips) match the chosen theme."""
+    pal = QPalette()
+    if dark:
+        window, base, alt = QColor(0x1e, 0x1e, 0x1e), QColor(0x2d, 0x2d, 0x2d), QColor(0x35, 0x35, 0x35)
+        text, button = QColor(0xe6, 0xe6, 0xe6), QColor(0x3a, 0x3a, 0x3a)
+        disabled, highlight = QColor(0x70, 0x70, 0x70), QColor(0x0a, 0x84, 0xff)
+        tip, link = QColor(0x2d, 0x2d, 0x2d), QColor(0x4e, 0xa3, 0xff)
+    else:
+        window, base, alt = QColor(0xff, 0xff, 0xff), QColor(0xff, 0xff, 0xff), QColor(0xf0, 0xf0, 0xf0)
+        text, button = QColor(0x1a, 0x1a, 0x1a), QColor(0xf0, 0xf0, 0xf0)
+        disabled, highlight = QColor(0x99, 0x99, 0x99), QColor(0x00, 0x66, 0xcc)
+        tip, link = QColor(0xff, 0xff, 0xdc), QColor(0x00, 0x66, 0xcc)
+    R, G = QPalette.ColorRole, QPalette.ColorGroup
+    pal.setColor(R.Window, window)
+    pal.setColor(R.WindowText, text)
+    pal.setColor(R.Base, base)
+    pal.setColor(R.AlternateBase, alt)
+    pal.setColor(R.Text, text)
+    pal.setColor(R.Button, button)
+    pal.setColor(R.ButtonText, text)
+    pal.setColor(R.ToolTipBase, tip)
+    pal.setColor(R.ToolTipText, text)
+    pal.setColor(R.Highlight, highlight)
+    pal.setColor(R.HighlightedText, QColor(0xff, 0xff, 0xff))
+    pal.setColor(R.Link, link)
+    pal.setColor(R.PlaceholderText, disabled)
+    pal.setColor(R.BrightText, QColor(0xff, 0x55, 0x55))
+    for role in (R.WindowText, R.Text, R.ButtonText):
+        pal.setColor(G.Disabled, role, disabled)
+    return pal
 
 
 def main():
