@@ -11389,13 +11389,16 @@ class VR180ProcessorGUI(QMainWindow):
         self._schedule_preview_update()
 
     def _auto_align_stereo(self):
-        """Sample frames across the clip, measure the residual misalignment
-        between the left and right eyes, and fill in the Stereo Offset
-        yaw/pitch/roll so the stereo pair forms a comfortable VR180 image.
+        """Sample frames across the clip, measure the residual vertical
+        misalignment between the left and right eyes, and fill in the
+        Stereo Offset pitch/roll so the stereo pair sits level.
 
-        Corrects vertical disparity (pitch) and roll mismatch, and converges
-        the stereo window (yaw). The measured residual is applied as half the
-        eye-to-eye offset because Stereo Offset is applied oppositely per eye.
+        Corrects vertical disparity (pitch) and roll mismatch only. Yaw is
+        NOT touched: the eye-to-eye horizontal offset is stereo disparity
+        (the 3D effect, depth-dependent) — not a rig error — so it is left
+        for the user to set as the convergence/comfort control. The measured
+        residual is applied as half the eye-to-eye offset because Stereo
+        Offset is applied oppositely per eye.
         """
         if not self.config.input_path:
             QMessageBox.information(self, "Auto Align Stereo",
@@ -11478,7 +11481,7 @@ class VR180ProcessorGUI(QMainWindow):
                 if cancelled:
                     break
 
-                valid = [m for m in per_frame if m[3] >= 20]
+                valid = [m for m in per_frame if m[2] >= 20]
                 if len(valid) < max(2, N // 3):
                     if pass_i == 0:
                         error_msg = ("Not enough matching detail between the "
@@ -11489,39 +11492,53 @@ class VR180ProcessorGUI(QMainWindow):
                                      "scene.")
                     break  # otherwise keep the correction from earlier passes
 
-                yaw = float(np.median([m[0] for m in valid]))
-                pitch = float(np.median([m[1] for m in valid]))
-                roll = float(np.median([m[2] for m in valid]))
-                mean_inliers = float(np.mean([m[3] for m in valid]))
-                last_residual = (yaw, pitch, roll, mean_inliers)
+                pitch = float(np.median([m[0] for m in valid]))
+                roll = float(np.median([m[1] for m in valid]))
+                mean_inliers = float(np.mean([m[2] for m in valid]))
+                last_residual = (pitch, roll, mean_inliers)
                 n_frames_used = len(valid)
                 if first_residual is None:
                     first_residual = last_residual
+                # TEMP DEBUG (auto-align diagnosis) — remove once signs confirmed
+                print(f"[auto-align] PASS {pass_i}: input="
+                      f"{'360' if self.config.is_360_input else 'sbs'} "
+                      f"gyro={'on' if self.gyro_stabilize_checkbox.isChecked() else 'off'}"
+                      f"  | residual median: pitch={pitch:+.3f}° "
+                      f"roll={roll:+.3f}°  ({len(valid)}/{N} frames)"
+                      f"  | stereo offset before: pitch={self.stereo_pitch_offset.value():+.3f} "
+                      f"roll={self.stereo_roll_offset.value():+.3f} "
+                      f"(yaw={self.stereo_yaw_offset.value():+.3f}, untouched)")
 
                 # Implausibly large → not a residual-alignment problem
-                if pass_i == 0 and max(abs(yaw), abs(pitch), abs(roll)) > 25.0:
+                if pass_i == 0 and max(abs(pitch), abs(roll)) > 25.0:
                     error_msg = (f"Measured a very large eye misalignment "
-                                 f"(yaw {yaw:.1f}°, pitch {pitch:.1f}°, "
-                                 f"roll {roll:.1f}°).\n\nAuto-align corrects "
-                                 f"small residual errors. Set the Global "
-                                 f"Panomap Adjustment and confirm the eyes are "
-                                 f"not swapped, then try again.")
+                                 f"(pitch {pitch:.1f}°, roll {roll:.1f}°)."
+                                 f"\n\nAuto-align corrects small residual "
+                                 f"errors. Set the Global Panomap Adjustment "
+                                 f"and confirm the eyes are not swapped, then "
+                                 f"try again.")
                     break
 
-                if max(abs(yaw), abs(pitch), abs(roll)) < CONVERGED_DEG:
+                if max(abs(pitch), abs(roll)) < CONVERGED_DEG:
                     break
                 if pass_i == MAX_PASSES:
                     break  # measured for the report; no further correction
 
                 # Stereo Offset is applied oppositely to each eye, so each
-                # control moves half the measured eye-to-eye residual. Yaw and
-                # pitch map to image translation (negative coefficient), roll
-                # maps to image rotation (positive coefficient) — hence the
-                # opposite sign on the roll term.
+                # control moves half the measured eye-to-eye residual. Pitch
+                # maps to image translation (negative coefficient), roll maps
+                # to image rotation (positive coefficient) — hence the opposite
+                # sign on the roll term. Yaw is left untouched (manual control).
                 self._set_stereo_offsets(
-                    self.stereo_yaw_offset.value() - yaw / 2.0,
+                    self.stereo_yaw_offset.value(),
                     self.stereo_pitch_offset.value() - pitch / 2.0,
                     self.stereo_roll_offset.value() + roll / 2.0)
+                # TEMP DEBUG (auto-align diagnosis) — remove once signs confirmed
+                print(f"[auto-align] PASS {pass_i}: applied correction "
+                      f"(pitch {-pitch/2.0:+.3f}, roll {+roll/2.0:+.3f}) → "
+                      f"stereo offset after: "
+                      f"pitch={self.stereo_pitch_offset.value():+.3f} "
+                      f"roll={self.stereo_roll_offset.value():+.3f}")
             progress.setValue((MAX_PASSES + 1) * N)
         finally:
             self.cached_raw_frame = snap['cached_raw_frame']
@@ -11568,8 +11585,8 @@ class VR180ProcessorGUI(QMainWindow):
         changed = any(abs(applied[i] - start_offsets[i]) > 1e-4 for i in range(3))
         if not changed:
             QMessageBox.information(self, "Auto Align Stereo",
-                f"The eyes are already well aligned (residual "
-                f"yaw {f[0]:+.2f}°, pitch {f[1]:+.2f}°, roll {f[2]:+.2f}°).\n\n"
+                f"The eyes are already level (residual "
+                f"pitch {f[0]:+.2f}°, roll {f[1]:+.2f}°).\n\n"
                 "No change was made.")
             self.status_bar.showMessage("Auto Align: eyes already aligned")
             return
@@ -11577,13 +11594,14 @@ class VR180ProcessorGUI(QMainWindow):
         QMessageBox.information(self, "Auto Align Stereo",
             f"Stereo eyes aligned using {n_frames_used} of {N} sampled frames.\n\n"
             f"Residual eye misalignment (before → after):\n"
-            f"  Convergence (yaw):   {f[0]:+.2f}°  →  {l[0]:+.2f}°\n"
-            f"  Vertical (pitch):    {f[1]:+.2f}°  →  {l[1]:+.2f}°\n"
-            f"  Roll:                {f[2]:+.2f}°  →  {l[2]:+.2f}°\n\n"
+            f"  Vertical (pitch):    {f[0]:+.2f}°  →  {l[0]:+.2f}°\n"
+            f"  Roll:                {f[1]:+.2f}°  →  {l[1]:+.2f}°\n\n"
             f"Stereo Offset applied:\n"
-            f"  Yaw {applied[0]:+.2f}°   Pitch {applied[1]:+.2f}°   "
-            f"Roll {applied[2]:+.2f}°")
-        self.status_bar.showMessage("Auto Align complete — Stereo Offset updated")
+            f"  Pitch {applied[1]:+.2f}°   Roll {applied[2]:+.2f}°\n\n"
+            f"Yaw (convergence) left unchanged at {applied[0]:+.2f}° — "
+            f"set it by hand for comfortable stereo depth.")
+        self.status_bar.showMessage(
+            "Auto Align complete — pitch/roll updated (yaw unchanged)")
 
     def _set_stereo_offsets(self, yaw, pitch, roll):
         """Set the three Stereo Offset controls without emitting valueChanged
@@ -11660,16 +11678,23 @@ class VR180ProcessorGUI(QMainWindow):
         return fr[:, :hw].copy(), fr[:, hw:].copy()
 
     def _measure_eye_misalignment(self, left, right):
-        """Feature-match the left/right eye images and estimate the rotational
-        misalignment between them.
+        """Feature-match the left/right eye images and estimate the VERTICAL
+        rig misalignment between them — pitch (vertical disparity) and roll.
 
-        Both images are in the same half-equirect projection (width spans 180°
-        of longitude, height spans 180° of latitude), so a small inter-eye
-        rotation appears as a similarity transform.
+        The two eyes are a stereo pair, so their horizontal offset is the
+        depth-dependent disparity field, not a rig error — a global similarity
+        transform cannot represent it and lets depth leak into every parameter.
+        Instead the horizontal disparity is left FREE per feature and only the
+        vertical relation is fitted:
 
-        Returns (yaw_deg, pitch_deg, roll_deg, inliers) — how the RIGHT eye is
-        offset relative to the LEFT (the full eye-to-eye residual) — or None if
-        matching was not reliable.
+            yl_i - yr_i  ≈  roll · xr_i + ty
+
+        i.e. vertical disparity is a robust line in xr — slope → roll,
+        intercept (at image centre) → vertical offset. Yaw is deliberately
+        not estimated (it is stereo disparity, a manual convergence control).
+
+        Returns (pitch_deg, roll_deg, inliers) — how the RIGHT eye is offset
+        relative to the LEFT — or None if matching was not reliable.
         """
         import math
 
@@ -11681,6 +11706,36 @@ class VR180ProcessorGUI(QMainWindow):
             if img.ndim == 3:
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
             return img
+
+        def _robust_line_fit(x, y):
+            """RANSAC fit of y = slope·x + intercept, robust to mismatched
+            features and to points on moving / depth-discontinuous objects.
+            Returns (slope, intercept, inlier_mask) or None."""
+            n = len(x)
+            if n < 12:
+                return None
+            rng = np.random.default_rng(0xA11)
+            thresh = 2.0   # px of vertical-disparity residual
+            best_mask, best_count = None, 0
+            for _ in range(200):
+                i, j = int(rng.integers(n)), int(rng.integers(n))
+                dx = x[j] - x[i]
+                if abs(dx) < 50.0:   # need a wide x baseline for a stable slope
+                    continue
+                slope = (y[j] - y[i]) / dx
+                icpt = y[i] - slope * x[i]
+                mask = np.abs(y - (slope * x + icpt)) < thresh
+                count = int(mask.sum())
+                if count > best_count:
+                    best_count, best_mask = count, mask
+            if best_mask is None or best_count < 12:
+                return None
+            # Least-squares refit on the inlier set
+            xi = x[best_mask]
+            yi = y[best_mask]
+            A = np.column_stack([xi, np.ones_like(xi)])
+            (slope, icpt), *_ = np.linalg.lstsq(A, yi, rcond=None)
+            return float(slope), float(icpt), best_mask
 
         gl = _gray_u8(left)
         gr = _gray_u8(right)
@@ -11716,30 +11771,32 @@ class VR180ProcessorGUI(QMainWindow):
         pts_l = np.float32([kl[m.queryIdx].pt for m in good]).reshape(-1, 2)
         pts_r = np.float32([kr[m.trainIdx].pt for m in good]).reshape(-1, 2)
 
-        # Similarity transform mapping RIGHT-eye points onto LEFT-eye points:
-        #   p_left ≈ Rot(roll) · p_right + (tx, ty)
-        M, inliers = cv2.estimateAffinePartial2D(
-            pts_r, pts_l, method=cv2.RANSAC, ransacReprojThreshold=3.0,
-            maxIters=5000, confidence=0.99)
-        if M is None or inliers is None:
+        # Decoupled stereo-rig model: the right eye maps onto the left by a
+        # roll rotation + vertical shift, with horizontal disparity FREE per
+        # feature (it is the 3D effect, depth-dependent — never fit it). For
+        # small roll this reduces to a line in vertical disparity:
+        #   Δy_i = (yl_i - yr_i) ≈ roll · xc_i + ty   (xc = x about the centre)
+        xr = pts_r[:, 0]
+        dy = pts_l[:, 1] - pts_r[:, 1]
+        xc = xr - (gr.shape[1] / 2.0)  # centre on the (downscaled) right image
+
+        fit = _robust_line_fit(xc, dy)
+        if fit is None:
             return None
-        n_in = int(inliers.sum())
+        slope, intercept, inlier_mask = fit
+        n_in = int(inlier_mask.sum())
         if n_in < 10:
             return None
 
-        a, b = float(M[0, 0]), float(M[1, 0])
-        tx, ty = float(M[0, 2]), float(M[1, 2])
-        s = math.hypot(a, b)
-        if s < 1e-6 or abs(s - 1.0) > 0.15:
-            return None  # implausible scale → unreliable match
-
-        roll_deg = math.degrees(math.atan2(b, a))  # scale-independent
-        tx /= scale  # translations back to full-resolution pixels
-        ty /= scale
-        # Half-equirect: full width = 180° longitude, full height = 180° latitude
-        yaw_deg = tx * (180.0 / float(w))
+        roll_deg = math.degrees(math.atan(slope))  # slope of Δy-vs-x ≈ roll
+        ty = intercept / scale  # vertical offset back to full-resolution pixels
+        # Half-equirect: full height spans 180° of latitude
         pitch_deg = ty * (180.0 / float(h))
-        return (yaw_deg, pitch_deg, roll_deg, n_in)
+        # TEMP DEBUG (auto-align diagnosis) — remove once signs are confirmed
+        print(f"[auto-align]   measure: ty={ty:+7.1f}px pitch={pitch_deg:+.3f}°  "
+              f"roll={roll_deg:+.3f}° (slope={slope:+.5f})  "
+              f"inliers={n_in}/{len(good)}")
+        return (pitch_deg, roll_deg, n_in)
 
     def _on_horizon_lock_toggled(self, checked):
         """Toggle horizon lock."""
