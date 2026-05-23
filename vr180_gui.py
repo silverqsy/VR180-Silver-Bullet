@@ -2850,13 +2850,13 @@ def get_subprocess_flags():
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QSlider, QSpinBox, QDoubleSpinBox,
-    QComboBox, QFileDialog, QGroupBox, QProgressBar,
+    QComboBox, QFileDialog, QGroupBox, QProgressBar, QProgressDialog,
     QMessageBox, QSplitter, QLineEdit, QStatusBar,
     QScrollArea, QToolButton, QCheckBox, QRadioButton, QButtonGroup, QTextEdit,
     QDialog, QPlainTextEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QImage, QPixmap, QPainter
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPalette
 
 
 def get_ffmpeg_path():
@@ -9433,7 +9433,8 @@ class PreviewWidget(QLabel):
         super().__init__()
         self.setMinimumSize(800, 400)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet("QLabel { background-color: #e0e0e0; border: 2px solid #cccccc; border-radius: 4px; }")
+        # Styled by the theme stylesheet via this object name (see _theme_qss)
+        self.setObjectName("previewArea")
         self.processed_pixmap = None
         self.zoom_level = 1.0
         self.pan_offset_x = 0
@@ -10239,6 +10240,15 @@ class VR180ProcessorGUI(QMainWindow):
         offset_layout.addWidget(QLabel("Roll:"), 2, 0)
         self.stereo_roll_offset = SliderWithSpinBox(-10, 10, 0, 3, 0.1, "°")
         offset_layout.addWidget(self.stereo_roll_offset, 2, 1)
+        self.auto_align_btn = QPushButton("✨ Auto Align Stereo")
+        self.auto_align_btn.setToolTip(
+            "Analyse the clip and automatically compute the Stereo Offset that\n"
+            "aligns the two eyes into a comfortable VR180 image:\n"
+            "  • removes vertical disparity (pitch) and roll mismatch\n"
+            "  • converges the stereo window onto the scene (yaw)\n"
+            "Samples several frames across the video and refines in two passes.\n"
+            "Requires a loaded video and OpenCV.")
+        offset_layout.addWidget(self.auto_align_btn, 3, 0, 1, 2)
         controls_layout.addWidget(offset_group)
 
         # GoPro Gyro Stabilization section
@@ -10347,10 +10357,8 @@ class VR180ProcessorGUI(QMainWindow):
         self.advanced_toggle_btn.setArrowType(Qt.ArrowType.RightArrow)
         self.advanced_toggle_btn.setCheckable(True)
         self.advanced_toggle_btn.setChecked(False)
-        self.advanced_toggle_btn.setStyleSheet(
-            "QToolButton { border: none; font-weight: bold; color: #555; padding: 4px 0; }"
-            "QToolButton:hover { color: #0066cc; }"
-        )
+        # Styled by the theme stylesheet via this object name (see _theme_qss)
+        self.advanced_toggle_btn.setObjectName("advancedToggle")
         gopro_layout.addWidget(self.advanced_toggle_btn)
 
         # Advanced settings container (RS controls, hidden by default)
@@ -10705,8 +10713,79 @@ class VR180ProcessorGUI(QMainWindow):
         self.status_bar.showMessage("Ready")
     
     def _apply_styles(self):
-        self.setStyleSheet("""
-            QMainWindow { background-color: #ffffff; }
+        # Object names let the theme stylesheet target specific widgets.
+        self.process_btn.setObjectName("processBtn")
+        self._theme_is_dark = None  # sentinel — forces the first _apply_theme
+        self._apply_theme()
+        # Follow live OS light/dark switches (Qt 6.5+ emits colorSchemeChanged;
+        # older Qt is covered by the ApplicationPaletteChange path below).
+        try:
+            sh = QApplication.instance().styleHints()
+            if hasattr(sh, 'colorSchemeChanged'):
+                sh.colorSchemeChanged.connect(lambda *_: self._apply_theme())
+        except Exception:
+            pass
+
+    def _apply_theme(self, *_args):
+        """Apply the light or dark theme to match the OS color scheme.
+
+        Idempotent: it only re-styles when the scheme actually changed, which
+        also stops the app.setPalette() call below from recursing through the
+        ApplicationPaletteChange event handled in changeEvent()."""
+        dark = _system_is_dark()
+        if dark == getattr(self, '_theme_is_dark', None):
+            return
+        self._theme_is_dark = dark
+        app = QApplication.instance()
+        if app is not None:
+            # Palette covers widgets the stylesheet doesn't reach: QMessageBox,
+            # QFileDialog, QProgressDialog, menus, tooltips.
+            app.setPalette(_build_palette(dark))
+        self.setStyleSheet(self._theme_qss(dark))
+
+    def changeEvent(self, event):
+        """Re-apply the theme when the OS color scheme changes. Fallback path
+        for Qt builds without the colorSchemeChanged signal — Qt still delivers
+        ApplicationPaletteChange on a system theme switch."""
+        try:
+            from PyQt6.QtCore import QEvent
+            if event.type() == QEvent.Type.ApplicationPaletteChange:
+                self._apply_theme()
+        except Exception:
+            pass
+        super().changeEvent(event)
+
+    def _theme_qss(self, dark):
+        """Return the Qt stylesheet for the dark or light theme."""
+        if dark:
+            return """
+            QMainWindow, QDialog { background-color: #1e1e1e; }
+            QWidget { color: #e6e6e6; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
+            QGroupBox { font-weight: bold; border: 1px solid #3c3c3c; border-radius: 6px; margin-top: 12px; padding: 12px; background: #262626; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 8px; color: #4ea3ff; }
+            QPushButton { background: #3a3a3a; border: 1px solid #555; border-radius: 4px; padding: 6px 16px; }
+            QPushButton:hover { background: #464646; border-color: #4ea3ff; }
+            QPushButton:disabled { background: #2a2a2a; color: #6b6b6b; }
+            QPushButton#processBtn { background: #0066cc; color: white; font-weight: bold; }
+            QPushButton#processBtn:disabled { background: #2a4a6e; color: #9bb6d4; }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: #2d2d2d; color: #e6e6e6; border: 1px solid #555; border-radius: 4px; padding: 6px; }
+            QComboBox QAbstractItemView { background: #2d2d2d; color: #e6e6e6; selection-background-color: #0a84ff; }
+            QSlider::groove:horizontal { height: 6px; background: #3c3c3c; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #4ea3ff; width: 16px; height: 16px; margin: -5px 0; border-radius: 8px; }
+            QProgressBar { border: 1px solid #555; border-radius: 4px; text-align: center; background: #2d2d2d; }
+            QProgressBar::chunk { background: #0066cc; border-radius: 3px; }
+            QToolButton { background: #3a3a3a; border: 1px solid #555; border-radius: 4px; }
+            QToolButton#advancedToggle { background: transparent; border: none; font-weight: bold; color: #a0a0a0; padding: 4px 0; }
+            QToolButton#advancedToggle:hover { color: #4ea3ff; }
+            QLabel#previewArea { background-color: #262626; border: 2px solid #3c3c3c; border-radius: 4px; }
+            QMenuBar { background: #262626; }
+            QMenuBar::item:selected { background: #3a3a3a; }
+            QMenu { background: #2d2d2d; border: 1px solid #555; }
+            QMenu::item:selected { background: #0a84ff; }
+            QToolTip { background: #2d2d2d; color: #e6e6e6; border: 1px solid #555; }
+        """
+        return """
+            QMainWindow, QDialog { background-color: #ffffff; }
             QWidget { color: #1a1a1a; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
             QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 6px; margin-top: 12px; padding: 12px; background: #f8f8f8; }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 8px; color: #0066cc; }
@@ -10720,9 +10799,11 @@ class VR180ProcessorGUI(QMainWindow):
             QProgressBar { border: 1px solid #ccc; border-radius: 4px; text-align: center; background: #f0f0f0; }
             QProgressBar::chunk { background: #0066cc; border-radius: 3px; }
             QToolButton { background: #f0f0f0; border: 1px solid #ccc; border-radius: 4px; }
-        """)
-        self.process_btn.setObjectName("processBtn")
-    
+            QToolButton#advancedToggle { background: transparent; border: none; font-weight: bold; color: #555; padding: 4px 0; }
+            QToolButton#advancedToggle:hover { color: #0066cc; }
+            QLabel#previewArea { background-color: #e0e0e0; border: 2px solid #cccccc; border-radius: 4px; }
+        """
+
     def _connect_signals(self):
         self.browse_input_btn.clicked.connect(self._browse_input)
         self.load_gyro_360_btn.clicked.connect(self._browse_gyro_360)
@@ -10742,6 +10823,7 @@ class VR180ProcessorGUI(QMainWindow):
         self.stereo_yaw_offset.valueChanged.connect(self._on_adjustment_changed)
         self.stereo_pitch_offset.valueChanged.connect(self._on_adjustment_changed)
         self.stereo_roll_offset.valueChanged.connect(self._on_adjustment_changed)
+        self.auto_align_btn.clicked.connect(self._auto_align_stereo)
         self.reset_all_btn.clicked.connect(self._reset_all)
         self.process_btn.clicked.connect(self._start_processing)
         self.cancel_btn.clicked.connect(self._cancel_processing)
@@ -11306,6 +11388,416 @@ class VR180ProcessorGUI(QMainWindow):
             self._rebuild_gyro_stabilizer()
         self._schedule_preview_update()
 
+    def _auto_align_stereo(self):
+        """Sample frames across the clip, measure the residual vertical
+        misalignment between the left and right eyes, and fill in the
+        Stereo Offset pitch/roll so the stereo pair sits level.
+
+        Corrects vertical disparity (pitch) and roll mismatch only. Yaw is
+        NOT touched: the eye-to-eye horizontal offset is stereo disparity
+        (the 3D effect, depth-dependent) — not a rig error — so it is left
+        for the user to set as the convergence/comfort control. The measured
+        residual is applied as half the eye-to-eye offset because Stereo
+        Offset is applied oppositely per eye.
+        """
+        if not self.config.input_path:
+            QMessageBox.information(self, "Auto Align Stereo",
+                                    "Load a video before running auto-align.")
+            return
+        if not HAS_CV2:
+            QMessageBox.warning(self, "Auto Align Stereo",
+                                "OpenCV (cv2) is required for auto-alignment "
+                                "but is not available in this build.")
+            return
+        if self.video_duration <= 0:
+            QMessageBox.warning(self, "Auto Align Stereo",
+                                "Video duration is unknown — cannot sample frames.")
+            return
+
+        N = 5                 # frames sampled per pass
+        MAX_PASSES = 2        # refinement corrections
+        CONVERGED_DEG = 0.03  # stop early when the residual is below this
+
+        # Sample timestamps spread across the trim range (or the whole clip)
+        t0 = self.trim_start if (self.trim_start and self.trim_start > 0) else 0.0
+        t1 = self.trim_end if (self.trim_end and self.trim_end > 0) else self.video_duration
+        if t1 - t0 < 0.05:
+            t0, t1 = 0.0, self.video_duration
+        span = t1 - t0
+        sample_times = [t0 + span * (i + 1) / (N + 1) for i in range(N)]
+
+        # Detach any in-flight preview extraction so it doesn't fight for the file
+        self._retire_current_extractor()
+
+        # Snapshot every piece of decode/cache state we are about to mutate
+        snap = {
+            'cached_raw_frame': self.cached_raw_frame,
+            'cached_raw_frame_pristine': self.cached_raw_frame_pristine,
+            'cached_timestamp': self.cached_timestamp,
+            'preview_timestamp': self.preview_timestamp,
+            'original_frame': self.original_frame,
+            'cached_crossA': getattr(self, 'cached_crossA', None),
+            'cached_crossB': getattr(self, 'cached_crossB', None),
+            'cached_crossA_pristine': getattr(self, 'cached_crossA_pristine', None),
+            'cached_crossB_pristine': getattr(self, 'cached_crossB_pristine', None),
+            'timeline': self.timeline_slider.value(),
+        }
+        start_offsets = (self.stereo_yaw_offset.value(),
+                         self.stereo_pitch_offset.value(),
+                         self.stereo_roll_offset.value())
+
+        progress = QProgressDialog("Sampling frames for stereo alignment…",
+                                   "Cancel", 0, (MAX_PASSES + 1) * N, self)
+        progress.setWindowTitle("Auto Align Stereo")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        self.auto_align_btn.setEnabled(False)
+        step = 0
+        first_residual = None
+        last_residual = None
+        n_frames_used = 0
+        cancelled = False
+        error_msg = None
+        try:
+            for pass_i in range(MAX_PASSES + 1):
+                per_frame = []
+                for t in sample_times:
+                    if progress.wasCanceled():
+                        cancelled = True
+                        break
+                    progress.setLabelText(
+                        f"Pass {pass_i + 1} of {MAX_PASSES + 1} — "
+                        f"analysing frame at {t:.1f}s")
+                    pair = self._render_eye_pair_at(t)
+                    if pair is not None:
+                        m = self._measure_eye_misalignment(pair[0], pair[1])
+                        if m is not None:
+                            per_frame.append(m)
+                    step += 1
+                    progress.setValue(step)
+                    QApplication.processEvents()
+                if cancelled:
+                    break
+
+                valid = [m for m in per_frame if m[2] >= 20]
+                if len(valid) < max(2, N // 3):
+                    if pass_i == 0:
+                        error_msg = ("Not enough matching detail between the "
+                                     "eyes to measure alignment.\n\nTry a "
+                                     "sharper, more textured section of the "
+                                     "clip, and check the Global Panomap "
+                                     "Adjustment so both eyes frame the same "
+                                     "scene.")
+                    break  # otherwise keep the correction from earlier passes
+
+                pitch = float(np.median([m[0] for m in valid]))
+                roll = float(np.median([m[1] for m in valid]))
+                mean_inliers = float(np.mean([m[2] for m in valid]))
+                last_residual = (pitch, roll, mean_inliers)
+                n_frames_used = len(valid)
+                if first_residual is None:
+                    first_residual = last_residual
+                # TEMP DEBUG (auto-align diagnosis) — remove once signs confirmed
+                print(f"[auto-align] PASS {pass_i}: input="
+                      f"{'360' if self.config.is_360_input else 'sbs'} "
+                      f"gyro={'on' if self.gyro_stabilize_checkbox.isChecked() else 'off'}"
+                      f"  | residual median: pitch={pitch:+.3f}° "
+                      f"roll={roll:+.3f}°  ({len(valid)}/{N} frames)"
+                      f"  | stereo offset before: pitch={self.stereo_pitch_offset.value():+.3f} "
+                      f"roll={self.stereo_roll_offset.value():+.3f} "
+                      f"(yaw={self.stereo_yaw_offset.value():+.3f}, untouched)")
+
+                # Implausibly large → not a residual-alignment problem
+                if pass_i == 0 and max(abs(pitch), abs(roll)) > 25.0:
+                    error_msg = (f"Measured a very large eye misalignment "
+                                 f"(pitch {pitch:.1f}°, roll {roll:.1f}°)."
+                                 f"\n\nAuto-align corrects small residual "
+                                 f"errors. Set the Global Panomap Adjustment "
+                                 f"and confirm the eyes are not swapped, then "
+                                 f"try again.")
+                    break
+
+                if max(abs(pitch), abs(roll)) < CONVERGED_DEG:
+                    break
+                if pass_i == MAX_PASSES:
+                    break  # measured for the report; no further correction
+
+                # Stereo Offset is applied oppositely to each eye, so each
+                # control moves half the measured eye-to-eye residual. Pitch
+                # maps to image translation (negative coefficient), roll maps
+                # to image rotation (positive coefficient) — hence the opposite
+                # sign on the roll term. Yaw is left untouched (manual control).
+                self._set_stereo_offsets(
+                    self.stereo_yaw_offset.value(),
+                    self.stereo_pitch_offset.value() - pitch / 2.0,
+                    self.stereo_roll_offset.value() + roll / 2.0)
+                # TEMP DEBUG (auto-align diagnosis) — remove once signs confirmed
+                print(f"[auto-align] PASS {pass_i}: applied correction "
+                      f"(pitch {-pitch/2.0:+.3f}, roll {+roll/2.0:+.3f}) → "
+                      f"stereo offset after: "
+                      f"pitch={self.stereo_pitch_offset.value():+.3f} "
+                      f"roll={self.stereo_roll_offset.value():+.3f}")
+            progress.setValue((MAX_PASSES + 1) * N)
+        finally:
+            self.cached_raw_frame = snap['cached_raw_frame']
+            self.cached_raw_frame_pristine = snap['cached_raw_frame_pristine']
+            self.cached_timestamp = snap['cached_timestamp']
+            self.preview_timestamp = snap['preview_timestamp']
+            self.original_frame = snap['original_frame']
+            for k in ('cached_crossA', 'cached_crossB',
+                      'cached_crossA_pristine', 'cached_crossB_pristine'):
+                if snap[k] is not None:
+                    setattr(self, k, snap[k])
+                elif hasattr(self, k):
+                    delattr(self, k)
+            self.timeline_slider.blockSignals(True)
+            self.timeline_slider.setValue(snap['timeline'])
+            self.timeline_slider.blockSignals(False)
+            progress.close()
+            self.auto_align_btn.setEnabled(True)
+
+        if error_msg:
+            self._set_stereo_offsets(*start_offsets)
+            self._on_adjustment_changed()
+            QMessageBox.warning(self, "Auto Align Stereo", error_msg)
+            self.status_bar.showMessage("Auto Align: alignment not applied")
+            return
+
+        if cancelled:
+            self._set_stereo_offsets(*start_offsets)
+            self._on_adjustment_changed()
+            self.status_bar.showMessage(
+                "Auto Align cancelled — Stereo Offset unchanged")
+            return
+
+        # Rebuild the stabilizer (offsets are baked in) and refresh the preview
+        self._on_adjustment_changed()
+
+        if first_residual is None:
+            return
+
+        f, l = first_residual, last_residual
+        applied = (self.stereo_yaw_offset.value(),
+                   self.stereo_pitch_offset.value(),
+                   self.stereo_roll_offset.value())
+        changed = any(abs(applied[i] - start_offsets[i]) > 1e-4 for i in range(3))
+        if not changed:
+            QMessageBox.information(self, "Auto Align Stereo",
+                f"The eyes are already level (residual "
+                f"pitch {f[0]:+.2f}°, roll {f[1]:+.2f}°).\n\n"
+                "No change was made.")
+            self.status_bar.showMessage("Auto Align: eyes already aligned")
+            return
+
+        QMessageBox.information(self, "Auto Align Stereo",
+            f"Stereo eyes aligned using {n_frames_used} of {N} sampled frames.\n\n"
+            f"Residual eye misalignment (before → after):\n"
+            f"  Vertical (pitch):    {f[0]:+.2f}°  →  {l[0]:+.2f}°\n"
+            f"  Roll:                {f[1]:+.2f}°  →  {l[1]:+.2f}°\n\n"
+            f"Stereo Offset applied:\n"
+            f"  Pitch {applied[1]:+.2f}°   Roll {applied[2]:+.2f}°\n\n"
+            f"Yaw (convergence) left unchanged at {applied[0]:+.2f}° — "
+            f"set it by hand for comfortable stereo depth.")
+        self.status_bar.showMessage(
+            "Auto Align complete — pitch/roll updated (yaw unchanged)")
+
+    def _set_stereo_offsets(self, yaw, pitch, roll):
+        """Set the three Stereo Offset controls without emitting valueChanged
+        (the caller refreshes the preview once when finished)."""
+        for widget, val in ((self.stereo_yaw_offset, yaw),
+                             (self.stereo_pitch_offset, pitch),
+                             (self.stereo_roll_offset, roll)):
+            widget.blockSignals(True)
+            widget.setValue(float(val))
+            widget.blockSignals(False)
+
+    def _render_eye_pair_at(self, timestamp):
+        """Decode and render the left/right eye images at a timestamp using the
+        current settings. Returns (left, right) arrays in the half-equirect
+        preview projection, or None on failure.
+
+        Mutates cached_* / timeline state — _auto_align_stereo snapshots and
+        restores it.
+        """
+        input_path, local_ts = self._resolve_segment_timestamp(timestamp)
+        captured = {}
+        try:
+            fe = FrameExtractor(input_path, local_ts, extract_raw=True,
+                                is_360=self.config.is_360_input)
+            fe.raw_frame_ready.connect(
+                lambda fr: captured.__setitem__('frame', fr),
+                Qt.ConnectionType.DirectConnection)
+            fe.error.connect(
+                lambda er: captured.__setitem__('error', er),
+                Qt.ConnectionType.DirectConnection)
+            fe.run()  # synchronous — executes on the GUI thread
+        except Exception as e:
+            print(f"[auto-align] decode failed at {timestamp:.2f}s: {e}")
+            return None
+
+        frame = captured.get('frame')
+        if frame is None:
+            print(f"[auto-align] no frame at {timestamp:.2f}s "
+                  f"({captured.get('error', 'unknown error')})")
+            return None
+
+        self.cached_raw_frame = frame
+        self.cached_raw_frame_pristine = frame
+        self.cached_timestamp = timestamp
+        self.preview_timestamp = timestamp
+        if self.config.is_360_input and getattr(fe, 'crossA', None) is not None:
+            self.cached_crossA = fe.crossA
+            self.cached_crossB = fe.crossB
+            self.cached_crossA_pristine = fe.crossA
+            self.cached_crossB_pristine = fe.crossB
+
+        # Drive gyro / rolling-shutter sampling to this timestamp
+        if self.video_duration > 0:
+            sv = int(round(timestamp / self.video_duration * 1000.0))
+            self.timeline_slider.blockSignals(True)
+            self.timeline_slider.setValue(max(0, min(1000, sv)))
+            self.timeline_slider.blockSignals(False)
+
+        try:
+            self._apply_preview_filters_to_cached_frame()
+        except Exception as e:
+            print(f"[auto-align] render failed at {timestamp:.2f}s: {e}")
+            return None
+
+        fr = self.original_frame
+        if fr is None or fr.ndim != 3 or fr.shape[1] < 4:
+            return None
+        # Upside-down mount renders the SBS rotated 180° (which swaps the eye
+        # halves). Undo it so the split below is the canonical [left, right]
+        # the Stereo Offset math assumes.
+        if self.upside_down_checkbox.isChecked():
+            fr = cv2.rotate(fr, cv2.ROTATE_180)
+        hw = fr.shape[1] // 2
+        return fr[:, :hw].copy(), fr[:, hw:].copy()
+
+    def _measure_eye_misalignment(self, left, right):
+        """Feature-match the left/right eye images and estimate the VERTICAL
+        rig misalignment between them — pitch (vertical disparity) and roll.
+
+        The two eyes are a stereo pair, so their horizontal offset is the
+        depth-dependent disparity field, not a rig error — a global similarity
+        transform cannot represent it and lets depth leak into every parameter.
+        Instead the horizontal disparity is left FREE per feature and only the
+        vertical relation is fitted:
+
+            yl_i - yr_i  ≈  roll · xr_i + ty
+
+        i.e. vertical disparity is a robust line in xr — slope → roll,
+        intercept (at image centre) → vertical offset. Yaw is deliberately
+        not estimated (it is stereo disparity, a manual convergence control).
+
+        Returns (pitch_deg, roll_deg, inliers) — how the RIGHT eye is offset
+        relative to the LEFT — or None if matching was not reliable.
+        """
+        import math
+
+        def _gray_u8(img):
+            if img.dtype == np.uint16:
+                img = ((img.astype(np.uint32) * 255 + 32767) // 65535).astype(np.uint8)
+            elif img.dtype != np.uint8:
+                img = np.clip(img, 0, 255).astype(np.uint8)
+            if img.ndim == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            return img
+
+        def _robust_line_fit(x, y):
+            """RANSAC fit of y = slope·x + intercept, robust to mismatched
+            features and to points on moving / depth-discontinuous objects.
+            Returns (slope, intercept, inlier_mask) or None."""
+            n = len(x)
+            if n < 12:
+                return None
+            rng = np.random.default_rng(0xA11)
+            thresh = 2.0   # px of vertical-disparity residual
+            best_mask, best_count = None, 0
+            for _ in range(200):
+                i, j = int(rng.integers(n)), int(rng.integers(n))
+                dx = x[j] - x[i]
+                if abs(dx) < 50.0:   # need a wide x baseline for a stable slope
+                    continue
+                slope = (y[j] - y[i]) / dx
+                icpt = y[i] - slope * x[i]
+                mask = np.abs(y - (slope * x + icpt)) < thresh
+                count = int(mask.sum())
+                if count > best_count:
+                    best_count, best_mask = count, mask
+            if best_mask is None or best_count < 12:
+                return None
+            # Least-squares refit on the inlier set
+            xi = x[best_mask]
+            yi = y[best_mask]
+            A = np.column_stack([xi, np.ones_like(xi)])
+            (slope, icpt), *_ = np.linalg.lstsq(A, yi, rcond=None)
+            return float(slope), float(icpt), best_mask
+
+        gl = _gray_u8(left)
+        gr = _gray_u8(right)
+        h, w = gl.shape[:2]
+
+        # Downscale large frames — the similarity estimate is unaffected and
+        # ORB on a ~1600px image is much faster. Translations are rescaled back.
+        scale = 1.0
+        max_dim = 1600
+        if max(h, w) > max_dim:
+            scale = max_dim / float(max(h, w))
+            gl = cv2.resize(gl, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            gr = cv2.resize(gr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+        try:
+            orb = cv2.ORB_create(nfeatures=3000)
+            kl, dl = orb.detectAndCompute(gl, None)
+            kr, dr = orb.detectAndCompute(gr, None)
+        except Exception as e:
+            print(f"[auto-align] feature detection failed: {e}")
+            return None
+        if dl is None or dr is None or len(kl) < 12 or len(kr) < 12:
+            return None
+
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+        good = []
+        for pair in bf.knnMatch(dl, dr, k=2):
+            if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance:
+                good.append(pair[0])
+        if len(good) < 12:
+            return None
+
+        pts_l = np.float32([kl[m.queryIdx].pt for m in good]).reshape(-1, 2)
+        pts_r = np.float32([kr[m.trainIdx].pt for m in good]).reshape(-1, 2)
+
+        # Decoupled stereo-rig model: the right eye maps onto the left by a
+        # roll rotation + vertical shift, with horizontal disparity FREE per
+        # feature (it is the 3D effect, depth-dependent — never fit it). For
+        # small roll this reduces to a line in vertical disparity:
+        #   Δy_i = (yl_i - yr_i) ≈ roll · xc_i + ty   (xc = x about the centre)
+        xr = pts_r[:, 0]
+        dy = pts_l[:, 1] - pts_r[:, 1]
+        xc = xr - (gr.shape[1] / 2.0)  # centre on the (downscaled) right image
+
+        fit = _robust_line_fit(xc, dy)
+        if fit is None:
+            return None
+        slope, intercept, inlier_mask = fit
+        n_in = int(inlier_mask.sum())
+        if n_in < 10:
+            return None
+
+        roll_deg = math.degrees(math.atan(slope))  # slope of Δy-vs-x ≈ roll
+        ty = intercept / scale  # vertical offset back to full-resolution pixels
+        # Half-equirect: full height spans 180° of latitude
+        pitch_deg = ty * (180.0 / float(h))
+        # TEMP DEBUG (auto-align diagnosis) — remove once signs are confirmed
+        print(f"[auto-align]   measure: ty={ty:+7.1f}px pitch={pitch_deg:+.3f}°  "
+              f"roll={roll_deg:+.3f}° (slope={slope:+.5f})  "
+              f"inliers={n_in}/{len(good)}")
+        return (pitch_deg, roll_deg, n_in)
+
     def _on_horizon_lock_toggled(self, checked):
         """Toggle horizon lock."""
         self._on_gyro_param_changed()
@@ -11598,11 +12090,38 @@ class VR180ProcessorGUI(QMainWindow):
             return Path(seg_path), dur - 0.01
         return self.config.input_path, timestamp
 
+    def _retire_current_extractor(self):
+        """Detach the active frame extractor (if any) so it finishes decoding
+        in the background. PyAV decode cannot be interrupted by cancel(), so we
+        must not drop the QThread reference while it runs (that causes the
+        'QThread destroyed while thread is still running' warning) nor block
+        the UI waiting on it. Its signals are disconnected so a late frame
+        cannot overwrite the cache."""
+        ex = getattr(self, 'extractor', None)
+        if ex is None or not ex.isRunning():
+            return
+        ex.cancel()  # kills the FFmpeg subprocess on the legacy decode path
+        for sig in (ex.raw_frame_ready, ex.error):
+            try:
+                sig.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+        if not hasattr(self, '_retiring_extractors'):
+            self._retiring_extractors = []
+        self._retiring_extractors.append(ex)
+        ex.finished.connect(self._on_retiring_extractor_finished)
+        self.extractor = None
+
+    def _on_retiring_extractor_finished(self):
+        """Drop references to background extractors that have finished, so
+        their QThread objects can be garbage-collected safely."""
+        if hasattr(self, '_retiring_extractors'):
+            self._retiring_extractors = [
+                e for e in self._retiring_extractors if e.isRunning()]
+
     def _extract_frame(self, timestamp, force_filter=False):
         if not self.config.input_path: return
-        if hasattr(self, 'extractor') and self.extractor and self.extractor.isRunning():
-            self.extractor.cancel()  # Kill FFmpeg process properly
-            self.extractor.wait(500)  # Wait longer for cleanup
+        self._retire_current_extractor()
         self.preview_timestamp = timestamp
 
         # If we have cached frame at this timestamp, apply OpenCV filters directly
@@ -13404,13 +13923,84 @@ class VR180ProcessorGUI(QMainWindow):
                 self.processor.terminate()
                 self.processor.wait(1000)
 
-        # Stop any frame extraction
-        if hasattr(self, 'extractor') and self.extractor and self.extractor.isRunning():
-            self.extractor.cancel()  # Kill FFmpeg process properly
-            self.extractor.wait(1000)
+        # Stop any frame extraction, including extractors still finishing in
+        # the background. PyAV decode cannot be interrupted, so wait generously
+        # before terminate() — which is acceptable only because we are exiting.
+        extractors = []
+        if hasattr(self, 'extractor') and self.extractor:
+            extractors.append(self.extractor)
+        extractors.extend(getattr(self, '_retiring_extractors', []))
+        for ex in extractors:
+            if ex.isRunning():
+                ex.cancel()
+        for ex in extractors:
+            if ex.isRunning():
+                ex.wait(5000)
+                if ex.isRunning():
+                    ex.terminate()
+                    ex.wait(1000)
 
         self._save_settings()
         super().closeEvent(event)
+
+
+def _system_is_dark():
+    """Best-effort detection of the OS color scheme. Returns True for dark.
+
+    Prefers Qt's colorScheme() (Qt 6.5+); falls back to the Windows registry
+    so the app still themes correctly on older Qt builds."""
+    try:
+        app = QApplication.instance()
+        if app is not None:
+            sh = app.styleHints()
+            if hasattr(sh, 'colorScheme'):
+                return sh.colorScheme() == Qt.ColorScheme.Dark
+    except Exception:
+        pass
+    if sys.platform == 'win32':
+        try:
+            import winreg
+            with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+                return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+        except Exception:
+            pass
+    return False
+
+
+def _build_palette(dark):
+    """Build a QPalette so widgets the stylesheet doesn't reach (QMessageBox,
+    QFileDialog, QProgressDialog, menus, tooltips) match the chosen theme."""
+    pal = QPalette()
+    if dark:
+        window, base, alt = QColor(0x1e, 0x1e, 0x1e), QColor(0x2d, 0x2d, 0x2d), QColor(0x35, 0x35, 0x35)
+        text, button = QColor(0xe6, 0xe6, 0xe6), QColor(0x3a, 0x3a, 0x3a)
+        disabled, highlight = QColor(0x70, 0x70, 0x70), QColor(0x0a, 0x84, 0xff)
+        tip, link = QColor(0x2d, 0x2d, 0x2d), QColor(0x4e, 0xa3, 0xff)
+    else:
+        window, base, alt = QColor(0xff, 0xff, 0xff), QColor(0xff, 0xff, 0xff), QColor(0xf0, 0xf0, 0xf0)
+        text, button = QColor(0x1a, 0x1a, 0x1a), QColor(0xf0, 0xf0, 0xf0)
+        disabled, highlight = QColor(0x99, 0x99, 0x99), QColor(0x00, 0x66, 0xcc)
+        tip, link = QColor(0xff, 0xff, 0xdc), QColor(0x00, 0x66, 0xcc)
+    R, G = QPalette.ColorRole, QPalette.ColorGroup
+    pal.setColor(R.Window, window)
+    pal.setColor(R.WindowText, text)
+    pal.setColor(R.Base, base)
+    pal.setColor(R.AlternateBase, alt)
+    pal.setColor(R.Text, text)
+    pal.setColor(R.Button, button)
+    pal.setColor(R.ButtonText, text)
+    pal.setColor(R.ToolTipBase, tip)
+    pal.setColor(R.ToolTipText, text)
+    pal.setColor(R.Highlight, highlight)
+    pal.setColor(R.HighlightedText, QColor(0xff, 0xff, 0xff))
+    pal.setColor(R.Link, link)
+    pal.setColor(R.PlaceholderText, disabled)
+    pal.setColor(R.BrightText, QColor(0xff, 0x55, 0x55))
+    for role in (R.WindowText, R.Text, R.ButtonText):
+        pal.setColor(G.Disabled, role, disabled)
+    return pal
 
 
 def main():
