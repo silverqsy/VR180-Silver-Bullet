@@ -3378,6 +3378,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6bee49d5fd327532ec2dae66b261f858a8055ba45c24677ce8cacf9206a192a"
 
 [[package]]
+name = "vr180-braw"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "vr180-core"
 version = "0.1.0"
 dependencies = [
@@ -3387,6 +3398,19 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "vqf-rs",
+]
+
+[[package]]
+name = "vr180-fisheye"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nalgebra",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "vr180-core",
 ]
 
 [[package]]
@@ -3402,7 +3426,9 @@ dependencies = [
  "rfd",
  "tracing",
  "tracing-subscriber",
+ "vr180-braw",
  "vr180-core",
+ "vr180-fisheye",
  "vr180-pipeline",
  "wgpu",
 ]
@@ -3423,7 +3449,9 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tracing",
+ "vr180-braw",
  "vr180-core",
+ "vr180-fisheye",
  "wgpu",
 ]
 

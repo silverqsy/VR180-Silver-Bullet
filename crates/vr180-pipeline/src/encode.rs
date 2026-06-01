@@ -87,6 +87,15 @@ pub struct H265Encoder {
     /// (`tag_apmp_vr180_sbs`) can modify the stream's codecpar
     /// side-data before the muxer writes the moov header.
     header_written: bool,
+    /// Target pixel format the scaler writes (one of YUV420P /
+    /// YUV420P10LE / P010LE depending on backend × bit_depth). Used
+    /// by `encode_frame` to allocate the destination frame.
+    enc_pix_fmt: ffmpeg::format::Pixel,
+    /// Lazy RGB48LE → enc_pix_fmt scaler. Initialised on first call
+    /// to `encode_frame_rgb48`. Independent of the primary RGB24
+    /// scaler so 10-bit and 8-bit input frames can both be handled
+    /// without rebuilding swscale every frame.
+    scaler_rgb48: Option<ffmpeg::software::scaling::Context>,
 }
 
 /// Which `encode_*` entry point this encoder was configured for.
@@ -111,12 +120,32 @@ impl H265Encoder {
     ///
     /// `backend` picks the codec. `VideoToolbox` is macOS-only and will
     /// return an `Err` on other platforms.
+    /// Legacy 8-bit Main-profile entry point. New callers should use
+    /// [`H265Encoder::create_with_bit_depth`] and pick 8 or 10.
     pub fn create(
         path: &Path,
         w: u32, h: u32,
         fps: f32,
         bitrate_kbps: u32,
         backend: EncoderBackend,
+    ) -> Result<Self> {
+        Self::create_with_bit_depth(path, w, h, fps, bitrate_kbps, backend, 8)
+    }
+
+    /// `bit_depth = 8` → Main profile, YUV420P input to the encoder.
+    /// `bit_depth = 10` → Main10 profile, YUV420P10LE (libx265) /
+    /// P010LE (VideoToolbox). Caller still passes packed RGB8 frames
+    /// to `encode_frame` — libswscale handles the 8 → 10 bit
+    /// expansion. True 10-bit shader output is a follow-up; for now
+    /// the codec gets a wider quantization grid (better gradation in
+    /// shadows / sky) at the cost of larger files.
+    pub fn create_with_bit_depth(
+        path: &Path,
+        w: u32, h: u32,
+        fps: f32,
+        bitrate_kbps: u32,
+        backend: EncoderBackend,
+        bit_depth: u8,
     ) -> Result<Self> {
         crate::decode::init(); // shared one-time ffmpeg_init
 
@@ -125,6 +154,11 @@ impl H265Encoder {
                 "hevc_videotoolbox is macOS-only. Use EncoderBackend::Libx265 \
                  on Windows / Linux (NVENC + Vulkan interop arrive in Phase 0.8.5+W).".into()
             ));
+        }
+        if bit_depth != 8 && bit_depth != 10 {
+            return Err(Error::Ffmpeg(format!(
+                "H265Encoder: bit_depth must be 8 or 10, got {bit_depth}"
+            )));
         }
 
         let mut octx = ffmpeg::format::output(&path)
@@ -149,12 +183,21 @@ impl H265Encoder {
         let (num, den) = approx_rational(fps);
         let time_base = ffmpeg::Rational(den, num);
 
+        // Pick encoder pixel format + corresponding swscale target by
+        // bit_depth. VT prefers P010LE for hardware-native 10-bit
+        // (semi-planar); libx265 wants YUV420P10LE (fully planar).
+        let enc_pix_fmt = match (bit_depth, backend) {
+            (10, EncoderBackend::VideoToolbox) => ffmpeg::format::Pixel::P010LE,
+            (10, EncoderBackend::Libx265)      => ffmpeg::format::Pixel::YUV420P10LE,
+            _                                  => ffmpeg::format::Pixel::YUV420P,
+        };
+
         let mut enc_ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
         unsafe {
             let raw = enc_ctx.as_mut_ptr();
             (*raw).width = w as i32;
             (*raw).height = h as i32;
-            (*raw).pix_fmt = ffmpeg::format::Pixel::YUV420P.into();
+            (*raw).pix_fmt = enc_pix_fmt.into();
             (*raw).time_base = time_base.into();
             (*raw).framerate = ffmpeg::Rational(num, den).into();
             (*raw).bit_rate = (bitrate_kbps as i64) * 1000;
@@ -181,10 +224,9 @@ impl H265Encoder {
                     // if VT init fails for any reason. We want a hard error so
                     // the user knows the HW path is broken.
                     set_opt(raw, "allow_sw",      "0")?;
-                    // profile=main: 8-bit, baseline of Apple decoders. main10
-                    // would require p010le input; deferred until we wire the
-                    // 10-bit RGB16Float→P010 swscale path.
-                    set_opt(raw, "profile",       "main")?;
+                    // profile = main / main10 depending on bit_depth.
+                    let prof = if bit_depth == 10 { "main10" } else { "main" };
+                    set_opt(raw, "profile", prof)?;
                     // power_efficient=0: don't let VT throttle to save battery
                     // when we're plugged in and want max throughput.
                     set_opt(raw, "power_efficient", "0")?;
@@ -211,11 +253,13 @@ impl H265Encoder {
             stream.set_time_base(time_base);
         }
 
-        // swscale: packed RGB24 → YUV420P
+        // swscale: packed RGB24 → encoder's pix_fmt (handles 8 → 10
+        // bit expansion internally for the P010LE / YUV420P10LE
+        // targets).
         let scaler = ffmpeg::software::scaling::Context::get(
             ffmpeg::format::Pixel::RGB24,
             w, h,
-            ffmpeg::format::Pixel::YUV420P,
+            enc_pix_fmt,
             w, h,
             ffmpeg::software::scaling::Flags::BICUBIC,
         ).map_err(|e| Error::Ffmpeg(format!("rgb→yuv scaler: {e}")))?;
@@ -225,6 +269,8 @@ impl H265Encoder {
             frame_count: 0, w, h, finished: false,
             encode_path: EncodePath::CpuInput,
             header_written: false,
+            enc_pix_fmt,
+            scaler_rgb48: None,
         })
     }
 
@@ -270,9 +316,10 @@ impl H265Encoder {
             }
         }
 
-        // Convert to YUV420P.
+        // Convert to the encoder's pixel format (YUV420P for 8-bit,
+        // YUV420P10LE / P010LE for 10-bit).
         let mut yuv_frame = ffmpeg::frame::Video::new(
-            ffmpeg::format::Pixel::YUV420P, self.w, self.h
+            self.enc_pix_fmt, self.w, self.h
         );
         self.scaler.run(&rgb_frame, &mut yuv_frame)
             .map_err(|e| Error::Ffmpeg(format!("scaler run: {e}")))?;
@@ -280,6 +327,63 @@ impl H265Encoder {
         self.frame_count += 1;
 
         // Send + drain.
+        self.encoder.send_frame(&yuv_frame)
+            .map_err(|e| Error::Ffmpeg(format!("send_frame: {e}")))?;
+        self.drain_packets()?;
+        Ok(())
+    }
+
+    /// Encode one packed RGB48LE frame (`w * h * 6` bytes, little-endian
+    /// 16-bit per channel, alpha already stripped). Only meaningful for
+    /// Main10 (bit_depth == 10) encoders — for 8-bit encoders we'd be
+    /// scaling down to 8-bit at the swscale step anyway.
+    ///
+    /// Uses a lazily-initialised second swscale context (RGB48LE →
+    /// `enc_pix_fmt`) since the primary scaler is set up for RGB24.
+    pub fn encode_frame_rgb48(&mut self, rgb48le: &[u8]) -> Result<()> {
+        self.ensure_header_written()?;
+        let want = (self.w as usize) * (self.h as usize) * 6;
+        if rgb48le.len() != want {
+            return Err(Error::Ffmpeg(format!(
+                "encode_frame_rgb48: expected {want} bytes, got {}", rgb48le.len()
+            )));
+        }
+        // Lazy second scaler for RGB48LE input.
+        if self.scaler_rgb48.is_none() {
+            self.scaler_rgb48 = Some(
+                ffmpeg::software::scaling::Context::get(
+                    ffmpeg::format::Pixel::RGB48LE,
+                    self.w, self.h,
+                    self.enc_pix_fmt,
+                    self.w, self.h,
+                    ffmpeg::software::scaling::Flags::BICUBIC,
+                ).map_err(|e| Error::Ffmpeg(format!("rgb48→yuv scaler: {e}")))?
+            );
+        }
+
+        let mut rgb_frame = ffmpeg::frame::Video::new(
+            ffmpeg::format::Pixel::RGB48LE, self.w, self.h
+        );
+        let stride = rgb_frame.stride(0);
+        {
+            let dst = rgb_frame.data_mut(0);
+            let row_bytes = (self.w as usize) * 6;
+            for y in 0..self.h as usize {
+                let dst_off = y * stride;
+                let src_off = y * row_bytes;
+                dst[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&rgb48le[src_off..src_off + row_bytes]);
+            }
+        }
+
+        let mut yuv_frame = ffmpeg::frame::Video::new(
+            self.enc_pix_fmt, self.w, self.h
+        );
+        self.scaler_rgb48.as_mut().unwrap().run(&rgb_frame, &mut yuv_frame)
+            .map_err(|e| Error::Ffmpeg(format!("rgb48 scaler run: {e}")))?;
+        yuv_frame.set_pts(Some(self.frame_count));
+        self.frame_count += 1;
+
         self.encoder.send_frame(&yuv_frame)
             .map_err(|e| Error::Ffmpeg(format!("send_frame: {e}")))?;
         self.drain_packets()?;
@@ -322,6 +426,28 @@ impl H265Encoder {
         &mut self,
         pb: &crate::interop_macos::EncodePixelBuffer,
     ) -> Result<()> {
+        self.encode_cv_pixel_buffer_raw(pb.pixel_buffer.as_raw() as *mut std::ffi::c_void)
+    }
+
+    /// Same as [`Self::encode_pixel_buffer`] but takes the 10-bit P010
+    /// IOSurface variant. The encoder must have been created with
+    /// `create_zero_copy_vt_p010`.
+    #[cfg(target_os = "macos")]
+    pub fn encode_pixel_buffer_p010(
+        &mut self,
+        pb: &crate::interop_macos::EncodePixelBufferP010,
+    ) -> Result<()> {
+        self.encode_cv_pixel_buffer_raw(pb.pixel_buffer.as_raw() as *mut std::ffi::c_void)
+    }
+
+    /// Internal: feed a raw CVPixelBufferRef (whether BGRA or P010) to
+    /// the zero-copy VT encoder. The encoder must have been created
+    /// with `create_zero_copy_vt` (or `_p010` variant).
+    #[cfg(target_os = "macos")]
+    fn encode_cv_pixel_buffer_raw(
+        &mut self,
+        pb_raw: *mut std::ffi::c_void,
+    ) -> Result<()> {
         if self.encode_path != EncodePath::ZeroCopyVt {
             return Err(Error::Ffmpeg(
                 "encode_pixel_buffer requires create_zero_copy_vt".into()
@@ -329,7 +455,6 @@ impl H265Encoder {
         }
         self.ensure_header_written()?;
         use ffmpeg::ffi::*;
-        // Allocate frame, set up hw-frame fields.
         unsafe {
             let frame = av_frame_alloc();
             if frame.is_null() {
@@ -340,9 +465,6 @@ impl H265Encoder {
             (*frame).height = self.h as i32;
             (*frame).pts    = self.frame_count;
 
-            // Reference the encoder's hw_frames_ctx (av_buffer_ref takes
-            // a +1 on the buffer). Required for VT to identify the frame
-            // as a hardware frame.
             let enc_raw = self.encoder.as_mut_ptr();
             let hwf_ref = (*enc_raw).hw_frames_ctx;
             if hwf_ref.is_null() {
@@ -353,17 +475,9 @@ impl H265Encoder {
             }
             (*frame).hw_frames_ctx = av_buffer_ref(hwf_ref);
 
-            // CFRetain the CVPixelBuffer for the frame's lifetime. The
-            // av_buffer_create call below installs a release callback
-            // that drops this retain when the AVFrame is unref'd.
-            let pb_raw = pb.pixel_buffer.as_raw();
             cf_retain(pb_raw as *const _);
-
-            // Bring-your-own-buffer: data[3] is the CVPixelBufferRef.
             (*frame).data[3] = pb_raw as *mut u8;
 
-            // buf[0] is an AVBufferRef whose free callback releases our
-            // +1 retain on the CVPixelBuffer.
             let buf = av_buffer_create(
                 std::ptr::null_mut(), 0,
                 Some(cv_pixel_buffer_release_callback),
@@ -380,7 +494,6 @@ impl H265Encoder {
 
             self.frame_count += 1;
 
-            // Send + drain.
             let ret = avcodec_send_frame(enc_raw, frame);
             if ret < 0 {
                 av_frame_free(&mut (frame as *mut _));
@@ -625,6 +738,31 @@ impl H265Encoder {
         fps: f32,
         bitrate_kbps: u32,
     ) -> Result<Self> {
+        Self::create_zero_copy_vt_with_format(path, w, h, fps, bitrate_kbps, 8)
+    }
+
+    /// P010-input zero-copy: same as `create_zero_copy_vt` but the
+    /// VT encoder is configured with `sw_format = P010LE` and
+    /// `profile = main10` so the IOSurface VT reads is a 10-bit
+    /// semi-planar YUV buffer (Y plane + UV plane). Pair with
+    /// [`crate::interop_macos::create_p010_encode_buffer`] +
+    /// `encode_pixel_buffer_p010`.
+    pub fn create_zero_copy_vt_p010(
+        path: &Path,
+        w: u32, h: u32,
+        fps: f32,
+        bitrate_kbps: u32,
+    ) -> Result<Self> {
+        Self::create_zero_copy_vt_with_format(path, w, h, fps, bitrate_kbps, 10)
+    }
+
+    fn create_zero_copy_vt_with_format(
+        path: &Path,
+        w: u32, h: u32,
+        fps: f32,
+        bitrate_kbps: u32,
+        bit_depth: u8,
+    ) -> Result<Self> {
         crate::decode::init();
         use ffmpeg::ffi::*;
 
@@ -674,7 +812,11 @@ impl H265Encoder {
             }
             let frames_ctx = (*f).data as *mut AVHWFramesContext;
             (*frames_ctx).format    = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
-            (*frames_ctx).sw_format = AVPixelFormat::AV_PIX_FMT_BGRA;
+            (*frames_ctx).sw_format = if bit_depth == 10 {
+                AVPixelFormat::AV_PIX_FMT_P010LE
+            } else {
+                AVPixelFormat::AV_PIX_FMT_BGRA
+            };
             (*frames_ctx).width     = w as i32;
             (*frames_ctx).height    = h as i32;
             // initial_pool_size=0 → no pre-allocation; we feed our own
@@ -709,10 +851,23 @@ impl H265Encoder {
             (*raw).hw_device_ctx = hw_device;
             (*raw).hw_frames_ctx = hw_frames;
 
+            // Colorimetry tags — these flow into the HEVC bitstream's
+            // VUI (video usability info) and the mp4's colr atom so
+            // players know how to inverse-transform our YCbCr back to
+            // RGB. Critical on the P010 zero-copy path: we hand VT
+            // pre-computed video-range Rec.709 YCbCr from our shader,
+            // so the output MUST be tagged that way or players will
+            // guess wrong (full-range interpretation → lifted blacks;
+            // Rec.601 inverse on Rec.709 data → off saturation).
+            (*raw).color_range     = AVColorRange::AVCOL_RANGE_MPEG;       // video range
+            (*raw).color_primaries = AVColorPrimaries::AVCOL_PRI_BT709;
+            (*raw).color_trc       = AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+            (*raw).colorspace      = AVColorSpace::AVCOL_SPC_BT709;
+
             // Same VT private-data tuning as the CPU-input path.
             set_opt(raw, "realtime",        "0")?;
             set_opt(raw, "allow_sw",        "0")?;
-            set_opt(raw, "profile",         "main")?;
+            set_opt(raw, "profile", if bit_depth == 10 { "main10" } else { "main" })?;
             set_opt(raw, "power_efficient", "0")?;
         }
 
@@ -742,6 +897,12 @@ impl H265Encoder {
             frame_count: 0, w, h, finished: false,
             encode_path: EncodePath::ZeroCopyVt,
             header_written: false,
+            // Zero-copy VT path doesn't use the scaler — the encoder's
+            // pix_fmt is AV_PIX_FMT_VIDEOTOOLBOX, the swscale field is
+            // a 1×1 placeholder. Set this to YUV420P so any incidental
+            // use of `enc_pix_fmt` does something sensible.
+            enc_pix_fmt: ffmpeg::format::Pixel::YUV420P,
+            scaler_rgb48: None,
         })
     }
 }

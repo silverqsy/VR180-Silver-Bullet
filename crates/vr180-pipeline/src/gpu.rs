@@ -13,7 +13,45 @@
 //! per-scanline RS warp, etc. live here too.
 
 use crate::{Error, Result};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Instant;
+
+/// Per-slot cache of the resources `project_fisheye_to_equirect_*_texture`
+/// needs every frame. Keyed by an integer slot id supplied by the caller
+/// (e.g., 0 = left eye, 1 = right eye). Reused across frames so the GUI
+/// preview path doesn't pay `create_texture` + `create_buffer` cost on
+/// every frame — those are the bulk of the per-frame `project` time at
+/// 50 fps, where the ~20 ms budget is tight.
+///
+/// Output textures are NOT cached here because the caller takes
+/// ownership (the UI thread holds them via `Arc<wgpu::Texture>` until
+/// it's done rendering). Only the inputs and the uniform/storage
+/// buffers are recycled.
+#[derive(Debug)]
+struct ProjFisheyeRsCacheSlot {
+    src_w: u32,
+    src_h: u32,
+    src_tex: wgpu::Texture,
+    src_view: wgpu::TextureView,
+    r_uniform: wgpu::Buffer,
+    cal_uniform: wgpu::Buffer,
+    rs_buf: wgpu::Buffer,
+    /// Capacity in bytes — `rs_buf` is sized for `src_h * 12 * 4` and
+    /// grown if a larger frame ever comes through.
+    rs_buf_capacity: u64,
+}
+
+/// Non-RS variant — same idea but no `rs_buf`.
+#[derive(Debug)]
+struct ProjFisheyeCacheSlot {
+    src_w: u32,
+    src_h: u32,
+    src_tex: wgpu::Texture,
+    src_view: wgpu::TextureView,
+    r_uniform: wgpu::Buffer,
+    cal_uniform: wgpu::Buffer,
+}
 
 /// One wgpu device + queue + default adapter + cached pipelines.
 ///
@@ -29,6 +67,24 @@ pub struct Device {
     pub device: std::sync::Arc<wgpu::Device>,
     pub queue: std::sync::Arc<wgpu::Queue>,
     eac_to_equirect: EacToEquirectPipeline,
+    fisheye_to_hequirect: FisheyeToHequirectPipeline,
+    fisheye_to_hequirect_16: FisheyeToHequirectPipeline,
+    /// RS-aware variant of `fisheye_to_hequirect`. Used by the GUI
+    /// preview when DJI OSV per-row matrices are available, to apply
+    /// per-scanline correction (matches DJI Studio's per-slab approach).
+    fisheye_to_hequirect_rs: FisheyeToHequirectRsPipeline,
+    /// Zero-copy fisheye projection that reads P010 IOSurface planes
+    /// (Y at full res, UV at half res) directly and does YCbCr→RGB
+    /// inline. Used on the OSV export path on macOS to skip the
+    /// FFmpeg P010LE → RGBA64LE swscale + CPU→GPU upload (~840 MB/frame
+    /// at native OSV res). Output format is Rgba16Unorm.
+    fisheye_p010_to_hequirect_16: FisheyeP010ToHequirectPipeline,
+    /// RS-aware sibling of `fisheye_p010_to_hequirect_16`. Takes an
+    /// additional per-scanline rotation-matrix storage buffer and
+    /// fuses per-row rolling-shutter correction into the projection.
+    /// Cancels the jelly/shear within each frame that per-frame
+    /// stabilization alone can't fix (DJI Osmo sensor ~19 ms readout).
+    fisheye_p010_to_hequirect_16_rs: FisheyeP010ToHequirectRsPipeline,
     lut3d: Lut3DPipeline,
     nv12_to_eac: Nv12ToEacPipeline,
     cdl: PerPixelPipeline,
@@ -38,11 +94,75 @@ pub struct Device {
     mid_detail_combine: MidDetailCombinePipeline,
     downsample_4x: Downsample4xPipeline,
     compose_sbs: ComposeSbsPipeline,
+    compose_sbs_p010_y:  P010ComposePipeline,
+    compose_sbs_p010_uv: P010ComposePipeline,
     bilinear_sampler: wgpu::Sampler,
+
+    /// Per-slot recycling for `project_fisheye_to_equirect_rs_texture`.
+    /// Slot key is supplied by the caller (0 = left eye, 1 = right eye
+    /// by convention) so we keep distinct source textures + uniform
+    /// buffers per eye and avoid stomping inflight writes. Cost saved
+    /// per frame at 50 fps with 2 eyes ≈ 4 large GPU allocations.
+    proj_fisheye_rs_cache: Mutex<HashMap<u32, ProjFisheyeRsCacheSlot>>,
+    /// Per-slot recycling for the non-RS variant
+    /// `project_fisheye_to_equirect_texture`.
+    proj_fisheye_cache: Mutex<HashMap<u32, ProjFisheyeCacheSlot>>,
+}
+
+#[derive(Debug)]
+struct P010ComposePipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
 }
 
 #[derive(Debug)]
 struct EacToEquirectPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+/// Fisheye → half-equirect projection (one eye per dispatch). Used for
+/// DJI OSV, SBS fisheye `.mp4`, and Blackmagic BRAW input families.
+/// Same general shape as `EacToEquirectPipeline` but the source is a
+/// raw fisheye image plus a Kannala-Brandt calibration uniform.
+#[derive(Debug)]
+struct FisheyeToHequirectPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+/// RS-aware sibling of `FisheyeToHequirectPipeline` for the RGBA
+/// preview path. Adds a 6th binding for the per-scanline R-matrix
+/// storage buffer used by `fisheye_to_hequirect_rs.wgsl`. Fuses
+/// per-row rolling-shutter / per-slab stabilization into the projection
+/// for OSV live preview.
+#[derive(Debug)]
+struct FisheyeToHequirectRsPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+/// Zero-copy P010 → half-equirect projection (one eye per dispatch).
+/// Same shader math as `FisheyeToHequirectPipeline` (16-bit output)
+/// but the input is two separate textures — a full-res Y plane
+/// (R16Unorm) and a half-res UV plane (Rg16Unorm) — and YCbCr→RGB
+/// BT.709 limited-range expansion is baked into the per-pixel kernel.
+/// Used on macOS for OSV export to skip the swscale + CPU bounce.
+#[derive(Debug)]
+struct FisheyeP010ToHequirectPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+/// RS-aware sibling of `FisheyeP010ToHequirectPipeline`. Adds a 7th
+/// binding for the per-scanline R-matrix storage buffer used by the
+/// rolling-shutter correction in `fisheye_p010_to_hequirect_rs.wgsl`.
+#[derive(Debug)]
+struct FisheyeP010ToHequirectRsPipeline {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -140,6 +260,11 @@ impl Device {
         queue: std::sync::Arc<wgpu::Queue>,
     ) -> Result<Self> {
         let eac_to_equirect = EacToEquirectPipeline::create(&device);
+        let fisheye_to_hequirect = FisheyeToHequirectPipeline::create(&device);
+        let fisheye_to_hequirect_16 = FisheyeToHequirectPipeline::create_16bit(&device);
+        let fisheye_to_hequirect_rs = FisheyeToHequirectRsPipeline::create(&device);
+        let fisheye_p010_to_hequirect_16 = FisheyeP010ToHequirectPipeline::create(&device);
+        let fisheye_p010_to_hequirect_16_rs = FisheyeP010ToHequirectRsPipeline::create(&device);
         let lut3d = Lut3DPipeline::create(&device);
         let nv12_to_eac = Nv12ToEacPipeline::create(&device);
         let cdl = PerPixelPipeline::create(
@@ -155,6 +280,12 @@ impl Device {
         let mid_detail_combine = MidDetailCombinePipeline::create(&device);
         let downsample_4x = Downsample4xPipeline::create(&device);
         let compose_sbs = ComposeSbsPipeline::create(&device);
+        let compose_sbs_p010_y  = P010ComposePipeline::create(
+            &device, "p010_y",  COMPOSE_SBS_P010_Y_WGSL,
+            wgpu::TextureFormat::R16Unorm);
+        let compose_sbs_p010_uv = P010ComposePipeline::create(
+            &device, "p010_uv", COMPOSE_SBS_P010_UV_WGSL,
+            wgpu::TextureFormat::Rg16Unorm);
         let bilinear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("bilinear"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -167,11 +298,19 @@ impl Device {
         });
         Ok(Self {
             instance, adapter, device, queue,
-            eac_to_equirect, lut3d, nv12_to_eac,
+            eac_to_equirect,
+            fisheye_to_hequirect, fisheye_to_hequirect_16,
+            fisheye_to_hequirect_rs,
+            fisheye_p010_to_hequirect_16,
+            fisheye_p010_to_hequirect_16_rs,
+            lut3d, nv12_to_eac,
             cdl, color_grade,
             gaussian_blur, sharpen_combine, mid_detail_combine, downsample_4x,
             compose_sbs,
+            compose_sbs_p010_y, compose_sbs_p010_uv,
             bilinear_sampler,
+            proj_fisheye_rs_cache: Mutex::new(HashMap::new()),
+            proj_fisheye_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -383,6 +522,160 @@ fn rgb_to_rgba(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
     out
 }
 
+impl Device {
+    /// Project one raw fisheye image to a half-equirect (`out_w ×
+    /// out_h × RGB8`) using the Kannala-Brandt model.
+    ///
+    /// `src_rgba` is `src_w × src_h × 4` packed RGBA8 (i.e. what the
+    /// decoder produces — for BGRA inputs, swizzle on the caller side).
+    /// `calib` defines the lens (fx/fy/cx/cy + k1..k4 + image-circle
+    /// radius). `rotation` is the per-frame stabilization rotation
+    /// (use [`EquirectRotation::IDENTITY`] when stabilization is off).
+    ///
+    /// Returns packed RGB8 ready for ffmpeg-side encoding. Same shape
+    /// as `project_cross_to_equirect`.
+    pub fn project_fisheye_to_equirect(
+        &self,
+        src_rgba: &[u8],
+        src_w: u32,
+        src_h: u32,
+        out_w: u32,
+        out_h: u32,
+        calib: FisheyeCalib,
+        rotation: EquirectRotation,
+    ) -> Result<Vec<u8>> {
+        let t_total = Instant::now();
+        debug_assert_eq!(src_rgba.len(), (src_w * src_h * 4) as usize);
+
+        // 1. Upload input texture.
+        let input_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fisheye_input_rgba"),
+            size: wgpu::Extent3d { width: src_w, height: src_h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &input_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            src_rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(src_w * 4),
+                rows_per_image: Some(src_h),
+            },
+            wgpu::Extent3d { width: src_w, height: src_h, depth_or_array_layers: 1 },
+        );
+
+        // 2. Output storage texture.
+        let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fisheye_equirect_rgba"),
+            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        // 3. Bind group.
+        let input_view = input_tex.create_view(&Default::default());
+        let output_view = output_tex.create_view(&Default::default());
+        let r_uniform = self.write_uniform("fisheye_R",
+            &EquirectUniforms::from_mat3(rotation.0));
+        let cal_uniform = self.write_uniform("fisheye_calib",
+            &FisheyeCalibUniforms::from_public(calib));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fisheye_to_hequirect_bg"),
+            layout: &self.fisheye_to_hequirect.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&input_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_hequirect.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&output_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
+            ],
+        });
+
+        // 4. Encode + dispatch.
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fisheye_to_hequirect_enc"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fisheye_to_hequirect_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fisheye_to_hequirect.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let wg_x = (out_w + 7) / 8;
+            let wg_y = (out_h + 7) / 8;
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+
+        // 5. Copy to staging, map, repack to RGB8. wgpu requires 256-
+        //    aligned row stride for buffer copies.
+        let bpp = 4u32;
+        let unpadded_row_bytes = out_w * bpp;
+        let padded_row_bytes = (unpadded_row_bytes + 255) & !255;
+        let buf_size = (padded_row_bytes * out_h) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fisheye_equirect_staging"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &output_tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(out_h),
+                },
+            },
+            wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
+            .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
+        let mapped = slice.get_mapped_range();
+
+        let mut out_rgb = Vec::with_capacity((out_w * out_h * 3) as usize);
+        for y in 0..out_h {
+            let row_off = (y * padded_row_bytes) as usize;
+            for x in 0..out_w {
+                let px_off = row_off + (x * 4) as usize;
+                out_rgb.extend_from_slice(&mapped[px_off..px_off + 3]);
+            }
+        }
+        drop(mapped);
+        staging.unmap();
+
+        tracing::debug!(elapsed=?t_total.elapsed(), "GPU project_fisheye_to_equirect total");
+        Ok(out_rgb)
+    }
+}
+
 impl EacToEquirectPipeline {
     fn create(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -472,6 +765,451 @@ impl EacToEquirectPipeline {
     }
 }
 
+impl FisheyeToHequirectPipeline {
+    fn create(device: &wgpu::Device) -> Self {
+        Self::create_for_format(device, wgpu::TextureFormat::Rgba8Unorm, "8bit")
+    }
+
+    /// 16-bit-per-channel output variant for end-to-end 10-bit export.
+    /// Same shader, same bindings, just `rgba16unorm` swapped in for
+    /// the storage-texture format via runtime WGSL string replace.
+    fn create_16bit(device: &wgpu::Device) -> Self {
+        Self::create_for_format(device, wgpu::TextureFormat::Rgba16Unorm, "16bit")
+    }
+
+    fn create_for_format(
+        device: &wgpu::Device,
+        out_format: wgpu::TextureFormat,
+        label_suffix: &str,
+    ) -> Self {
+        // Templated shader: the source declares `rgba8unorm, write` for
+        // the storage texture; for the 16-bit variant we swap that to
+        // `rgba16unorm, write` before compiling. Cheaper than duplicating
+        // the whole shader file and the rest of the kernel is identical.
+        let wgsl = if out_format == wgpu::TextureFormat::Rgba16Unorm {
+            FISHEYE_TO_HEQUIRECT_WGSL.replace("rgba8unorm, write", "rgba16unorm, write")
+        } else {
+            FISHEYE_TO_HEQUIRECT_WGSL.to_string()
+        };
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("fisheye_to_hequirect_{label_suffix}")),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&format!("fisheye_to_hequirect_bgl_{label_suffix}")),
+            entries: &[
+                // (0) input fisheye texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // (1) bilinear sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // (2) output storage texture (half-equirect)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: out_format,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                // (3) per-frame rotation R (same EquirectUniforms shape)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<EquirectUniforms>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+                // (4) per-eye KB calibration uniforms
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<FisheyeCalibUniforms>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("fisheye_to_hequirect_pll_{label_suffix}")),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(&format!("fisheye_to_hequirect_pipeline_{label_suffix}")),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some(&format!("fisheye_sampler_{label_suffix}")),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        Self { pipeline, bind_group_layout, sampler }
+    }
+}
+
+impl FisheyeP010ToHequirectPipeline {
+    /// Build the P010 zero-copy fisheye projection pipeline. Six
+    /// bindings: Y tex, UV tex, sampler, output storage tex,
+    /// per-frame rotation, per-eye KB calib.
+    fn create(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fisheye_p010_to_hequirect"),
+            source: wgpu::ShaderSource::Wgsl(FISHEYE_P010_TO_HEQUIRECT_WGSL.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fisheye_p010_to_hequirect_bgl"),
+            entries: &[
+                // (0) Y plane (R16Unorm)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // (1) UV plane (Rg16Unorm, half-res)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // (2) bilinear sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // (3) output storage (Rgba16Unorm)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                // (4) per-frame rotation R
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<EquirectUniforms>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+                // (5) per-eye KB calibration
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<FisheyeCalibUniforms>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fisheye_p010_to_hequirect_pll"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fisheye_p010_to_hequirect_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("fisheye_p010_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        Self { pipeline, bind_group_layout, sampler }
+    }
+}
+
+impl FisheyeToHequirectRsPipeline {
+    /// Build the RS-aware RGBA fisheye projection pipeline. Six bindings:
+    /// input fisheye tex, sampler, output storage, R uniform, calib
+    /// uniform, per-row R storage buffer.
+    fn create(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fisheye_to_hequirect_rs"),
+            source: wgpu::ShaderSource::Wgsl(FISHEYE_TO_HEQUIRECT_RS_WGSL.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fisheye_to_hequirect_rs_bgl"),
+            entries: &[
+                // (0) input fisheye texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // (1) bilinear sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // (2) output storage (Rgba8Unorm)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                // (3) per-frame rotation R
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<EquirectUniforms>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+                // (4) per-eye KB calibration
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<FisheyeCalibUniforms>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+                // (5) per-row RS R storage buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fisheye_to_hequirect_rs_pll"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fisheye_to_hequirect_rs_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("fisheye_rs_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        Self { pipeline, bind_group_layout, sampler }
+    }
+}
+
+impl FisheyeP010ToHequirectRsPipeline {
+    /// Build the RS-aware P010 fisheye projection pipeline. Seven
+    /// bindings: Y tex, UV tex, sampler, output, R uniform, calib
+    /// uniform, and per-row R storage buffer.
+    fn create(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fisheye_p010_to_hequirect_rs"),
+            source: wgpu::ShaderSource::Wgsl(FISHEYE_P010_TO_HEQUIRECT_RS_WGSL.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fisheye_p010_to_hequirect_rs_bgl"),
+            entries: &[
+                // (0) Y plane (R16Unorm)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // (1) UV plane (Rg16Unorm, half-res)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // (2) bilinear sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // (3) output storage (Rgba16Unorm)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                // (4) per-frame rotation R
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<EquirectUniforms>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+                // (5) per-eye KB calibration
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<FisheyeCalibUniforms>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+                // (6) per-row RS R storage buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fisheye_p010_to_hequirect_rs_pll"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fisheye_p010_to_hequirect_rs_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("fisheye_p010_rs_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        Self { pipeline, bind_group_layout, sampler }
+    }
+}
+
 /// WGSL kernel: per output pixel in the half-equirect, compute a 3D
 /// direction, dispatch to one of the 5 EAC faces, sample from the
 /// input cross with bilinear filtering. Pixels outside the cross's
@@ -479,6 +1217,34 @@ impl EacToEquirectPipeline {
 ///
 /// Ported from `FrameExtractor.build_cross_remap` in `vr180_gui.py`.
 const EAC_TO_EQUIRECT_WGSL: &str = include_str!("shaders/eac_to_equirect.wgsl");
+
+/// WGSL kernel: Kannala-Brandt fisheye → half-equirect for the
+/// non-GoPro input families (DJI OSV, SBS fisheye, Blackmagic BRAW).
+/// Ported from the Metal kernel at `vr180_gui.py:1350-1480`. CPU
+/// reference for testing lives in
+/// `crates/vr180-fisheye/src/projection.rs`.
+const FISHEYE_TO_HEQUIRECT_WGSL: &str =
+    include_str!("shaders/fisheye_to_hequirect.wgsl");
+
+/// WGSL kernel: P010 (10-bit YCbCr planes) → half-equirect, used when
+/// the source IOSurface is directly available (macOS OSV export). Does
+/// YCbCr→RGB Rec.709 expansion in the same dispatch as the KB projection,
+/// avoiding the FFmpeg P010LE→RGBA64LE swscale and the CPU→GPU upload.
+const FISHEYE_P010_TO_HEQUIRECT_WGSL: &str =
+    include_str!("shaders/fisheye_p010_to_hequirect.wgsl");
+
+/// WGSL kernel: P010 → half-equirect with fused stab + per-row rolling
+/// shutter correction. Same math as `fisheye_p010_to_hequirect.wgsl`
+/// plus a per-scanline re-projection step that cancels intra-frame
+/// shear from the sensor's row-by-row readout.
+const FISHEYE_P010_TO_HEQUIRECT_RS_WGSL: &str =
+    include_str!("shaders/fisheye_p010_to_hequirect_rs.wgsl");
+
+/// WGSL kernel: RGBA fisheye → half-equirect with fused stab + per-row
+/// rolling-shutter correction. Used by the GUI preview when DJI OSV
+/// per-row matrices are available.
+const FISHEYE_TO_HEQUIRECT_RS_WGSL: &str =
+    include_str!("shaders/fisheye_to_hequirect_rs.wgsl");
 
 /// std140 layout for the EAC→equirect shader's R matrix uniform.
 /// 12-scalar layout (3 rows × 3 floats + 1 pad per row) — used in
@@ -601,6 +1367,137 @@ impl EquirectRsParams {
     };
 }
 
+// ── Fisheye → half-equirect uniforms ───────────────────────────────
+
+/// std140 layout for the fisheye→equirect shader's calibration uniform.
+/// 16 scalars (4 × vec4 = 64 bytes). Matches the WGSL
+/// `FisheyeCalibUniforms` struct field-by-field. See
+/// `fisheye_to_hequirect.wgsl` for the per-pixel use of each value.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct FisheyeCalibUniforms {
+    fx: f32, fy: f32, cx: f32, cy: f32,
+    k1: f32, k2: f32, k3: f32, k4: f32,
+    theta_trans: f32, theta_max: f32, r_max: f32, _pad0: f32,
+    src_w: f32, src_h: f32, output_hfov_rad: f32, _pad2: f32,
+}
+
+/// Public per-eye Kannala-Brandt fisheye calibration. Caller builds
+/// one of these (typically by composing a `vr180_fisheye::FisheyeCalibration`
+/// with the working frame size) and hands it to
+/// [`Device::project_fisheye_to_equirect`].
+#[derive(Copy, Clone, Debug)]
+pub struct FisheyeCalib {
+    /// Focal length in pixels (x). Comes either from the camera
+    /// preset / Gyroflow JSON, or recomputed at runtime from
+    /// `FisheyeCalibration::fx_from_fov`.
+    pub fx: f32,
+    /// Focal length in pixels (y). Equal to `fx` for square sensors;
+    /// differs for anamorphic.
+    pub fy: f32,
+    /// Principal point in pixels (image origin top-left).
+    pub cx: f32,
+    pub cy: f32,
+    /// KB-4 distortion coefficients (Gyroflow / OpenCV convention).
+    pub k: [f32; 4],
+    /// KB → cubic-Hermite extension boundary (radians).
+    pub theta_trans: f32,
+    /// Cubic extension upper bound (radians).
+    pub theta_max: f32,
+    /// Image-circle radius in pixels — caller computes from
+    /// cx/cy + src_w/src_h. Pins the cubic at the boundary.
+    pub r_max: f32,
+    /// Working fisheye texture width in pixels.
+    pub src_w: f32,
+    /// Working fisheye texture height in pixels.
+    pub src_h: f32,
+    /// Output half-equirect HORIZONTAL half-FOV in radians. The shader
+    /// derives `lon = (u - 0.5) * 2 * output_hfov_rad`, so:
+    ///   π/2 (90°)  → 180° total HFOV (standard VR180)
+    ///   1.812      → 207.68° total HFOV (full DJI Osmo 360 lens FOV)
+    /// Defaults to π/2 for backward compat; OSV builds set this to
+    /// lens-FOV/2 so the export captures every pixel the lens saw.
+    pub output_hfov_rad: f32,
+}
+
+impl FisheyeCalib {
+    /// Convenience constructor with sensible defaults for the cubic
+    /// extension boundaries (`theta_trans = 80°`, `theta_max = 110°`)
+    /// and standard 180°-HFOV equirect output.
+    pub fn new(
+        fx: f32, fy: f32, cx: f32, cy: f32, k: [f32; 4],
+        src_w: f32, src_h: f32, r_max: f32,
+    ) -> Self {
+        Self {
+            fx, fy, cx, cy, k,
+            theta_trans: 80.0_f32.to_radians(),
+            theta_max:   110.0_f32.to_radians(),
+            r_max, src_w, src_h,
+            output_hfov_rad: std::f32::consts::FRAC_PI_2,
+        }
+    }
+
+    /// Constructor that disables the cubic Hermite extension and uses
+    /// **pure KB across the full FOV**, matching the Python MLX kernel
+    /// at `vr180_gui.py:1386-1395`. The `theta_max` upper clamp is set
+    /// from `max_r / fx` (Python's "loose upper clamp" at
+    /// `vr180_gui.py:1846-1847`).
+    ///
+    /// Use this for OSV (and any source whose KB coefficients stay
+    /// monotonic across the entire FOV — the Hermite extension only
+    /// exists to keep things sane when the polynomial diverges).
+    ///
+    /// `theta_trans` is set to a value just past `theta_max` so the
+    /// shader's `theta ≤ theta_trans` test always succeeds for any
+    /// post-clamp θ, guaranteeing KB is used.
+    pub fn new_pure_kb(
+        fx: f32, fy: f32, cx: f32, cy: f32, k: [f32; 4],
+        src_w: f32, src_h: f32,
+    ) -> Self {
+        // Python: max_r = max(cx, cy, w-cx, h-cy) — largest distance
+        // from the principal point to any image edge.
+        let max_r = cx.max(cy).max(src_w - cx).max(src_h - cy).max(1.0);
+        let fx_safe = fx.max(1e-3);
+        let theta_max = max_r / fx_safe; // radians; Python's loose upper clamp.
+        // Bump theta_trans above theta_max so the shader's
+        // `theta ≤ theta_trans` test always picks KB after clamping.
+        let theta_trans = theta_max + 0.1;
+        Self {
+            fx, fy, cx, cy, k,
+            theta_trans,
+            theta_max,
+            r_max: max_r,
+            src_w, src_h,
+            output_hfov_rad: std::f32::consts::FRAC_PI_2,
+        }
+    }
+
+    /// Set the output equirect's horizontal half-FOV. Use this when
+    /// you want the output to cover more than 180° — e.g. for the
+    /// OSV's 207.68° lens, pass `(207.68_f32 / 2.0).to_radians()`.
+    /// Returns `self` so it can chain after `new_pure_kb`.
+    pub fn with_output_hfov(mut self, hfov_rad: f32) -> Self {
+        self.output_hfov_rad = hfov_rad;
+        self
+    }
+}
+
+impl FisheyeCalibUniforms {
+    fn from_public(c: FisheyeCalib) -> Self {
+        Self {
+            fx: c.fx, fy: c.fy, cx: c.cx, cy: c.cy,
+            k1: c.k[0], k2: c.k[1], k3: c.k[2], k4: c.k[3],
+            theta_trans: c.theta_trans,
+            theta_max:   c.theta_max,
+            r_max:       c.r_max,
+            _pad0: 0.0,
+            src_w: c.src_w, src_h: c.src_h,
+            output_hfov_rad: c.output_hfov_rad,
+            _pad2: 0.0,
+        }
+    }
+}
+
 const LUT3D_WGSL: &str = include_str!("shaders/lut3d.wgsl");
 const NV12_TO_EAC_WGSL: &str = include_str!("shaders/nv12_to_eac_cross.wgsl");
 const CDL_WGSL: &str = include_str!("shaders/cdl.wgsl");
@@ -610,6 +1507,8 @@ const SHARPEN_COMBINE_WGSL: &str = include_str!("shaders/sharpen_combine.wgsl");
 const MID_DETAIL_COMBINE_WGSL: &str = include_str!("shaders/mid_detail_combine.wgsl");
 const DOWNSAMPLE_4X_WGSL: &str = include_str!("shaders/downsample_4x.wgsl");
 const COMPOSE_SBS_BGRA_WGSL: &str = include_str!("shaders/compose_sbs_bgra.wgsl");
+const COMPOSE_SBS_P010_Y_WGSL:  &str = include_str!("shaders/compose_sbs_p010_y.wgsl");
+const COMPOSE_SBS_P010_UV_WGSL: &str = include_str!("shaders/compose_sbs_p010_uv.wgsl");
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -2334,6 +3233,785 @@ impl Device {
         pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
     }
 
+    /// Record a fisheye→half-equirect compute pass into an existing
+    /// encoder. Counterpart to `record_equirect_project` for the
+    /// fisheye source family. `fisheye_tex` is an Rgba8Unorm texture
+    /// holding one raw fisheye eye; `dst` is the output equirect
+    /// storage texture.
+    fn record_fisheye_project(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        fisheye_tex: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        calib: FisheyeCalib,
+    ) {
+        let src_v = fisheye_tex.create_view(&Default::default());
+        let dst_v = dst.create_view(&Default::default());
+        let r_uniform = self.write_uniform("fisheye_R_record",
+            &EquirectUniforms::from_mat3(rotation.0));
+        let cal_uniform = self.write_uniform("fisheye_calib_record",
+            &FisheyeCalibUniforms::from_public(calib));
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fisheye_project_bg"),
+            layout: &self.fisheye_to_hequirect.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_hequirect.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_v) },
+                wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("fisheye_project_pass"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.fisheye_to_hequirect.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+    }
+
+    /// CPU-input fisheye → equirect with texture output (no readback).
+    /// Same shape as `project_cross_to_equirect_texture` but for the
+    /// raw-fisheye source family.
+    pub fn project_fisheye_to_equirect_texture(
+        &self,
+        src_rgba: &[u8],
+        src_w: u32, src_h: u32,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        calib: FisheyeCalib,
+        slot: u32,
+    ) -> Result<wgpu::Texture> {
+        let output_tex = make_rw_texture(&self.device, "fisheye_eq_tex_out", out_w, out_h,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC);
+        let dst_view = output_tex.create_view(&Default::default());
+
+        let mut cache = self.proj_fisheye_cache.lock().unwrap();
+        let needs_init = match cache.get(&slot) {
+            Some(s) => s.src_w != src_w || s.src_h != src_h,
+            None => true,
+        };
+        if needs_init {
+            let src_tex = make_rw_texture(&self.device, "fisheye_src", src_w, src_h,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+            let src_view = src_tex.create_view(&Default::default());
+            let r_uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fisheye_R_cached"),
+                size: std::mem::size_of::<EquirectUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let cal_uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fisheye_calib_cached"),
+                size: std::mem::size_of::<FisheyeCalibUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            cache.insert(slot, ProjFisheyeCacheSlot {
+                src_w, src_h, src_tex, src_view, r_uniform, cal_uniform,
+            });
+        }
+        let s = cache.get(&slot).unwrap();
+
+        self.upload_rgba(&s.src_tex, src_rgba, src_w, src_h);
+        self.queue.write_buffer(&s.r_uniform, 0,
+            bytemuck::bytes_of(&EquirectUniforms::from_mat3(rotation.0)));
+        self.queue.write_buffer(&s.cal_uniform, 0,
+            bytemuck::bytes_of(&FisheyeCalibUniforms::from_public(calib)));
+
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fisheye_project_bg"),
+            layout: &self.fisheye_to_hequirect.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&s.src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_hequirect.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: s.r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: s.cal_uniform.as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fisheye_project_tex_enc"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fisheye_project_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fisheye_to_hequirect.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// RS-aware variant of [`Self::project_fisheye_to_equirect_texture`].
+    /// Takes an additional per-scanline rotation buffer (`rs_rows_f32`
+    /// = 12 f32 per row × `src_h` rows) and applies per-row correction
+    /// fused with the per-frame stab. Used by the GUI preview path when
+    /// DJI OSV per-row matrices are available so we get DJI Studio's
+    /// per-slab stab quality without leaving the live pipeline.
+    pub fn project_fisheye_to_equirect_rs_texture(
+        &self,
+        src_rgba: &[u8],
+        src_w: u32, src_h: u32,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        calib: FisheyeCalib,
+        rs_rows_f32: &[f32],
+        slot: u32,
+    ) -> Result<wgpu::Texture> {
+        debug_assert_eq!(rs_rows_f32.len(), (src_h as usize) * 12);
+
+        // Reused output texture is still owned by the caller (UI thread
+        // may render the previous frame for a few ms), so allocate
+        // fresh. Everything else lives in the slot cache and is updated
+        // via write_buffer/write_texture instead of recreated.
+        let output_tex = make_rw_texture(&self.device, "fisheye_eq_tex_out_rs", out_w, out_h,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC);
+        let dst_view = output_tex.create_view(&Default::default());
+
+        let mut cache = self.proj_fisheye_rs_cache.lock().unwrap();
+        // Rebuild slot if dims changed (eye_w/eye_h doesn't matter — it
+        // only affects dispatch size, not cached resources).
+        let needs_init = match cache.get(&slot) {
+            Some(s) => s.src_w != src_w || s.src_h != src_h,
+            None => true,
+        };
+        if needs_init {
+            let src_tex = make_rw_texture(&self.device,
+                "fisheye_src_rs", src_w, src_h,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+            let src_view = src_tex.create_view(&Default::default());
+            let r_uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fisheye_R_rs"),
+                size: std::mem::size_of::<EquirectUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let cal_uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fisheye_calib_rs"),
+                size: std::mem::size_of::<FisheyeCalibUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let rs_buf_capacity = (rs_rows_f32.len() * std::mem::size_of::<f32>()) as u64;
+            let rs_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fisheye_rs_rows"),
+                size: rs_buf_capacity,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            cache.insert(slot, ProjFisheyeRsCacheSlot {
+                src_w, src_h,
+                src_tex, src_view,
+                r_uniform, cal_uniform,
+                rs_buf, rs_buf_capacity,
+            });
+        }
+        // Grow rs_buf if a larger frame ever arrives without a dim change
+        // (unusual — but src_h could shift via settings).
+        let needed_rs = (rs_rows_f32.len() * std::mem::size_of::<f32>()) as u64;
+        if cache.get(&slot).unwrap().rs_buf_capacity < needed_rs {
+            let rs_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fisheye_rs_rows"),
+                size: needed_rs,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let s = cache.get_mut(&slot).unwrap();
+            s.rs_buf = rs_buf;
+            s.rs_buf_capacity = needed_rs;
+        }
+        let s = cache.get(&slot).unwrap();
+
+        // Update reused resources in-place. write_buffer / write_texture
+        // are queue ops; WGPU serialises them with the compute dispatch
+        // below, so a single slot can be reused for consecutive frames.
+        self.upload_rgba(&s.src_tex, src_rgba, src_w, src_h);
+        self.queue.write_buffer(&s.r_uniform, 0,
+            bytemuck::bytes_of(&EquirectUniforms::from_mat3(rotation.0)));
+        self.queue.write_buffer(&s.cal_uniform, 0,
+            bytemuck::bytes_of(&FisheyeCalibUniforms::from_public(calib)));
+        self.queue.write_buffer(&s.rs_buf, 0, bytemuck::cast_slice(rs_rows_f32));
+
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fisheye_to_hequirect_rs_bg"),
+            layout: &self.fisheye_to_hequirect_rs.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&s.src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_hequirect_rs.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: s.r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: s.cal_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: s.rs_buf.as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fisheye_project_rs_tex_enc"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fisheye_project_rs_tex_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fisheye_to_hequirect_rs.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            let wg_x = (out_w + 7) / 8;
+            let wg_y = (out_h + 7) / 8;
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// 16-bit-per-channel projection. Same KB math + cubic Hermite
+    /// extension as the 8-bit variant; output texture is Rgba16Unorm
+    /// instead of Rgba8Unorm. Source is uploaded as 16-bit so source
+    /// precision (P010 → RGBA64LE → texture) is preserved.
+    pub fn project_fisheye_to_equirect_texture_16(
+        &self,
+        src_rgba64le: &[u8],
+        src_w: u32, src_h: u32,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        calib: FisheyeCalib,
+    ) -> Result<wgpu::Texture> {
+        debug_assert_eq!(src_rgba64le.len(), (src_w as usize) * (src_h as usize) * 8);
+        // Source texture: Rgba16Unorm to keep the 16-bit precision
+        // through the bilinear sampler in the shader.
+        let src_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fisheye_src_16"),
+            size: wgpu::Extent3d { width: src_w, height: src_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &src_tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            src_rgba64le,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(src_w * 8),
+                rows_per_image: Some(src_h),
+            },
+            wgpu::Extent3d { width: src_w, height: src_h, depth_or_array_layers: 1 },
+        );
+        // Output: Rgba16Unorm half-equirect.
+        let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fisheye_eq_tex_out_16"),
+            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let src_view = src_tex.create_view(&Default::default());
+        let dst_view = output_tex.create_view(&Default::default());
+        let r_uniform = self.write_uniform("fisheye_R_record_16",
+            &EquirectUniforms::from_mat3(rotation.0));
+        let cal_uniform = self.write_uniform("fisheye_calib_record_16",
+            &FisheyeCalibUniforms::from_public(calib));
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fisheye_project_bg_16"),
+            layout: &self.fisheye_to_hequirect_16.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_hequirect_16.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fisheye_project_tex_enc_16"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fisheye_project_pass_16"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fisheye_to_hequirect_16.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// Zero-copy P010 projection. The Y and UV plane textures come
+    /// from `crate::interop_macos::wgpu_texture_from_iosurface_plane`
+    /// (i.e. they alias the VideoToolbox-decoded CVPixelBuffer
+    /// directly) — no host-memory hop and no swscale.
+    ///
+    /// `src_w` / `src_h` is the native fisheye resolution (matches the
+    /// Y plane dims). Calibration must have been resolved against those
+    /// dims, NOT against any preview-clamped working size.
+    ///
+    /// Output: Rgba16Unorm half-equirect ready to feed into
+    /// `compose_sbs_to_p010`.
+    #[cfg(target_os = "macos")]
+    pub fn project_fisheye_p010_to_equirect_texture_16(
+        &self,
+        y_tex: &wgpu::Texture,
+        uv_tex: &wgpu::Texture,
+        src_w: u32, src_h: u32,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        calib: FisheyeCalib,
+    ) -> Result<wgpu::Texture> {
+        let _ = (src_w, src_h); // dims are encoded into the calib uniform's src_w/src_h
+        let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fisheye_p010_eq_tex_out_16"),
+            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let y_view  = y_tex .create_view(&Default::default());
+        let uv_view = uv_tex.create_view(&Default::default());
+        let dst_view = output_tex.create_view(&Default::default());
+        let r_uniform = self.write_uniform("fisheye_p010_R_record_16",
+            &EquirectUniforms::from_mat3(rotation.0));
+        let cal_uniform = self.write_uniform("fisheye_p010_calib_record_16",
+            &FisheyeCalibUniforms::from_public(calib));
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fisheye_p010_project_bg_16"),
+            layout: &self.fisheye_p010_to_hequirect_16.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.fisheye_p010_to_hequirect_16.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dst_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cal_uniform.as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fisheye_p010_project_tex_enc_16"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fisheye_p010_project_pass_16"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fisheye_p010_to_hequirect_16.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// RS-aware variant of [`Self::project_fisheye_p010_to_equirect_texture_16`].
+    /// Same inputs plus a per-scanline rotation buffer
+    /// (`per_row_matrices_f32`, packed as 12 f32 per row — three vec4
+    /// rows with trailing pad; total `fish_h * 12` floats). The
+    /// projection shader looks up the row this pixel maps to and
+    /// re-projects through that row's matrix, cancelling intra-frame
+    /// shear from the sensor readout.
+    ///
+    /// Pass an all-zeros buffer to disable RS (the shader checks the
+    /// first matrix's `r00` and skips the per-row pass if it's 0).
+    #[cfg(target_os = "macos")]
+    pub fn project_fisheye_p010_to_equirect_rs_texture_16(
+        &self,
+        y_tex: &wgpu::Texture,
+        uv_tex: &wgpu::Texture,
+        src_w: u32, src_h: u32,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        calib: FisheyeCalib,
+        per_row_matrices_f32: &[f32],
+    ) -> Result<wgpu::Texture> {
+        let _ = (src_w, src_h); // dims are encoded into the calib uniform
+        let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fisheye_p010_rs_eq_tex_out_16"),
+            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let y_view  = y_tex .create_view(&Default::default());
+        let uv_view = uv_tex.create_view(&Default::default());
+        let dst_view = output_tex.create_view(&Default::default());
+        let r_uniform = self.write_uniform("fisheye_p010_rs_R_uniform",
+            &EquirectUniforms::from_mat3(rotation.0));
+        let cal_uniform = self.write_uniform("fisheye_p010_rs_calib_uniform",
+            &FisheyeCalibUniforms::from_public(calib));
+
+        // Per-row R storage buffer. Must contain at least one row;
+        // when callers pass an empty slice we synthesize a 1-row
+        // all-zeros buffer so the shader's `rsm.r00 != 0.0` skip-check
+        // triggers reliably.
+        let rs_bytes: &[u8] = if per_row_matrices_f32.is_empty() {
+            &[0u8; 48] // 12 f32 == 48 bytes
+        } else {
+            bytemuck::cast_slice(per_row_matrices_f32)
+        };
+        let rs_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fisheye_p010_rs_rows_buf"),
+            size: rs_bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&rs_buf, 0, rs_bytes);
+
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fisheye_p010_rs_project_bg_16"),
+            layout: &self.fisheye_p010_to_hequirect_16_rs.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.fisheye_p010_to_hequirect_16_rs.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dst_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cal_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: rs_buf.as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fisheye_p010_rs_project_tex_enc_16"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fisheye_p010_rs_project_pass_16"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fisheye_p010_to_hequirect_16_rs.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// 16-bit SBS compose. Same shape as `compose_sbs_textures` but
+    /// the output is Rgba16Unorm and the inputs MUST be Rgba16Unorm.
+    pub fn compose_sbs_textures_16(
+        &self,
+        left: &wgpu::Texture,
+        right: &wgpu::Texture,
+        eye_w: u32,
+        eye_h: u32,
+    ) -> Result<wgpu::Texture> {
+        let out_w = eye_w * 2;
+        let sbs = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sbs_export_compose_16"),
+            size: wgpu::Extent3d { width: out_w, height: eye_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("sbs_export_compose_enc_16"),
+        });
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: left, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &sbs, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d { width: eye_w, height: eye_h, depth_or_array_layers: 1 },
+        );
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: right, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &sbs, mip_level: 0,
+                origin: wgpu::Origin3d { x: eye_w, y: 0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d { width: eye_w, height: eye_h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        Ok(sbs)
+    }
+
+    /// Zero-copy 10-bit P010 SBS compose. Takes the two Rgba16Unorm
+    /// per-eye projection outputs and writes both planes of the P010
+    /// CVPixelBuffer (Y full-res + UV half-res with 2×2 chroma
+    /// subsampling) via two compute dispatches. The result is ready
+    /// for VT to consume directly — no swscale, no readback, no
+    /// ffmpeg frame copy on the CPU side.
+    #[cfg(target_os = "macos")]
+    pub fn compose_sbs_to_p010(
+        &self,
+        left_16: &wgpu::Texture,
+        right_16: &wgpu::Texture,
+        target: &crate::interop_macos::EncodePixelBufferP010,
+        eye_w: u32, eye_h: u32,
+    ) -> Result<()> {
+        let l_v = left_16.create_view(&Default::default());
+        let r_v = right_16.create_view(&Default::default());
+        let y_v = target.y_tex.create_view(&Default::default());
+        let uv_v = target.uv_tex.create_view(&Default::default());
+        let uni = self.write_uniform("p010_compose_u",
+            &ComposeSbsUniforms { eye_w, _pad0: 0, _pad1: 0, _pad2: 0 });
+        let out_w = eye_w * 2;
+        let out_h = eye_h;
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("compose_sbs_to_p010_enc"),
+        });
+
+        // Y plane pass (full SBS res).
+        {
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("p010_y_bg"),
+                layout: &self.compose_sbs_p010_y.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&l_v) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r_v) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&y_v) },
+                    wgpu::BindGroupEntry { binding: 3, resource: uni.as_entire_binding() },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("p010_y_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compose_sbs_p010_y.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        // UV plane pass (half SBS res — one thread per 2×2 source block).
+        {
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("p010_uv_bg"),
+                layout: &self.compose_sbs_p010_uv.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&l_v) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r_v) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&uv_v) },
+                    wgpu::BindGroupEntry { binding: 3, resource: uni.as_entire_binding() },
+                ],
+            });
+            let uv_w = out_w / 2;
+            let uv_h = out_h / 2;
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("p010_uv_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compose_sbs_p010_uv.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((uv_w + 7) / 8, (uv_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        // Block until both planes are fully written before VT reads.
+        self.device.poll(wgpu::Maintain::Wait);
+        Ok(())
+    }
+
+    /// Read back an `Rgba16Unorm` texture as packed **RGB48LE** (6
+    /// bytes per pixel, little-endian, alpha channel dropped). The
+    /// returned buffer is suitable for ffmpeg's RGB48LE pixel format
+    /// → swscale → YUV420P10LE → Main10 encode.
+    pub fn read_texture_rgb48(
+        &self,
+        tex: &wgpu::Texture,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        // Rgba16Unorm is 8 bytes/pixel on the GPU; we drop the 2 alpha
+        // bytes to emit RGB48LE (6 bytes/pixel) for the encoder.
+        let bpp = 8u32;
+        let unpadded_row_bytes = w * bpp;
+        let padded_row_bytes = (unpadded_row_bytes + 255) & !255;
+        let buf_size = (padded_row_bytes * h) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("read_texture_rgb48_staging"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("read_texture_rgb48_enc"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
+            .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
+        let mapped = slice.get_mapped_range();
+
+        // Pack 8-byte RGBA64LE → 6-byte RGB48LE per pixel (strip alpha).
+        let mut out = Vec::with_capacity((w * h * 6) as usize);
+        for y in 0..h {
+            let row_off = (y * padded_row_bytes) as usize;
+            for x in 0..w {
+                let px_off = row_off + (x * 8) as usize;
+                out.extend_from_slice(&mapped[px_off..px_off + 6]);
+            }
+        }
+        drop(mapped);
+        staging.unmap();
+        Ok(out)
+    }
+
+    /// Build an SBS texture by copying `left` to `(0,0)` and `right`
+    /// to `(eye_w, 0)`. Output is `2*eye_w × eye_h × Rgba8Unorm` and
+    /// includes COPY_SRC so the caller can read it back. This is the
+    /// GPU-resident alternative to CPU-side SBS interleaving and
+    /// removes ~88 MB/frame of memcpy at 3840×3840 per-eye.
+    pub fn compose_sbs_textures(
+        &self,
+        left: &wgpu::Texture,
+        right: &wgpu::Texture,
+        eye_w: u32,
+        eye_h: u32,
+    ) -> Result<wgpu::Texture> {
+        let out_w = eye_w * 2;
+        let sbs = make_rw_texture(&self.device, "sbs_export_compose", out_w, eye_h,
+            wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("sbs_export_compose_enc"),
+        });
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: left, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &sbs, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d { width: eye_w, height: eye_h, depth_or_array_layers: 1 },
+        );
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: right, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &sbs, mip_level: 0,
+                origin: wgpu::Origin3d { x: eye_w, y: 0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d { width: eye_w, height: eye_h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        Ok(sbs)
+    }
+
+    /// Read back an `Rgba8Unorm` texture as packed RGB8 (3 bytes per
+    /// pixel). Handles the 256-byte-aligned bytes-per-row requirement
+    /// of `wgpu::ImageCopyBuffer`. Used by the fisheye export path to
+    /// produce the encoder-ready RGB buffer after GPU compose.
+    pub fn read_texture_rgb8(
+        &self,
+        tex: &wgpu::Texture,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let bpp = 4u32;
+        let unpadded_row_bytes = w * bpp;
+        let padded_row_bytes = (unpadded_row_bytes + 255) & !255;
+        let buf_size = (padded_row_bytes * h) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("read_texture_rgb8_staging"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("read_texture_rgb8_enc"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
+            .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
+        let mapped = slice.get_mapped_range();
+
+        let mut out_rgb = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            let row_off = (y * padded_row_bytes) as usize;
+            for x in 0..w {
+                let px_off = row_off + (x * 4) as usize;
+                out_rgb.extend_from_slice(&mapped[px_off..px_off + 3]);
+            }
+        }
+        drop(mapped);
+        staging.unmap();
+        Ok(out_rgb)
+    }
+
     fn record_cdl(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -2588,6 +4266,51 @@ struct Lut3DResources {
 }
 
 // ===== Phase 0.7.5.6: zero-copy encode SBS composition =====
+
+impl P010ComposePipeline {
+    fn create(
+        device: &wgpu::Device,
+        label: &str,
+        wgsl: &str,
+        out_format: wgpu::TextureFormat,
+    ) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("compose_sbs_{label}")),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&format!("compose_sbs_{label}_bgl")),
+            entries: &[
+                bgle_tex(0),
+                bgle_tex(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: out_format,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                bgle_uniform(3, std::mem::size_of::<ComposeSbsUniforms>() as u64),
+            ],
+        });
+        let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("compose_sbs_{label}_pll")),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(&format!("compose_sbs_{label}_pipeline")),
+            layout: Some(&pll),
+            module: &shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+        Self { pipeline, bind_group_layout }
+    }
+}
 
 impl ComposeSbsPipeline {
     fn create(device: &wgpu::Device) -> Self {

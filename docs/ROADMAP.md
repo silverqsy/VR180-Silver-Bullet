@@ -1289,6 +1289,112 @@ need a "filter to Rust-supported subset" path until these land:
 Each of these is a separate small phase; the JSON schema grows one
 field at a time as they land. No big-bang rewrite.
 
+## Phase 0.13 — Fisheye source family (DJI OSV / SBS / Blackmagic BRAW) ✅
+
+Counterpart to the GoPro Max EAC family. The GoPro pipeline assumes
+the firmware has already corrected fisheye distortion into EAC cube
+faces; this phase handles cameras where the source frame is still raw
+fisheye on the sensor (DJI Osmo 360 `.osv`, Insta360 / Vuze / Canon
+SBS `.mp4`, Blackmagic Pyxis 12K / URSA Cine Immersive `.braw`).
+
+Architectural shape: one workspace, one binary, auto-detect by
+extension + container probe. EAC family stays untouched; new
+fisheye crates + a new WGSL shader handle the rest.
+
+- [x] **`vr180-fisheye` crate** — Kannala-Brandt projection (forward
+      + Newton-Raphson inverse + cubic Hermite extension past
+      80°), `FisheyeCalibration` struct, Gyroflow lens-profile JSON
+      loader (`bmci 4096.json` / `cine immersive 8192 7200.json` parse
+      cleanly), curated 8-entry camera-preset catalog. 11 tests pass.
+- [x] **`vr180-braw` crate** — `braw_helper` subprocess wrapper
+      (`--info` / `--decode` / `--gyro` / `--audio`). Parses JSON
+      stderr header + binary stdout. Multi-track stereo (URSA Cine
+      Immersive, Pyxis 12K) auto-emits SBS BGRA. The C++ helper is
+      vendored under `helpers/braw/braw_helper.cpp` with a
+      `build_braw.sh` that links against the user-installed
+      Blackmagic RAW SDK. SDK isn't redistributable, so the helper
+      stays user-built (mirrors the Swift-helper pattern).
+- [x] **`fisheye_to_hequirect.wgsl`** — KB forward projection per
+      output pixel, with cubic Hermite extension past θ_trans for
+      super-fisheye lenses. CPU reference in
+      `vr180-fisheye/src/projection.rs` validated by 4 round-trip
+      tests; the shader is a 1:1 port.
+- [x] **`Device::project_fisheye_to_equirect{_,_texture}`** — public
+      API mirroring the EAC variants. Includes
+      `record_fisheye_project` for the texture-chained color-stack
+      path.
+- [x] **`fisheye_decode.rs`** — `FisheyePairIter` trait with three
+      concrete iterators: `SbsFisheyeIter` (single ffmpeg stream,
+      split horizontally; matches Python `_decode_sbs_thread`),
+      `DualStreamFisheyeIter` (two parallel video streams in one
+      container; matches Python `_decode_osv_thread`),
+      `BrawFisheyeIter` (wraps `vr180-braw::BrawDecoder`,
+      auto-handles dual-track SBS composition). BGRA→RGBA swizzle
+      tested for 8-bit and 16-bit.
+- [x] **`source_kind.rs`** — extension-first format detection with
+      ffmpeg-container probe for ambiguous `.mp4` / `.mov` (gpmd
+      stream → GoPro EAC; 2 video streams → dual-stream fisheye;
+      else SBS). Mirrors `vr180_gui.py:8317-8324`.
+- [x] **GUI auto-routing** — `start_decoder` now branches on
+      `SourceKind`. Fisheye sources take `run_fisheye`, GoPro stays
+      on the existing `run_zero_copy` / `run_cpu_assemble`.
+- [x] **GUI fisheye-mode panel** — Camera-preset dropdown (8 entries),
+      FOV override slider, lens-offset (cx/cy) sliders, KB k1-k4
+      sliders, "Load Gyroflow Lens Profile" button. Shown only when
+      SourceKind is fisheye; hidden for GoPro EAC. Source kind shown
+      as a colored badge in the source info. Settings apply live —
+      `settings_generation` bumps trigger `resolve_fisheye_calib`
+      rebuild on the next decoder iteration.
+- [x] **BRAW VQF 6D stabilization** — `vr180-pipeline::braw_imu`
+      reads gyro+accel from `braw_helper --gyro`, runs VQF 6D
+      (mag=None), samples one quat per frame at `t_mid = (fi+0.5)·dt`,
+      references against frame 0, applies `C_IMU_TO_CAM = diag(+1,-1,+1)`.
+      Stationary-IMU test → near-identity rotations. Cached at decoder
+      start; per-frame lookup by absolute frame index.
+- [x] **BRAW audio extraction** — `vr180-braw::extract_audio_to_wav`
+      pipes `braw_helper --audio` stdout RIFF/WAV to disk. RAII
+      `TempWavPath` wrapper for export-pipeline use (auto-cleanup).
+- [x] **DJI OSV stabilization** — `vr180-fisheye::dji_osv` parses
+      the `djmd` protobuf (hand-rolled varint+wire-type walker —
+      no `prost` dependency); `vr180-pipeline::dji_imu` runs the
+      direct-quat integration with per-frame mid-HR sampling,
+      hemisphere-alignment, centered EMA smoothing
+      (`smooth_quats_ema`, fps-aware tau), max-corr clamp, and
+      DJI's empirical `C = [[0,-1,0],[0,0,1],[-1,0,0]]` IMU→camera
+      transform. Real-file integration test against
+      `CAM_20260225224810_0003_D.osv`: 1486 frames, 33 HR
+      samples/frame, 120/120 frames produce non-identity rotations.
+- [x] **DJI per-eye calibration** — protobuf `lens_a` and
+      `lens_b` cx/cy (differing by tens of pixels) flow into
+      separate `FisheyeCalib`s per eye. After the DJI iter's
+      swap_eyes=true (so left=Lens B per the OSV convention),
+      left projection uses lens_b's cx/cy and right uses lens_a's.
+- [x] **`.insv` support removed** — out of scope per user.
+
+### Deferred follow-ups
+
+- [ ] **SBS fisheye stabilization** — Insta360 / Vuze / Canon
+      formats embed gyro telemetry differently — each needs its own
+      parser. Currently identity rotation.
+- [ ] **DJI per-row RS correction** — Python OSV path does
+      Catmull-Rom interpolation of HR quats across the rolling-
+      shutter readout window (~19 ms) and applies a per-row
+      rotation. Currently we use a single per-frame rotation.
+      `DjiOsvImu` already exposes the full HR sample arrays per
+      frame, so the math can drop in as a follow-up.
+- [ ] **Fisheye→fisheye output mode** — Stabilize without
+      projection change. Niche; output-mode dropdown surfaces it
+      grayed-out. CPU math (inverse KB + Hermite) already in
+      `vr180-fisheye::projection`; needs a second WGSL shader.
+- [ ] **Export pipeline for fisheye sources** — `vr180-render` CLI
+      currently only handles GoPro EAC. Fisheye export needs:
+      `--source fisheye` route, LUT + lift/gamma/gain via
+      `apply_color_stack_texture`, ProRes / MV-HEVC paths via the
+      existing helper subprocesses. ~1 week of work, separate phase.
+- [ ] **Live stab toggle** — Stab on/off currently requires
+      Stop+Play to recompute. Could re-run extraction async on
+      toggle and swap the cached array atomically.
+
 ## Phase 1.0 — Tauri UI (future)
 
 Only after 0.9 is shipping. Tauri shell replaces PyQt6 entirely:

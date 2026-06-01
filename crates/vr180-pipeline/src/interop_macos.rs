@@ -527,6 +527,125 @@ pub fn create_bgra_encode_buffer(
     })
 }
 
+// ─── P010 encode buffer (10-bit semi-planar YUV) ───────────────────
+//
+// FourCC `x420` = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange.
+// Plane 0: Y, 16-bit per sample, top 10 bits used, full resolution.
+// Plane 1: UV interleaved, 16-bit per sample-pair, half resolution.
+// VT's hevc_videotoolbox accepts this as sw_format=P010LE for Main10
+// encode — no swscale, no CPU bounce.
+//
+// (First attempt used 'xv02' which is wrong — VT returned
+// kCVReturnInvalidPixelFormat (-6680). Apple's CoreVideo header
+// CVPixelBuffer.h defines this as 'x420'.)
+const K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR_10_BIPLANAR_VIDEORANGE: u32 =
+    u32::from_be_bytes(*b"x420");
+
+/// P010-format encode pixel buffer: the GPU writes both planes (Y at
+/// full res, UV at half res) directly into the IOSurface, then VT
+/// reads it for Main10 encode. End-to-end 10-bit with no CPU bandwidth
+/// on the encode side.
+pub struct EncodePixelBufferP010 {
+    pub pixel_buffer: RetainedCVPixelBuffer,
+    pub iosurface: RetainedIOSurface,
+    /// Y plane wgpu texture: R16Unorm, `(width, height)`.
+    pub y_tex: wgpu::Texture,
+    /// UV plane wgpu texture: Rg16Unorm at half resolution
+    /// `(width/2, height/2)` — interleaved U and V.
+    pub uv_tex: wgpu::Texture,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Create an IOSurface-backed P010 CVPixelBuffer and wrap each plane
+/// as a wgpu storage texture. `width` and `height` must be even (the
+/// UV plane is half-res so odd sizes won't divide cleanly).
+pub fn create_p010_encode_buffer(
+    device: &wgpu::Device,
+    width: u32, height: u32,
+) -> Result<EncodePixelBufferP010> {
+    if width % 2 != 0 || height % 2 != 0 {
+        return Err(Error::Wgpu(format!(
+            "P010 encode buffer requires even dimensions, got {width}×{height}"
+        )));
+    }
+    let attrs = unsafe { build_iosurface_attrs() };
+    let mut pb: CVPixelBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        CVPixelBufferCreate(
+            std::ptr::null(),
+            width as usize,
+            height as usize,
+            K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR_10_BIPLANAR_VIDEORANGE,
+            attrs as CFDictionaryRef,
+            &mut pb,
+        )
+    };
+    unsafe { CFRelease(attrs as CFTypeRef); }
+    if ret != 0 || pb.is_null() {
+        return Err(Error::Wgpu(format!(
+            "CVPixelBufferCreate P010 returned {ret} (pb={:?})", pb
+        )));
+    }
+    let pixel_buffer = unsafe { RetainedCVPixelBuffer::from_create_rule(pb) };
+    let raw_io = unsafe { CVPixelBufferGetIOSurface(pixel_buffer.as_raw()) };
+    if raw_io.is_null() {
+        return Err(Error::Wgpu(
+            "P010 CVPixelBuffer has no IOSurface backing".into()
+        ));
+    }
+    let iosurface = unsafe { RetainedIOSurface::retain(raw_io) };
+
+    // Sanity: plane count should be 2.
+    let plane_count = unsafe { IOSurfaceGetPlaneCount(iosurface.as_raw()) };
+    if plane_count < 2 {
+        return Err(Error::Wgpu(format!(
+            "P010 IOSurface has {plane_count} planes, expected 2"
+        )));
+    }
+    let p0_w = iosurface.plane_width(0) as u32;
+    let p0_h = iosurface.plane_height(0) as u32;
+    let p1_w = iosurface.plane_width(1) as u32;
+    let p1_h = iosurface.plane_height(1) as u32;
+    if p0_w != width || p0_h != height
+        || p1_w != width / 2 || p1_h != height / 2
+    {
+        return Err(Error::Wgpu(format!(
+            "P010 plane geometry mismatch: Y={p0_w}×{p0_h} (expect {width}×{height}), \
+             UV={p1_w}×{p1_h} (expect {}×{})", width / 2, height / 2
+        )));
+    }
+
+    // Wrap each plane as a wgpu texture via the existing
+    // wgpu_texture_from_iosurface_plane helper. The planes are
+    // separate wgpu textures that share the same IOSurface backing.
+    let y_plane = wgpu_texture_from_iosurface_plane(
+        device, iosurface.clone(), 0,
+        metal::MTLPixelFormat::R16Unorm,
+        wgpu::TextureFormat::R16Unorm,
+        width, height, "p010_y_plane",
+    )?;
+    let uv_plane = wgpu_texture_from_iosurface_plane(
+        device, iosurface.clone(), 1,
+        metal::MTLPixelFormat::RG16Unorm,
+        wgpu::TextureFormat::Rg16Unorm,
+        width / 2, height / 2, "p010_uv_plane",
+    )?;
+
+    Ok(EncodePixelBufferP010 {
+        pixel_buffer, iosurface,
+        y_tex: y_plane.texture,
+        uv_tex: uv_plane.texture,
+        width, height,
+    })
+}
+
+impl Clone for RetainedIOSurface {
+    fn clone(&self) -> Self {
+        unsafe { Self::retain(self.as_raw()) }
+    }
+}
+
 /// Build a tiny CFDictionary `{ kCVPixelBufferIOSurfacePropertiesKey: {} }`
 /// to pass to `CVPixelBufferCreate`. The presence of the key (with any
 /// value, even an empty dict) triggers IOSurface backing. Using

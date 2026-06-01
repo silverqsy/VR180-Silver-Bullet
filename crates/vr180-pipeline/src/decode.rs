@@ -88,6 +88,78 @@ fn find_gpmd_stream(ictx: &ffmpeg_next::format::context::Input) -> Option<usize>
     None
 }
 
+/// FourCC `'djmd'` — the codec tag DJI uses for the protobuf
+/// metadata stream in `.osv` files. Letters d, j, m, d.
+const DJMD_TAG: u32 = u32::from_le_bytes(*b"djmd");
+
+/// Pull the DJI Osmo metadata blob from an `.osv` file. Equivalent to
+/// the Python pipeline's `ffmpeg -i <file> -map 0:3 -c copy -f data
+/// pipe:1` at `vr180_gui.py:364-370`.
+///
+/// The container typically has two `djmd` tracks (per the Python
+/// survey of the sample file): the "CAM meta" track at index 3
+/// (~226 kb/s) carries the full per-frame protobuf, while a second
+/// "Gyro" track at index 4 (~36 kb/s) carries something else we don't
+/// use. We pick the **largest** `djmd` stream (in bytes-yielded
+/// terms), not the first — this is robust against firmware variants
+/// where the track order might differ.
+pub fn extract_dji_meta_stream(path: &Path) -> Result<Vec<u8>> {
+    init();
+
+    let mut ictx = ffmpeg_next::format::input(path)
+        .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+
+    // Collect all djmd stream indices first.
+    let djmd_indices: Vec<usize> = ictx
+        .streams()
+        .filter(|s| {
+            // SAFETY: same POD-field read pattern as find_gpmd_stream.
+            let tag = unsafe { (*s.parameters().as_ptr()).codec_tag };
+            tag == DJMD_TAG
+        })
+        .map(|s| s.index())
+        .collect();
+    if djmd_indices.is_empty() {
+        return Err(Error::Ffmpeg(format!(
+            "no `djmd` data stream in {path:?}"
+        )));
+    }
+    tracing::debug!(
+        "djmd track indices in {}: {:?}",
+        path.display(), djmd_indices
+    );
+
+    // Buffer one Vec<u8> per djmd stream — keeps the option open to
+    // pick a different track later (e.g. by handler_name) without
+    // re-walking the container.
+    let mut buffers: std::collections::HashMap<usize, Vec<u8>> =
+        djmd_indices.iter().map(|&i| (i, Vec::with_capacity(64 * 1024))).collect();
+
+    for (stream, packet) in ictx.packets() {
+        if let Some(buf) = buffers.get_mut(&stream.index()) {
+            if let Some(data) = packet.data() {
+                buf.extend_from_slice(data);
+            }
+        }
+    }
+
+    let (best_idx, best_buf) = buffers
+        .into_iter()
+        .max_by_key(|(_, buf)| buf.len())
+        .ok_or_else(|| Error::Ffmpeg("no djmd packets read".into()))?;
+
+    if best_buf.is_empty() {
+        return Err(Error::Ffmpeg(format!(
+            "djmd stream {best_idx} of {path:?} was empty"
+        )));
+    }
+    tracing::info!(
+        "djmd: picked stream {} ({} bytes) from {}",
+        best_idx, best_buf.len(), path.display()
+    );
+    Ok(best_buf)
+}
+
 /// Inspect basic video info for a .360 (or any container): fps,
 /// duration, and the dimensions of the largest video stream. Used by
 /// `probe-gyro` to convert sample counts → seconds in the printout.
@@ -431,6 +503,29 @@ impl ZeroCopyStreamPairIter {
 
     pub fn dims(&self) -> vr180_core::eac::Dims { self.dims }
 
+    /// Seek both decoders to (at most) `target_s` seconds. Internally:
+    /// 1. `av_seek_frame` to the nearest keyframe ≤ target_s.
+    /// 2. Flush both decoder contexts so old packets are dropped.
+    /// 3. Reset the frame counter so `frame_limit` semantics still
+    ///    apply post-seek.
+    ///
+    /// The caller is responsible for stepping forward with
+    /// `next_pair` until they reach the exact target frame they
+    /// wanted — keyframe granularity is typically 1-2 s on GoPro
+    /// HEVC.
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let ts = (target_s.max(0.0) * 1_000_000.0) as i64; // AV_TIME_BASE
+        self.ictx.seek(ts, ..ts)
+            .map_err(|e| Error::Ffmpeg(format!("seek to {target_s:.3}s: {e}")))?;
+        // Flush both decoders so leftover packets / frames from the
+        // previous position don't poison the next next_pair call.
+        for d in &mut self.decoders {
+            d.flush();
+        }
+        self.frames_yielded = 0;
+        Ok(())
+    }
+
     /// Pull the next zero-copy `(s0, s4)` IOSurface pair. Returns
     /// `Ok(None)` at EOF or frame limit. Each call may issue multiple
     /// packets to the decoder before both streams yield a frame.
@@ -599,7 +694,25 @@ pub fn decode_first_vt_frame(path: &Path) -> Result<ffmpeg_next::frame::Video> {
 /// deliberately don't hold an independent clone here since this
 /// Phase 0.6 pipeline only decodes one frame per stream and exits.
 #[cfg(target_os = "macos")]
-fn try_enable_videotoolbox_decode(
+/// Visibility-bumped to `pub(crate)` so the fisheye-source decoders
+/// can opt into VT decode too. The function itself is no-op on
+/// non-macOS.
+#[cfg(target_os = "macos")]
+pub(crate) fn try_enable_videotoolbox_decode(
+    dec_ctx: &mut ffmpeg_next::codec::context::Context,
+) -> bool {
+    try_enable_videotoolbox_decode_inner(dec_ctx)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn try_enable_videotoolbox_decode(
+    _dec_ctx: &mut ffmpeg_next::codec::context::Context,
+) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn try_enable_videotoolbox_decode_inner(
     dec_ctx: &mut ffmpeg_next::codec::context::Context,
 ) -> bool {
     use ffmpeg_next::ffi::*;
@@ -648,7 +761,7 @@ unsafe extern "C" fn videotoolbox_get_format(
 /// host system memory via `av_hwframe_transfer_data`. The destination
 /// frame's pixel format is determined by FFmpeg — typically `NV12` for
 /// 8-bit HEVC/H.264 and `P010` for 10-bit Main10.
-fn download_hw_frame(
+pub(crate) fn download_hw_frame(
     hw_frame: &ffmpeg_next::frame::Video,
     sw_frame: &mut ffmpeg_next::frame::Video,
 ) -> Result<()> {
@@ -777,6 +890,19 @@ impl StreamPairIter {
 
     pub fn dims(&self) -> vr180_core::eac::Dims { self.dims }
     pub fn decode_path(&self) -> DecodePath { self.decode_path }
+
+    /// CPU-path counterpart to `ZeroCopyStreamPairIter::seek`. See
+    /// that method's docstring for semantics.
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let ts = (target_s.max(0.0) * 1_000_000.0) as i64;
+        self.ictx.seek(ts, ..ts)
+            .map_err(|e| Error::Ffmpeg(format!("seek to {target_s:.3}s: {e}")))?;
+        for d in &mut self.decoders {
+            d.flush();
+        }
+        self.frames_yielded = 0;
+        Ok(())
+    }
 
     /// Pull the next `StreamPair` (one frame from each video stream).
     /// Returns `Ok(None)` at EOF or after the frame limit is hit.

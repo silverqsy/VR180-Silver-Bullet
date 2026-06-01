@@ -9,12 +9,19 @@
 #![warn(missing_debug_implementations)]
 
 pub mod audio;
+pub mod braw_imu;
 pub mod decode;
+pub mod dji_imu;
 pub mod encode;
+pub mod fisheye_decode;
+pub mod fisheye_export;
 pub mod gpu;
 pub mod helpers;
 pub mod imu;
 pub mod render;
+pub mod source_kind;
+
+pub use source_kind::SourceKind;
 
 #[cfg(target_os = "macos")]
 pub mod interop_macos;

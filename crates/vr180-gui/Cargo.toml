@@ -31,6 +31,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# Our pipeline + core.
+# Our pipeline + core + fisheye/BRAW shims.
 vr180-core = { workspace = true }
 vr180-pipeline = { workspace = true }
+vr180-fisheye = { workspace = true }
+vr180-braw = { workspace = true }

@@ -11,6 +11,8 @@ path = "src/lib.rs"
 
 [dependencies]
 vr180-core = { workspace = true }
+vr180-fisheye = { workspace = true }
+vr180-braw = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
