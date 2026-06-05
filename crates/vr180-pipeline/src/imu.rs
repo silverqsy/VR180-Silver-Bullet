@@ -33,8 +33,16 @@ pub struct PreparedImu {
     pub acc_body: Vec<[f32; 3]>,
     /// Optional per-sample 3-axis magnetic-north vector, resampled to gyro rate.
     pub mag_body: Option<Vec<[f32; 3]>>,
-    /// Gyro sample interval in seconds (e.g. `~0.00125` for 800 Hz).
+    /// Gyro sample interval in seconds, computed from the STMP-anchored
+    /// span (`(t[-1] - t[0]) / (N - 1)`) — matches Python's `gyro_dt`
+    /// at `parse_gyro_raw.py:1508-1509`. Falls back to
+    /// `probe_duration / N` only if gyro times can't be built.
     pub gyr_ts: f32,
+    /// STMP-anchored per-sample video-time for each gyro sample.
+    /// Exposed so callers can drive the per-frame resample with the
+    /// same timeline used to derive `gyr_ts` and to linearly
+    /// interpolate the acc/mag inputs.
+    pub gyro_times: Vec<f32>,
     pub acc_source: AccSource,
     pub mag_source: MagSource,
     /// Raw counts pre-resample for the printout (acc, mag).
@@ -43,15 +51,28 @@ pub struct PreparedImu {
 }
 
 /// Build [`PreparedImu`] from a .360 file. Equivalent to the input-prep
-/// half of `vqf_to_cori_quats` in Python.
+/// half of `vqf_to_cori_quats` in Python — but matches the
+/// **multi-segment** Python pipeline's timing/resampling behaviour:
+///
+/// - `gyr_ts` is the actual STMP-anchored span / (N - 1).
+/// - acc and mag are **time-linearly interpolated** to the gyro
+///   timeline (not nearest-neighbour proportional indexing).
 pub fn prepare_for_vqf(path: &Path) -> Result<PreparedImu> {
     use crate::decode::{extract_gpmf_stream, probe_video};
+    use vr180_core::gyro::{
+        resample::build_imu_sample_times,
+        cori_iori::parse_cori_with_stmps,
+    };
+
     let gpmf = extract_gpmf_stream(path)?;
     let probe = probe_video(path)?;
     let raw = parse_raw_imu(&gpmf);
     if raw.gyro.is_empty() {
         return Err(Error::Ffmpeg("no GYRO blocks in GPMF stream".into()));
     }
+    let (_cori_q, cori_stmps) = parse_cori_with_stmps(&gpmf);
+    let probe_duration = probe.duration_sec as f32;
+    let fps = probe.fps;
 
     // 3a. Flatten gyro with ZXY → body-frame axis remap.
     // GoPro ORIN="ZXY": raw[0]=Z, raw[1]=X, raw[2]=Y.
@@ -63,44 +84,44 @@ pub fn prepare_for_vqf(path: &Path) -> Result<PreparedImu> {
         }
     }
 
-    let duration = probe.duration_sec as f32;
-    let gyr_ts = duration / gyro_body.len() as f32;
+    // 3b. STMP-anchored per-sample video-time for each gyro sample.
+    // Used as the master timeline for everything downstream.
+    let gyro_times = build_imu_sample_times(&raw.gyro, &cori_stmps, fps, probe_duration);
+
+    // 3c. `gyr_ts` from the actual STMP-anchored span (matches Python's
+    // `gyro_dt = (combined_gyro_times[-1] - combined_gyro_times[0]) / (N - 1)`
+    // at `parse_gyro_raw.py:1508-1509`). Falls back to
+    // `probe_duration / N` if STMPs weren't available (gyro_times then
+    // came from the uniform-spacing fallback in `build_imu_sample_times`).
+    let gyr_ts = if gyro_times.len() >= 2 {
+        let span = gyro_times[gyro_times.len() - 1] - gyro_times[0];
+        (span / (gyro_times.len() - 1) as f32).max(1e-6)
+    } else {
+        (probe_duration / gyro_body.len().max(1) as f32).max(1e-6)
+    };
 
     // 4. Pick acc source: GRAV × 9.81 (already filtered by GoPro firmware,
     //    cleaner than raw ACCL) if gravity magnitude is plausible.
+    //    Time-based linear interpolation to gyro times.
     let (acc_body, acc_source, n_acc_input) =
-        pick_acc_source(&raw, gyro_body.len());
+        pick_acc_source(&raw, &cori_stmps, fps, probe_duration, &gyro_times);
 
     // 5. Pick mag source: MNOR (firmware-calibrated magnetic north).
+    //    Same time-based interpolation.
     let (mag_body, mag_source, n_mag_input) =
-        pick_mag_source(&raw, gyro_body.len());
+        pick_mag_source(&raw, &cori_stmps, fps, probe_duration, &gyro_times);
 
     Ok(PreparedImu {
         gyro_body,
         acc_body,
         mag_body,
         gyr_ts,
+        gyro_times,
         acc_source,
         mag_source,
         n_acc_input,
         n_mag_input,
     })
-}
-
-/// Resample a (N×3) sequence of samples to `target_len` by
-/// proportional nearest-neighbor indexing.
-///
-/// Equivalent to Python's
-/// `idx = min(int(t / src_dt), len(src) - 1)` where
-/// `t = i * target_dt` — algebraically `idx = (i * src_len) / target_len`.
-fn resample_proportional(src: &[[f32; 3]], target_len: usize) -> Vec<[f32; 3]> {
-    if src.is_empty() {
-        return vec![[0.0; 3]; target_len];
-    }
-    let src_len = src.len();
-    (0..target_len)
-        .map(|i| src[(i * src_len / target_len).min(src_len - 1)])
-        .collect()
 }
 
 fn flatten_with_remap(blocks: &[ImuBlock], remap: [usize; 3]) -> Vec<[f32; 3]> {
@@ -113,9 +134,62 @@ fn flatten_with_remap(blocks: &[ImuBlock], remap: [usize; 3]) -> Vec<[f32; 3]> {
     out
 }
 
-fn pick_acc_source(raw: &RawImu, gyro_len: usize)
-    -> (Vec<[f32; 3]>, AccSource, usize)
-{
+/// Per-component linear interpolation of a 3-vector timeseries
+/// (`src[i]` at `src_times[i]`) onto `dst_times`. Edge-clamps. Mirrors
+/// Python's `np.interp(dst_times, src_times, src[:, c])` per component
+/// — the same operation `vqf_to_cori_quats_multi_segment` uses to drop
+/// the acc/mag streams onto the gyro timeline
+/// (`parse_gyro_raw.py:1492-1494`).
+fn resample_time_linear(
+    src: &[[f32; 3]],
+    src_times: &[f32],
+    dst_times: &[f32],
+) -> Vec<[f32; 3]> {
+    if src.is_empty() || src_times.len() != src.len() {
+        return vec![[0.0; 3]; dst_times.len()];
+    }
+    if src.len() == 1 {
+        return vec![src[0]; dst_times.len()];
+    }
+    let n_src = src.len();
+    let last_t = src_times[n_src - 1];
+    let first_t = src_times[0];
+    let mut out = Vec::with_capacity(dst_times.len());
+    for &t in dst_times {
+        if t <= first_t {
+            out.push(src[0]);
+            continue;
+        }
+        if t >= last_t {
+            out.push(src[n_src - 1]);
+            continue;
+        }
+        // Upper-bound index in src_times for `t`.
+        let hi = src_times
+            .partition_point(|x| *x <= t)
+            .max(1)
+            .min(n_src - 1);
+        let lo = hi - 1;
+        let span = (src_times[hi] - src_times[lo]).max(1e-9);
+        let frac = ((t - src_times[lo]) / span).clamp(0.0, 1.0);
+        out.push([
+            src[lo][0] + frac * (src[hi][0] - src[lo][0]),
+            src[lo][1] + frac * (src[hi][1] - src[lo][1]),
+            src[lo][2] + frac * (src[hi][2] - src[lo][2]),
+        ]);
+    }
+    out
+}
+
+fn pick_acc_source(
+    raw: &RawImu,
+    cori_stmps: &[vr180_core::gyro::cori_iori::CoriBlockStmp],
+    fps: f32,
+    probe_duration: f32,
+    gyro_times: &[f32],
+) -> (Vec<[f32; 3]>, AccSource, usize) {
+    use vr180_core::gyro::resample::build_imu_sample_times;
+
     // GRAV uses axis map (0, 2, 1) per project memory; magnitude in g
     // (multiply by 9.81 to get m/s²).
     let grav_body = flatten_with_remap(&raw.grav, [0, 2, 1]);
@@ -128,22 +202,24 @@ fn pick_acc_source(raw: &RawImu, gyro_len: usize)
         let mean = [sum[0] / n as f32, sum[1] / n as f32, sum[2] / n as f32];
         let mag = (mean[0]*mean[0] + mean[1]*mean[1] + mean[2]*mean[2]).sqrt();
         if mag > 0.1 {
-            let mut scaled: Vec<[f32; 3]> = grav_body.iter()
+            let scaled: Vec<[f32; 3]> = grav_body.iter()
                 .map(|s| [s[0] * 9.81, s[1] * 9.81, s[2] * 9.81])
                 .collect();
             let n_input = scaled.len();
-            scaled = resample_proportional(&scaled, gyro_len);
-            return (scaled, AccSource::Grav, n_input);
+            let grav_times = build_imu_sample_times(&raw.grav, cori_stmps, fps, probe_duration);
+            let resampled = resample_time_linear(&scaled, &grav_times, gyro_times);
+            return (resampled, AccSource::Grav, n_input);
         }
     }
     // Fallback: raw ACCL with same axis map as gyro (1, 2, 0).
     let accl_body = flatten_with_remap(&raw.accl, [1, 2, 0]);
     if !accl_body.is_empty() {
         let n_input = accl_body.len();
-        let resampled = resample_proportional(&accl_body, gyro_len);
+        let accl_times = build_imu_sample_times(&raw.accl, cori_stmps, fps, probe_duration);
+        let resampled = resample_time_linear(&accl_body, &accl_times, gyro_times);
         return (resampled, AccSource::Raw, n_input);
     }
-    (vec![[0.0; 3]; gyro_len], AccSource::None, 0)
+    (vec![[0.0; 3]; gyro_times.len()], AccSource::None, 0)
 }
 
 /// Run the full VQF pipeline (input prep + 9D fusion + Y↔Z swap +
@@ -168,6 +244,14 @@ fn pick_acc_source(raw: &RawImu, gyro_len: usize)
 /// downstream, and a safe default otherwise (the average over a
 /// short window collapses to point-sample when the rotation is
 /// slow-varying).
+///
+/// Resample window is **1 ms** (matches Python's `window_ms=1.0` default
+/// at `parse_gyro_raw.py:1265`). Wider windows wash out the gyro's
+/// high-frequency content and add asymmetric phase lag whenever the
+/// signal is moving across the window — both of which broke OSV-style
+/// stab when we tried `window_s = SROT_S` previously.
+const VQF_RESAMPLE_WINDOW_S: f32 = 0.001;
+
 pub fn vqf_cori_equivalent_stream(
     input: &Path,
     fps: f32,
@@ -175,13 +259,13 @@ pub fn vqf_cori_equivalent_stream(
 ) -> Result<Vec<Quat>> {
     use vr180_core::gyro::{
         vqf,
-        resample::{resample_quats_to_frames_timed, build_imu_sample_times, cori_swap_yz, SROT_S},
-        cori_iori::parse_cori_with_stmps,
+        resample::{resample_quats_to_frames_timed, cori_swap_yz, SROT_S},
     };
-    use crate::decode::{extract_gpmf_stream, probe_video};
 
-    // 1. Prep the IMU arrays (ZXY → body remap, GRAV/ACCL source pick,
-    //    mag resample at gyro rate). Reuses Phase 0.3 input prep.
+    // 1. Prep the IMU arrays. `prepare_for_vqf` now returns the
+    //    STMP-anchored gyro timeline and computes `gyr_ts` from it,
+    //    and time-linearly interpolates acc/mag onto the same timeline
+    //    (matches the multi-segment Python pipeline).
     let prep = prepare_for_vqf(input)?;
     let vqf_fps = 1.0 / prep.gyr_ts.max(1e-6);
     tracing::info!(
@@ -206,28 +290,24 @@ pub fn vqf_cori_equivalent_stream(
     //    on one axis.
     let cori_equiv: Vec<Quat> = run.quats.into_iter().map(cori_swap_yz).collect();
 
-    // 4. Build per-sample timestamps using STMP-based drift correction.
-    //    Falls back to uniform spacing if STMPs are missing. This is
-    //    the critical fix for "shake grows over time": the IMU clock
-    //    runs ~1 ms/s faster than the video clock; without CORI-STMP
-    //    anchoring, the VQF→frame mapping drifts linearly.
-    let gpmf = extract_gpmf_stream(input)?;
-    let (_cori_q, cori_stmps) = parse_cori_with_stmps(&gpmf);
-    let raw = vr180_core::gyro::raw::parse_raw_imu(&gpmf);
-    let probe = probe_video(input)?;
-    let sample_times = build_imu_sample_times(
-        &raw.gyro, &cori_stmps, fps, probe.duration_sec as f32,
-    );
+    // 4. Use the prep-built STMP-anchored gyro times for the per-video-
+    //    frame resample. Identical timeline to the one used for `gyr_ts`,
+    //    so VQF's per-sample step matches the per-sample interpretation
+    //    of the resampler.
+    let sample_times = prep.gyro_times;
     if sample_times.len() != cori_equiv.len() {
         tracing::warn!(
             "VQF: per-sample time count ({}) != VQF sample count ({}); \
              falling back to uniform-rate resample (drift not corrected)",
             sample_times.len(), cori_equiv.len(),
         );
-        // Fallback to the legacy uniform-rate path.
+        // Fallback to the legacy uniform-rate path. 1 ms window matches
+        // Python's `window_ms=1.0` default — effectively point-sampling
+        // so VQF's high-frequency content survives into the per-frame
+        // CORI stream.
         use vr180_core::gyro::resample::resample_quats_to_frames;
         return Ok(resample_quats_to_frames(
-            &cori_equiv, vqf_fps, fps, n_frames, SROT_S * 0.5, SROT_S,
+            &cori_equiv, vqf_fps, fps, n_frames, SROT_S * 0.5, VQF_RESAMPLE_WINDOW_S,
         ));
     }
     tracing::info!(
@@ -237,22 +317,31 @@ pub fn vqf_cori_equivalent_stream(
         sample_times.len() as f32 / sample_times.last().copied().unwrap_or(1.0).max(1e-3),
     );
 
-    // 5. Resample to per-video-frame quaternions. Window-average over
-    //    SROT centered at each frame's readout midpoint, using the
-    //    STMP-anchored sample timestamps.
+    // 5. Resample to per-video-frame quaternions. Sample at the
+    //    readout midpoint with a 1 ms averaging window — matches
+    //    Python's `window_ms=1.0` default (`vqf_to_cori_quats` at
+    //    `parse_gyro_raw.py:1265-1270`). Effectively point-sampling,
+    //    preserving the VQF stream's full high-frequency content so
+    //    downstream stab can correct against frame-rate jitter.
     Ok(resample_quats_to_frames_timed(
         &sample_times,
         &cori_equiv,
         fps,
         n_frames,
         SROT_S * 0.5,
-        SROT_S,
+        VQF_RESAMPLE_WINDOW_S,
     ))
 }
 
-fn pick_mag_source(raw: &RawImu, gyro_len: usize)
-    -> (Option<Vec<[f32; 3]>>, MagSource, usize)
-{
+fn pick_mag_source(
+    raw: &RawImu,
+    cori_stmps: &[vr180_core::gyro::cori_iori::CoriBlockStmp],
+    fps: f32,
+    probe_duration: f32,
+    gyro_times: &[f32],
+) -> (Option<Vec<[f32; 3]>>, MagSource, usize) {
+    use vr180_core::gyro::resample::build_imu_sample_times;
+
     // MNOR — Python doesn't define an explicit axis map, so we pass it
     // through verbatim (raw on-disk axes). If validation reveals a remap
     // is needed we'll add one here.
@@ -263,6 +352,7 @@ fn pick_mag_source(raw: &RawImu, gyro_len: usize)
         .flat_map(|b| b.samples.iter().copied())
         .collect();
     let n_input = mnor_body.len();
-    let resampled = resample_proportional(&mnor_body, gyro_len);
+    let mnor_times = build_imu_sample_times(&raw.mnor, cori_stmps, fps, probe_duration);
+    let resampled = resample_time_linear(&mnor_body, &mnor_times, gyro_times);
     (Some(resampled), MagSource::Mnor, n_input)
 }

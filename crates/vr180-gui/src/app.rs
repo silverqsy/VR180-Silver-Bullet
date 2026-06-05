@@ -59,12 +59,133 @@ pub struct App {
     /// detect when to bump the generation counter (so the decoder
     /// recomputes per-eye bundles).
     last_pushed_settings: Settings,
+    /// Last settings value written to disk, and when — used to debounce
+    /// the persisted-settings save so a slider drag doesn't hammer disk.
+    last_saved_settings: Settings,
+    last_settings_save_at: std::time::Instant,
 
     // ─── Export job (fisheye sources only for now) ───────────────
     /// `Some` while an export is in flight. `None` once the worker
     /// finishes (cleanly or via cancel) — the GUI re-enables the
     /// Export button.
     export_job: Option<ExportJob>,
+
+    /// Audio playback for the preview. `Some` when the clip's source
+    /// has an audio track. Tied to the same play / pause / seek
+    /// commands as the video decoder.
+    audio_player: Option<crate::audio_player::AudioPlayer>,
+
+    /// User-chosen codec/bitrate/metadata for the next export. Shown
+    /// in a floating window when the user clicks Export…
+    export_opts: ExportOptions,
+    /// True while the export-options window is open.
+    export_opts_visible: bool,
+
+    /// Preview magnifier for alignment inspection. `preview_zoom` is the
+    /// magnification (1.0 = fit-to-window); `preview_center` is the point
+    /// of the image kept centered, in UV [0,1]. Scroll zooms toward the
+    /// cursor, drag pans, double-click resets.
+    preview_zoom: f32,
+    preview_center: egui::Vec2,
+
+    /// Full-resolution still for zoomed alignment: while paused + zoomed,
+    /// the current frame is re-rendered at native source resolution on a
+    /// worker thread so the magnifier shows real detail (the live preview
+    /// is decoded at a capped working size). `full_res_display` holds the
+    /// registered hi-res texture; `full_res_key` identifies the (frame,
+    /// settings) it was rendered for; the receiver carries an in-flight
+    /// job's result.
+    full_res_display: Option<DisplayFrame>,
+    /// Key (frame+settings) the current `full_res_display` was rendered for.
+    full_res_key: u64,
+    /// Key (frame+settings) we currently *want* a still for. While this
+    /// differs from `full_res_key` the still is stale (mid drag/scrub) and
+    /// the zoom view shows the live preview instead — which is responsive
+    /// (decoder thread) and now frame-aligned with the still, so the swap on
+    /// settle doesn't shift.
+    full_res_desired_key: u64,
+    /// Settle timer: the most recent (frame+settings) key and when it last
+    /// changed. The native still is rendered only once the key has been
+    /// stable for the settle window, so a drag/scrub shows the live preview
+    /// throughout and the heavy render fires just once on settle.
+    detail_last_key: u64,
+    detail_key_changed_at: std::time::Instant,
+    /// Native-res still renderer (synchronous, main-thread). Created on
+    /// entering detail mode (paused + zoomed on a fisheye clip), dropped on
+    /// leaving. Caches the decoded native frame so alignment tweaks only
+    /// re-project (fast). NOT a background thread — see `DetailCache`.
+    detail_cache: Option<crate::decoder::DetailCache>,
+}
+
+/// Codec choice for the export pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportCodec { H265, ProRes }
+
+impl ExportCodec {
+    fn label(self) -> &'static str {
+        match self {
+            ExportCodec::H265 => "H.265 (HEVC)",
+            ExportCodec::ProRes => "ProRes",
+        }
+    }
+}
+
+/// ProRes profiles. Numbers match ffmpeg's `-profile:v N`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProResProfile {
+    Proxy = 0,
+    Lt = 1,
+    Standard = 2,
+    Hq = 3,
+    P4444 = 4,
+    P4444Xq = 5,
+}
+
+impl ProResProfile {
+    fn label(self) -> &'static str {
+        match self {
+            ProResProfile::Proxy    => "Proxy",
+            ProResProfile::Lt       => "LT",
+            ProResProfile::Standard => "Standard",
+            ProResProfile::Hq       => "HQ",
+            ProResProfile::P4444    => "4444",
+            ProResProfile::P4444Xq  => "4444 XQ",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExportOptions {
+    codec: ExportCodec,
+    /// H.265 average bitrate in Mbps. Range 20..=500.
+    h265_bitrate_mbps: u32,
+    /// 8 or 10 (Main / Main10) for H.265.
+    h265_bit_depth: u8,
+    prores_profile: ProResProfile,
+    /// Inject Apple Projected Media Profile (Vision Pro VR180).
+    inject_apmp: bool,
+    /// Inject Spatial Media V2 (YouTube VR180) — st3d + sv3d boxes.
+    /// MUTUALLY EXCLUSIVE with `inject_apmp` (they overwrite the same
+    /// atoms in the visual sample entry) — the GUI enforces it.
+    inject_youtube: bool,
+    /// Camera baseline in mm for APMP `cams/blin`. Typical 60..=70.
+    apmp_baseline_mm: f32,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            codec: ExportCodec::H265,
+            h265_bitrate_mbps: 200,
+            h265_bit_depth: 10,
+            prores_profile: ProResProfile::Hq,
+            // APMP is the headline target (Vision Pro). They're
+            // mutually exclusive; the dialog enforces it.
+            inject_apmp: true,
+            inject_youtube: false,
+            apmp_baseline_mm: 65.0,
+        }
+    }
 }
 
 struct ExportJob {
@@ -154,7 +275,9 @@ impl App {
             "pipeline running on the eframe-owned wgpu device"
         );
 
-        let defaults = Settings::default();
+        // Restore the user's last-used settings from disk (defaults on first
+        // run). Persisted across launches so every knob is remembered.
+        let defaults = Settings::load_persisted();
         Self {
             pipeline,
             egui_renderer: wgpu_state.renderer.clone(),
@@ -168,36 +291,75 @@ impl App {
             control: None,
             fps_stats: FpsStats::default(),
             settings: defaults.clone(),
+            last_saved_settings: defaults.clone(),
+            last_settings_save_at: std::time::Instant::now(),
             last_pushed_settings: defaults,
             export_job: None,
+            audio_player: None,
+            export_opts: ExportOptions::default(),
+            export_opts_visible: false,
+            preview_zoom: 1.0,
+            preview_center: egui::vec2(0.5, 0.5),
+            full_res_display: None,
+            full_res_key: 0,
+            full_res_desired_key: 0,
+            detail_last_key: 0,
+            detail_key_changed_at: std::time::Instant::now(),
+            detail_cache: None,
         }
     }
 
     /// Pick an output path and spawn the export worker. No-op if no
     /// clip is loaded, an export is already in flight, or the source
     /// is GoPro EAC (the existing CLI handles that family).
+    /// Top-toolbar Export button — opens the options window. The actual
+    /// export kicks off from `commit_export()` once the user confirms.
     fn start_export(&mut self) {
+        if self.export_job.is_some() { return; }
+        if !matches!(self.clip.as_ref().map(|c| c.source_kind),
+            Some(k) if k.is_fisheye())
+        {
+            tracing::warn!("export: only fisheye sources supported");
+            return;
+        }
+        self.export_opts_visible = true;
+    }
+
+    /// Called from the export-options window's "Start Export…" button.
+    /// Pops up the save-file dialog, builds the FisheyeExportConfig
+    /// from `self.export_opts`, and spawns the encode worker.
+    fn commit_export(&mut self) {
+        self.export_opts_visible = false;
         if self.export_job.is_some() { return; }
         let (path, clip) = match (&self.loaded_path, &self.clip) {
             (Some(p), Some(c)) => (p.clone(), c.clone()),
             _ => return,
         };
         if !clip.source_kind.is_fisheye() {
-            tracing::warn!("export: only fisheye sources supported (got {:?})", clip.source_kind);
             return;
         }
 
-        // Default output path: same dir, _SBS.mp4 suffix.
+        // Default output path: same dir, _SBS.mp4 / .mov suffix.
         let stem = path.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("output");
+        let ext_default = match self.export_opts.codec {
+            ExportCodec::H265 => "mp4",
+            ExportCodec::ProRes => "mov", // ProRes is conventional in MOV
+        };
         let default_out = path.parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-            .join(format!("{stem}_SBS.mp4"));
+            .join(format!("{stem}_SBS.{ext_default}"));
 
         let chosen = rfd::FileDialog::new()
-            .add_filter("H.265 MP4", &["mp4", "mov"])
+            .add_filter(
+                match self.export_opts.codec {
+                    ExportCodec::H265 => "H.265 video",
+                    ExportCodec::ProRes => "ProRes QuickTime",
+                },
+                &["mp4", "mov"],
+            )
             .set_file_name(default_out.file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "output.mp4".into()))
@@ -205,35 +367,63 @@ impl App {
             .save_file();
         let Some(output_path) = chosen else { return; };
 
-        // Pick the backend: VT on macOS, libx265 elsewhere.
-        let backend = if cfg!(target_os = "macos") {
-            vr180_pipeline::encode::EncoderBackend::VideoToolbox
-        } else {
-            vr180_pipeline::encode::EncoderBackend::Libx265
+        // Pick the backend based on the chosen codec + platform.
+        let backend = match (self.export_opts.codec, cfg!(target_os = "macos")) {
+            (ExportCodec::H265, true) =>
+                vr180_pipeline::encode::EncoderBackend::VideoToolbox,
+            (ExportCodec::H265, false) =>
+                vr180_pipeline::encode::EncoderBackend::Libx265,
+            (ExportCodec::ProRes, true) =>
+                vr180_pipeline::encode::EncoderBackend::ProResVideoToolbox,
+            (ExportCodec::ProRes, false) =>
+                vr180_pipeline::encode::EncoderBackend::ProResKs,
         };
 
-        // Output resolution: native source eye dims (no downscale).
-        // For OSV that's 3840×3840 per eye → 7680×3840 SBS output.
-        // For BRAW Pyxis it's whatever the .braw natively decodes to.
-        // The fisheye projection shader handles any input resolution
-        // because it samples KB-radially — runtime is roughly linear
-        // in output pixel count.
-        let (eye_w, eye_h) = if clip.fisheye_eye_w > 0 {
+        // Output resolution depends on the projection target. For
+        // half-equirect VR180 we use the source eye dims (or fallback
+        // for non-fisheye sources). For fisheye pass-through we use
+        // the raw source eye dims since the projection is bypassed.
+        let (mut eye_w, mut eye_h) = if clip.fisheye_eye_w > 0 {
             (clip.fisheye_eye_w, clip.fisheye_eye_h)
         } else {
-            // Fallback (shouldn't really hit for fisheye sources, but
-            // be defensive — match the stream dims).
             (clip.width.max(512), clip.height.max(512))
         };
 
-        // Default 200 Mbps. Bit depth = 10 → true end-to-end 10-bit
-        // path: scaler outputs RGBA64LE, projection runs on a
-        // Rgba16Unorm pipeline, compose at 16-bit, readback as
-        // RGB48LE, encoder takes RGB48LE → Main10. Slower than the
-        // 8-bit zero-copy path (no P010 IOSurface yet) but
-        // genuinely 10-bit precise from source to codec.
-        let bitrate_kbps: u32 = 200_000;
-        let bit_depth: u8 = 10;
+        let projection = match self.settings.fisheye_output_mode {
+            crate::decoder::FisheyeOutputMode::HalfEquirect =>
+                vr180_pipeline::fisheye_export::FisheyeExportProjection::HalfEquirect,
+            crate::decoder::FisheyeOutputMode::Fisheye =>
+                vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye,
+        };
+        // Fisheye output is a CIRCLE in a SQUARE frame — force eye_h = eye_w
+        // so SBS becomes (2*side × side). For OSV (3840×3840) this is a
+        // no-op; for non-square sources it picks the smaller side so
+        // the fisheye disk fits.
+        if projection == vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye {
+            let side = eye_w.min(eye_h);
+            eye_w = side;
+            eye_h = side;
+        }
+        let color_stack = self.settings.build_color_stack();
+
+        // Bitrate / bit-depth come from the options window. ProRes
+        // ignores the bitrate field (the profile picks the rate)
+        // and is always 10-bit / 12-bit per profile.
+        let (bitrate_kbps, bit_depth) = match self.export_opts.codec {
+            ExportCodec::H265 => (
+                self.export_opts.h265_bitrate_mbps.saturating_mul(1000),
+                self.export_opts.h265_bit_depth,
+            ),
+            ExportCodec::ProRes => {
+                // The encoder ignores bitrate for ProRes but the config
+                // field is non-optional — pass a sane default.
+                let pix_is_12bit = matches!(
+                    self.export_opts.prores_profile,
+                    ProResProfile::P4444 | ProResProfile::P4444Xq,
+                );
+                (0, if pix_is_12bit { 10 } else { 10 })
+            }
+        };
 
         let cfg = vr180_pipeline::fisheye_export::FisheyeExportConfig {
             source_path: path,
@@ -245,15 +435,37 @@ impl App {
             bitrate_kbps,
             encoder: backend,
             bit_depth,
+            prores_profile: self.export_opts.prores_profile as i32,
+            inject_apmp: self.export_opts.inject_apmp,
+            inject_youtube_vr180: self.export_opts.inject_youtube,
+            apmp_baseline_mm: self.export_opts.apmp_baseline_mm,
             stabilize: self.settings.stabilize,
+            dji_max_corr_deg: self.settings.dji_max_corr_deg,
+            dji_smooth_ms: self.settings.dji_smooth_ms,
+            view_adjust: vr180_pipeline::panomap::ViewAdjust {
+                pano_yaw_deg: self.settings.pano_yaw_deg,
+                pano_pitch_deg: self.settings.pano_pitch_deg,
+                pano_roll_deg: self.settings.pano_roll_deg,
+                stereo_yaw_deg: self.settings.stereo_yaw_deg,
+                stereo_pitch_deg: self.settings.stereo_pitch_deg,
+                stereo_roll_deg: self.settings.stereo_roll_deg,
+            },
             fisheye_preset: self.settings.fisheye_preset.clone(),
-            fisheye_fov_deg: self.settings.fisheye_fov_deg,
-            fisheye_k: self.settings.fisheye_k,
-            fisheye_cx_offset_px: self.settings.fisheye_cx_offset_px,
-            fisheye_cy_offset_px: self.settings.fisheye_cy_offset_px,
+            fisheye_override_left: self.settings.fisheye_override_left,
+            fisheye_override_right: self.settings.fisheye_override_right,
+            fisheye_fov_deg_left: self.settings.fisheye_fov_deg_left,
+            fisheye_fov_deg_right: self.settings.fisheye_fov_deg_right,
+            fisheye_k_left: self.settings.fisheye_k_left,
+            fisheye_k_right: self.settings.fisheye_k_right,
+            fisheye_cx_norm_left: self.settings.fisheye_cx_norm_left,
+            fisheye_cy_norm_left: self.settings.fisheye_cy_norm_left,
+            fisheye_cx_norm_right: self.settings.fisheye_cx_norm_right,
+            fisheye_cy_norm_right: self.settings.fisheye_cy_norm_right,
             fisheye_swap_eyes: self.settings.fisheye_swap_eyes,
             trim_in_s: self.settings.trim_in_s,
             trim_out_s: self.settings.trim_out_s,
+            color_stack,
+            projection,
         };
 
         // Stop preview playback for the duration of the export — both
@@ -307,6 +519,139 @@ impl App {
         }
     }
 
+    /// Drive the full-resolution still used by the zoom magnifier. While
+    /// paused + zoomed on a fisheye clip, the current frame is decoded +
+    /// re-projected at native source resolution and shown in the magnifier
+    /// (the live preview decodes at a capped working size). No-op otherwise.
+    ///
+    /// The native render runs SYNCHRONOUSLY on this (main) thread — see
+    /// `DetailCache` for why a background thread deadlocks against eframe's
+    /// renderer on the shared Metal device. To hide the resulting one-frame
+    /// hitch it is DEBOUNCED: it fires only once the desired (frame,
+    /// settings) key has been stable for the settle window. During an active
+    /// drag/scrub the key keeps changing, so the preview shows the live
+    /// low-res frame and we skip the heavy render until you stop.
+    fn poll_full_res(&mut self, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering;
+        // Keep the detail cache alive whenever we're paused on a fisheye clip
+        // — independent of zoom. Zoom only gates whether we RENDER a still,
+        // not whether the cache (and its decoded native frame) exists. That
+        // way zooming out and back in reuses the already-decoded frame
+        // instead of re-decoding it (a GOP walk at native res), which showed
+        // up as a fresh slowdown on every zoom-in.
+        let keep_alive = self.decoder_alive
+            && !self.playing
+            && self.clip.as_ref().map(|c| c.source_kind.is_fisheye()).unwrap_or(false);
+
+        if !keep_alive {
+            if let Some(prev) = self.full_res_display.take() {
+                self.egui_renderer.write().free_texture(&prev.egui_id);
+            }
+            self.full_res_key = 0;
+            self.full_res_desired_key = 0;
+            self.detail_last_key = 0;
+            self.detail_cache = None; // close the native decoder
+            return;
+        }
+
+        let (path, kind, fps) = match (&self.loaded_path, &self.clip) {
+            (Some(p), Some(c)) => (p.clone(), c.source_kind, c.fps),
+            _ => return,
+        };
+        // Spin up the native-res renderer on entering detail mode. It owns a
+        // background decode thread; `ctx` lets that thread poke a repaint
+        // when a frame finishes decoding so the still appears promptly.
+        if self.detail_cache.is_none() {
+            self.detail_cache = Some(crate::decoder::DetailCache::new(
+                path, kind, fps, self.settings.fisheye_swap_eyes, ctx.clone()));
+            self.full_res_key = 0;
+            self.full_res_desired_key = 0;
+            self.detail_last_key = 0;
+        }
+
+        // Only render a still while zoomed in. When zoomed out we keep the
+        // cache + the last rendered still (the 1× view uses the live
+        // preview), so returning here makes zoom-in instant when nothing
+        // changed — and a cheap re-projection (no decode) if settings moved.
+        if self.preview_zoom <= 1.001 {
+            return;
+        }
+
+        // Key identifies the (frame, settings) we want a still for. Zoom is
+        // excluded — one still covers the whole frame; the UV sub-rect
+        // samples it.
+        let ts = self.current_display.as_ref().map(|d| d.timestamp_s).unwrap_or(0.0);
+        let gen = self.control.as_ref()
+            .map(|c| c.settings_generation.load(Ordering::SeqCst)).unwrap_or(0);
+        let ts_ms = (ts * 1000.0).round() as i64 as u64;
+        let key = ts_ms.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(gen).max(1);
+
+        self.full_res_desired_key = key;
+
+        // Settle timer: reset whenever the wanted (frame+settings) changes.
+        // We render the native still ONLY once the key has been stable for
+        // the window. While you're dragging a slider (or scrubbing) the key
+        // keeps moving, so `full_res_key != full_res_desired_key` and the
+        // zoom view shows the live preview — which renders on the DECODER
+        // thread (parallel, non-blocking → responsive) and is now frame-
+        // aligned with the still, so the swap on settle doesn't shift.
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+        if key != self.detail_last_key {
+            self.detail_last_key = key;
+            self.detail_key_changed_at = std::time::Instant::now();
+        }
+
+        // Already showing this exact key → done.
+        if key == self.full_res_key {
+            return;
+        }
+        // Not settled yet → leave the live preview up; wake when it settles.
+        if self.detail_key_changed_at.elapsed() < SETTLE {
+            ctx.request_repaint_after(SETTLE);
+            return;
+        }
+
+        // Settled. `render` now does the GPU project + compose on this thread
+        // (~10 ms) IF the native frame is already decoded; otherwise it kicks
+        // the background decode and returns None (cheap). So calling it every
+        // poll while pending is fine — no heavy work on the main thread until
+        // the frame is ready. On None we poll again (the worker also pokes a
+        // repaint the instant it finishes decoding, so there's no needless
+        // wait). This also means a transient decode failure simply retries
+        // instead of latching "no still".
+        let pipeline = self.pipeline.clone(); // Arc — avoids borrowing self twice
+        let settings = self.settings.clone();
+        let rendered = self.detail_cache.as_mut().unwrap()
+            .render(&pipeline, ts, &settings, 0);
+        if rendered.is_none() {
+            // Decoding (or a transient failure) — keep the live preview up
+            // and poll again shortly.
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        if let Some((tex, w, h)) = rendered {
+            let mut rend = self.egui_renderer.write();
+            if let Some(prev) = self.full_res_display.take() {
+                rend.free_texture(&prev.egui_id);
+            }
+            // sRGB view so egui decodes our Rec.709-gamma SBS to linear on
+            // sample (egui re-applies the OETF) — prevents the double-gamma
+            // that made the preview look washed out vs the export.
+            let view = tex.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                ..Default::default()
+            });
+            let id = rend.register_native_texture(
+                &self.pipeline.device, &view, wgpu::FilterMode::Linear);
+            drop(rend);
+            self.full_res_display = Some(DisplayFrame {
+                texture: Arc::new(tex), egui_id: id,
+                width: w, height: h,
+                frame_idx: 0, timestamp_s: ts,
+            });
+            self.full_res_key = key;
+        }
+    }
+
     /// Drain whatever's in the frame channel, register the newest
     /// frame's texture with egui (freeing the previous one).
     ///
@@ -355,7 +700,13 @@ impl App {
         // Register the new texture. Use a view of the SBS texture as
         // the egui-side handle. wgpu::Texture is Arc internally so
         // keeping our own Arc + handing eframe a view is fine.
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // sRGB view so egui decodes our Rec.709-gamma SBS to linear on
+        // sample (egui re-applies the OETF) — prevents the double-gamma that
+        // made the preview look washed out vs the export.
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            ..Default::default()
+        });
         let id = renderer.register_native_texture(
             &self.pipeline.device, &view, wgpu::FilterMode::Linear,
         );
@@ -378,11 +729,10 @@ impl App {
     fn pick_and_load_file(&mut self) {
         let path = rfd::FileDialog::new()
             .add_filter(
-                "All supported (.360 / .osv / .braw / .mp4 / .mov)",
+                "All supported video",
                 &["360", "osv", "OSV", "braw", "BRAW",
                   "mp4", "MP4", "mov", "MOV"],
             )
-            .add_filter("GoPro Max (.360)", &["360"])
             .add_filter("DJI Osmo 360 (.osv)", &["osv", "OSV"])
             .add_filter("Blackmagic RAW (.braw)", &["braw", "BRAW"])
             .add_filter("Side-by-side fisheye (.mp4 / .mov)",
@@ -392,9 +742,11 @@ impl App {
     }
 
     fn load_file(&mut self, path: PathBuf) {
+        let t_load = std::time::Instant::now();
         // ── Tear down everything tied to the previous clip ──────────
         // 1. Stop the decoder thread + drop the IPC channels.
         self.stop_playback();
+        tracing::info!("load_timing: after stop_playback @ {:?}", t_load.elapsed());
         // 2. Free the egui-registered preview texture from the old
         //    clip. Without this the previous frame stays painted in
         //    the central panel until the new decoder produces output.
@@ -404,18 +756,18 @@ impl App {
             // Dropping `prev.texture` (the Arc<wgpu::Texture>) below
             // releases the GPU memory when the last reference goes.
         }
-        // 3. Reset volatile playback state. The user's persistent
-        //    preferences (stabilize toggle, preview_eye_w) stay.
+        // 3. Reset volatile playback state. Everything in `Settings` is now
+        //    REMEMBERED across loads (and across launches, via
+        //    `Settings::save_persisted`) — stabilization, view-adjust,
+        //    per-eye override / calibration, output mode, color, LUT — so a
+        //    new clip keeps your last setup. The only exception is the trim
+        //    range, which is clip-specific (time offsets) and would be
+        //    meaningless on a different clip. Per-clip camera defaults
+        //    (preset + built-in LUT) below only fill in still-unset values,
+        //    so an explicit choice always wins.
         self.fps_stats = FpsStats::default();
         self.settings.trim_in_s = None;
         self.settings.trim_out_s = None;
-        self.settings.fisheye_preset.clear();
-        self.settings.fisheye_fov_deg = 0.0;
-        self.settings.fisheye_k = [0.0; 4];
-        self.settings.fisheye_cx_offset_px = 0.0;
-        self.settings.fisheye_cy_offset_px = 0.0;
-        self.settings.fisheye_swap_eyes = false;
-        self.settings.fisheye_output_mode = crate::decoder::FisheyeOutputMode::HalfEquirect;
         // 4. Drop ClipInfo + path so the sidebar shows "no file"
         //    momentarily if probe / detection below fails.
         self.clip = None;
@@ -433,6 +785,7 @@ impl App {
                 return;
             }
         };
+        tracing::info!("load_timing: after probe_video @ {:?}", t_load.elapsed());
         let dims = vr180_core::eac::Dims::new(probe.width, probe.height);
 
         // GoPro family: parse GPMF + GEOC for metadata display.
@@ -477,7 +830,11 @@ impl App {
         // Unconditional — we just cleared it above, so this lands the
         // right default for the NEW clip regardless of what the prior
         // clip was.
-        if source_kind != vr180_pipeline::SourceKind::GoProEac {
+        // Per-camera default preset — only when none is set yet, so a
+        // remembered/explicit choice is preserved.
+        if source_kind != vr180_pipeline::SourceKind::GoProEac
+            && self.settings.fisheye_preset.is_empty()
+        {
             let auto = match source_kind {
                 vr180_pipeline::SourceKind::DjiOsv        => "DJI Osmo 360",
                 vr180_pipeline::SourceKind::BlackmagicRaw => "Blackmagic Pyxis 12K",
@@ -485,11 +842,23 @@ impl App {
             };
             self.settings.fisheye_preset = auto.to_string();
         }
+        // Autoload the embedded DJI Osmo 360 "D-Log M → Rec.709" LUT for OSV
+        // footage so the preview and export show corrected Rec.709 color by
+        // default — but only when no LUT is set, so a remembered choice (a
+        // different LUT, or a deliberately cleared one within a session) is
+        // preserved. The user can clear or swap it in the Color panel.
+        if source_kind == vr180_pipeline::SourceKind::DjiOsv
+            && self.settings.lut_path.is_empty()
+        {
+            self.settings.lut_path = crate::decoder::BUILTIN_OSMO_LUT_PATH.to_string();
+            self.settings.lut_intensity = 1.0;
+        }
         // Snapshot settings so the next spawn_decoder doesn't bump
         // generation unnecessarily on the first frame.
         self.last_pushed_settings = self.settings.clone();
 
         let segments = vr180_core::segments::detect_segments(&path);
+        tracing::info!("load_timing: after detect_segments @ {:?}", t_load.elapsed());
 
         self.clip = Some(ClipInfo {
             width: probe.width, height: probe.height,
@@ -502,19 +871,34 @@ impl App {
             fisheye_eye_w, fisheye_eye_h,
         });
         self.loaded_path = Some(path);
+        // Kick off the decoder in paused state right away so the first
+        // frame paints without forcing the user to press Play. The pause
+        // loop in the decoder is wired to skip its sleep on the FIRST
+        // pulled pair, so the user sees the clip's opening frame and
+        // can immediately use the view-adjust / stabilization sliders.
+        self.spawn_decoder(true);
+        tracing::info!("load_timing: load_file TOTAL @ {:?}", t_load.elapsed());
     }
 
     // ─── Playback control ────────────────────────────────────────
 
     /// Spawn a fresh decoder thread. Used when starting playback on a
     /// freshly loaded clip (or when explicitly Stop'd and restarted).
-    fn spawn_decoder(&mut self) {
+    /// `start_paused = true` puts the decoder in paused state from the
+    /// outset — the worker still pulls the first pair and the main
+    /// loop still renders it once (because the pause loop is skipped
+    /// when a new pair has just been pulled), so the user sees the
+    /// first frame without having to press Play.
+    fn spawn_decoder(&mut self, start_paused: bool) {
         let Some(path) = self.loaded_path.clone() else {
             tracing::warn!("spawn_decoder: no path loaded");
             return;
         };
         self.stop_playback();
-        tracing::info!("spawn_decoder: starting decoder for {}", path.display());
+        tracing::info!(
+            "spawn_decoder: starting decoder for {} (paused={})",
+            path.display(), start_paused
+        );
         let cfg = DecoderConfig {
             path,
             settings: self.settings.clone(),
@@ -523,9 +907,10 @@ impl App {
         let (frame_tx, frame_rx) = crossbeam_channel::bounded(2);
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let control = Arc::new(DecoderControl {
-            paused: std::sync::atomic::AtomicBool::new(false),
+            paused: std::sync::atomic::AtomicBool::new(start_paused),
             settings: parking_lot::RwLock::new(self.settings.clone()),
             settings_generation: std::sync::atomic::AtomicU64::new(0),
+            detected_calib: parking_lot::Mutex::new(None),
         });
         let pipeline = self.pipeline.clone();
         let control_for_thread = control.clone();
@@ -539,10 +924,28 @@ impl App {
         self.frame_rx = Some(frame_rx);
         self.cmd_tx = Some(cmd_tx);
         self.control = Some(control);
-        self.playing = true;
+        self.playing = !start_paused;
         self.decoder_alive = true;
         self.last_pushed_settings = self.settings.clone();
         self.fps_stats = FpsStats::default();
+
+        // Spawn the audio player alongside the video decoder. It runs
+        // its own thread + cpal output stream and is held by the App
+        // for the lifetime of the playback session.
+        if let Some(audio_path) = self.loaded_path.clone() {
+            let t_audio = std::time::Instant::now();
+            self.audio_player = match crate::audio_player::AudioPlayer::open(
+                audio_path, start_paused,
+            ) {
+                Ok(Some(player)) => Some(player),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("audio_player: open failed: {e}");
+                    None
+                }
+            };
+            tracing::info!("load_timing: AudioPlayer::open @ {:?}", t_audio.elapsed());
+        }
     }
 
     /// Toggle play/pause. If no decoder is alive yet, this kicks off
@@ -551,13 +954,16 @@ impl App {
     /// exactly where pause left it.
     fn toggle_play_pause(&mut self) {
         if !self.decoder_alive {
-            self.spawn_decoder();
+            self.spawn_decoder(false); // Play button → start playing
             return;
         }
         if let Some(ctl) = &self.control {
             self.playing = !self.playing;
             ctl.paused.store(!self.playing, Ordering::SeqCst);
             tracing::info!("toggle_play_pause: playing={}", self.playing);
+        }
+        if let Some(player) = &self.audio_player {
+            player.set_playing(self.playing);
         }
     }
 
@@ -566,10 +972,13 @@ impl App {
     /// position via the regular pipeline).
     fn seek_to(&mut self, target_s: f64) {
         if !self.decoder_alive {
-            self.spawn_decoder();
+            self.spawn_decoder(false);
         }
         if let Some(tx) = &self.cmd_tx {
             let _ = tx.send(DecoderCommand::Seek(target_s.max(0.0)));
+        }
+        if let Some(player) = &self.audio_player {
+            player.seek_to(target_s.max(0.0));
         }
     }
 
@@ -686,6 +1095,9 @@ impl App {
         self.control = None;
         self.playing = false;
         self.decoder_alive = false;
+        // Drop the audio player: cpal stream stops, worker thread
+        // shuts down (Stop command).
+        self.audio_player = None;
     }
 
     /// Diff `self.settings` against `last_pushed_settings`; if changed,
@@ -702,6 +1114,134 @@ impl App {
         }
         self.last_pushed_settings = self.settings.clone();
     }
+
+    /// Persist settings to disk when they change. Debounced: writes at most
+    /// every ~1.2 s during continuous edits (a slider drag), and flushes
+    /// IMMEDIATELY when the window is closing so a last-moment tweak isn't
+    /// lost (eframe's own storage is disabled here).
+    fn persist_settings(&mut self, ctx: &egui::Context) {
+        if self.settings == self.last_saved_settings {
+            return;
+        }
+        let closing = ctx.input(|i| i.viewport().close_requested());
+        if closing
+            || self.last_settings_save_at.elapsed() >= std::time::Duration::from_millis(1200)
+        {
+            self.settings.save_persisted();
+            self.last_saved_settings = self.settings.clone();
+            self.last_settings_save_at = std::time::Instant::now();
+        }
+    }
+
+    /// Draw the floating export-options window when `export_opts_visible`
+    /// is set. The window is dismissable; "Start Export…" hands off to
+    /// `commit_export()` which pops the save-file dialog and spawns the
+    /// encode worker.
+    fn draw_export_options_window(&mut self, ctx: &egui::Context) {
+        if !self.export_opts_visible { return; }
+        let mut open = true;
+        let mut commit = false;
+        egui::Window::new("Export options")
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(360.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let opts = &mut self.export_opts;
+                ui.label(RichText::new("Codec").strong());
+                egui::ComboBox::from_id_source("export_codec")
+                    .selected_text(opts.codec.label())
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut opts.codec, ExportCodec::H265,   ExportCodec::H265.label());
+                        ui.selectable_value(&mut opts.codec, ExportCodec::ProRes, ExportCodec::ProRes.label());
+                    });
+                ui.add_space(8.0);
+
+                match opts.codec {
+                    ExportCodec::H265 => {
+                        ui.label(RichText::new("H.265 bitrate").strong());
+                        ui.add(egui::Slider::new(&mut opts.h265_bitrate_mbps, 20..=500)
+                            .text("Mbps"));
+                        ui.add_space(4.0);
+                        // 10-bit (Main10) is the default and stays 10-bit
+                        // end-to-end; 8-bit (Main) is offered for users who
+                        // need the wider-compatibility profile.
+                        ui.label(RichText::new("Bit depth").strong());
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut opts.h265_bit_depth, 10u8, "10-bit (Main10)");
+                            ui.selectable_value(&mut opts.h265_bit_depth, 8u8,  "8-bit (Main)");
+                        });
+                    }
+                    ExportCodec::ProRes => {
+                        ui.label(RichText::new("ProRes profile").strong());
+                        egui::ComboBox::from_id_source("prores_profile")
+                            .selected_text(opts.prores_profile.label())
+                            .width(220.0)
+                            .show_ui(ui, |ui| {
+                                use ProResProfile::*;
+                                for p in [Proxy, Lt, Standard, Hq, P4444, P4444Xq] {
+                                    ui.selectable_value(&mut opts.prores_profile, p, p.label());
+                                }
+                            });
+                    }
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(RichText::new("VR180 metadata").strong());
+                // Mutually exclusive — they overwrite the same atoms.
+                // Show as radio so it's obvious only one is active.
+                #[derive(PartialEq, Eq, Copy, Clone)]
+                enum MetaTarget { None, Apmp, Youtube }
+                let mut target = match (opts.inject_apmp, opts.inject_youtube) {
+                    (true, _)        => MetaTarget::Apmp,
+                    (false, true)    => MetaTarget::Youtube,
+                    _                => MetaTarget::None,
+                };
+                ui.radio_value(&mut target, MetaTarget::Apmp,
+                    "Apple Vision Pro (APMP — vexu + hfov)");
+                if matches!(target, MetaTarget::Apmp) {
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        ui.label("Camera baseline");
+                        ui.add(egui::Slider::new(&mut opts.apmp_baseline_mm, 30.0..=120.0)
+                            .suffix(" mm").fixed_decimals(1));
+                    });
+                }
+                ui.radio_value(&mut target, MetaTarget::Youtube,
+                    "YouTube (Spherical V2 — st3d + sv3d)");
+                ui.radio_value(&mut target, MetaTarget::None,
+                    "None (no VR180 metadata)");
+                opts.inject_apmp    = matches!(target, MetaTarget::Apmp);
+                opts.inject_youtube = matches!(target, MetaTarget::Youtube);
+                ui.label(RichText::new(
+                    "APMP and Spatial V2 conflict in the same atoms, so \
+                     only one can be active per file. Re-run the export \
+                     with the other target if you need a second copy."
+                ).small().color(Color32::GRAY));
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        commit = false;
+                        self.export_opts_visible = false;
+                    }
+                    ui.add_space(8.0);
+                    let label = match opts.codec {
+                        ExportCodec::H265   => "Start Export… (H.265)",
+                        ExportCodec::ProRes => "Start Export… (ProRes)",
+                    };
+                    if ui.button(RichText::new(label).strong()).clicked() {
+                        commit = true;
+                    }
+                });
+            });
+        if !open { self.export_opts_visible = false; }
+        if commit { self.commit_export(); }
+    }
 }
 
 impl eframe::App for App {
@@ -711,6 +1251,10 @@ impl eframe::App for App {
         self.drain_frames(ctx);
         // Drain export-job progress + check for completion.
         self.poll_export_job();
+        // Drive the full-res still for the zoom magnifier.
+        self.poll_full_res(ctx);
+        // Export options floating window (shown on Export click).
+        self.draw_export_options_window(ctx);
         // Force a continuous repaint while an export is in flight so
         // the progress bar updates without needing mouse input.
         if self.export_job.is_some() {
@@ -773,7 +1317,7 @@ impl eframe::App for App {
                     ui.label(RichText::new("▶ VR180 Silver Bullet Neo")
                         .strong().color(Color32::from_rgb(90, 166, 255)));
                     ui.separator();
-                    if ui.button("Open .360…").clicked() {
+                    if ui.button("Load video…").clicked() {
                         self.pick_and_load_file();
                     }
 
@@ -799,6 +1343,20 @@ impl eframe::App for App {
                                 ui.selectable_value(&mut self.settings.preview_eye_w, w,
                                     format!("{w}"));
                             }
+                        });
+
+                    ui.separator();
+                    ui.label(RichText::new("View").color(Color32::GRAY));
+                    egui::ComboBox::from_id_source("preview_mode_combo")
+                        .selected_text(self.settings.preview_mode.as_str())
+                        .show_ui(ui, |ui| {
+                            use crate::decoder::PreviewMode as M;
+                            ui.selectable_value(&mut self.settings.preview_mode,
+                                M::Sbs, M::Sbs.as_str());
+                            ui.selectable_value(&mut self.settings.preview_mode,
+                                M::Anaglyph, M::Anaglyph.as_str());
+                            ui.selectable_value(&mut self.settings.preview_mode,
+                                M::Overlay50, M::Overlay50.as_str());
                         });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -843,21 +1401,48 @@ impl eframe::App for App {
             .default_width(300.0)
             .min_width(240.0)
             .show(ctx, |ui| {
+              // Scroll the controls vertically so every section stays
+              // reachable even when many are expanded / the window is short.
+              egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
                 ui.add_space(8.0);
                 egui::CollapsingHeader::new(RichText::new("Source").strong())
                     .default_open(true)
                     .show(ui, |ui| { self.draw_source_info(ui); });
 
-                // Fisheye sources (OSV / SBS / BRAW) get the
-                // camera-preset / FOV / KB panel. GoPro EAC keeps
-                // the existing stabilization + RS panels.
+                // Fisheye sources (OSV / SBS / BRAW): Stabilization +
+                // Output are top-level sections; the camera-preset /
+                // per-eye FOV / center / KB panel is its own (collapsed)
+                // section. GoPro EAC keeps the existing stab + RS panels.
                 if matches!(kind, Some(k) if k.is_fisheye()) {
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new("Stabilization").strong()
+                    )
+                    .default_open(true)
+                    .show(ui, |ui| { self.draw_fisheye_stab_panel(ui); });
+
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new("Output").strong()
+                    )
+                    .default_open(true)
+                    .show(ui, |ui| { self.draw_fisheye_output_panel(ui); });
+
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new(
                         RichText::new("Fisheye lens").strong()
                     )
-                    .default_open(true)
+                    .default_open(false)
                     .show(ui, |ui| { self.draw_fisheye_panel(ui); });
+
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new("View adjustment").strong()
+                    )
+                    .default_open(false)
+                    .show(ui, |ui| { self.draw_view_adjust_panel(ui); });
                 } else {
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new(
@@ -873,6 +1458,14 @@ impl eframe::App for App {
                     .default_open(true)
                     .show(ui, |ui| { self.draw_rs_panel(ui); });
                 }
+
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new(
+                    RichText::new("Color").strong()
+                )
+                .default_open(false)
+                .show(ui, |ui| { self.draw_color_panel(ui); });
+                }); // ScrollArea
             });
 
         // ─── Bottom: status bar + transport ─────────────────────
@@ -950,19 +1543,102 @@ impl eframe::App for App {
 
         // ─── Main preview area ──────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(d) = &self.current_display {
+            // Copy out the display handle so we can borrow `self` mutably for
+            // the zoom/pan state below. When zoomed + paused we show the
+            // `DetailCache` still — but only while it's CURRENT for both the
+            // live frame and the live settings (`full_res_key == desired`).
+            // During a drag/scrub the desired key moves ahead, so we show the
+            // live preview instead: it renders on the decoder thread (so the
+            // adjustment stays responsive) and is now frame-aligned with the
+            // still, so the swap to the crisp still on settle doesn't shift.
+            let cur_ts = self.current_display.as_ref()
+                .map(|d| d.timestamp_s).unwrap_or(0.0);
+            let use_full_res = self.preview_zoom > 1.001 && !self.playing
+                && self.full_res_key == self.full_res_desired_key
+                && self.full_res_display.as_ref()
+                    .map(|d| (d.timestamp_s - cur_ts).abs() < 0.02).unwrap_or(false);
+            let disp = if use_full_res {
+                self.full_res_display.as_ref()
+            } else {
+                self.current_display.as_ref()
+            }.map(|d| (d.egui_id, d.width, d.height));
+            if let Some((egui_id, dw, dh)) = disp {
                 let avail = ui.available_size();
-                let aspect = d.width as f32 / d.height as f32;
+                let aspect = dw as f32 / dh as f32;
                 // Fit-to-area with aspect ratio preserved.
                 let (w, h) = if avail.x / avail.y > aspect {
                     (avail.y * aspect, avail.y)
                 } else {
                     (avail.x, avail.x / aspect)
                 };
-                let sized = egui::load::SizedTexture::new(d.egui_id, egui::vec2(w, h));
-                ui.centered_and_justified(|ui| {
-                    ui.add(egui::Image::new(sized).fit_to_exact_size(egui::vec2(w, h)));
-                });
+
+                // Centered image rect + an interaction region over exactly
+                // that rect (for scroll-zoom and drag-pan).
+                let img_rect = egui::Rect::from_center_size(
+                    ui.max_rect().center(), egui::vec2(w, h));
+                let resp = ui.interact(
+                    img_rect, ui.id().with("preview_zoom"),
+                    egui::Sense::click_and_drag());
+
+                let zoom = &mut self.preview_zoom;
+                let center = &mut self.preview_center;
+
+                // Scroll → zoom toward the cursor.
+                if resp.hovered() {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll.abs() > 0.01 {
+                        let old_z = *zoom;
+                        let new_z = (*zoom * (1.0 + scroll * 0.002)).clamp(1.0, 64.0);
+                        if let Some(p) = resp.hover_pos() {
+                            // UV under the cursor, kept fixed across the zoom.
+                            let f = egui::vec2(
+                                ((p.x - img_rect.left()) / w).clamp(0.0, 1.0) - 0.5,
+                                ((p.y - img_rect.top()) / h).clamp(0.0, 1.0) - 0.5,
+                            );
+                            let uv_cur = *center + f / old_z;
+                            *zoom = new_z;
+                            *center = uv_cur - f / new_z;
+                        } else {
+                            *zoom = new_z;
+                        }
+                    }
+                }
+                // Drag → pan (only meaningful when zoomed in).
+                if resp.dragged() && *zoom > 1.0 {
+                    let d = resp.drag_delta();
+                    center.x -= d.x / (w * *zoom);
+                    center.y -= d.y / (h * *zoom);
+                }
+                // Double-click → reset to fit.
+                if resp.double_clicked() {
+                    *zoom = 1.0;
+                    *center = egui::vec2(0.5, 0.5);
+                }
+
+                // Clamp the visible window inside [0,1] so we never show
+                // outside the image.
+                let half = 0.5 / *zoom;
+                center.x = center.x.clamp(half, 1.0 - half);
+                center.y = center.y.clamp(half, 1.0 - half);
+                let uv = egui::Rect::from_min_max(
+                    egui::pos2(center.x - half, center.y - half),
+                    egui::pos2(center.x + half, center.y + half),
+                );
+
+                // Paint the (sub-rect of the) texture into the fitted rect.
+                let sized = egui::load::SizedTexture::new(egui_id, egui::vec2(w, h));
+                egui::Image::new(sized).uv(uv).paint_at(ui, img_rect);
+
+                // Zoom readout + reset hint, top-left overlay.
+                let painter = ui.painter_at(img_rect);
+                painter.text(
+                    img_rect.left_top() + egui::vec2(8.0, 8.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{:.0}%  (scroll = zoom, drag = pan, dbl-click = reset)",
+                        *zoom * 100.0),
+                    egui::FontId::proportional(12.0),
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 180),
+                );
             } else if self.loaded_path.is_some() {
                 ui.centered_and_justified(|ui| {
                     ui.label(RichText::new("Click ▶ Play to start preview.")
@@ -973,7 +1649,7 @@ impl eframe::App for App {
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new("🎬").size(48.0));
                         ui.add_space(8.0);
-                        ui.label(RichText::new("Drop a .360 file here, or click Open .360.")
+                        ui.label(RichText::new("Drop a video file here, or click Load video.")
                             .size(13.0).color(Color32::GRAY));
                     });
                 });
@@ -982,11 +1658,17 @@ impl eframe::App for App {
 
         // Push slider edits to the running decoder.
         self.maybe_push_settings();
+        // Remember settings across launches (debounced; flushes on close).
+        self.persist_settings(ctx);
 
-        // While the decoder is producing frames, keep the UI awake so
-        // the next frame draws without waiting for a user input event.
-        if self.playing {
-            ctx.request_repaint_after(std::time::Duration::from_millis(8));
+        // Keep the UI awake whenever a decoder is running so the next
+        // frame draws without waiting for a user input event.
+        // - playing: 125 Hz, matches the source frame budget
+        // - paused but alive: 20 Hz, enough to display slider-driven
+        //   re-renders the decoder thread pushes into frame_rx.
+        if self.decoder_alive {
+            let delay_ms = if self.playing { 8 } else { 50 };
+            ctx.request_repaint_after(std::time::Duration::from_millis(delay_ms));
         }
     }
 }
@@ -1102,49 +1784,209 @@ impl App {
         });
     }
 
-    /// Settings panel for fisheye sources (OSV / SBS / BRAW). Mirrors
-    /// the Python app's lens parameters at vr180_gui.py:5500+. All
-    /// sliders apply live during playback — bumping
-    /// `settings_generation` makes the decoder re-resolve the
-    /// `FisheyeCalib` on the next frame.
-    fn draw_fisheye_panel(&mut self, ui: &mut egui::Ui) {
-        let presets = vr180_fisheye::presets::presets();
+    /// Global pano-map + per-eye stereo offset. Ports the Python
+    /// app's sliders at `vr180_gui.py:10654-10681` plus the per-eye
+    /// composition at `vr180_gui.py:12789-12804`. Applied after
+    /// stabilization, so default-0 is a no-op even when stab is on.
+    /// Color grading panel — port of the CDL / LUT / temp-tint-sat
+    /// controls from the Python app (`vr180_gui.py:11132-11290`).
+    /// All knobs apply live to the preview through the
+    /// `Settings::build_color_stack()` plumbing.
+    fn draw_color_panel(&mut self, ui: &mut egui::Ui) {
+        let s = &mut self.settings;
+
+        // CDL: lift / gamma / gain / shadow / highlight.
+        ui.label(RichText::new("Tone (CDL)").strong());
+        ui.add(egui::Slider::new(&mut s.lift, -1.0..=1.0)
+            .text("Lift").fixed_decimals(2));
+        ui.add(egui::Slider::new(&mut s.gamma, 0.2..=3.0)
+            .text("Gamma").fixed_decimals(2));
+        ui.add(egui::Slider::new(&mut s.gain, 0.2..=3.0)
+            .text("Gain").fixed_decimals(2));
+        ui.add(egui::Slider::new(&mut s.shadow, -1.0..=1.0)
+            .text("Shadow").fixed_decimals(2));
+        ui.add(egui::Slider::new(&mut s.highlight, -1.0..=1.0)
+            .text("Highlight").fixed_decimals(2));
+        if ui.button("Reset tone").clicked() {
+            s.lift = 0.0; s.gamma = 1.0; s.gain = 1.0;
+            s.shadow = 0.0; s.highlight = 0.0;
+        }
+
+        ui.separator();
+
+        // White balance + saturation.
+        ui.label(RichText::new("White balance").strong());
+        ui.add(egui::Slider::new(&mut s.temperature, -1.0..=1.0)
+            .text("Temperature").fixed_decimals(2));
+        ui.add(egui::Slider::new(&mut s.tint, -1.0..=1.0)
+            .text("Tint").fixed_decimals(2));
+        ui.add(egui::Slider::new(&mut s.saturation, 0.0..=2.0)
+            .text("Saturation").fixed_decimals(2));
+        if ui.button("Reset color").clicked() {
+            s.temperature = 0.0; s.tint = 0.0; s.saturation = 1.0;
+        }
+
+        ui.separator();
+
+        // 3D LUT.
+        ui.label(RichText::new("3D LUT (.cube)").strong());
+        ui.horizontal(|ui| {
+            let mut label = if s.lut_path.is_empty() {
+                "(none)".to_string()
+            } else if s.lut_path == crate::decoder::BUILTIN_OSMO_LUT_PATH {
+                crate::decoder::BUILTIN_OSMO_LUT_NAME.to_string()
+            } else {
+                std::path::Path::new(&s.lut_path)
+                    .file_name().and_then(|f| f.to_str()).unwrap_or("(invalid)")
+                    .to_string()
+            };
+            ui.add(egui::TextEdit::singleline(&mut label).interactive(false).desired_width(160.0));
+            if ui.button("Browse…").clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Cube LUT", &["cube", "CUBE"])
+                    .pick_file()
+                {
+                    s.lut_path = p.to_string_lossy().to_string();
+                }
+            }
+            if ui.button("Clear").clicked() {
+                s.lut_path.clear();
+            }
+        });
+        // Quick re-apply of the embedded Osmo 360 D-LogM → Rec.709 LUT
+        // (autoloaded for OSV clips; offered here in case it was cleared).
+        if s.lut_path != crate::decoder::BUILTIN_OSMO_LUT_PATH
+            && ui.button("Use built-in Osmo 360 D-LogM→709").clicked()
+        {
+            s.lut_path = crate::decoder::BUILTIN_OSMO_LUT_PATH.to_string();
+            s.lut_intensity = 1.0;
+        }
+        ui.add_enabled_ui(!s.lut_path.is_empty(), |ui| {
+            ui.add(egui::Slider::new(&mut s.lut_intensity, 0.0..=1.0)
+                .text("Intensity").fixed_decimals(2));
+        });
+    }
+
+    fn draw_view_adjust_panel(&mut self, ui: &mut egui::Ui) {
+        let zoom = self.preview_zoom;
+        let s = &mut self.settings;
+        ui.label(RichText::new("Global (both eyes)").small().color(Color32::GRAY));
+        if zoom > 1.001 {
+            ui.label(RichText::new(format!("fine drag ×{:.0} (zoomed)", zoom))
+                .small().color(Color32::from_rgb(120, 180, 120)));
+        }
+        // Rotational alignment: extra-fine (0.15×) on top of the zoom
+        // scaling, since these need sub-degree precision.
+        let rot_fine = 0.15;
+        // Global pano-map: Up/Down arrows step 0.1° per press.
+        let pano_key_step = 0.1;
+        fine_slider(ui, zoom, &mut s.pano_yaw_deg, -180.0..=180.0, "Yaw (°)", 3, rot_fine, pano_key_step);
+        fine_slider(ui, zoom, &mut s.pano_pitch_deg, -90.0..=90.0, "Pitch (°)", 3, rot_fine, pano_key_step);
+        fine_slider(ui, zoom, &mut s.pano_roll_deg, -45.0..=45.0, "Roll (°)", 3, rot_fine, pano_key_step);
+        ui.add_space(4.0);
+        ui.label(RichText::new("Stereo offset (right = +, left = −)")
+            .small().color(Color32::GRAY));
+        // Stereo offset: Up/Down arrows step 0.01° per press.
+        let stereo_key_step = 0.01;
+        fine_slider(ui, zoom, &mut s.stereo_yaw_deg, -10.0..=10.0, "Yaw (°)", 3, rot_fine, stereo_key_step);
+        fine_slider(ui, zoom, &mut s.stereo_pitch_deg, -10.0..=10.0, "Pitch (°)", 3, rot_fine, stereo_key_step);
+        fine_slider(ui, zoom, &mut s.stereo_roll_deg, -10.0..=10.0, "Roll (°)", 3, rot_fine, stereo_key_step);
+        ui.add_space(4.0);
+        if ui.button("Reset to 0").clicked() {
+            s.pano_yaw_deg = 0.0;
+            s.pano_pitch_deg = 0.0;
+            s.pano_roll_deg = 0.0;
+            s.stereo_yaw_deg = 0.0;
+            s.stereo_pitch_deg = 0.0;
+            s.stereo_roll_deg = 0.0;
+        }
+    }
+
+    /// Stabilization panel for fisheye sources (own sidebar section).
+    fn draw_fisheye_stab_panel(&mut self, ui: &mut egui::Ui) {
         let kind = self.clip.as_ref().map(|c| c.source_kind);
         let is_braw = matches!(kind, Some(vr180_pipeline::SourceKind::BlackmagicRaw));
         let is_osv  = matches!(kind, Some(vr180_pipeline::SourceKind::DjiOsv));
         let s = &mut self.settings;
 
-        // ── Stabilization (BRAW VQF + DJI OSV direct-quat). SBS
-        //    fisheye is identity until per-camera gyro parsers land
-        //    (Insta360 / Vuze / Canon each different).
-        if is_braw || is_osv {
-            let stab_label = if is_braw {
-                "Stabilization (VQF 6D, BRAW)"
-            } else {
-                "Stabilization (DJI camera quats)"
-            };
-            ui.checkbox(&mut s.stabilize, stab_label);
-            ui.add_enabled_ui(s.stabilize, |ui| {
-                if is_osv {
-                    // OSV is hard-locked to pure camera-lock: target
-                    // is frame 0 for every frame, no per-frame
-                    // correction cap. Neither slider applies here, so
-                    // both are hidden — only the mode label.
-                    ui.label(RichText::new(
-                        "Mode: camera-lock (frame 0, no cap)"
-                    ).small().color(Color32::from_rgb(180, 180, 180)));
-                }
-                // BRAW VQF currently has no smoothing/cap knobs —
-                // the per-frame quat IS the smoothed output of VQF
-                // itself. Future task could add a post-VQF EMA pass.
-            });
+        if !(is_braw || is_osv) {
             ui.label(RichText::new(
-                "Stab toggle is live during playback — first time \
-                 you flip it on, gyro extraction runs (~1 s stutter). \
-                 Sliders apply live too."
+                "No gyro stabilization available for this source yet."
             ).small().color(Color32::GRAY));
-            ui.separator();
+            return;
         }
+        let stab_label = if is_braw {
+            "Stabilization (VQF 6D, BRAW)"
+        } else {
+            "Stabilization (DJI camera quats)"
+        };
+        ui.checkbox(&mut s.stabilize, stab_label);
+        ui.add_enabled_ui(s.stabilize, |ui| {
+            if is_osv {
+                // smooth_ms = 0 → sharp camera-lock (legacy).
+                // smooth_ms > 0 → soft-stab (GoPro-style).
+                ui.add(egui::Slider::new(&mut s.dji_smooth_ms, 0.0..=3000.0)
+                    .text("Smooth (ms)  0 = sharp lock, > 0 = soft-stab"));
+                ui.add(egui::Slider::new(&mut s.dji_max_corr_deg, 0.0..=45.0)
+                    .text("Max corr (°)  0 = no cap"));
+            }
+        });
+        ui.label(RichText::new(
+            "Stab toggle is live during playback — first time you flip \
+             it on, gyro extraction runs (~1 s stutter). Sliders apply \
+             live too."
+        ).small().color(Color32::GRAY));
+    }
+
+    /// Output panel for fisheye sources — projection target + L↔R swap.
+    fn draw_fisheye_output_panel(&mut self, ui: &mut egui::Ui) {
+        let is_osv = matches!(
+            self.clip.as_ref().map(|c| c.source_kind),
+            Some(vr180_pipeline::SourceKind::DjiOsv)
+        );
+        let s = &mut self.settings;
+
+        ui.horizontal(|ui| {
+            ui.label("Format");
+            egui::ComboBox::from_id_source("fisheye_output_mode")
+                .selected_text(s.fisheye_output_mode.as_str())
+                .show_ui(ui, |ui| {
+                    use crate::decoder::FisheyeOutputMode as M;
+                    ui.selectable_value(&mut s.fisheye_output_mode,
+                        M::HalfEquirect, "Half-equirect (VR180)");
+                    ui.selectable_value(&mut s.fisheye_output_mode,
+                        M::Fisheye, "Fisheye SBS");
+                });
+        });
+        ui.label(RichText::new(
+            "Fisheye SBS = stabilized circular fisheye per eye in a 2×side \
+             SBS frame. Stab, panomap, stereo-offset all apply just like \
+             the VR180 mode; per-eye FOV controls output FOV."
+        ).small().color(Color32::GRAY));
+
+        if is_osv {
+            ui.add_space(4.0);
+            ui.checkbox(&mut s.fisheye_swap_eyes, "Swap L↔R eyes");
+        }
+    }
+
+    /// Per-eye lens calibration panel (camera preset + per-eye FOV /
+    /// center / KB + Gyroflow load). Mirrors the Python app's lens
+    /// parameters. All sliders apply live during playback.
+    fn draw_fisheye_panel(&mut self, ui: &mut egui::Ui) {
+        let presets = vr180_fisheye::presets::presets();
+        // Native per-eye pixel dims, used to display the principal point
+        // as absolute pixels (stored normalized internally). Falls back
+        // to 1.0 (so we'd show the raw normalized value) if unknown.
+        let (native_w, native_h) = self.clip.as_ref()
+            .map(|c| (c.fisheye_eye_w.max(1) as f32, c.fisheye_eye_h.max(1) as f32))
+            .unwrap_or((1.0, 1.0));
+        // In-file per-eye calibration the decoder resolved (OSV protobuf).
+        // Used to display the actual values + seed the Override fields.
+        let detected = self.control.as_ref()
+            .and_then(|c| *c.detected_calib.lock());
+        let zoom = self.preview_zoom;
+        let s = &mut self.settings;
 
         // ── Preset dropdown ─────────────────────────────────────
         ui.horizontal(|ui| {
@@ -1158,107 +2000,57 @@ impl App {
                 .selected_text(current)
                 .width(200.0)
                 .show_ui(ui, |ui| {
-                    if ui.selectable_label(s.fisheye_preset.is_empty(), "(Auto)").clicked() {
-                        s.fisheye_preset.clear();
-                    }
-                    for p in presets {
+                    // Only the cameras relevant to this project are offered:
+                    // the DJI Osmo 360 and a Custom slot. (Empty preset still
+                    // auto-resolves to the Osmo 360 for OSV clips.)
+                    for p in presets.iter()
+                        .filter(|p| p.name == "DJI Osmo 360" || p.name == "Custom")
+                    {
                         let selected = s.fisheye_preset == p.name;
                         if ui.selectable_label(selected, p.name).clicked() {
                             s.fisheye_preset = p.name.to_string();
-                            // Reset overrides so the preset's values
-                            // take effect immediately. The user can
-                            // then nudge the FOV / KB sliders.
-                            s.fisheye_fov_deg = 0.0;
-                            s.fisheye_k = [0.0; 4];
-                            s.fisheye_cx_offset_px = 0.0;
-                            s.fisheye_cy_offset_px = 0.0;
                         }
                     }
                 });
         });
 
-        // ── FOV / lens-offset / KB sliders ──────────────────────
-        ui.add_space(2.0);
+        let preset_default_fov = presets
+            .iter().find(|p| p.name == s.fisheye_preset)
+            .map(|p| p.default_fov_deg as f32)
+            .unwrap_or(180.0);
+        let preset_k: [f32; 4] = presets
+            .iter().find(|p| p.name == s.fisheye_preset)
+            .map(|p| [p.calib.k[0] as f32, p.calib.k[1] as f32,
+                      p.calib.k[2] as f32, p.calib.k[3] as f32])
+            .unwrap_or([0.0; 4]);
 
-        // FOV override. 0 = use preset default; otherwise this value wins.
-        let mut fov_enabled = s.fisheye_fov_deg > 0.0;
-        ui.checkbox(&mut fov_enabled, "Override FOV");
-        if fov_enabled && s.fisheye_fov_deg <= 0.0 {
-            // Seed with the preset's default.
-            s.fisheye_fov_deg = presets
-                .iter().find(|p| p.name == s.fisheye_preset)
-                .map(|p| p.default_fov_deg as f32)
-                .unwrap_or(180.0);
-        } else if !fov_enabled {
-            s.fisheye_fov_deg = 0.0;
-        }
-        ui.add_enabled_ui(fov_enabled, |ui| {
-            ui.add(egui::Slider::new(&mut s.fisheye_fov_deg, 90.0..=230.0)
-                .text("Full FOV (°)").fixed_decimals(2));
-        });
-
-        // Lens offset sliders.
-        ui.collapsing("Lens center offset", |ui| {
-            ui.add(egui::Slider::new(&mut s.fisheye_cx_offset_px, -200.0..=200.0)
-                .text("cx Δpx").fixed_decimals(1));
-            ui.add(egui::Slider::new(&mut s.fisheye_cy_offset_px, -200.0..=200.0)
-                .text("cy Δpx").fixed_decimals(1));
-        });
-
-        // KB k1-k4 sliders (advanced).
-        ui.collapsing("KB distortion (k1–k4)", |ui| {
-            let mut k_override = s.fisheye_k.iter().any(|c| c.abs() > 1e-9);
-            ui.checkbox(&mut k_override, "Override preset k");
-            if k_override && s.fisheye_k.iter().all(|c| c.abs() < 1e-9) {
-                // Seed from the preset.
-                if let Some(p) = presets.iter().find(|p| p.name == s.fisheye_preset) {
-                    for i in 0..4 {
-                        s.fisheye_k[i] = p.calib.k[i] as f32;
-                    }
-                }
-            } else if !k_override {
-                s.fisheye_k = [0.0; 4];
-            }
-            ui.add_enabled_ui(k_override, |ui| {
-                for (i, k) in s.fisheye_k.iter_mut().enumerate() {
-                    ui.add(egui::Slider::new(k, -0.5..=0.5)
-                        .text(format!("k{}", i + 1)).fixed_decimals(6));
-                }
-            });
-        });
-
-        // ── Swap eyes (OSV only) ────────────────────────────────
-        let is_osv = matches!(
-            self.clip.as_ref().map(|c| c.source_kind),
-            Some(vr180_pipeline::SourceKind::DjiOsv)
-        );
-        if is_osv {
-            ui.add_space(4.0);
-            ui.checkbox(&mut s.fisheye_swap_eyes, "Swap L↔R eyes");
-        }
-
-        // ── Output mode (fisheye→fisheye is Task #10 pending) ───
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label("Output");
-            egui::ComboBox::from_id_source("fisheye_output_mode")
-                .selected_text(s.fisheye_output_mode.as_str())
-                .show_ui(ui, |ui| {
-                    use crate::decoder::FisheyeOutputMode as M;
-                    ui.selectable_value(&mut s.fisheye_output_mode,
-                        M::HalfEquirect, "half-equirect");
-                    ui.add_enabled(false,
-                        egui::SelectableLabel::new(
-                            s.fisheye_output_mode == M::Fisheye,
-                            "fisheye (Task #10)"
-                        )
-                    );
-                });
-        });
+        draw_eye_lens(
+            ui, "L", "Left eye", native_w, native_h, zoom,
+            detected.map(|d| d.left),
+            &mut s.fisheye_override_left,
+            &mut s.fisheye_fov_deg_left,
+            &mut s.fisheye_cx_norm_left,
+            &mut s.fisheye_cy_norm_left,
+            &mut s.fisheye_k_left,
+            preset_default_fov, preset_k,
+        );
+        ui.separator();
+        draw_eye_lens(
+            ui, "R", "Right eye", native_w, native_h, zoom,
+            detected.map(|d| d.right),
+            &mut s.fisheye_override_right,
+            &mut s.fisheye_fov_deg_right,
+            &mut s.fisheye_cx_norm_right,
+            &mut s.fisheye_cy_norm_right,
+            &mut s.fisheye_k_right,
+            preset_default_fov, preset_k,
+        );
 
-        // ── Load Gyroflow lens profile ──────────────────────────
+        // ── Load Gyroflow lens profile (applies to BOTH eyes; enables
+        //    override on both so the loaded values take effect) ────
         ui.add_space(6.0);
-        if ui.button("Load Gyroflow lens profile…").clicked() {
+        if ui.button("Load Gyroflow lens profile (both eyes)…").clicked() {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("Gyroflow lens profile (.json)", &["json", "JSON"])
                 .pick_file()
@@ -1266,42 +2058,203 @@ impl App {
                 match vr180_fisheye::GyroflowLensProfile::load(&path) {
                     Ok(prof) => match prof.to_calibration() {
                         Ok(cal) => {
-                            // Push the calibration's KB into settings (the
-                            // FOV will be derived per the current preset).
-                            for i in 0..4 {
-                                s.fisheye_k[i] = cal.k[i] as f32;
-                            }
-                            // Compute approximate FOV from the rim radius
-                            // (if the JSON specifies a calib_dimension).
+                            let kk = [cal.k[0] as f32, cal.k[1] as f32,
+                                      cal.k[2] as f32, cal.k[3] as f32];
+                            s.fisheye_override_left = true;
+                            s.fisheye_override_right = true;
+                            s.fisheye_k_left = kk;
+                            s.fisheye_k_right = kk;
                             if cal.calib_w > 0 {
                                 let r_max = (cal.calib_w.min(cal.calib_h) as f64) * 0.5;
-                                let fov_rad = cal.full_fov_from_rim(r_max);
-                                s.fisheye_fov_deg = fov_rad.to_degrees() as f32;
+                                let fov = cal.full_fov_from_rim(r_max).to_degrees() as f32;
+                                s.fisheye_fov_deg_left = fov;
+                                s.fisheye_fov_deg_right = fov;
                             }
                             tracing::info!(
                                 "loaded Gyroflow lens profile: {} — fov≈{:.2}°, k={:?}",
-                                path.display(), s.fisheye_fov_deg, s.fisheye_k
+                                path.display(), s.fisheye_fov_deg_left, kk
                             );
                         }
-                        Err(e) => tracing::error!(
-                            "Gyroflow lens profile invalid: {e}"
-                        ),
+                        Err(e) => tracing::error!("Gyroflow lens profile invalid: {e}"),
                     },
-                    Err(e) => tracing::error!(
-                        "load Gyroflow JSON {}: {e}", path.display()
-                    ),
+                    Err(e) => tracing::error!("load Gyroflow JSON {}: {e}", path.display()),
                 }
             }
         }
 
         ui.add_space(6.0);
         ui.label(RichText::new(
-            "Camera presets autoload on file open. Override the FOV \
-             or k coefficients above for non-standard lenses, or load \
-             a Gyroflow lens profile for community-maintained \
-             calibrations."
+            "With Override off, each eye uses the in-file (OSV) / preset \
+             calibration. Turn Override on for an eye to set its FOV, \
+             principal point and distortion by hand."
         ).small().color(Color32::GRAY));
     }
+}
+
+/// Draw one eye's lens-calibration controls. A single "Override" toggle
+/// gates everything: off → in-file/preset calibration; on → manual FOV,
+/// absolute principal point, and KB k1–k4.
+///
+/// The principal point is stored normalized (`*cx_norm` ∈ [0,1]) but
+/// displayed/edited as absolute pixels at the native per-eye resolution
+/// (`native_w` × `native_h`), so the value is resolution-independent.
+///
+/// Free function so each eye's distinct `Settings` fields can be borrowed
+/// independently. `id` must be unique per eye ("L"/"R").
+fn draw_eye_lens(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    native_w: f32,
+    native_h: f32,
+    zoom: f32,
+    detected: Option<crate::decoder::EyeCalibSeed>,
+    over: &mut bool,
+    fov: &mut f32,
+    cx_norm: &mut f32,
+    cy_norm: &mut f32,
+    k: &mut [f32; 4],
+    preset_default_fov: f32,
+    preset_k: [f32; 4],
+) {
+    ui.push_id(id, |ui| {
+        // Header row: eye label + the single master Override toggle.
+        let was_over = *over;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(over, "Override");
+            });
+        });
+
+        // On the off→on transition, seed the principal point from the ACTUAL
+        // in-file calibration when we have it (real per-lens cx/cy). FOV is
+        // taken from the PRESET — we no longer load it from the file
+        // calibration — and k is the preset too, matching Override-off.
+        if *over && !was_over {
+            *fov = if preset_default_fov > 0.0 { preset_default_fov } else { 180.0 };
+            if let Some(d) = detected {
+                *cx_norm = d.cx_norm;
+                *cy_norm = d.cy_norm;
+            } else {
+                *cx_norm = 0.5;
+                *cy_norm = 0.5;
+            }
+            *k = preset_k;
+        }
+
+        if !*over {
+            // FOV comes from the PRESET (not the file calibration); the
+            // principal point is the actual in-file cx/cy. k is the preset.
+            let fov_disp = if preset_default_fov > 0.0 { preset_default_fov } else { 180.0 };
+            if let Some(d) = detected {
+                ui.label(RichText::new(format!(
+                    "Preset FOV {:.1}°  ·  in-file cx {:.1}, cy {:.1} px",
+                    fov_disp, d.cx_norm * native_w, d.cy_norm * native_h,
+                )).small().color(Color32::GRAY));
+            } else {
+                ui.label(RichText::new(format!("Preset FOV {:.1}°  ·  center cx/cy", fov_disp))
+                    .small().color(Color32::GRAY));
+            }
+            return;
+        }
+
+        if zoom > 1.001 {
+            ui.label(RichText::new(format!("fine drag ×{:.0} (zoomed)", zoom))
+                .small().color(Color32::from_rgb(120, 180, 120)));
+        }
+
+        // FOV (zoom-scaled fine drag).
+        fine_slider(ui, zoom, fov, 90.0..=230.0, "Full FOV (°)", 2, 1.0, 0.0);
+
+        // Principal point — absolute pixels at native res, stored as norm.
+        // DragValue speed scales with 1/zoom for sub-pixel control.
+        let drag_speed = (0.5 / zoom.max(1.0)) as f64;
+        let mut cx_px = *cx_norm * native_w;
+        let mut cy_px = *cy_norm * native_h;
+        ui.horizontal(|ui| {
+            ui.label("cx (px)");
+            if ui.add(egui::DragValue::new(&mut cx_px).speed(drag_speed)
+                .range(0.0..=native_w)).changed()
+            {
+                *cx_norm = (cx_px / native_w).clamp(0.0, 1.0);
+            }
+            ui.label("cy (px)");
+            if ui.add(egui::DragValue::new(&mut cy_px).speed(drag_speed)
+                .range(0.0..=native_h)).changed()
+            {
+                *cy_norm = (cy_px / native_h).clamp(0.0, 1.0);
+            }
+        });
+        if ui.small_button("Center").clicked() {
+            *cx_norm = 0.5;
+            *cy_norm = 0.5;
+        }
+
+        // KB distortion (zoom-scaled fine drag).
+        ui.collapsing("KB distortion (k1–k4)", |ui| {
+            for (i, ki) in k.iter_mut().enumerate() {
+                fine_slider(ui, zoom, ki, -0.5..=0.5, &format!("k{}", i + 1), 6, 1.0, 0.0);
+            }
+            if ui.small_button("Reset k to preset").clicked() {
+                *k = preset_k;
+            }
+        });
+    });
+}
+
+/// A slider whose effective drag is scaled by `1/zoom` when zoomed in
+/// (`zoom > 1`), giving sub-pixel-fine value control for alignment while
+/// the slider still spans the full range. At `zoom == 1` it's a plain
+/// slider. The trick: after egui maps the cursor position to a value, we
+/// keep only `1/zoom` of this frame's change, so the value creeps at
+/// `1/zoom` of cursor speed.
+fn fine_slider(
+    ui: &mut egui::Ui,
+    zoom: f32,
+    val: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    text: &str,
+    decimals: usize,
+    extra: f32,
+    key_step: f32,
+) -> egui::Response {
+    let (lo, hi) = (*range.start(), *range.end());
+    let before = *val;
+    let mut slider = egui::Slider::new(val, range)
+        .text(text)
+        .fixed_decimals(decimals)
+        .smart_aim(false);
+    // `step_by` makes the keyboard step EXACTLY `key_step` per press — for
+    // both the track (Left/Right) and the numeric value box (Up/Down). Its
+    // only side effect is quantizing a drag to multiples of `key_step`, which
+    // here is far finer than the slider's pixel resolution (0.1° over a ~2°/px
+    // track, 0.001° over a ~0.1/px track), so the drag feel is unchanged.
+    if key_step > 0.0 {
+        slider = slider.step_by(key_step as f64);
+    }
+    let resp = ui.add(slider);
+    // `extra < 1.0` makes a control even finer (e.g. rotational alignment
+    // needs sub-degree control). Effective per-frame gain = extra / zoom.
+    if zoom > 1.001 && resp.dragged() {
+        *val = before + (*val - before) * extra / zoom;
+    }
+    // Up/Down arrow keys nudge by exactly `key_step` while focused — e.g.
+    // 0.1° for the global pano-map, 0.001° for the stereo offset. The value
+    // box handles Up/Down (stepping by `step_by` above) when IT has focus and
+    // CONSUMES them — so `count_and_consume_key` here returns 0 and never
+    // double-steps. When the track is focused instead (it ignores Up/Down,
+    // using Left/Right), the keys are free and we apply the step ourselves.
+    if key_step > 0.0 && resp.has_focus() {
+        let net = ui.input_mut(|i| {
+            i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) as i32
+                - i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) as i32
+        });
+        if net != 0 {
+            *val = (*val + net as f32 * key_step).clamp(lo, hi);
+        }
+    }
+    resp
 }
 
 /// Format seconds as `mm:ss.ff` (frame-fraction-style, 2 decimals).

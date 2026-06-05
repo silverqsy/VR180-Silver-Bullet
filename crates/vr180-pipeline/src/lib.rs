@@ -18,8 +18,10 @@ pub mod fisheye_export;
 pub mod gpu;
 pub mod helpers;
 pub mod imu;
+pub mod panomap;
 pub mod render;
 pub mod source_kind;
+pub mod spherical_inject;
 
 pub use source_kind::SourceKind;
 

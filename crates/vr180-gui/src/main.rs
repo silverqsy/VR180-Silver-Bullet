@@ -9,6 +9,7 @@
 //! wgpu instead of Qt RHI.
 
 mod app;
+mod audio_player;
 mod decoder;
 
 use tracing_subscriber::EnvFilter;

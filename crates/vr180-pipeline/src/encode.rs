@@ -36,14 +36,25 @@ pub enum EncoderBackend {
     Libx265,
     /// `hevc_videotoolbox` Apple hardware encoder. macOS only.
     VideoToolbox,
+    /// `prores_videotoolbox` Apple hardware encoder. macOS only.
+    /// Profile passed via the encoder config's `prores_profile` field.
+    ProResVideoToolbox,
+    /// `prores_ks` Kostya Shishkov's software encoder. Cross-platform.
+    ProResKs,
 }
 
 impl EncoderBackend {
-    fn codec_name(self) -> &'static str {
+    pub fn codec_name(self) -> &'static str {
         match self {
-            EncoderBackend::Libx265      => "libx265",
-            EncoderBackend::VideoToolbox => "hevc_videotoolbox",
+            EncoderBackend::Libx265             => "libx265",
+            EncoderBackend::VideoToolbox        => "hevc_videotoolbox",
+            EncoderBackend::ProResVideoToolbox  => "prores_videotoolbox",
+            EncoderBackend::ProResKs            => "prores_ks",
         }
+    }
+
+    pub fn is_prores(self) -> bool {
+        matches!(self, EncoderBackend::ProResVideoToolbox | EncoderBackend::ProResKs)
     }
 }
 
@@ -129,7 +140,7 @@ impl H265Encoder {
         bitrate_kbps: u32,
         backend: EncoderBackend,
     ) -> Result<Self> {
-        Self::create_with_bit_depth(path, w, h, fps, bitrate_kbps, backend, 8)
+        Self::create_with_bit_depth(path, w, h, fps, bitrate_kbps, backend, 8, -1)
     }
 
     /// `bit_depth = 8` → Main profile, YUV420P input to the encoder.
@@ -139,6 +150,8 @@ impl H265Encoder {
     /// expansion. True 10-bit shader output is a follow-up; for now
     /// the codec gets a wider quantization grid (better gradation in
     /// shadows / sky) at the cost of larger files.
+    /// `prores_profile` (0..=5) is the ProRes profile when `backend.is_prores()`.
+    /// Pass `-1` (or any negative value) for HEVC.
     pub fn create_with_bit_depth(
         path: &Path,
         w: u32, h: u32,
@@ -146,6 +159,7 @@ impl H265Encoder {
         bitrate_kbps: u32,
         backend: EncoderBackend,
         bit_depth: u8,
+        prores_profile: i32,
     ) -> Result<Self> {
         crate::decode::init(); // shared one-time ffmpeg_init
 
@@ -187,9 +201,11 @@ impl H265Encoder {
         // bit_depth. VT prefers P010LE for hardware-native 10-bit
         // (semi-planar); libx265 wants YUV420P10LE (fully planar).
         let enc_pix_fmt = match (bit_depth, backend) {
-            (10, EncoderBackend::VideoToolbox) => ffmpeg::format::Pixel::P010LE,
-            (10, EncoderBackend::Libx265)      => ffmpeg::format::Pixel::YUV420P10LE,
-            _                                  => ffmpeg::format::Pixel::YUV420P,
+            (10, EncoderBackend::VideoToolbox)        => ffmpeg::format::Pixel::P010LE,
+            (10, EncoderBackend::Libx265)             => ffmpeg::format::Pixel::YUV420P10LE,
+            (_,  EncoderBackend::ProResVideoToolbox)
+                | (_, EncoderBackend::ProResKs)       => ffmpeg::format::Pixel::YUV422P10LE,
+            _                                         => ffmpeg::format::Pixel::YUV420P,
         };
 
         let mut enc_ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
@@ -235,6 +251,27 @@ impl H265Encoder {
                     // libx265 defaults are fine — ABR at the configured
                     // bit_rate, medium preset. Could expose --preset
                     // and --crf knobs later if we want a quality dial.
+                }
+                EncoderBackend::ProResVideoToolbox | EncoderBackend::ProResKs => {
+                    // ProRes ignores bit_rate (the profile picks the
+                    // target rate). Codec tag is per-profile and the
+                    // muxer derives it from the profile — leave the
+                    // hvc1 we set above out by overwriting with 0 so
+                    // the muxer picks the right tag (apch / apcn /
+                    // apco / apcs / ap4h / ap4x).
+                    (*raw).codec_tag = 0;
+                    (*raw).bit_rate = 0;
+                    // Profile is read from the encoder context's
+                    // `profile` field directly.
+                    if prores_profile >= 0 {
+                        (*raw).profile = prores_profile;
+                    }
+                    if matches!(backend, EncoderBackend::ProResKs) {
+                        // prores_ks (libavcodec): pin the QuickTime
+                        // "Apple" vendor tag so QuickTime / FCP recognize
+                        // the file as native ProRes (not "Other").
+                        set_opt(raw, "vendor", "apl0")?;
+                    }
                 }
             }
         }

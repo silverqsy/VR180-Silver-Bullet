@@ -20,6 +20,7 @@
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use parking_lot::RwLock;
+use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,12 +39,35 @@ use {
     vr180_pipeline::decode::{iter_stream_pairs, HwDecode},
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub stabilize: bool,
     pub cori_source: CoriSource,
     pub smooth_ms: f32,
     pub max_corr_deg: f32,
+    /// DJI OSV stabilization smoothing window. `0.0` = sharp
+    /// per-frame camera-lock (legacy default — bit-identical to the
+    /// pre-slider build). > 0 lowpasses the per-frame correction
+    /// quats over that window for a softer lock.
+    pub dji_smooth_ms: f32,
+    /// DJI OSV stabilization soft-cap on correction angle. `0.0` =
+    /// no cap (legacy default — unlimited correction). > 0 caps the
+    /// per-frame rotation magnitude in degrees.
+    pub dji_max_corr_deg: f32,
+    /// Global pano-map adjustment angles (degrees). Shared between
+    /// eyes. Applied as `R_view = R_y(yaw) · R_x(pitch) · R_z(roll)`
+    /// composed AFTER stabilization. All-zero default = identity =
+    /// bit-identical to the no-pano-map pipeline.
+    pub pano_yaw_deg: f32,
+    pub pano_pitch_deg: f32,
+    pub pano_roll_deg: f32,
+    /// Per-eye stereo offset angles (degrees). Sign-flips between
+    /// eyes: right = pano + stereo, left = pano − stereo. Same
+    /// convention as the Python app at `vr180_gui.py:12433-12438`.
+    pub stereo_yaw_deg: f32,
+    pub stereo_pitch_deg: f32,
+    pub stereo_roll_deg: f32,
     pub rs_correct: bool,
     pub rs_mode: RsMode,
     pub rs_readout_ms: f32,
@@ -64,23 +88,85 @@ pub struct Settings {
     /// file extension (`.osv` → DJI Osmo 360, `.braw` → Pyxis 12K).
     /// Any other value must match a preset in `vr180_fisheye::presets`.
     pub fisheye_preset: String,
-    /// Full FOV override in degrees. `0.0` → use preset default. The
-    /// fisheye decoder converts to fx via `image_w / (2 · half_fov)`.
-    pub fisheye_fov_deg: f32,
-    /// KB-4 distortion coefficients override. `[0,0,0,0]` → use the
-    /// preset's k. Otherwise these go straight into `FisheyeCalib`.
-    pub fisheye_k: [f32; 4],
-    /// Principal-point offset from image center in pixels (working
-    /// resolution). `(0,0)` means cx/cy = src_w/2, src_h/2.
-    pub fisheye_cx_offset_px: f32,
-    pub fisheye_cy_offset_px: f32,
+    /// Per-eye manual-override master switch. When OFF, that eye uses the
+    /// in-file (OSV protobuf) / preset calibration and ALL the manual
+    /// fields below are ignored. When ON, the eye is fully described by
+    /// the manual fov / cx / cy / k below.
+    pub fisheye_override_left: bool,
+    pub fisheye_override_right: bool,
+    /// Per-eye manual full FOV in degrees (used only when override is on).
+    /// Converted to fx via `image_w / (2 · half_fov)`.
+    pub fisheye_fov_deg_left: f32,
+    pub fisheye_fov_deg_right: f32,
+    /// Per-eye manual KB-4 distortion coefficients (override on).
+    pub fisheye_k_left: [f32; 4],
+    pub fisheye_k_right: [f32; 4],
+    /// Per-eye principal point, NORMALIZED to [0,1] of the frame
+    /// (`cx_norm = cx_px / image_w`). Stored normalized so the same value
+    /// is correct at the capped preview resolution and the full export
+    /// resolution; the UI displays/edits it as absolute native pixels.
+    /// Used only when override is on. `0.5` = image center.
+    pub fisheye_cx_norm_left: f32,
+    pub fisheye_cy_norm_left: f32,
+    pub fisheye_cx_norm_right: f32,
+    pub fisheye_cy_norm_right: f32,
     /// For DJI OSV / dual-stream sources: swap L↔R after decode. The
     /// Python app exposes this as `swap_eyes` at vr180_gui.py:3554.
     pub fisheye_swap_eyes: bool,
     /// Output projection. `HalfEquirect` is the standard VR180 output
-    /// (left-right hemisphere). `Fisheye` stabilizes the source
-    /// without un-warping (Task #10 pending).
+    /// (left-right hemisphere). `Fisheye` skips the projection entirely
+    /// and writes the raw fisheye eyes as SBS — useful for VFX or
+    /// re-grade pipelines.
     pub fisheye_output_mode: FisheyeOutputMode,
+
+    // ─── Color grade ─────────────────────────────────────────────
+    // All defaults are identity (no change). Mirrors
+    // `_default_processing_config` in `vr180_gui.py`.
+
+    /// Lift (Resolve "Offset"). Raises the black point; positive
+    /// values lift shadows.
+    pub lift: f32,
+    /// Gamma (Resolve "Pow"). Reciprocal applied to mids. 1.0 = neutral.
+    pub gamma: f32,
+    /// Gain (Resolve "Slope"). Multiplier on highlights. 1.0 = neutral.
+    pub gain: f32,
+    /// Shadow smooth-rolloff zone adjust [-1..+1].
+    pub shadow: f32,
+    /// Highlight smooth-rolloff zone adjust [-1..+1].
+    pub highlight: f32,
+    /// Temperature [-1..+1]. Positive = warmer, negative = cooler.
+    pub temperature: f32,
+    /// Tint [-1..+1]. Positive = magenta, negative = green.
+    pub tint: f32,
+    /// Saturation. 1.0 = neutral, 0.0 = grayscale, 2.0 = double.
+    pub saturation: f32,
+    /// Optional 3D LUT file path. Empty string = no LUT.
+    pub lut_path: String,
+    /// LUT blend strength [0..1].
+    pub lut_intensity: f32,
+
+    /// Preview composer mode — SBS / anaglyph / 50% overlay.
+    pub preview_mode: PreviewMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PreviewMode { Sbs, Anaglyph, Overlay50 }
+
+impl PreviewMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PreviewMode::Sbs       => "SBS",
+            PreviewMode::Anaglyph  => "Anaglyph (red/cyan)",
+            PreviewMode::Overlay50 => "50% overlay",
+        }
+    }
+    pub fn to_pipeline(self) -> vr180_pipeline::gpu::PreviewMode {
+        match self {
+            PreviewMode::Sbs       => vr180_pipeline::gpu::PreviewMode::Sbs,
+            PreviewMode::Anaglyph  => vr180_pipeline::gpu::PreviewMode::Anaglyph,
+            PreviewMode::Overlay50 => vr180_pipeline::gpu::PreviewMode::Overlay50,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -88,8 +174,19 @@ impl Default for Settings {
         Self {
             stabilize: false,
             cori_source: CoriSource::Auto,
+            // Defaults match across both paths: 1000 ms soft-stab +
+            // 15° soft cap. Drop smooth_ms to 0 for sharp camera-lock
+            // to frame 0 instead.
             smooth_ms: 1000.0,
             max_corr_deg: 15.0,
+            dji_smooth_ms: 1000.0,
+            dji_max_corr_deg: 15.0,
+            pano_yaw_deg: 0.0,
+            pano_pitch_deg: 0.0,
+            pano_roll_deg: 0.0,
+            stereo_yaw_deg: 0.0,
+            stereo_pitch_deg: 0.0,
+            stereo_roll_deg: 0.0,
             rs_correct: false,
             rs_mode: RsMode::Firmware,
             rs_readout_ms: 15.224,
@@ -97,35 +194,189 @@ impl Default for Settings {
             trim_in_s: None,
             trim_out_s: None,
             fisheye_preset: String::new(),
-            fisheye_fov_deg: 0.0,
-            fisheye_k: [0.0, 0.0, 0.0, 0.0],
-            fisheye_cx_offset_px: 0.0,
-            fisheye_cy_offset_px: 0.0,
+            fisheye_override_left: false,
+            fisheye_override_right: false,
+            fisheye_fov_deg_left: 0.0,
+            fisheye_fov_deg_right: 0.0,
+            fisheye_k_left: [0.0, 0.0, 0.0, 0.0],
+            fisheye_k_right: [0.0, 0.0, 0.0, 0.0],
+            fisheye_cx_norm_left: 0.5,
+            fisheye_cy_norm_left: 0.5,
+            fisheye_cx_norm_right: 0.5,
+            fisheye_cy_norm_right: 0.5,
             fisheye_swap_eyes: false,
             fisheye_output_mode: FisheyeOutputMode::HalfEquirect,
+            lift: 0.0,
+            gamma: 1.0,
+            gain: 1.0,
+            shadow: 0.0,
+            highlight: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
+            saturation: 1.0,
+            lut_path: String::new(),
+            lut_intensity: 1.0,
+            preview_mode: PreviewMode::Sbs,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The DJI Osmo 360 "D-Log M → Rec.709" conversion LUT, embedded in the
+/// binary so it's always available regardless of any DaVinci install.
+pub const BUILTIN_OSMO_LUT: &str =
+    include_str!("../assets/dji_osmo360_dlogm_to_rec709.cube");
+/// Sentinel `lut_path` value that means "use the embedded Osmo 360 LUT".
+/// (Chosen so it can never collide with a real filesystem path.)
+pub const BUILTIN_OSMO_LUT_PATH: &str = "<builtin:osmo360-dlogm-rec709>";
+/// Friendly name shown in the LUT picker for the builtin.
+pub const BUILTIN_OSMO_LUT_NAME: &str = "DJI Osmo 360 D-LogM→709 (built-in)";
+
+thread_local! {
+    /// Per-thread cache of the most-recently-loaded parsed LUT, keyed by
+    /// `lut_path`. `build_color_stack` is called once per preview frame,
+    /// so without this the (≈1 MB) `.cube` would be re-read and re-parsed
+    /// every frame. We keep just one entry — the LUT path changes rarely.
+    static LUT_CACHE: std::cell::RefCell<Option<(String, vr180_core::Cube3DLut)>>
+        = std::cell::RefCell::new(None);
+}
+
+/// Load + parse the LUT for `lut_path`, caching the parsed result per
+/// thread. Resolves the builtin sentinel to the embedded `.cube`.
+pub(crate) fn load_lut_cached(lut_path: &str) -> Option<vr180_core::Cube3DLut> {
+    LUT_CACHE.with(|cache| {
+        if let Some((k, lut)) = cache.borrow().as_ref() {
+            if k == lut_path { return Some(lut.clone()); }
+        }
+        let parsed = if lut_path == BUILTIN_OSMO_LUT_PATH {
+            match vr180_core::Cube3DLut::from_str(BUILTIN_OSMO_LUT) {
+                Ok(l) => Some(l),
+                Err(e) => { tracing::warn!("builtin Osmo LUT parse failed: {e}"); None }
+            }
+        } else {
+            let p = std::path::Path::new(lut_path);
+            if p.exists() {
+                match vr180_core::Cube3DLut::from_file(p) {
+                    Ok(l) => Some(l),
+                    Err(e) => { tracing::warn!("LUT load failed ({lut_path}): {e}"); None }
+                }
+            } else { None }
+        };
+        if let Some(l) = &parsed {
+            *cache.borrow_mut() = Some((lut_path.to_string(), l.clone()));
+        }
+        parsed
+    })
+}
+
+impl Settings {
+    /// Build a `ColorStackPlan` from the slider state. Returns
+    /// identity (`ColorStackPlan::default()`) when no color knob is
+    /// active and the LUT path is empty — the pipeline `any_active()`
+    /// check then short-circuits the whole stage chain.
+    pub fn build_color_stack(&self) -> vr180_pipeline::gpu::ColorStackPlan {
+        let mut plan = vr180_pipeline::gpu::ColorStackPlan::default();
+        plan.cdl = vr180_pipeline::gpu::CdlParams {
+            lift: self.lift,
+            gamma: self.gamma.max(0.0001),
+            gain: self.gain,
+            shadow: self.shadow,
+            highlight: self.highlight,
+        };
+        plan.color_grade = vr180_pipeline::gpu::ColorGradeParams {
+            temperature: self.temperature,
+            tint: self.tint,
+            saturation: self.saturation,
+        };
+        if !self.lut_path.is_empty() {
+            if let Some(lut) = load_lut_cached(&self.lut_path) {
+                plan.lut = Some((lut, self.lut_intensity.clamp(0.0, 1.0)));
+            }
+        }
+        plan
+    }
+
+    /// Path to the persisted settings JSON in the per-user config dir,
+    /// resolved per-OS so persistence works on macOS, Windows, and Linux:
+    ///   • macOS:   `~/Library/Application Support/VR180SilverBulletNeo/`
+    ///   • Windows: `%APPDATA%\VR180SilverBulletNeo\`
+    ///   • Linux:   `$XDG_CONFIG_HOME` or `~/.config` + `/VR180SilverBulletNeo/`
+    pub fn config_path() -> Option<PathBuf> {
+        let dir = if cfg!(target_os = "macos") {
+            let home = std::env::var_os("HOME")?;
+            PathBuf::from(home).join("Library/Application Support/VR180SilverBulletNeo")
+        } else if cfg!(target_os = "windows") {
+            // %APPDATA% = C:\Users\<user>\AppData\Roaming
+            let appdata = std::env::var_os("APPDATA")?;
+            PathBuf::from(appdata).join("VR180SilverBulletNeo")
+        } else {
+            // Linux / other: XDG_CONFIG_HOME, falling back to ~/.config.
+            let base = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+            base.join("VR180SilverBulletNeo")
+        };
+        Some(dir.join("settings.json"))
+    }
+
+    /// Load persisted settings, falling back to defaults if there's no file
+    /// yet or anything fails to parse. `#[serde(default)]` on the struct
+    /// means a config written by an OLDER build (missing newer fields) still
+    /// loads — each missing field takes its `Default` value.
+    pub fn load_persisted() -> Self {
+        let Some(path) = Self::config_path() else { return Self::default() };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<Settings>(&text) {
+                Ok(s) => {
+                    tracing::info!("settings: restored from {}", path.display());
+                    s
+                }
+                Err(e) => {
+                    tracing::warn!("settings: parse {} failed ({e}); using defaults",
+                        path.display());
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(), // no file yet → defaults
+        }
+    }
+
+    /// Write the current settings to disk (best-effort; logs on failure).
+    pub fn save_persisted(&self) {
+        let Some(path) = Self::config_path() else { return };
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!("settings: mkdir {} failed: {e}", dir.display());
+                return;
+            }
+        }
+        match serde_json::to_string_pretty(self) {
+            Ok(json) => if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!("settings: write {} failed: {e}", path.display());
+            },
+            Err(e) => tracing::warn!("settings: serialize failed: {e}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FisheyeOutputMode {
     /// Half-equirect VR180 output (default).
     HalfEquirect,
-    /// Stabilized fisheye output, no projection change.
-    /// Currently falls back to HalfEquirect (Task #10 pending).
+    /// Stabilized circular-fisheye SBS output (full reprojection — stab,
+    /// panomap, stereo offset, and per-row RS all apply).
     Fisheye,
 }
 
 impl FisheyeOutputMode {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::HalfEquirect => "half-equirect",
-            Self::Fisheye      => "fisheye (stab only)",
+            Self::HalfEquirect => "Half-equirect (VR180)",
+            Self::Fisheye      => "Fisheye SBS",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoriSource { Direct, Vqf, Auto }
 impl CoriSource {
     pub fn as_str(&self) -> &'static str {
@@ -137,7 +388,7 @@ impl CoriSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RsMode { Firmware, NoFirmware }
 impl RsMode {
     pub fn as_str(&self) -> &'static str {
@@ -182,6 +433,32 @@ pub struct DecoderControl {
     pub paused: AtomicBool,
     pub settings: RwLock<Settings>,
     pub settings_generation: AtomicU64,
+    /// Per-eye in-file calibration the decoder resolved from the source
+    /// (OSV protobuf). `None` until the decoder has parsed it (or for
+    /// sources without an in-file calibration). The UI reads this to
+    /// display the actual calibration and to seed the per-eye Override
+    /// fields, instead of guessing image-center.
+    pub detected_calib: parking_lot::Mutex<Option<DetectedLensCalib>>,
+}
+
+/// One eye's in-file calibration, in the same units the UI's per-eye
+/// Override controls use: FOV in degrees (in this app's equidistant
+/// `fov ↔ fx` convention, so feeding it back reproduces the same fx),
+/// principal point NORMALIZED to [0,1], and KB k1–k4.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EyeCalibSeed {
+    pub fov_deg: f32,
+    pub cx_norm: f32,
+    pub cy_norm: f32,
+    pub k: [f32; 4],
+}
+
+/// The pair of in-file per-eye calibrations (after the L=lens_b,
+/// R=lens_a eye mapping).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DetectedLensCalib {
+    pub left: EyeCalibSeed,
+    pub right: EyeCalibSeed,
 }
 
 /// One frame ready for display. `texture` is a square BGRA-bytes
@@ -352,6 +629,28 @@ fn run_fisheye(
                     IterCmd::Seek(t) => {
                         let _ = iter.seek(t);
                         gen = gen.wrapping_add(1);
+                        // `seek` lands on the keyframe AT OR BEFORE t and
+                        // does not decode forward, so the next frame would be
+                        // that keyframe — up to a whole GOP (~1 s) early.
+                        // Decode forward to the frame AT t and yield THAT
+                        // first, so the preview lands on the correct frame
+                        // (and matches the native detail still, which does
+                        // the same). Pre-target frames advance the decoder
+                        // but aren't shown. Bounded so a bad pts can't spin.
+                        let dt = 1.0 / (fps.max(1e-3) as f64);
+                        for _ in 0..1200 {
+                            match iter.next_pair() {
+                                Ok(Some(p)) => {
+                                    if p.pts_s >= t - dt * 0.5 {
+                                        if pair_tx.send((gen, p)).is_err() {
+                                            return Ok(());
+                                        }
+                                        break;
+                                    }
+                                }
+                                _ => break, // EOS or error
+                            }
+                        }
                     }
                 }
             }
@@ -419,15 +718,42 @@ fn run_fisheye(
         None
     };
 
+    // Publish the in-file per-lens calibration so the UI can show the
+    // actual values and seed the per-eye Override fields from them
+    // (instead of guessing image-center). Left = lens_b, right = lens_a
+    // (matches the DJI iter's default eye swap).
+    if let Some(imu) = dji_osv_imu.as_ref() {
+        let seed = |lens: &vr180_fisheye::DjiLensCalib| -> EyeCalibSeed {
+            let w = lens.width.unwrap_or(src_w as f32).max(1.0);
+            let h = lens.height.unwrap_or(src_h as f32).max(1.0);
+            // fov in this app's equidistant fov↔fx convention so feeding
+            // it back into the override reproduces the same fx:
+            //   fx = w / (2·half) ⟹ fov = w / fx  (radians).
+            let fov_deg = lens.fx.map(|fx| (w / fx.max(1.0)).to_degrees())
+                .unwrap_or(180.0);
+            EyeCalibSeed {
+                fov_deg,
+                cx_norm: lens.cx.map(|v| v / w).unwrap_or(0.5),
+                cy_norm: lens.cy.map(|v| v / h).unwrap_or(0.5),
+                k: [lens.k1.unwrap_or(0.0), lens.k2.unwrap_or(0.0),
+                    lens.k3.unwrap_or(0.0), lens.k4.unwrap_or(0.0)],
+            }
+        };
+        *control.detected_calib.lock() = Some(DetectedLensCalib {
+            left:  seed(&imu.lens_b),
+            right: seed(&imu.lens_a),
+        });
+    }
+
     // ── Resolve initial calibrations from settings + preset + protobuf
     let mut cached_gen = control.settings_generation.load(Ordering::SeqCst);
     let (mut calib_left, mut calib_right) = resolve_fisheye_calib_pair(
         &control.settings.read(), kind, src_w, src_h, dji_osv_imu.as_ref(),
     );
     tracing::info!(
-        "decoder (fisheye): initial calib L fx={:.1}, cx={:.1}, cy={:.1} | R fx={:.1}, cx={:.1}, cy={:.1}",
-        calib_left.fx, calib_left.cx, calib_left.cy,
-        calib_right.fx, calib_right.cx, calib_right.cy
+        "decoder (fisheye): initial calib L fx={:.1}, cx={:.1}, cy={:.1}, k={:?} | R fx={:.1}, cx={:.1}, cy={:.1}, k={:?}",
+        calib_left.fx, calib_left.cx, calib_left.cy, calib_left.k,
+        calib_right.fx, calib_right.cx, calib_right.cy, calib_right.k
     );
     let _ = presets::presets(); // anchor the import for downstream use
 
@@ -471,13 +797,20 @@ fn run_fisheye(
             }
             vr180_pipeline::SourceKind::DjiOsv => {
                 if let Some(osv) = dji_osv_imu {
-                    // OSV is locked to pure camera-lock: smooth_ms = 0
-                    // (q_target = frame_quats[0]) AND no per-frame
-                    // correction cap (max_corr_deg = ∞). The Max corr
-                    // slider is hidden in the GUI for OSV — there's
-                    // nothing it can usefully control in this mode.
-                    let max_corr_deg = f32::INFINITY;
-                    let smooth_ms = 0.0_f32;
+                    // Base mode is camera-lock (smooth_ms = 0 →
+                    // q_corr = q_actual.conjugate(), no cap → no
+                    // clamp). The OSV sliders ONLY activate when the
+                    // user moves them off 0 — at slider=0 the values
+                    // passed below are bit-identical to the legacy
+                    // hardcoded `f32::INFINITY` / `0.0`.
+                    let s = control.settings.read();
+                    let max_corr_deg = if s.dji_max_corr_deg > 0.0 {
+                        s.dji_max_corr_deg
+                    } else {
+                        f32::INFINITY
+                    };
+                    let smooth_ms = s.dji_smooth_ms;
+                    drop(s);
                     match vr180_pipeline::dji_imu::compute_dji_stabilization(
                         osv, total_frames, max_corr_deg, smooth_ms, fps,
                     ) {
@@ -561,19 +894,45 @@ fn run_fisheye(
             }
         }
     };
-    'main: while let Some(pair) = {
-        // Pull one pair to render; drop (preview_decimation-1) more
-        // to thin the rendered framerate. Decode work happens on the
-        // worker — these drops do NOT save decode budget on this thread.
-        let mut p = recv_next_pair(&pair_rx, expected_gen);
-        for _ in 1..preview_decimation {
-            match recv_next_pair(&pair_rx, expected_gen) {
-                Some(next) => p = Some(next),
-                None => break,
+    // Persist the current pair across iterations so the pause loop
+    // can re-render it on slider changes (live preview while paused).
+    // While not paused we discard it each iteration and pull fresh.
+    let mut maybe_pair: Option<vr180_pipeline::fisheye_decode::FisheyePair> = None;
+    'main: loop {
+        // Pull a new pair from the channel UNLESS we're paused and
+        // already holding a pair we want to re-render with new
+        // settings (the pause loop below sets `force_render_next` on
+        // a settings_generation bump and breaks out to this point).
+        let stay_on_pair = control.paused.load(Ordering::SeqCst)
+            && maybe_pair.is_some();
+        if !stay_on_pair {
+            // Block for one pair to render.
+            let mut p = recv_next_pair(&pair_rx, expected_gen);
+            // Drop up to (preview_decimation-1) MORE — but only ones
+            // already buffered (non-blocking try_recv). Forcing blocking
+            // recvs for the dropped frames would double the wait when
+            // decode-bound (channel empty), without any benefit: the GPU
+            // render is not the bottleneck there, so there is nothing to
+            // save by thinning it. Non-blocking drain thins the displayed
+            // framerate ONLY when the worker is genuinely ahead (channel
+            // has spare pairs); when VT is struggling we render every
+            // pair it delivers, which is what keeps throttled playback
+            // smooth instead of frozen.
+            if p.is_some() {
+                for _ in 1..preview_decimation {
+                    match pair_rx.try_recv() {
+                        Ok((g, np)) if g == expected_gen => p = Some(np),
+                        Ok(_) => {}             // stale, drop, keep draining
+                        Err(_) => break,        // empty or disconnected
+                    }
+                }
+            }
+            match p {
+                Some(p) => maybe_pair = Some(p),
+                None => break 'main, // EOS or worker disconnected
             }
         }
-        p
-    } {
+        let pair = maybe_pair.as_ref().expect("maybe_pair populated above");
         decode_us = last_iter_end.elapsed().as_micros();
         // ── 0. Live stabilize toggle. When the user flips the
         //       checkbox during playback, recompute on this iteration.
@@ -634,11 +993,24 @@ fn run_fisheye(
             }
         }
 
-        // ── 3. Pause handling.
-        if control.paused.load(Ordering::SeqCst) && !force_render_next {
+        // ── 3. Pause handling. Sleep until unpaused, a slider change,
+        //       or a command. Slider changes (settings_generation bump)
+        //       break out with `force_render_next = true` so the existing
+        //       render code re-runs against the in-scope `pair` with the
+        //       new settings — that's how live preview works while paused.
+        //
+        //       Skip the pause loop when we JUST pulled a new pair
+        //       (`!stay_on_pair`): we want to render it once before
+        //       parking. That makes the first frame visible right after
+        //       a paused-state spawn — no need to press Play.
+        if control.paused.load(Ordering::SeqCst) && !force_render_next && stay_on_pair {
             let pause_start = std::time::Instant::now();
             while control.paused.load(Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(16));
+                if control.settings_generation.load(Ordering::SeqCst) != cached_gen {
+                    force_render_next = true;
+                    break;
+                }
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
                         DecoderCommand::Stop => return Ok(()),
@@ -650,6 +1022,7 @@ fn run_fisheye(
                             start_wall = None;
                             paused_offset = std::time::Duration::ZERO;
                             force_render_next = true;
+                            maybe_pair = None; // discard stale pair, pull fresh
                             continue 'main;
                         }
                     }
@@ -675,11 +1048,38 @@ fn run_fisheye(
             );
         }
 
-        // ── 5. Wall-clock pacing + skip when behind.
+        // ── 5. Wall-clock pacing.
         let wall_t = start_wall
             .get_or_insert_with(std::time::Instant::now)
             .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
-        if !force_render_next && wall_t > frame_t_rel + preview_dt * 0.5 {
+
+        // Decode-bound vs render-bound. `decode_us` is how long the
+        // recv for THIS iteration's pair(s) blocked on the worker. If
+        // it ate a big slice of the frame budget, VT decode — not the
+        // GPU render — is the bottleneck (the channel is draining).
+        //
+        // HEVC can't skip-decode (every frame is a reference), so when
+        // VT thermally throttles below the source rate the worker simply
+        // can't deliver pairs fast enough. Skipping the *render* here is
+        // futile: we'd still block on the next recv, the idealized wall
+        // clock keeps outrunning the frame clock, and playback spirals
+        // into rendering almost nothing — the "frozen after ~30 s"
+        // symptom. Instead, resync the playback clock to now and render
+        // every pair the worker manages to deliver. 50p that VT can only
+        // sustain at ~18 fps then plays *smoothly* at ~18 fps rather than
+        // freezing.
+        //
+        // The skip path below is kept for the genuinely render-bound
+        // case (channel full → decode_us ≈ 0, but the GPU render fell
+        // behind real time): there, skipping a frame DOES let us catch
+        // up to the audio clock.
+        let decode_bound = (decode_us as f64) > preview_dt * 0.5e6;
+        if decode_bound {
+            // Pace to actual decode throughput — drop accumulated debt.
+            start_wall = Some(std::time::Instant::now()
+                - std::time::Duration::from_secs_f64(frame_t_rel)
+                - paused_offset);
+        } else if !force_render_next && wall_t > frame_t_rel + preview_dt * 0.5 {
             frame_idx += 1;
             skipped_count += 1;
             if wall_t > frame_t_rel + 1.0 {
@@ -688,7 +1088,7 @@ fn run_fisheye(
                     - paused_offset);
             }
             if skipped_count % 30 == 0 {
-                tracing::debug!("decoder (fisheye): behind by {:.1} ms — skipped {} (decode={}µs)",
+                tracing::debug!("decoder (fisheye): render-bound, behind by {:.1} ms — skipped {} (decode={}µs)",
                     (wall_t - frame_t_rel) * 1000.0, skipped_count, decode_us);
             }
             last_iter_end = std::time::Instant::now();
@@ -789,26 +1189,97 @@ fn run_fisheye(
         }
 
         let phase_t2 = std::time::Instant::now();
-        let (left_tex, right_tex) = if let Some(rs_buf) = rs_rows_f32.as_deref() {
-            let l = pipeline.project_fisheye_to_equirect_rs_texture(
-                &pair.left, src_w, src_h, eye_w, eye_h, rot, calib_left, rs_buf, 0,
-            )?;
-            let r = pipeline.project_fisheye_to_equirect_rs_texture(
-                &pair.right, src_w, src_h, eye_w, eye_h, rot, calib_right, rs_buf, 1,
-            )?;
-            (l, r)
-        } else {
-            let l = pipeline.project_fisheye_to_equirect_texture(
-                &pair.left, src_w, src_h, eye_w, eye_h, rot, calib_left, 0,
-            )?;
-            let r = pipeline.project_fisheye_to_equirect_texture(
-                &pair.right, src_w, src_h, eye_w, eye_h, rot, calib_right, 1,
-            )?;
-            (l, r)
+        // Compose the per-frame stab matrix with the per-eye view
+        // adjustment (global pano-map + stereo offset). When all six
+        // sliders are 0 (default), `is_identity()` short-circuits
+        // and `rot` is passed through verbatim → byte-identical to
+        // the no-pano-map pipeline.
+        let view_adjust = {
+            let s = control.settings.read();
+            vr180_pipeline::panomap::ViewAdjust {
+                pano_yaw_deg: s.pano_yaw_deg,
+                pano_pitch_deg: s.pano_pitch_deg,
+                pano_roll_deg: s.pano_roll_deg,
+                stereo_yaw_deg: s.stereo_yaw_deg,
+                stereo_pitch_deg: s.stereo_pitch_deg,
+                stereo_roll_deg: s.stereo_roll_deg,
+            }
         };
+        let (rot_left, rot_right) = if view_adjust.is_identity() {
+            (rot, rot)
+        } else {
+            let (v_l, v_r) = view_adjust.per_eye_matrices();
+            (
+                vr180_pipeline::gpu::EquirectRotation(
+                    vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &v_l)),
+                vr180_pipeline::gpu::EquirectRotation(
+                    vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &v_r)),
+            )
+        };
+        // Decide projection target: half-equirect VR180 (default) or
+        // stabilized fisheye output. Both paths apply the per-frame stab
+        // matrix composed with the per-eye view-adjust (so panomap +
+        // stereo-offset sliders work in either mode).
+        let (left_tex, right_tex) = {
+            let s = control.settings.read();
+            let mode = s.fisheye_output_mode;
+            drop(s);
+            match mode {
+                FisheyeOutputMode::HalfEquirect => {
+                    if let Some(rs_buf) = rs_rows_f32.as_deref() {
+                        let l = pipeline.project_fisheye_to_equirect_rs_texture(
+                            &pair.left, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_buf, 0,
+                        )?;
+                        let r = pipeline.project_fisheye_to_equirect_rs_texture(
+                            &pair.right, src_w, src_h, eye_w, eye_h, rot_right, calib_right, rs_buf, 1,
+                        )?;
+                        (l, r)
+                    } else {
+                        let l = pipeline.project_fisheye_to_equirect_texture(
+                            &pair.left, src_w, src_h, eye_w, eye_h, rot_left, calib_left, 0,
+                        )?;
+                        let r = pipeline.project_fisheye_to_equirect_texture(
+                            &pair.right, src_w, src_h, eye_w, eye_h, rot_right, calib_right, 1,
+                        )?;
+                        (l, r)
+                    }
+                }
+                FisheyeOutputMode::Fisheye => {
+                    // Square fisheye output: use min(eye_w, eye_h) for
+                    // both axes so the result is a circle in a square
+                    // frame regardless of the half-equirect aspect.
+                    let side = eye_w.min(eye_h);
+                    if let Some(rs_buf) = rs_rows_f32.as_deref() {
+                        // Per-row rolling-shutter correction, same as the
+                        // half-equirect path — the RS warp operates on the
+                        // source-frame direction independent of the output
+                        // projection.
+                        let l = pipeline.project_fisheye_to_fisheye_rs_texture(
+                            &pair.left, src_w, src_h, side, side, rot_left, calib_left, rs_buf,
+                        )?;
+                        let r = pipeline.project_fisheye_to_fisheye_rs_texture(
+                            &pair.right, src_w, src_h, side, side, rot_right, calib_right, rs_buf,
+                        )?;
+                        (l, r)
+                    } else {
+                        let l = pipeline.project_fisheye_to_fisheye_texture(
+                            &pair.left, src_w, src_h, side, side, rot_left, calib_left,
+                        )?;
+                        let r = pipeline.project_fisheye_to_fisheye_texture(
+                            &pair.right, src_w, src_h, side, side, rot_right, calib_right,
+                        )?;
+                        (l, r)
+                    }
+                }
+            }
+        };
+        let (preview_eye_w, preview_eye_h) = (left_tex.width(), left_tex.height());
         let phase_project = phase_t2.elapsed();
         let phase_t3 = std::time::Instant::now();
-        let sbs_tex = compose_sbs(&pipeline, &left_tex, &right_tex, eye_w, eye_h)?;
+        let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
+            &pipeline, &control.settings.read(), &left_tex, &right_tex,
+            preview_eye_w, preview_eye_h,
+        )?;
         let phase_compose = phase_t3.elapsed();
         // Per-frame phase timing. First 20 rendered frames log every
         // time so we see warm-cache numbers; after that, every 30.
@@ -833,8 +1304,8 @@ fn run_fisheye(
 
         let out = DecodedFrame {
             texture: Arc::new(sbs_tex),
-            width: eye_w * 2,
-            height: eye_h,
+            width: out_w,
+            height: out_h,
             frame_idx: absolute_frame_idx,
             timestamp_s: frame_t_abs,
         };
@@ -849,11 +1320,52 @@ fn run_fisheye(
         if now < frame_t_rel {
             std::thread::sleep(std::time::Duration::from_secs_f64(frame_t_rel - now));
         }
-        frame_idx += 1;
-        let _ = _check_pair_dims(&pair, src_w, src_h);
+        // While paused we re-render the SAME source pair on slider
+        // changes — don't advance the timeline cursor.
+        if !control.paused.load(Ordering::SeqCst) {
+            frame_idx += 1;
+        }
+        let _ = _check_pair_dims(pair, src_w, src_h);
         last_iter_end = std::time::Instant::now();
     }
     Ok(())
+}
+
+/// Upload an RGBA8 pixel buffer into a Rgba8Unorm texture with
+/// TEXTURE_BINDING + COPY_SRC + STORAGE_BINDING, suitable for the
+/// preview-mode composer.
+fn upload_rgba8_for_preview(
+    pipeline: &vr180_pipeline::gpu::Device,
+    rgba: &[u8],
+    w: u32, h: u32,
+    label: &str,
+) -> anyhow::Result<wgpu::Texture> {
+    let tex = pipeline.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::STORAGE_BINDING,
+        view_formats: &[],
+    });
+    pipeline.queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &tex, mip_level: 0,
+            origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    Ok(tex)
 }
 
 fn _check_pair_dims(
@@ -887,7 +1399,7 @@ fn _check_pair_dims(
 /// = right eye, stream 1 = Lens B = left eye, AND we swap_eyes at
 /// the iter (see DualStreamFisheyeIter::new_with_swap). So after the
 /// swap: left output = Lens B, right output = Lens A.
-fn resolve_fisheye_calib_pair(
+pub(crate) fn resolve_fisheye_calib_pair(
     s: &Settings,
     kind: vr180_pipeline::SourceKind,
     src_w: u32,
@@ -912,74 +1424,82 @@ fn resolve_fisheye_calib_pair(
         presets::find(auto_name).unwrap_or(&presets::presets()[7])
     });
 
-    // fx fallback when the protobuf doesn't supply fx (or for non-OSV
-    // sources). FOV override always wins; otherwise prefer preset; else
-    // derive from preset's default FOV.
-    let fx_fallback = if s.fisheye_fov_deg > 0.0 {
-        let half = (s.fisheye_fov_deg.to_radians()) * 0.5;
-        (src_w as f32) / (2.0 * half)
-    } else if preset.calib.fx > 0.0 && preset.calib.calib_w > 0 {
+    // Preset-derived auto fx (used when override is off and the
+    // protobuf doesn't supply fx, or for non-OSV sources).
+    let fx_auto = if preset.calib.fx > 0.0 && preset.calib.calib_w > 0 {
         (preset.calib.fx as f32) * (src_w as f32) / (preset.calib.calib_w as f32)
     } else {
         let half = (preset.default_fov_deg as f32).to_radians() * 0.5;
         (src_w as f32) / (2.0 * half)
     };
-
-    // KB distortion coefficients: settings override the preset only
-    // when at least one settings slot is non-zero.
-    let k_override = s.fisheye_k.iter().any(|c| c.abs() > 1e-9);
-    let k = if k_override {
-        s.fisheye_k
-    } else {
-        [preset.calib.k[0] as f32, preset.calib.k[1] as f32,
-         preset.calib.k[2] as f32, preset.calib.k[3] as f32]
+    let preset_k = [preset.calib.k[0] as f32, preset.calib.k[1] as f32,
+                    preset.calib.k[2] as f32, preset.calib.k[3] as f32];
+    // Manual fx from a per-eye FOV (degrees). fx = w / (2·half_fov).
+    let fx_from_fov = |fov_deg: f32| -> f32 {
+        let half = fov_deg.max(1.0).to_radians() * 0.5;
+        (src_w as f32) / (2.0 * half)
     };
 
-    // Default cx/cy = image center + user offset (applied to both eyes).
-    let default_cx = src_w as f32 * 0.5 + s.fisheye_cx_offset_px;
-    let default_cy = src_h as f32 * 0.5 + s.fisheye_cy_offset_px;
-
-    // For OSV: per-lens protobuf fx/fy/cx/cy + pure-KB projection
-    // (no Hermite extension) so the Rust shader matches the Python
-    // MLX kernel byte-for-byte. After the DJI iter's default swap:
-    // left = Lens B, right = Lens A.
+    // For OSV: per-lens protobuf fx/fy/cx/cy + pure-KB projection. After
+    // the DJI iter's default swap: left = Lens B, right = Lens A.
     match (kind, osv) {
         (vr180_pipeline::SourceKind::DjiOsv, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
-            let cx_l = imu.lens_b.cx.map(|v| v * scale_x).unwrap_or(default_cx)
-                + s.fisheye_cx_offset_px;
-            let cy_l = imu.lens_b.cy.map(|v| v * scale_y).unwrap_or(default_cy)
-                + s.fisheye_cy_offset_px;
-            let cx_r = imu.lens_a.cx.map(|v| v * scale_x).unwrap_or(default_cx)
-                + s.fisheye_cx_offset_px;
-            let cy_r = imu.lens_a.cy.map(|v| v * scale_y).unwrap_or(default_cy)
-                + s.fisheye_cy_offset_px;
-            let fx_l = imu.lens_b.fx.map(|v| v * scale_x).unwrap_or(fx_fallback);
-            let fy_l = imu.lens_b.fy.map(|v| v * scale_y).unwrap_or(fx_l);
-            let fx_r = imu.lens_a.fx.map(|v| v * scale_x).unwrap_or(fx_fallback);
-            let fy_r = imu.lens_a.fy.map(|v| v * scale_y).unwrap_or(fx_r);
-            // Output stays at 180° VR180. Source-side theta_max comes
-            // from `max_r / fx ≈ 104°` (set inside `new_pure_kb`), so
-            // stab rotations can sample the lens periphery without
-            // writing black at the equator.
+            let eye = |lens: &vr180_fisheye::DjiLensCalib,
+                       ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4]|
+                -> vr180_pipeline::gpu::FisheyeCalib
+            {
+                let (fx, fy, cx, cy, k) = if ov {
+                    // Manual: fx from FOV, absolute cx/cy from normalized,
+                    // manual k (preset if all-zero).
+                    let fx = fx_from_fov(fov);
+                    let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
+                    (fx, fx, cxn * src_w as f32, cyn * src_h as f32, k)
+                } else {
+                    // Auto: in-file per-lens principal point (cx/cy), but
+                    // PRESET focal/FOV. We deliberately do NOT load the FOV
+                    // from the file calibration (its fx/fy) — the preset's
+                    // `fx_auto` is used for both axes (square pixels, preset
+                    // field of view). k is the preset too.
+                    let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
+                    let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
+                    (fx_auto, fx_auto, cx, cy, preset_k)
+                };
+                vr180_pipeline::gpu::FisheyeCalib::new_pure_kb(
+                    fx, fy, cx, cy, k, src_w as f32, src_h as f32,
+                )
+            };
             (
-                vr180_pipeline::gpu::FisheyeCalib::new_pure_kb(
-                    fx_l, fy_l, cx_l, cy_l, k, src_w as f32, src_h as f32,
-                ),
-                vr180_pipeline::gpu::FisheyeCalib::new_pure_kb(
-                    fx_r, fy_r, cx_r, cy_r, k, src_w as f32, src_h as f32,
-                ),
+                eye(&imu.lens_b, s.fisheye_override_left, s.fisheye_fov_deg_left,
+                    s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left),
+                eye(&imu.lens_a, s.fisheye_override_right, s.fisheye_fov_deg_right,
+                    s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right),
             )
         }
         _ => {
-            // Non-OSV: keep the previous Hermite-default constructor.
+            // Non-OSV: Hermite-default constructor, per-eye. No protobuf,
+            // so "auto" = preset; override = manual fov/cx/cy/k.
             let r_max = (src_w.min(src_h) as f32) * 0.5;
-            let mk = |cx, cy| vr180_pipeline::gpu::FisheyeCalib::new(
-                fx_fallback, fx_fallback, cx, cy, k,
-                src_w as f32, src_h as f32, r_max,
-            );
-            (mk(default_cx, default_cy), mk(default_cx, default_cy))
+            let eye = |ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4]|
+                -> vr180_pipeline::gpu::FisheyeCalib
+            {
+                let (fx, cx, cy, k) = if ov {
+                    let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
+                    (fx_from_fov(fov), cxn * src_w as f32, cyn * src_h as f32, k)
+                } else {
+                    (fx_auto, src_w as f32 * 0.5, src_h as f32 * 0.5, preset_k)
+                };
+                vr180_pipeline::gpu::FisheyeCalib::new(
+                    fx, fx, cx, cy, k, src_w as f32, src_h as f32, r_max,
+                )
+            };
+            (
+                eye(s.fisheye_override_left, s.fisheye_fov_deg_left,
+                    s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left),
+                eye(s.fisheye_override_right, s.fisheye_fov_deg_right,
+                    s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right),
+            )
         }
     }
 }
@@ -1181,12 +1701,14 @@ fn run_zero_copy(
         let right_tex = pipeline.project_cross_texture_to_equirect_texture(
             &cross_a, eye_w, eye_h, rr, sr,
         )?;
-        let sbs_tex = compose_sbs(&pipeline, &left_tex, &right_tex, eye_w, eye_h)?;
+        let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
+            &pipeline, &control.settings.read(), &left_tex, &right_tex, eye_w, eye_h,
+        )?;
 
         let out = DecodedFrame {
             texture: Arc::new(sbs_tex),
-            width: eye_w * 2,
-            height: eye_h,
+            width: out_w,
+            height: out_h,
             frame_idx: absolute_frame_idx,
             timestamp_s: frame_t_abs,
         };
@@ -1372,12 +1894,14 @@ fn run_cpu_assemble(
         let right_tex = pipeline.project_cross_to_equirect_texture(
             &cross_a, cross_w_px, eye_w, eye_h, rr, sr,
         )?;
-        let sbs_tex = compose_sbs(&pipeline, &left_tex, &right_tex, eye_w, eye_h)?;
+        let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
+            &pipeline, &control.settings.read(), &left_tex, &right_tex, eye_w, eye_h,
+        )?;
 
         let out = DecodedFrame {
             texture: Arc::new(sbs_tex),
-            width: eye_w * 2,
-            height: eye_h,
+            width: out_w,
+            height: out_h,
             frame_idx: absolute_frame_idx,
             timestamp_s: frame_t_abs,
         };
@@ -1395,6 +1919,361 @@ fn run_cpu_assemble(
         frame_idx += 1;
     }
     Ok(())
+}
+
+/// Compose left + right eye textures into the preview output, applying
+/// the user's color stack and selected preview mode (SBS / anaglyph /
+/// 50% overlay). Returns `(texture, width, height)` of the result.
+///
+/// Color stack runs only when at least one knob is active — identity
+/// (all defaults) takes a zero-cost passthrough.
+fn compose_with_color_and_mode(
+    pipeline: &Device,
+    s: &Settings,
+    left_tex: &wgpu::Texture,
+    right_tex: &wgpu::Texture,
+    eye_w: u32,
+    eye_h: u32,
+) -> anyhow::Result<(wgpu::Texture, u32, u32)> {
+    let color_plan = s.build_color_stack();
+    let preview_mode = s.preview_mode.to_pipeline();
+
+    // ── No grade: composite the projection outputs directly. ──
+    // This is the hot path for ordinary playback — no per-eye color
+    // passes, no extra texture allocations. compose_preview only READS
+    // the inputs (TEXTURE_BINDING), so we pass them straight through.
+    if !color_plan.any_active() {
+        if preview_mode == vr180_pipeline::gpu::PreviewMode::Sbs {
+            // Single texture-copy compose — byte-identical to the
+            // pre-color-stack pipeline (1 submit, 1 alloc).
+            let sbs = compose_sbs(pipeline, left_tex, right_tex, eye_w, eye_h)?;
+            return Ok((sbs, eye_w * 2, eye_h));
+        }
+        // Anaglyph / overlay: one compute dispatch, no extra copies.
+        let out = pipeline.compose_preview(
+            left_tex, right_tex, eye_w, eye_h, preview_mode,
+        )?;
+        let (out_w, out_h) = preview_mode.output_dims(eye_w, eye_h);
+        return Ok((out, out_w, out_h));
+    }
+
+    // ── Grade active: per-eye color stack in 16-BIT, then composite. ──
+    // Run the SAME 16-bit color stack the export uses (`apply_color_stack_
+    // per_eye_16`) so the preview's CDL / white-balance / LUT / saturation
+    // match the export's math — no 8-bit banding introduced by the grade.
+    // `compose_preview` reads its inputs as filterable float, so the
+    // Rgba16Unorm graded eyes feed it directly and it writes the Rgba8Unorm
+    // SBS that egui displays. (The source is still the preview's working-res
+    // 8-bit decode, but the grade math now matches the export exactly.)
+    let left_g  = pipeline.apply_color_stack_per_eye_16(left_tex,  eye_w, eye_h, &color_plan)?;
+    let right_g = pipeline.apply_color_stack_per_eye_16(right_tex, eye_w, eye_h, &color_plan)?;
+    let left_post  = left_g .as_ref().unwrap_or(left_tex);
+    let right_post = right_g.as_ref().unwrap_or(right_tex);
+    let sbs_tex = pipeline.compose_preview(
+        left_post, right_post, eye_w, eye_h, preview_mode,
+    )?;
+    let (out_w, out_h) = preview_mode.output_dims(eye_w, eye_h);
+    Ok((sbs_tex, out_w, out_h))
+}
+
+/// Native-resolution still renderer for the zoom magnifier.
+///
+/// Split for responsiveness:
+///   • A BACKGROUND THREAD owns the native decoder and does the heavy,
+///     I/O-bound seek + decode-forward (a whole GOP at 3840² ≈ 1–2 s on the
+///     external volume). This is CPU / VideoToolbox ONLY — it never touches
+///     the wgpu device, so it can't wedge Metal's drawable queue against the
+///     main thread (the deadlock we hit when GPU work ran off-thread). It
+///     posts the decoded native pair back and pokes egui to repaint.
+///   • The MAIN THREAD does the GPU project + color + compose (~10 ms) once
+///     the native pair is ready, keeping GPU work single-party.
+///
+/// Net: zooming/seeking no longer freezes — the live preview stays
+/// interactive while the still streams in, then swaps in when decoded.
+/// Stabilization is recomputed only when stab params change.
+pub(crate) struct DetailCache {
+    path: PathBuf,
+    kind: vr180_pipeline::SourceKind,
+    fps: f32,
+    imu: Option<vr180_fisheye::DjiOsvImu>,
+    /// Background decode worker: send a requested timestamp, receive the
+    /// decoded native pair `(ts_ms, pair)`.
+    req_tx: crossbeam_channel::Sender<f64>,
+    res_rx: crossbeam_channel::Receiver<(i64, vr180_pipeline::fisheye_decode::FisheyePair)>,
+    _handle: std::thread::JoinHandle<()>,
+    /// Latest decoded native pair, held on the main thread.
+    cached_ts: i64,
+    cached_pair: Option<vr180_pipeline::fisheye_decode::FisheyePair>,
+    cached_stab_key: u64,
+    cached_stab: Option<Vec<EquirectRotation>>,
+}
+
+impl DetailCache {
+    pub fn new(
+        path: PathBuf,
+        kind: vr180_pipeline::SourceKind,
+        fps: f32,
+        swap_eyes: bool,
+        ctx: egui::Context,
+    ) -> Self {
+        let imu = if matches!(kind, vr180_pipeline::SourceKind::DjiOsv) {
+            vr180_pipeline::decode::extract_dji_meta_stream(&path).ok()
+                .and_then(|blob| vr180_fisheye::DjiOsvImu::parse(&blob).ok())
+        } else { None };
+        let (req_tx, req_rx) = crossbeam_channel::bounded::<f64>(1);
+        let (res_tx, res_rx) =
+            crossbeam_channel::unbounded::<(i64, vr180_pipeline::fisheye_decode::FisheyePair)>();
+        let path_w = path.clone();
+        let handle = std::thread::spawn(move || {
+            detail_decode_worker(path_w, kind, swap_eyes, fps, req_rx, res_tx, ctx);
+        });
+        Self {
+            path, kind, fps, imu,
+            req_tx, res_rx, _handle: handle,
+            cached_ts: i64::MIN,
+            cached_pair: None,
+            cached_stab_key: u64::MAX,
+            cached_stab: None,
+        }
+    }
+
+    /// Render the still for `timestamp` under `s`. The native DECODE runs on
+    /// the background thread; this only does the (fast) GPU project + color +
+    /// compose once the frame is ready. Returns:
+    ///   • `Some((tex, w, h))` when the native frame is decoded & projected.
+    ///   • `None` when the frame isn't decoded yet — a background decode is
+    ///     (re)requested and the caller keeps the live preview up + retries.
+    /// `out_cap` bounds the OUTPUT resolution (source is always native);
+    /// `0` = native full detail.
+    pub fn render(
+        &mut self,
+        pipeline: &Device,
+        timestamp: f64,
+        s: &Settings,
+        out_cap: u32,
+    ) -> Option<(wgpu::Texture, u32, u32)> {
+        // Pick up any freshly-decoded native pair from the worker.
+        while let Ok((ts_ms, pair)) = self.res_rx.try_recv() {
+            self.cached_ts = ts_ms;
+            self.cached_pair = Some(pair);
+        }
+        let ts_ms = (timestamp * 1000.0).round() as i64;
+        if self.cached_ts != ts_ms || self.cached_pair.is_none() {
+            // Frame not decoded yet → ask the worker. The request channel is
+            // bounded(1) + drained-to-latest in the worker, so a fast scrub
+            // just moves the target instead of queuing every frame.
+            let _ = self.req_tx.try_send(timestamp.max(0.0));
+            return None;
+        }
+        let pair = self.cached_pair.as_ref()?;
+
+        // Stabilization — only when the stab params changed.
+        let sk = stab_key(s);
+        if self.cached_stab_key != sk {
+            self.cached_stab = compute_stab_for(
+                self.kind, &self.path, self.imu.as_ref(), s, self.fps);
+            self.cached_stab_key = sk;
+        }
+
+        // Project + color + compose on THIS (main) thread (≈10 ms).
+        render_still_from_pair(
+            pipeline, self.kind, s, self.fps, pair,
+            self.imu.as_ref(), self.cached_stab.as_deref(), out_cap,
+        ).ok().flatten()
+    }
+}
+
+/// Background decode worker for `DetailCache`. CPU / VideoToolbox only — it
+/// never touches the wgpu device, so it can't deadlock the main thread's
+/// Metal present. Seeks + decodes-forward to the requested timestamp at
+/// native resolution, posts the pair back, and pokes egui to repaint.
+fn detail_decode_worker(
+    path: PathBuf,
+    kind: vr180_pipeline::SourceKind,
+    swap_eyes: bool,
+    fps: f32,
+    req_rx: crossbeam_channel::Receiver<f64>,
+    res_tx: crossbeam_channel::Sender<(i64, vr180_pipeline::fisheye_decode::FisheyePair)>,
+    ctx: egui::Context,
+) {
+    let mut iter = match open_native_iter(&path, kind, swap_eyes) {
+        Ok(it) => it,
+        Err(e) => { tracing::warn!("detail decode: open failed: {e}"); return; }
+    };
+    let dt = 1.0 / (fps.max(1e-3) as f64);
+    loop {
+        // Block for one request, then drain to the latest (coalesce scrubs).
+        let mut ts = match req_rx.recv() { Ok(t) => t, Err(_) => return };
+        while let Ok(t) = req_rx.try_recv() { ts = t; }
+        let target = ts.max(0.0);
+        if iter.seek(target).is_err() { continue; }
+        // `seek` lands on the keyframe at/before the target; decode forward
+        // to the exact frame so the still matches the live preview.
+        let t0 = std::time::Instant::now();
+        let mut n = 0u32;
+        let mut latest: Option<vr180_pipeline::fisheye_decode::FisheyePair> = None;
+        for _ in 0..1200 {
+            match iter.next_pair() {
+                Ok(Some(p)) => {
+                    n += 1;
+                    let reached = p.pts_s >= target - dt * 0.5;
+                    latest = Some(p);
+                    if reached { break; }
+                }
+                _ => break,
+            }
+        }
+        if let Some(p) = latest {
+            tracing::info!("detail decode: {} frames → {:.3}s in {:?}",
+                n, target, t0.elapsed());
+            let ts_ms = (target * 1000.0).round() as i64;
+            if res_tx.send((ts_ms, p)).is_err() { return; }
+            ctx.request_repaint(); // wake the UI to project + show the still
+        }
+    }
+}
+
+fn open_native_iter(
+    path: &std::path::Path,
+    kind: vr180_pipeline::SourceKind,
+    swap_eyes: bool,
+) -> anyhow::Result<Box<dyn vr180_pipeline::fisheye_decode::FisheyePairIter>> {
+    use vr180_pipeline::fisheye_decode::{SbsFisheyeIter, DualStreamFisheyeIter, BrawFisheyeIter};
+    use vr180_pipeline::decode::HwDecode;
+    Ok(match kind {
+        vr180_pipeline::SourceKind::DjiOsv => {
+            let swap = !swap_eyes;
+            Box::new(DualStreamFisheyeIter::new_with_options(path, HwDecode::Auto, 0, swap, 0, 8)?)
+        }
+        vr180_pipeline::SourceKind::SbsFisheye =>
+            Box::new(SbsFisheyeIter::new(path, HwDecode::Auto, 0)?),
+        vr180_pipeline::SourceKind::BlackmagicRaw => {
+            let info = vr180_braw::BrawInfo::probe(path)
+                .map_err(|e| anyhow::anyhow!("braw probe: {e}"))?;
+            let opts = vr180_braw::decoder::DecodeOptions::default();
+            Box::new(BrawFisheyeIter::new(path, &info, &opts, 0)
+                .map_err(|e| anyhow::anyhow!("braw start: {e}"))?)
+        }
+        _ => anyhow::bail!("non-fisheye source"),
+    })
+}
+
+/// Hash the stab-affecting settings so the worker re-computes per-frame
+/// stabilization only when these change (not on every calib/view tweak).
+fn stab_key(s: &Settings) -> u64 {
+    let mut h: u64 = if s.stabilize { 1 } else { 0 };
+    h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_smooth_ms.to_bits() as u64);
+    h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_max_corr_deg.to_bits() as u64);
+    h
+}
+
+fn compute_stab_for(
+    kind: vr180_pipeline::SourceKind,
+    path: &std::path::Path,
+    imu: Option<&vr180_fisheye::DjiOsvImu>,
+    s: &Settings,
+    fps: f32,
+) -> Option<Vec<EquirectRotation>> {
+    if !s.stabilize { return None; }
+    let total = vr180_pipeline::decode::probe_video(path)
+        .map(|p| (p.duration_sec * p.fps as f64).round() as usize).unwrap_or(0).max(1);
+    match kind {
+        vr180_pipeline::SourceKind::DjiOsv => imu.and_then(|osv| {
+            let max_corr = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
+            vr180_pipeline::dji_imu::compute_dji_stabilization(osv, total, max_corr, s.dji_smooth_ms, fps)
+                .ok().map(|st| st.per_frame)
+        }),
+        vr180_pipeline::SourceKind::BlackmagicRaw =>
+            vr180_braw::BrawGyroData::extract(path).ok()
+                .and_then(|g| vr180_pipeline::braw_imu::compute_braw_stabilization(&g, fps, total).ok())
+                .map(|st| st.per_frame),
+        _ => None,
+    }
+}
+
+/// Project + compose ONE already-decoded native fisheye pair into an SBS
+/// texture using the current settings. Re-runs the same calib / stab /
+/// RS / view-adjust / color path as the live preview, at native res.
+fn render_still_from_pair(
+    pipeline: &Device,
+    kind: vr180_pipeline::SourceKind,
+    s: &Settings,
+    fps: f32,
+    pair: &vr180_pipeline::fisheye_decode::FisheyePair,
+    imu: Option<&vr180_fisheye::DjiOsvImu>,
+    stab_rotations: Option<&[EquirectRotation]>,
+    out_cap: u32,
+) -> anyhow::Result<Option<(wgpu::Texture, u32, u32)>> {
+    let (src_w, src_h) = (pair.eye_w, pair.eye_h);
+    let (calib_left, calib_right) =
+        resolve_fisheye_calib_pair(s, kind, src_w, src_h, imu);
+
+    // Output-resolution cap. The SOURCE is always sampled at native res
+    // (calib is built from src_w/src_h above), so capping only changes how
+    // many OUTPUT pixels we project into — the framing is identical. A small
+    // cap gives a fast, soft still for live dragging; `0` / large = native,
+    // full-detail. Because both come from THIS same projection of the same
+    // cached frame, the low-res and full-res stills are pixel-aligned and
+    // never jump when one replaces the other.
+    let cap = if out_cap == 0 { u32::MAX } else { out_cap };
+    let proj_scale = (cap as f32 / src_w.max(src_h).max(1) as f32).min(1.0);
+    let oeq_w = ((src_w as f32 * proj_scale).round() as u32).max(16);
+    let oeq_h = ((src_h as f32 * proj_scale).round() as u32).max(16);
+    let oside = (((src_w.min(src_h)) as f32 * proj_scale).round() as u32).max(16);
+
+    let dt = 1.0 / fps as f64;
+    let stab_idx = if pair.pts_s.is_finite() && pair.pts_s >= 0.0 {
+        (pair.pts_s / dt).round() as usize
+    } else { 0 };
+    let rot = stab_rotations
+        .and_then(|v| v.get(stab_idx).copied())
+        .unwrap_or(EquirectRotation::IDENTITY);
+
+    let view_adjust = vr180_pipeline::panomap::ViewAdjust {
+        pano_yaw_deg: s.pano_yaw_deg, pano_pitch_deg: s.pano_pitch_deg, pano_roll_deg: s.pano_roll_deg,
+        stereo_yaw_deg: s.stereo_yaw_deg, stereo_pitch_deg: s.stereo_pitch_deg, stereo_roll_deg: s.stereo_roll_deg,
+    };
+    let (rot_left, rot_right) = if view_adjust.is_identity() { (rot, rot) } else {
+        let (vl, vr) = view_adjust.per_eye_matrices();
+        (EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &vl)),
+         EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &vr)))
+    };
+
+    let rs_rows: Option<Vec<f32>> = if s.stabilize && stab_rotations.is_some() {
+        imu.and_then(|osv| {
+            let lens_a = osv.lens_a.mount_quat_xyzw
+                .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
+            vr180_pipeline::dji_imu::compute_per_row_quaternions_for_frame(
+                osv, stab_idx,
+                vr180_pipeline::dji_imu::dji_osmo_readout_ms_for_fps(fps) / 1000.0,
+                src_h, fps,
+            ).map(|q| vr180_pipeline::dji_imu::pack_per_row_camera_matrices(&q, lens_a))
+        })
+    } else { None };
+
+    let (left_tex, right_tex) = match s.fisheye_output_mode {
+        FisheyeOutputMode::HalfEquirect => {
+            if let Some(buf) = rs_rows.as_deref() {
+                (pipeline.project_fisheye_to_equirect_rs_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, buf, 20)?,
+                 pipeline.project_fisheye_to_equirect_rs_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, buf, 21)?)
+            } else {
+                (pipeline.project_fisheye_to_equirect_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, 20)?,
+                 pipeline.project_fisheye_to_equirect_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, 21)?)
+            }
+        }
+        FisheyeOutputMode::Fisheye => {
+            if let Some(buf) = rs_rows.as_deref() {
+                (pipeline.project_fisheye_to_fisheye_rs_texture(&pair.left, src_w, src_h, oside, oside, rot_left, calib_left, buf)?,
+                 pipeline.project_fisheye_to_fisheye_rs_texture(&pair.right, src_w, src_h, oside, oside, rot_right, calib_right, buf)?)
+            } else {
+                (pipeline.project_fisheye_to_fisheye_texture(&pair.left, src_w, src_h, oside, oside, rot_left, calib_left)?,
+                 pipeline.project_fisheye_to_fisheye_texture(&pair.right, src_w, src_h, oside, oside, rot_right, calib_right)?)
+            }
+        }
+    };
+    let (ew, eh) = (left_tex.width(), left_tex.height());
+    let (sbs, ow, oh) = compose_with_color_and_mode(pipeline, s, &left_tex, &right_tex, ew, eh)?;
+    Ok(Some((sbs, ow, oh)))
 }
 
 /// Build a one-shot stitch: left + right equirect → 2×W SBS, in
@@ -1418,7 +2297,11 @@ fn compose_sbs(
         usage: wgpu::TextureUsages::COPY_DST
              | wgpu::TextureUsages::TEXTURE_BINDING
              | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
+        // Allow an sRGB view so egui (which treats sampled textures as
+        // LINEAR and re-applies the OETF) decodes our Rec.709-gamma values
+        // to linear on sample — otherwise it double-gamma-encodes them and
+        // the preview looks washed out / flatter than the export.
+        view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
     });
 
     let mut encoder = pipeline.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1507,9 +2390,22 @@ fn build_per_eye_frames(
                     apply_gravity_alignment_inplace(&mut cori, gq.conjugate());
                 }
             }
-            let smoothed = bidirectional_smooth(&cori, fps, &SmoothParams {
-                smooth_ms: s.smooth_ms, ..Default::default()
-            });
+            // `smooth_ms = 0` → CAMERA-LOCK to frame 0: every frame
+            // uses `cori[0]` as the smoothed anchor, so `q_heading
+            // = raw · cori[0]⁻¹` and at frame 0 it collapses to
+            // identity. Matches the OSV camera-lock semantic so both
+            // paths behave the same at the default.
+            //
+            // `smooth_ms > 0` → soft-stab (the legacy GoPro path):
+            // anchor is a bidirectional-smoothed orientation, so
+            // slow camera motion passes through and jitter is killed.
+            let smoothed = if s.smooth_ms <= 0.0 {
+                vec![cori[0]; cori.len()]
+            } else {
+                bidirectional_smooth(&cori, fps, &SmoothParams {
+                    smooth_ms: s.smooth_ms, ..Default::default()
+                })
+            };
             (0..cori.len()).map(|i| {
                 let (l, r) = per_eye_rotations(
                     cori[i], smoothed[i],
@@ -1558,6 +2454,11 @@ fn build_per_eye_frames(
     };
 
     let n = rotations.len().max(rs_eyes.len());
+    tracing::info!(
+        "build_per_eye_frames: stabilize={} rs_correct={} cori_samples={} iori_samples={} rotations={} rs_eyes={} → bundle n={}",
+        s.stabilize, s.rs_correct, cori.len(), iori.len(),
+        rotations.len(), rs_eyes.len(), n
+    );
     Ok((0..n).map(|i| {
         let (rl, rr) = rotations.get(i).copied()
             .unwrap_or((EquirectRotation::IDENTITY, EquirectRotation::IDENTITY));

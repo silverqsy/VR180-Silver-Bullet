@@ -319,34 +319,39 @@ pub fn compute_dji_stabilization(
         }
     }
 
-    // Step 3: match DJI Studio's `getMatrixForEisAndHorizontal`.
+    // Step 3: per-frame correction matrices.
     //
-    // Decoded from the binary (2026-05-31): for a VR180-modded camera
-    // where the protobuf per-lens extrinsics (K0, K1 at EisBase offsets
-    // +0x90 and +0x120) stay at their default identity values, the
-    // formula reduces to
-    //     output = q_imu⁻¹ · q_anchor2⁻¹
-    // since M = K3·K0·K1·K2 collapses to K3·K2 = I (K2 and K3 are
-    // mutually inverse basis permutations), and the R_anchor1 factor
-    // cancels itself between `getMatrixForEisAndHorizontal` and the
-    // inner `getFineTonedRotation`.
+    // Camera-lock to FRAME 0. The user's stabilization expectation is
+    // that the view stays anchored to whatever direction the camera
+    // was pointing at the start of the clip; as the camera moves, the
+    // shader counter-rotates by the deviation. The math:
     //
-    // This is horizon lock — DJI samples the IMU at the slice time and
-    // its inverse becomes the stab rotation directly, not relative to
-    // frame 0. Camera lock would be a post-processing step on top.
+    //     q_corr = q_actual⁻¹ · q_zero       where q_zero = q_actual at frame 0
     //
-    // `Q_ANCHOR2` is built from the rodata rotvec components at
-    // `[0x102737{3f8,400,408}]` — `(0.00645, 0.00190, 0.00729)` rad —
-    // about a 0.57° fixed offset.
-    let _ = smooth_ms;
-    let _ = fps;
-    // **Live lldb extraction at runtime** confirmed that DJI Studio's
-    // EisBase has `q_anchor2 = identity` (0, 0, 0, 1) once
-    // `getQuaternionForEisAndHorizontal` is actually called — the
-    // rotvec constants in rodata only initialize the field, and some
-    // later setup overwrites it back to identity. So the formula
-    // simplifies to `output = q_imu⁻¹`.
-    let q_anchor2_inv = Quat::IDENTITY;
+    // At frame 0 this collapses to `q_zero⁻¹ · q_zero = IDENTITY` (no
+    // correction → the rendered view matches the captured texture's
+    // direction at frame 0). At frame N it produces the rotation that
+    // takes the camera from its current pose back to frame 0's pose.
+    //
+    // This differs from DJI Studio's `getMatrixForEisAndHorizontal`,
+    // which is horizon-lock-to-identity (`q_actual⁻¹` alone). The DJI
+    // formula leaves the view tilted by the camera's initial pose at
+    // frame 0; user wants frame 0 itself as the lock anchor instead.
+    let q_zero = frame_quats[0];
+
+    // Optional bidirectional EMA smoothing on the per-frame IMU quats.
+    // Only consumed by the `smooth_ms > 0` soft-stab branch below; the
+    // default camera-lock branch reads `q_actual` and `q_zero` directly.
+    let smoothed_quats: Vec<Quat> = if smooth_ms > 0.0 && fps > 0.0 {
+        let tau_frames = ((smooth_ms / 1000.0) * fps).round() as usize;
+        if tau_frames < 2 {
+            frame_quats.clone()
+        } else {
+            smooth_quats_ema(&frame_quats, tau_frames)
+        }
+    } else {
+        frame_quats.clone()
+    };
 
     // Per-clip lens_a from protobuf field 21. Two effects:
     // 1. Compute DJI's exact `+0x3d8` rotation: R_dji = mat((q_la·q_imu)⁻¹)
@@ -377,8 +382,18 @@ pub fn compute_dji_stabilization(
     let lens_a_quat = osv.lens_a.mount_quat_xyzw.unwrap_or(LENS_A_QUAT_XYZW);
 
     let mut per_frame = Vec::with_capacity(n_frames);
-    for q_actual in frame_quats.iter() {
-        let q_corr = q_actual.conjugate().mul(q_anchor2_inv).normalize();
+    for (q_actual, q_smoothed) in frame_quats.iter().zip(smoothed_quats.iter()) {
+        // - `smooth_ms = 0`: camera-lock to frame 0 — anchor is `q_zero`.
+        // - `smooth_ms > 0`: soft-stab — anchor is the rolling smoothed
+        //   orientation `q_smoothed`. As smooth_ms grows, the smoother
+        //   lags more, so the lock target moves with slow camera motion
+        //   but per-frame jitter relative to it gets counter-rotated.
+        //
+        // Both formulas share the same shape `q_corr = q_actual⁻¹ · q_anchor`
+        // — the shader's matrix takes view directions FROM the anchor's
+        // frame TO `q_actual`'s frame, which is what we sample from.
+        let q_anchor = if smooth_ms > 0.0 { *q_smoothed } else { q_zero };
+        let q_corr = q_actual.conjugate().mul(q_anchor).normalize();
         let q_corr = clamp_correction(q_corr, max_corr_deg);
         let r_eis = q_corr.to_mat3_row_major();
         let r_final = apply_c_imu_to_cam_with_lens_a(&r_eis, lens_a_quat);

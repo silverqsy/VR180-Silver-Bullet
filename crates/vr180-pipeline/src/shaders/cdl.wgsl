@@ -52,11 +52,14 @@ fn cdl_channel(x_in: f32) -> f32 {
     // 4. highlight mask — bell-curve centered in upper half
     let h_t = clamp(2.0 * x - 1.0, 0.0, 1.0);
     x = x + u.highlight * hermite(h_t) * 0.6;
-    // 5. gamma — pow(x, 1/gamma). Clamp x ≥ 0 so pow doesn't NaN on
-    //    a negative residue from extreme lift / shadow params.
+    // Clip to [0,1] BEFORE gamma — matches the Python app exactly
+    // (build_color_1d_lut: np.clip(x,0,1) then power), so the gamma
+    // encodes the already-clamped, zone-adjusted curve.
+    x = clamp(x, 0.0, 1.0);
+    // 5. gamma — pow(x, 1/gamma).
     let inv_g = 1.0 / max(u.gamma, 0.0001);
-    x = pow(max(x, 0.0), inv_g);
-    return clamp(x, 0.0, 1.0);
+    x = pow(x, inv_g);
+    return x;
 }
 
 @compute @workgroup_size(8, 8, 1)

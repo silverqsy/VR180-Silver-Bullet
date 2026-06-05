@@ -26,6 +26,18 @@ rfd = "0.14"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 
+# Audio output (cross-platform OS device). The audio-decoder thread
+# pushes resampled f32 samples into a parking_lot Mutex<VecDeque>;
+# the cpal callback pops from it. AAC decode reuses the workspace
+# ffmpeg-next.
+cpal = "0.15"
+ffmpeg-next = { workspace = true }
+bytemuck = { workspace = true }
+
+# Settings persistence (serialize the GUI Settings to JSON on disk).
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 # Errors / logging.
 anyhow = { workspace = true }
 tracing = { workspace = true }

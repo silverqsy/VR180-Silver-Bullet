@@ -164,3 +164,168 @@ pub fn extract_ambisonic_to_wav(input: &Path, output_wav: &Path) -> Result<Ambis
     );
     Ok(info)
 }
+
+/// Pick the most useful audio stream in `path` — first non-attached-pic
+/// audio track, regardless of channel count or codec. Returns the
+/// stream index, channel count, and sample rate. `None` if the file
+/// has no audio.
+pub fn probe_any_audio(input: &Path) -> Result<Option<(usize, u32, u32)>> {
+    crate::decode::init();
+    let ictx = ffmpeg::format::input(&input)
+        .map_err(|e| Error::Ffmpeg(format!("open {input:?}: {e}")))?;
+    for stream in ictx.streams() {
+        let params = stream.parameters();
+        if params.medium() != ffmpeg::media::Type::Audio { continue; }
+        let (channels, sample_rate) = unsafe {
+            let raw = params.as_ptr();
+            (
+                (*raw).ch_layout.nb_channels as u32,
+                (*raw).sample_rate as u32,
+            )
+        };
+        return Ok(Some((stream.index(), channels, sample_rate)));
+    }
+    Ok(None)
+}
+
+/// Mux a video-only file with the audio track from a separate source.
+/// Both video and audio are copied with no re-encode (stream copy), so
+/// the operation is fast and lossless.
+///
+/// Use this as a post-export step: write the video-only output via
+/// `H265Encoder`, then call this to fold the source clip's audio (e.g.
+/// the stereo AAC track on DJI OSV) onto the final container.
+///
+/// Returns the number of audio packets copied. If `audio_src` has no
+/// audio track the function returns `Ok(0)` and the output still
+/// contains the video — caller can decide whether to keep using it.
+pub fn mux_video_with_passthrough_audio(
+    audio_src: &Path,
+    video_src: &Path,
+    final_out: &Path,
+) -> Result<u64> {
+    crate::decode::init();
+
+    let mut a_in = ffmpeg::format::input(&audio_src)
+        .map_err(|e| Error::Ffmpeg(format!("open audio src {audio_src:?}: {e}")))?;
+    let mut v_in = ffmpeg::format::input(&video_src)
+        .map_err(|e| Error::Ffmpeg(format!("open video src {video_src:?}: {e}")))?;
+
+    // Locate the first audio stream in the audio source.
+    let a_idx = a_in.streams()
+        .filter(|s| {
+            s.parameters().medium() == ffmpeg::media::Type::Audio
+        })
+        .map(|s| s.index())
+        .next();
+    let a_idx = match a_idx {
+        Some(i) => i,
+        None => {
+            tracing::info!(
+                src = %audio_src.display(),
+                "no audio track in source — output will be video-only"
+            );
+            return Ok(0);
+        }
+    };
+
+    // Locate the first video stream in the video source.
+    let v_idx = v_in.streams()
+        .filter(|s| s.parameters().medium() == ffmpeg::media::Type::Video)
+        .map(|s| s.index())
+        .next()
+        .ok_or_else(|| Error::Ffmpeg(format!("no video stream in {video_src:?}")))?;
+
+    let mut octx = ffmpeg::format::output(&final_out)
+        .map_err(|e| Error::Ffmpeg(format!("open output {final_out:?}: {e}")))?;
+
+    // Build output streams (params copy) for both video and audio.
+    // We DO NOT clear `codec_tag` for the video stream — the encoder
+    // wrote `hvc1` (QuickTime / Vision Pro require it for HEVC) and
+    // zeroing it makes the muxer fall back to `hev1`, which those
+    // players refuse to decode (the file looks "audio only" in them).
+    // For audio we still clear so the muxer picks the right MOV/MP4
+    // codec_tag for AAC.
+    let v_src_params = v_in.stream(v_idx).unwrap().parameters();
+    let v_src_tb = v_in.stream(v_idx).unwrap().time_base();
+    let out_v_idx = {
+        let mut s = octx.add_stream(ffmpeg::codec::Id::None)
+            .map_err(|e| Error::Ffmpeg(format!("add video stream: {e}")))?;
+        s.set_parameters(v_src_params);
+        s.set_time_base(v_src_tb);
+        s.index()
+    };
+
+    let a_src_params = a_in.stream(a_idx).unwrap().parameters();
+    let a_src_tb = a_in.stream(a_idx).unwrap().time_base();
+    let out_a_idx = {
+        let mut s = octx.add_stream(ffmpeg::codec::Id::None)
+            .map_err(|e| Error::Ffmpeg(format!("add audio stream: {e}")))?;
+        s.set_parameters(a_src_params);
+        s.set_time_base(a_src_tb);
+        unsafe {
+            let raw = s.parameters().as_mut_ptr();
+            (*raw).codec_tag = 0;
+        }
+        s.index()
+    };
+
+    octx.write_header()
+        .map_err(|e| Error::Ffmpeg(format!("write_header: {e}")))?;
+
+    // Interleave video and audio packets by ascending PTS so the MP4
+    // muxer doesn't have to buffer the whole stream of one type before
+    // it sees the other. We use peekable iterators and pick whichever
+    // packet is older next.
+    let v_out_tb = octx.stream(out_v_idx).unwrap().time_base();
+    let a_out_tb = octx.stream(out_a_idx).unwrap().time_base();
+    let mut v_iter = v_in.packets().filter(|(s, _)| s.index() == v_idx).peekable();
+    let mut a_iter = a_in.packets().filter(|(s, _)| s.index() == a_idx).peekable();
+    let mut v_packets = 0u64;
+    let mut a_packets = 0u64;
+
+    // Compute seconds for a packet's dts/pts in its source time base.
+    fn pkt_seconds(p: &ffmpeg::Packet, tb: ffmpeg::Rational) -> f64 {
+        let t = p.dts().or_else(|| p.pts()).unwrap_or(0);
+        t as f64 * tb.numerator() as f64 / tb.denominator() as f64
+    }
+
+    loop {
+        let v_t = v_iter.peek().map(|(_, p)| pkt_seconds(p, v_src_tb));
+        let a_t = a_iter.peek().map(|(_, p)| pkt_seconds(p, a_src_tb));
+        let take_video = match (v_t, a_t) {
+            (Some(vt), Some(at)) => vt <= at,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_video {
+            let (_, mut packet) = v_iter.next().unwrap();
+            packet.set_stream(out_v_idx);
+            packet.set_position(-1);
+            packet.rescale_ts(v_src_tb, v_out_tb);
+            packet.write_interleaved(&mut octx)
+                .map_err(|e| Error::Ffmpeg(format!("write video packet: {e}")))?;
+            v_packets += 1;
+        } else {
+            let (_, mut packet) = a_iter.next().unwrap();
+            packet.set_stream(out_a_idx);
+            packet.set_position(-1);
+            packet.rescale_ts(a_src_tb, a_out_tb);
+            packet.write_interleaved(&mut octx)
+                .map_err(|e| Error::Ffmpeg(format!("write audio packet: {e}")))?;
+            a_packets += 1;
+        }
+    }
+
+    octx.write_trailer()
+        .map_err(|e| Error::Ffmpeg(format!("write_trailer: {e}")))?;
+
+    tracing::info!(
+        final = %final_out.display(),
+        video_packets = v_packets,
+        audio_packets = a_packets,
+        "mux complete — video + audio passthrough"
+    );
+    Ok(a_packets)
+}
