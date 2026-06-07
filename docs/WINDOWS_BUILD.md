@@ -35,7 +35,7 @@ cd /path/to/VR180SilverBulletNeo
 git add -A                       # picks up the untracked assets/shaders/sources
 git status                       # sanity-check: assets/, shaders, *.rs all staged
 git commit -m "Neo: GUI color/LUT/persistence/detail-cache work"
-git push origin neo
+git push origin 2.0
 ```
 
 (`Cargo.lock` is committed too, which is correct for an application — it
@@ -46,7 +46,7 @@ pins the exact dependency versions the Windows build will use.)
 ```pwsh
 git clone https://github.com/silverqsy/VR180-Silver-Bullet.git
 cd VR180-Silver-Bullet
-git checkout neo
+git checkout 2.0
 ```
 
 > Alternatively, copy the whole working tree to the Windows PC directly

@@ -1258,7 +1258,7 @@ equivalent CLI flags, same heavy grade + LUT + APAC + APMP):
 
 ### Deferred — Python GUI patch (separate PR on `main`)
 
-Out of scope for this `neo` branch. When that lands, the GUI's
+Out of scope for this `2.0` branch. When that lands, the GUI's
 "Export" action either:
 - (current) runs the in-process Python encoder, OR
 - (toggle on) writes the user's `ProcessingConfig` to a temp JSON
