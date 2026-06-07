@@ -32,17 +32,36 @@ fn main() -> anyhow::Result<()> {
         // request it on the wgpu device eframe creates for us so the
         // pipeline (which borrows that device) can use R16Unorm /
         // Rg16Unorm without re-creating the device.
-        wgpu_options: egui_wgpu::WgpuConfiguration {
-            device_descriptor: std::sync::Arc::new(|adapter| {
-                let want = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
-                let have = adapter.features() & want;
-                wgpu::DeviceDescriptor {
-                    label: Some("vr180-gui device"),
-                    required_features: have,
-                    required_limits: wgpu::Limits::default(),
-                }
-            }),
-            ..Default::default()
+        // egui-wgpu 0.34 moved device-creation knobs into `wgpu_setup`.
+        // `WgpuSetupCreateNew` has no `Default`, so start from the default
+        // config and override only the device descriptor — we request
+        // TEXTURE_FORMAT_16BIT_NORM (needed for the R16/Rg16 16-bit color
+        // stack). Backend left default (Vulkan on Windows); forcing DX12
+        // caused DXGI_ERROR_DEVICE_REMOVED with D3D11VA decode + wgpu-D3D12.
+        wgpu_options: {
+            let mut cfg = egui_wgpu::WgpuConfiguration::default();
+            if let egui_wgpu::WgpuSetup::CreateNew(create) = &mut cfg.wgpu_setup {
+                create.device_descriptor = std::sync::Arc::new(|adapter: &wgpu::Adapter| {
+                    // TEXTURE_FORMAT_16BIT_NORM: R16/Rg16 color stack.
+                    // TEXTURE_FORMAT_P010 / _NV12: zero-copy import of
+                    // NVDEC-decoded frames into wgpu (Windows D3D11→Vulkan).
+                    // `& adapter.features()` so we only request what's
+                    // supported (graceful on GPUs that lack them).
+                    let want = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+                        | wgpu::Features::TEXTURE_FORMAT_P010
+                        | wgpu::Features::TEXTURE_FORMAT_NV12;
+                    let have = adapter.features() & want;
+                    wgpu::DeviceDescriptor {
+                        label: Some("vr180-gui device"),
+                        required_features: have,
+                        required_limits: wgpu::Limits::default(),
+                        memory_hints: wgpu::MemoryHints::default(),
+                        trace: wgpu::Trace::Off,
+                        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                    }
+                });
+            }
+            cfg
         },
         ..Default::default()
     };

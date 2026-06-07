@@ -175,9 +175,22 @@ pub fn probe_video(path: &Path) -> Result<VideoProbe> {
     init();
     let ictx = ffmpeg_next::format::input(path)
         .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+    // Pick the LARGEST video stream by pixel area rather than ffmpeg's
+    // `av_find_best_stream` (`.best()`). DJI OSV containers carry a
+    // small MJPEG preview/thumbnail stream (e.g. 688×344) that `best()`
+    // selects over the full-resolution HEVC fisheye eyes — it honours
+    // the thumbnail's DEFAULT disposition — yielding a bogus 688×344 /
+    // 0 fps probe that aborts the load. The real eyes are always the
+    // biggest streams, so max-area selection is robust across cameras
+    // and firmware revisions (and matches this fn's doc comment).
     let stream = ictx
         .streams()
-        .best(ffmpeg_next::media::Type::Video)
+        .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+        .max_by_key(|s| {
+            // SAFETY: reading POD width/height from AVCodecParameters.
+            let p = unsafe { &*s.parameters().as_ptr() };
+            (p.width as i64) * (p.height as i64)
+        })
         .ok_or_else(|| Error::Ffmpeg("no video stream".into()))?;
     let params = stream.parameters();
     let avg = stream.avg_frame_rate();
@@ -776,6 +789,110 @@ pub(crate) fn download_hw_frame(
         return Err(Error::Ffmpeg(format!("av_hwframe_transfer_data: {ret}")));
     }
     Ok(())
+}
+
+// ─── D3D11VA hwaccel plumbing (Windows only) ───────────────────────────
+
+/// Wire D3D11VA hardware decode onto a codec context (Windows). Mirror
+/// of [`try_enable_videotoolbox_decode`]: creates an FFmpeg-owned D3D11
+/// device, installs it as `hw_device_ctx`, and points `get_format` at
+/// [`d3d11va_get_format`] so the decoder emits `AV_PIX_FMT_D3D11`
+/// surfaces. Returns `true` if the hwaccel attached.
+///
+/// This offloads HEVC decode to the GPU video engine (NVDEC on NVIDIA,
+/// the equivalent block on Intel/AMD) — the single biggest win for
+/// OSV's two 3840×3840 HEVC streams, which are ~an order of magnitude
+/// too slow to decode in software. Decoded frames are GPU-resident;
+/// callers download them to host memory with [`download_hw_frame`]
+/// (NV12 for 8-bit, P010 for 10-bit Main10).
+#[cfg(target_os = "windows")]
+pub(crate) fn try_enable_d3d11va_decode(
+    dec_ctx: &mut ffmpeg_next::codec::context::Context,
+) -> bool {
+    use ffmpeg_next::ffi::*;
+    let mut hw_device: *mut AVBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        av_hwdevice_ctx_create(
+            &mut hw_device,
+            AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+            std::ptr::null(),     // device name — picks the default adapter
+            std::ptr::null_mut(), // options
+            0,
+        )
+    };
+    if ret < 0 || hw_device.is_null() {
+        tracing::debug!("av_hwdevice_ctx_create D3D11VA returned {ret}");
+        return false;
+    }
+    unsafe {
+        let raw = dec_ctx.as_mut_ptr();
+        (*raw).hw_device_ctx = hw_device;
+        (*raw).get_format = Some(d3d11va_get_format);
+    }
+    true
+}
+
+/// FFmpeg `get_format` callback: prefer `AV_PIX_FMT_D3D11` from the
+/// offered list (keeps decode on the GPU), else fall through to the
+/// first software format so an unsupported profile still decodes on
+/// the CPU rather than failing.
+#[cfg(target_os = "windows")]
+unsafe extern "C" fn d3d11va_get_format(
+    _ctx: *mut ffmpeg_next::ffi::AVCodecContext,
+    pix_fmts: *const ffmpeg_next::ffi::AVPixelFormat,
+) -> ffmpeg_next::ffi::AVPixelFormat {
+    use ffmpeg_next::ffi::AVPixelFormat::*;
+    let mut p = pix_fmts;
+    while unsafe { *p } != AV_PIX_FMT_NONE {
+        if unsafe { *p } == AV_PIX_FMT_D3D11 {
+            return AV_PIX_FMT_D3D11;
+        }
+        p = unsafe { p.add(1) };
+    }
+    unsafe { *pix_fmts }
+}
+
+/// Decode the first GPU-resident (`AV_PIX_FMT_D3D11`) frame from the largest
+/// video stream of `path`. For interop testing of the zero-copy path —
+/// returns the frame still on the GPU (not downloaded). Windows-only.
+#[cfg(target_os = "windows")]
+pub fn decode_first_d3d11_frame(path: &Path) -> Result<ffmpeg_next::frame::Video> {
+    init();
+    let mut ictx = ffmpeg_next::format::input(path)
+        .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+    let (idx, params) = {
+        let s = ictx
+            .streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+            .max_by_key(|s| {
+                let p = unsafe { &*s.parameters().as_ptr() };
+                (p.width as i64) * (p.height as i64)
+            })
+            .ok_or_else(|| Error::Ffmpeg("no video stream".into()))?;
+        (s.index(), s.parameters())
+    };
+    let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(params)
+        .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+    if !try_enable_d3d11va_decode(&mut codec_ctx) {
+        return Err(Error::Ffmpeg("d3d11va setup failed".into()));
+    }
+    let mut dec = codec_ctx
+        .decoder()
+        .video()
+        .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
+    let mut frame = ffmpeg_next::frame::Video::empty();
+    for (s, packet) in ictx.packets() {
+        if s.index() != idx {
+            continue;
+        }
+        if dec.send_packet(&packet).is_err() {
+            continue;
+        }
+        if dec.receive_frame(&mut frame).is_ok() {
+            return Ok(frame);
+        }
+    }
+    Err(Error::Ffmpeg("no d3d11 frame decoded".into()))
 }
 
 /// Per-stream decode timing for a multi-frame benchmark run.

@@ -66,6 +66,33 @@ pub trait FisheyePairIter {
 
     /// Eye dimensions (one fisheye, not the SBS-composed frame).
     fn eye_dims(&self) -> (u32, u32);
+
+    /// Decode-forward to the first frame at/after `target_pts_s` (within half
+    /// a frame `dt`), returning ONLY that frame. Call after `seek`.
+    ///
+    /// The default scans via `next_pair`, so every intermediate GOP frame
+    /// still pays the full HW→CPU download + swscale. Iterators where that
+    /// conversion dominates the seek cost (the dual-stream OSV detail-still
+    /// path) override this to decode the intermediates on the hardware engine
+    /// but convert only the target frame. Returns the last decoded frame if
+    /// the target is past EOF, or `Ok(None)` if nothing decodes.
+    fn decode_forward_to(&mut self, target_pts_s: f64, dt: f64)
+        -> Result<Option<FisheyePair>>
+    {
+        let cutoff = target_pts_s - dt * 0.5;
+        let mut latest: Option<FisheyePair> = None;
+        for _ in 0..4000 {
+            match self.next_pair()? {
+                Some(p) => {
+                    let reached = p.pts_s >= cutoff;
+                    latest = Some(p);
+                    if reached { break; }
+                }
+                None => break,
+            }
+        }
+        Ok(latest)
+    }
 }
 
 // ── SBS fisheye (single ffmpeg stream, split horizontally) ─────────
@@ -294,6 +321,10 @@ pub struct DualStreamFisheyeIter {
     frame_limit: u32,
     frames_yielded: u32,
     time_base_s: f64,
+    /// Temporary decode-stage profiling: cumulative seconds spent in the
+    /// HW-frame download and in swscale, summed across both eyes.
+    dbg_download_s: f64,
+    dbg_scale_s: f64,
     /// If true, output left = stream[1], right = stream[0]. Default
     /// false: left = stream[0]. The Python OSV path swaps based on
     /// `cfg.swap_eyes` (`vr180_gui.py:3554`).
@@ -430,12 +461,27 @@ impl DualStreamFisheyeIter {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (i, hw);
                 if matches!(hw, HwDecode::VideoToolbox) {
                     return Err(Error::Ffmpeg(
                         "VideoToolbox is macOS-only".into()
                     ));
                 }
+                // Windows: offload HEVC decode to the GPU video engine via
+                // D3D11VA (NVDEC on NVIDIA, equivalent on Intel/AMD). `Auto`
+                // falls back to software if the hwaccel can't attach.
+                // Decoded surfaces arrive as AV_PIX_FMT_D3D11 and are
+                // downloaded to host memory in `scale_one`.
+                #[cfg(target_os = "windows")]
+                if matches!(hw, HwDecode::Auto)
+                    && crate::decode::try_enable_d3d11va_decode(&mut codec_ctx)
+                {
+                    hw_active[i] = true;
+                    tracing::info!(
+                        "DualStreamFisheyeIter: D3D11VA hw decode active on stream {i}"
+                    );
+                }
+                #[cfg(not(target_os = "windows"))]
+                { let _ = i; }
             }
             let dec = codec_ctx.decoder().video()
                 .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
@@ -454,7 +500,7 @@ impl DualStreamFisheyeIter {
             clamp_decode_dim_to(w0, h0, max_decode_side)
         };
         tracing::info!(
-            "DualStreamFisheyeIter: native {}x{}, VT={}/{}, working {}x{} (cap={})",
+            "DualStreamFisheyeIter: native {}x{}, hw={}/{}, working {}x{} (cap={})",
             w0, h0, hw_active[0], hw_active[1], eye_w, eye_h,
             if max_decode_side == 0 { "off".into() } else { max_decode_side.to_string() }
         );
@@ -471,6 +517,8 @@ impl DualStreamFisheyeIter {
             output_bit_depth,
             frame_limit, frames_yielded: 0,
             time_base_s,
+            dbg_download_s: 0.0,
+            dbg_scale_s: 0.0,
             swap_eyes,
         })
     }
@@ -533,6 +581,65 @@ impl FisheyePairIter for DualStreamFisheyeIter {
         }))
     }
 
+    fn decode_forward_to(&mut self, target_pts_s: f64, dt: f64)
+        -> Result<Option<FisheyePair>>
+    {
+        // Decode-forward on the HW video engine, running the HW→CPU download +
+        // swscale ONLY for the target frame. Intermediate GOP frames are still
+        // decoded (the decoder needs them as references) but their surfaces are
+        // dropped without the ~200 ms/frame conversion — the dominant cost when
+        // seeking deep into a GOP for a single still (≈11 s → ≈2 s at 8K).
+        let cutoff = target_pts_s - dt * 0.5;
+        let mut result: [Option<(Vec<u8>, i64)>; 2] = [None, None];
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        let mut sw_storage = ffmpeg_next::frame::Video::empty();
+        let mut eof = false;
+        for _ in 0..8000 {
+            for pos in 0..2 {
+                if result[pos].is_some() { continue; }
+                // Drain everything this decoder has buffered, skipping the
+                // download+swscale until we hit the target frame.
+                while self.decoders[pos].receive_frame(&mut decoded).is_ok() {
+                    let pts = decoded.pts().unwrap_or(0);
+                    if (pts as f64 * self.time_base_s) >= cutoff {
+                        let rgba = self.scale_one(pos, &mut decoded, &mut sw_storage)?;
+                        result[pos] = Some((rgba, pts));
+                        break;
+                    }
+                    // else: intermediate frame — decoded for reference, dropped.
+                }
+            }
+            if result.iter().all(|r| r.is_some()) { break; }
+            if eof { break; }
+            // Feed one more packet to the stream that needs it. (Bind first so
+            // the ictx borrow ends before we touch the decoders, as next_pair.)
+            let res = self.ictx.packets().next();
+            match res {
+                Some((stream, packet)) => {
+                    if let Some(pos) =
+                        self.video_indices.iter().position(|&i| i == stream.index())
+                    {
+                        let _ = self.decoders[pos].send_packet(&packet);
+                    }
+                }
+                None => eof = true, // no more packets — drain once more, then stop
+            }
+        }
+        let (Some((f0, pts0)), Some((f1, _))) = (result[0].take(), result[1].take())
+        else {
+            return Ok(None);
+        };
+        let pts_s = pts0 as f64 * self.time_base_s;
+        let (left, right) = if self.swap_eyes { (f1, f0) } else { (f0, f1) };
+        self.frames_yielded += 1;
+        Ok(Some(FisheyePair {
+            left, right,
+            eye_w: self.eye_w, eye_h: self.eye_h,
+            bit_depth: self.output_bit_depth,
+            pts_s,
+        }))
+    }
+
     fn seek(&mut self, target_s: f64) -> Result<()> {
         let ts = (target_s.max(0.0) * 1_000_000.0) as i64;
         self.ictx.seek(ts, ..ts)
@@ -561,10 +668,19 @@ impl DualStreamFisheyeIter {
         decoded: &mut ffmpeg_next::frame::Video,
         sw_storage: &mut ffmpeg_next::frame::Video,
     ) -> Result<Vec<u8>> {
+        // Hardware-resident frame? Download to host memory. Covers both
+        // the macOS VideoToolbox surface and the Windows D3D11VA surface
+        // (NV12 for 8-bit, P010 for 10-bit Main10) — swscale handles both.
         let src_ref: &mut ffmpeg_next::frame::Video = if self.hw_active[pos]
-            && decoded.format() == ffmpeg_next::format::Pixel::VIDEOTOOLBOX
+            && matches!(
+                decoded.format(),
+                ffmpeg_next::format::Pixel::VIDEOTOOLBOX
+                    | ffmpeg_next::format::Pixel::D3D11
+            )
         {
+            let t_dl = std::time::Instant::now();
             crate::decode::download_hw_frame(decoded, sw_storage)?;
+            self.dbg_download_s += t_dl.elapsed().as_secs_f64();
             sw_storage
         } else {
             decoded
@@ -625,10 +741,274 @@ impl DualStreamFisheyeIter {
             }
         };
         let mut rgba_frame = ffmpeg_next::frame::Video::empty();
-        scaler.run(src_ref, &mut rgba_frame)
-            .map_err(|e| Error::Ffmpeg(format!("scale: {e}")))?;
+        let t_scale = std::time::Instant::now();
+        let run_res = scaler.run(src_ref, &mut rgba_frame);
+        let scale_elapsed = t_scale.elapsed().as_secs_f64();
+        run_res.map_err(|e| Error::Ffmpeg(format!("scale: {e}")))?;
+        self.dbg_scale_s += scale_elapsed;
         let bpp = if is_16bit { 8 } else { 4 };
         Ok(extract_packed_rgba_n(&rgba_frame, bpp))
+    }
+
+    /// Temporary profiling accessor: cumulative (download, swscale)
+    /// seconds since open, summed across both eyes.
+    pub fn debug_timing_s(&self) -> (f64, f64) {
+        (self.dbg_download_s, self.dbg_scale_s)
+    }
+}
+
+// ── Windows zero-copy dual-stream (d3d11va, GPU-resident) ──────────
+//
+// The Windows analogue of the macOS `ZeroCopyDualStreamFisheyeIter`
+// below. Both OSV streams decode via `d3d11va` (NVDEC on NVIDIA) and
+// stay GPU-resident as `AV_PIX_FMT_D3D11` P010 textures. Instead of the
+// `DualStreamFisheyeIter` download + swscale → RGBA `Vec<u8>` (the 54%
+// download + 29% swscale the profiler flagged), each eye's decoder DPB
+// slice is `CopySubresourceRegion`'d into a fresh shareable texture and
+// exported as an NT handle. The consumer imports those handles into
+// wgpu's Vulkan device (zero-copy memory alias) and projects the P010
+// planes directly via `project_fisheye_p010_planar_to_equirect_texture_16`.
+//
+// Used by the GUI preview's `run_fisheye_zerocopy` path. Export still has
+// its own path; this is preview-only for now.
+
+/// One GPU-resident fisheye pair — each eye is a D3D11 P010 texture shared
+/// out as an NT handle (see [`crate::interop_windows::D3d11SharedTexture`]).
+/// Hold this alive until the projection GPU work that imports + reads it has
+/// been submitted; dropping it closes the NT handles and releases the D3D11
+/// textures.
+#[cfg(target_os = "windows")]
+pub struct SharedFisheyePair {
+    pub left: crate::interop_windows::D3d11SharedTexture,
+    pub right: crate::interop_windows::D3d11SharedTexture,
+    /// Native fisheye dims (the full-res P010 — calibration resolves against
+    /// these, NOT a downscaled working res).
+    pub eye_w: u32,
+    pub eye_h: u32,
+    /// Presentation timestamp in seconds, `0.0` if unknown.
+    pub pts_s: f64,
+}
+
+// SAFETY: the COM interfaces inside `D3d11SharedTexture` are windows-rs agile
+// wrappers (Send + Sync) and the NT handle is a process-global value valid on
+// any thread. We move the pair from the decode worker thread to the consuming
+// (project) thread and there only (a) import via the NT handle on the Vulkan
+// side and (b) Release/CloseHandle on drop — we never issue D3D11 immediate-
+// context calls on the consuming thread. Moving it across threads is sound.
+#[cfg(target_os = "windows")]
+unsafe impl Send for SharedFisheyePair {}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for SharedFisheyePair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedFisheyePair")
+            .field("eye_w", &self.eye_w)
+            .field("eye_h", &self.eye_h)
+            .field("pts_s", &self.pts_s)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Dual-stream OSV iterator that keeps frames GPU-resident via `d3d11va` and
+/// yields [`SharedFisheyePair`]s of single-plane **RGBA16** textures. Each
+/// eye's P010 is converted to RGBA16 (+ box downscale to the working res) on
+/// the D3D11 side ([`crate::interop_windows::P010Converter`]) — the multi-plane
+/// P010 imports into Vulkan with a broken chroma-plane offset, so we hand the
+/// importer a single-plane RGBA16 instead. No CPU download, no swscale.
+#[cfg(target_os = "windows")]
+pub struct D3d11SharedDualStreamIter {
+    ictx: ffmpeg_next::format::context::Input,
+    video_indices: [usize; 2],
+    decoders: Vec<ffmpeg_next::codec::decoder::Video>,
+    /// Native decoded fisheye dims.
+    native_w: u32,
+    native_h: u32,
+    /// Working (downscaled) dims the converter outputs / we yield.
+    work_w: u32,
+    work_h: u32,
+    /// One converter per stream (each stream decodes on its own d3d11va
+    /// device), built lazily on the first frame.
+    converters: [Option<crate::interop_windows::P010Converter>; 2],
+    frames_yielded: u32,
+    time_base_s: f64,
+    /// If true, output left = stream[1], right = stream[0] (DJI OSV
+    /// convention; see `DualStreamFisheyeIter`).
+    swap_eyes: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for D3d11SharedDualStreamIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("D3d11SharedDualStreamIter")
+            .field("video_indices", &self.video_indices)
+            .field("native", &(self.native_w, self.native_h))
+            .field("work", &(self.work_w, self.work_h))
+            .field("swap_eyes", &self.swap_eyes)
+            .field("frames_yielded", &self.frames_yielded)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl D3d11SharedDualStreamIter {
+    /// Open a dual-stream OSV and enable `d3d11va` HEVC decode on both streams.
+    /// `work_w`/`work_h` is the preview working resolution the P010 is converted
+    /// + downscaled to (clamped to never upscale past native). Returns an error
+    /// (so the caller can fall back to the CPU path) if there aren't two video
+    /// streams or `d3d11va` can't attach to either stream.
+    pub fn new(path: &Path, swap_eyes: bool, work_w: u32, work_h: u32) -> Result<Self> {
+        ffmpeg_init();
+        let ictx = ffmpeg_next::format::input(path)
+            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+        let video_indices: Vec<usize> = ictx
+            .streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+            .map(|s| s.index())
+            .take(2)
+            .collect();
+        if video_indices.len() < 2 {
+            return Err(Error::Ffmpeg(format!(
+                "expected 2 video streams (OSV / dual-camera), found {}",
+                video_indices.len()
+            )));
+        }
+        let video_indices = [video_indices[0], video_indices[1]];
+        let mut decoders = Vec::with_capacity(2);
+        for &idx in video_indices.iter() {
+            let stream = ictx.stream(idx).unwrap();
+            let mut codec_ctx =
+                ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+                    .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+            if !crate::decode::try_enable_d3d11va_decode(&mut codec_ctx) {
+                return Err(Error::Ffmpeg(format!(
+                    "zero-copy OSV path requires d3d11va hwaccel — setup failed on stream {idx}"
+                )));
+            }
+            decoders.push(
+                codec_ctx.decoder().video()
+                    .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?,
+            );
+        }
+        let (w0, h0) = (decoders[0].width(), decoders[0].height());
+        let (w1, h1) = (decoders[1].width(), decoders[1].height());
+        if (w0, h0) != (w1, h1) {
+            return Err(Error::Ffmpeg(format!(
+                "OSV zero-copy streams disagree on dims: {w0}x{h0} vs {w1}x{h1}"
+            )));
+        }
+        let time_base = ictx.stream(video_indices[0]).unwrap().time_base();
+        let time_base_s = time_base.numerator() as f64 / time_base.denominator() as f64;
+        let work_w = work_w.clamp(2, w0);
+        let work_h = work_h.clamp(2, h0);
+        tracing::info!(
+            "D3d11SharedDualStreamIter: native {}x{} → work {}x{} (D3D11 P010→RGBA16 + downscale), swap_eyes={}",
+            w0, h0, work_w, work_h, swap_eyes
+        );
+        Ok(Self {
+            ictx, video_indices, decoders,
+            native_w: w0, native_h: h0,
+            work_w, work_h,
+            converters: [None, None],
+            frames_yielded: 0,
+            time_base_s,
+            swap_eyes,
+        })
+    }
+
+    /// Working (downscaled) dims — what `next_pair` yields.
+    pub fn eye_dims(&self) -> (u32, u32) { (self.work_w, self.work_h) }
+    /// Native decoded dims (before downscale).
+    pub fn native_dims(&self) -> (u32, u32) { (self.native_w, self.native_h) }
+
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let ts = (target_s.max(0.0) * 1_000_000.0) as i64;
+        self.ictx.seek(ts, ..ts)
+            .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        for d in &mut self.decoders {
+            d.flush();
+        }
+        self.frames_yielded = 0;
+        Ok(())
+    }
+
+    /// Pull the next GPU-resident pair. Decodes one frame from each stream
+    /// (holding both simultaneously), shares each eye's DPB slice into a fresh
+    /// NT-handle texture, then releases the source frames. Returns `Ok(None)`
+    /// at EOF.
+    pub fn next_pair(&mut self) -> Result<Option<SharedFisheyePair>> {
+        let mut frames: [Option<(ffmpeg_next::frame::Video, i64)>; 2] = [None, None];
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+
+        // Drain any pre-buffered frames first.
+        for pos in 0..2 {
+            if frames[pos].is_some() { continue; }
+            if self.decoders[pos].receive_frame(&mut decoded).is_ok() {
+                let pts = decoded.pts().unwrap_or(0);
+                frames[pos] = Some((
+                    std::mem::replace(&mut decoded, ffmpeg_next::frame::Video::empty()),
+                    pts,
+                ));
+            }
+        }
+
+        if frames.iter().any(|f| f.is_none()) {
+            loop {
+                let (stream, packet) = match self.ictx.packets().next() {
+                    Some(x) => x,
+                    None => break,
+                };
+                let pos = match self.video_indices.iter().position(|&i| i == stream.index()) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                // Always feed the packet to its decoder, even if that eye's
+                // frame is already in hand, so the decoders stay in lockstep.
+                if self.decoders[pos].send_packet(&packet).is_err() { continue; }
+                if frames[pos].is_none()
+                    && self.decoders[pos].receive_frame(&mut decoded).is_ok()
+                {
+                    let pts = decoded.pts().unwrap_or(0);
+                    frames[pos] = Some((
+                        std::mem::replace(&mut decoded, ffmpeg_next::frame::Video::empty()),
+                        pts,
+                    ));
+                }
+                if frames.iter().all(|f| f.is_some()) { break; }
+            }
+        }
+
+        let (Some((f0, pts0)), Some((f1, _pts1))) = (frames[0].take(), frames[1].take()) else {
+            return Ok(None);
+        };
+        let pts_s = pts0 as f64 * self.time_base_s;
+
+        // Convert each eye P010 → shareable RGBA16 (D3D11-side YCbCr→RGB +
+        // downscale, then NT-handle share). After this the source frames can
+        // drop — their pixels live in our converted copies.
+        let (work_w, work_h) = (self.work_w, self.work_h);
+        let s0 = unsafe {
+            crate::interop_windows::share_eye_converted(&f0, &mut self.converters[0], work_w, work_h)
+        }
+        .ok_or_else(|| Error::Ffmpeg("zero-copy: convert eye0 failed".into()))?;
+        let s1 = unsafe {
+            crate::interop_windows::share_eye_converted(&f1, &mut self.converters[1], work_w, work_h)
+        }
+        .ok_or_else(|| Error::Ffmpeg("zero-copy: convert eye1 failed".into()))?;
+        // Both eyes' decode+convert were submitted (on their two separate
+        // d3d11va devices) WITHOUT an intervening fence, so the GPU runs them
+        // concurrently. Now fence both before handing the pair off — the
+        // importer must see completed pixels (the chroma fix depends on it).
+        unsafe { s0.wait_gpu_idle(); s1.wait_gpu_idle(); }
+        drop(f0);
+        drop(f1);
+
+        let (left, right) = if self.swap_eyes { (s1, s0) } else { (s0, s1) };
+        self.frames_yielded += 1;
+        Ok(Some(SharedFisheyePair {
+            left, right,
+            eye_w: self.work_w, eye_h: self.work_h,
+            pts_s,
+        }))
     }
 }
 

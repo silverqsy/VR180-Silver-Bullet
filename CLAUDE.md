@@ -3,37 +3,52 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ If you're on the Windows PC: your job is the Windows build
+## ⚡ Status: Windows build works — now a macOS verification handoff
 
-The immediate task for this handoff is to **build and run the GUI app
-(`vr180-gui`) natively on Windows**, then fix anything platform-specific
-that the macOS-only dev hasn't been able to test.
+The Windows native build of `vr180-gui` is **up and running**: it builds,
+plays OSV, and exports H.265 via **NVENC, GPU-resident** (NVDEC→wgpu→CUDA,
+no CPU readback — see "Windows GPU-resident export" below). A round of
+Windows-developed fixes touched **cross-platform display/color/decode code**.
+The macOS machine should rebuild and **verify these on Metal** (they were
+developed against Vulkan and couldn't be checked on macOS):
 
-**Start here: [docs/WINDOWS_BUILD.md](docs/WINDOWS_BUILD.md)** — it's the
-full, current step-by-step (toolchain, FFmpeg, build, run, gotchas).
+1. **Preview gamma — most important.** The egui display-view gamma was
+   corrected for **egui-wgpu 0.34** (see Lesson #2): the preview SBS is now
+   handed to egui with a **plain `Rgba8Unorm` view** on every platform, not
+   an sRGB view. **Verify the macOS preview matches the export** (not too
+   dark, not washed). This very likely *fixes* a latent too-dark preview on
+   macOS that the 0.28→0.34 egui upgrade introduced — the old sRGB-view
+   trick was only correct under 0.28. Do **not** revert it to an sRGB view.
+2. **Export color range.** Both export paths now emit **video-range
+   (limited / `AVCOL_RANGE_MPEG`) Rec.709** (was full-range on the Windows
+   GPU-resident path — a band-aid for the gamma bug, now removed). Verify
+   the macOS VideoToolbox/ProRes export still looks right and matches the
+   (now gamma-correct) preview.
+3. **Fisheye output mode** now previews **and** exports as a fisheye SBS
+   (was half-equirect-only in the zero-copy preview + GPU-resident export).
+   Verify on macOS.
 
-Quick version:
+Build/run quick-ref (build `-p vr180-gui`, **not** the workspace):
 ```pwsh
+# Windows
 $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"   # LLVM 17+
 $env:FFMPEG_DIR    = "C:\path\to\ffmpeg-7.x-dev"   # avbuild dev distribution
-cargo build --release -p vr180-gui                 # build ONLY the GUI (see below)
-$env:PATH = "$env:FFMPEG_DIR\bin;$env:PATH"
-.\target\release\vr180-gui.exe
+cargo build --release -p vr180-gui
+$env:PATH = "$env:FFMPEG_DIR\bin;$env:PATH"; .\target\release\vr180-gui.exe
 ```
+```sh
+# macOS
+cargo build --release -p vr180-gui && ./target/release/vr180-gui
+```
+Full Windows step-by-step (toolchain, FFmpeg, gotchas):
+[docs/WINDOWS_BUILD.md](docs/WINDOWS_BUILD.md).
 
-Most likely Windows issue: a recently-added line references a macOS-only
-API without a `#[cfg(target_os = "macos")]` gate. The error looks like
-`unresolved import crate::interop_macos` or `cannot find function
-create_p010_encode_buffer`. Fix = gate that block (with a
-`#[cfg(not(target_os = "macos"))]` fallback or `unreachable!()` where a
-value is needed — see `fisheye_export.rs` `use_zero_copy_*` for the
-pattern). The big macOS modules are already gated; expect only small gaps.
-
-> ⚠️ Build `-p vr180-gui`, **not** the whole workspace. The secondary
-> `vr180-render` CLI has a pre-existing non-exhaustive-match error
-> (`EncoderBackend::ProResVideoToolbox`/`ProResKs` arms missing in
-> `crates/vr180-render/src/main.rs`). It's unrelated to the GUI; fix it
-> only if you actually need the CLI.
+> ⚠️ The Windows-only additions (`nvenc_cuda`, the `cudarc` dep, D3D11→CUDA
+> interop) are `#[cfg(target_os = "windows")]` / `[target.'cfg(windows)']`
+> gated — they don't build on macOS. The secondary `vr180-render` CLI still
+> has a pre-existing non-exhaustive-match error; ignore it (build the GUI).
+> The verification examples under `crates/vr180-pipeline/examples/` are
+> gitignored local scaffolding (several are Windows/CUDA-only).
 
 ## What this is
 
@@ -43,10 +58,9 @@ no Python. The reference implementation is the Python/PyQt6 app at
 `../vr180_processor/vr180_gui.py` (the `main` branch / sibling worktree)
 — **we read it to port algorithms, we don't modify it.**
 
-- **Shipped:** a native desktop GUI, `vr180-gui` (eframe 0.28 + egui +
-  egui-wgpu + wgpu 0.20). This is the product. (The old CLAUDE.md said
-  "don't build the GUI yet / Tauri later" — obsolete; the GUI exists and
-  is the focus.)
+- **Shipped:** a native desktop GUI, `vr180-gui` (**eframe 0.34 + egui +
+  egui-wgpu + wgpu 29** — note: NOT 0.28/0.20; that stale version line hid a
+  display-gamma bug, see Lesson #2). This is the product.
 - **Primary source format:** DJI Osmo 360 `.osv` (dual-stream fisheye).
   Also handles SBS fisheye, Blackmagic `.braw`, and GoPro Max `.360`
   (EAC) as a legacy path.
@@ -79,11 +93,14 @@ paths exist on purpose, behind `#[cfg(target_os = "...")]`:
   `metal` / `core-foundation` / `objc` / `foreign-types` are
   `[target.'cfg(target_os = "macos")'.dependencies]` — they never build
   on Windows.
-- **Cross-platform (the Windows path):** ffmpeg software/`d3d11va` decode
-  (`DualStreamFisheyeIter`), `libx265` (H.265) + `prores_ks` (ProRes)
-  software encode, the whole wgpu compute pipeline, the GUI, audio
-  (cpal→WASAPI), file picker (rfd). The encoder backend is auto-selected
-  per-OS in `app.rs::commit_export`.
+- **Cross-platform + Windows fast paths:** `d3d11va` (NVDEC) decode —
+  `DualStreamFisheyeIter` for stills, `D3d11SharedDualStreamIter` for the
+  **zero-copy live preview** (D3D11 P010→RGBA16→Vulkan, no CPU readback);
+  `hevc_nvenc` (H.265, the **Windows default**, GPU-resident — see below)
+  with a `libx265` software fallback; `prores_ks` (ProRes); the whole wgpu
+  compute pipeline; GUI; audio (cpal→WASAPI); file picker (rfd). Encoder
+  backend auto-selected per-OS in `app.rs::commit_export`. Windows now has
+  its OWN zero-copy fast paths — it's no longer "macOS fast, Windows slow."
 
 Rules: every cfg gate matters; `pub use` from a macOS module must itself
 be gated (see `vr180-pipeline/src/lib.rs`); use `Path`/`PathBuf` (never
@@ -129,12 +146,36 @@ Every stage must hold ≥10-bit precision. NOTE: intermediates are
 **`Rgba16Unorm`** (not `Rgba16Float` — the old CLAUDE.md was wrong).
 - macOS: VT P010 IOSurface decode → 16-bit project → 16-bit color stack →
   P010 IOSurface encode (Main10), zero-copy.
-- Windows: ffmpeg 16-bit decode → 16-bit project → 16-bit color stack →
-  RGB48 readback → `libx265 --profile main10`. Still true 10-bit, just
-  not zero-copy.
+- Windows: NVDEC P010 decode → D3D11 P010→RGBA16 → 16-bit project → 16-bit
+  color stack → P010 compose → **GPU-resident CUDA NVENC** (`--profile
+  main10`), zero-copy (see "Windows GPU-resident export"). Fallback:
+  P010/RGB48 readback → `hevc_nvenc`/`libx265`.
 - The **preview** runs the same 16-bit color stack as the export, then
   composes to an `Rgba8Unorm` SBS for egui. Don't add an 8-bit color
   shortcut into the graded path.
+
+## Windows GPU-resident H.265 export (the fast path)
+
+On Windows, 10-bit H.265 export runs **fully GPU-resident** — no CPU
+readback — at the NVENC ceiling (~36 fps @ 8K on a 4090):
+
+> NVDEC P010 decode → D3D11 P010→RGBA16 → wgpu 16-bit project/color/compose
+> → P010 plane textures → **exportable Vulkan images → CUDA external memory
+> → `cuMemcpy2D` (DtoD) into NVENC's CUDA frame** → `hevc_nvenc`.
+
+Lives in `nvenc_cuda.rs` (`#[cfg(target_os = "windows")]`), dispatched from
+`fisheye_export.rs`. `cudarc` is a `[target.'cfg(windows)']` dep. The export
+uses a **dedicated** wgpu device (`gpu.rs::new_dedicated_from_adapter`) so it
+can't deadlock eframe's renderer (Lesson #1). Falls back to a P010/RGB48
+readback `hevc_nvenc`/`libx265` path. Both `HalfEquirect` and `Fisheye`
+output modes take the fast path.
+
+**Color range:** both the GPU-resident and readback paths compose
+**video-range** YCbCr and tag `AVCOL_RANGE_MPEG` (Rec.709) — the
+distribution standard (YouTube VR180, headsets), matching the source and the
+gamma-correct preview. `compose_sbs_to_p010_textures(…, full_range: bool)`
+takes a flag but **both callers pass `false`**; the brief full-range
+experiment was a band-aid for the preview-gamma bug (Lesson #2) and is gone.
 
 ## Hard-won lessons — DON'T regress these
 
@@ -145,15 +186,24 @@ Every stage must hold ≥10-bit precision. NOTE: intermediates are
    `DetailCache` decodes on a background thread (CPU/VideoToolbox only —
    it returns `Vec<u8>` pairs, never touches wgpu) and does the GPU
    project/compose on the **main** thread. Keep it that way.
-2. **Preview gamma:** egui treats sampled textures as *linear* and
-   re-applies the OETF. Our SBS holds Rec.709-gamma RGB, so preview
-   textures are registered with an **sRGB view** to cancel the double
-   encode (see the `register_native_texture` calls in `app.rs`). Without
-   it the preview looks washed-out vs the export.
-3. **Detail still = exact frame:** the native decoder seeks to a keyframe
-   and **decodes forward** to the requested pts; without it the still
-   shows a keyframe up to a GOP away and the image jumps. (Same fix in
-   the live decode worker's seek.)
+2. **Preview gamma (egui-wgpu 0.34 — corrected):** egui-wgpu's fragment
+   shader expects display textures that are **NOT sRGB-aware** — it samples
+   them as gamma/raw bytes (and on an sRGB swapchain linearizes at the very
+   end so the hardware re-encode is identity). Our SBS already holds
+   Rec.709-gamma bytes, so register it with a **plain `Rgba8Unorm` view** on
+   every platform (`preview_view_format` in `app.rs`; used at both
+   `register_native_texture` calls). An **sRGB view double-decodes** → the
+   preview shows `sRGB⁻¹(v)`, too dark. Windows' non-sRGB `Bgra8Unorm`
+   swapchain made it obvious; on macOS's sRGB swapchain it's wrong via a
+   different path. The old "register with an sRGB view" advice was correct
+   only under **egui-wgpu 0.28** and is now stale — **do not restore it.**
+3. **Detail still = exact frame, decode-forward skip:** the native decoder
+   seeks to a keyframe and **decodes forward** to the requested pts (else the
+   still shows a keyframe up to a GOP away). The OSV dual-stream path uses
+   `DualStreamFisheyeIter::decode_forward_to`: it decodes the intermediate
+   GOP frames on the HW engine but runs the HW→CPU download + swscale only on
+   the **target** frame (≈11 s → ≈0.6 s for a deep seek at 8K). Same
+   decode-forward in the live worker's seek.
 4. **OSV gyro timing:** per-frame stab samples the IMU 8.5 ms after
    frame-start (fps-independent); rolling-shutter uses a 19 ms (30 fps) /
    16.23 ms (50 fps) readout window centered on it. Verified vs DJI
@@ -177,14 +227,17 @@ Every stage must hold ≥10-bit precision. NOTE: intermediates are
 ## Don't
 
 - Don't run wgpu/GPU work off the main thread (see lesson #1).
-- Don't add CUDA / OpenCL / Numba deps — `wgpu` is the GPU answer.
+- `wgpu` is the GPU answer for compute/render. The ONE sanctioned exception
+  is the Windows NVENC export, which uses `cudarc` purely to feed NVENC
+  (Windows-gated); don't add CUDA/OpenCL/Numba anywhere else.
 - Don't shell out to a system `ffmpeg` — use `ffmpeg-next` in-process.
 - Don't remove a `#[cfg(target_os = "...")]` gate without confirming the
   API exists on the other platform; the Mac-only paths are FAST paths
   with deliberate cross-platform fallbacks.
 - Don't push to `main` (this is the `neo` branch).
-- Don't drop the graded path to 8-bit; don't reintroduce the preview
-  double-gamma or off-thread GPU deadlock.
+- Don't drop the graded path to 8-bit; don't re-introduce the off-thread GPU
+  deadlock; don't switch the preview back to an sRGB texture view (Lesson #2)
+  or the H.265 export back to full-range.
 
 ## Doc pointers
 

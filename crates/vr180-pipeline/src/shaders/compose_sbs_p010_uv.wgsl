@@ -9,7 +9,8 @@
 @group(0) @binding(1) var right_tex: texture_2d<f32>;
 @group(0) @binding(2) var uv_out:    texture_storage_2d<rg16unorm, write>;
 
-struct Uniforms { eye_w: u32, _pad0: u32, _pad1: u32, _pad2: u32, }
+// `full_range` (0 = video/limited [64,960], 1 = full [0,1023]).
+struct Uniforms { eye_w: u32, full_range: u32, _pad1: u32, _pad2: u32, }
 @group(0) @binding(3) var<uniform> u: Uniforms;
 
 const CHROMA_SCALE: f32 = 64.0 / 65535.0;
@@ -26,6 +27,10 @@ fn rgb_to_uv10_videorange(r: f32, g: f32, b: f32) -> vec2<f32> {
     // 10-bit video range.
     let cb_norm = -0.1146 * r - 0.3854 * g + 0.5 * b + 0.5;
     let cr_norm =  0.5    * r - 0.4542 * g - 0.0458 * b + 0.5;
+    if (u.full_range != 0u) {
+        // Full range: [0,1] → [0, 1023], chroma centered at 512.
+        return vec2<f32>(cb_norm * 1023.0, cr_norm * 1023.0);
+    }
     let cb10 = 64.0 + cb_norm * (960.0 - 64.0);
     let cr10 = 64.0 + cr_norm * (960.0 - 64.0);
     return vec2<f32>(cb10, cr10);

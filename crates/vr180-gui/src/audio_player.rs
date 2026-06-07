@@ -89,7 +89,7 @@ impl AudioPlayer {
             .ok_or_else(|| anyhow!("no default audio output device"))?;
         let supported = device.default_output_config()
             .map_err(|e| anyhow!("default_output_config: {e}"))?;
-        let device_sample_rate = supported.sample_rate().0;
+        let device_sample_rate = supported.sample_rate();
         let device_channels = supported.channels() as u32;
         tracing::info!(
             "audio_player: cpal device {:?} — {} ch @ {} Hz, fmt={:?}",

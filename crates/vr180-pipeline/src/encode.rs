@@ -32,8 +32,13 @@ use std::path::Path;
 /// outside macOS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderBackend {
-    /// `libx265` software encoder. Cross-platform, quality-tunable.
+    /// `libx265` software encoder. Cross-platform, quality-tunable, slow.
     Libx265,
+    /// `hevc_nvenc` NVIDIA hardware encoder. Windows / Linux with an
+    /// NVIDIA GPU. Many times faster than libx265 at large resolutions
+    /// (the VR180 SBS export is otherwise CPU-encode-bound). Falls back to
+    /// libx265 at the call site if the encoder can't be opened.
+    HevcNvenc,
     /// `hevc_videotoolbox` Apple hardware encoder. macOS only.
     VideoToolbox,
     /// `prores_videotoolbox` Apple hardware encoder. macOS only.
@@ -47,6 +52,7 @@ impl EncoderBackend {
     pub fn codec_name(self) -> &'static str {
         match self {
             EncoderBackend::Libx265             => "libx265",
+            EncoderBackend::HevcNvenc           => "hevc_nvenc",
             EncoderBackend::VideoToolbox        => "hevc_videotoolbox",
             EncoderBackend::ProResVideoToolbox  => "prores_videotoolbox",
             EncoderBackend::ProResKs            => "prores_ks",
@@ -107,6 +113,11 @@ pub struct H265Encoder {
     /// scaler so 10-bit and 8-bit input frames can both be handled
     /// without rebuilding swscale every frame.
     scaler_rgb48: Option<ffmpeg::software::scaling::Context>,
+    /// Lazy RGBA64LE → enc_pix_fmt scaler. Like `scaler_rgb48` but for
+    /// the 8-byte-per-pixel readback path: swscale drops the alpha and
+    /// does the YUV conversion, so the GPU readback skips the per-pixel
+    /// RGBA64→RGB48 repack (a 30M-iteration/frame CPU loop at 8K SBS).
+    scaler_rgba64: Option<ffmpeg::software::scaling::Context>,
 }
 
 /// Which `encode_*` entry point this encoder was configured for.
@@ -202,6 +213,10 @@ impl H265Encoder {
         // (semi-planar); libx265 wants YUV420P10LE (fully planar).
         let enc_pix_fmt = match (bit_depth, backend) {
             (10, EncoderBackend::VideoToolbox)        => ffmpeg::format::Pixel::P010LE,
+            // NVENC consumes P010 (10-bit) / NV12 (8-bit) natively — both
+            // semi-planar, the formats the HW encoder wants.
+            (10, EncoderBackend::HevcNvenc)           => ffmpeg::format::Pixel::P010LE,
+            (8,  EncoderBackend::HevcNvenc)           => ffmpeg::format::Pixel::NV12,
             (10, EncoderBackend::Libx265)             => ffmpeg::format::Pixel::YUV420P10LE,
             (_,  EncoderBackend::ProResVideoToolbox)
                 | (_, EncoderBackend::ProResKs)       => ffmpeg::format::Pixel::YUV422P10LE,
@@ -220,6 +235,16 @@ impl H265Encoder {
             (*raw).gop_size = 60; // ~2s at 30 fps
             // MP4 needs hvc1 codec tag (vs hev1) for QuickTime / Vision Pro.
             (*raw).codec_tag = u32::from_le_bytes(*b"hvc1");
+            // Colorimetry → HEVC VUI + mp4 `colr` atom. Our RGB→YUV (swscale or
+            // the GPU P010 compose) emits video-range Rec.709; without these
+            // tags players guess full-range and lift the blacks (washed-out).
+            // HEVC backends only — ProRes keeps its own colr handling.
+            if !backend.is_prores() {
+                (*raw).color_range     = ffmpeg::ffi::AVColorRange::AVCOL_RANGE_MPEG;
+                (*raw).color_primaries = ffmpeg::ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+                (*raw).color_trc       = ffmpeg::ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+                (*raw).colorspace      = ffmpeg::ffi::AVColorSpace::AVCOL_SPC_BT709;
+            }
             // Global header flag for mp4 / mov muxers.
             if octx.format().flags()
                 .contains(ffmpeg::format::flag::Flags::GLOBAL_HEADER)
@@ -251,6 +276,19 @@ impl H265Encoder {
                     // libx265 defaults are fine — ABR at the configured
                     // bit_rate, medium preset. Could expose --preset
                     // and --crf knobs later if we want a quality dial.
+                }
+                EncoderBackend::HevcNvenc => {
+                    // NVIDIA hardware HEVC. preset p1(fastest)..p7(slowest);
+                    // p5 + tune=hq is high quality and still many times
+                    // faster than libx265 on a discrete GPU. VBR targets the
+                    // configured bit_rate (set above); maxrate gives VBR
+                    // headroom so high-detail VR180 frames aren't starved.
+                    let prof = if bit_depth == 10 { "main10" } else { "main" };
+                    set_opt(raw, "preset",  "p5")?;
+                    set_opt(raw, "tune",    "hq")?;
+                    set_opt(raw, "rc",      "vbr")?;
+                    set_opt(raw, "profile", prof)?;
+                    (*raw).rc_max_rate = ((bitrate_kbps as i64) * 1000 * 3) / 2;
                 }
                 EncoderBackend::ProResVideoToolbox | EncoderBackend::ProResKs => {
                     // ProRes ignores bit_rate (the profile picks the
@@ -308,6 +346,7 @@ impl H265Encoder {
             header_written: false,
             enc_pix_fmt,
             scaler_rgb48: None,
+            scaler_rgba64: None,
         })
     }
 
@@ -423,6 +462,122 @@ impl H265Encoder {
 
         self.encoder.send_frame(&yuv_frame)
             .map_err(|e| Error::Ffmpeg(format!("send_frame: {e}")))?;
+        self.drain_packets()?;
+        Ok(())
+    }
+
+    /// Encode one packed RGBA64LE frame (`w * h * 8` bytes, little-endian
+    /// 16-bit RGBA). swscale strips the alpha and converts to the encoder
+    /// pixel format in one SIMD pass — so the GPU readback can hand us the
+    /// raw 8-byte-per-pixel texture data via a bulk row copy instead of a
+    /// per-pixel RGBA64→RGB48 repack (which is ~30M iterations/frame at 8K
+    /// SBS and was the export's main-thread bottleneck).
+    pub fn encode_frame_rgba64(&mut self, rgba64le: &[u8]) -> Result<()> {
+        self.ensure_header_written()?;
+        let want = (self.w as usize) * (self.h as usize) * 8;
+        if rgba64le.len() != want {
+            return Err(Error::Ffmpeg(format!(
+                "encode_frame_rgba64: expected {want} bytes, got {}", rgba64le.len()
+            )));
+        }
+        if self.scaler_rgba64.is_none() {
+            self.scaler_rgba64 = Some(
+                ffmpeg::software::scaling::Context::get(
+                    ffmpeg::format::Pixel::RGBA64LE,
+                    self.w, self.h,
+                    self.enc_pix_fmt,
+                    self.w, self.h,
+                    ffmpeg::software::scaling::Flags::BICUBIC,
+                ).map_err(|e| Error::Ffmpeg(format!("rgba64→yuv scaler: {e}")))?
+            );
+        }
+
+        let mut rgba_frame = ffmpeg::frame::Video::new(
+            ffmpeg::format::Pixel::RGBA64LE, self.w, self.h
+        );
+        let stride = rgba_frame.stride(0);
+        {
+            let dst = rgba_frame.data_mut(0);
+            let row_bytes = (self.w as usize) * 8;
+            for y in 0..self.h as usize {
+                let dst_off = y * stride;
+                let src_off = y * row_bytes;
+                dst[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&rgba64le[src_off..src_off + row_bytes]);
+            }
+        }
+
+        let mut yuv_frame = ffmpeg::frame::Video::new(
+            self.enc_pix_fmt, self.w, self.h
+        );
+        self.scaler_rgba64.as_mut().unwrap().run(&rgba_frame, &mut yuv_frame)
+            .map_err(|e| Error::Ffmpeg(format!("rgba64 scaler run: {e}")))?;
+        yuv_frame.set_pts(Some(self.frame_count));
+        self.frame_count += 1;
+
+        self.encoder.send_frame(&yuv_frame)
+            .map_err(|e| Error::Ffmpeg(format!("send_frame: {e}")))?;
+        self.drain_packets()?;
+        Ok(())
+    }
+
+    /// True when the encoder's native input format is P010LE (NVENC /
+    /// VideoToolbox 10-bit). Callers can then GPU-compose straight to P010
+    /// planes and use [`Self::encode_frame_p010`], skipping swscale.
+    pub fn wants_p010(&self) -> bool {
+        self.enc_pix_fmt == ffmpeg::format::Pixel::P010LE
+    }
+
+    /// Encode one P010LE frame from GPU-composed planes — NO swscale. The
+    /// color-space conversion (RGB→YUV, chroma subsample, 10-bit MSB align)
+    /// already happened on the GPU, so this just copies the two planes into
+    /// an AVFrame whose pixel format already matches the encoder. This is
+    /// the path that removes the single-threaded CPU swscale that otherwise
+    /// caps the export's encode stage.
+    ///
+    /// `y`  = `w * h * 2` bytes (16-bit luma, tightly packed).
+    /// `uv` = `w * (h/2) * 2` bytes (interleaved 16-bit Cb,Cr at half res).
+    /// Only valid when [`Self::wants_p010`] is true.
+    pub fn encode_frame_p010(&mut self, y: &[u8], uv: &[u8]) -> Result<()> {
+        self.ensure_header_written()?;
+        if self.enc_pix_fmt != ffmpeg::format::Pixel::P010LE {
+            return Err(Error::Ffmpeg(
+                "encode_frame_p010 called on a non-P010 encoder".into()
+            ));
+        }
+        let w = self.w as usize;
+        let h = self.h as usize;
+        let y_row = w * 2;        // 16-bit luma
+        let uv_row = w * 2;       // interleaved Cb,Cr (w/2 pairs × 2 samples × 2 bytes)
+        if y.len() != y_row * h || uv.len() != uv_row * (h / 2) {
+            return Err(Error::Ffmpeg(format!(
+                "encode_frame_p010: bad plane sizes y={} (want {}) uv={} (want {})",
+                y.len(), y_row * h, uv.len(), uv_row * (h / 2)
+            )));
+        }
+        let mut frame = ffmpeg::frame::Video::new(
+            ffmpeg::format::Pixel::P010LE, self.w, self.h
+        );
+        {
+            let stride = frame.stride(0);
+            let dst = frame.data_mut(0);
+            for r in 0..h {
+                dst[r * stride..r * stride + y_row]
+                    .copy_from_slice(&y[r * y_row..r * y_row + y_row]);
+            }
+        }
+        {
+            let stride = frame.stride(1);
+            let dst = frame.data_mut(1);
+            for r in 0..h / 2 {
+                dst[r * stride..r * stride + uv_row]
+                    .copy_from_slice(&uv[r * uv_row..r * uv_row + uv_row]);
+            }
+        }
+        frame.set_pts(Some(self.frame_count));
+        self.frame_count += 1;
+        self.encoder.send_frame(&frame)
+            .map_err(|e| Error::Ffmpeg(format!("send_frame p010: {e}")))?;
         self.drain_packets()?;
         Ok(())
     }
@@ -940,6 +1095,7 @@ impl H265Encoder {
             // use of `enc_pix_fmt` does something sensible.
             enc_pix_fmt: ffmpeg::format::Pixel::YUV420P,
             scaler_rgb48: None,
+            scaler_rgba64: None,
         })
     }
 }

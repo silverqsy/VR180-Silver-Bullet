@@ -41,7 +41,7 @@ ffmpeg-next = "8.1"
 
 # GPU compute — single backend (Metal / Vulkan / DX12 via wgpu).
 # Replaces the MLX / Numba CUDA / Numba CPU trichotomy from the Python app.
-wgpu = "0.20"
+wgpu = "29"
 pollster = "0.4"
 bytemuck = { version = "1.21", features = ["derive"] }
 

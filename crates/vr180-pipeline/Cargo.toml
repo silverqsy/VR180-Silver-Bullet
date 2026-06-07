@@ -40,6 +40,36 @@ core-foundation = "0.9"
 objc = "0.2"
 foreign-types = "0.5"
 
+# D3D11 (NVDEC / D3D11VA decode output) ↔ Vulkan (wgpu) zero-copy interop
+# (Windows only). `ash` MUST resolve to the same minor wgpu-hal 29 uses,
+# so the `vk::Image` we import is the exact type `create_texture_from_hal`
+# expects. The `windows` crate drives the D3D11 side (texture share +
+# keyed mutex). Original MIT-licensed implementation in `interop_windows.rs`
+# (standard external-memory technique; not derived from GPL sources).
+[target.'cfg(target_os = "windows")'.dependencies]
+ash = "0.38"
+# CUDA driver API (dynamic-loaded nvcuda.dll, no toolkit needed) for the
+# GPU-resident encode path: import the Vulkan-composed P010 into CUDA and feed
+# NVENC directly (no CPU readback). Used via its raw `sys` layer for the
+# external-memory / external-semaphore interop the safe wrappers don't cover.
+cudarc = { version = "0.12", default-features = false, features = ["driver", "dynamic-linking", "cuda-12040"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[dev-dependencies]
+# PNG dump for the headless preview-repro example (lets us eyeball the exact
+# zero-copy preview output without the GUI).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Surfaces the pipeline's `tracing` logs (perf timings, path-engaged lines) in
+# the headless examples — the lib emits via `tracing`, which needs a subscriber.
+tracing-subscriber = "0.3"
+
 [features]
 default = []
 # Lets us compile without an FFmpeg dev install during very early

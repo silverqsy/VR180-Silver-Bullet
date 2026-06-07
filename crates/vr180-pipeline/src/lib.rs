@@ -36,6 +36,9 @@ pub use interop_macos::{
 #[cfg(target_os = "windows")]
 pub mod interop_windows;
 
+#[cfg(target_os = "windows")]
+pub mod nvenc_cuda;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("core: {0}")]

@@ -34,3 +34,18 @@ Thumbs.db
 /*.360
 /*.mp4
 /*.mov
+
+# Verification / debug artifacts (examples + manual runs write these to the
+# repo root or crate dir; never source). PNG/JPG/log dumps, raw pixel dumps.
+/*.png
+/*.jpg
+/*.log
+/build_log.txt
+*.rgba64
+/crates/vr180-pipeline/src/colorcheck.mp4
+/crates/vr180-pipeline/src/colorcheck*.png
+
+# Local verification scaffolding — handy on Windows, but several of these
+# examples are Windows/CUDA-only and would break the macOS `--all-targets`
+# build. Kept local; not part of the handoff.
+/crates/vr180-pipeline/examples/

@@ -559,6 +559,60 @@ fn run_fisheye(
     use vr180_pipeline::gpu::FisheyeCalib;
     use vr180_fisheye::presets;
 
+    // ── Windows zero-copy fast path (DJI OSV only) ───────────────────
+    // Probe synchronously so the decision is made BEFORE the live
+    // channels are consumed: if wgpu is on Vulkan with P010 support AND
+    // d3d11va attaches to both OSV streams, run the GPU-resident
+    // decode→import→project path (no CPU download / swscale). Any miss
+    // falls through to the portable CPU path below with frame_tx/cmd_rx
+    // untouched.
+    #[cfg(target_os = "windows")]
+    {
+        let has_p010 = pipeline.device
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_P010);
+        let on_vulkan = vr180_pipeline::interop_windows::is_vulkan_backend(&pipeline.device);
+        if matches!(kind, vr180_pipeline::SourceKind::DjiOsv) && on_vulkan && has_p010 {
+            // XOR with DJI's "swap by default" (matches the CPU worker).
+            let swap = !control.settings.read().fisheye_swap_eyes;
+            let ctx = vr180_pipeline::interop_windows::VulkanImportCtx::from_wgpu(
+                &pipeline.adapter, &pipeline.device,
+            );
+            // Working res for the D3D11-side P010→RGBA16 downscale: ~1280
+            // (matches the proven CPU working res), never below the preview eye.
+            // The iter clamps it to native.
+            let work = eye_w.max(eye_h).max(1280);
+            let iter = vr180_pipeline::fisheye_decode::D3d11SharedDualStreamIter::new(
+                &cfg.path, swap, work, work,
+            );
+            match (ctx, iter) {
+                (Some(ctx), Ok(iter)) => {
+                    tracing::info!(
+                        "decoder (fisheye): ZERO-COPY d3d11va→Vulkan path ENGAGED \
+                         (full-res P010, no CPU download/swscale)"
+                    );
+                    return run_fisheye_zerocopy(
+                        pipeline, cfg, control, kind, fps, dt, eye_w, eye_h,
+                        ctx, iter, frame_tx, cmd_rx,
+                    );
+                }
+                (c, i) => {
+                    tracing::warn!(
+                        "decoder (fisheye): zero-copy unavailable (vulkan_ctx={}, \
+                         d3d11va_iter_ok={}) — falling back to CPU download path",
+                        c.is_some(), i.is_ok()
+                    );
+                }
+            }
+        } else {
+            tracing::info!(
+                "decoder (fisheye): zero-copy preconditions not met \
+                 (dji_osv={}, vulkan={}, p010={}) — CPU path",
+                matches!(kind, vr180_pipeline::SourceKind::DjiOsv), on_vulkan, has_p010
+            );
+        }
+    }
+
     // === Pipelined decode ===
     //
     // The iter is created and run inside a worker thread so decode and
@@ -1331,6 +1385,513 @@ fn run_fisheye(
     Ok(())
 }
 
+/// Holds one source frame's GPU-resident resources alive together: the shared
+/// D3D11 pair and the two wgpu P010 textures imported from it. The imports
+/// **alias** the pair's D3D11 memory, so the pair must outlive them — bundling
+/// them guarantees that. Kept in a short retire queue so a frame is freed only
+/// a couple of frames after it stops being projected; by then the GPU has
+/// finished sampling it. (We can't block-poll for GPU completion on this
+/// thread without risking the cross-thread wgpu deadlock from Lesson #1, so we
+/// defer the drop instead of fencing.)
+#[cfg(target_os = "windows")]
+struct FrameHold {
+    /// Held for its `Drop` (closes NT handles / releases D3D11 textures) and
+    /// for `pts_s`. Field is read, so no underscore needed.
+    pair: vr180_pipeline::fisheye_decode::SharedFisheyePair,
+    /// The two eyes' imported RGBA16 textures (D3D11-converted, working-res),
+    /// aliasing the D3D11 memory in `pair`.
+    l_tex: wgpu::Texture,
+    r_tex: wgpu::Texture,
+}
+
+/// Push a just-replaced frame onto the retire queue and drop anything older
+/// than the last two frames (deferred GPU-completion drop — see [`FrameHold`]).
+#[cfg(target_os = "windows")]
+fn retire_frame(
+    q: &mut std::collections::VecDeque<FrameHold>,
+    old: Option<FrameHold>,
+) {
+    if let Some(fh) = old {
+        q.push_back(fh);
+        while q.len() > 2 { q.pop_front(); }
+    }
+}
+
+/// Windows zero-copy fisheye decoder loop (DJI OSV dual-stream).
+///
+/// Mirrors [`run_fisheye`]'s pacing / pause-resume / seek / trim / live-stab /
+/// live-calib semantics, but the pixel source is GPU-resident: a worker
+/// sub-thread decodes both streams with `d3d11va` and shares each eye out as an
+/// NT-handle P010 texture (no CPU download, no swscale); this thread imports
+/// each into wgpu's Vulkan device (zero-copy memory alias) and projects the
+/// P010 planes directly via `project_fisheye_p010_planar_to_equirect_texture_16`.
+///
+/// Honors both output modes: `HalfEquirect` (RS-corrected when OSV stab is on)
+/// and `Fisheye` (raw stabilized fisheye SBS), each via the matching RGBA16
+/// texture-input projection — so the live preview matches the export 1:1.
+/// v1 limitation vs the CPU path: the `Fisheye` projection applies frame-level
+/// stabilization only (no per-row RS), matching the GPU-resident export.
+#[cfg(target_os = "windows")]
+fn run_fisheye_zerocopy(
+    pipeline: Arc<vr180_pipeline::gpu::Device>,
+    cfg: &DecoderConfig,
+    control: Arc<DecoderControl>,
+    kind: vr180_pipeline::SourceKind,
+    fps: f32,
+    dt: f64,
+    eye_w: u32,
+    eye_h: u32,
+    ctx: vr180_pipeline::interop_windows::VulkanImportCtx,
+    iter: vr180_pipeline::fisheye_decode::D3d11SharedDualStreamIter,
+    frame_tx: Sender<DecodedFrame>,
+    cmd_rx: Receiver<DecoderCommand>,
+) -> anyhow::Result<()> {
+    use vr180_pipeline::fisheye_decode::SharedFisheyePair;
+
+    // ── Worker sub-thread: decode + share (D3D11 only, never touches wgpu) ──
+    enum IterCmd { Seek(f64) }
+    let (pair_tx, pair_rx) = crossbeam_channel::bounded::<(u64, SharedFisheyePair)>(8);
+    let (iter_cmd_tx, iter_cmd_rx) = crossbeam_channel::bounded::<IterCmd>(8);
+    let (dims_tx, dims_rx) = crossbeam_channel::bounded::<(u32, u32)>(1);
+
+    let initial_trim_in = control.settings.read().trim_in_s;
+    let mut iter = iter;
+    let _decode_handle = std::thread::spawn(move || {
+        if let Some(t_in) = initial_trim_in {
+            if t_in > 0.001 { let _ = iter.seek(t_in); }
+        }
+        let (sw, sh) = iter.eye_dims();
+        if dims_tx.send((sw, sh)).is_err() { return; }
+        let mut gen: u64 = 0;
+        loop {
+            while let Ok(cmd) = iter_cmd_rx.try_recv() {
+                match cmd {
+                    IterCmd::Seek(t) => {
+                        let _ = iter.seek(t);
+                        gen = gen.wrapping_add(1);
+                        // Decode forward to the frame AT t and yield it first
+                        // (seek lands on the keyframe ≤ t; same as the CPU path).
+                        let dtl = 1.0 / (fps.max(1e-3) as f64);
+                        for _ in 0..1200 {
+                            match iter.next_pair() {
+                                Ok(Some(p)) => {
+                                    if p.pts_s >= t - dtl * 0.5 {
+                                        if pair_tx.send((gen, p)).is_err() { return; }
+                                        break;
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                }
+            }
+            match iter.next_pair() {
+                Ok(Some(p)) => { if pair_tx.send((gen, p)).is_err() { break; } }
+                Ok(None) => break,
+                Err(e) => { tracing::warn!("zero-copy decode worker: {e}"); break; }
+            }
+        }
+    });
+
+    let (src_w, src_h) = match dims_rx.recv() {
+        Ok(d) => d,
+        Err(_) => anyhow::bail!("zero-copy decode worker failed to start"),
+    };
+    tracing::info!("decoder (fisheye/zc): native eye dims = {}x{} (full-res zero-copy)", src_w, src_h);
+
+    // ── Per-eye calibration + stabilization from the OSV protobuf ────
+    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> =
+        match vr180_pipeline::decode::extract_dji_meta_stream(&cfg.path) {
+            Ok(blob) => match vr180_fisheye::DjiOsvImu::parse(&blob) {
+                Ok(imu) => Some(imu),
+                Err(e) => { tracing::warn!("zc: dji protobuf parse failed: {e}"); None }
+            },
+            Err(e) => { tracing::warn!("zc: dji metadata extract failed: {e}"); None }
+        };
+    if let Some(imu) = dji_osv_imu.as_ref() {
+        let seed = |lens: &vr180_fisheye::DjiLensCalib| -> EyeCalibSeed {
+            let w = lens.width.unwrap_or(src_w as f32).max(1.0);
+            let h = lens.height.unwrap_or(src_h as f32).max(1.0);
+            let fov_deg = lens.fx.map(|fx| (w / fx.max(1.0)).to_degrees()).unwrap_or(180.0);
+            EyeCalibSeed {
+                fov_deg,
+                cx_norm: lens.cx.map(|v| v / w).unwrap_or(0.5),
+                cy_norm: lens.cy.map(|v| v / h).unwrap_or(0.5),
+                k: [lens.k1.unwrap_or(0.0), lens.k2.unwrap_or(0.0),
+                    lens.k3.unwrap_or(0.0), lens.k4.unwrap_or(0.0)],
+            }
+        };
+        *control.detected_calib.lock() = Some(DetectedLensCalib {
+            left: seed(&imu.lens_b),
+            right: seed(&imu.lens_a),
+        });
+    }
+
+    // `src_w`/`src_h` ARE the working (downscaled) dims the worker yields — the
+    // D3D11 side already converted P010→RGBA16 AND box-downscaled to this res,
+    // so the projection minifies only mildly (single tap, no alias) and we
+    // import a clean single-plane RGBA16. Calib resolves against THIS res (the
+    // projection samples the imported working-res texture).
+    let mut cached_gen = control.settings_generation.load(Ordering::SeqCst);
+    let (mut calib_left, mut calib_right) = resolve_fisheye_calib_pair(
+        &control.settings.read(), kind, src_w, src_h, dji_osv_imu.as_ref(),
+    );
+    tracing::info!(
+        "decoder (fisheye/zc): initial calib L fx={:.1} cx={:.1} cy={:.1} | R fx={:.1} cx={:.1} cy={:.1}",
+        calib_left.fx, calib_left.cx, calib_left.cy, calib_right.fx, calib_right.cx, calib_right.cy
+    );
+
+    let total_frames = vr180_pipeline::decode::probe_video(&cfg.path)
+        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+        .unwrap_or(0)
+        .max(1);
+    let compute_stab = |osv: Option<&vr180_fisheye::DjiOsvImu>,
+                        control: &DecoderControl| -> Option<Vec<EquirectRotation>> {
+        let osv = osv?;
+        let s = control.settings.read();
+        let max_corr_deg = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
+        let smooth_ms = s.dji_smooth_ms;
+        drop(s);
+        match vr180_pipeline::dji_imu::compute_dji_stabilization(
+            osv, total_frames, max_corr_deg, smooth_ms, fps,
+        ) {
+            Ok(stab) => Some(stab.per_frame),
+            Err(e) => { tracing::warn!("zc: dji stab failed: {e}"); None }
+        }
+    };
+    let mut stab_rotations: Option<Vec<EquirectRotation>> = None;
+    let mut last_stabilize_state = false;
+    if control.settings.read().stabilize {
+        stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control);
+        last_stabilize_state = true;
+    }
+
+    // ── Pacing / control state (same model as run_fisheye) ───────────
+    let mut frame_idx: u32 = 0;
+    let mut time_offset: f64 = 0.0;
+    let mut skipped_count: u32 = 0;
+    let mut start_wall: Option<std::time::Instant> = None;
+    let mut paused_offset = std::time::Duration::ZERO;
+    let mut force_render_next = false;
+    let mut expected_gen: u64 = 0;
+    if let Some(t_in) = initial_trim_in {
+        if t_in > 0.001 { time_offset = t_in; }
+    }
+
+    // Decimate >30 fps to half: the preview render contends with eframe and
+    // can't reliably make a 50 fps (20 ms) budget on this heavy 3840² 10-bit
+    // dual-stream source, so a clean locked 25 fps beats a render-bound,
+    // stuttery ~30. (Matches the CPU/VT path's behaviour.)
+    let preview_decimation: u32 = if fps > 30.5 { 2 } else { 1 };
+    let preview_fps = fps / preview_decimation as f32;
+    let preview_dt = 1.0_f64 / preview_fps as f64;
+    if preview_decimation > 1 {
+        tracing::info!("decoder (fisheye/zc): fps={:.2} → decimation {}× → {:.2} fps",
+            fps, preview_decimation, preview_fps);
+    }
+
+    let mut last_iter_end = std::time::Instant::now();
+    let mut decode_us: u128;
+
+    let recv_next_pair = |rx: &crossbeam_channel::Receiver<(u64, SharedFisheyePair)>, expected: u64|
+        -> Option<SharedFisheyePair>
+    {
+        loop {
+            match rx.recv() {
+                Ok((g, p)) if g == expected => return Some(p),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+    };
+
+    // `current` is the frame being shown; `retire_q` holds recently-replaced
+    // frames until the GPU is surely done with them (deferred drop, 2 deep).
+    let mut current: Option<FrameHold> = None;
+    let mut retire_q: std::collections::VecDeque<FrameHold> = std::collections::VecDeque::new();
+
+    'main: loop {
+        let stay_on_pair = control.paused.load(Ordering::SeqCst) && current.is_some();
+        if !stay_on_pair {
+            let mut p = recv_next_pair(&pair_rx, expected_gen);
+            if p.is_some() {
+                for _ in 1..preview_decimation {
+                    match pair_rx.try_recv() {
+                        Ok((g, np)) if g == expected_gen => p = Some(np),
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            match p {
+                Some(sp) => {
+                    // Import both eyes → single-plane RGBA16 wgpu textures
+                    // aliasing the D3D11-converted memory.
+                    let l_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.left) };
+                    let r_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.right) };
+                    let prev = current.take();
+                    retire_frame(&mut retire_q, prev);
+                    current = Some(FrameHold { pair: sp, l_tex, r_tex });
+                }
+                None => break 'main,
+            }
+        }
+        let fh = current.as_ref().expect("current populated above");
+        decode_us = last_iter_end.elapsed().as_micros();
+
+        // Live stabilize toggle.
+        let now_stabilize = control.settings.read().stabilize;
+        if now_stabilize != last_stabilize_state {
+            stab_rotations = if now_stabilize { compute_stab(dji_osv_imu.as_ref(), &control) } else { None };
+            last_stabilize_state = now_stabilize;
+        }
+
+        // Drain commands (seek/stop).
+        let mut seek_target: Option<f64> = None;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                DecoderCommand::Stop => return Ok(()),
+                DecoderCommand::Seek(t) => seek_target = Some(t.max(0.0)),
+            }
+        }
+        if let Some(t) = seek_target {
+            let _ = iter_cmd_tx.send(IterCmd::Seek(t));
+            expected_gen = expected_gen.wrapping_add(1);
+            time_offset = t; frame_idx = 0; start_wall = None;
+            paused_offset = std::time::Duration::ZERO; force_render_next = true;
+            let prev = current.take(); retire_frame(&mut retire_q, prev);
+            continue 'main;
+        }
+
+        // Trim-out loop.
+        let frame_t_rel = frame_idx as f64 * preview_dt;
+        let frame_t_abs = time_offset + frame_t_rel;
+        {
+            let s = control.settings.read();
+            if let Some(out_t) = s.trim_out_s {
+                if frame_t_abs >= out_t {
+                    let in_t = s.trim_in_s.unwrap_or(0.0);
+                    drop(s);
+                    let _ = iter_cmd_tx.send(IterCmd::Seek(in_t));
+                    expected_gen = expected_gen.wrapping_add(1);
+                    time_offset = in_t; frame_idx = 0; start_wall = None;
+                    paused_offset = std::time::Duration::ZERO; force_render_next = true;
+                    let prev = current.take(); retire_frame(&mut retire_q, prev);
+                    continue 'main;
+                }
+            }
+        }
+
+        // Pause handling (re-render current source on slider changes).
+        if control.paused.load(Ordering::SeqCst) && !force_render_next && stay_on_pair {
+            let pause_start = std::time::Instant::now();
+            while control.paused.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                if control.settings_generation.load(Ordering::SeqCst) != cached_gen {
+                    force_render_next = true; break;
+                }
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        DecoderCommand::Stop => return Ok(()),
+                        DecoderCommand::Seek(t) => {
+                            let _ = iter_cmd_tx.send(IterCmd::Seek(t.max(0.0)));
+                            expected_gen = expected_gen.wrapping_add(1);
+                            time_offset = t.max(0.0); frame_idx = 0; start_wall = None;
+                            paused_offset = std::time::Duration::ZERO; force_render_next = true;
+                            let prev = current.take(); retire_frame(&mut retire_q, prev);
+                            continue 'main;
+                        }
+                    }
+                }
+            }
+            paused_offset += pause_start.elapsed();
+        }
+
+        // Settings changed → re-resolve per-eye calib.
+        let current_gen = control.settings_generation.load(Ordering::SeqCst);
+        if current_gen != cached_gen {
+            let snap = control.settings.read();
+            let (l, r) = resolve_fisheye_calib_pair(&snap, kind, src_w, src_h, dji_osv_imu.as_ref());
+            calib_left = l; calib_right = r; drop(snap); cached_gen = current_gen;
+        }
+
+        // Wall-clock pacing.
+        let wall_t = start_wall
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
+        let decode_bound = (decode_us as f64) > preview_dt * 0.5e6;
+        if decode_bound {
+            start_wall = Some(std::time::Instant::now()
+                - std::time::Duration::from_secs_f64(frame_t_rel) - paused_offset);
+        } else if !force_render_next && wall_t > frame_t_rel + preview_dt * 0.5 {
+            frame_idx += 1; skipped_count += 1;
+            if wall_t > frame_t_rel + 1.0 {
+                start_wall = Some(std::time::Instant::now()
+                    - std::time::Duration::from_secs_f64(frame_t_rel) - paused_offset);
+            }
+            if skipped_count % 30 == 0 {
+                tracing::debug!("decoder (fisheye/zc): render-bound, behind {:.1} ms, skipped {}",
+                    (wall_t - frame_t_rel) * 1000.0, skipped_count);
+            }
+            last_iter_end = std::time::Instant::now();
+            continue;
+        }
+
+        // ── Project each eye (P010 planar) + compose SBS ─────────────
+        let phase_t0 = std::time::Instant::now();
+        let stab_idx = if fh.pair.pts_s.is_finite() && fh.pair.pts_s >= 0.0 {
+            (fh.pair.pts_s / dt).round() as usize
+        } else {
+            (((time_offset / dt).round() as i64) + frame_idx as i64).max(0) as usize
+        };
+        let absolute_frame_idx = stab_idx as u32;
+        let rot = stab_rotations.as_ref().and_then(|v| v.get(stab_idx).copied())
+            .unwrap_or(EquirectRotation::IDENTITY);
+
+        // Diagnostic: confirm frame-level stab is actually varying (rules out a
+        // "does nothing" wiring bug vs. a "wobbly = missing rolling-shutter" issue).
+        if frame_idx % 30 == 0 {
+            let tr = rot.0[0] + rot.0[4] + rot.0[8];
+            let mag = (((tr - 1.0) * 0.5).clamp(-1.0, 1.0)).acos().to_degrees();
+            tracing::info!(
+                "zc stab: idx={} mag={:.2}° (on={}, n_rots={}, rs_correct={})",
+                stab_idx, mag,
+                stab_rotations.is_some(),
+                stab_rotations.as_ref().map(|v| v.len()).unwrap_or(0),
+                control.settings.read().rs_correct,
+            );
+        }
+
+        // Per-row rolling-shutter correction for THIS frame (DJI OSV). Computed
+        // whenever stabilize is on — RS is part of the OSV stab (gated on
+        // `stabilize`, not `rs_correct`), matching the CPU/paused-still path.
+        // `src_h` is the working-res fisheye height the projection samples; the
+        // same per-row quats apply to both eyes (one IMU). Without this the OSV
+        // rolling-shutter jello is uncorrected (the "broken" stab).
+        let rs_rows_f32: Option<Vec<f32>> = if control.settings.read().stabilize {
+            dji_osv_imu.as_ref().and_then(|osv| {
+                vr180_pipeline::dji_imu::compute_per_row_quaternions_for_frame(
+                    osv,
+                    stab_idx,
+                    vr180_pipeline::dji_imu::dji_osmo_readout_ms_for_fps(fps) / 1000.0,
+                    src_h,
+                    fps,
+                )
+            }).map(|q| {
+                let lens_a = dji_osv_imu.as_ref()
+                    .and_then(|osv| osv.lens_a.mount_quat_xyzw)
+                    .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
+                vr180_pipeline::dji_imu::pack_per_row_camera_matrices(&q, lens_a)
+            })
+        } else {
+            None
+        };
+
+        let view_adjust = {
+            let s = control.settings.read();
+            vr180_pipeline::panomap::ViewAdjust {
+                pano_yaw_deg: s.pano_yaw_deg, pano_pitch_deg: s.pano_pitch_deg, pano_roll_deg: s.pano_roll_deg,
+                stereo_yaw_deg: s.stereo_yaw_deg, stereo_pitch_deg: s.stereo_pitch_deg, stereo_roll_deg: s.stereo_roll_deg,
+            }
+        };
+        let (rot_left, rot_right) = if view_adjust.is_identity() {
+            (rot, rot)
+        } else {
+            let (v_l, v_r) = view_adjust.per_eye_matrices();
+            (
+                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &v_l)),
+                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &v_r)),
+            )
+        };
+
+        let (left_tex, right_tex) = {
+            let s = control.settings.read();
+            let mode = s.fisheye_output_mode;
+            drop(s);
+            let (ow, oh) = match mode {
+                FisheyeOutputMode::HalfEquirect => (eye_w, eye_h),
+                // Fisheye output is a CIRCLE in a SQUARE frame (per eye).
+                FisheyeOutputMode::Fisheye => { let side = eye_w.min(eye_h); (side, side) }
+            };
+            // The imported textures are already RGBA16 at the working res (the
+            // D3D11 side did P010→RGBA16 + downscale), so project single-tap
+            // straight from them — no luma moiré, no chroma colour-fringing.
+            match mode {
+                // Raw fisheye SBS — match the GPU-resident export's Fisheye path
+                // EXACTLY so the preview previews what the export writes: pure
+                // KB fisheye reprojection with frame-level stab rotation only,
+                // NO per-row RS (there is no `_to_fisheye_rs_16` shader; the
+                // export skips RS for fisheye too — see fisheye_export.rs).
+                FisheyeOutputMode::Fisheye => {
+                    let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                        &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, 0,
+                    )?;
+                    let r = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                        &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1,
+                    )?;
+                    (l, r)
+                }
+                // Half-equirect VR180: when OSV stab is on use the RS variant so
+                // per-row rolling shutter is corrected (kills the jello); same
+                // per-row quats for both eyes.
+                FisheyeOutputMode::HalfEquirect => {
+                    if let Some(rs) = rs_rows_f32.as_deref() {
+                        let l = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                            &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs, 0,
+                        )?;
+                        let r = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                            &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs, 1,
+                        )?;
+                        (l, r)
+                    } else {
+                        let l = pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                            &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, 0,
+                        )?;
+                        let r = pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                            &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1,
+                        )?;
+                        (l, r)
+                    }
+                }
+            }
+        };
+        let (pe_w, pe_h) = (left_tex.width(), left_tex.height());
+        let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
+            &pipeline, &control.settings.read(), &left_tex, &right_tex, pe_w, pe_h,
+        )?;
+
+        let should_log = frame_idx < 10 || frame_idx % 60 == 0;
+        if should_log {
+            tracing::info!(
+                "perf(zc) f={:>4} wait={:>5}µs render={:>5}µs budget@{:.0}fps={:.0}µs (dec={}× native {}×{})",
+                frame_idx, decode_us, phase_t0.elapsed().as_micros(),
+                preview_fps, 1_000_000.0 / preview_fps, preview_decimation, src_w, src_h,
+            );
+        }
+
+        let out = DecodedFrame {
+            texture: Arc::new(sbs_tex),
+            width: out_w, height: out_h,
+            frame_idx: absolute_frame_idx,
+            timestamp_s: frame_t_abs,
+        };
+        match frame_tx.try_send(out) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => return Ok(()),
+        }
+        force_render_next = false;
+        let now = start_wall.unwrap().elapsed().as_secs_f64() - paused_offset.as_secs_f64();
+        if now < frame_t_rel {
+            std::thread::sleep(std::time::Duration::from_secs_f64(frame_t_rel - now));
+        }
+        if !control.paused.load(Ordering::SeqCst) { frame_idx += 1; }
+        last_iter_end = std::time::Instant::now();
+    }
+    Ok(())
+}
+
 /// Upload an RGBA8 pixel buffer into a Rgba8Unorm texture with
 /// TEXTURE_BINDING + COPY_SRC + STORAGE_BINDING, suitable for the
 /// preview-mode composer.
@@ -1353,12 +1914,12 @@ fn upload_rgba8_for_preview(
         view_formats: &[],
     });
     pipeline.queue.write_texture(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: &tex, mip_level: 0,
             origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
         },
         rgba,
-        wgpu::ImageDataLayout {
+        wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(w * 4),
             rows_per_image: Some(h),
@@ -1944,10 +2505,19 @@ fn compose_with_color_and_mode(
     // the inputs (TEXTURE_BINDING), so we pass them straight through.
     if !color_plan.any_active() {
         if preview_mode == vr180_pipeline::gpu::PreviewMode::Sbs {
-            // Single texture-copy compose — byte-identical to the
-            // pre-color-stack pipeline (1 submit, 1 alloc).
-            let sbs = compose_sbs(pipeline, left_tex, right_tex, eye_w, eye_h)?;
-            return Ok((sbs, eye_w * 2, eye_h));
+            // 8-bit eyes (CPU path): single texture-copy compose —
+            // byte-identical to the pre-color-stack pipeline (1 submit, 1
+            // alloc). 16-bit eyes (Windows zero-copy P010 path) can't use the
+            // copy (it can't convert Rgba16Unorm→Rgba8Unorm), so route them
+            // through `compose_preview`, which reads filterable-float and
+            // writes the Rgba8Unorm SBS egui displays.
+            if left_tex.format() == wgpu::TextureFormat::Rgba8Unorm {
+                let sbs = compose_sbs(pipeline, left_tex, right_tex, eye_w, eye_h)?;
+                return Ok((sbs, eye_w * 2, eye_h));
+            }
+            let out = pipeline.compose_preview(left_tex, right_tex, eye_w, eye_h, preview_mode)?;
+            let (out_w, out_h) = preview_mode.output_dims(eye_w, eye_h);
+            return Ok((out, out_w, out_h));
         }
         // Anaglyph / overlay: one compute dispatch, no extra copies.
         let out = pipeline.compose_preview(
@@ -2108,24 +2678,15 @@ fn detail_decode_worker(
         let target = ts.max(0.0);
         if iter.seek(target).is_err() { continue; }
         // `seek` lands on the keyframe at/before the target; decode forward
-        // to the exact frame so the still matches the live preview.
+        // to the exact frame so the still matches the live preview. For the
+        // dual-stream OSV path this decodes the intermediate GOP frames on the
+        // HW engine but converts (HW→CPU download + swscale) only the target
+        // frame — the bulk of the per-seek cost at 8K (≈11 s → ≈2 s).
         let t0 = std::time::Instant::now();
-        let mut n = 0u32;
-        let mut latest: Option<vr180_pipeline::fisheye_decode::FisheyePair> = None;
-        for _ in 0..1200 {
-            match iter.next_pair() {
-                Ok(Some(p)) => {
-                    n += 1;
-                    let reached = p.pts_s >= target - dt * 0.5;
-                    latest = Some(p);
-                    if reached { break; }
-                }
-                _ => break,
-            }
-        }
+        let latest = iter.decode_forward_to(target, dt).ok().flatten();
         if let Some(p) = latest {
-            tracing::info!("detail decode: {} frames → {:.3}s in {:?}",
-                n, target, t0.elapsed());
+            tracing::info!("detail decode → {:.3}s in {:?}",
+                target, t0.elapsed());
             let ts_ms = (target * 1000.0).round() as i64;
             if res_tx.send((ts_ms, p)).is_err() { return; }
             ctx.request_repaint(); // wake the UI to project + show the still
@@ -2309,11 +2870,11 @@ fn compose_sbs(
     });
     // Copy left → (0, 0)
     encoder.copy_texture_to_texture(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: left, mip_level: 0,
             origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
         },
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: &sbs, mip_level: 0,
             origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
         },
@@ -2321,11 +2882,11 @@ fn compose_sbs(
     );
     // Copy right → (eye_w, 0)
     encoder.copy_texture_to_texture(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: right, mip_level: 0,
             origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
         },
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: &sbs, mip_level: 0,
             origin: wgpu::Origin3d { x: eye_w, y: 0, z: 0 },
             aspect: wgpu::TextureAspect::All,

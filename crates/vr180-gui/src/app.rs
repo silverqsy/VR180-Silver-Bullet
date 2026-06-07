@@ -29,6 +29,11 @@ pub struct App {
     /// that want to register textures (currently the App holds it
     /// exclusively).
     egui_renderer: Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
+    /// Texture-view format used to register our Rec.709-gamma SBS with egui.
+    /// Always `Rgba8Unorm` (pass-through): egui-wgpu 0.34 samples display
+    /// textures as gamma/raw bytes ("NOT sRGB-aware"), so an sRGB *view*
+    /// would over-darken the preview to `sRGB⁻¹(v)`. See the constructor.
+    preview_view_format: wgpu::TextureFormat,
 
     // ─── User-visible state ──────────────────────────────────────
     loaded_path: Option<PathBuf>,
@@ -161,6 +166,11 @@ struct ExportOptions {
     h265_bitrate_mbps: u32,
     /// 8 or 10 (Main / Main10) for H.265.
     h265_bit_depth: u8,
+    /// H.265 encoder: hardware (NVIDIA NVENC) vs software (libx265).
+    /// Hardware is the default on Windows — it's many times faster at
+    /// VR180 resolutions. macOS always uses VideoToolbox regardless.
+    /// Falls back to libx265 automatically if NVENC can't be opened.
+    h265_hardware: bool,
     prores_profile: ProResProfile,
     /// Inject Apple Projected Media Profile (Vision Pro VR180).
     inject_apmp: bool,
@@ -178,6 +188,7 @@ impl Default for ExportOptions {
             codec: ExportCodec::H265,
             h265_bitrate_mbps: 200,
             h265_bit_depth: 10,
+            h265_hardware: true,
             prores_profile: ProResProfile::Hq,
             // APMP is the headline target (Vision Pro). They're
             // mutually exclusive; the dialog enforces it.
@@ -246,6 +257,10 @@ impl App {
         // preview (which is typically dark imagery itself) and matches
         // the rest of the colorist tooling our users come from
         // (DaVinci, FCP, Premiere, Insta360 Studio — all dark).
+        // egui 0.34 follows the OS theme by default, so forcing the
+        // visuals alone isn't enough — pin the theme *preference* to Dark
+        // (matches the previous build, which was always dark).
+        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
         // Pull the wgpu Arcs that eframe set up. Sharing the device
@@ -258,15 +273,12 @@ impl App {
         // (it's dropped after device creation). We don't use the
         // instance in our pipeline after construction, so a fresh
         // throwaway one is fine.
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
-        });
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let pipeline = vr180_pipeline::gpu::Device::from_existing(
             instance,
-            wgpu_state.adapter.clone(),
-            wgpu_state.device.clone(),
-            wgpu_state.queue.clone(),
+            std::sync::Arc::new(wgpu_state.adapter.clone()),
+            std::sync::Arc::new(wgpu_state.device.clone()),
+            std::sync::Arc::new(wgpu_state.queue.clone()),
         ).expect("pipeline device init from shared wgpu device");
         let pipeline = Arc::new(pipeline);
         tracing::info!(
@@ -274,13 +286,36 @@ impl App {
             name = %pipeline.adapter.get_info().name,
             "pipeline running on the eframe-owned wgpu device"
         );
+        // The egui surface (swapchain) format decides how egui encodes its
+        // output to the screen, which in turn decides whether our
+        // Rgba8UnormSrgb texture *view* (sRGB-decode-on-sample) is cancelled
+        // by a matching encode-on-store. On macOS this is *Srgb (validated
+        // correct); if Windows/Vulkan hands back a non-sRGB surface the decode
+        // isn't re-encoded and the preview shows sRGB⁻¹(v) — too dark.
+        tracing::info!(
+            target_format = ?wgpu_state.target_format,
+            is_srgb = wgpu_state.target_format.is_srgb(),
+            "egui surface (swapchain) format"
+        );
 
         // Restore the user's last-used settings from disk (defaults on first
         // run). Persisted across launches so every knob is remembered.
         let defaults = Settings::load_persisted();
+        // egui-wgpu 0.34's fragment shader (both the linear- and
+        // gamma-framebuffer variants) explicitly "expect normal textures that
+        // are NOT sRGB-aware": it samples them as gamma/raw bytes, and on an
+        // sRGB swapchain it linearizes at the very end so the hardware
+        // re-encode is identity. Our SBS already holds Rec.709-gamma bytes, so
+        // we register it with a PLAIN Unorm view on every platform. An sRGB
+        // *view* would sRGB-decode the sample; egui then treats that linear
+        // value as gamma and displays sRGB⁻¹(v) — too dark (the Windows
+        // symptom; the old sRGB view was right only under egui-wgpu 0.28).
+        let _ = wgpu_state.target_format; // logged above; view choice is fixed
+        let preview_view_format = wgpu::TextureFormat::Rgba8Unorm;
         Self {
             pipeline,
             egui_renderer: wgpu_state.renderer.clone(),
+            preview_view_format,
             loaded_path: None,
             clip: None,
             playing: false,
@@ -367,16 +402,22 @@ impl App {
             .save_file();
         let Some(output_path) = chosen else { return; };
 
-        // Pick the backend based on the chosen codec + platform.
+        // Pick the backend based on the chosen codec + platform. On
+        // Windows/Linux, H.265 defaults to NVENC (hardware) — libx265 is
+        // the VR180 export bottleneck — but the user can pick software in
+        // the options; either way `open_h265_encoder` falls back to libx265
+        // if NVENC can't be opened. macOS always uses VideoToolbox.
+        use vr180_pipeline::encode::EncoderBackend;
         let backend = match (self.export_opts.codec, cfg!(target_os = "macos")) {
-            (ExportCodec::H265, true) =>
-                vr180_pipeline::encode::EncoderBackend::VideoToolbox,
+            (ExportCodec::H265, true) => EncoderBackend::VideoToolbox,
             (ExportCodec::H265, false) =>
-                vr180_pipeline::encode::EncoderBackend::Libx265,
-            (ExportCodec::ProRes, true) =>
-                vr180_pipeline::encode::EncoderBackend::ProResVideoToolbox,
-            (ExportCodec::ProRes, false) =>
-                vr180_pipeline::encode::EncoderBackend::ProResKs,
+                if self.export_opts.h265_hardware {
+                    EncoderBackend::HevcNvenc
+                } else {
+                    EncoderBackend::Libx265
+                },
+            (ExportCodec::ProRes, true) => EncoderBackend::ProResVideoToolbox,
+            (ExportCodec::ProRes, false) => EncoderBackend::ProResKs,
         };
 
         // Output resolution depends on the projection target. For
@@ -468,14 +509,36 @@ impl App {
             projection,
         };
 
-        // Stop preview playback for the duration of the export — both
-        // share the same wgpu device + ffmpeg input contexts on the
-        // same file, no point racing.
+        // Stop preview playback for the duration of the export — they'd
+        // otherwise race on the same ffmpeg input contexts / decoder.
         self.stop_playback();
 
         let (progress_tx, progress_rx) = crossbeam_channel::bounded(256);
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_for_thread = cancel.clone();
+        // The export worker runs GPU work + RGB48 readback (`Maintain::Wait`)
+        // on a background thread. Lesson #1: doing that on the device eframe
+        // presents with can wedge the present queue. Export never hands a
+        // texture to egui (it reads back to CPU for the encoder), so on
+        // Windows we give it a DEDICATED logical device on the same adapter —
+        // fully isolated from eframe's present queue. Falls back to the shared
+        // device if the dedicated one can't be created.
+        #[cfg(target_os = "windows")]
+        let pipeline = match vr180_pipeline::gpu::Device::new_dedicated_from_adapter(
+            &self.pipeline.adapter,
+        ) {
+            Ok(d) => {
+                tracing::info!(
+                    "export: dedicated wgpu device (isolated from eframe present queue)"
+                );
+                Arc::new(d)
+            }
+            Err(e) => {
+                tracing::warn!("export: dedicated device unavailable ({e}); sharing eframe device");
+                self.pipeline.clone()
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
         let pipeline = self.pipeline.clone();
         let handle = std::thread::spawn(move || {
             vr180_pipeline::fisheye_export::export_fisheye(
@@ -633,11 +696,16 @@ impl App {
             if let Some(prev) = self.full_res_display.take() {
                 rend.free_texture(&prev.egui_id);
             }
-            // sRGB view so egui decodes our Rec.709-gamma SBS to linear on
-            // sample (egui re-applies the OETF) — prevents the double-gamma
-            // that made the preview look washed out vs the export.
+            // Plain Unorm pass-through view (`preview_view_format`): egui-wgpu
+            // 0.34 wants gamma/raw-byte samples, so NO sRGB decode here (an
+            // sRGB view darkens the preview to sRGB⁻¹(v) vs the export).
             let view = tex.create_view(&wgpu::TextureViewDescriptor {
-                format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                format: Some(self.preview_view_format),
+                // wgpu 29 derives a view's usages from the texture (which
+                // has STORAGE_BINDING from the compose pass) and rejects an
+                // sRGB storage view. This view is only sampled for display,
+                // so restrict it to TEXTURE_BINDING.
+                usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
                 ..Default::default()
             });
             let id = rend.register_native_texture(
@@ -700,11 +768,14 @@ impl App {
         // Register the new texture. Use a view of the SBS texture as
         // the egui-side handle. wgpu::Texture is Arc internally so
         // keeping our own Arc + handing eframe a view is fine.
-        // sRGB view so egui decodes our Rec.709-gamma SBS to linear on
-        // sample (egui re-applies the OETF) — prevents the double-gamma that
-        // made the preview look washed out vs the export.
+        // Plain Unorm pass-through view (`preview_view_format`): egui-wgpu 0.34
+        // samples display textures as gamma/raw bytes, so no sRGB decode here
+        // (an sRGB view darkens the preview to sRGB⁻¹(v) vs the export).
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            format: Some(self.preview_view_format),
+            // wgpu 29: restrict to TEXTURE_BINDING so the sRGB view isn't
+            // treated as a storage view (the SBS texture has STORAGE usage).
+            usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
             ..Default::default()
         });
         let id = renderer.register_native_texture(
@@ -1173,6 +1244,21 @@ impl App {
                             ui.selectable_value(&mut opts.h265_bit_depth, 10u8, "10-bit (Main10)");
                             ui.selectable_value(&mut opts.h265_bit_depth, 8u8,  "8-bit (Main)");
                         });
+                        // Encoder choice — hardware vs software. macOS always
+                        // uses VideoToolbox, so only surface this elsewhere.
+                        if !cfg!(target_os = "macos") {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("Encoder").strong());
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut opts.h265_hardware, true,  "Hardware (NVENC)");
+                                ui.selectable_value(&mut opts.h265_hardware, false, "Software (libx265)");
+                            });
+                            ui.label(RichText::new(if opts.h265_hardware {
+                                "GPU HEVC — fast (NVIDIA); auto-falls back to libx265 if unavailable."
+                            } else {
+                                "CPU HEVC — slow at VR180 resolutions, max software quality."
+                            }).weak().size(11.0));
+                        }
                     }
                     ExportCodec::ProRes => {
                         ui.label(RichText::new("ProRes profile").strong());
@@ -1245,6 +1331,13 @@ impl App {
 }
 
 impl eframe::App for App {
+    // eframe 0.34 made `ui` the required method and deprecated `update`.
+    // Our UI builds multiple panels (top/side/central) directly from
+    // `ctx`, so we keep overriding `update` (eframe's runner still calls
+    // it) and leave `ui` empty.
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
+    #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drain decoder frames first so the most recent texture is
         // ready by the time we render the central panel.
@@ -1530,8 +1623,15 @@ impl eframe::App for App {
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("Space play · I in · O out · ⌘O open · F fullscreen")
-                        .small().color(Color32::DARK_GRAY));
+                    // Only show the hint when there's room. A right-to-left
+                    // label in this shared row overflows LEFT when the window
+                    // is narrow, drawing over the trim buttons — guard on the
+                    // remaining width so it just hides instead of overlapping.
+                    let open = if cfg!(target_os = "macos") { "⌘O" } else { "Ctrl+O" };
+                    let hint = format!("Space play · I in · O out · {open} open · F fullscreen");
+                    if ui.available_width() > 320.0 {
+                        ui.label(RichText::new(hint).small().color(Color32::DARK_GRAY));
+                    }
                 });
             });
         });

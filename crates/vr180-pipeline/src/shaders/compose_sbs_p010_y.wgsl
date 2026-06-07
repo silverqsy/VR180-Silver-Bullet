@@ -12,7 +12,8 @@
 @group(0) @binding(1) var right_tex: texture_2d<f32>;
 @group(0) @binding(2) var y_out:     texture_storage_2d<r16unorm, write>;
 
-struct Uniforms { eye_w: u32, _pad0: u32, _pad1: u32, _pad2: u32, }
+// `full_range` (0 = video/limited [64,940], 1 = full [0,1023]).
+struct Uniforms { eye_w: u32, full_range: u32, _pad1: u32, _pad2: u32, }
 @group(0) @binding(3) var<uniform> u: Uniforms;
 
 // Rec.709 luma + video-range YCbCr scaling. P010 video-range Y goes
@@ -34,7 +35,11 @@ fn rgb_to_y10_videorange(r: f32, g: f32, b: f32) -> f32 {
     // that matches what swscale does for "RGB→YUV" without a
     // dedicated colorspace flag).
     let y_norm = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    // Video-range mapping: [0,1] → [64, 940] in 10-bit.
+    if (u.full_range != 0u) {
+        // Full range: [0,1] → [0, 1023] in 10-bit.
+        return y_norm * 1023.0;
+    }
+    // Video range: [0,1] → [64, 940] in 10-bit.
     return 64.0 + y_norm * (940.0 - 64.0);
 }
 

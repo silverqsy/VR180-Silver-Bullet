@@ -20,7 +20,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
-wgpu = "0.20"
+wgpu = "29"
 
 # probe-iosurface CLI demo path uses metal::MTLPixelFormat directly.
 # Whole subcommand is `#[cfg(target_os = "macos")]` so make the dep

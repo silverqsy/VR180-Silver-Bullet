@@ -150,6 +150,39 @@ fn video_only_temp_path(final_out: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(s)
 }
 
+/// Open the H.265 encoder, transparently falling back from the NVIDIA
+/// hardware encoder (`hevc_nvenc`) to `libx265` (CPU) if it can't be
+/// created — e.g. no NVIDIA GPU, a driver mismatch, or the codec missing
+/// from the FFmpeg build. The hardware path is the default on Windows
+/// because libx265 is the export bottleneck at VR180 resolutions, but it
+/// must degrade gracefully rather than fail the export outright.
+#[allow(clippy::too_many_arguments)]
+fn open_h265_encoder(
+    video_tmp: &std::path::Path,
+    sbs_w: u32, sbs_h: u32,
+    fps: f32,
+    bitrate_kbps: u32,
+    backend: EncoderBackend,
+    bit_depth: u8,
+    prores_profile: i32,
+) -> Result<H265Encoder> {
+    match H265Encoder::create_with_bit_depth(
+        video_tmp, sbs_w, sbs_h, fps, bitrate_kbps, backend, bit_depth, prores_profile,
+    ) {
+        Ok(enc) => Ok(enc),
+        Err(e) if backend == EncoderBackend::HevcNvenc => {
+            tracing::warn!(
+                "fisheye_export: hevc_nvenc unavailable ({e}); falling back to libx265 (CPU)"
+            );
+            H265Encoder::create_with_bit_depth(
+                video_tmp, sbs_w, sbs_h, fps, bitrate_kbps,
+                EncoderBackend::Libx265, bit_depth, prores_profile,
+            )
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Inject VR180 metadata atoms into `final_out` in place.
 /// At most ONE of `inject_youtube` / `inject_apmp` can be enabled —
 /// the two metadata flavours overwrite the same set of atoms and a
@@ -263,6 +296,115 @@ pub fn export_fisheye(
             return export_fisheye_osv_zerocopy_p010(
                 pipeline, cfg, &mut progress_cb, cancel,
             );
+        }
+    }
+
+    // ── Fast path: GPU-resident OSV → CUDA → NVENC (Windows, default) ────
+    // The full zero-copy-encode path — keeps the frame in VRAM and feeds NVENC
+    // via CUDA, no CPU readback. ~1.5× the readback path at 8K (reaches the
+    // NVENC hardware ceiling, ~36 fps). Default for NVENC + 10-bit + HalfEquirect
+    // + Vulkan + P010; set VR180_NO_GPU_RESIDENT to force the readback path.
+    // ANY failure (setup or mid-stream) falls through to the readback path, so
+    // enabling it by default is strictly safe.
+    #[cfg(target_os = "windows")]
+    tracing::info!(
+        "fisheye_export dispatch probe: src={:?} enc={:?} bd={} proj={:?} vulkan={} p010={}",
+        cfg.source_kind, cfg.encoder, cfg.bit_depth, cfg.projection,
+        crate::interop_windows::is_vulkan_backend(&pipeline.device),
+        pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010),
+    );
+
+    #[cfg(target_os = "windows")]
+    {
+        let try_gpu_resident = std::env::var_os("VR180_NO_GPU_RESIDENT").is_none()
+            && std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
+            && matches!(cfg.source_kind, SourceKind::DjiOsv)
+            && matches!(cfg.encoder, EncoderBackend::HevcNvenc)
+            && cfg.bit_depth == 10
+            && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye)
+            && crate::interop_windows::is_vulkan_backend(&pipeline.device)
+            && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010);
+        if try_gpu_resident {
+            let swap = !cfg.fisheye_swap_eyes;
+            let ctx = crate::interop_windows::VulkanImportCtx::from_wgpu(
+                &pipeline.adapter, &pipeline.device,
+            );
+            let iter = crate::fisheye_decode::D3d11SharedDualStreamIter::new(
+                &cfg.source_path, swap, u32::MAX, u32::MAX,
+            );
+            match (ctx, iter) {
+                (Some(ctx), Ok(iter)) => {
+                    tracing::info!("fisheye_export: GPU-RESIDENT NVENC(CUDA) path ENGAGED");
+                    match export_fisheye_osv_gpu_resident(
+                        Arc::clone(&pipeline), cfg.clone(), ctx, iter, &mut progress_cb, Arc::clone(&cancel),
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => tracing::warn!(
+                            "fisheye_export: GPU-resident path failed ({e}) — \
+                             falling back to the readback path"
+                        ),
+                    }
+                }
+                (c, i) => tracing::warn!(
+                    "fisheye_export: GPU-resident unavailable (vulkan_ctx={}, iter_ok={}) — \
+                     falling through to readback path", c.is_some(), i.is_ok()
+                ),
+            }
+        }
+    }
+
+    // ── Fast path: zero-copy OSV → d3d11va → Vulkan → libx265 (Windows) ──
+    // GPU-resident decode: NVDEC (d3d11va) decodes the dual HEVC P010
+    // streams, a D3D11 compute shader converts each eye P010→RGBA16 at
+    // native res (no downscale), and the texture is imported into wgpu via
+    // VK_KHR_external_memory_win32 — exactly the preview's zero-copy front
+    // end. From there it's the same RS-aware KB projection + 16-bit color
+    // stack + SBS compose, then RGB48 readback → libx265 (the portable
+    // path's encoder tail). What we save vs the portable path: the per-frame
+    // swscale P010LE→RGBA64LE + CPU upload of the 3840² dual stream.
+    //
+    // Scope: OSV + HEVC(libx265) + HalfEquirect + Vulkan + P010 only.
+    // Anything else (ProRes, raw-fisheye pass-through, non-OSV, DX12, no
+    // P010) — or the `VR180_EXPORT_FORCE_CPU` escape hatch — falls through
+    // to the portable readback path below, untouched.
+    #[cfg(target_os = "windows")]
+    {
+        let can_try = std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
+            && matches!(cfg.source_kind, SourceKind::DjiOsv)
+            && matches!(cfg.encoder, EncoderBackend::Libx265 | EncoderBackend::HevcNvenc)
+            && cfg.projection == FisheyeExportProjection::HalfEquirect
+            && (cfg.bit_depth == 10 || cfg.bit_depth == 8)
+            && crate::interop_windows::is_vulkan_backend(&pipeline.device)
+            && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010);
+        if can_try {
+            // OSV swap-by-default ⊕ user override (matches preview + CPU path).
+            let swap = !cfg.fisheye_swap_eyes;
+            let ctx = crate::interop_windows::VulkanImportCtx::from_wgpu(
+                &pipeline.adapter, &pipeline.device,
+            );
+            // u32::MAX work dims → the iter clamps to native, so the D3D11
+            // P010→RGBA16 convert is 1:1 (full-res export, no quality loss).
+            let iter = crate::fisheye_decode::D3d11SharedDualStreamIter::new(
+                &cfg.source_path, swap, u32::MAX, u32::MAX,
+            );
+            match (ctx, iter) {
+                (Some(ctx), Ok(iter)) => {
+                    tracing::info!(
+                        "fisheye_export: ZERO-COPY d3d11va→Vulkan export path ENGAGED \
+                         (native-res P010, no CPU download/swscale)"
+                    );
+                    return export_fisheye_osv_zerocopy_d3d11(
+                        pipeline, cfg, ctx, iter, &mut progress_cb, cancel,
+                    );
+                }
+                (c, i) => {
+                    tracing::warn!(
+                        "fisheye_export: zero-copy unavailable (vulkan_ctx={}, \
+                         d3d11va_iter_ok={}) — falling back to CPU readback path",
+                        c.is_some(), i.is_ok()
+                    );
+                }
+            }
         }
     }
 
@@ -398,15 +540,26 @@ pub fn export_fisheye(
     // what lets us preserve the OSV's stereo AAC track.
     let video_tmp = video_only_temp_path(&cfg.output_path);
     let mut encoder = if use_zero_copy_bgra {
-        H265Encoder::create_zero_copy_vt(
+        // macOS/VideoToolbox-only zero-copy BGRA path. `use_zero_copy_bgra`
+        // is always `false` on non-macOS targets, so this arm is dead there
+        // — gate the VT-only ctor and supply `unreachable!()` where the
+        // value is needed (mirrors the `#[cfg]` blocks in the encode loop).
+        #[cfg(target_os = "macos")]
+        { H265Encoder::create_zero_copy_vt(
             &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
-        )?
+        )? }
+        #[cfg(not(target_os = "macos"))]
+        { unreachable!("zero-copy BGRA encode is macOS/VideoToolbox-only") }
     } else if use_zero_copy_p010 {
-        H265Encoder::create_zero_copy_vt_p010(
+        // macOS/VideoToolbox-only zero-copy P010 (Main10) path. Same gating.
+        #[cfg(target_os = "macos")]
+        { H265Encoder::create_zero_copy_vt_p010(
             &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
-        )?
+        )? }
+        #[cfg(not(target_os = "macos"))]
+        { unreachable!("zero-copy P010 encode is macOS/VideoToolbox-only") }
     } else {
-        H265Encoder::create_with_bit_depth(
+        open_h265_encoder(
             &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
             cfg.encoder, cfg.bit_depth, cfg.prores_profile,
         )?
@@ -926,6 +1079,640 @@ fn export_fisheye_osv_zerocopy_p010(
     Ok(())
 }
 
+// ── Fast path: zero-copy OSV → d3d11va → Vulkan → libx265 (Windows) ────
+//
+// The Windows analogue of `export_fisheye_osv_zerocopy_p010`. Pulls
+// GPU-resident RGBA16 eye textures from `D3d11SharedDualStreamIter`
+// (NVDEC d3d11va decode + a D3D11 compute P010→RGBA16 convert at native
+// res), imports each into wgpu via `VK_KHR_external_memory_win32`, runs
+// the same RS-aware KB projection + 16-bit color stack + SBS compose the
+// preview uses, then reads back RGB48 and hands it to libx265. The encoder
+// tail is identical to the portable path — only the decode → projection
+// handoff stays GPU-resident (no swscale, no per-frame CPU upload).
+//
+// Scope: HalfEquirect + HEVC(libx265). Errors are hard (the caller already
+// committed to this path after a successful iter/ctx open); they propagate
+// rather than silently restart on the CPU path mid-stream.
+#[cfg(target_os = "windows")]
+fn export_fisheye_osv_zerocopy_d3d11(
+    pipeline: Arc<Device>,
+    cfg: FisheyeExportConfig,
+    ctx: crate::interop_windows::VulkanImportCtx,
+    mut iter: crate::fisheye_decode::D3d11SharedDualStreamIter,
+    progress_cb: &mut impl FnMut(ExportProgress),
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    let (src_w, src_h) = iter.eye_dims(); // == native (work clamped to native)
+    let (nw, nh) = iter.native_dims();
+    tracing::info!(
+        "fisheye_export (zero-copy): work {}x{} (native {}x{}) → {}x{} SBS",
+        src_w, src_h, nw, nh, cfg.eye_w * 2, cfg.eye_h
+    );
+
+    // ── Per-eye calib + stab from the OSV protobuf (same as portable) ──
+    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> =
+        match crate::decode::extract_dji_meta_stream(&cfg.source_path) {
+            Ok(blob) => match vr180_fisheye::DjiOsvImu::parse(&blob) {
+                Ok(imu) => Some(imu),
+                Err(e) => { tracing::warn!("zc export: dji protobuf parse: {e}"); None }
+            },
+            Err(e) => { tracing::warn!("zc export: dji meta extract: {e}"); None }
+        };
+    let (calib_left, calib_right) =
+        resolve_calib_pair(&cfg, src_w, src_h, dji_osv_imu.as_ref());
+
+    let total_clip_frames = crate::decode::probe_video(&cfg.source_path)
+        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+        .unwrap_or(0)
+        .max(1);
+    let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
+        dji_osv_imu.as_ref().and_then(|osv| {
+            let max_corr = if cfg.dji_max_corr_deg > 0.0 {
+                cfg.dji_max_corr_deg
+            } else { f32::INFINITY };
+            crate::dji_imu::compute_dji_stabilization(
+                osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps,
+            ).ok().map(|s| s.per_frame)
+        })
+    } else { None };
+    tracing::info!(
+        "fisheye_export (zero-copy): stab = {}",
+        if stab_rotations.is_some() { "engaged" } else { "off" }
+    );
+
+    // ── Trim ───────────────────────────────────────────────────────
+    let t_in = cfg.trim_in_s.unwrap_or(0.0).max(0.0);
+    if t_in > 0.001 { iter.seek(t_in)?; }
+    let t_out = cfg.trim_out_s
+        .map(|t| t.max(t_in + 1e-3))
+        .unwrap_or(f64::INFINITY);
+    let total_frames_to_write = if t_out.is_finite() {
+        ((t_out - t_in) * cfg.fps as f64).round() as u64
+    } else {
+        (total_clip_frames as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
+    };
+
+    let sbs_w = cfg.eye_w * 2;
+    let sbs_h = cfg.eye_h;
+    let video_tmp = video_only_temp_path(&cfg.output_path);
+
+    let dt = 1.0 / cfg.fps as f64;
+    let color_plan = cfg.color_stack.clone();
+    let readout_s = crate::dji_imu::dji_osmo_readout_ms_for_fps(cfg.fps) / 1000.0;
+    let lens_a_mount = dji_osv_imu.as_ref()
+        .and_then(|o| o.lens_a.mount_quat_xyzw)
+        .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
+
+    // ── 3-stage pipeline ───────────────────────────────────────────
+    // The serial path summed decode + GPU + encode per frame; at native
+    // res that's encode/readback-bound at ~4 fps. Split it so decode and
+    // encode overlap the GPU+readback critical path on the main thread:
+    //
+    //   [decode thread]  D3D11/NVDEC + P010→RGBA16 convert → SharedFisheyePair
+    //        │ sync_channel(3)
+    //   [main thread]    import → project(+RS) → color → compose → RGB48 readback
+    //        │ sync_channel(2)   (177 MB/frame at 7680×3840 → keep the bound low)
+    //   [encode thread]  owns H265Encoder (NVENC, libx265 fallback) → file
+    //
+    // All three touch DIFFERENT GPU contexts (ffmpeg D3D11 / our dedicated
+    // Vulkan device / NVENC's own session), so there's no shared queue to
+    // wedge — Lesson #1 stays satisfied. Wall-clock ≈ the slowest stage
+    // instead of their sum.
+    use crate::fisheye_decode::SharedFisheyePair;
+    // What the main thread hands the encode thread. P010 = the GPU already
+    // did RGB→YUV (NVENC's native input, no swscale); Rgba64 = swscale
+    // fallback (libx265 / 8-bit).
+    enum EncFrame { P010 { y: Vec<u8>, uv: Vec<u8> }, Rgba64(Vec<u8>) }
+    let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<SharedFisheyePair>(3);
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<EncFrame>(2);
+    let (fmt_tx, fmt_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+
+    // Decode thread — D3D11 only, never touches wgpu. `iter` was already
+    // trim-seeked above; just pump pairs until EOF, cancel, or the main
+    // thread drops the receiver (early stop / error).
+    let cancel_dec = cancel.clone();
+    let mut iter = iter;
+    let decode_handle = std::thread::spawn(move || {
+        loop {
+            if cancel_dec.load(Ordering::SeqCst) { break; }
+            match iter.next_pair() {
+                Ok(Some(p)) => { if pair_tx.send(p).is_err() { break; } }
+                Ok(None) => break,
+                Err(e) => { tracing::warn!("zc export: decode worker: {e}"); break; }
+            }
+        }
+    });
+
+    // Encode thread — owns the encoder so the NVENC→libx265 fallback (and
+    // the codec's own threads) live here, off the GPU critical path. The
+    // encoder is created HERE so a create failure cleanly drops `rgb_rx`,
+    // unblocking the main thread, and surfaces via the join below.
+    let enc_video_tmp = video_tmp.clone();
+    let (enc_backend, enc_fps, enc_bitrate, enc_bd, enc_prores) =
+        (cfg.encoder, cfg.fps, cfg.bitrate_kbps, cfg.bit_depth, cfg.prores_profile);
+    let encode_handle = std::thread::spawn(move || -> Result<u64> {
+        let mut encoder = open_h265_encoder(
+            &enc_video_tmp, sbs_w, sbs_h, enc_fps, enc_bitrate,
+            enc_backend, enc_bd, enc_prores,
+        )?;
+        // Report the encoder's native input so the main thread produces the
+        // matching layout. On create-failure we never send → main's recv
+        // errs and the pipeline winds down, surfacing the error at the join.
+        let _ = fmt_tx.send(encoder.wants_p010());
+        let mut n: u64 = 0;
+        while let Ok(f) = frame_rx.recv() {
+            match f {
+                EncFrame::P010 { y, uv } => encoder.encode_frame_p010(&y, &uv)?,
+                EncFrame::Rgba64(b)      => encoder.encode_frame_rgba64(&b)?,
+            }
+            n += 1;
+        }
+        encoder.finish()?;
+        Ok(n)
+    });
+    // Block until the encoder is open and reports its input format.
+    let wants_p010 = fmt_rx.recv().unwrap_or(false);
+    tracing::info!(
+        "fisheye_export (zero-copy): encode input = {}",
+        if wants_p010 { "P010 (GPU compose → NVENC, no swscale)" } else { "RGBA64 (swscale)" }
+    );
+
+    // Main thread — GPU work. import → project → color → compose → readback.
+    let t_start = std::time::Instant::now();
+    let mut frame_idx: u64 = 0;
+    let mut main_err: Option<Error> = None;
+    // Per-stage wall-clock accountancy (which pipeline stage is the floor?).
+    let (mut t_recv, mut t_gpu, mut t_send) = (
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    );
+    // Sub-split of the GPU stage: compute (project+compose) vs readback copy
+    // — tells us whether a GPU-resident encode (eliminating the readback)
+    // would actually help, or whether the projection compute is the floor.
+    let (mut t_gpuexec, mut t_readback) = (
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    );
+
+    loop {
+        let r0 = std::time::Instant::now();
+        let sp = match pair_rx.recv() { Ok(s) => s, Err(_) => break };
+        t_recv += r0.elapsed();
+        if cancel.load(Ordering::SeqCst) {
+            tracing::info!("fisheye_export (zero-copy): cancelled at frame {}", frame_idx);
+            break;
+        }
+        if sp.pts_s.is_finite() && sp.pts_s >= t_out {
+            tracing::info!("fisheye_export (zero-copy): hit trim_out @ {:.3}s", sp.pts_s);
+            break;
+        }
+
+        // PTS-based stab lookup (same logic as preview + portable path).
+        let stab_idx = if sp.pts_s.is_finite() && sp.pts_s >= 0.0 {
+            (sp.pts_s / dt).round() as usize
+        } else { frame_idx as usize };
+        let rot = stab_rotations
+            .as_ref()
+            .and_then(|v| v.get(stab_idx).copied())
+            .unwrap_or(EquirectRotation::IDENTITY);
+        let (rot_left, rot_right) = if cfg.view_adjust.is_identity() {
+            (rot, rot)
+        } else {
+            let (v_l, v_r) = cfg.view_adjust.per_eye_matrices();
+            (
+                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot.0, &v_l)),
+                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot.0, &v_r)),
+            )
+        };
+
+        // Per-row rolling-shutter matrices (only when stabilizing). Same
+        // lens_a mount quat for both eyes — matches the preview.
+        let rs_rows: Option<Vec<f32>> = if cfg.stabilize {
+            dji_osv_imu.as_ref().and_then(|osv| {
+                crate::dji_imu::compute_per_row_quaternions_for_frame(
+                    osv, stab_idx, readout_s, src_h, cfg.fps,
+                )
+            }).map(|q| crate::dji_imu::pack_per_row_camera_matrices(&q, lens_a_mount))
+        } else { None };
+
+        // All GPU work for this frame, errors captured so we can shut the
+        // pipeline down cleanly rather than unwinding past the join.
+        let g0 = std::time::Instant::now();
+        let readback: Result<EncFrame> = (|| {
+            // Import both eyes (single-plane RGBA16 aliasing the D3D11 convert).
+            let l_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.left) };
+            let r_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.right) };
+
+            // KB projection (RS variant when stabilizing). Slots 30/31 keep
+            // the export's cached output textures distinct from preview 0/1.
+            let (left16, right16) = if let Some(rs) = rs_rows.as_deref() {
+                (
+                    pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs, 30,
+                    )?,
+                    pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs, 31,
+                    )?,
+                )
+            } else {
+                (
+                    pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30,
+                    )?,
+                    pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31,
+                    )?,
+                )
+            };
+
+            // 16-bit color stack per eye.
+            let left_g = pipeline.apply_color_stack_per_eye_16(
+                &left16, cfg.eye_w, cfg.eye_h, &color_plan,
+            )?;
+            let right_g = pipeline.apply_color_stack_per_eye_16(
+                &right16, cfg.eye_w, cfg.eye_h, &color_plan,
+            )?;
+            let l_final = left_g.as_ref().unwrap_or(&left16);
+            let r_final = right_g.as_ref().unwrap_or(&right16);
+            if wants_p010 {
+                // GPU does RGB→YUV + chroma subsample; read back both P010
+                // planes (≈half the RGBA64 bytes) → NVENC consumes directly,
+                // no CPU swscale (the encode-stage bottleneck).
+                // Video-range here (false): the readback path's encoder
+                // (create_with_bit_depth) tags AVCOL_RANGE_MPEG, so the data
+                // must be video-range to match. (The GPU-resident path now
+                // also uses video-range — both export paths agree.)
+                let (y_tex, uv_tex) = pipeline.compose_sbs_to_p010_textures(
+                    l_final, r_final, cfg.eye_w, cfg.eye_h, false,
+                )?;
+                // Time the two readbacks separately (NO extra poll — that
+                // serializes the pipeline). The Y readback's internal poll
+                // drains the GPU, so the UV readback runs GPU-idle = pure copy
+                // cost. That tells us what a GPU-resident encode would save.
+                let ry = std::time::Instant::now();
+                let y = pipeline.read_texture_planar(&y_tex, sbs_w, sbs_h, 2)?;
+                t_gpuexec += ry.elapsed(); // GPU-exec + Y copy
+                let ruv = std::time::Instant::now();
+                let uv = pipeline.read_texture_planar(&uv_tex, sbs_w / 2, sbs_h / 2, 4)?;
+                t_readback += ruv.elapsed(); // pure UV copy (GPU idle)
+                Ok(EncFrame::P010 { y, uv })
+            } else {
+                let sbs_tex_16 = pipeline.compose_sbs_textures_16(
+                    l_final, r_final, cfg.eye_w, cfg.eye_h,
+                )?;
+                Ok(EncFrame::Rgba64(
+                    pipeline.read_texture_rgba64(&sbs_tex_16, sbs_w, sbs_h)?
+                ))
+            }
+        })();
+
+        // The RGB48 readback drained the GPU (map_async + Maintain::Wait), so
+        // this frame's imported eye textures are no longer in flight — drop
+        // the D3D11 share now (frees the import + the converted texture).
+        drop(sp);
+        t_gpu += g0.elapsed();
+
+        let frame = match readback {
+            Ok(r) => r,
+            Err(e) => { main_err = Some(e); break; }
+        };
+        // Hand off to the encode thread. A send error means the encoder
+        // failed to open (frame_rx dropped) — stop; the join surfaces why.
+        let s0 = std::time::Instant::now();
+        if frame_tx.send(frame).is_err() { break; }
+        t_send += s0.elapsed();
+
+        frame_idx += 1;
+        if frame_idx % 30 == 0 {
+            let n = frame_idx as u32;
+            tracing::info!(
+                "zc export perf: f={} avg/frame: recv_wait={:?} gpu+readback={:?} send_wait={:?} \
+                 [readY(gpu+copy)={:?} readUV(pure copy)={:?}]",
+                frame_idx, t_recv / n, t_gpu / n, t_send / n, t_gpuexec / n, t_readback / n,
+            );
+        }
+        let elapsed = t_start.elapsed().as_secs_f32().max(1e-3);
+        progress_cb(ExportProgress {
+            frame_idx,
+            total_frames: total_frames_to_write,
+            fps_avg: frame_idx as f32 / elapsed,
+        });
+    }
+
+    // Tear down: close the encode feed (encoder.finish runs), stop decode,
+    // then join both. Order matters only in that both senders/receivers must
+    // drop so the threads can exit their recv loops.
+    drop(frame_tx);
+    drop(pair_rx);
+    let enc_result = encode_handle.join();
+    let _ = decode_handle.join();
+
+    if let Some(e) = main_err {
+        return Err(e);
+    }
+    match enc_result {
+        Ok(Ok(_n)) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(Error::Ffmpeg("zc export: encode thread panicked".into())),
+    }
+
+    finalize_with_audio(&cfg.source_path, &video_tmp, &cfg.output_path)?;
+    finalize_metadata(
+        &cfg.output_path,
+        cfg.inject_youtube_vr180,
+        cfg.inject_apmp,
+        cfg.apmp_baseline_mm,
+    )?;
+    tracing::info!(
+        "fisheye_export (zero-copy d3d11, pipelined): done, {} frames in {:.2?}",
+        frame_idx, t_start.elapsed()
+    );
+    Ok(())
+}
+
+// ── Fast path: GPU-resident OSV → CUDA → NVENC (Windows, opt-in) ───────
+//
+// The endgame of the export optimization: the composited P010 frame never
+// leaves VRAM. Decode (d3d11va) → import → project → color → compose to P010
+// plane textures (wgpu/Vulkan) → copy into exportable linear images shared
+// with CUDA → intra-VRAM `cuMemcpy2DAsync` (DtoD) into NVENC's CUDA frame →
+// `hevc_nvenc`. Eliminates the ~24 ms/frame CPU readback that caps the
+// readback path at ~23 fps at 8K. Modeled on slr-studio-neo's proven
+// CUDA↔Vulkan interop, adapted for wgpu 29 (linear image via `texture_from_raw`
+// since wgpu-hal 29 dropped Vulkan `buffer_from_raw`).
+//
+// Gated behind `VR180_GPU_RESIDENT`; NVENC + 10-bit + HalfEquirect only.
+// Single-threaded CUDA (the primary context is current on this thread);
+// decode is inline for v1. Errors propagate (the caller already committed).
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn export_fisheye_osv_gpu_resident(
+    pipeline: Arc<Device>,
+    cfg: FisheyeExportConfig,
+    ctx: crate::interop_windows::VulkanImportCtx,
+    mut iter: crate::fisheye_decode::D3d11SharedDualStreamIter,
+    progress_cb: &mut impl FnMut(ExportProgress),
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    use crate::nvenc_cuda::{CudaNvencEncoder, SharedP010Frame};
+
+    // Bind the device-0 primary CUDA context to THIS thread; ffmpeg's CUDA
+    // hwdevice + our external-memory imports both share it.
+    let _cuda = cudarc::driver::CudaDevice::new(0)
+        .map_err(|e| Error::Ffmpeg(format!("cuda primary ctx: {e:?}")))?;
+
+    let (src_w, src_h) = iter.eye_dims();
+    let (nw, nh) = iter.native_dims();
+    let sbs_w = cfg.eye_w * 2;
+    let sbs_h = cfg.eye_h;
+    tracing::info!(
+        "fisheye_export (GPU-resident): work {}x{} (native {}x{}) → {}x{} SBS → NVENC(CUDA)",
+        src_w, src_h, nw, nh, sbs_w, sbs_h
+    );
+
+    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> =
+        match crate::decode::extract_dji_meta_stream(&cfg.source_path) {
+            Ok(blob) => vr180_fisheye::DjiOsvImu::parse(&blob).ok(),
+            Err(_) => None,
+        };
+    let (calib_left, calib_right) = resolve_calib_pair(&cfg, src_w, src_h, dji_osv_imu.as_ref());
+
+    let total_clip_frames = crate::decode::probe_video(&cfg.source_path)
+        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+        .unwrap_or(0)
+        .max(1);
+    let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
+        dji_osv_imu.as_ref().and_then(|osv| {
+            let max_corr = if cfg.dji_max_corr_deg > 0.0 { cfg.dji_max_corr_deg } else { f32::INFINITY };
+            crate::dji_imu::compute_dji_stabilization(
+                osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps,
+            ).ok().map(|s| s.per_frame)
+        })
+    } else { None };
+
+    let t_in = cfg.trim_in_s.unwrap_or(0.0).max(0.0);
+    if t_in > 0.001 { iter.seek(t_in)?; }
+    let t_out = cfg.trim_out_s.map(|t| t.max(t_in + 1e-3)).unwrap_or(f64::INFINITY);
+    let total_frames_to_write = if t_out.is_finite() {
+        ((t_out - t_in) * cfg.fps as f64).round() as u64
+    } else {
+        (total_clip_frames as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
+    };
+
+    let video_tmp = video_only_temp_path(&cfg.output_path);
+    // Ring of shared P010 frames: the main thread composes frame N+k while the
+    // encode thread is still feeding NVENC frame N. RING slots + a bounded
+    // channel of depth RING-2 keep main from overwriting an in-flight slot.
+    const RING: usize = 4;
+    let ring: Vec<SharedP010Frame> = (0..RING)
+        .map(|_| SharedP010Frame::new(&ctx, &pipeline.device, sbs_w, sbs_h))
+        .collect::<Result<Vec<_>>>()?;
+    tracing::info!("fisheye_export (GPU-resident): {RING}-slot shared P010 ring ready");
+
+    // Encode thread owns the NVENC(CUDA) encoder (created here so its ffmpeg
+    // CUDA hwdevice + frame pool live on one thread). It receives CUDA plane
+    // pointers (Copy values, valid in the shared device-0 primary context) and
+    // runs the DtoD + send_frame — overlapping NVENC's ~30 ms/frame at 8K with
+    // the main thread's ~4 ms GPU compose. A create failure surfaces at join.
+    struct EncMsg { y_ptr: u64, y_pitch: usize, uv_ptr: u64, uv_pitch: usize }
+    let (enc_tx, enc_rx) = std::sync::mpsc::sync_channel::<EncMsg>(RING - 2);
+    let (efps, ebr, etmp) = (cfg.fps, cfg.bitrate_kbps, video_tmp.clone());
+    let encode_handle = std::thread::spawn(move || -> Result<u64> {
+        let _cuda = cudarc::driver::CudaDevice::new(0)
+            .map_err(|e| Error::Ffmpeg(format!("encode-thread cuda ctx: {e:?}")))?;
+        let mut encoder = CudaNvencEncoder::new(&etmp, sbs_w, sbs_h, efps, ebr)?;
+        let mut n: u64 = 0;
+        while let Ok(m) = enc_rx.recv() {
+            unsafe { encoder.encode_cuda_planes(m.y_ptr, m.y_pitch, m.uv_ptr, m.uv_pitch)?; }
+            n += 1;
+        }
+        encoder.finish()?;
+        Ok(n)
+    });
+    tracing::info!("fisheye_export (GPU-resident): NVENC(CUDA) encode thread up");
+
+    let dt = 1.0 / cfg.fps as f64;
+    let color_plan = cfg.color_stack.clone();
+    let readout_s = crate::dji_imu::dji_osmo_readout_ms_for_fps(cfg.fps) / 1000.0;
+    let lens_a_mount = dji_osv_imu.as_ref()
+        .and_then(|o| o.lens_a.mount_quat_xyzw)
+        .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
+
+    // Decode sub-thread (D3D11/NVDEC only — never touches CUDA/wgpu), so the
+    // ~10 ms decode overlaps the GPU compose + NVENC encode on this thread.
+    use crate::fisheye_decode::SharedFisheyePair;
+    let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<SharedFisheyePair>(3);
+    let cancel_dec = cancel.clone();
+    let mut iter = iter;
+    let decode_handle = std::thread::spawn(move || {
+        loop {
+            if cancel_dec.load(Ordering::SeqCst) { break; }
+            match iter.next_pair() {
+                Ok(Some(p)) => { if pair_tx.send(p).is_err() { break; } }
+                Ok(None) => break,
+                Err(e) => { tracing::warn!("gpu-resident decode: {e}"); break; }
+            }
+        }
+    });
+
+    let t_start = std::time::Instant::now();
+    let mut frame_idx: u64 = 0;
+    let (mut t_decode, mut t_gpu, mut t_enc) = (
+        std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO,
+    );
+
+    loop {
+        let d0 = std::time::Instant::now();
+        let sp = match pair_rx.recv() { Ok(s) => s, Err(_) => break };
+        t_decode += d0.elapsed();
+        if cancel.load(Ordering::SeqCst) { break; }
+        if sp.pts_s.is_finite() && sp.pts_s >= t_out { break; }
+        let g0 = std::time::Instant::now();
+
+        let stab_idx = if sp.pts_s.is_finite() && sp.pts_s >= 0.0 {
+            (sp.pts_s / dt).round() as usize
+        } else { frame_idx as usize };
+        let rot = stab_rotations.as_ref().and_then(|v| v.get(stab_idx).copied())
+            .unwrap_or(EquirectRotation::IDENTITY);
+        let (rot_left, rot_right) = if cfg.view_adjust.is_identity() {
+            (rot, rot)
+        } else {
+            let (v_l, v_r) = cfg.view_adjust.per_eye_matrices();
+            (
+                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot.0, &v_l)),
+                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot.0, &v_r)),
+            )
+        };
+        let rs_rows: Option<Vec<f32>> = if cfg.stabilize {
+            dji_osv_imu.as_ref().and_then(|osv| {
+                crate::dji_imu::compute_per_row_quaternions_for_frame(
+                    osv, stab_idx, readout_s, src_h, cfg.fps,
+                )
+            }).map(|q| crate::dji_imu::pack_per_row_camera_matrices(&q, lens_a_mount))
+        } else { None };
+
+        // Import + project + color (same as the readback path).
+        let l_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.left) };
+        let r_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.right) };
+        let (left16, right16) = if cfg.projection == FisheyeExportProjection::Fisheye {
+            // Raw fisheye SBS pass-through (frame-level stab rotation, no RS) —
+            // slots 32/33 so the cache doesn't collide with the equirect slots.
+            (
+                pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                    &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 32)?,
+                pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                    &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 33)?,
+            )
+        } else if let Some(rs) = rs_rows.as_deref() {
+            (
+                pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                    &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs, 30)?,
+                pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                    &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs, 31)?,
+            )
+        } else {
+            (
+                pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                    &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30)?,
+                pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                    &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31)?,
+            )
+        };
+        let left_g = pipeline.apply_color_stack_per_eye_16(&left16, cfg.eye_w, cfg.eye_h, &color_plan)?;
+        let right_g = pipeline.apply_color_stack_per_eye_16(&right16, cfg.eye_w, cfg.eye_h, &color_plan)?;
+        let l_final = left_g.as_ref().unwrap_or(&left16);
+        let r_final = right_g.as_ref().unwrap_or(&right16);
+
+        // Diagnostic: dump the pre-encode graded RGB (the "preview" pixels,
+        // before any YCbCr conversion) for one frame, so we can compare it to
+        // the decoded output and isolate any color-roundtrip error.
+        if std::env::var("VR180_DUMP_PREENCODE").ok().and_then(|s| s.parse::<u64>().ok()) == Some(frame_idx) {
+            if let Ok(sbs16) = pipeline.compose_sbs_textures_16(l_final, r_final, cfg.eye_w, cfg.eye_h) {
+                if let Ok(rgba) = pipeline.read_texture_rgba64(&sbs16, sbs_w, sbs_h) {
+                    let p = cfg.output_path.with_extension("preencode.rgba64");
+                    let _ = std::fs::write(&p, &rgba);
+                    tracing::info!("VR180_DUMP_PREENCODE: wrote {}x{} RGBA64 → {}", sbs_w, sbs_h, p.display());
+                }
+            }
+        }
+
+        // Compose to P010 plane textures, then copy into this ring slot's
+        // CUDA-shared linear images. submit + poll(Wait) orders the GPU
+        // produce before the encode thread's CUDA DtoD reads the slot.
+        let sh = &ring[frame_idx as usize % RING];
+        // Video-range (limited) Rec.709 YCbCr — the distribution standard,
+        // consistent with the readback/libx265 paths and the source. Tagged
+        // AVCOL_RANGE_MPEG (see CudaNvencEncoder). A compliant decoder expands
+        // it back to the grade the gamma-correct preview shows. (The old
+        // full-range here was a band-aid for the too-dark preview, since fixed
+        // in the egui display path — see app.rs `preview_view_format`.)
+        let (y_opt, uv_opt) = pipeline.compose_sbs_to_p010_textures(l_final, r_final, cfg.eye_w, cfg.eye_h, false)?;
+        {
+            let mut enc = pipeline.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpu_resident_copy_to_shared"),
+            });
+            let copy = |enc: &mut wgpu::CommandEncoder, src: &wgpu::Texture, dst: &wgpu::Texture, w: u32, h: u32| {
+                enc.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo { texture: src, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyTextureInfo { texture: dst, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+            };
+            copy(&mut enc, &y_opt, sh.y_texture(), sbs_w, sbs_h);
+            copy(&mut enc, &uv_opt, sh.uv_texture(), sbs_w / 2, sbs_h / 2);
+            pipeline.queue.submit(Some(enc.finish()));
+        }
+        let _ = pipeline.device.poll(wgpu::PollType::wait_indefinitely());
+        t_gpu += g0.elapsed();
+
+        // Hand the (Copy) CUDA plane pointers to the encode thread. The
+        // bounded channel paces us to NVENC's rate; the GPU compose above
+        // overlapped this slot's predecessor's encode.
+        let e0 = std::time::Instant::now();
+        let (y_ptr, y_pitch) = sh.y_cuda();
+        let (uv_ptr, uv_pitch) = sh.uv_cuda();
+        if enc_tx.send(EncMsg { y_ptr, y_pitch, uv_ptr, uv_pitch }).is_err() {
+            break; // encode thread died — surfaced at join
+        }
+        t_enc += e0.elapsed();
+
+        drop(sp);
+        frame_idx += 1;
+        if frame_idx % 30 == 0 {
+            let n = frame_idx as u32;
+            tracing::info!(
+                "GPU-resident export: {} frames, {:.1} fps | recv_wait={:?} gpu+poll={:?} enc_send_wait={:?}",
+                frame_idx, frame_idx as f32 / t_start.elapsed().as_secs_f32().max(1e-3),
+                t_decode / n, t_gpu / n, t_enc / n,
+            );
+        }
+        progress_cb(ExportProgress {
+            frame_idx,
+            total_frames: total_frames_to_write,
+            fps_avg: frame_idx as f32 / t_start.elapsed().as_secs_f32().max(1e-3),
+        });
+    }
+
+    drop(pair_rx);
+    let _ = decode_handle.join();
+    drop(enc_tx); // end the encode thread's recv loop → it flushes + finishes
+    let enc_result = encode_handle.join();
+    drop(ring);   // free shared frames only AFTER the encoder is done reading
+    match enc_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(Error::Ffmpeg("gpu-resident encode thread panicked".into())),
+    }
+    finalize_with_audio(&cfg.source_path, &video_tmp, &cfg.output_path)?;
+    finalize_metadata(&cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm)?;
+    tracing::info!(
+        "fisheye_export (GPU-resident): done, {} frames in {:.2?} ({:.1} fps)",
+        frame_idx, t_start.elapsed(), frame_idx as f32 / t_start.elapsed().as_secs_f32().max(1e-3)
+    );
+    Ok(())
+}
+
 // (Old CPU SBS compose removed — replaced by
 // Device::compose_sbs_textures + read_texture_rgb8 on the GPU.)
 
@@ -1090,12 +1877,12 @@ fn upload_rgba8_texture(
         view_formats: &[],
     });
     pipeline.queue.write_texture(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: &tex, mip_level: 0,
             origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
         },
         rgba,
-        wgpu::ImageDataLayout {
+        wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(w * 4),
             rows_per_image: Some(h),
@@ -1142,12 +1929,12 @@ fn upload_rgba_as_rgba16(
         view_formats: &[],
     });
     pipeline.queue.write_texture(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: &tex, mip_level: 0,
             origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
         },
         &wide,
-        wgpu::ImageDataLayout {
+        wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(bytes_per_row),
             rows_per_image: Some(h),

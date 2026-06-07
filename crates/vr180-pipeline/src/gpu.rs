@@ -73,6 +73,9 @@ pub struct Device {
     /// preview when DJI OSV per-row matrices are available, to apply
     /// per-scanline correction (matches DJI Studio's per-slab approach).
     fisheye_to_hequirect_rs: FisheyeToHequirectRsPipeline,
+    /// 16-bit-output RS half-equirect projection (Windows zero-copy preview
+    /// stab with per-row rolling-shutter correction).
+    fisheye_to_hequirect_rs_16: FisheyeToHequirectRsPipeline,
     /// Zero-copy fisheye projection that reads P010 IOSurface planes
     /// (Y at full res, UV at half res) directly and does YCbCr→RGB
     /// inline. Used on the OSV export path on macOS to skip the
@@ -99,6 +102,10 @@ pub struct Device {
     /// RS-aware sibling of `fisheye_p010_to_fisheye_16` (zero-copy 10-bit
     /// fisheye-output export with per-row rolling-shutter correction).
     fisheye_p010_to_fisheye_rs_16: FisheyeP010ToHequirectRsPipeline,
+    /// P010 → RGBA16 resolve + box downscale (Windows zero-copy preview
+    /// prefilter — upsamples chroma to RGB then downscales, so the
+    /// preview's big minification doesn't alias).
+    p010_resolve: P010ResolvePipeline,
     lut3d: Lut3DPipeline,
     /// 16-bit-output variant of the 3D LUT pass. The LUT itself stays
     /// 8-bit (33³ entries — sampling is in floats so the LUT's own
@@ -139,6 +146,18 @@ pub struct Device {
     /// Per-slot recycling for the non-RS variant
     /// `project_fisheye_to_equirect_texture`.
     proj_fisheye_cache: Mutex<HashMap<u32, ProjFisheyeCacheSlot>>,
+    /// Per-slot reusable output texture for the Windows zero-copy preview
+    /// projection (`project_fisheye_rgba16_texture_to_equirect_16`). Avoids a
+    /// per-frame `create_texture` on the decoder thread (which contends with
+    /// eframe's main thread for the shared wgpu device). Keyed by slot, stores
+    /// `(w, h, texture)`; reused when dims match.
+    rgba16_eq_out_cache: Mutex<HashMap<u32, (u32, u32, wgpu::Texture)>>,
+    /// Reusable MAP_READ staging buffers for texture readback, keyed by byte
+    /// size. Allocating a fresh 88 MB staging buffer every frame (the P010
+    /// Y+UV readback) is a big chunk of the export's per-frame cost —
+    /// `vkAllocateMemory` of host-visible memory isn't free. Reusing one of
+    /// the right size makes the readback transfer-bound instead of alloc-bound.
+    readback_staging: Mutex<HashMap<u64, wgpu::Buffer>>,
 }
 
 #[derive(Debug)]
@@ -198,6 +217,25 @@ struct FisheyeP010ToHequirectRsPipeline {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+}
+
+/// P010 → RGBA16 resolve + box-downscale (see `p010_resolve_rgba16.wgsl`).
+/// Five bindings: Y tex, UV tex, sampler, RGBA16 storage out, dims uniform.
+#[derive(Debug)]
+struct P010ResolvePipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+/// Uniform for [`P010ResolvePipeline`] — source + destination dimensions.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ResolveDims {
+    src_w: f32,
+    src_h: f32,
+    out_w: f32,
+    out_h: f32,
 }
 
 #[derive(Debug)]
@@ -295,6 +333,7 @@ impl Device {
         let fisheye_to_hequirect = FisheyeToHequirectPipeline::create(&device);
         let fisheye_to_hequirect_16 = FisheyeToHequirectPipeline::create_16bit(&device);
         let fisheye_to_hequirect_rs = FisheyeToHequirectRsPipeline::create(&device);
+        let fisheye_to_hequirect_rs_16 = FisheyeToHequirectRsPipeline::create_16bit(&device);
         let fisheye_p010_to_hequirect_16 = FisheyeP010ToHequirectPipeline::create(&device);
         let fisheye_p010_to_hequirect_16_rs = FisheyeP010ToHequirectRsPipeline::create(&device);
         let fisheye_to_fisheye = FisheyeToHequirectPipeline::create_fisheye_out(&device);
@@ -302,6 +341,7 @@ impl Device {
         let fisheye_to_fisheye_16 = FisheyeToHequirectPipeline::create_fisheye_out_16(&device);
         let fisheye_p010_to_fisheye_16 = FisheyeP010ToHequirectPipeline::create_fisheye_out(&device);
         let fisheye_p010_to_fisheye_rs_16 = FisheyeP010ToHequirectRsPipeline::create_fisheye_out(&device);
+        let p010_resolve = P010ResolvePipeline::create(&device);
         let lut3d = Lut3DPipeline::create(&device);
         let lut3d_16 = Lut3DPipeline::create_16bit(&device);
         let nv12_to_eac = Nv12ToEacPipeline::create(&device);
@@ -344,7 +384,7 @@ impl Device {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         Ok(Self {
@@ -352,10 +392,12 @@ impl Device {
             eac_to_equirect,
             fisheye_to_hequirect, fisheye_to_hequirect_16,
             fisheye_to_hequirect_rs,
+            fisheye_to_hequirect_rs_16,
             fisheye_p010_to_hequirect_16,
             fisheye_p010_to_hequirect_16_rs,
             fisheye_to_fisheye, fisheye_to_fisheye_rs, fisheye_to_fisheye_16,
             fisheye_p010_to_fisheye_16, fisheye_p010_to_fisheye_rs_16,
+            p010_resolve,
             lut3d, lut3d_16, nv12_to_eac,
             cdl, cdl_16,
             color_grade, color_grade_16,
@@ -367,13 +409,15 @@ impl Device {
             bilinear_sampler,
             proj_fisheye_rs_cache: Mutex::new(HashMap::new()),
             proj_fisheye_cache: Mutex::new(HashMap::new()),
+            rgba16_eq_out_cache: Mutex::new(HashMap::new()),
+            readback_staging: Mutex::new(HashMap::new()),
         })
     }
 
     async fn new_async() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -382,7 +426,7 @@ impl Device {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or_else(|| Error::Wgpu("no compatible adapter".into()))?;
+            .map_err(|e| Error::Wgpu(format!("no compatible adapter: {e}")))?;
         let info = adapter.get_info();
         tracing::info!(
             backend = ?info.backend,
@@ -402,14 +446,60 @@ impl Device {
                     label: Some("vr180-render"),
                     required_features,
                     required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    trace: wgpu::Trace::Off,
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 },
-                None,
             )
             .await
             .map_err(|e| Error::Wgpu(format!("request_device: {e}")))?;
         Self::from_existing(
             instance,
             std::sync::Arc::new(adapter),
+            std::sync::Arc::new(device),
+            std::sync::Arc::new(queue),
+        )
+    }
+
+    /// Build a **dedicated** pipeline device on an existing adapter (e.g.
+    /// eframe's), with its own logical `wgpu::Device`/`Queue` separate from
+    /// the host renderer's. Requests the 16-bit-norm / P010 / NV12 features
+    /// needed for the 10-bit color stack and the Windows d3d11→Vulkan
+    /// zero-copy import.
+    ///
+    /// Why: the file **export** runs on a background thread and reads frames
+    /// back to CPU for the encoder (`Maintain::Wait`); it never hands a
+    /// texture to egui. Running that on a device that is ISOLATED from the
+    /// one eframe presents with sidesteps Lesson #1 entirely — a background
+    /// `Maintain::Wait` on a private device/queue can't wedge the host's
+    /// present queue on any backend. The shared device stays reserved for
+    /// the preview, whose textures must live in eframe's device.
+    pub fn new_dedicated_from_adapter(
+        adapter: &std::sync::Arc<wgpu::Adapter>,
+    ) -> Result<Self> {
+        let want = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            | wgpu::Features::TEXTURE_FORMAT_P010
+            | wgpu::Features::TEXTURE_FORMAT_NV12;
+        let have = adapter.features() & want;
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("vr180 export (dedicated)"),
+                required_features: have,
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            },
+        ))
+        .map_err(|e| Error::Wgpu(format!("export request_device: {e}")))?;
+        // `from_existing` keeps an instance handle alive; a throwaway one is
+        // fine (we never create surfaces on it — see app.rs for the same).
+        let instance = wgpu::Instance::new(
+            wgpu::InstanceDescriptor::new_without_display_handle(),
+        );
+        Self::from_existing(
+            instance,
+            adapter.clone(),
             std::sync::Arc::new(device),
             std::sync::Arc::new(queue),
         )
@@ -448,14 +538,14 @@ impl Device {
             view_formats: &[],
         });
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &input_tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             &cross_rgba,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(cross_w * 4),
                 rows_per_image: Some(cross_w),
@@ -505,7 +595,7 @@ impl Device {
                 timestamp_writes: None,
             });
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, Some(&bind_group), &[]);
             let wg_x = (out_w + 7) / 8;
             let wg_y = (out_h + 7) / 8;
             pass.dispatch_workgroups(wg_x, wg_y, 1);
@@ -524,15 +614,15 @@ impl Device {
             mapped_at_creation: false,
         });
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &output_tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_row_bytes),
                     rows_per_image: Some(out_h),
@@ -546,7 +636,7 @@ impl Device {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv()
             .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
             .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
@@ -615,14 +705,14 @@ impl Device {
             view_formats: &[],
         });
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &input_tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             src_rgba,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(src_w * 4),
                 rows_per_image: Some(src_h),
@@ -671,7 +761,7 @@ impl Device {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.fisheye_to_hequirect.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, Some(&bind_group), &[]);
             let wg_x = (out_w + 7) / 8;
             let wg_y = (out_h + 7) / 8;
             pass.dispatch_workgroups(wg_x, wg_y, 1);
@@ -690,14 +780,14 @@ impl Device {
             mapped_at_creation: false,
         });
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &output_tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_row_bytes),
                     rows_per_image: Some(out_h),
@@ -710,7 +800,7 @@ impl Device {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv()
             .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
             .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
@@ -797,15 +887,16 @@ impl EacToEquirectPipeline {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("eac_to_equirect_pll"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("eac_to_equirect_pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("cross_sampler"),
@@ -814,7 +905,7 @@ impl EacToEquirectPipeline {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         Self { pipeline, bind_group_layout, sampler }
@@ -941,15 +1032,16 @@ impl FisheyeToHequirectPipeline {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("fisheye_to_hequirect_pll_{label_suffix}")),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&format!("fisheye_to_hequirect_pipeline_{label_suffix}")),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some(&format!("fisheye_sampler_{label_suffix}")),
@@ -958,7 +1050,7 @@ impl FisheyeToHequirectPipeline {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         Self { pipeline, bind_group_layout, sampler }
@@ -1061,15 +1153,16 @@ impl FisheyeP010ToHequirectPipeline {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("{label}_pll")),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&format!("{label}_pipeline")),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some(&format!("{label}_smp")),
@@ -1078,7 +1171,99 @@ impl FisheyeP010ToHequirectPipeline {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        Self { pipeline, bind_group_layout, sampler }
+    }
+}
+
+impl P010ResolvePipeline {
+    fn create(device: &wgpu::Device) -> Self {
+        let label = "p010_resolve_rgba16";
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(P010_RESOLVE_RGBA16_WGSL.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("p010_resolve_bgl"),
+            entries: &[
+                // (0) Y plane (R16Unorm)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // (1) UV plane (Rg16Unorm, half-res)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // (2) bilinear sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // (3) output storage (Rgba16Unorm)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                // (4) dims uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<ResolveDims>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("p010_resolve_pll"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("p010_resolve_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("p010_resolve_smp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         Self { pipeline, bind_group_layout, sampler }
@@ -1102,7 +1287,27 @@ impl FisheyeToHequirectRsPipeline {
         )
     }
 
+    /// 16-bit-output RS half-equirect projection (Windows zero-copy preview
+    /// stab). Same shader as `create()` with the storage format swapped to
+    /// `rgba16unorm` at runtime (matches the `create_16bit` trick used by the
+    /// non-RS pipeline), so the RS-corrected eye stays 16-bit through compose.
+    fn create_16bit(device: &wgpu::Device) -> Self {
+        let wgsl = FISHEYE_TO_HEQUIRECT_RS_WGSL.replace("rgba8unorm, write", "rgba16unorm, write");
+        Self::create_with_shader_fmt(
+            device, "fisheye_to_hequirect_rs_16", &wgsl, wgpu::TextureFormat::Rgba16Unorm,
+        )
+    }
+
     fn create_with_shader(device: &wgpu::Device, label: &str, wgsl: &str) -> Self {
+        Self::create_with_shader_fmt(device, label, wgsl, wgpu::TextureFormat::Rgba8Unorm)
+    }
+
+    fn create_with_shader_fmt(
+        device: &wgpu::Device,
+        label: &str,
+        wgsl: &str,
+        out_format: wgpu::TextureFormat,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(wgsl.into()),
@@ -1128,13 +1333,13 @@ impl FisheyeToHequirectRsPipeline {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                // (2) output storage (Rgba8Unorm)
+                // (2) output storage (Rgba8Unorm or Rgba16Unorm)
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: out_format,
                         view_dimension: wgpu::TextureViewDimension::D2,
                     },
                     count: None,
@@ -1180,15 +1385,16 @@ impl FisheyeToHequirectRsPipeline {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("{label}_pll")),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&format!("{label}_pipeline")),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some(&format!("{label}_smp")),
@@ -1197,7 +1403,7 @@ impl FisheyeToHequirectRsPipeline {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         Self { pipeline, bind_group_layout, sampler }
@@ -1310,15 +1516,16 @@ impl FisheyeP010ToHequirectRsPipeline {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("{label}_pll")),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&format!("{label}_pipeline")),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some(&format!("{label}_smp")),
@@ -1327,7 +1534,7 @@ impl FisheyeP010ToHequirectRsPipeline {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         Self { pipeline, bind_group_layout, sampler }
@@ -1356,6 +1563,13 @@ const FISHEYE_TO_HEQUIRECT_WGSL: &str =
 /// avoiding the FFmpeg P010LE→RGBA64LE swscale and the CPU→GPU upload.
 const FISHEYE_P010_TO_HEQUIRECT_WGSL: &str =
     include_str!("shaders/fisheye_p010_to_hequirect.wgsl");
+
+/// WGSL kernel: P010 (Y/UV planes) → RGBA16 resolve + box downscale.
+/// Upsamples chroma to full-res RGB then box-averages down to the working
+/// resolution (the correct order) so the live preview's big minification
+/// doesn't produce chroma moiré. See `p010_resolve_rgba16.wgsl`.
+const P010_RESOLVE_RGBA16_WGSL: &str =
+    include_str!("shaders/p010_resolve_rgba16.wgsl");
 
 /// WGSL kernel: P010 → half-equirect with fused stab + per-row rolling
 /// shutter correction. Same math as `fisheye_p010_to_hequirect.wgsl`
@@ -1926,15 +2140,16 @@ impl Nv12ToEacPipeline {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("nv12_to_eac_pll"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("nv12_to_eac_pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("nv12_smp"),
@@ -1943,7 +2158,7 @@ impl Nv12ToEacPipeline {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         Self { pipeline, bind_group_layout, sampler }
@@ -2027,16 +2242,17 @@ impl PerPixelPipeline {
         let pll_label = format!("{label}_pll");
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&pll_label),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pp_label = format!("{label}_pipeline");
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&pp_label),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         Self { pipeline, bind_group_layout }
     }
@@ -2079,12 +2295,12 @@ impl Device {
             view_formats: &[],
         });
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &in_tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
             &rgba,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(w * 4),
                 rows_per_image: Some(h),
@@ -2130,7 +2346,7 @@ impl Device {
                 label: Some(&pass_label), timestamp_writes: None,
             });
             pass.set_pipeline(&pipeline.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, Some(&bind_group), &[]);
             let wg_x = (w + 7) / 8;
             let wg_y = (h + 7) / 8;
             pass.dispatch_workgroups(wg_x, wg_y, 1);
@@ -2147,13 +2363,13 @@ impl Device {
             mapped_at_creation: false,
         });
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &out_tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_row_bytes),
                     rows_per_image: Some(h),
@@ -2166,7 +2382,7 @@ impl Device {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv()
             .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
             .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
@@ -2302,7 +2518,7 @@ impl Device {
                 label: Some("sharpen_combine_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.sharpen_combine.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
         }
         let out_rgb = self.encode_readback_rgb(&mut encoder, &out_tex, w, h)?;
@@ -2371,7 +2587,7 @@ impl Device {
                 label: Some("mid_downsample_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.downsample_4x.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((sw + 7) / 8, (sh + 7) / 8, 1);
         }
 
@@ -2399,7 +2615,7 @@ impl Device {
                 label: Some("mid_combine_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.mid_detail_combine.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
         }
 
@@ -2414,12 +2630,12 @@ impl Device {
 
     fn upload_rgba(&self, tex: &wgpu::Texture, rgba: &[u8], w: u32, h: u32) {
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
             rgba,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(w * 4),
                 rows_per_image: Some(h),
@@ -2490,7 +2706,7 @@ impl Device {
             label: Some(&pass_label), timestamp_writes: None,
         });
         pass.set_pipeline(&pipeline.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, Some(&bg), &[]);
         pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
     }
 
@@ -2513,13 +2729,13 @@ impl Device {
             mapped_at_creation: false,
         });
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_row_bytes),
                     rows_per_image: Some(h),
@@ -2534,7 +2750,7 @@ impl Device {
         let slice = rb.staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv()
             .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
             .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
@@ -2678,7 +2894,7 @@ impl Device {
                 label: Some("nv12_to_eac_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.nv12_to_eac.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, Some(&bind_group), &[]);
             let wg = (cw + 7) / 8;
             pass.dispatch_workgroups(wg, wg, 1);
         }
@@ -2738,7 +2954,7 @@ impl Device {
                 label: Some("eac_to_equirect_zc_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.eac_to_equirect.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, Some(&bind_group), &[]);
             let wg_x = (out_w + 7) / 8;
             let wg_y = (out_h + 7) / 8;
             pass.dispatch_workgroups(wg_x, wg_y, 1);
@@ -2754,13 +2970,13 @@ impl Device {
             mapped_at_creation: false,
         });
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &output_tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_row_bytes),
                     rows_per_image: Some(out_h),
@@ -2773,7 +2989,7 @@ impl Device {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv()
             .map_err(|_| Error::Wgpu("staging map closed".into()))?
             .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
@@ -2879,16 +3095,17 @@ impl Lut3DPipeline {
         let pll_label = format!("{label}_pll");
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&pll_label),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pp_label = format!("{label}_pipeline");
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&pp_label),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         let smp_label = format!("{label}_smp");
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -2898,7 +3115,7 @@ impl Lut3DPipeline {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         Self { pipeline, bind_group_layout, sampler }
@@ -2928,12 +3145,12 @@ impl Device {
             view_formats: &[],
         });
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &input_tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
             &input_rgba,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(w * 4),
                 rows_per_image: Some(h),
@@ -2955,12 +3172,12 @@ impl Device {
             view_formats: &[],
         });
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &lut_tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
             &lut_bytes,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(lut.size * 4),
                 rows_per_image: Some(lut.size),
@@ -3020,7 +3237,7 @@ impl Device {
                 label: Some("lut3d_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.lut3d.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, Some(&bind_group), &[]);
             let wg_x = (w + 7) / 8;
             let wg_y = (h + 7) / 8;
             pass.dispatch_workgroups(wg_x, wg_y, 1);
@@ -3038,13 +3255,13 @@ impl Device {
             mapped_at_creation: false,
         });
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &output_tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_row_bytes),
                     rows_per_image: Some(h),
@@ -3057,7 +3274,7 @@ impl Device {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv()
             .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
             .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
@@ -3107,15 +3324,16 @@ impl GaussianBlur1dPipeline {
         });
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("{label}_pll")),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&format!("{label}_pipeline")),
             layout: Some(&pll),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         Self { pipeline, bind_group_layout }
     }
@@ -3151,15 +3369,16 @@ impl SharpenCombinePipeline {
         });
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("{label}_pll")),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&format!("{label}_pipeline")),
             layout: Some(&pll),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         Self { pipeline, bind_group_layout }
     }
@@ -3200,15 +3419,16 @@ impl MidDetailCombinePipeline {
         });
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("{label}_pll")),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&format!("{label}_pipeline")),
             layout: Some(&pll),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         Self { pipeline, bind_group_layout }
     }
@@ -3242,15 +3462,16 @@ impl Downsample4xPipeline {
         });
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("{label}_pll")),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&format!("{label}_pipeline")),
             layout: Some(&pll),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         Self { pipeline, bind_group_layout }
     }
@@ -3572,7 +3793,7 @@ impl Device {
             label: Some("equirect_project_pass"), timestamp_writes: None,
         });
         pass.set_pipeline(&self.eac_to_equirect.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, Some(&bg), &[]);
         pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
     }
 
@@ -3611,7 +3832,7 @@ impl Device {
             label: Some("fisheye_project_pass"), timestamp_writes: None,
         });
         pass.set_pipeline(&self.fisheye_to_hequirect.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, Some(&bg), &[]);
         pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
     }
 
@@ -3685,7 +3906,7 @@ impl Device {
                 label: Some("fisheye_project_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.fisheye_to_hequirect.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -3805,7 +4026,7 @@ impl Device {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.fisheye_to_hequirect_rs.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             let wg_x = (out_w + 7) / 8;
             let wg_y = (out_h + 7) / 8;
             pass.dispatch_workgroups(wg_x, wg_y, 1);
@@ -3839,13 +4060,13 @@ impl Device {
             view_formats: &[],
         });
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &src_tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             src_rgba64le,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(src_w * 8),
                 rows_per_image: Some(src_h),
@@ -3889,7 +4110,7 @@ impl Device {
                 label: Some("fisheye_project_pass_16"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.fisheye_to_hequirect_16.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -3956,7 +4177,368 @@ impl Device {
                 label: Some("fisheye_p010_project_pass_16"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.fisheye_p010_to_hequirect_16.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// Windows zero-copy P010 projection: same math/pipeline as
+    /// [`Self::project_fisheye_p010_to_equirect_texture_16`], but sources Y/UV
+    /// from the two planes of a **single** imported P010 texture (the
+    /// D3D11→Vulkan-imported NVDEC frame) via plane-aspect views, rather than
+    /// two separate IOSurface plane textures. Available on all platforms.
+    pub fn project_fisheye_p010_planar_to_equirect_texture_16(
+        &self,
+        p010_tex: &wgpu::Texture,
+        src_w: u32, src_h: u32,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        calib: FisheyeCalib,
+    ) -> Result<wgpu::Texture> {
+        let _ = (src_w, src_h); // encoded into the calib uniform
+        let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fisheye_p010_planar_eq_out_16"),
+            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        // P010 plane views: plane 0 = R16 (Y), plane 1 = Rg16 (CbCr).
+        let y_view = p010_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("p010_y_plane"),
+            format: Some(wgpu::TextureFormat::R16Unorm),
+            aspect: wgpu::TextureAspect::Plane0,
+            ..Default::default()
+        });
+        let uv_view = p010_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("p010_uv_plane"),
+            format: Some(wgpu::TextureFormat::Rg16Unorm),
+            aspect: wgpu::TextureAspect::Plane1,
+            ..Default::default()
+        });
+        let dst_view = output_tex.create_view(&Default::default());
+        let r_uniform = self.write_uniform("fisheye_p010_planar_R_16",
+            &EquirectUniforms::from_mat3(rotation.0));
+        let cal_uniform = self.write_uniform("fisheye_p010_planar_calib_16",
+            &FisheyeCalibUniforms::from_public(calib));
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fisheye_p010_planar_bg_16"),
+            layout: &self.fisheye_p010_to_hequirect_16.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.fisheye_p010_to_hequirect_16.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dst_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cal_uniform.as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fisheye_p010_planar_enc_16"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fisheye_p010_planar_pass_16"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fisheye_p010_to_hequirect_16.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// Resolve an imported P010 frame (Y/UV plane views) to a downscaled
+    /// `Rgba16Unorm` fisheye image: upsample chroma to RGB at full res, then
+    /// box-average down to `out_w × out_h` (see `p010_resolve_rgba16.wgsl`).
+    /// `src_w`/`src_h` are the native P010 dims. This is the Windows
+    /// zero-copy preview prefilter — pair it with
+    /// [`Self::project_fisheye_rgba16_texture_to_equirect_16`] so the
+    /// projection minifies only a little and a single bilinear tap no longer
+    /// aliases (no luma moiré, no chroma colour-fringing).
+    pub fn resolve_p010_to_rgba16(
+        &self,
+        p010_tex: &wgpu::Texture,
+        src_w: u32, src_h: u32,
+        out_w: u32, out_h: u32,
+    ) -> Result<wgpu::Texture> {
+        let out_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("p010_resolved_rgba16"),
+            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        // P010 plane views: plane 0 = R16 (Y), plane 1 = Rg16 (CbCr).
+        let y_view = p010_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("p010_resolve_y"),
+            format: Some(wgpu::TextureFormat::R16Unorm),
+            aspect: wgpu::TextureAspect::Plane0,
+            ..Default::default()
+        });
+        let uv_view = p010_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("p010_resolve_uv"),
+            format: Some(wgpu::TextureFormat::Rg16Unorm),
+            aspect: wgpu::TextureAspect::Plane1,
+            ..Default::default()
+        });
+        let dst_view = out_tex.create_view(&Default::default());
+        let dims = self.write_uniform("p010_resolve_dims", &ResolveDims {
+            src_w: src_w as f32, src_h: src_h as f32,
+            out_w: out_w as f32, out_h: out_h as f32,
+        });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("p010_resolve_bg"),
+            layout: &self.p010_resolve.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.p010_resolve.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dst_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("p010_resolve_enc"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("p010_resolve_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.p010_resolve.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(out_tex)
+    }
+
+    /// Project an already-on-GPU `Rgba16Unorm` fisheye texture to half-equirect
+    /// (16-bit). Same as [`Self::project_fisheye_to_equirect_texture_16`] but
+    /// the source is an existing texture (e.g. from [`Self::resolve_p010_to_rgba16`])
+    /// instead of a CPU byte upload — no host hop. `calib` MUST be resolved
+    /// against `src_w`/`src_h` (the resolved texture's dims, NOT the native ones).
+    pub fn project_fisheye_rgba16_texture_to_equirect_16(
+        &self,
+        src_tex: &wgpu::Texture,
+        src_w: u32, src_h: u32,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        calib: FisheyeCalib,
+        slot: u32,
+    ) -> Result<wgpu::Texture> {
+        let _ = (src_w, src_h); // encoded in the calib uniform's src_w/src_h
+        // Reuse a per-slot output texture across frames so the decoder thread
+        // doesn't `create_texture` every frame (that contends with eframe's
+        // main thread on the shared wgpu device). Safe to overwrite: the
+        // previous frame's compose read this texture before this frame's
+        // projection writes it (GPU-ordered on the same queue), and the eq
+        // output isn't held past compose. `Texture` clones are cheap handles.
+        let output_tex = {
+            let mut cache = self.rgba16_eq_out_cache.lock().unwrap();
+            let hit = matches!(cache.get(&slot), Some(&(w, h, _)) if w == out_w && h == out_h);
+            if !hit {
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("fisheye_rgba16_eq_out_16"),
+                    size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                cache.insert(slot, (out_w, out_h, tex));
+            }
+            cache.get(&slot).unwrap().2.clone()
+        };
+        let src_view = src_tex.create_view(&Default::default());
+        let dst_view = output_tex.create_view(&Default::default());
+        let r_uniform = self.write_uniform("fisheye_rgba16_R_16",
+            &EquirectUniforms::from_mat3(rotation.0));
+        let cal_uniform = self.write_uniform("fisheye_rgba16_calib_16",
+            &FisheyeCalibUniforms::from_public(calib));
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fisheye_rgba16_project_bg_16"),
+            layout: &self.fisheye_to_hequirect_16.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_hequirect_16.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fisheye_rgba16_project_enc_16"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fisheye_rgba16_project_pass_16"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fisheye_to_hequirect_16.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// Fisheye-output sibling of [`Self::project_fisheye_rgba16_texture_to_equirect_16`]:
+    /// raw stabilized-fisheye SBS output (no equirect un-warp) from an on-GPU
+    /// `Rgba16Unorm` fisheye texture. Same bindings as the equirect path
+    /// (src / sampler / dst / R / calib); only the pipeline differs
+    /// (`fisheye_to_fisheye_16`). Used by the GPU-resident export when the
+    /// output mode is Fisheye. No per-row RS (matches the readback Fisheye path).
+    pub fn project_fisheye_rgba16_texture_to_fisheye_16(
+        &self,
+        src_tex: &wgpu::Texture,
+        src_w: u32, src_h: u32,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        calib: FisheyeCalib,
+        slot: u32,
+    ) -> Result<wgpu::Texture> {
+        let _ = (src_w, src_h); // encoded in the calib uniform's src_w/src_h
+        let output_tex = {
+            let mut cache = self.rgba16_eq_out_cache.lock().unwrap();
+            let hit = matches!(cache.get(&slot), Some(&(w, h, _)) if w == out_w && h == out_h);
+            if !hit {
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("fisheye_rgba16_fish_out_16"),
+                    size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                cache.insert(slot, (out_w, out_h, tex));
+            }
+            cache.get(&slot).unwrap().2.clone()
+        };
+        let src_view = src_tex.create_view(&Default::default());
+        let dst_view = output_tex.create_view(&Default::default());
+        let r_uniform = self.write_uniform("fisheye_rgba16_fish_R_16",
+            &EquirectUniforms::from_mat3(rotation.0));
+        let cal_uniform = self.write_uniform("fisheye_rgba16_fish_calib_16",
+            &FisheyeCalibUniforms::from_public(calib));
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fisheye_rgba16_fish_bg_16"),
+            layout: &self.fisheye_to_fisheye_16.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_fisheye_16.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fisheye_rgba16_fish_enc_16"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fisheye_rgba16_fish_pass_16"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fisheye_to_fisheye_16.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// RS-aware sibling of [`Self::project_fisheye_rgba16_texture_to_equirect_16`]:
+    /// projects an on-GPU `Rgba16Unorm` fisheye texture to half-equirect (16-bit)
+    /// with **per-row rolling-shutter** correction (the piece DJI OSV stab needs
+    /// to kill jello). `per_row_matrices_f32` packs 12 f32 per source row
+    /// (`src_h * 12`, from `pack_per_row_camera_matrices`); pass an empty slice
+    /// to disable RS. Reuses the same per-slot output cache as the non-RS path.
+    pub fn project_fisheye_rgba16_texture_to_equirect_rs_16(
+        &self,
+        src_tex: &wgpu::Texture,
+        src_w: u32, src_h: u32,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        calib: FisheyeCalib,
+        per_row_matrices_f32: &[f32],
+        slot: u32,
+    ) -> Result<wgpu::Texture> {
+        let _ = (src_w, src_h); // encoded in the calib uniform's src_w/src_h
+        let output_tex = {
+            let mut cache = self.rgba16_eq_out_cache.lock().unwrap();
+            let hit = matches!(cache.get(&slot), Some(&(w, h, _)) if w == out_w && h == out_h);
+            if !hit {
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("fisheye_rgba16_rs_eq_out_16"),
+                    size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                cache.insert(slot, (out_w, out_h, tex));
+            }
+            cache.get(&slot).unwrap().2.clone()
+        };
+        let src_view = src_tex.create_view(&Default::default());
+        let dst_view = output_tex.create_view(&Default::default());
+        let r_uniform = self.write_uniform("fisheye_rgba16_rs_R_16",
+            &EquirectUniforms::from_mat3(rotation.0));
+        let cal_uniform = self.write_uniform("fisheye_rgba16_rs_calib_16",
+            &FisheyeCalibUniforms::from_public(calib));
+        // Per-row R storage buffer (12 f32/row). Empty → 1-row zeros so the
+        // shader's `rsm.r00 != 0.0` skip-check disables RS cleanly.
+        let rs_bytes: &[u8] = if per_row_matrices_f32.is_empty() {
+            &[0u8; 48]
+        } else {
+            bytemuck::cast_slice(per_row_matrices_f32)
+        };
+        let rs_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fisheye_rgba16_rs_rows_buf"),
+            size: rs_bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&rs_buf, 0, rs_bytes);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fisheye_rgba16_rs_bg_16"),
+            layout: &self.fisheye_to_hequirect_rs_16.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_hequirect_rs_16.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: rs_buf.as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fisheye_rgba16_rs_enc_16"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fisheye_rgba16_rs_pass_16"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fisheye_to_hequirect_rs_16.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -4042,7 +4624,7 @@ impl Device {
                 label: Some("fisheye_p010_rs_project_pass_16"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.fisheye_p010_to_hequirect_16_rs.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -4101,7 +4683,7 @@ impl Device {
                 label: Some("fish_out_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.fisheye_to_fisheye.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -4174,7 +4756,7 @@ impl Device {
                 label: Some("fish_out_rs_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.fisheye_to_fisheye_rs.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -4218,12 +4800,12 @@ impl Device {
             std::borrow::Cow::Owned(out)
         };
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &src_tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
             &widened,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(src_w * 8),
                 rows_per_image: Some(src_h),
@@ -4266,7 +4848,7 @@ impl Device {
                 label: Some("fish_out16_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.fisheye_to_fisheye_16.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -4324,7 +4906,7 @@ impl Device {
                 label: Some("fish_p010_out_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.fisheye_p010_to_fisheye_16.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -4397,7 +4979,7 @@ impl Device {
                 label: Some("fish_p010_out_rs_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.fisheye_p010_to_fisheye_rs_16.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -4429,12 +5011,12 @@ impl Device {
             label: Some("sbs_export_compose_enc_16"),
         });
         encoder.copy_texture_to_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: left, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &sbs, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -4442,12 +5024,12 @@ impl Device {
             wgpu::Extent3d { width: eye_w, height: eye_h, depth_or_array_layers: 1 },
         );
         encoder.copy_texture_to_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: right, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &sbs, mip_level: 0,
                 origin: wgpu::Origin3d { x: eye_w, y: 0, z: 0 },
                 aspect: wgpu::TextureAspect::All,
@@ -4501,7 +5083,7 @@ impl Device {
                 label: Some("p010_y_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.compose_sbs_p010_y.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
         // UV plane pass (half SBS res — one thread per 2×2 source block).
@@ -4522,12 +5104,12 @@ impl Device {
                 label: Some("p010_uv_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.compose_sbs_p010_uv.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((uv_w + 7) / 8, (uv_h + 7) / 8, 1);
         }
         self.queue.submit(Some(encoder.finish()));
         // Block until both planes are fully written before VT reads.
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         Ok(())
     }
 
@@ -4557,14 +5139,14 @@ impl Device {
             label: Some("read_texture_rgb48_enc"),
         });
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_row_bytes),
                     rows_per_image: Some(h),
@@ -4577,7 +5159,7 @@ impl Device {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv()
             .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
             .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
@@ -4591,6 +5173,223 @@ impl Device {
                 let px_off = row_off + (x * 8) as usize;
                 out.extend_from_slice(&mapped[px_off..px_off + 6]);
             }
+        }
+        drop(mapped);
+        staging.unmap();
+        Ok(out)
+    }
+
+    /// Like [`Self::read_texture_rgb48`] but keeps all 8 bytes/pixel
+    /// (RGBA64LE) via a bulk per-row copy with NO per-pixel work. The
+    /// encoder's swscale drops the alpha + converts to YUV in one SIMD
+    /// pass; doing the alpha strip here meant a ~30M-iteration/frame loop
+    /// on the export's main-thread critical path. Returns `w*h*8` bytes,
+    /// tightly packed.
+    pub fn read_texture_rgba64(
+        &self,
+        tex: &wgpu::Texture,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let bpp = 8u32;
+        let unpadded_row_bytes = w * bpp;
+        let padded_row_bytes = (unpadded_row_bytes + 255) & !255;
+        let buf_size = (padded_row_bytes * h) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("read_texture_rgba64_staging"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("read_texture_rgba64_enc"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
+            .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
+        let mapped = slice.get_mapped_range();
+
+        // Bulk per-row copy — strips only the swscale row padding, keeps all
+        // 8 bytes/pixel. At 7680-wide the row is already 256-aligned, so this
+        // is effectively one contiguous memcpy.
+        let row_bytes = unpadded_row_bytes as usize;
+        let mut out = vec![0u8; row_bytes * h as usize];
+        for y in 0..h as usize {
+            let src = y * padded_row_bytes as usize;
+            out[y * row_bytes..y * row_bytes + row_bytes]
+                .copy_from_slice(&mapped[src..src + row_bytes]);
+        }
+        drop(mapped);
+        staging.unmap();
+        Ok(out)
+    }
+
+    /// GPU SBS compose straight to **P010 planes in plain, readable
+    /// textures**: a full-res `R16Unorm` luma plane + a half-res
+    /// `Rg16Unorm` interleaved-chroma plane, both 10-bit MSB-aligned (the
+    /// P010LE layout NVENC consumes). Reuses the same compute shaders as the
+    /// macOS IOSurface compose; the only difference is the destinations are
+    /// `COPY_SRC` textures we can read back. The point: the encode thread
+    /// can then feed NVENC P010 directly via `encode_frame_p010` and skip
+    /// the single-threaded CPU swscale (RGB→YUV) that otherwise caps the
+    /// export's encode stage.
+    pub fn compose_sbs_to_p010_textures(
+        &self,
+        left_16: &wgpu::Texture,
+        right_16: &wgpu::Texture,
+        eye_w: u32, eye_h: u32,
+        full_range: bool,
+    ) -> Result<(wgpu::Texture, wgpu::Texture)> {
+        let out_w = eye_w * 2;
+        let out_h = eye_h;
+        let y_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("p010_y_tex"),
+            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let uv_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("p010_uv_tex"),
+            size: wgpu::Extent3d { width: out_w / 2, height: out_h / 2, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg16Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let l_v = left_16.create_view(&Default::default());
+        let r_v = right_16.create_view(&Default::default());
+        let y_v = y_tex.create_view(&Default::default());
+        let uv_v = uv_tex.create_view(&Default::default());
+        let uni = self.write_uniform("p010_tex_compose_u",
+            &ComposeSbsUniforms { eye_w, _pad0: full_range as u32, _pad1: 0, _pad2: 0 });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("compose_sbs_to_p010_textures_enc"),
+        });
+        {
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("p010_tex_y_bg"),
+                layout: &self.compose_sbs_p010_y.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&l_v) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r_v) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&y_v) },
+                    wgpu::BindGroupEntry { binding: 3, resource: uni.as_entire_binding() },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("p010_tex_y_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compose_sbs_p010_y.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        {
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("p010_tex_uv_bg"),
+                layout: &self.compose_sbs_p010_uv.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&l_v) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r_v) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&uv_v) },
+                    wgpu::BindGroupEntry { binding: 3, resource: uni.as_entire_binding() },
+                ],
+            });
+            let uv_w = out_w / 2;
+            let uv_h = out_h / 2;
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("p010_tex_uv_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compose_sbs_p010_uv.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            pass.dispatch_workgroups((uv_w + 7) / 8, (uv_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok((y_tex, uv_tex))
+    }
+
+    /// Read back a single-mip 2D texture as tightly-packed bytes via a bulk
+    /// per-row copy (no per-pixel work). `bytes_per_px` must match the
+    /// format (2 = R16Unorm, 4 = Rg16Unorm). Returns `w*h*bytes_per_px`.
+    pub fn read_texture_planar(
+        &self,
+        tex: &wgpu::Texture,
+        w: u32, h: u32,
+        bytes_per_px: u32,
+    ) -> Result<Vec<u8>> {
+        let unpadded_row_bytes = w * bytes_per_px;
+        let padded_row_bytes = (unpadded_row_bytes + 255) & !255;
+        let buf_size = (padded_row_bytes * h) as u64;
+        // Reuse a staging buffer of this size across frames — a fresh 59/29 MB
+        // host-visible allocation per frame dominated the readback cost.
+        let staging = {
+            let mut cache = self.readback_staging.lock().unwrap();
+            cache.entry(buf_size).or_insert_with(|| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("readback_staging_cached"),
+                    size: buf_size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            }).clone()
+        };
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("read_texture_planar_enc"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .map_err(|_| Error::Wgpu("planar map send channel closed".into()))?
+            .map_err(|e| Error::Wgpu(format!("planar map: {e}")))?;
+        let mapped = slice.get_mapped_range();
+        let row = unpadded_row_bytes as usize;
+        let mut out = vec![0u8; row * h as usize];
+        for y in 0..h as usize {
+            let src = y * padded_row_bytes as usize;
+            out[y * row..y * row + row].copy_from_slice(&mapped[src..src + row]);
         }
         drop(mapped);
         staging.unmap();
@@ -4618,12 +5417,12 @@ impl Device {
             label: Some("sbs_export_compose_enc"),
         });
         encoder.copy_texture_to_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: left, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &sbs, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -4631,12 +5430,12 @@ impl Device {
             wgpu::Extent3d { width: eye_w, height: eye_h, depth_or_array_layers: 1 },
         );
         encoder.copy_texture_to_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: right, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &sbs, mip_level: 0,
                 origin: wgpu::Origin3d { x: eye_w, y: 0, z: 0 },
                 aspect: wgpu::TextureAspect::All,
@@ -4671,14 +5470,14 @@ impl Device {
             label: Some("read_texture_rgb8_enc"),
         });
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_row_bytes),
                     rows_per_image: Some(h),
@@ -4691,7 +5490,7 @@ impl Device {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv()
             .map_err(|_| Error::Wgpu("staging map send channel closed".into()))?
             .map_err(|e| Error::Wgpu(format!("staging map: {e}")))?;
@@ -4772,7 +5571,7 @@ impl Device {
             label: Some(&pass_label), timestamp_writes: None,
         });
         pass.set_pipeline(&pipeline.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, Some(&bg), &[]);
         pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
     }
 
@@ -4815,7 +5614,7 @@ impl Device {
             label: Some("sharp_chain_combine_pass"), timestamp_writes: None,
         });
         pass.set_pipeline(&self.sharpen_combine.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, Some(&bg), &[]);
         pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
     }
 
@@ -4853,7 +5652,7 @@ impl Device {
                 label: Some("mid_chain_ds_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.downsample_4x.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((sw + 7) / 8, (sh + 7) / 8, 1);
         }
         // Passes 2 + 3: blur the small image.
@@ -4879,7 +5678,7 @@ impl Device {
                 label: Some("mid_chain_combine_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.mid_detail_combine.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
         }
     }
@@ -4923,7 +5722,7 @@ impl Device {
             label: Some("sharp16_combine_pass"), timestamp_writes: None,
         });
         pass.set_pipeline(&self.sharpen_combine_16.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, Some(&bg), &[]);
         pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
     }
 
@@ -4959,7 +5758,7 @@ impl Device {
                 label: Some("mid16_ds_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.downsample_4x_16.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((sw + 7) / 8, (sh + 7) / 8, 1);
         }
         self.dispatch_blur_1d_16(encoder, "mid16_h", small,   small_h, &blur_h_u, sw, sh);
@@ -4983,7 +5782,7 @@ impl Device {
                 label: Some("mid16_combine_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.mid_detail_combine_16.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
         }
     }
@@ -5005,12 +5804,12 @@ impl Device {
             view_formats: &[],
         });
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &lut_tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
             &lut_bytes,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(lut.size * 4),
                 rows_per_image: Some(lut.size),
@@ -5055,7 +5854,7 @@ impl Device {
             label: Some("lut3d_chain_pass"), timestamp_writes: None,
         });
         pass.set_pipeline(&self.lut3d.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, Some(&bg), &[]);
         pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
     }
 }
@@ -5100,15 +5899,16 @@ impl P010ComposePipeline {
         });
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("compose_sbs_{label}_pll")),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&format!("compose_sbs_{label}_pipeline")),
             layout: Some(&pll),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         Self { pipeline, bind_group_layout }
     }
@@ -5155,16 +5955,17 @@ impl ComposeSbsPipeline {
         let pll_label = format!("{label}_pll");
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&pll_label),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let pp_label = format!("{label}_pipeline");
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&pp_label),
             layout: Some(&pll),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: Default::default(),
+            cache: None,
         });
         Self { pipeline, bind_group_layout }
     }
@@ -5244,14 +6045,14 @@ impl Device {
                 label: Some("compose_sbs_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.compose_sbs.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (eye_h + 7) / 8, 1);
         }
         // Submit and wait so the IOSurface is fully written before
         // VideoToolbox starts reading. `Maintain::Wait` blocks the calling
         // thread until the GPU has completed every submitted command.
         self.queue.submit(Some(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         tracing::debug!(elapsed=?t_total.elapsed(), "apply_color_stack_to_sbs_bgra");
         Ok(())
     }
@@ -5460,7 +6261,7 @@ impl Device {
             label: Some("lut3d16_chain_pass"), timestamp_writes: None,
         });
         pass.set_pipeline(&self.lut3d_16.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, Some(&bg), &[]);
         pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
     }
 
@@ -5490,11 +6291,11 @@ impl Device {
                 label: Some("stack8_per_eye_copy"),
             });
             enc.copy_texture_to_texture(
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: src, mip_level: 0,
                     origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
                 },
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: &dst, mip_level: 0,
                     origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
                 },
@@ -5714,7 +6515,7 @@ impl Device {
                 label: Some("compose_preview_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.compose_preview.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -5878,12 +6679,12 @@ mod eac_assembly_regression {
             .flat_map(|b| b.into_iter())
             .collect();
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
             &bytes,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(w * 2),
                 rows_per_image: Some(h),
@@ -5914,12 +6715,12 @@ mod eac_assembly_regression {
             bytes.extend_from_slice(&v_u16.to_le_bytes());
         }
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
             &bytes,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(w * 4),
                 rows_per_image: Some(h),
@@ -5944,13 +6745,13 @@ mod eac_assembly_regression {
             label: Some("test_readback_enc"),
         });
         enc.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_row_bytes),
                     rows_per_image: Some(h),
@@ -5962,7 +6763,7 @@ mod eac_assembly_regression {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        dev.device.poll(wgpu::Maintain::Wait);
+        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
         let mapped = slice.get_mapped_range();
         let mut out = Vec::with_capacity((w * h * 4) as usize);
