@@ -39,6 +39,16 @@ metal = "0.28"
 core-foundation = "0.9"
 objc = "0.2"
 foreign-types = "0.5"
+# wgpu-hal 29 migrated its Metal backend off the `metal` (metal-rs) crate
+# to objc2-metal, so the hal boundary (`Device::texture_from_raw` /
+# `raw_device`) now speaks objc2 types. We keep metal-rs for the
+# IOSurface→MTLTexture *creation* (self-contained, still compiles) and
+# bridge to objc2 only at that boundary. Versions MUST match what
+# wgpu-hal 29 pulls in (objc2 0.6 / objc2-metal 0.3) so the
+# `Retained<ProtocolObject<dyn MTLTexture>>` we hand over is the exact
+# crate type the hal escape consumes.
+objc2 = "0.6"
+objc2-metal = "0.3"
 
 # D3D11 (NVDEC / D3D11VA decode output) ↔ Vulkan (wgpu) zero-copy interop
 # (Windows only). `ash` MUST resolve to the same minor wgpu-hal 29 uses,

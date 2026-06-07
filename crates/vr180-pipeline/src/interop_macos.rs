@@ -41,8 +41,14 @@
 
 use crate::{Error, Result};
 use ffmpeg_next as ffmpeg;
-use foreign_types::ForeignType;
+use foreign_types::{ForeignType, ForeignTypeRef};
 use objc::{msg_send, sel, sel_impl};
+// objc2 types for the wgpu-hal 29 Metal boundary (see `metal_device_retained`
+// / `objc2_texture_from_metal`). metal-rs (`metal::…`) is always fully
+// qualified in this module, so these bare names never clash with it.
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLDevice, MTLTexture, MTLTextureType};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
@@ -255,6 +261,53 @@ pub fn metal_texture_from_iosurface_plane(
     Some(unsafe { metal::Texture::from_ptr(raw_tex as _) })
 }
 
+// ─── wgpu-hal 29 objc2 bridge ─────────────────────────────────────────
+//
+// wgpu-hal 29 dropped metal-rs; its Metal backend is objc2-metal now. Our
+// IOSurface→MTLTexture creation above stays in metal-rs (it never touches
+// wgpu-hal), and we bridge to objc2 only at the two wgpu-hal boundary
+// calls: pulling wgpu's MTLDevice out, and handing our MTLTexture in.
+// metal-rs and objc2 wrap the *same* Obj-C `id`, so each bridge is a typed
+// pointer reinterpret plus correct retain/release bookkeeping.
+
+/// Clone wgpu's underlying Metal device as an objc2 retained handle.
+/// `None` if the wgpu device isn't on the Metal backend.
+///
+/// The returned `Retained` owns a +1 on the shared `MTLDevice`; callers
+/// borrow it as a metal-rs `&DeviceRef` (same `id`) and MUST keep the
+/// `Retained` alive for the duration of that borrow.
+fn metal_device_retained(
+    device: &wgpu::Device,
+) -> Option<Retained<ProtocolObject<dyn MTLDevice>>> {
+    // SAFETY: `as_hal` hands out a guard that derefs to the hal Metal
+    // `Device`; we immediately clone (retain) the device handle out of it,
+    // so nothing dangles once the guard drops.
+    unsafe {
+        device
+            .as_hal::<wgpu::hal::api::Metal>()
+            .map(|hal_device| hal_device.raw_device().clone())
+    }
+}
+
+/// Reinterpret a metal-rs `Texture` as the objc2 `MTLTexture` that
+/// wgpu-hal 29's `Device::texture_from_raw` consumes. Adds one retain for
+/// objc2's ownership; the metal-rs `Texture` is consumed and releases its
+/// own retain on drop, leaving the returned handle as the sole owner.
+///
+/// # Safety
+/// `tex` must wrap a live `MTLTexture` — it always does here, having come
+/// straight from `newTextureWithDescriptor:iosurface:plane:`.
+unsafe fn objc2_texture_from_metal(
+    tex: metal::Texture,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    // metal-rs and objc2 are both thin pointers to the same Obj-C object,
+    // so this is a pointer reinterpret, not a transmute of layout.
+    let id = tex.as_ptr() as *mut ProtocolObject<dyn MTLTexture>;
+    // +1 retain for objc2; `tex` drops at end of scope → its original +1
+    // is released. Net: the object survives, owned solely by the result.
+    unsafe { Retained::retain(id) }
+}
+
 /// One IOSurface plane wrapped as a `wgpu::Texture`. Holds a retain on
 /// the surface so dropping this struct frees both cleanly.
 pub struct IOSurfacePlaneTexture {
@@ -284,32 +337,38 @@ pub fn wgpu_texture_from_iosurface_plane(
     height: u32,
     label: &str,
 ) -> Result<IOSurfacePlaneTexture> {
-    // 1. Clone the underlying metal::Device out of wgpu's hal escape.
-    //    The clone is a cheap NSObject retain.
-    let metal_device = unsafe {
-        device.as_hal::<wgpu::hal::api::Metal, _, _>(|hal| {
-            hal.map(|d| d.raw_device().lock().clone())
-        })
-    }
-    .flatten()
-    .ok_or_else(|| Error::Wgpu(
+    // 1. Get wgpu's underlying Metal device (objc2 handle), then borrow it
+    //    as a metal-rs DeviceRef for the metal-rs texture creator below —
+    //    both wrap the same MTLDevice `id`. `objc2_device` owns the retain
+    //    and must outlive the borrow, so keep it bound for the whole fn.
+    let objc2_device = metal_device_retained(device).ok_or_else(|| Error::Wgpu(
         "wgpu device is not on the Metal backend (as_hal returned None)".into()
     ))?;
+    let metal_device: &metal::DeviceRef = unsafe {
+        metal::DeviceRef::from_ptr(
+            Retained::as_ptr(&objc2_device) as *mut metal::MTLDevice,
+        )
+    };
 
     // 2. metal::Texture plane view via newTextureWithDescriptor:iosurface:plane:
     let metal_texture = metal_texture_from_iosurface_plane(
-        &metal_device, &surface, plane, metal_format, width, height,
+        metal_device, &surface, plane, metal_format, width, height,
     ).ok_or_else(|| Error::Wgpu(format!(
         "newTextureWithDescriptor:iosurface:plane: returned nil for plane {plane}, \
          format={metal_format:?}, {width}×{height}"
     )))?;
 
-    // 3. Wrap as wgpu-hal Texture.
+    // 3. Wrap as wgpu-hal Texture. wgpu-hal 29's Metal backend is objc2-
+    //    based, so bridge the metal-rs Texture → objc2 MTLTexture first.
+    let objc2_texture = unsafe { objc2_texture_from_metal(metal_texture) }
+        .ok_or_else(|| Error::Wgpu(
+            "failed to retain MTLTexture for the wgpu-hal handoff".into()
+        ))?;
     let hal_texture = unsafe {
         <wgpu::hal::api::Metal as wgpu::hal::Api>::Device::texture_from_raw(
-            metal_texture,
+            objc2_texture,
             wgpu_format,
-            metal::MTLTextureType::D2,
+            MTLTextureType::Type2D,
             1, // array_layers
             1, // mip_levels
             wgpu::hal::CopyExtent { width, height, depth: 1 },
@@ -480,27 +539,31 @@ pub fn create_bgra_encode_buffer(
     // IOSurfaceGetPlaneCount returns 0 (non-planar surfaces). Metal's
     // newTextureWithDescriptor:iosurface:plane: accepts plane=0 for
     // non-planar surfaces — that's the documented contract.
-    let metal_device = unsafe {
-        device.as_hal::<wgpu::hal::api::Metal, _, _>(|hal| {
-            hal.map(|d| d.raw_device().lock().clone())
-        })
-    }
-    .flatten()
-    .ok_or_else(|| Error::Wgpu(
+    let objc2_device = metal_device_retained(device).ok_or_else(|| Error::Wgpu(
         "wgpu device is not on the Metal backend (as_hal returned None)".into()
     ))?;
+    let metal_device: &metal::DeviceRef = unsafe {
+        metal::DeviceRef::from_ptr(
+            Retained::as_ptr(&objc2_device) as *mut metal::MTLDevice,
+        )
+    };
 
     let metal_tex = metal_texture_from_iosurface_plane(
-        &metal_device, &iosurface, 0, metal_format, width, height,
+        metal_device, &iosurface, 0, metal_format, width, height,
     ).ok_or_else(|| Error::Wgpu(format!(
         "newTextureWithDescriptor:iosurface:plane:0 returned nil for BGRA {width}×{height}"
     )))?;
 
+    // Bridge metal-rs Texture → objc2 MTLTexture for wgpu-hal 29.
+    let objc2_texture = unsafe { objc2_texture_from_metal(metal_tex) }
+        .ok_or_else(|| Error::Wgpu(
+            "failed to retain MTLTexture for the wgpu-hal handoff".into()
+        ))?;
     let hal_texture = unsafe {
         <wgpu::hal::api::Metal as wgpu::hal::Api>::Device::texture_from_raw(
-            metal_tex,
+            objc2_texture,
             wgpu_format,
-            metal::MTLTextureType::D2,
+            MTLTextureType::Type2D,
             1, 1,
             wgpu::hal::CopyExtent { width, height, depth: 1 },
         )
