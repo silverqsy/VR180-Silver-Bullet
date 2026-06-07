@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Pure-Rust headless core for VR180 Silver Bullet Neo: gyro, EAC math, color, atom writers."
+description = "Pure-Rust headless core for VR180 Silver Bullet 2.0: gyro, EAC math, color, atom writers."
 
 [lib]
 path = "src/lib.rs"

@@ -52,7 +52,7 @@ Full Windows step-by-step (toolchain, FFmpeg, gotchas):
 
 ## What this is
 
-**VR180 Silver Bullet Neo** — a clean-room Rust rewrite of a VR180
+**VR180 Silver Bullet 2.0** — a clean-room Rust rewrite of a VR180
 camera-mod processor. Single self-contained native binary per platform,
 no Python. The reference implementation is the Python/PyQt6 app at
 `../vr180_processor/vr180_gui.py` (the `main` branch / sibling worktree)

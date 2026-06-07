@@ -1,4 +1,4 @@
-//! VR180 Silver Bullet Neo — headless core.
+//! VR180 Silver Bullet 2.0 — headless core.
 //!
 //! Pure Rust, no I/O, no GPU. All camera-format math, gyro fusion,
 //! color math, and atom writers live here so they can be tested

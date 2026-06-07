@@ -1,4 +1,4 @@
-//! `vr180-gui` — native egui + wgpu GUI for VR180 Silver Bullet Neo.
+//! `vr180-gui` — native egui + wgpu GUI for VR180 Silver Bullet 2.0.
 //!
 //! Replaces the Tauri/WebView shell with a single-binary native app.
 //! The headline win over the Tauri version: **the decoded + projected
@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("VR180 Silver Bullet Neo")
+            .with_title("VR180 Silver Bullet 2.0")
             .with_inner_size([1480.0, 920.0])
             .with_min_inner_size([1100.0, 720.0])
             .with_drag_and_drop(true),
@@ -67,7 +67,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     eframe::run_native(
-        "VR180 Silver Bullet Neo",
+        "VR180 Silver Bullet 2.0",
         native_options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     ).map_err(|e| anyhow::anyhow!("eframe: {e}"))?;

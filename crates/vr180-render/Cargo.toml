@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "CLI render binary for VR180 Silver Bullet Neo."
+description = "CLI render binary for VR180 Silver Bullet 2.0."
 
 [[bin]]
 name = "vr180-render"

@@ -297,23 +297,23 @@ impl Settings {
 
     /// Path to the persisted settings JSON in the per-user config dir,
     /// resolved per-OS so persistence works on macOS, Windows, and Linux:
-    ///   • macOS:   `~/Library/Application Support/VR180SilverBulletNeo/`
-    ///   • Windows: `%APPDATA%\VR180SilverBulletNeo\`
-    ///   • Linux:   `$XDG_CONFIG_HOME` or `~/.config` + `/VR180SilverBulletNeo/`
+    ///   • macOS:   `~/Library/Application Support/VR180SilverBullet2.0/`
+    ///   • Windows: `%APPDATA%\VR180SilverBullet2.0\`
+    ///   • Linux:   `$XDG_CONFIG_HOME` or `~/.config` + `/VR180SilverBullet2.0/`
     pub fn config_path() -> Option<PathBuf> {
         let dir = if cfg!(target_os = "macos") {
             let home = std::env::var_os("HOME")?;
-            PathBuf::from(home).join("Library/Application Support/VR180SilverBulletNeo")
+            PathBuf::from(home).join("Library/Application Support/VR180SilverBullet2.0")
         } else if cfg!(target_os = "windows") {
             // %APPDATA% = C:\Users\<user>\AppData\Roaming
             let appdata = std::env::var_os("APPDATA")?;
-            PathBuf::from(appdata).join("VR180SilverBulletNeo")
+            PathBuf::from(appdata).join("VR180SilverBullet2.0")
         } else {
             // Linux / other: XDG_CONFIG_HOME, falling back to ~/.config.
             let base = std::env::var_os("XDG_CONFIG_HOME")
                 .map(PathBuf::from)
                 .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-            base.join("VR180SilverBulletNeo")
+            base.join("VR180SilverBullet2.0")
         };
         Some(dir.join("settings.json"))
     }

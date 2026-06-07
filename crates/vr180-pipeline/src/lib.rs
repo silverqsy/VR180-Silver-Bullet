@@ -1,4 +1,4 @@
-//! VR180 Silver Bullet Neo — I/O + GPU pipeline.
+//! VR180 Silver Bullet 2.0 — I/O + GPU pipeline.
 //!
 //! All side-effects live here: ffmpeg-next decode/encode, wgpu
 //! kernels, Swift helper subprocess spawn. `vr180-core` stays

@@ -382,7 +382,7 @@ that changes for the future Main10 path).
 - [x] Order of operations matches Python (vr180_gui.py:7746):
       equirect → CDL → 3D LUT → sharpen → mid-detail → color_grade.
       Saturation moves up from "after mid-detail" (Python) to "fused
-      with temp/tint" (Neo) — perceptible only when sat is non-default
+      with temp/tint" (2.0) — perceptible only when sat is non-default
       AND mid-detail is non-zero; a split into separate `--saturation`
       pass after mid-detail is a possible follow-up if exact parity is
       needed.

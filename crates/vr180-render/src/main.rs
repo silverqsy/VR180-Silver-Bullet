@@ -352,7 +352,7 @@ enum Cmd {
     ///
     /// Intended for the Python GUI on `main`: write the user's
     /// settings to a JSON, spawn `vr180-render render --config foo.json`,
-    /// get the Neo-speed export pipeline for free.
+    /// get the 2.0 export pipeline for free.
     ///
     /// See `crates/vr180-render/src/config.rs` for the schema.
     /// Identity defaults everywhere; a minimal config can be just

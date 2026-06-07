@@ -86,7 +86,7 @@ The Python app does `ffmpeg_subprocess → stdout bytes → np.frombuffer
 CPU memory at full resolution. At 8K that's hundreds of MB/sec per
 frame of pure memory bandwidth tax.
 
-Neo's interop pattern per platform:
+The 2.0 interop pattern per platform:
 
 - **macOS:** VideoToolbox decode → `IOSurface` → wrap as `MTLTexture` →
   hand to wgpu as a `wgpu::Texture` via `wgpu::hal::metal::Device::texture_from_raw`.

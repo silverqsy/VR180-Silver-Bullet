@@ -12,7 +12,7 @@
 //!   So a minimal config can be just `{"input": ..., "output": ...}`.
 //! - **`deny_unknown_fields`.** Mistyped field names should error
 //!   rather than silently no-op. The cost is forward-compatibility:
-//!   a Python GUI from a future Neo version writing a new field will
+//!   a Python GUI from a future 2.0 version writing a new field will
 //!   fail on an older Rust binary. Acceptable — version both sides
 //!   in lockstep.
 //! - **No serde on `vr180-pipeline` types.** This keeps the pipeline

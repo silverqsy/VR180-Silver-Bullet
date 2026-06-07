@@ -135,7 +135,7 @@ preview renders, the color/LUT panel works, and an export produces a file.
 | ProRes encode | `prores_videotoolbox` (HW) | **`prores_ks`** (SW) | Auto-selected. |
 | 10-bit export path | P010 IOSurface zero-copy | **16-bit project → RGB48 readback → libx265 Main10** | Still 10-bit end-to-end; just not zero-copy. The whole `interop_macos` / IOSurface layer is `#[cfg(target_os = "macos")]`. |
 | Decode | VideoToolbox P010 zero-copy | **ffmpeg software decode** (or d3d11va via `HwDecode::Auto`) | OSV dual-stream decode is ffmpeg-based and portable. |
-| Preview, color stack, LUT (bundled), zoom/detail cache, audio (cpal→WASAPI), file picker (rfd), settings persistence | ✓ | ✓ | Fully cross-platform. Settings now save to `%APPDATA%\VR180SilverBulletNeo\settings.json`. |
+| Preview, color stack, LUT (bundled), zoom/detail cache, audio (cpal→WASAPI), file picker (rfd), settings persistence | ✓ | ✓ | Fully cross-platform. Settings now save to `%APPDATA%\VR180SilverBullet2.0\settings.json`. |
 
 **Net effect:** Windows exports work and look identical (same 16-bit color
 math, same LUT order), but **export is slower** because encode/decode run

@@ -1,7 +1,7 @@
 [package]
 name = "vr180-gui"
-version = "0.1.0"
-description = "VR180 Silver Bullet Neo — egui+wgpu native GUI"
+version = "2.0.0"
+description = "VR180 Silver Bullet 2.0 — egui+wgpu native GUI"
 edition = "2021"
 publish = false
 

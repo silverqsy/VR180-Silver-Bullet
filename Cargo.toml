@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "2.0.0"
 edition = "2021"
 rust-version = "1.79"
 license = "MIT"
@@ -59,10 +59,10 @@ objc = "0.2"
 foreign-types = "0.5"
 
 # Internal crates
-vr180-core = { path = "crates/vr180-core", version = "0.1.0" }
-vr180-pipeline = { path = "crates/vr180-pipeline", version = "0.1.0" }
-vr180-fisheye = { path = "crates/vr180-fisheye", version = "0.1.0" }
-vr180-braw = { path = "crates/vr180-braw", version = "0.1.0" }
+vr180-core = { path = "crates/vr180-core", version = "2.0.0" }
+vr180-pipeline = { path = "crates/vr180-pipeline", version = "2.0.0" }
+vr180-fisheye = { path = "crates/vr180-fisheye", version = "2.0.0" }
+vr180-braw = { path = "crates/vr180-braw", version = "2.0.0" }
 
 [profile.release]
 opt-level = 3

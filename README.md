@@ -1,4 +1,4 @@
-# VR180 Silver Bullet — Neo
+# VR180 Silver Bullet 2.0
 
 A clean-room Rust rewrite of the [VR180 Silver Bullet](../vr180_processor/)
 GoPro Max 2 VR180 mod processor.
@@ -8,7 +8,7 @@ GoPro Max 2 VR180 mod processor.
 The Python/PyQt6 app shipped on `main` works, but its architecture
 constrains us:
 
-| Pain point in the Python app | Root cause | Neo fix |
+| Pain point in the Python app | Root cause | 2.0 fix |
 |---|---|---|
 | 3 GB Windows install | PyQt6 + Numba + cv2 + av + Python 3.11 | Single ~80 MB native binary |
 | "WinError 2 / cudart in PhysX" | Bundled-binary path detection + Numba CUDA toolkit hunt | `ffmpeg-next` links libav in-process; `wgpu` needs no CUDA toolkit |

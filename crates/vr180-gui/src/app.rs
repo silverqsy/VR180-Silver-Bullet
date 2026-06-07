@@ -1407,7 +1407,7 @@ impl eframe::App for App {
             .exact_height(40.0)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new("▶ VR180 Silver Bullet Neo")
+                    ui.label(RichText::new("▶ VR180 Silver Bullet 2.0")
                         .strong().color(Color32::from_rgb(90, 166, 255)));
                     ui.separator();
                     if ui.button("Load video…").clicked() {
