@@ -301,6 +301,9 @@ impl App {
         // Restore the user's last-used settings from disk (defaults on first
         // run). Persisted across launches so every knob is remembered.
         let defaults = Settings::load_persisted();
+        // Apply the persisted IMU-phase tuning value to the pipeline global
+        // so it's in effect before the first stab / rolling-shutter compute.
+        vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(defaults.dji_imu_phase_ms);
         // egui-wgpu 0.34's fragment shader (both the linear- and
         // gamma-framebuffer variants) explicitly "expect normal textures that
         // are NOT sRGB-aware": it samples them as gamma/raw bytes, and on an
@@ -466,6 +469,9 @@ impl App {
             }
         };
 
+        // Snapshot the IMU-phase tuning value into the pipeline global so
+        // the export's stabilization uses the value shown in the UI.
+        vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(self.settings.dji_imu_phase_ms);
         let cfg = vr180_pipeline::fisheye_export::FisheyeExportConfig {
             source_path: path,
             output_path: output_path.clone(),
@@ -652,12 +658,10 @@ impl App {
         self.full_res_desired_key = key;
 
         // Settle timer: reset whenever the wanted (frame+settings) changes.
-        // We render the native still ONLY once the key has been stable for
-        // the window. While you're dragging a slider (or scrubbing) the key
-        // keeps moving, so `full_res_key != full_res_desired_key` and the
-        // zoom view shows the live preview — which renders on the DECODER
-        // thread (parallel, non-blocking → responsive) and is now frame-
-        // aligned with the still, so the swap on settle doesn't shift.
+        // The settle ONLY guards a frame change (scrub/seek) — that needs a
+        // background re-decode, and the live preview is the right thing to
+        // show meanwhile. A settings adjustment on a PAUSED frame is handled
+        // separately below (no settle, no low-res drop).
         const SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
         if key != self.detail_last_key {
             self.detail_last_key = key;
@@ -668,8 +672,20 @@ impl App {
         if key == self.full_res_key {
             return;
         }
-        // Not settled yet → leave the live preview up; wake when it settles.
-        if self.detail_key_changed_at.elapsed() < SETTLE {
+
+        // Is the wanted still for the SAME frame we're already showing at full
+        // res? Then only the SETTINGS changed — an adjustment on a paused
+        // frame. The DetailCache already has this frame's native pair decoded,
+        // so re-projecting it is cheap (GPU project+compose on this thread, no
+        // decode). Render it IN PLACE immediately instead of dropping to the
+        // low-res live preview — so dragging a calib/view slider while zoomed
+        // updates the full-res still live, with no low-res↔full-res swap.
+        let same_frame = self.full_res_display.as_ref()
+            .map(|d| (d.timestamp_s * 1000.0).round() as i64 as u64 == ts_ms)
+            .unwrap_or(false);
+        // Frame changed and not settled yet → leave the live preview up while
+        // the background decode runs; wake when it settles.
+        if !same_frame && self.detail_key_changed_at.elapsed() < SETTLE {
             ctx.request_repaint_after(SETTLE);
             return;
         }
@@ -924,6 +940,15 @@ impl App {
             self.settings.lut_path = crate::decoder::BUILTIN_OSMO_LUT_PATH.to_string();
             self.settings.lut_intensity = 1.0;
         }
+        // Refresh the (non-persisted) IMU-phase to SROT/2 for THIS clip's fps
+        // — fps-aware (9.15 ms @30 fps, 8.11 ms @50 fps), re-seeded on every
+        // load so a prior clip's tweak never carries over. Set before the
+        // snapshot below so the decoder spawns with it and gen isn't bumped
+        // on frame 0.
+        let imu_phase = vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(probe.fps);
+        self.settings.dji_imu_phase_ms = imu_phase;
+        vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(imu_phase);
+
         // Snapshot settings so the next spawn_decoder doesn't bump
         // generation unnecessarily on the first frame.
         self.last_pushed_settings = self.settings.clone();
@@ -1383,11 +1408,6 @@ impl eframe::App for App {
                 {
                     self.pick_and_load_file();
                 }
-                if i.key_pressed(egui::Key::F) && i.modifiers.is_none() {
-                    let v = ctx.viewport_id();
-                    let cur = i.viewport().fullscreen.unwrap_or(false);
-                    ctx.send_viewport_cmd_to(v, egui::ViewportCommand::Fullscreen(!cur));
-                }
                 // I / O — mark in/out at current playhead.
                 let cur = self.current_display.as_ref()
                     .map(|d| d.timestamp_s).unwrap_or(0.0);
@@ -1628,7 +1648,7 @@ impl eframe::App for App {
                     // is narrow, drawing over the trim buttons — guard on the
                     // remaining width so it just hides instead of overlapping.
                     let open = if cfg!(target_os = "macos") { "⌘O" } else { "Ctrl+O" };
-                    let hint = format!("Space play · I in · O out · {open} open · F fullscreen");
+                    let hint = format!("Space play · I in · O out · {open} open");
                     if ui.available_width() > 320.0 {
                         ui.label(RichText::new(hint).small().color(Color32::DARK_GRAY));
                     }
@@ -2029,6 +2049,15 @@ impl App {
                     .text("Smooth (ms)  0 = sharp lock, > 0 = soft-stab"));
                 ui.add(egui::Slider::new(&mut s.dji_max_corr_deg, 0.0..=45.0)
                     .text("Max corr (°)  0 = no cap"));
+                // IMU sample-timing test knob (see dji_imu.rs). Defaults to
+                // SROT/2 (readout midpoint), re-seeded per file and NOT
+                // persisted; DJI's own sample point is ≈8.5 ms. Drag to A/B
+                // against DJI Studio. Feeds stab + rolling-shutter timing.
+                ui.add(egui::Slider::new(&mut s.dji_imu_phase_ms, 0.0..=17.0)
+                    .step_by(0.001)
+                    .fixed_decimals(3)
+                    .text("IMU phase (ms after frame-start) · SROT/2 default, DJI≈8.5"));
+                vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
             }
         });
         ui.label(RichText::new(
@@ -2227,32 +2256,41 @@ fn draw_eye_lens(
             });
         });
 
-        // On the off→on transition, seed the principal point from the ACTUAL
-        // in-file calibration when we have it (real per-lens cx/cy). FOV is
-        // taken from the PRESET — we no longer load it from the file
-        // calibration — and k is the preset too, matching Override-off.
+        // On the off→on transition, seed from the calibration that was just
+        // in effect: the in-file (OSV) per-lens FOV / cx / cy / k when we
+        // have it, so Override "freezes" the auto factory values for
+        // hand-tweaking. Falls back to preset FOV/k + center when there's no
+        // detected calib (non-OSV source).
         if *over && !was_over {
-            *fov = if preset_default_fov > 0.0 { preset_default_fov } else { 180.0 };
             if let Some(d) = detected {
+                *fov = d.fov_deg;
                 *cx_norm = d.cx_norm;
                 *cy_norm = d.cy_norm;
+                *k = d.k;
             } else {
+                *fov = if preset_default_fov > 0.0 { preset_default_fov } else { 180.0 };
                 *cx_norm = 0.5;
                 *cy_norm = 0.5;
+                *k = preset_k;
             }
-            *k = preset_k;
         }
 
         if !*over {
-            // FOV comes from the PRESET (not the file calibration); the
-            // principal point is the actual in-file cx/cy. k is the preset.
-            let fov_disp = if preset_default_fov > 0.0 { preset_default_fov } else { 180.0 };
+            // Auto = the per-lens FACTORY calibration read from the OSV file:
+            // real FOV (from fx), principal point, and KB k1–k4. Show the
+            // actual values so the calibration is visible. Falls back to the
+            // preset FOV when there's no detected calib (non-OSV source).
             if let Some(d) = detected {
                 ui.label(RichText::new(format!(
-                    "Preset FOV {:.1}°  ·  in-file cx {:.1}, cy {:.1} px",
-                    fov_disp, d.cx_norm * native_w, d.cy_norm * native_h,
+                    "In-file FOV {:.1}°  ·  cx {:.1}, cy {:.1} px",
+                    d.fov_deg, d.cx_norm * native_w, d.cy_norm * native_h,
+                )).small().color(Color32::GRAY));
+                ui.label(RichText::new(format!(
+                    "in-file k = [{:.4}, {:.4}, {:.4}, {:.4}]",
+                    d.k[0], d.k[1], d.k[2], d.k[3],
                 )).small().color(Color32::GRAY));
             } else {
+                let fov_disp = if preset_default_fov > 0.0 { preset_default_fov } else { 180.0 };
                 ui.label(RichText::new(format!("Preset FOV {:.1}°  ·  center cx/cy", fov_disp))
                     .small().color(Color32::GRAY));
             }

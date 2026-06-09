@@ -1769,11 +1769,20 @@ fn resolve_calib_pair(
                     let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
                     (fx, fx, cxn * src_w as f32, cyn * src_h as f32, k)
                 } else {
+                    // Auto: full per-lens factory calibration from the OSV
+                    // protobuf — fx/fy (→FOV), cx/cy, AND the KB k1–k4. Must
+                    // match the GUI's resolve_fisheye_calib_pair exactly so
+                    // export == preview. k is dimensionless (no scale);
+                    // missing fields fall back to the preset.
                     let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
                     let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
                     let fx = lens.fx.map(|v| v * scale_x).unwrap_or(fx_auto);
                     let fy = lens.fy.map(|v| v * scale_y).unwrap_or(fx);
-                    (fx, fy, cx, cy, preset_k)
+                    let k = match (lens.k1, lens.k2, lens.k3, lens.k4) {
+                        (Some(a), Some(b), Some(c), Some(d)) => [a, b, c, d],
+                        _ => preset_k,
+                    };
+                    (fx, fy, cx, cy, k)
                 };
                 FisheyeCalib::new_pure_kb(fx, fy, cx, cy, k, src_w as f32, src_h as f32)
             };

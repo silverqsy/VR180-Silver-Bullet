@@ -39,6 +39,13 @@ use {
     vr180_pipeline::decode::{iter_stream_pairs, HwDecode},
 };
 
+/// Serde default + pre-file-load seed for the (non-persisted) IMU-phase
+/// slider: SROT/2 at 30 fps (9.15 ms). Refreshed to the actual clip fps in
+/// `App::load_file` once a file is open.
+fn default_dji_imu_phase_ms() -> f32 {
+    vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(30.0)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -55,6 +62,15 @@ pub struct Settings {
     /// no cap (legacy default — unlimited correction). > 0 caps the
     /// per-frame rotation magnitude in degrees.
     pub dji_max_corr_deg: f32,
+    /// IMU sample offset, ms after frame_start. Defaults to **SROT/2** (the
+    /// readout-window midpoint; 9.15 ms @30 fps, 8.11 ms @50 fps) and is
+    /// **refreshed on every file load** to the new clip's fps. A live
+    /// A/B-test knob for stabilization timing vs DJI Studio; feeds BOTH the
+    /// per-frame stab sample and the rolling-shutter window (coupled, as DJI
+    /// does). NOT persisted (`#[serde(skip)]`) — each session/clip starts at
+    /// the SROT/2 default regardless of prior tweaks.
+    #[serde(skip, default = "default_dji_imu_phase_ms")]
+    pub dji_imu_phase_ms: f32,
     /// Global pano-map adjustment angles (degrees). Shared between
     /// eyes. Applied as `R_view = R_y(yaw) · R_x(pitch) · R_z(roll)`
     /// composed AFTER stabilization. All-zero default = identity =
@@ -181,6 +197,7 @@ impl Default for Settings {
             max_corr_deg: 15.0,
             dji_smooth_ms: 1000.0,
             dji_max_corr_deg: 15.0,
+            dji_imu_phase_ms: default_dji_imu_phase_ms(),
             pano_yaw_deg: 0.0,
             pano_pitch_deg: 0.0,
             pano_roll_deg: 0.0,
@@ -864,6 +881,7 @@ fn run_fisheye(
                         f32::INFINITY
                     };
                     let smooth_ms = s.dji_smooth_ms;
+                    vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
                     drop(s);
                     match vr180_pipeline::dji_imu::compute_dji_stabilization(
                         osv, total_frames, max_corr_deg, smooth_ms, fps,
@@ -882,6 +900,10 @@ fn run_fisheye(
             _ => None,
         }
     };
+    // Live-recompute trigger for the MAIN preview: bump-compare the
+    // stab-affecting settings hash so slider moves (smooth / max-corr /
+    // imu-phase) re-derive stabilization mid-playback, like the toggle.
+    let mut last_stab_key = stab_key(&control.settings.read());
     if control.settings.read().stabilize {
         stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control, fps);
         last_stabilize_state = true;
@@ -1002,6 +1024,9 @@ fn run_fisheye(
                 stab_rotations = None;
             }
             last_stabilize_state = now_stabilize;
+            // Keep the live-recompute hash in sync so the settings-change
+            // block below doesn't redundantly recompute on this toggle.
+            last_stab_key = stab_key(&control.settings.read());
         }
 
         // ── 1. Drain commands.
@@ -1096,6 +1121,20 @@ fn run_fisheye(
             calib_right = r;
             drop(snap);
             cached_gen = current_gen;
+            // Live stab recompute when a stab-affecting slider (smooth /
+            // max-corr / imu-phase) changed — keeps the MAIN preview in
+            // sync, not just the zoom/DetailCache view. Only fires when the
+            // stab hash actually moves (brief stutter on change, then live).
+            let nk = stab_key(&control.settings.read());
+            if nk != last_stab_key {
+                let on = control.settings.read().stabilize;
+                stab_rotations = if on {
+                    compute_stab(dji_osv_imu.as_ref(), &control, fps)
+                } else {
+                    None
+                };
+                last_stab_key = nk;
+            }
             tracing::debug!(
                 "decoder (fisheye): live calib update gen={}, L.fx={:.1}, R.fx={:.1}",
                 current_gen, calib_left.fx, calib_right.fx
@@ -1552,6 +1591,7 @@ fn run_fisheye_zerocopy(
         let s = control.settings.read();
         let max_corr_deg = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
         let smooth_ms = s.dji_smooth_ms;
+        vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
         drop(s);
         match vr180_pipeline::dji_imu::compute_dji_stabilization(
             osv, total_frames, max_corr_deg, smooth_ms, fps,
@@ -1951,10 +1991,12 @@ fn _check_pair_dims(
 ///
 /// Returns `(calib_left, calib_right)`. For non-DJI sources both are
 /// identical. For DJI OSV, when a parsed protobuf is supplied, each
-/// eye gets its own cx/cy from the per-lens protobuf entry — lens A
-/// and lens B differ by tens of pixels in practice. fx and k still
-/// come from the preset / settings (the protobuf's k coefficients
-/// are unreliable past ~88° per the Python source).
+/// eye gets its FULL per-lens factory calibration from the protobuf:
+/// fx/fy (→FOV), principal point (cx/cy), AND the KB k1–k4 distortion.
+/// The file's KB polynomial folds past ~89°, so it is valid only out
+/// to the 180°-VR180 edge (max sampled θ = 90°); for full-FOV output
+/// past 180° prefer the preset/override. Anything the file omits
+/// falls back to the preset.
 ///
 /// Eye→lens mapping: DJI's stream-to-lens layout is stream 0 = Lens A
 /// = right eye, stream 1 = Lens B = left eye, AND we swap_eyes at
@@ -2018,14 +2060,34 @@ pub(crate) fn resolve_fisheye_calib_pair(
                     let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
                     (fx, fx, cxn * src_w as f32, cyn * src_h as f32, k)
                 } else {
-                    // Auto: in-file per-lens principal point (cx/cy), but
-                    // PRESET focal/FOV. We deliberately do NOT load the FOV
-                    // from the file calibration (its fx/fy) — the preset's
-                    // `fx_auto` is used for both axes (square pixels, preset
-                    // field of view). k is the preset too.
+                    // Auto: load the per-lens FACTORY calibration from the
+                    // OSV protobuf — principal point (cx/cy), focal length
+                    // (fx/fy → FOV) AND the KB k1–k4 distortion. fx/fy/cx/cy
+                    // are stored at the calib resolution (lens.width/height),
+                    // so scale to the working res. k is dimensionless (no
+                    // scale). Anything the file omits falls back to the
+                    // preset (fx_auto / preset_k).
+                    //
+                    // FOV note: the optical FOV is implied by fx (theta_max =
+                    // max_r/fx in new_pure_kb), NOT by the file's nominal
+                    // "half_fov" field — that reads ~90° and does NOT match
+                    // fx·image-circle (~106° half). So loading fx loads FOV.
+                    //
+                    // k-fold note: this lens's KB polynomial peaks near θ≈89°
+                    // then folds, so it is valid only out to ~88°. For 180°
+                    // VR180 output (max sampled θ = 90°) we sit right at that
+                    // edge, where the factory k is both safe and more accurate
+                    // than the smoothed preset. Output past 180° would sample
+                    // the folded region — use the preset/override there.
                     let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
                     let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
-                    (fx_auto, fx_auto, cx, cy, preset_k)
+                    let fx = lens.fx.map(|v| v * scale_x).unwrap_or(fx_auto);
+                    let fy = lens.fy.map(|v| v * scale_y).unwrap_or(fx);
+                    let k = match (lens.k1, lens.k2, lens.k3, lens.k4) {
+                        (Some(a), Some(b), Some(c), Some(d)) => [a, b, c, d],
+                        _ => preset_k,
+                    };
+                    (fx, fy, cx, cy, k)
                 };
                 vr180_pipeline::gpu::FisheyeCalib::new_pure_kb(
                     fx, fy, cx, cy, k, src_w as f32, src_h as f32,
@@ -2725,6 +2787,7 @@ fn stab_key(s: &Settings) -> u64 {
     let mut h: u64 = if s.stabilize { 1 } else { 0 };
     h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_smooth_ms.to_bits() as u64);
     h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_max_corr_deg.to_bits() as u64);
+    h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_imu_phase_ms.to_bits() as u64);
     h
 }
 
@@ -2741,6 +2804,7 @@ fn compute_stab_for(
     match kind {
         vr180_pipeline::SourceKind::DjiOsv => imu.and_then(|osv| {
             let max_corr = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
+            vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
             vr180_pipeline::dji_imu::compute_dji_stabilization(osv, total, max_corr, s.dji_smooth_ms, fps)
                 .ok().map(|st| st.per_frame)
         }),

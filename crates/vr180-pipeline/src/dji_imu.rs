@@ -663,7 +663,7 @@ fn smooth_quats_ema(quats: &[Quat], tau_frames: usize) -> Vec<Quat> {
 /// Per-row rolling-shutter correction quaternions for one video frame.
 ///
 /// Mirrors `DjiGyroStabilizer.get_per_row_quaternions` at
-/// `vr180_gui.py:828-985`. The DJI Osmo sensor takes ~19 ms to read a
+/// `vr180_gui.py:828-985`. The DJI Osmo sensor takes ~18.3 ms to read a
 /// full frame top-to-bottom; per-frame stabilization can lock the
 /// overall frame to the reference orientation but can't fix the
 /// intra-frame shear that fast camera motion creates. This function
@@ -677,14 +677,14 @@ fn smooth_quats_ema(quats: &[Quat], tau_frames: usize) -> Vec<Quat> {
 ///    boundary).
 /// 2. Hemisphere-align all samples for slerp safety.
 /// 3. For each scanline `y ∈ [0, fish_h)`, compute its readout time
-///    `t_y = readout_start + (y / fish_h) · readout_s` where
-///    `readout_start = (frame_dur - readout_s) / 2` puts the readout
-///    window centred on the frame.
+///    `t_y = readout_start + (y / fish_h) · readout_s`, where the readout
+///    window is centred on the IMU-phase point — the same point as the
+///    per-frame stab sample (see `dji_imu_phase_offset_s_fps`).
 /// 4. Component-wise Catmull-Rom interpolate the merged quaternion
 ///    timeline to that time (matches DJI Studio's `catmullRomQuaternion`
 ///    convention — NLERP-style, not slerp).
-/// 5. Also interpolate at `t_mid = frame_dur / 2` (the mid-frame
-///    reference).
+/// 5. Also interpolate at `t_mid` (the readout-window center; the
+///    reference orientation each row is corrected to).
 /// 6. Output: `q_corr_row = q_row⁻¹ ⊗ q_mid` per row. Applying this to
 ///    the projected direction rotates from "mid-frame orientation" to
 ///    "this row's orientation" — exactly what we need so the kernel
@@ -776,6 +776,9 @@ pub fn compute_per_row_quaternions_for_frame(
     // the *same* readout_s the caller passed in, this stays correct
     // when the camera switches sensor modes (different fps → maybe
     // different readout).
+    // RS window phase — the SAME IMU-phase point as the per-frame stab
+    // sample (DJI anchors both to one point; verified via disasm). The
+    // readout window is centred on it, ±readout/2.
     let phase_offset_s = dji_imu_phase_offset_s_fps(readout_s, fps);
     let readout_start = (frame_dur - readout_s) * 0.5 + phase_offset_s;
     let t_mid = frame_dur * 0.5 + phase_offset_s;
@@ -947,18 +950,19 @@ pub fn pack_per_row_camera_matrices(quats: &[Quat], lens_a_quat_xyzw: [f32; 4]) 
 /// sensor crops/bins to fit the smaller frame budget) — use
 /// [`dji_osmo_readout_ms_for_fps`] when fps is known.
 ///
-/// Values verified via lldb capture of EisBase fields `+0x60c` (scan
-/// lines) × `+0x614` (ns per line) in DJI Studio:
-/// - 30 fps:   4766 × 3840 ns = 18.30 ms (hardcoded as 19 here for
-///             backward compat with the old constant)
-/// - 50 fps:   4226 × 3840 ns = 16.23 ms (different sensor mode)
-pub const DJI_OSMO_OQ001_READOUT_MS: f32 = 19.0;
+/// Measured via lldb capture of EisBase fields `+0x60c` (scan lines) ×
+/// `+0x614` (ns per line) in DJI Studio — the exact `scan_lines · ns_per_line`
+/// the firmware uses:
+/// - 30 fps:   4766 × 3840 ns = 18.301 ms  ← this constant
+/// - 50 fps:   4226 × 3840 ns = 16.228 ms (different sensor mode; see
+///             [`dji_osmo_readout_ms_for_fps`])
+pub const DJI_OSMO_OQ001_READOUT_MS: f32 = 18.301;
 
 /// FPS-aware sensor readout. The OSMO 360 switches sensor mode
 /// (crop/binning) at higher recording fps to fit the smaller frame
 /// budget, which yields a shorter scanline readout. Phase offset
 /// scales with readout (see [`dji_imu_phase_offset_s`]), so this
-/// matters: at 50 fps using the 30 fps readout gives a ~1.2 ms
+/// matters: at 50 fps using the 30 fps readout gives a ~1 ms
 /// timing error, observed as a "loose" feeling in fast camera
 /// motion ("the stab is the right size but lands at the wrong axis").
 pub fn dji_osmo_readout_ms_for_fps(fps: f32) -> f32 {
@@ -1033,13 +1037,49 @@ pub fn dji_imu_phase_offset_s(_readout_s: f32) -> f32 {
 /// `readout_s` is no longer used directly, but kept in the signature
 /// for callers that want to pass it (it informs the per-row pipeline's
 /// readout window separately).
+/// Default IMU sample offset (ms after frame_start) — the empirically
+/// verified DJI sample point (see dji_studio_field_measurements: DJI's
+/// own formula lands 8.05–8.77 ms after frame_start across 30/50 fps).
+pub const DJI_IMU_PHASE_DEFAULT_MS: f32 = 8.5;
+
+/// FPS-aware default IMU-phase value (ms after frame_start) used to seed
+/// the GUI slider: **half the sensor readout (SROT/2)** — the readout-window
+/// midpoint. Evaluates to 9.15 ms @ 30 fps and 8.114 ms @ 50 fps via
+/// [`dji_osmo_readout_ms_for_fps`]. Re-evaluated on every file load (fps can
+/// change between clips) and never persisted, so each clip starts from the
+/// readout-midpoint default rather than a stale per-clip tweak.
+pub fn dji_imu_phase_default_ms_for_fps(fps: f32) -> f32 {
+    dji_osmo_readout_ms_for_fps(fps) * 0.5
+}
+
+/// Live-tunable IMU sample offset, stored as **microseconds after
+/// frame_start**. Default 8500 (8.5 ms). Exposed as a GUI slider so the
+/// value can be A/B-tested against DJI Studio output; read by
+/// [`dji_imu_phase_offset_s_fps`], which feeds BOTH the per-frame stab
+/// sample and the rolling-shutter readout-window center — so one knob
+/// moves all IMU timing consistently.
+static DJI_IMU_PHASE_US: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(8500);
+
+/// Set the IMU sample offset (ms after frame_start). Clamped to [0, 60] ms.
+pub fn set_dji_imu_phase_after_start_ms(ms: f32) {
+    let us = (ms * 1000.0).round().clamp(0.0, 60_000.0) as u32;
+    DJI_IMU_PHASE_US.store(us, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current IMU sample offset (ms after frame_start).
+pub fn dji_imu_phase_after_start_ms() -> f32 {
+    DJI_IMU_PHASE_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+}
+
 #[inline]
 pub fn dji_imu_phase_offset_s_fps(_readout_s: f32, fps: f32) -> f32 {
-    /// Constant offset from frame_start where DJI samples IMU.
-    /// Verified empirically across 30 fps and 50 fps clips.
-    const TARGET_OFFSET_FROM_FRAME_START_S: f32 = 0.0085;
+    // Target offset (s after frame_start) — a live-tunable global, default
+    // 8.5 ms. The mid-frame term cancels so the IMU is sampled at a fixed
+    // point after frame_start regardless of fps (verified 30 & 50 fps).
+    let target_s = DJI_IMU_PHASE_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1.0e6;
     let frame_dur = if fps > 0.0 { 1.0 / fps } else { 1.0 / 30.0 };
-    TARGET_OFFSET_FROM_FRAME_START_S - 0.5 * frame_dur
+    target_s - 0.5 * frame_dur
 }
 
 /// Default IMU phase offset for the 19 ms readout OSMO 360 mode at 30 fps.
