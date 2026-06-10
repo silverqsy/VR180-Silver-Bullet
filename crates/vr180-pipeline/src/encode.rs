@@ -218,8 +218,14 @@ impl H265Encoder {
             (10, EncoderBackend::HevcNvenc)           => ffmpeg::format::Pixel::P010LE,
             (8,  EncoderBackend::HevcNvenc)           => ffmpeg::format::Pixel::NV12,
             (10, EncoderBackend::Libx265)             => ffmpeg::format::Pixel::YUV420P10LE,
-            (_,  EncoderBackend::ProResVideoToolbox)
-                | (_, EncoderBackend::ProResKs)       => ffmpeg::format::Pixel::YUV422P10LE,
+            // ffmpeg 8's prores_videotoolbox REJECTS yuv422p10le at open
+            // (supported: yuv420p, nv12, ayuv64le, uyvy422, p010le, nv16).
+            // AYUV64LE (16-bit packed 4:4:4:4) is the only listed input
+            // that keeps ≥10-bit depth AND full chroma — VT downsamples to
+            // the profile's 4:2:2/4:4:4 internally. p010le would halve the
+            // chroma before a 4:2:2 codec; the rest are 8-bit.
+            (_,  EncoderBackend::ProResVideoToolbox)  => ffmpeg::format::Pixel::AYUV64LE,
+            (_,  EncoderBackend::ProResKs)            => ffmpeg::format::Pixel::YUV422P10LE,
             _                                         => ffmpeg::format::Pixel::YUV420P,
         };
 
@@ -948,6 +954,22 @@ impl H265Encoder {
         Self::create_zero_copy_vt_with_format(path, w, h, fps, bitrate_kbps, 10)
     }
 
+    /// ProRes flavour of the zero-copy VT encode: `prores_videotoolbox`
+    /// (Apple's hardware ProRes engine) fed the SAME P010 CVPixelBuffers
+    /// as the HEVC path via `encode_pixel_buffer_p010` — p010le is in the
+    /// encoder's supported sw-format list; VT converts to the profile's
+    /// 4:2:2/4:4:4 internally. `prores_profile` = 0..=5
+    /// (Proxy/LT/Standard/HQ/4444/4444 XQ).
+    pub fn create_zero_copy_vt_prores(
+        path: &Path,
+        w: u32, h: u32,
+        fps: f32,
+        prores_profile: i32,
+    ) -> Result<Self> {
+        Self::create_zero_copy_vt_impl(path, w, h, fps, 0, 10,
+            EncoderBackend::ProResVideoToolbox, prores_profile)
+    }
+
     fn create_zero_copy_vt_with_format(
         path: &Path,
         w: u32, h: u32,
@@ -955,16 +977,33 @@ impl H265Encoder {
         bitrate_kbps: u32,
         bit_depth: u8,
     ) -> Result<Self> {
+        Self::create_zero_copy_vt_impl(path, w, h, fps, bitrate_kbps, bit_depth,
+            EncoderBackend::VideoToolbox, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_zero_copy_vt_impl(
+        path: &Path,
+        w: u32, h: u32,
+        fps: f32,
+        bitrate_kbps: u32,
+        bit_depth: u8,
+        backend: EncoderBackend,
+        prores_profile: i32,
+    ) -> Result<Self> {
         crate::decode::init();
         use ffmpeg::ffi::*;
+
+        let is_prores = backend == EncoderBackend::ProResVideoToolbox;
+        let codec_name = if is_prores { "prores_videotoolbox" } else { "hevc_videotoolbox" };
 
         let mut octx = ffmpeg::format::output(&path)
             .map_err(|e| Error::Ffmpeg(format!("output ctx {path:?}: {e}")))?;
 
-        let codec = ffmpeg::codec::encoder::find_by_name("hevc_videotoolbox")
-            .ok_or_else(|| Error::Ffmpeg(
-                "hevc_videotoolbox encoder not available in this FFmpeg build".into()
-            ))?;
+        let codec = ffmpeg::codec::encoder::find_by_name(codec_name)
+            .ok_or_else(|| Error::Ffmpeg(format!(
+                "{codec_name} encoder not available in this FFmpeg build"
+            )))?;
 
         let stream_index = {
             let stream = octx.add_stream(codec)
@@ -1032,9 +1071,17 @@ impl H265Encoder {
             (*raw).pix_fmt = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
             (*raw).time_base = time_base.into();
             (*raw).framerate = ffmpeg::Rational(num, den).into();
-            (*raw).bit_rate = (bitrate_kbps as i64) * 1000;
+            if is_prores {
+                // ProRes: bitrate is profile-determined (the field is
+                // ignored); the codec tag (apcn/apch/ap4h/…) is set by the
+                // encoder from the profile — leave 0 so it isn't clobbered.
+                (*raw).profile = prores_profile;
+            } else {
+                (*raw).bit_rate = (bitrate_kbps as i64) * 1000;
+                // MP4 needs hvc1 (vs hev1) for QuickTime / Vision Pro.
+                (*raw).codec_tag = u32::from_le_bytes(*b"hvc1");
+            }
             (*raw).gop_size = 60;
-            (*raw).codec_tag = u32::from_le_bytes(*b"hvc1");
             if octx.format().flags()
                 .contains(ffmpeg::format::flag::Flags::GLOBAL_HEADER)
             {
@@ -1056,17 +1103,21 @@ impl H265Encoder {
             (*raw).color_trc       = AVColorTransferCharacteristic::AVCOL_TRC_BT709;
             (*raw).colorspace      = AVColorSpace::AVCOL_SPC_BT709;
 
-            // Same VT private-data tuning as the CPU-input path.
+            // Same VT private-data tuning as the CPU-input path. The
+            // string `profile` opt is HEVC-only (main/main10); ProRes takes
+            // its profile via the ctx field above.
             set_opt(raw, "realtime",        "0")?;
             set_opt(raw, "allow_sw",        "0")?;
-            set_opt(raw, "profile", if bit_depth == 10 { "main10" } else { "main" })?;
+            if !is_prores {
+                set_opt(raw, "profile", if bit_depth == 10 { "main10" } else { "main" })?;
+            }
             set_opt(raw, "power_efficient", "0")?;
         }
 
         let encoder = enc_ctx.encoder().video()
             .map_err(|e| Error::Ffmpeg(format!("video encoder context: {e}")))?
             .open_as(codec)
-            .map_err(|e| Error::Ffmpeg(format!("open hevc_videotoolbox (zero-copy): {e}")))?;
+            .map_err(|e| Error::Ffmpeg(format!("open {codec_name} (zero-copy): {e}")))?;
 
         {
             let mut stream = octx.stream_mut(stream_index)

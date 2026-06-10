@@ -70,21 +70,45 @@ it to Just Work; the checklist is what to *confirm*, not to port:
 > Windows **readback export path now covers Fisheye too** (same
 > `(projection, rs)` split, slots 30/31) so libx265 / 8-bit /
 > GPU-resident-fallback fisheye exports keep RS instead of dropping to the
-> portable no-RS path. Remaining KNOWN asymmetries, all macOS-side or
-> shared — for the macOS machine to consider:
-> 1. **libx265 export on macOS = portable path = NO per-row RS** (the p010
->    fast path gates on `encoder == VideoToolbox` only). Windows libx265
->    goes through its zero-copy readback path WITH RS — so the same
->    libx265 settings produce RS-corrected output on Windows but jello on
->    macOS when stabilizing. Fix idea: extend the p010 path (decode side)
->    to the libx265 tail, or add RS to the portable path.
-> 2. **ProRes export takes the portable path on BOTH platforms** (slow, no
->    RS) — the "P010 IOSurface export path, VideoToolbox/ProRes-VT" line
->    below overstates; the gate is VT-HEVC only. Consistent cross-platform
->    today, but ProRes users lose RS. Same fix ideas as (1).
+> portable no-RS path. Audit items, as resolved on macOS 2026-06-10:
+> 1. ~~libx265 on macOS = no RS~~ / 2. ~~ProRes = no RS on both~~ —
+>    **FIXED: the PORTABLE path itself now applies per-row RS** (same CPU
+>    `compute_per_row_quaternions_for_frame` build + the same rgba16 RS
+>    kernels via `build_eye_eq_16(rs)`, slots 30/31; 8-bit arms use the
+>    byte-path `*_rs_texture` kernels). Covers macOS libx265 (8 + 10-bit),
+>    ProRes on BOTH platforms, and every future fallback — the portable
+>    path is now feature-complete, just slower. Bonus: the 10-bit arms no
+>    longer build-and-discard two 8-bit projections per frame (the old
+>    unconditional `left_tex`/`right_tex`). Verified vs the macOS p010 VT
+>    reference: stab+RS libx265 vs VT mean diff = encoder noise (see
+>    `examples/rs_portable_check.rs`, gitignored).
 > 3. The GoPro `.360` EAC preview (legacy) ignores the view-adjust panel on
 >    both platforms (per-eye bundle predates it) — consistent, just a
->    legacy-path limitation.
+>    legacy-path limitation. Still open.
+>
+> Two MORE real bugs found + fixed while verifying (macOS, 2026-06-10):
+> 4. **ProRes-VT was broken at encoder open under ffmpeg 8** —
+>    `prores_videotoolbox` rejects `yuv422p10le` (its input list: yuv420p,
+>    nv12, ayuv64le, uyvy422, p010le, nv16). Now fed **AYUV64LE** (16-bit
+>    packed 4:4:4 — the only listed input keeping ≥10-bit + full chroma; VT
+>    converts to the profile's 4:2:2 internally). `prores_ks` keeps
+>    yuv422p10le. Verified: ProRes HQ 10-bit 4:2:2 output, RS-corrected
+>    (1.6/255 vs the VT HEVC reference). FOLLOW-UP the same day: ProRes-VT
+>    now takes the **zero-copy P010 path** (same CVPixelBuffers as VT-HEVC
+>    via `create_zero_copy_vt_prores`; profile via ctx field, codec_tag
+>    left 0 so the encoder sets apch/…) — ~3 fps → **~17.6 fps** @ 8K, and
+>    0.7/255 vs the HEVC reference (identical projected pixels). The
+>    AYUV64LE readback route remains as the non-OSV-source fallback.
+> 5. **Trimmed exports were wrong on every path**: (a) the iterators'
+>    `seek(trim_in)` lands on the keyframe AT/BEFORE the target with no
+>    decode-forward, so exports gained up to a GOP of pre-roll (trim 2–3 s
+>    → 90 frames from 0.0); (b) the audio mux copied the FULL source audio
+>    at original timestamps → over-long file AND audio offset by trim_in.
+>    Fixed: all 4 export loops drop pre-trim frames (`pts < t_in − dt/2`),
+>    and `mux_video_with_passthrough_audio` takes `(audio_offset_s,
+>    max_duration_s)` — skips, rebases to 0, and stops at the video's
+>    length. Verified: trim 2..3 s → exactly 30 frames + 1.00 s audio on
+>    both portable and zc paths.
 
 Build/run quick-ref (build `-p vr180-gui`, **not** the workspace):
 ```pwsh
@@ -147,10 +171,14 @@ paths exist on purpose, behind `#[cfg(target_os = "...")]`:
 
 - **macOS only:** `interop_macos` (IOSurface↔Metal↔wgpu zero-copy),
   `ZeroCopyDualStreamFisheyeIter` (VT P010 zero-copy decode), the P010
-  IOSurface export path, VideoToolbox/ProRes-VT encode. The crates
-  `metal` / `core-foundation` / `objc` / `foreign-types` are
-  `[target.'cfg(target_os = "macos")'.dependencies]` — they never build
-  on Windows.
+  IOSurface export path — gates on **VT encode (HEVC OR ProRes-VT)**;
+  ProRes-VT rides the same P010 CVPixelBuffers into Apple's hardware
+  ProRes engine via `create_zero_copy_vt_prores` (~17 fps @ 8K HQ, was
+  ~3 fps on the readback path). Only libx265 / prores_ks ride the
+  portable readback path, which since 2026-06-10 also carries per-row
+  RS. The crates `metal` / `core-foundation` / `objc` / `foreign-types`
+  are `[target.'cfg(target_os = "macos")'.dependencies]` — they never
+  build on Windows.
 - **Cross-platform + Windows fast paths:** `d3d11va` (NVDEC) decode —
   `DualStreamFisheyeIter` for stills, `D3d11SharedDualStreamIter` for the
   **zero-copy live preview** (D3D11 P010→RGBA16→Vulkan, no CPU readback);

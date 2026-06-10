@@ -203,7 +203,15 @@ pub fn mux_video_with_passthrough_audio(
     audio_src: &Path,
     video_src: &Path,
     final_out: &Path,
+    audio_offset_s: f64,
+    max_duration_s: Option<f64>,
 ) -> Result<u64> {
+    // `audio_offset_s` / `max_duration_s` implement TRIMMED exports: the
+    // video temp starts at source-time `trim_in` but its own timeline at 0,
+    // so the source audio must be cut at `audio_offset_s` (= trim_in),
+    // rebased to 0, and stopped after the video's duration. Without this a
+    // trimmed export carried the FULL source audio at original timestamps —
+    // wrong length and out of sync by trim_in seconds.
     crate::decode::init();
 
     let mut a_in = ffmpeg::format::input(&audio_src)
@@ -290,9 +298,35 @@ pub fn mux_video_with_passthrough_audio(
         t as f64 * tb.numerator() as f64 / tb.denominator() as f64
     }
 
+    // Audio cut window in source-audio time, and the pts rebase (ticks)
+    // that moves the first kept packet to ≈0 on the output timeline.
+    let a_tb_per_s = a_src_tb.denominator() as f64 / a_src_tb.numerator() as f64;
+    let a_off_ticks = (audio_offset_s * a_tb_per_s).round() as i64;
+    let mut a_done = false;
+
     loop {
+        // Skip leading audio entirely before trim_in (packet granularity,
+        // ~21 ms for AAC — inaudible cut slop).
+        while let Some((_, p)) = a_iter.peek() {
+            if pkt_seconds(p, a_src_tb) < audio_offset_s - 1e-6 {
+                a_iter.next();
+            } else {
+                break;
+            }
+        }
+        // Stop audio once the video's duration is covered.
+        if !a_done {
+            if let (Some(max_d), Some((_, p))) = (max_duration_s, a_iter.peek()) {
+                if pkt_seconds(p, a_src_tb) - audio_offset_s >= max_d {
+                    a_done = true;
+                }
+            }
+        }
         let v_t = v_iter.peek().map(|(_, p)| pkt_seconds(p, v_src_tb));
-        let a_t = a_iter.peek().map(|(_, p)| pkt_seconds(p, a_src_tb));
+        let a_t = if a_done { None } else {
+            // Compare on the OUTPUT timeline (audio rebased by trim_in).
+            a_iter.peek().map(|(_, p)| pkt_seconds(p, a_src_tb) - audio_offset_s)
+        };
         let take_video = match (v_t, a_t) {
             (Some(vt), Some(at)) => vt <= at,
             (Some(_), None) => true,
@@ -309,6 +343,14 @@ pub fn mux_video_with_passthrough_audio(
             v_packets += 1;
         } else {
             let (_, mut packet) = a_iter.next().unwrap();
+            // Rebase to the output timeline (clamp the first packet's
+            // sub-packet remainder to 0 rather than going negative).
+            if let Some(pts) = packet.pts() {
+                packet.set_pts(Some((pts - a_off_ticks).max(0)));
+            }
+            if let Some(dts) = packet.dts() {
+                packet.set_dts(Some((dts - a_off_ticks).max(0)));
+            }
             packet.set_stream(out_a_idx);
             packet.set_position(-1);
             packet.rescale_ts(a_src_tb, a_out_tb);
