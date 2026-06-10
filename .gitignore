@@ -49,3 +49,7 @@ Thumbs.db
 # examples are Windows/CUDA-only and would break the macOS `--all-targets`
 # build. Kept local; not part of the handoff.
 /crates/vr180-pipeline/examples/
+
+# Release bundling output (signed .app / .zip / .dmg) — produced locally by
+# the macOS release process; ship via GitHub Releases, never the repo.
+/dist/
