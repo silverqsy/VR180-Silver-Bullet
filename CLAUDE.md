@@ -63,6 +63,29 @@ it to Just Work; the checklist is what to *confirm*, not to port:
 > macOS path. Nothing to verify on macOS (the macOS paths were already
 > correct); listed so the divergence isn't reintroduced.
 
+> 🔍 **Full cross-platform parity audit (Windows session, 2026-06-10).**
+> OSV preview, detail-still, color stack, preview gamma, video-range tags,
+> calib (k5/p1/p2/swap-follow/195°), stab + RS: **in parity** (macOS OSV
+> preview is the shared CPU worker; Windows zc worker matches it). The
+> Windows **readback export path now covers Fisheye too** (same
+> `(projection, rs)` split, slots 30/31) so libx265 / 8-bit /
+> GPU-resident-fallback fisheye exports keep RS instead of dropping to the
+> portable no-RS path. Remaining KNOWN asymmetries, all macOS-side or
+> shared — for the macOS machine to consider:
+> 1. **libx265 export on macOS = portable path = NO per-row RS** (the p010
+>    fast path gates on `encoder == VideoToolbox` only). Windows libx265
+>    goes through its zero-copy readback path WITH RS — so the same
+>    libx265 settings produce RS-corrected output on Windows but jello on
+>    macOS when stabilizing. Fix idea: extend the p010 path (decode side)
+>    to the libx265 tail, or add RS to the portable path.
+> 2. **ProRes export takes the portable path on BOTH platforms** (slow, no
+>    RS) — the "P010 IOSurface export path, VideoToolbox/ProRes-VT" line
+>    below overstates; the gate is VT-HEVC only. Consistent cross-platform
+>    today, but ProRes users lose RS. Same fix ideas as (1).
+> 3. The GoPro `.360` EAC preview (legacy) ignores the view-adjust panel on
+>    both platforms (per-eye bundle predates it) — consistent, just a
+>    legacy-path limitation.
+
 Build/run quick-ref (build `-p vr180-gui`, **not** the workspace):
 ```pwsh
 # Windows

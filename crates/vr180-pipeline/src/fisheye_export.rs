@@ -379,16 +379,19 @@ pub fn export_fisheye(
     // path's encoder tail). What we save vs the portable path: the per-frame
     // swscale P010LE→RGBA64LE + CPU upload of the 3840² dual stream.
     //
-    // Scope: OSV + HEVC(libx265) + HalfEquirect + Vulkan + P010 only.
-    // Anything else (ProRes, raw-fisheye pass-through, non-OSV, DX12, no
-    // P010) — or the `VR180_EXPORT_FORCE_CPU` escape hatch — falls through
-    // to the portable readback path below, untouched.
+    // Scope: OSV + HEVC(libx265/nvenc) + either projection + Vulkan + P010.
+    // Anything else (ProRes, non-OSV, DX12, no P010) — or the
+    // `VR180_EXPORT_FORCE_CPU` escape hatch — falls through to the portable
+    // readback path below, untouched. Covers Fisheye too (parity with the
+    // macOS p010 path) so libx265 / 8-bit / GPU-resident-fallback fisheye
+    // exports keep RS + the zero-copy decode instead of dropping to the
+    // portable path.
     #[cfg(target_os = "windows")]
     {
         let can_try = std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
             && matches!(cfg.source_kind, SourceKind::DjiOsv)
             && matches!(cfg.encoder, EncoderBackend::Libx265 | EncoderBackend::HevcNvenc)
-            && cfg.projection == FisheyeExportProjection::HalfEquirect
+            && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye)
             && (cfg.bit_depth == 10 || cfg.bit_depth == 8)
             && crate::interop_windows::is_vulkan_backend(&pipeline.device)
             && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010);
@@ -1320,26 +1323,43 @@ fn export_fisheye_osv_zerocopy_d3d11(
             let l_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.left) };
             let r_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.right) };
 
-            // KB projection (RS variant when stabilizing). Slots 30/31 keep
-            // the export's cached output textures distinct from preview 0/1.
-            let (left16, right16) = if let Some(rs) = rs_rows.as_deref() {
-                (
+            // KB projection (RS variant when stabilizing; same
+            // (projection, rs) split as the GPU-resident + macOS p010
+            // paths). Slots 30/31 keep the export's cached output
+            // textures distinct from preview 0/1.
+            let (left16, right16) = match (cfg.projection, rs_rows.as_deref()) {
+                (FisheyeExportProjection::HalfEquirect, Some(rs)) => (
                     pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
                         &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs, 30,
                     )?,
                     pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
                         &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs, 31,
                     )?,
-                )
-            } else {
-                (
+                ),
+                (FisheyeExportProjection::HalfEquirect, None) => (
                     pipeline.project_fisheye_rgba16_texture_to_equirect_16(
                         &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30,
                     )?,
                     pipeline.project_fisheye_rgba16_texture_to_equirect_16(
                         &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31,
                     )?,
-                )
+                ),
+                (FisheyeExportProjection::Fisheye, Some(rs)) => (
+                    pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
+                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs, 30,
+                    )?,
+                    pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
+                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs, 31,
+                    )?,
+                ),
+                (FisheyeExportProjection::Fisheye, None) => (
+                    pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30,
+                    )?,
+                    pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31,
+                    )?,
+                ),
             };
 
             // 16-bit color stack per eye.
