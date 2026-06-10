@@ -1612,14 +1612,24 @@ fn export_fisheye_osv_gpu_resident(
         let l_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.left) };
         let r_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.right) };
         let (left16, right16) = if cfg.projection == FisheyeExportProjection::Fisheye {
-            // Raw fisheye SBS pass-through (frame-level stab rotation, no RS) —
-            // slots 32/33 so the cache doesn't collide with the equirect slots.
-            (
-                pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                    &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 32)?,
-                pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                    &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 33)?,
-            )
+            // Normalized fisheye SBS output (slots 32/33 so the cache doesn't
+            // collide with the equirect slots). RS-corrected when stabilizing —
+            // same (projection, rs) split as the macOS p010 export path.
+            if let Some(rs) = rs_rows.as_deref() {
+                (
+                    pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
+                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs, 32)?,
+                    pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
+                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs, 33)?,
+                )
+            } else {
+                (
+                    pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 32)?,
+                    pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 33)?,
+                )
+            }
         } else if let Some(rs) = rs_rows.as_deref() {
             (
                 pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(

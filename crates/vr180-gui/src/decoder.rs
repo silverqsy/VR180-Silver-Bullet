@@ -1920,19 +1920,29 @@ fn run_fisheye_zerocopy(
             // D3D11 side did P010→RGBA16 + downscale), so project single-tap
             // straight from them — no luma moiré, no chroma colour-fringing.
             match mode {
-                // Raw fisheye SBS — match the GPU-resident export's Fisheye path
-                // EXACTLY so the preview previews what the export writes: pure
-                // KB fisheye reprojection with frame-level stab rotation only,
-                // NO per-row RS (there is no `_to_fisheye_rs_16` shader; the
-                // export skips RS for fisheye too — see fisheye_export.rs).
+                // Normalized fisheye SBS — match the GPU-resident export's
+                // Fisheye path EXACTLY so the preview previews what the export
+                // writes. When OSV stab is on, the same per-row RS correction
+                // as half-equirect (parity with the macOS p010 + CPU-worker
+                // fisheye paths, which have always applied RS here).
                 FisheyeOutputMode::Fisheye => {
-                    let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                        &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, 0,
-                    )?;
-                    let r = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                        &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1,
-                    )?;
-                    (l, r)
+                    if let Some(rs) = rs_rows_f32.as_deref() {
+                        let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
+                            &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs, 0,
+                        )?;
+                        let r = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
+                            &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs, 1,
+                        )?;
+                        (l, r)
+                    } else {
+                        let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                            &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, 0,
+                        )?;
+                        let r = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                            &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1,
+                        )?;
+                        (l, r)
+                    }
                 }
                 // Half-equirect VR180: when OSV stab is on use the RS variant so
                 // per-row rolling shutter is corrected (kills the jello); same

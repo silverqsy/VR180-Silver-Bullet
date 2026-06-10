@@ -49,6 +49,20 @@ it to Just Work; the checklist is what to *confirm*, not to port:
    the preview; panel capped at 420 px); zoomed paused-frame drag re-render
    throttled to 120 ms (was per pointer event on the UI thread).
 
+> ✅ **Windows verification done** (DX12/Vulkan + NVENC, RTX 4090): all six
+> confirmed — the new lens model / 195° fisheye / soft-stab flow into the
+> GPU-resident CUDA path automatically via the shared `resolve_calib_pair`
+> + WGSL; GPU-resident vs portable-CPU diff is encoder-noise only (mean
+> ≤2/255); 8K = 8192×4096 Main10 accepted, ~17.5 fps. One real gap found
+> and FIXED on Windows: **fisheye-output RS parity** — macOS p010
+> RS-corrects fisheye output (`fisheye_p010_to_fisheye_rs_16`), but the
+> Windows zero-copy preview + GPU-resident export had no RS-capable
+> fisheye projection. Added `fisheye_to_fisheye_rs_16` (same WGSL,
+> format-patched to rgba16) + `project_fisheye_rgba16_texture_to_fisheye_rs_16`
+> and wired both call sites with the same `(projection, rs)` split as the
+> macOS path. Nothing to verify on macOS (the macOS paths were already
+> correct); listed so the divergence isn't reintroduced.
+
 Build/run quick-ref (build `-p vr180-gui`, **not** the workspace):
 ```pwsh
 # Windows

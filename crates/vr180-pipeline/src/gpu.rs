@@ -96,6 +96,11 @@ pub struct Device {
     fisheye_to_fisheye_rs: FisheyeToHequirectRsPipeline,
     /// 16-bit fisheye-to-fisheye for the 10-bit export path.
     fisheye_to_fisheye_16: FisheyeToHequirectPipeline,
+    /// RS-aware sibling of `fisheye_to_fisheye_16` (sampled RGBA16 input —
+    /// the Windows zero-copy preview + GPU-resident export). Parity with the
+    /// macOS `fisheye_p010_to_fisheye_rs_16` path: fisheye output gets the
+    /// same per-row rolling-shutter correction as half-equirect.
+    fisheye_to_fisheye_rs_16: FisheyeToHequirectRsPipeline,
     /// 16-bit zero-copy P010 → fisheye-output projection. macOS-only
     /// zero-copy path for OSV fisheye-output 10-bit export.
     fisheye_p010_to_fisheye_16: FisheyeP010ToHequirectPipeline,
@@ -339,6 +344,7 @@ impl Device {
         let fisheye_to_fisheye = FisheyeToHequirectPipeline::create_fisheye_out(&device);
         let fisheye_to_fisheye_rs = FisheyeToHequirectRsPipeline::create_fisheye_out(&device);
         let fisheye_to_fisheye_16 = FisheyeToHequirectPipeline::create_fisheye_out_16(&device);
+        let fisheye_to_fisheye_rs_16 = FisheyeToHequirectRsPipeline::create_fisheye_out_16bit(&device);
         let fisheye_p010_to_fisheye_16 = FisheyeP010ToHequirectPipeline::create_fisheye_out(&device);
         let fisheye_p010_to_fisheye_rs_16 = FisheyeP010ToHequirectRsPipeline::create_fisheye_out(&device);
         let p010_resolve = P010ResolvePipeline::create(&device);
@@ -396,6 +402,7 @@ impl Device {
             fisheye_p010_to_hequirect_16,
             fisheye_p010_to_hequirect_16_rs,
             fisheye_to_fisheye, fisheye_to_fisheye_rs, fisheye_to_fisheye_16,
+            fisheye_to_fisheye_rs_16,
             fisheye_p010_to_fisheye_16, fisheye_p010_to_fisheye_rs_16,
             p010_resolve,
             lut3d, lut3d_16, nv12_to_eac,
@@ -1284,6 +1291,17 @@ impl FisheyeToHequirectRsPipeline {
     fn create_fisheye_out(device: &wgpu::Device) -> Self {
         Self::create_with_shader(
             device, "fisheye_to_fisheye_rs", FISHEYE_TO_FISHEYE_RS_WGSL,
+        )
+    }
+
+    /// 16-bit-output RS fisheye-output projection (Windows zero-copy preview
+    /// + GPU-resident export). Same WGSL as `create_fisheye_out()` with the
+    /// storage format swapped to `rgba16unorm` at runtime (the `create_16bit`
+    /// trick), so the RS-corrected fisheye eye stays 16-bit through compose.
+    fn create_fisheye_out_16bit(device: &wgpu::Device) -> Self {
+        let wgsl = FISHEYE_TO_FISHEYE_RS_WGSL.replace("rgba8unorm, write", "rgba16unorm, write");
+        Self::create_with_shader_fmt(
+            device, "fisheye_to_fisheye_rs_16", &wgsl, wgpu::TextureFormat::Rgba16Unorm,
         )
     }
 
@@ -4419,8 +4437,9 @@ impl Device {
     /// raw stabilized-fisheye SBS output (no equirect un-warp) from an on-GPU
     /// `Rgba16Unorm` fisheye texture. Same bindings as the equirect path
     /// (src / sampler / dst / R / calib); only the pipeline differs
-    /// (`fisheye_to_fisheye_16`). Used by the GPU-resident export when the
-    /// output mode is Fisheye. No per-row RS (matches the readback Fisheye path).
+    /// (`fisheye_to_fisheye_16`). Used by the GPU-resident export + zero-copy
+    /// preview when the output mode is Fisheye and stab is off; the RS-aware
+    /// sibling is [`Self::project_fisheye_rgba16_texture_to_fisheye_rs_16`].
     pub fn project_fisheye_rgba16_texture_to_fisheye_16(
         &self,
         src_tex: &wgpu::Texture,
@@ -4475,6 +4494,88 @@ impl Device {
                 label: Some("fisheye_rgba16_fish_pass_16"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.fisheye_to_fisheye_16.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// RS-aware sibling of [`Self::project_fisheye_rgba16_texture_to_fisheye_16`]:
+    /// normalized fisheye output with **per-row rolling-shutter** correction.
+    /// Windows analogue of the macOS `project_fisheye_p010_to_fisheye_rs_texture_16`
+    /// path so fisheye output gets the same RS treatment as half-equirect.
+    /// Same bindings as the equirect RS path; only the pipeline differs.
+    pub fn project_fisheye_rgba16_texture_to_fisheye_rs_16(
+        &self,
+        src_tex: &wgpu::Texture,
+        src_w: u32, src_h: u32,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        calib: FisheyeCalib,
+        per_row_matrices_f32: &[f32],
+        slot: u32,
+    ) -> Result<wgpu::Texture> {
+        let _ = (src_w, src_h); // encoded in the calib uniform's src_w/src_h
+        let output_tex = {
+            let mut cache = self.rgba16_eq_out_cache.lock().unwrap();
+            let hit = matches!(cache.get(&slot), Some(&(w, h, _)) if w == out_w && h == out_h);
+            if !hit {
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("fisheye_rgba16_rs_fish_out_16"),
+                    size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                cache.insert(slot, (out_w, out_h, tex));
+            }
+            cache.get(&slot).unwrap().2.clone()
+        };
+        let src_view = src_tex.create_view(&Default::default());
+        let dst_view = output_tex.create_view(&Default::default());
+        let r_uniform = self.write_uniform("fisheye_rgba16_rs_fish_R_16",
+            &EquirectUniforms::from_mat3(rotation.0));
+        let cal_uniform = self.write_uniform("fisheye_rgba16_rs_fish_calib_16",
+            &FisheyeCalibUniforms::from_public(calib));
+        // Per-row R storage buffer (12 f32/row). Empty → 1-row zeros so the
+        // shader's `rsm.r00 != 0.0` skip-check disables RS cleanly.
+        let rs_bytes: &[u8] = if per_row_matrices_f32.is_empty() {
+            &[0u8; 48]
+        } else {
+            bytemuck::cast_slice(per_row_matrices_f32)
+        };
+        let rs_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fisheye_rgba16_rs_fish_rows_buf"),
+            size: rs_bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&rs_buf, 0, rs_bytes);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fisheye_rgba16_rs_fish_bg_16"),
+            layout: &self.fisheye_to_fisheye_rs_16.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_fisheye_rs_16.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: rs_buf.as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fisheye_rgba16_rs_fish_enc_16"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fisheye_rgba16_rs_fish_pass_16"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fisheye_to_fisheye_rs_16.pipeline);
             pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
