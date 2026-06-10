@@ -56,6 +56,14 @@ pub struct ViewAdjust {
     pub stereo_yaw_deg: f32,
     pub stereo_pitch_deg: f32,
     pub stereo_roll_deg: f32,
+    /// Camera mounted upside-down: rotate the output 180° in-plane.
+    /// Because the YPR convention is `R = Ry·Rx·Rz(roll)` with roll
+    /// innermost, this is EXACTLY `roll += 180°` on both eyes — the
+    /// flip applies to the output ray first, so pano/stereo sliders
+    /// and stabilization still act in unflipped world space. The
+    /// caller must ALSO swap the L/R eye assignment (an upside-down
+    /// rig mirrors the eye positions); see `Settings::effective_swap_eyes`.
+    pub upside_down: bool,
 }
 
 impl ViewAdjust {
@@ -66,6 +74,7 @@ impl ViewAdjust {
         stereo_yaw_deg: 0.0,
         stereo_pitch_deg: 0.0,
         stereo_roll_deg: 0.0,
+        upside_down: false,
     };
 
     /// Fast path: when every slider is at 0 the view matrix is
@@ -77,19 +86,21 @@ impl ViewAdjust {
             && self.stereo_yaw_deg == 0.0
             && self.stereo_pitch_deg == 0.0
             && self.stereo_roll_deg == 0.0
+            && !self.upside_down
     }
 
     /// Build `(R_view_left, R_view_right)` row-major 3×3 matrices.
     pub fn per_eye_matrices(&self) -> ([f32; 9], [f32; 9]) {
+        let flip = if self.upside_down { 180.0 } else { 0.0 };
         let left = ypr_to_mat3_row_major(
             self.pano_yaw_deg - self.stereo_yaw_deg,
             self.pano_pitch_deg - self.stereo_pitch_deg,
-            self.pano_roll_deg - self.stereo_roll_deg,
+            self.pano_roll_deg - self.stereo_roll_deg + flip,
         );
         let right = ypr_to_mat3_row_major(
             self.pano_yaw_deg + self.stereo_yaw_deg,
             self.pano_pitch_deg + self.stereo_pitch_deg,
-            self.pano_roll_deg + self.stereo_roll_deg,
+            self.pano_roll_deg + self.stereo_roll_deg + flip,
         );
         (left, right)
     }

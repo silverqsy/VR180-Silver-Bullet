@@ -62,6 +62,11 @@ pub struct Settings {
     /// no cap (legacy default — unlimited correction). > 0 caps the
     /// per-frame rotation magnitude in degrees.
     pub dji_max_corr_deg: f32,
+    /// Soft-stab velocity→smoothing response curve (Python "Response"
+    /// slider, 0.2–3.0). < 1 = follows motion early (anticipatory),
+    /// 1 = linear, > 1 = holds longer then catches up (cinematic lag).
+    /// Only used when `dji_smooth_ms > 0`.
+    pub dji_responsiveness: f32,
     /// IMU sample offset, ms after frame_start. Defaults to **SROT/2** (the
     /// readout-window midpoint; 9.15 ms @30 fps, 8.11 ms @50 fps) and is
     /// **refreshed on every file load** to the new clip's fps. A live
@@ -123,6 +128,12 @@ pub struct Settings {
     /// files load fine.
     pub fisheye_k5_left: f32,
     pub fisheye_k5_right: f32,
+    /// Per-eye manual override for the Brown-Conrady tangential coeffs
+    /// `[p1, p2]` (OSV field 20). OSV-only; `[0,0]` = none. In Auto mode
+    /// these are loaded from the file regardless. Serde-defaulted so old
+    /// settings files load fine.
+    pub fisheye_p_left: [f32; 2],
+    pub fisheye_p_right: [f32; 2],
     /// Per-eye principal point, NORMALIZED to [0,1] of the frame
     /// (`cx_norm = cx_px / image_w`). Stored normalized so the same value
     /// is correct at the capped preview resolution and the full export
@@ -135,6 +146,11 @@ pub struct Settings {
     /// For DJI OSV / dual-stream sources: swap L↔R after decode. The
     /// Python app exposes this as `swap_eyes` at vr180_gui.py:3554.
     pub fisheye_swap_eyes: bool,
+    /// Camera mounted upside-down. Implies BOTH a 180° in-plane output
+    /// rotation (via `ViewAdjust::upside_down`) AND an L↔R eye swap
+    /// (the rig flip mirrors the eye positions) — see
+    /// [`Settings::effective_swap_eyes`].
+    pub camera_upside_down: bool,
     /// Output projection. `HalfEquirect` is the standard VR180 output
     /// (left-right hemisphere). `Fisheye` skips the projection entirely
     /// and writes the raw fisheye eyes as SBS — useful for VFX or
@@ -206,8 +222,9 @@ impl Default for Settings {
             // to frame 0 instead.
             smooth_ms: 1000.0,
             max_corr_deg: 15.0,
-            dji_smooth_ms: 1000.0,
+            dji_smooth_ms: 1200.0,
             dji_max_corr_deg: 15.0,
+            dji_responsiveness: 1.0,
             dji_imu_phase_ms: default_dji_imu_phase_ms(),
             pano_yaw_deg: 0.0,
             pano_pitch_deg: 0.0,
@@ -230,11 +247,14 @@ impl Default for Settings {
             fisheye_k_right: [0.0, 0.0, 0.0, 0.0],
             fisheye_k5_left: 0.0,
             fisheye_k5_right: 0.0,
+            fisheye_p_left: [0.0, 0.0],
+            fisheye_p_right: [0.0, 0.0],
             fisheye_cx_norm_left: 0.5,
             fisheye_cy_norm_left: 0.5,
             fisheye_cx_norm_right: 0.5,
             fisheye_cy_norm_right: 0.5,
             fisheye_swap_eyes: false,
+            camera_upside_down: false,
             fisheye_output_mode: FisheyeOutputMode::HalfEquirect,
             lift: 0.0,
             gamma: 1.0,
@@ -300,6 +320,14 @@ pub(crate) fn load_lut_cached(lut_path: &str) -> Option<vr180_core::Cube3DLut> {
 }
 
 impl Settings {
+    /// The L↔R eye swap that should actually be applied: the manual
+    /// "Swap L↔R" toggle XOR the upside-down mount (flipping the rig
+    /// 180° mirrors the physical eye positions, so upside-down implies
+    /// a swap on top of whatever the user chose).
+    pub fn effective_swap_eyes(&self) -> bool {
+        self.fisheye_swap_eyes ^ self.camera_upside_down
+    }
+
     /// Build a `ColorStackPlan` from the slider state. Returns
     /// identity (`ColorStackPlan::default()`) when no color knob is
     /// active and the LUT path is empty — the pipeline `any_active()`
@@ -393,8 +421,9 @@ impl Settings {
 pub enum FisheyeOutputMode {
     /// Half-equirect VR180 output (default).
     HalfEquirect,
-    /// Stabilized circular-fisheye SBS output (full reprojection — stab,
-    /// panomap, stereo offset, and per-row RS all apply).
+    /// Normalized circular-fisheye SBS output: a canonical 195° EQUIDISTANT
+    /// fisheye (full reprojection — stab, panomap, stereo offset, per-row RS
+    /// all apply; the source lens's own distortion is removed).
     Fisheye,
 }
 
@@ -402,7 +431,7 @@ impl FisheyeOutputMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::HalfEquirect => "Half-equirect (VR180)",
-            Self::Fisheye      => "Fisheye SBS",
+            Self::Fisheye      => "Fisheye SBS (195° equidist.)",
         }
     }
 }
@@ -484,6 +513,9 @@ pub struct EyeCalibSeed {
     pub k: [f32; 4],
     /// 5th KB radial coefficient from the file (OSV field 15); 0 if absent.
     pub k5: f32,
+    /// Brown-Conrady tangential coeffs `[p1, p2]` from the file (field 20);
+    /// `[0,0]` if absent.
+    pub p: [f32; 2],
 }
 
 /// The pair of in-file per-eye calibrations (after the L=lens_b,
@@ -607,7 +639,7 @@ fn run_fisheye(
         let on_vulkan = vr180_pipeline::interop_windows::is_vulkan_backend(&pipeline.device);
         if matches!(kind, vr180_pipeline::SourceKind::DjiOsv) && on_vulkan && has_p010 {
             // XOR with DJI's "swap by default" (matches the CPU worker).
-            let swap = !control.settings.read().fisheye_swap_eyes;
+            let swap = !control.settings.read().effective_swap_eyes();
             let ctx = vr180_pipeline::interop_windows::VulkanImportCtx::from_wgpu(
                 &pipeline.adapter, &pipeline.device,
             );
@@ -675,7 +707,7 @@ fn run_fisheye(
 
     let path_for_worker = cfg.path.clone();
     let kind_for_worker = kind;
-    let initial_swap_eyes = control.settings.read().fisheye_swap_eyes;
+    let initial_swap_eyes = control.settings.read().effective_swap_eyes();
     let initial_trim_in = control.settings.read().trim_in_s;
 
     let _decode_handle = std::thread::spawn(move || -> anyhow::Result<()> {
@@ -825,11 +857,16 @@ fn run_fisheye(
                 k: [lens.k1.unwrap_or(0.0), lens.k2.unwrap_or(0.0),
                     lens.k3.unwrap_or(0.0), lens.k4.unwrap_or(0.0)],
                 k5: lens.k5.unwrap_or(0.0),
+                p: [lens.p1.unwrap_or(0.0), lens.p2.unwrap_or(0.0)],
             }
         };
+        // Per-output-eye seeds — follow the user swap so the Override
+        // panel shows/seeds the calib of the lens actually on that eye.
+        let swapped = control.settings.read().effective_swap_eyes();
+        let (sl, sr) = if swapped { (&imu.lens_a, &imu.lens_b) } else { (&imu.lens_b, &imu.lens_a) };
         *control.detected_calib.lock() = Some(DetectedLensCalib {
-            left:  seed(&imu.lens_b),
-            right: seed(&imu.lens_a),
+            left:  seed(sl),
+            right: seed(sr),
         });
     }
 
@@ -898,10 +935,11 @@ fn run_fisheye(
                         f32::INFINITY
                     };
                     let smooth_ms = s.dji_smooth_ms;
+                    let responsiveness = s.dji_responsiveness;
                     vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
                     drop(s);
                     match vr180_pipeline::dji_imu::compute_dji_stabilization(
-                        osv, total_frames, max_corr_deg, smooth_ms, fps,
+                        osv, total_frames, max_corr_deg, smooth_ms, fps, responsiveness,
                     ) {
                         Ok(stab) => {
                             tracing::info!(
@@ -1313,6 +1351,7 @@ fn run_fisheye(
                 stereo_yaw_deg: s.stereo_yaw_deg,
                 stereo_pitch_deg: s.stereo_pitch_deg,
                 stereo_roll_deg: s.stereo_roll_deg,
+                upside_down: s.camera_upside_down,
             }
         };
         let (rot_left, rot_right) = if view_adjust.is_identity() {
@@ -1577,11 +1616,14 @@ fn run_fisheye_zerocopy(
                 k: [lens.k1.unwrap_or(0.0), lens.k2.unwrap_or(0.0),
                     lens.k3.unwrap_or(0.0), lens.k4.unwrap_or(0.0)],
                 k5: lens.k5.unwrap_or(0.0),
+                p: [lens.p1.unwrap_or(0.0), lens.p2.unwrap_or(0.0)],
             }
         };
+        let swapped = control.settings.read().effective_swap_eyes();
+        let (sl, sr) = if swapped { (&imu.lens_a, &imu.lens_b) } else { (&imu.lens_b, &imu.lens_a) };
         *control.detected_calib.lock() = Some(DetectedLensCalib {
-            left: seed(&imu.lens_b),
-            right: seed(&imu.lens_a),
+            left: seed(sl),
+            right: seed(sr),
         });
     }
 
@@ -1609,10 +1651,11 @@ fn run_fisheye_zerocopy(
         let s = control.settings.read();
         let max_corr_deg = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
         let smooth_ms = s.dji_smooth_ms;
+        let responsiveness = s.dji_responsiveness;
         vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
         drop(s);
         match vr180_pipeline::dji_imu::compute_dji_stabilization(
-            osv, total_frames, max_corr_deg, smooth_ms, fps,
+            osv, total_frames, max_corr_deg, smooth_ms, fps, responsiveness,
         ) {
             Ok(stab) => Some(stab.per_frame),
             Err(e) => { tracing::warn!("zc: dji stab failed: {e}"); None }
@@ -1851,6 +1894,7 @@ fn run_fisheye_zerocopy(
             vr180_pipeline::panomap::ViewAdjust {
                 pano_yaw_deg: s.pano_yaw_deg, pano_pitch_deg: s.pano_pitch_deg, pano_roll_deg: s.pano_roll_deg,
                 stereo_yaw_deg: s.stereo_yaw_deg, stereo_pitch_deg: s.stereo_pitch_deg, stereo_roll_deg: s.stereo_roll_deg,
+                upside_down: s.camera_upside_down,
             }
         };
         let (rot_left, rot_right) = if view_adjust.is_identity() {
@@ -2063,12 +2107,13 @@ pub(crate) fn resolve_fisheye_calib_pair(
 
     // For OSV: per-lens protobuf fx/fy/cx/cy + pure-KB projection. After
     // the DJI iter's default swap: left = Lens B, right = Lens A.
-    match (kind, osv) {
+    let (calib_l, calib_r) = match (kind, osv) {
         (vr180_pipeline::SourceKind::DjiOsv, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
             let eye = |lens: &vr180_fisheye::DjiLensCalib,
-                       ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4], km5: f32|
+                       ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4], km5: f32,
+                       km_p: [f32; 2]|
                 -> vr180_pipeline::gpu::FisheyeCalib
             {
                 let (fx, fy, cx, cy, k, k5) = if ov {
@@ -2114,19 +2159,28 @@ pub(crate) fn resolve_fisheye_calib_pair(
                     fx, fy, cx, cy, k, src_w as f32, src_h as f32,
                 );
                 calib.k5 = k5;
-                // Brown-Conrady tangential from the file (field 20). Auto
-                // loads it per-lens; override has no manual p yet → 0.
-                calib.p1 = if ov { 0.0 } else { lens.p1.unwrap_or(0.0) };
-                calib.p2 = if ov { 0.0 } else { lens.p2.unwrap_or(0.0) };
+                // Brown-Conrady tangential (field 20). Auto loads it per-lens
+                // from the file; override uses the manual [p1, p2] (km_p),
+                // seeded from the file so toggling override doesn't drop it.
+                calib.p1 = if ov { km_p[0] } else { lens.p1.unwrap_or(0.0) };
+                calib.p2 = if ov { km_p[1] } else { lens.p2.unwrap_or(0.0) };
                 calib
             };
+            // The factory calib must follow the STREAM, not the output
+            // slot: with the user swap on, the left output carries Lens A,
+            // so it must be dewarped with Lens A's calib (and vice versa).
+            let (lens_l, lens_r) = if s.effective_swap_eyes() {
+                (&imu.lens_a, &imu.lens_b)
+            } else {
+                (&imu.lens_b, &imu.lens_a)
+            };
             (
-                eye(&imu.lens_b, s.fisheye_override_left, s.fisheye_fov_deg_left,
+                eye(lens_l, s.fisheye_override_left, s.fisheye_fov_deg_left,
                     s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left,
-                    s.fisheye_k5_left),
-                eye(&imu.lens_a, s.fisheye_override_right, s.fisheye_fov_deg_right,
+                    s.fisheye_k5_left, s.fisheye_p_left),
+                eye(lens_r, s.fisheye_override_right, s.fisheye_fov_deg_right,
                     s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right,
-                    s.fisheye_k5_right),
+                    s.fisheye_k5_right, s.fisheye_p_right),
             )
         }
         _ => {
@@ -2153,6 +2207,16 @@ pub(crate) fn resolve_fisheye_calib_pair(
                     s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right),
             )
         }
+    };
+
+    // Equidistant FISHEYE output target: set the output half-FOV so the
+    // fisheye shaders map the inscribed circle to a clean normalized
+    // fisheye (matches the export path). Equirect keeps the default 90°.
+    if matches!(s.fisheye_output_mode, FisheyeOutputMode::Fisheye) {
+        let hfov = (vr180_pipeline::fisheye_export::FISHEYE_OUT_FULL_FOV_DEG * 0.5).to_radians();
+        (calib_l.with_output_hfov(hfov), calib_r.with_output_hfov(hfov))
+    } else {
+        (calib_l, calib_r)
     }
 }
 
@@ -2825,6 +2889,7 @@ fn stab_key(s: &Settings) -> u64 {
     h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_smooth_ms.to_bits() as u64);
     h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_max_corr_deg.to_bits() as u64);
     h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_imu_phase_ms.to_bits() as u64);
+    h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_responsiveness.to_bits() as u64);
     h
 }
 
@@ -2842,7 +2907,8 @@ fn compute_stab_for(
         vr180_pipeline::SourceKind::DjiOsv => imu.and_then(|osv| {
             let max_corr = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
             vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
-            vr180_pipeline::dji_imu::compute_dji_stabilization(osv, total, max_corr, s.dji_smooth_ms, fps)
+            vr180_pipeline::dji_imu::compute_dji_stabilization(
+                osv, total, max_corr, s.dji_smooth_ms, fps, s.dji_responsiveness)
                 .ok().map(|st| st.per_frame)
         }),
         vr180_pipeline::SourceKind::BlackmagicRaw =>
@@ -2894,6 +2960,7 @@ fn render_still_from_pair(
     let view_adjust = vr180_pipeline::panomap::ViewAdjust {
         pano_yaw_deg: s.pano_yaw_deg, pano_pitch_deg: s.pano_pitch_deg, pano_roll_deg: s.pano_roll_deg,
         stereo_yaw_deg: s.stereo_yaw_deg, stereo_pitch_deg: s.stereo_pitch_deg, stereo_roll_deg: s.stereo_roll_deg,
+        upside_down: s.camera_upside_down,
     };
     let (rot_left, rot_right) = if view_adjust.is_identity() { (rot, rot) } else {
         let (vl, vr) = view_adjust.per_eye_matrices();

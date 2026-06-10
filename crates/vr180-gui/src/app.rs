@@ -37,6 +37,10 @@ pub struct App {
 
     // ─── User-visible state ──────────────────────────────────────
     loaded_path: Option<PathBuf>,
+    /// Last (swap, upside_down) pair the decoder was opened with —
+    /// a change triggers an automatic clip reload (the dual-stream
+    /// iterators bind eye order at open).
+    eye_orientation_applied: (bool, bool),
     clip: Option<ClipInfo>,
     /// Playing means the decoder thread is alive AND not paused.
     /// Paused-but-not-stopped (decoder thread parked) is `playing=false`
@@ -115,6 +119,10 @@ pub struct App {
     /// throughout and the heavy render fires just once on settle.
     detail_last_key: u64,
     detail_key_changed_at: std::time::Instant,
+    /// When the native still was last actually rendered — throttles the
+    /// same-frame (slider-drag) re-render so the UI thread doesn't pay a
+    /// full-res render per pointer event.
+    full_res_rendered_at: std::time::Instant,
     /// Native-res still renderer (synchronous, main-thread). Created on
     /// entering detail mode (paused + zoomed on a fisheye clip), dropped on
     /// leaving. Caches the decoded native frame so alignment tweaks only
@@ -130,6 +138,24 @@ pub struct App {
 /// Codec choice for the export pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportCodec { H265, ProRes }
+
+/// Output resolution target for the export. `Native` renders at the
+/// source's per-eye dimensions (OSV: 3840² per eye → 7680×3840 SBS).
+/// `R8k` renders the PROJECTION at 4096² per eye → 8192×4096 SBS —
+/// the projection kernel samples the native-res source directly into
+/// the 4096 grid (one resample, end-to-end at output res; sharpen /
+/// color / encode all run at 4096), NOT a finished-frame upscale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportResolution { Native, R8k }
+
+impl ExportResolution {
+    fn label(self) -> &'static str {
+        match self {
+            ExportResolution::Native => "Native (source)",
+            ExportResolution::R8k    => "8192 × 4096 (8K)",
+        }
+    }
+}
 
 impl ExportCodec {
     fn label(self) -> &'static str {
@@ -167,6 +193,8 @@ impl ProResProfile {
 #[derive(Debug, Clone)]
 struct ExportOptions {
     codec: ExportCodec,
+    /// Output resolution target (Native / 8192×4096).
+    resolution: ExportResolution,
     /// H.265 average bitrate in Mbps. Range 20..=500.
     h265_bitrate_mbps: u32,
     /// 8 or 10 (Main / Main10) for H.265.
@@ -191,6 +219,7 @@ impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             codec: ExportCodec::H265,
+            resolution: ExportResolution::Native,
             h265_bitrate_mbps: 200,
             h265_bit_depth: 10,
             h265_hardware: true,
@@ -325,6 +354,7 @@ impl App {
             egui_renderer: wgpu_state.renderer.clone(),
             preview_view_format,
             loaded_path: None,
+            eye_orientation_applied: (defaults.fisheye_swap_eyes, defaults.camera_upside_down),
             clip: None,
             playing: false,
             decoder_alive: false,
@@ -346,6 +376,7 @@ impl App {
             full_res_display: None,
             full_res_key: 0,
             full_res_desired_key: 0,
+            full_res_rendered_at: std::time::Instant::now(),
             detail_last_key: 0,
             detail_key_changed_at: std::time::Instant::now(),
             detail_cache: None,
@@ -438,6 +469,14 @@ impl App {
         } else {
             (clip.width.max(512), clip.height.max(512))
         };
+        // 8K target: render the projection itself at 4096² per eye
+        // (8192×4096 SBS). The projection samples the native source
+        // directly into the 4096 grid — full resolution end-to-end,
+        // not a last-step upscale.
+        if self.export_opts.resolution == ExportResolution::R8k {
+            eye_w = 4096;
+            eye_h = 4096;
+        }
 
         let projection = match self.settings.fisheye_output_mode {
             crate::decoder::FisheyeOutputMode::HalfEquirect =>
@@ -495,6 +534,7 @@ impl App {
             stabilize: self.settings.stabilize,
             dji_max_corr_deg: self.settings.dji_max_corr_deg,
             dji_smooth_ms: self.settings.dji_smooth_ms,
+            dji_responsiveness: self.settings.dji_responsiveness,
             view_adjust: vr180_pipeline::panomap::ViewAdjust {
                 pano_yaw_deg: self.settings.pano_yaw_deg,
                 pano_pitch_deg: self.settings.pano_pitch_deg,
@@ -502,6 +542,7 @@ impl App {
                 stereo_yaw_deg: self.settings.stereo_yaw_deg,
                 stereo_pitch_deg: self.settings.stereo_pitch_deg,
                 stereo_roll_deg: self.settings.stereo_roll_deg,
+                upside_down: self.settings.camera_upside_down,
             },
             fisheye_preset: self.settings.fisheye_preset.clone(),
             fisheye_override_left: self.settings.fisheye_override_left,
@@ -512,11 +553,14 @@ impl App {
             fisheye_k_right: self.settings.fisheye_k_right,
             fisheye_k5_left: self.settings.fisheye_k5_left,
             fisheye_k5_right: self.settings.fisheye_k5_right,
+            fisheye_p_left: self.settings.fisheye_p_left,
+            fisheye_p_right: self.settings.fisheye_p_right,
             fisheye_cx_norm_left: self.settings.fisheye_cx_norm_left,
             fisheye_cy_norm_left: self.settings.fisheye_cy_norm_left,
             fisheye_cx_norm_right: self.settings.fisheye_cx_norm_right,
             fisheye_cy_norm_right: self.settings.fisheye_cy_norm_right,
-            fisheye_swap_eyes: self.settings.fisheye_swap_eyes,
+            // Effective swap: manual toggle XOR upside-down mount.
+            fisheye_swap_eyes: self.settings.effective_swap_eyes(),
             trim_in_s: self.settings.trim_in_s,
             trim_out_s: self.settings.trim_out_s,
             color_stack,
@@ -640,7 +684,7 @@ impl App {
         // when a frame finishes decoding so the still appears promptly.
         if self.detail_cache.is_none() {
             self.detail_cache = Some(crate::decoder::DetailCache::new(
-                path, kind, fps, self.settings.fisheye_swap_eyes, ctx.clone()));
+                path, kind, fps, self.settings.effective_swap_eyes(), ctx.clone()));
             self.full_res_key = 0;
             self.full_res_desired_key = 0;
             self.detail_last_key = 0;
@@ -698,6 +742,23 @@ impl App {
             return;
         }
 
+        // Throttle the same-frame (slider-drag) re-render. It runs
+        // synchronously on the UI thread at NATIVE res (project + RS quats +
+        // compose), so doing it for every pointer event made the sliders feel
+        // laggy — each drag tick paid a full-res render. ~8 Hz keeps the
+        // still visibly tracking the drag while the slider stays fluid; the
+        // trailing poll (key still != full_res_key once the interval elapses)
+        // renders the FINAL value, so nothing is ever lost.
+        const DRAG_RENDER_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(120);
+        if same_frame && self.full_res_key != 0 {
+            let since = self.full_res_rendered_at.elapsed();
+            if since < DRAG_RENDER_INTERVAL {
+                ctx.request_repaint_after(DRAG_RENDER_INTERVAL - since);
+                return;
+            }
+        }
+
         // Settled. `render` now does the GPU project + compose on this thread
         // (~10 ms) IF the native frame is already decoded; otherwise it kicks
         // the background decode and returns None (cheap). So calling it every
@@ -741,6 +802,7 @@ impl App {
                 frame_idx: 0, timestamp_s: ts,
             });
             self.full_res_key = key;
+            self.full_res_rendered_at = std::time::Instant::now();
         }
     }
 
@@ -1236,6 +1298,7 @@ impl App {
             self.settings.fisheye_cy_norm_left = d.left.cy_norm;
             self.settings.fisheye_k_left = d.left.k;
             self.settings.fisheye_k5_left = d.left.k5;
+            self.settings.fisheye_p_left = d.left.p;
         }
         if self.settings.fisheye_override_right {
             self.settings.fisheye_fov_deg_right = d.right.fov_deg;
@@ -1243,6 +1306,7 @@ impl App {
             self.settings.fisheye_cy_norm_right = d.right.cy_norm;
             self.settings.fisheye_k_right = d.right.k;
             self.settings.fisheye_k5_right = d.right.k5;
+            self.settings.fisheye_p_right = d.right.p;
         }
     }
 
@@ -1295,6 +1359,18 @@ impl App {
             .open(&mut open)
             .show(ctx, |ui| {
                 let opts = &mut self.export_opts;
+                ui.label(RichText::new("Resolution").strong());
+                egui::ComboBox::from_id_source("export_resolution")
+                    .selected_text(opts.resolution.label())
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut opts.resolution,
+                            ExportResolution::Native, ExportResolution::Native.label());
+                        ui.selectable_value(&mut opts.resolution,
+                            ExportResolution::R8k, ExportResolution::R8k.label());
+                    });
+                ui.add_space(8.0);
+
                 ui.label(RichText::new("Codec").strong());
                 egui::ComboBox::from_id_source("export_codec")
                     .selected_text(opts.codec.label())
@@ -1421,6 +1497,20 @@ impl eframe::App for App {
         // arrives (so Override tracks the new clip, not the old one). Runs
         // before maybe_push_settings so the re-seeded values reach the decoder.
         self.maybe_reseed_fisheye_override();
+        // Eye-orientation toggles (Swap L↔R / upside-down) bind at decoder
+        // START (the dual-stream iterators take swap at open), so a live
+        // toggle needs a clip reload to take effect everywhere — decode
+        // order, per-eye calib, detail worker. Detect the change and
+        // reload the current clip automatically.
+        let eye_orient = (self.settings.fisheye_swap_eyes, self.settings.camera_upside_down);
+        if eye_orient != self.eye_orientation_applied {
+            self.eye_orientation_applied = eye_orient;
+            if let Some(p) = self.loaded_path.clone() {
+                tracing::info!("eye orientation changed (swap={}, upside_down={}) — reloading clip",
+                    eye_orient.0, eye_orient.1);
+                self.load_file(p);
+            }
+        }
         // Drain export-job progress + check for completion.
         self.poll_export_job();
         // Drive the full-res still for the zoom magnifier.
@@ -1582,12 +1672,21 @@ impl eframe::App for App {
             .resizable(true)
             .default_width(300.0)
             .min_width(240.0)
+            // Cap so a stale persisted width (or any future content-width
+            // feedback) can never squeeze the preview out of view.
+            .max_width(420.0)
             .show(ctx, |ui| {
               // Scroll the controls vertically so every section stays
               // reachable even when many are expanded / the window is short.
               egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                // Longer slider tracks (egui default is 100). FIXED width —
+                // sizing from available_width() feeds back: wider sliders
+                // grow the panel's content width, which grows the panel,
+                // which widens the sliders… until the preview is squeezed
+                // out. 150 + value box + label fits the 300 default panel.
+                ui.spacing_mut().slider_width = 150.0;
                 ui.add_space(8.0);
                 egui::CollapsingHeader::new(RichText::new("Source").strong())
                     .default_open(true)
@@ -1598,6 +1697,13 @@ impl eframe::App for App {
                 // per-eye FOV / center / KB panel is its own (collapsed)
                 // section. GoPro EAC keeps the existing stab + RS panels.
                 if matches!(kind, Some(k) if k.is_fisheye()) {
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new("View adjustment").strong()
+                    )
+                    .default_open(true)
+                    .show(ui, |ui| { self.draw_view_adjust_panel(ui); });
+
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new(
                         RichText::new("Stabilization").strong()
@@ -1618,13 +1724,6 @@ impl eframe::App for App {
                     )
                     .default_open(false)
                     .show(ui, |ui| { self.draw_fisheye_panel(ui); });
-
-                    ui.add_space(4.0);
-                    egui::CollapsingHeader::new(
-                        RichText::new("View adjustment").strong()
-                    )
-                    .default_open(false)
-                    .show(ui, |ui| { self.draw_view_adjust_panel(ui); });
                 } else {
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new(
@@ -2115,25 +2214,24 @@ impl App {
                 // smooth_ms = 0 → sharp camera-lock (legacy).
                 // smooth_ms > 0 → soft-stab (GoPro-style).
                 ui.add(egui::Slider::new(&mut s.dji_smooth_ms, 0.0..=3000.0)
-                    .text("Smooth (ms)  0 = sharp lock, > 0 = soft-stab"));
+                    .text("Smooth (ms)"));
                 ui.add(egui::Slider::new(&mut s.dji_max_corr_deg, 0.0..=45.0)
-                    .text("Max corr (°)  0 = no cap"));
+                    .text("Max corr (°)"));
+                // Velocity→smoothing response curve (Python "Response").
+                // <1 follows motion early; >1 holds longer, then catches up.
+                ui.add(egui::Slider::new(&mut s.dji_responsiveness, 0.2..=3.0)
+                    .fixed_decimals(1)
+                    .text("Response"));
                 // IMU sample-timing test knob (see dji_imu.rs). Defaults to
                 // SROT/2 (readout midpoint), re-seeded per file and NOT
-                // persisted; DJI's own sample point is ≈8.5 ms. Drag to A/B
-                // against DJI Studio. Feeds stab + rolling-shutter timing.
+                // persisted. Feeds stab + rolling-shutter timing.
                 ui.add(egui::Slider::new(&mut s.dji_imu_phase_ms, 0.0..=17.0)
                     .step_by(0.001)
                     .fixed_decimals(3)
-                    .text("IMU phase (ms after frame-start) · SROT/2 default, DJI≈8.5"));
+                    .text("IMU phase (ms)"));
                 vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
             }
         });
-        ui.label(RichText::new(
-            "Stab toggle is live during playback — first time you flip \
-             it on, gyro extraction runs (~1 s stutter). Sliders apply \
-             live too."
-        ).small().color(Color32::GRAY));
     }
 
     /// Output panel for fisheye sources — projection target + L↔R swap.
@@ -2151,20 +2249,18 @@ impl App {
                 .show_ui(ui, |ui| {
                     use crate::decoder::FisheyeOutputMode as M;
                     ui.selectable_value(&mut s.fisheye_output_mode,
-                        M::HalfEquirect, "Half-equirect (VR180)");
+                        M::HalfEquirect, M::HalfEquirect.as_str());
                     ui.selectable_value(&mut s.fisheye_output_mode,
-                        M::Fisheye, "Fisheye SBS");
+                        M::Fisheye, M::Fisheye.as_str());
                 });
         });
-        ui.label(RichText::new(
-            "Fisheye SBS = stabilized circular fisheye per eye in a 2×side \
-             SBS frame. Stab, panomap, stereo-offset all apply just like \
-             the VR180 mode; per-eye FOV controls output FOV."
-        ).small().color(Color32::GRAY));
 
         if is_osv {
             ui.add_space(4.0);
             ui.checkbox(&mut s.fisheye_swap_eyes, "Swap L↔R eyes");
+            // 180° output rotation + implicit eye swap (flipping the rig
+            // mirrors the eye positions). Toggling reloads the clip.
+            ui.checkbox(&mut s.camera_upside_down, "Upside-down mount (180°)");
         }
     }
 
@@ -2191,7 +2287,9 @@ impl App {
             .unwrap_or(false);
         let s = &mut self.settings;
 
-        // ── Preset dropdown ─────────────────────────────────────
+        // ── Camera preset — hidden for OSV: the .osv file carries the full
+        //    per-lens calibration, so a camera/profile picker is redundant.
+        if !is_osv {
         ui.horizontal(|ui| {
             ui.label("Camera");
             let current = if s.fisheye_preset.is_empty() {
@@ -2216,6 +2314,7 @@ impl App {
                     }
                 });
         });
+        } // hide camera preset for OSV
 
         let preset_default_fov = presets
             .iter().find(|p| p.name == s.fisheye_preset)
@@ -2236,7 +2335,7 @@ impl App {
             &mut s.fisheye_cx_norm_left,
             &mut s.fisheye_cy_norm_left,
             &mut s.fisheye_k_left,
-            &mut s.fisheye_k5_left, is_osv,
+            &mut s.fisheye_k5_left, &mut s.fisheye_p_left, is_osv,
             preset_default_fov, preset_k,
         );
         ui.separator();
@@ -2248,12 +2347,14 @@ impl App {
             &mut s.fisheye_cx_norm_right,
             &mut s.fisheye_cy_norm_right,
             &mut s.fisheye_k_right,
-            &mut s.fisheye_k5_right, is_osv,
+            &mut s.fisheye_k5_right, &mut s.fisheye_p_right, is_osv,
             preset_default_fov, preset_k,
         );
 
         // ── Load Gyroflow lens profile (applies to BOTH eyes; enables
-        //    override on both so the loaded values take effect) ────
+        //    override on both so the loaded values take effect). Hidden for
+        //    OSV — its calibration comes from the file, not a profile. ──
+        if !is_osv {
         ui.add_space(6.0);
         if ui.button("Load Gyroflow lens profile (both eyes)…").clicked() {
             if let Some(path) = rfd::FileDialog::new()
@@ -2286,6 +2387,7 @@ impl App {
                 }
             }
         }
+        } // hide Gyroflow loader for OSV
 
         ui.add_space(6.0);
         ui.label(RichText::new(
@@ -2321,6 +2423,7 @@ fn draw_eye_lens(
     cy_norm: &mut f32,
     k: &mut [f32; 4],
     k5: &mut f32,
+    p: &mut [f32; 2],
     is_osv: bool,
     preset_default_fov: f32,
     preset_k: [f32; 4],
@@ -2347,12 +2450,14 @@ fn draw_eye_lens(
                 *cy_norm = d.cy_norm;
                 *k = d.k;
                 *k5 = d.k5;
+                *p = d.p;
             } else {
                 *fov = if preset_default_fov > 0.0 { preset_default_fov } else { 180.0 };
                 *cx_norm = 0.5;
                 *cy_norm = 0.5;
                 *k = preset_k;
                 *k5 = 0.0;
+                *p = [0.0, 0.0];
             }
         }
 
@@ -2369,7 +2474,9 @@ fn draw_eye_lens(
                 ui.label(RichText::new(format!(
                     "in-file k = [{:.4}, {:.4}, {:.4}, {:.4}]{}",
                     d.k[0], d.k[1], d.k[2], d.k[3],
-                    if is_osv { format!("  k5={:.5}", d.k5) } else { String::new() },
+                    if is_osv {
+                        format!("  k5={:.5}  p=[{:.5}, {:.5}]", d.k5, d.p[0], d.p[1])
+                    } else { String::new() },
                 )).small().color(Color32::GRAY));
             } else {
                 let fov_disp = if preset_default_fov > 0.0 { preset_default_fov } else { 180.0 };
@@ -2413,7 +2520,7 @@ fn draw_eye_lens(
 
         // KB distortion (zoom-scaled fine drag). k5 only for OSV (DJI's
         // 5-coefficient model); other cameras use the 4-coeff KB.
-        let k_title = if is_osv { "KB distortion (k1–k5)" } else { "KB distortion (k1–k4)" };
+        let k_title = "KB parameters";
         ui.collapsing(k_title, |ui| {
             for (i, ki) in k.iter_mut().enumerate() {
                 fine_slider(ui, zoom, ki, -0.5..=0.5, &format!("k{}", i + 1), 6, 1.0, 0.0);
@@ -2422,10 +2529,14 @@ fn draw_eye_lens(
                 // 5th radial coeff (θ¹¹ term). Keeps the projection monotonic
                 // past ~90° out to the full lens FOV.
                 fine_slider(ui, zoom, k5, -0.05..=0.05, "k5", 6, 1.0, 0.0);
+                // Brown-Conrady tangential (decentering) — small but visible at
+                // the rim. Seeded from the file (field 20) when Override engages.
+                fine_slider(ui, zoom, &mut p[0], -0.01..=0.01, "p1 (tangential)", 6, 1.0, 0.0);
+                fine_slider(ui, zoom, &mut p[1], -0.01..=0.01, "p2 (tangential)", 6, 1.0, 0.0);
             }
             if ui.small_button("Reset k to preset").clicked() {
                 *k = preset_k;
-                if is_osv { *k5 = 0.0; }
+                if is_osv { *k5 = 0.0; *p = [0.0, 0.0]; }
             }
         });
     });

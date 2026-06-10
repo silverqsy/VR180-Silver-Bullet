@@ -245,22 +245,28 @@ fn c_imu_to_cam_with_lens_a(lens_a_quat_xyzw: [f32; 4]) -> [[f32; 3]; 3] {
 /// `max_corr_deg` clamps the rotation magnitude per frame (set to
 /// `f32::INFINITY` to disable). The Python default is 10°.
 ///
-/// `smooth_ms` controls a centered (acausal) EMA on the per-frame
-/// reference orientation, in milliseconds. `0.0` disables smoothing
-/// (raw camera quats — twitchy on handheld). The Python implementation
-/// uses bidirectional velocity-dampened NLERP, which is fancier; this
-/// simpler EMA is the obvious upgrade path from "no smoothing at all"
-/// and wires the existing `smooth_ms` GUI slider into something real.
+/// `smooth_ms` selects the stabilization mode. `0.0` = camera-lock to
+/// frame 0 (sharp; hard `max_corr_deg` clamp). `> 0` = soft-stab: the
+/// anchor is a velocity-dampened smoothed camera path (Gyroflow-style,
+/// ported from the Python app's `_smooth_quats_velocity_dampened`) with
+/// `smooth_ms` as the calm-motion time constant and a SOFT elastic
+/// `max_corr_deg` limit applied inside the smoother.
 ///
 /// `fps` is used to scale `smooth_ms` to a frame count for the EMA
 /// time constant. Pass the actual clip frame rate so the time-domain
 /// behaviour of the slider is consistent across cameras.
+///
+/// `responsiveness` shapes the soft-stab velocity→smoothing curve
+/// (Python "Response" slider, 0.2–3.0): < 1 starts following motion
+/// early (anticipatory), 1 = linear, > 1 holds still longer then
+/// catches up (cinematic lag). Ignored when `smooth_ms == 0`.
 pub fn compute_dji_stabilization(
     osv: &DjiOsvImu,
     n_frames: usize,
     max_corr_deg: f32,
     smooth_ms: f32,
     fps: f32,
+    responsiveness: f32,
 ) -> Result<DjiStabResult> {
     let identity_run = || DjiStabResult {
         per_frame: vec![EquirectRotation::IDENTITY; n_frames],
@@ -339,16 +345,22 @@ pub fn compute_dji_stabilization(
     // frame 0; user wants frame 0 itself as the lock anchor instead.
     let q_zero = frame_quats[0];
 
-    // Optional bidirectional EMA smoothing on the per-frame IMU quats.
-    // Only consumed by the `smooth_ms > 0` soft-stab branch below; the
-    // default camera-lock branch reads `q_actual` and `q_zero` directly.
+    // Optional velocity-dampened smoothing on the per-frame IMU quats
+    // (Gyroflow-style; ported from the Python app — see
+    // `smooth_quats_velocity_dampened`). Only consumed by the
+    // `smooth_ms > 0` soft-stab branch below; the default camera-lock
+    // branch reads `q_actual` and `q_zero` directly. The smoother also
+    // applies the SOFT elastic `max_corr_deg` limit itself, so the
+    // soft-stab branch skips the hard clamp (re-clamping at the same
+    // threshold would undo the elastic behaviour and snap again).
     let smoothed_quats: Vec<Quat> = if smooth_ms > 0.0 && fps > 0.0 {
-        let tau_frames = ((smooth_ms / 1000.0) * fps).round() as usize;
-        if tau_frames < 2 {
-            frame_quats.clone()
-        } else {
-            smooth_quats_ema(&frame_quats, tau_frames)
-        }
+        smooth_quats_velocity_dampened(
+            &frame_quats, fps, smooth_ms,
+            /* fast_ms */ 50.0,
+            /* max_velocity (deg/s) */ 200.0,
+            max_corr_deg,
+            responsiveness,
+        )
     } else {
         frame_quats.clone()
     };
@@ -394,7 +406,14 @@ pub fn compute_dji_stabilization(
         // frame TO `q_actual`'s frame, which is what we sample from.
         let q_anchor = if smooth_ms > 0.0 { *q_smoothed } else { q_zero };
         let q_corr = q_actual.conjugate().mul(q_anchor).normalize();
-        let q_corr = clamp_correction(q_corr, max_corr_deg);
+        // Camera-lock: hard clamp (a fixed anchor can drift arbitrarily
+        // far, so an absolute cap is the right tool). Soft-stab: already
+        // soft-limited inside the smoother — don't re-clamp.
+        let q_corr = if smooth_ms > 0.0 {
+            q_corr
+        } else {
+            clamp_correction(q_corr, max_corr_deg)
+        };
         let r_eis = q_corr.to_mat3_row_major();
         let r_final = apply_c_imu_to_cam_with_lens_a(&r_eis, lens_a_quat);
         per_frame.push(EquirectRotation(r_final));
@@ -634,30 +653,95 @@ fn clamp_correction(q: Quat, max_deg: f32) -> Quat {
     qc.normalize()
 }
 
-/// Centered exponential moving average of a quaternion time series.
-/// Two-pass IIR (forward + backward) for zero phase delay. `tau_frames`
-/// is the EMA time constant in frames — larger = more smoothing.
-fn smooth_quats_ema(quats: &[Quat], tau_frames: usize) -> Vec<Quat> {
-    if quats.is_empty() || tau_frames < 2 {
+/// Velocity-dampened bidirectional quaternion smoothing — a port of the
+/// Python app's `_smooth_quats_velocity_dampened` (vr180_gui.py:4407),
+/// itself inspired by Gyroflow's algorithm. Three properties the plain
+/// EMA it replaces lacked, all load-bearing for perceived smoothness:
+///
+/// 1. **Velocity-adaptive time constant.** Calm motion → heavy smoothing
+///    (`smooth_ms`); fast motion → light smoothing (`fast_ms`, follows the
+///    camera). The velocity signal itself is bidirectionally smoothed with
+///    a ~200 ms window, giving LOOK-AHEAD: smoothing relaxes *before* a
+///    fast pan arrives instead of lagging into a huge correction.
+/// 2. **Symmetric two-sided kernel.** Forward and backward passes each run
+///    on the RAW series and are midpoint-slerped — zero phase delay.
+/// 3. **Soft elastic correction limit.** Past `max_corr_deg` the
+///    correction is compressed logarithmically (`soft = limit·(1+ln(a/limit))`)
+///    instead of hard-clamped — no visible "snap" when a pan saturates the
+///    cap and the stabilizer hands the view back to the camera.
+///
+/// `max_corr_deg` ≤ 0 or non-finite disables the limiter (the caller maps
+/// the slider's 0 to `f32::INFINITY`).
+fn smooth_quats_velocity_dampened(
+    quats: &[Quat],
+    fps: f32,
+    smooth_ms: f32,
+    fast_ms: f32,
+    max_velocity_deg_s: f32,
+    max_corr_deg: f32,
+    responsiveness: f32,
+) -> Vec<Quat> {
+    let n = quats.len();
+    if n < 2 || fps <= 0.0 {
         return quats.to_vec();
     }
-    let alpha = 1.0_f32 / (tau_frames as f32);
-    let n = quats.len();
-    let mut fwd: Vec<Quat> = Vec::with_capacity(n);
-    fwd.push(quats[0]);
+    let dt = 1.0 / fps;
+
+    // ── Step 1: per-frame angular velocity (deg/s), then a ±200 ms
+    //    bidirectional EMA so the τ-schedule anticipates motion. ──
+    let mut vel = vec![0.0_f32; n];
     for i in 1..n {
-        let prev = fwd[i - 1];
-        let next = quats[i];
-        fwd.push(prev.slerp(next, alpha));
+        let d = quats[i - 1].dot(quats[i]).abs().min(1.0);
+        vel[i] = (2.0 * d.acos()).to_degrees() / dt;
     }
-    let mut bwd: Vec<Quat> = vec![Quat::IDENTITY; n];
-    bwd[n - 1] = fwd[n - 1];
+    let vel_alpha = (dt / 0.2).min(1.0);
+    for i in 1..n {
+        vel[i] = vel[i - 1] * (1.0 - vel_alpha) + vel[i] * vel_alpha;
+    }
     for i in (0..n - 1).rev() {
-        let prev = bwd[i + 1];
-        let next = fwd[i];
-        bwd[i] = prev.slerp(next, alpha);
+        vel[i] = vel[i + 1] * (1.0 - vel_alpha) + vel[i] * vel_alpha;
     }
-    bwd
+
+    // ── Step 2: bidirectional adaptive exponential smoothing. ──
+    let tau_smooth = smooth_ms / 1000.0;
+    let tau_fast = fast_ms / 1000.0;
+    let resp = responsiveness.max(0.1);
+    let alpha_at = |v: f32| -> f32 {
+        let lin = if max_velocity_deg_s > 0.0 {
+            (v / max_velocity_deg_s).min(1.0)
+        } else {
+            0.0
+        };
+        let ratio = lin.powf(resp);
+        let tau = tau_smooth * (1.0 - ratio) + tau_fast * ratio;
+        (dt / (tau + dt)).min(1.0)
+    };
+    let mut fwd: Vec<Quat> = quats.to_vec();
+    for i in 1..n {
+        fwd[i] = fwd[i - 1].slerp(quats[i], alpha_at(vel[i]));
+    }
+    let mut bwd: Vec<Quat> = quats.to_vec();
+    for i in (0..n - 1).rev() {
+        bwd[i] = bwd[i + 1].slerp(quats[i], alpha_at(vel[i]));
+    }
+    let mut smoothed: Vec<Quat> =
+        (0..n).map(|i| fwd[i].slerp(bwd[i], 0.5)).collect();
+
+    // ── Step 3: soft elastic limit on the smoothed-vs-raw angle (which
+    //    IS the per-frame correction angle, since q_corr = raw⁻¹·smoothed). ──
+    if max_corr_deg > 0.0 && max_corr_deg.is_finite() {
+        let max_rad = max_corr_deg.to_radians();
+        for i in 0..n {
+            let d = quats[i].dot(smoothed[i]).abs().min(1.0);
+            let angle = 2.0 * d.acos();
+            if angle > max_rad {
+                let soft = max_rad * (1.0 + (angle / max_rad).ln());
+                let t = (soft / angle).min(1.0);
+                smoothed[i] = quats[i].slerp(smoothed[i], t);
+            }
+        }
+    }
+    smoothed.into_iter().map(|q| q.normalize()).collect()
 }
 
 /// Per-row rolling-shutter correction quaternions for one video frame.
@@ -1183,7 +1267,7 @@ mod tests {
             lens_a: Default::default(),
             lens_b: Default::default(),
         };
-        let stab = compute_dji_stabilization(&osv, n_frames, 10.0, 0.0, 30.0)
+        let stab = compute_dji_stabilization(&osv, n_frames, 10.0, 0.0, 30.0, 1.0)
             .expect("stab");
         assert_eq!(stab.per_frame.len(), n_frames);
         for (i, rot) in stab.per_frame.iter().enumerate() {
@@ -1290,7 +1374,7 @@ mod tests {
 
         // Compute stab with camera-lock (smooth_ms=0) to match the
         // GUI's OSV path.
-        let stab = compute_dji_stabilization(&osv, n, 60.0, 0.0, 30.0).unwrap();
+        let stab = compute_dji_stabilization(&osv, n, 60.0, 0.0, 30.0, 1.0).unwrap();
 
         // Also pull the raw per-frame mid-HR quat so we can compute
         // "how much did the camera move from frame 0" independently
@@ -1410,7 +1494,7 @@ mod tests {
     #[test]
     fn empty_osv_returns_identity_fallback() {
         let osv = DjiOsvImu::default();
-        let stab = compute_dji_stabilization(&osv, 30, 10.0, 0.0, 30.0).unwrap();
+        let stab = compute_dji_stabilization(&osv, 30, 10.0, 0.0, 30.0, 1.0).unwrap();
         assert_eq!(stab.per_frame.len(), 30);
         for r in &stab.per_frame {
             assert_eq!(r.0, EquirectRotation::IDENTITY.0);
@@ -1477,7 +1561,7 @@ mod tests {
         // Use 1000 ms smoothing — long enough to confirm the smoothing
         // pass doesn't crash on real high-rate camera quat data, but
         // not so long that we suppress all motion.
-        let stab = compute_dji_stabilization(&osv, n_frames, 15.0, 1000.0, 29.97).unwrap();
+        let stab = compute_dji_stabilization(&osv, n_frames, 15.0, 1000.0, 29.97, 1.0).unwrap();
         let mut non_identity = 0usize;
         for r in &stab.per_frame {
             let m = r.0;

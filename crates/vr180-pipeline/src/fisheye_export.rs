@@ -28,16 +28,22 @@ pub enum FisheyeExportProjection {
     /// Standard VR180 — un-warp each fisheye eye through the KB calib
     /// to a half-equirect, then compose SBS.
     HalfEquirect,
-    /// Raw fisheye pass-through — no projection. Each source fisheye
-    /// eye copied straight into the SBS output. Stabilization is
-    /// ignored (a rotation in 3D world space doesn't map cleanly to a
-    /// fisheye pixel transform without resampling).
+    /// Normalized circular fisheye — reproject each eye into a canonical
+    /// EQUIDISTANT fisheye of `FISHEYE_OUT_FULL_FOV_DEG` full FOV, with
+    /// stabilization + per-eye view adjust applied and the source lens's
+    /// own distortion removed. Output is a square per-eye disk → SBS is
+    /// (2·side × side).
     Fisheye,
 }
 
 impl Default for FisheyeExportProjection {
     fn default() -> Self { Self::HalfEquirect }
 }
+
+/// Full FOV (degrees) of the normalized equidistant fisheye output. The
+/// inscribed circle of the square output frame maps to this angle, so the
+/// disk edge sits at `FISHEYE_OUT_FULL_FOV_DEG / 2` from the optical axis.
+pub const FISHEYE_OUT_FULL_FOV_DEG: f32 = 195.0;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,6 +94,9 @@ pub struct FisheyeExportConfig {
     /// per-frame camera-lock (legacy default). Mirrors
     /// `Settings.dji_smooth_ms`.
     pub dji_smooth_ms: f32,
+    /// Soft-stab velocity→smoothing response curve (0.2–3.0, 1 = linear).
+    /// Mirrors `Settings.dji_responsiveness`.
+    pub dji_responsiveness: f32,
     /// Per-eye view adjustment (global pano-map + stereo offset).
     /// `ViewAdjust::IDENTITY` (all zeros) = no-op, composed AFTER
     /// stabilization in the projection step.
@@ -114,6 +123,10 @@ pub struct FisheyeExportConfig {
     /// Per-eye manual k5 override (OSV 5th radial coeff); 0 = none.
     pub fisheye_k5_left: f32,
     pub fisheye_k5_right: f32,
+    /// Per-eye manual Brown-Conrady tangential override `[p1, p2]` (OSV
+    /// field 20); `[0,0]` = none. Mirrors Auto so override keeps the rim.
+    pub fisheye_p_left: [f32; 2],
+    pub fisheye_p_right: [f32; 2],
     /// Normalized [0,1] principal point per eye (used when override on).
     pub fisheye_cx_norm_left: f32,
     pub fisheye_cy_norm_left: f32,
@@ -483,7 +496,7 @@ pub fn export_fisheye(
                         cfg.dji_max_corr_deg
                     } else { f32::INFINITY };
                     crate::dji_imu::compute_dji_stabilization(
-                        osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps,
+                        osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness,
                     ).ok().map(|s| s.per_frame)
                 })
             }
@@ -840,7 +853,7 @@ fn export_fisheye_osv_zerocopy_p010(
                 cfg.dji_max_corr_deg
             } else { f32::INFINITY };
             crate::dji_imu::compute_dji_stabilization(
-                osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps,
+                osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness,
             ).ok().map(|s| s.per_frame)
         })
     } else { None };
@@ -1134,7 +1147,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
                 cfg.dji_max_corr_deg
             } else { f32::INFINITY };
             crate::dji_imu::compute_dji_stabilization(
-                osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps,
+                osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness,
             ).ok().map(|s| s.per_frame)
         })
     } else { None };
@@ -1489,7 +1502,7 @@ fn export_fisheye_osv_gpu_resident(
         dji_osv_imu.as_ref().and_then(|osv| {
             let max_corr = if cfg.dji_max_corr_deg > 0.0 { cfg.dji_max_corr_deg } else { f32::INFINITY };
             crate::dji_imu::compute_dji_stabilization(
-                osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps,
+                osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness,
             ).ok().map(|s| s.per_frame)
         })
     } else { None };
@@ -1759,12 +1772,13 @@ fn resolve_calib_pair(
 
     // For OSV, prefer the per-lens protobuf calibration. After the DJI
     // iter's default swap: left = Lens B, right = Lens A.
-    match (cfg.source_kind, osv) {
+    let (calib_l, calib_r) = match (cfg.source_kind, osv) {
         (SourceKind::DjiOsv, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
             let eye = |lens: &vr180_fisheye::DjiLensCalib,
-                       ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4], km5: f32|
+                       ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4], km5: f32,
+                       km_p: [f32; 2]|
                 -> FisheyeCalib
             {
                 let (fx, fy, cx, cy, k, k5) = if ov {
@@ -1790,17 +1804,27 @@ fn resolve_calib_pair(
                 let mut calib =
                     FisheyeCalib::new_pure_kb(fx, fy, cx, cy, k, src_w as f32, src_h as f32);
                 calib.k5 = k5;
-                calib.p1 = if ov { 0.0 } else { lens.p1.unwrap_or(0.0) };
-                calib.p2 = if ov { 0.0 } else { lens.p2.unwrap_or(0.0) };
+                // Tangential: Auto from file, override uses the manual [p1,p2]
+                // (km_p, GUI-seeded from the file). Must match the preview path.
+                calib.p1 = if ov { km_p[0] } else { lens.p1.unwrap_or(0.0) };
+                calib.p2 = if ov { km_p[1] } else { lens.p2.unwrap_or(0.0) };
                 calib
             };
+            // Calib follows the STREAM: with the user swap on, the left
+            // output carries Lens A → use Lens A's calib (matches the
+            // GUI resolver so export == preview).
+            let (lens_l, lens_r) = if cfg.fisheye_swap_eyes {
+                (&imu.lens_a, &imu.lens_b)
+            } else {
+                (&imu.lens_b, &imu.lens_a)
+            };
             (
-                eye(&imu.lens_b, cfg.fisheye_override_left, cfg.fisheye_fov_deg_left,
+                eye(lens_l, cfg.fisheye_override_left, cfg.fisheye_fov_deg_left,
                     cfg.fisheye_cx_norm_left, cfg.fisheye_cy_norm_left, cfg.fisheye_k_left,
-                    cfg.fisheye_k5_left),
-                eye(&imu.lens_a, cfg.fisheye_override_right, cfg.fisheye_fov_deg_right,
+                    cfg.fisheye_k5_left, cfg.fisheye_p_left),
+                eye(lens_r, cfg.fisheye_override_right, cfg.fisheye_fov_deg_right,
                     cfg.fisheye_cx_norm_right, cfg.fisheye_cy_norm_right, cfg.fisheye_k_right,
-                    cfg.fisheye_k5_right),
+                    cfg.fisheye_k5_right, cfg.fisheye_p_right),
             )
         }
         _ => {
@@ -1822,6 +1846,17 @@ fn resolve_calib_pair(
                     cfg.fisheye_cx_norm_right, cfg.fisheye_cy_norm_right, cfg.fisheye_k_right),
             )
         }
+    };
+
+    // Equidistant FISHEYE output target: set the output half-FOV so the
+    // shaders map the inscribed circle of the square frame to a clean
+    // FISHEYE_OUT_FULL_FOV_DEG fisheye. (The equirect target keeps the
+    // default 90° horizontal half-FOV.)
+    if cfg.projection == FisheyeExportProjection::Fisheye {
+        let hfov = (FISHEYE_OUT_FULL_FOV_DEG * 0.5).to_radians();
+        (calib_l.with_output_hfov(hfov), calib_r.with_output_hfov(hfov))
+    } else {
+        (calib_l, calib_r)
     }
 }
 

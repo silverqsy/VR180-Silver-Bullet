@@ -56,50 +56,30 @@ fn kb_radius(theta: f32) -> f32 {
     if (theta <= cal.theta_trans) { return kb_forward(theta); }
     return kb_cubic_extension(theta);
 }
-// Invert KB: given a source-pixel radius, solve for the ray angle theta
-// via Newton-Raphson. Used by the fisheye-output parametrisation so the
-// OUTPUT uses the source lens's own projection (identity rotation → 1:1).
-fn kb_inverse(r_target: f32) -> f32 {
-    if (r_target <= 0.0) { return 0.0; }
-    var theta = r_target / max(cal.fx, 1.0);   // paraxial seed
-    for (var i = 0; i < 8; i = i + 1) {
-        let f = kb_forward(theta) - r_target;
-        let d = kb_forward_deriv(theta);
-        theta = theta - f / max(d, 1e-4);
-        theta = clamp(theta, 0.0, cal.theta_max);
-    }
-    return theta;
-}
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let out_dim = textureDimensions(out_tex);
     if (gid.x >= out_dim.x || gid.y >= out_dim.y) { return; }
 
-    // Output uses the SOURCE lens's own KB projection (not a synthetic
-    // equidistant one): map this output pixel into source-pixel space,
-    // invert KB to get the ray angle, so an identity rotation reproduces
-    // the source fisheye 1:1 — exactly the original projection and FOV.
-    let scale_x = cal.src_w / f32(out_dim.x);
-    let scale_y = cal.src_h / f32(out_dim.y);
-    // Output is a CENTERED fisheye whose geometric center represents the
-    // lens optical axis. Distances are measured from the output center
-    // (converted to source pixels) and KB-inverted with the source
-    // focal — so the projection + FOV match the source lens. The applied
-    // principal point (cal.cx/cal.cy) is honored via the source sampling
-    // below: it sets WHERE in the source the optical axis sits, so
-    // changing cx/cy shifts the output accordingly.
-    let dx = ((f32(gid.x) + 0.5) - f32(out_dim.x) * 0.5) * scale_x;
-    let dy = (f32(out_dim.y) * 0.5 - (f32(gid.y) + 0.5)) * scale_y;
-    let dyp = dy * (cal.fx / max(cal.fy, 1e-6));
-    let r_out = sqrt(dx * dx + dyp * dyp);
-    if (r_out > cal.r_max) {
+    // NORMALIZED equidistant circular-fisheye output: the inscribed circle
+    // of the (square) output frame maps LINEARLY to ray angle, with the
+    // circle edge at the output half-FOV (cal.output_hfov_rad). A canonical
+    // projection — independent of the source lens's own distortion — so the
+    // result is a standard equidistant fisheye (195° full FOV). The output
+    // is centered on the optical axis; cal.cx/cal.cy locate that axis in the
+    // SOURCE during sampling below, so changing them shifts the source tap.
+    let half = min(f32(out_dim.x), f32(out_dim.y)) * 0.5;
+    let dx = (f32(gid.x) + 0.5) - f32(out_dim.x) * 0.5;
+    let dy = f32(out_dim.y) * 0.5 - (f32(gid.y) + 0.5);
+    let r_norm = sqrt(dx * dx + dy * dy) / max(half, 1.0);
+    if (r_norm > 1.0) {
         textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)),
                      vec4<f32>(0.0, 0.0, 0.0, 1.0));
         return;
     }
-    let phi_out = atan2(dyp, dx);
-    let theta_out = kb_inverse(r_out);
+    let phi_out = atan2(dy, dx);
+    let theta_out = r_norm * cal.output_hfov_rad;   // equidistant: θ = ρ · θ_max
     let s_t = sin(theta_out);
     let c_t = cos(theta_out);
     let dir = vec3<f32>(s_t * cos(phi_out), s_t * sin(phi_out), c_t);
