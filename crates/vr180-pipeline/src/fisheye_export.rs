@@ -111,6 +111,9 @@ pub struct FisheyeExportConfig {
     pub fisheye_fov_deg_right: f32,
     pub fisheye_k_left: [f32; 4],
     pub fisheye_k_right: [f32; 4],
+    /// Per-eye manual k5 override (OSV 5th radial coeff); 0 = none.
+    pub fisheye_k5_left: f32,
+    pub fisheye_k5_right: f32,
     /// Normalized [0,1] principal point per eye (used when override on).
     pub fisheye_cx_norm_left: f32,
     pub fisheye_cy_norm_left: f32,
@@ -1761,19 +1764,19 @@ fn resolve_calib_pair(
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
             let eye = |lens: &vr180_fisheye::DjiLensCalib,
-                       ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4]|
+                       ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4], km5: f32|
                 -> FisheyeCalib
             {
-                let (fx, fy, cx, cy, k) = if ov {
+                let (fx, fy, cx, cy, k, k5) = if ov {
                     let fx = fx_from_fov(fov);
                     let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
-                    (fx, fx, cxn * src_w as f32, cyn * src_h as f32, k)
+                    (fx, fx, cxn * src_w as f32, cyn * src_h as f32, k, km5)
                 } else {
                     // Auto: full per-lens factory calibration from the OSV
-                    // protobuf — fx/fy (→FOV), cx/cy, AND the KB k1–k4. Must
-                    // match the GUI's resolve_fisheye_calib_pair exactly so
-                    // export == preview. k is dimensionless (no scale);
-                    // missing fields fall back to the preset.
+                    // protobuf — fx/fy (→FOV), cx/cy, the KB k1–k4 AND the 5th
+                    // radial coeff k5 (field 15). Must match the GUI's
+                    // resolve_fisheye_calib_pair exactly so export == preview.
+                    // k is dimensionless (no scale); missing → preset / 0.
                     let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
                     let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
                     let fx = lens.fx.map(|v| v * scale_x).unwrap_or(fx_auto);
@@ -1782,15 +1785,22 @@ fn resolve_calib_pair(
                         (Some(a), Some(b), Some(c), Some(d)) => [a, b, c, d],
                         _ => preset_k,
                     };
-                    (fx, fy, cx, cy, k)
+                    (fx, fy, cx, cy, k, lens.k5.unwrap_or(0.0))
                 };
-                FisheyeCalib::new_pure_kb(fx, fy, cx, cy, k, src_w as f32, src_h as f32)
+                let mut calib =
+                    FisheyeCalib::new_pure_kb(fx, fy, cx, cy, k, src_w as f32, src_h as f32);
+                calib.k5 = k5;
+                calib.p1 = if ov { 0.0 } else { lens.p1.unwrap_or(0.0) };
+                calib.p2 = if ov { 0.0 } else { lens.p2.unwrap_or(0.0) };
+                calib
             };
             (
                 eye(&imu.lens_b, cfg.fisheye_override_left, cfg.fisheye_fov_deg_left,
-                    cfg.fisheye_cx_norm_left, cfg.fisheye_cy_norm_left, cfg.fisheye_k_left),
+                    cfg.fisheye_cx_norm_left, cfg.fisheye_cy_norm_left, cfg.fisheye_k_left,
+                    cfg.fisheye_k5_left),
                 eye(&imu.lens_a, cfg.fisheye_override_right, cfg.fisheye_fov_deg_right,
-                    cfg.fisheye_cx_norm_right, cfg.fisheye_cy_norm_right, cfg.fisheye_k_right),
+                    cfg.fisheye_cx_norm_right, cfg.fisheye_cy_norm_right, cfg.fisheye_k_right,
+                    cfg.fisheye_k5_right),
             )
         }
         _ => {

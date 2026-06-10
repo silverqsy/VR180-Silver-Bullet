@@ -120,6 +120,11 @@ pub struct App {
     /// leaving. Caches the decoded native frame so alignment tweaks only
     /// re-project (fast). NOT a background thread — see `DetailCache`.
     detail_cache: Option<crate::decoder::DetailCache>,
+    /// Last in-file calibration we re-seeded the Override fields from. When a
+    /// new clip publishes a different `detected_calib`, any eye currently in
+    /// Override is re-seeded from it (so Override tracks the new clip's
+    /// factory calib instead of the previous clip's stale values).
+    fisheye_last_seeded: Option<crate::decoder::DetectedLensCalib>,
 }
 
 /// Codec choice for the export pipeline.
@@ -344,6 +349,7 @@ impl App {
             detail_last_key: 0,
             detail_key_changed_at: std::time::Instant::now(),
             detail_cache: None,
+            fisheye_last_seeded: None,
         }
     }
 
@@ -504,6 +510,8 @@ impl App {
             fisheye_fov_deg_right: self.settings.fisheye_fov_deg_right,
             fisheye_k_left: self.settings.fisheye_k_left,
             fisheye_k_right: self.settings.fisheye_k_right,
+            fisheye_k5_left: self.settings.fisheye_k5_left,
+            fisheye_k5_right: self.settings.fisheye_k5_right,
             fisheye_cx_norm_left: self.settings.fisheye_cx_norm_left,
             fisheye_cy_norm_left: self.settings.fisheye_cy_norm_left,
             fisheye_cx_norm_right: self.settings.fisheye_cx_norm_right,
@@ -967,6 +975,19 @@ impl App {
             fisheye_eye_w, fisheye_eye_h,
         });
         self.loaded_path = Some(path);
+
+        // Drop the zoom-magnifier cache so it can't serve the PREVIOUS clip's
+        // decoded native frame / still on the first zoom-in into this one.
+        // (poll_full_res only resets these on leaving detail mode, not on a
+        // clip swap while still paused+zoomed.)
+        if let Some(prev) = self.full_res_display.take() {
+            self.egui_renderer.write().free_texture(&prev.egui_id);
+        }
+        self.detail_cache = None;
+        self.full_res_key = 0;
+        self.full_res_desired_key = 0;
+        self.detail_last_key = 0;
+
         // Kick off the decoder in paused state right away so the first
         // frame paints without forcing the user to press Play. The pause
         // loop in the decoder is wired to skip its sleep on the FIRST
@@ -1196,6 +1217,35 @@ impl App {
         self.audio_player = None;
     }
 
+    /// Re-seed the per-eye Override calibration whenever a NEW clip's in-file
+    /// calibration arrives. Without this, loading a different clip while
+    /// Override is on would keep the previous clip's factory values. Only
+    /// re-seeds eyes currently in Override (Override-off eyes read the in-file
+    /// calib directly via the resolver's auto path). The off→on toggle is
+    /// handled separately in `draw_eye_lens`.
+    fn maybe_reseed_fisheye_override(&mut self) {
+        let detected = self.control.as_ref().and_then(|c| *c.detected_calib.lock());
+        if detected == self.fisheye_last_seeded {
+            return; // unchanged (same clip, or both absent) — nothing to do
+        }
+        self.fisheye_last_seeded = detected;
+        let Some(d) = detected else { return; }; // cleared mid-load → wait for next
+        if self.settings.fisheye_override_left {
+            self.settings.fisheye_fov_deg_left = d.left.fov_deg;
+            self.settings.fisheye_cx_norm_left = d.left.cx_norm;
+            self.settings.fisheye_cy_norm_left = d.left.cy_norm;
+            self.settings.fisheye_k_left = d.left.k;
+            self.settings.fisheye_k5_left = d.left.k5;
+        }
+        if self.settings.fisheye_override_right {
+            self.settings.fisheye_fov_deg_right = d.right.fov_deg;
+            self.settings.fisheye_cx_norm_right = d.right.cx_norm;
+            self.settings.fisheye_cy_norm_right = d.right.cy_norm;
+            self.settings.fisheye_k_right = d.right.k;
+            self.settings.fisheye_k5_right = d.right.k5;
+        }
+    }
+
     /// Diff `self.settings` against `last_pushed_settings`; if changed,
     /// push to the shared control and bump the generation counter so
     /// the decoder rebuilds per-eye bundles on its next iteration.
@@ -1367,6 +1417,10 @@ impl eframe::App for App {
         // Drain decoder frames first so the most recent texture is
         // ready by the time we render the central panel.
         self.drain_frames(ctx);
+        // Re-seed Override calib when a new clip's in-file calibration
+        // arrives (so Override tracks the new clip, not the old one). Runs
+        // before maybe_push_settings so the re-seeded values reach the decoder.
+        self.maybe_reseed_fisheye_override();
         // Drain export-job progress + check for completion.
         self.poll_export_job();
         // Drive the full-res still for the zoom magnifier.
@@ -1470,7 +1524,22 @@ impl eframe::App for App {
                                 M::Anaglyph, M::Anaglyph.as_str());
                             ui.selectable_value(&mut self.settings.preview_mode,
                                 M::Overlay50, M::Overlay50.as_str());
+                            ui.selectable_value(&mut self.settings.preview_mode,
+                                M::SingleEye, M::SingleEye.as_str());
                         });
+
+                    // Single-eye: a toggle to switch which eye. Flipping it
+                    // only changes which eye renders — the zoom/pan viewpoint
+                    // is left untouched, so the view stays put.
+                    if self.settings.preview_mode == crate::decoder::PreviewMode::SingleEye {
+                        let eye = if self.settings.preview_eye_right { "Right" } else { "Left" };
+                        if ui.button(format!("Eye: {eye}  ⇄"))
+                            .on_hover_text("Switch eye (keeps zoom/pan)")
+                            .clicked()
+                        {
+                            self.settings.preview_eye_right = !self.settings.preview_eye_right;
+                        }
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(env!("CARGO_PKG_VERSION"))
@@ -2115,6 +2184,11 @@ impl App {
         let detected = self.control.as_ref()
             .and_then(|c| *c.detected_calib.lock());
         let zoom = self.preview_zoom;
+        // k5 (5th radial coeff) only applies to DJI OSV's 5-coefficient
+        // model — gate the override slider on the loaded clip being OSV.
+        let is_osv = self.clip.as_ref()
+            .map(|c| c.source_kind == vr180_pipeline::SourceKind::DjiOsv)
+            .unwrap_or(false);
         let s = &mut self.settings;
 
         // ── Preset dropdown ─────────────────────────────────────
@@ -2162,6 +2236,7 @@ impl App {
             &mut s.fisheye_cx_norm_left,
             &mut s.fisheye_cy_norm_left,
             &mut s.fisheye_k_left,
+            &mut s.fisheye_k5_left, is_osv,
             preset_default_fov, preset_k,
         );
         ui.separator();
@@ -2173,6 +2248,7 @@ impl App {
             &mut s.fisheye_cx_norm_right,
             &mut s.fisheye_cy_norm_right,
             &mut s.fisheye_k_right,
+            &mut s.fisheye_k5_right, is_osv,
             preset_default_fov, preset_k,
         );
 
@@ -2217,6 +2293,7 @@ impl App {
              calibration. Turn Override on for an eye to set its FOV, \
              principal point and distortion by hand."
         ).small().color(Color32::GRAY));
+
     }
 }
 
@@ -2243,6 +2320,8 @@ fn draw_eye_lens(
     cx_norm: &mut f32,
     cy_norm: &mut f32,
     k: &mut [f32; 4],
+    k5: &mut f32,
+    is_osv: bool,
     preset_default_fov: f32,
     preset_k: [f32; 4],
 ) {
@@ -2267,11 +2346,13 @@ fn draw_eye_lens(
                 *cx_norm = d.cx_norm;
                 *cy_norm = d.cy_norm;
                 *k = d.k;
+                *k5 = d.k5;
             } else {
                 *fov = if preset_default_fov > 0.0 { preset_default_fov } else { 180.0 };
                 *cx_norm = 0.5;
                 *cy_norm = 0.5;
                 *k = preset_k;
+                *k5 = 0.0;
             }
         }
 
@@ -2286,8 +2367,9 @@ fn draw_eye_lens(
                     d.fov_deg, d.cx_norm * native_w, d.cy_norm * native_h,
                 )).small().color(Color32::GRAY));
                 ui.label(RichText::new(format!(
-                    "in-file k = [{:.4}, {:.4}, {:.4}, {:.4}]",
+                    "in-file k = [{:.4}, {:.4}, {:.4}, {:.4}]{}",
                     d.k[0], d.k[1], d.k[2], d.k[3],
+                    if is_osv { format!("  k5={:.5}", d.k5) } else { String::new() },
                 )).small().color(Color32::GRAY));
             } else {
                 let fov_disp = if preset_default_fov > 0.0 { preset_default_fov } else { 180.0 };
@@ -2329,13 +2411,21 @@ fn draw_eye_lens(
             *cy_norm = 0.5;
         }
 
-        // KB distortion (zoom-scaled fine drag).
-        ui.collapsing("KB distortion (k1–k4)", |ui| {
+        // KB distortion (zoom-scaled fine drag). k5 only for OSV (DJI's
+        // 5-coefficient model); other cameras use the 4-coeff KB.
+        let k_title = if is_osv { "KB distortion (k1–k5)" } else { "KB distortion (k1–k4)" };
+        ui.collapsing(k_title, |ui| {
             for (i, ki) in k.iter_mut().enumerate() {
                 fine_slider(ui, zoom, ki, -0.5..=0.5, &format!("k{}", i + 1), 6, 1.0, 0.0);
             }
+            if is_osv {
+                // 5th radial coeff (θ¹¹ term). Keeps the projection monotonic
+                // past ~90° out to the full lens FOV.
+                fine_slider(ui, zoom, k5, -0.05..=0.05, "k5", 6, 1.0, 0.0);
+            }
             if ui.small_button("Reset k to preset").clicked() {
                 *k = preset_k;
+                if is_osv { *k5 = 0.0; }
             }
         });
     });

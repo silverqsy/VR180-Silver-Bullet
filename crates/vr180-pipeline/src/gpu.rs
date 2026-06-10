@@ -1716,8 +1716,12 @@ impl EquirectRsParams {
 struct FisheyeCalibUniforms {
     fx: f32, fy: f32, cx: f32, cy: f32,
     k1: f32, k2: f32, k3: f32, k4: f32,
-    theta_trans: f32, theta_max: f32, r_max: f32, _pad0: f32,
+    // k5 = the 5th odd-power KB coefficient (θ¹¹ term); reuses the old
+    // `_pad0` slot so the uniform layout is unchanged. 0 for sources that
+    // only have a 4-coeff model → the new term vanishes (back-compat).
+    theta_trans: f32, theta_max: f32, r_max: f32, k5: f32,
     src_w: f32, src_h: f32, output_hfov_rad: f32, _pad2: f32,
+    p1: f32, p2: f32, _pad3: f32, _pad4: f32,
 }
 
 /// Public per-eye Kannala-Brandt fisheye calibration. Caller builds
@@ -1738,6 +1742,16 @@ pub struct FisheyeCalib {
     pub cy: f32,
     /// KB-4 distortion coefficients (Gyroflow / OpenCV convention).
     pub k: [f32; 4],
+    /// 5th odd-power KB radial coefficient (θ¹¹ term). DJI Studio's lens
+    /// model is 5-coeff: `θ_d = θ + k1θ³ + k2θ⁵ + k3θ⁷ + k4θ⁹ + k5θ¹¹`.
+    /// Loaded from the OSV file (protobuf field 15); k5 keeps the radial
+    /// map monotonic past ~90°. 0 for 4-coeff sources (term vanishes).
+    pub k5: f32,
+    /// Brown-Conrady tangential distortion (OSV field 20). Applied to the
+    /// normalized point after the radial KB: `u += 2·p1·u·v + p2·(r²+2u²)`,
+    /// `v += p1·(r²+2v²) + 2·p2·u·v`. 0 → no tangential (vanishes).
+    pub p1: f32,
+    pub p2: f32,
     /// KB → cubic-Hermite extension boundary (radians).
     pub theta_trans: f32,
     /// Cubic extension upper bound (radians).
@@ -1767,7 +1781,7 @@ impl FisheyeCalib {
         src_w: f32, src_h: f32, r_max: f32,
     ) -> Self {
         Self {
-            fx, fy, cx, cy, k,
+            fx, fy, cx, cy, k, k5: 0.0, p1: 0.0, p2: 0.0,
             theta_trans: 80.0_f32.to_radians(),
             theta_max:   110.0_f32.to_radians(),
             r_max, src_w, src_h,
@@ -1801,7 +1815,7 @@ impl FisheyeCalib {
         // `theta ≤ theta_trans` test always picks KB after clamping.
         let theta_trans = theta_max + 0.1;
         Self {
-            fx, fy, cx, cy, k,
+            fx, fy, cx, cy, k, k5: 0.0, p1: 0.0, p2: 0.0,
             theta_trans,
             theta_max,
             r_max: max_r,
@@ -1828,10 +1842,11 @@ impl FisheyeCalibUniforms {
             theta_trans: c.theta_trans,
             theta_max:   c.theta_max,
             r_max:       c.r_max,
-            _pad0: 0.0,
+            k5: c.k5,
             src_w: c.src_w, src_h: c.src_h,
             output_hfov_rad: c.output_hfov_rad,
             _pad2: 0.0,
+            p1: c.p1, p2: c.p2, _pad3: 0.0, _pad4: 0.0,
         }
     }
 }
@@ -1879,6 +1894,9 @@ pub enum PreviewMode {
     Sbs,
     Anaglyph,
     Overlay50,
+    /// Show one eye full-frame. The shader outputs the LEFT input; the
+    /// caller swaps left/right bindings to pick the physical eye.
+    SingleEye,
 }
 
 impl Default for PreviewMode {
@@ -1891,6 +1909,7 @@ impl PreviewMode {
             PreviewMode::Sbs       => "SBS",
             PreviewMode::Anaglyph  => "Anaglyph (red/cyan)",
             PreviewMode::Overlay50 => "50% overlay",
+            PreviewMode::SingleEye => "Single eye",
         }
     }
     fn shader_code(self) -> u32 {
@@ -1898,6 +1917,7 @@ impl PreviewMode {
             PreviewMode::Sbs       => 0,
             PreviewMode::Anaglyph  => 1,
             PreviewMode::Overlay50 => 2,
+            PreviewMode::SingleEye => 3,
         }
     }
     pub fn output_dims(self, eye_w: u32, eye_h: u32) -> (u32, u32) {

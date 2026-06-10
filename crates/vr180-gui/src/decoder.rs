@@ -117,6 +117,12 @@ pub struct Settings {
     /// Per-eye manual KB-4 distortion coefficients (override on).
     pub fisheye_k_left: [f32; 4],
     pub fisheye_k_right: [f32; 4],
+    /// Per-eye manual override for the 5th KB radial coefficient (k5).
+    /// OSV-only (DJI's 5-coeff model); 0 = none. In Auto mode k5 is loaded
+    /// from the file regardless of this. Serde-defaulted so old settings
+    /// files load fine.
+    pub fisheye_k5_left: f32,
+    pub fisheye_k5_right: f32,
     /// Per-eye principal point, NORMALIZED to [0,1] of the frame
     /// (`cx_norm = cx_px / image_w`). Stored normalized so the same value
     /// is correct at the capped preview resolution and the full export
@@ -161,12 +167,15 @@ pub struct Settings {
     /// LUT blend strength [0..1].
     pub lut_intensity: f32,
 
-    /// Preview composer mode — SBS / anaglyph / 50% overlay.
+    /// Preview composer mode — SBS / anaglyph / 50% overlay / single eye.
     pub preview_mode: PreviewMode,
+    /// In Single-eye mode, which eye to show: false = left, true = right.
+    /// The "switch eye" toggle flips this; the viewpoint (zoom/pan) is kept.
+    pub preview_eye_right: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PreviewMode { Sbs, Anaglyph, Overlay50 }
+pub enum PreviewMode { Sbs, Anaglyph, Overlay50, SingleEye }
 
 impl PreviewMode {
     pub fn as_str(self) -> &'static str {
@@ -174,6 +183,7 @@ impl PreviewMode {
             PreviewMode::Sbs       => "SBS",
             PreviewMode::Anaglyph  => "Anaglyph (red/cyan)",
             PreviewMode::Overlay50 => "50% overlay",
+            PreviewMode::SingleEye => "Single eye",
         }
     }
     pub fn to_pipeline(self) -> vr180_pipeline::gpu::PreviewMode {
@@ -181,6 +191,7 @@ impl PreviewMode {
             PreviewMode::Sbs       => vr180_pipeline::gpu::PreviewMode::Sbs,
             PreviewMode::Anaglyph  => vr180_pipeline::gpu::PreviewMode::Anaglyph,
             PreviewMode::Overlay50 => vr180_pipeline::gpu::PreviewMode::Overlay50,
+            PreviewMode::SingleEye => vr180_pipeline::gpu::PreviewMode::SingleEye,
         }
     }
 }
@@ -217,6 +228,8 @@ impl Default for Settings {
             fisheye_fov_deg_right: 0.0,
             fisheye_k_left: [0.0, 0.0, 0.0, 0.0],
             fisheye_k_right: [0.0, 0.0, 0.0, 0.0],
+            fisheye_k5_left: 0.0,
+            fisheye_k5_right: 0.0,
             fisheye_cx_norm_left: 0.5,
             fisheye_cy_norm_left: 0.5,
             fisheye_cx_norm_right: 0.5,
@@ -234,6 +247,7 @@ impl Default for Settings {
             lut_path: String::new(),
             lut_intensity: 1.0,
             preview_mode: PreviewMode::Sbs,
+            preview_eye_right: false,
         }
     }
 }
@@ -462,17 +476,19 @@ pub struct DecoderControl {
 /// Override controls use: FOV in degrees (in this app's equidistant
 /// `fov ↔ fx` convention, so feeding it back reproduces the same fx),
 /// principal point NORMALIZED to [0,1], and KB k1–k4.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct EyeCalibSeed {
     pub fov_deg: f32,
     pub cx_norm: f32,
     pub cy_norm: f32,
     pub k: [f32; 4],
+    /// 5th KB radial coefficient from the file (OSV field 15); 0 if absent.
+    pub k5: f32,
 }
 
 /// The pair of in-file per-eye calibrations (after the L=lens_b,
 /// R=lens_a eye mapping).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct DetectedLensCalib {
     pub left: EyeCalibSeed,
     pub right: EyeCalibSeed,
@@ -808,6 +824,7 @@ fn run_fisheye(
                 cy_norm: lens.cy.map(|v| v / h).unwrap_or(0.5),
                 k: [lens.k1.unwrap_or(0.0), lens.k2.unwrap_or(0.0),
                     lens.k3.unwrap_or(0.0), lens.k4.unwrap_or(0.0)],
+                k5: lens.k5.unwrap_or(0.0),
             }
         };
         *control.detected_calib.lock() = Some(DetectedLensCalib {
@@ -822,9 +839,9 @@ fn run_fisheye(
         &control.settings.read(), kind, src_w, src_h, dji_osv_imu.as_ref(),
     );
     tracing::info!(
-        "decoder (fisheye): initial calib L fx={:.1}, cx={:.1}, cy={:.1}, k={:?} | R fx={:.1}, cx={:.1}, cy={:.1}, k={:?}",
-        calib_left.fx, calib_left.cx, calib_left.cy, calib_left.k,
-        calib_right.fx, calib_right.cx, calib_right.cy, calib_right.k
+        "decoder (fisheye): initial calib L fx={:.1}, cx={:.1}, cy={:.1}, k={:?}, k5={:.6} | R fx={:.1}, cx={:.1}, cy={:.1}, k={:?}, k5={:.6}",
+        calib_left.fx, calib_left.cx, calib_left.cy, calib_left.k, calib_left.k5,
+        calib_right.fx, calib_right.cx, calib_right.cy, calib_right.k, calib_right.k5
     );
     let _ = presets::presets(); // anchor the import for downstream use
 
@@ -1135,9 +1152,9 @@ fn run_fisheye(
                 };
                 last_stab_key = nk;
             }
-            tracing::debug!(
-                "decoder (fisheye): live calib update gen={}, L.fx={:.1}, R.fx={:.1}",
-                current_gen, calib_left.fx, calib_right.fx
+            tracing::info!(
+                "decoder (fisheye): live calib update gen={}, L.fx={:.1} k5={:.6}, R.fx={:.1} k5={:.6}",
+                current_gen, calib_left.fx, calib_left.k5, calib_right.fx, calib_right.k5
             );
         }
 
@@ -1559,6 +1576,7 @@ fn run_fisheye_zerocopy(
                 cy_norm: lens.cy.map(|v| v / h).unwrap_or(0.5),
                 k: [lens.k1.unwrap_or(0.0), lens.k2.unwrap_or(0.0),
                     lens.k3.unwrap_or(0.0), lens.k4.unwrap_or(0.0)],
+                k5: lens.k5.unwrap_or(0.0),
             }
         };
         *control.detected_calib.lock() = Some(DetectedLensCalib {
@@ -2050,15 +2068,15 @@ pub(crate) fn resolve_fisheye_calib_pair(
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
             let eye = |lens: &vr180_fisheye::DjiLensCalib,
-                       ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4]|
+                       ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4], km5: f32|
                 -> vr180_pipeline::gpu::FisheyeCalib
             {
-                let (fx, fy, cx, cy, k) = if ov {
+                let (fx, fy, cx, cy, k, k5) = if ov {
                     // Manual: fx from FOV, absolute cx/cy from normalized,
-                    // manual k (preset if all-zero).
+                    // manual k1–k4 (preset if all-zero) + manual k5 (km5).
                     let fx = fx_from_fov(fov);
                     let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
-                    (fx, fx, cxn * src_w as f32, cyn * src_h as f32, k)
+                    (fx, fx, cxn * src_w as f32, cyn * src_h as f32, k, km5)
                 } else {
                     // Auto: load the per-lens FACTORY calibration from the
                     // OSV protobuf — principal point (cx/cy), focal length
@@ -2087,17 +2105,28 @@ pub(crate) fn resolve_fisheye_calib_pair(
                         (Some(a), Some(b), Some(c), Some(d)) => [a, b, c, d],
                         _ => preset_k,
                     };
-                    (fx, fy, cx, cy, k)
+                    // k5 (protobuf field 15) — DJI's 5th radial KB coeff.
+                    // Keeps the projection monotonic past ~90° out to the full
+                    // lens FOV. 0 when the file omits it (4-coeff fallback).
+                    (fx, fy, cx, cy, k, lens.k5.unwrap_or(0.0))
                 };
-                vr180_pipeline::gpu::FisheyeCalib::new_pure_kb(
+                let mut calib = vr180_pipeline::gpu::FisheyeCalib::new_pure_kb(
                     fx, fy, cx, cy, k, src_w as f32, src_h as f32,
-                )
+                );
+                calib.k5 = k5;
+                // Brown-Conrady tangential from the file (field 20). Auto
+                // loads it per-lens; override has no manual p yet → 0.
+                calib.p1 = if ov { 0.0 } else { lens.p1.unwrap_or(0.0) };
+                calib.p2 = if ov { 0.0 } else { lens.p2.unwrap_or(0.0) };
+                calib
             };
             (
                 eye(&imu.lens_b, s.fisheye_override_left, s.fisheye_fov_deg_left,
-                    s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left),
+                    s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left,
+                    s.fisheye_k5_left),
                 eye(&imu.lens_a, s.fisheye_override_right, s.fisheye_fov_deg_right,
-                    s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right),
+                    s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right,
+                    s.fisheye_k5_right),
             )
         }
         _ => {
@@ -2560,6 +2589,14 @@ fn compose_with_color_and_mode(
 ) -> anyhow::Result<(wgpu::Texture, u32, u32)> {
     let color_plan = s.build_color_stack();
     let preview_mode = s.preview_mode.to_pipeline();
+    // Single-eye: the compose shader (mode 3) outputs the LEFT input. To show
+    // the RIGHT eye, swap the bindings so the right eye lands in that slot.
+    let (left_tex, right_tex) =
+        if preview_mode == vr180_pipeline::gpu::PreviewMode::SingleEye && s.preview_eye_right {
+            (right_tex, left_tex)
+        } else {
+            (left_tex, right_tex)
+        };
 
     // ── No grade: composite the projection outputs directly. ──
     // This is the hot path for ordinary playback — no per-eye color

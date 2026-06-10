@@ -48,8 +48,9 @@ struct EquirectUniforms {
 struct FisheyeCalibUniforms {
     fx: f32, fy: f32, cx: f32, cy: f32,
     k1: f32, k2: f32, k3: f32, k4: f32,
-    theta_trans: f32, theta_max: f32, r_max: f32, _pad0: f32,
+    theta_trans: f32, theta_max: f32, r_max: f32, k5: f32,
     src_w: f32, src_h: f32, output_hfov_rad: f32, _pad2: f32,
+    p1: f32, p2: f32, _pad3: f32, _pad4: f32,
 }
 @group(0) @binding(5) var<uniform> cal: FisheyeCalibUniforms;
 
@@ -77,7 +78,7 @@ fn yuv_to_rgb_bt709_p010(y: f32, u: f32, v: f32) -> vec3<f32> {
 
 fn kb_forward(theta: f32) -> f32 {
     let t2 = theta * theta;
-    let inner = 1.0 + t2 * (cal.k1 + t2 * (cal.k2 + t2 * (cal.k3 + t2 * cal.k4)));
+    let inner = 1.0 + t2 * (cal.k1 + t2 * (cal.k2 + t2 * (cal.k3 + t2 * (cal.k4 + t2 * cal.k5))));
     return cal.fx * theta * inner;
 }
 fn kb_forward_deriv(theta: f32) -> f32 {
@@ -85,11 +86,13 @@ fn kb_forward_deriv(theta: f32) -> f32 {
     let t4 = t2 * t2;
     let t6 = t4 * t2;
     let t8 = t4 * t4;
+    let t10 = t8 * t2;
     return cal.fx * (1.0
         + 3.0 * cal.k1 * t2
         + 5.0 * cal.k2 * t4
         + 7.0 * cal.k3 * t6
-        + 9.0 * cal.k4 * t8);
+        + 9.0 * cal.k4 * t8
+        + 11.0 * cal.k5 * t10);
 }
 fn kb_cubic_extension(theta: f32) -> f32 {
     let span = cal.theta_max - cal.theta_trans;
@@ -128,8 +131,16 @@ fn project_kb(xn: f32, yn: f32, zn: f32) -> vec2<f32> {
         cos_phi = xn / sin_theta;
         sin_phi = yn / sin_theta;
     }
-    let src_x = cal.cx + r_px * cos_phi;
-    let src_y = cal.cy - r_px * sin_phi * (cal.fy / cal.fx);
+    // Brown-Conrady tangential distortion (p1,p2) — DJI applies this to the
+    // normalized point AFTER the radial KB. p1=p2=0 → identical to before.
+    let theta_d = r_px / cal.fx;          // r_px = fx · θ_d
+    let u0 = theta_d * cos_phi;
+    let v0 = theta_d * sin_phi;
+    let r2 = u0 * u0 + v0 * v0;            // = θ_d²
+    let ut = u0 + 2.0 * cal.p1 * u0 * v0 + cal.p2 * (r2 + 2.0 * u0 * u0);
+    let vt = v0 + cal.p1 * (r2 + 2.0 * v0 * v0) + 2.0 * cal.p2 * u0 * v0;
+    let src_x = cal.cx + cal.fx * ut;
+    let src_y = cal.cy - cal.fy * vt;
     return vec2<f32>(src_x, src_y);
 }
 

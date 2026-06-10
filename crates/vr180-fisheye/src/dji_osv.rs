@@ -50,9 +50,13 @@ use vr180_core::gyro::cori_iori::Quat;
 
 /// Per-lens calibration entry from the OSV protobuf.
 ///
-/// Field map (from `vr180_gui.py:301-307`):
-/// `1=fx 2=fy 3=cx 4=cy 5=k1 6=k2 7=k3 8=k4 10=width 11=height
-///  12=yaw_offset 13=half_fov 14=pitch_offset 15=roll_offset`.
+/// Field map (verified against DJI Studio's runtime `Intrinsic` via lldb
+/// capture during an export — corrects the old `vr180_gui.py:301-307` guess):
+/// `1=fx 2=fy 3=cx 4=cy  5=k1 6=k2 7=k3 8=k4  10=width 11=height
+///  15=k5  20=[p1,p2](tangential)  21=mount_quat(x,y,z,w)`.
+/// f12/13/14 (yaw/nominal-fov/pitch) are stored but DJI's renderer ignores
+/// them; the mount comes from the f21 quaternion. f15 is the 5th radial
+/// KB coefficient (NOT roll_offset as previously assumed).
 #[derive(Debug, Clone, Default)]
 pub struct DjiLensCalib {
     pub fx: Option<f32>,
@@ -68,11 +72,25 @@ pub struct DjiLensCalib {
     pub yaw_offset: Option<f32>,
     pub half_fov: Option<f32>,
     pub pitch_offset: Option<f32>,
-    pub roll_offset: Option<f32>,
+    /// 5th Kannala-Brandt radial coefficient — protobuf **field 15**.
+    /// DJI's lens model is a 5-coefficient odd-power KB:
+    /// `θ_d = θ + k1·θ³ + k2·θ⁵ + k3·θ⁷ + k4·θ⁹ + k5·θ¹¹`. The k5 term is
+    /// what keeps the projection monotonic past ~90° out to the full
+    /// ~105° lens FOV. Verified by lldb-capturing DJI Studio's runtime
+    /// `Intrinsic` during export (it read field 15 as the 5th radial
+    /// coeff — this field was previously mislabeled "roll_offset").
+    pub k5: Option<f32>,
+    /// Brown-Conrady tangential distortion `(p1, p2)` — protobuf **field
+    /// 20** (2×f32). Tiny (~1e-4) but part of DJI's exact model:
+    /// `u' = u + 2·p1·u·v + p2·(r²+2u²)`, `v' = v + p1·(r²+2v²) + 2·p2·u·v`.
+    pub p1: Option<f32>,
+    pub p2: Option<f32>,
     /// Factory IMU-mount quaternion `(x, y, z, w)` — at protobuf field
     /// 21. Differs per camera unit by up to ~0.5°. We previously
     /// hardcoded the value from one test clip, which left a small
     /// rotation error on other cameras; reading per-clip removes that.
+    /// (This quat — NOT fields 12/13/14 — is the orientation DJI's
+    /// renderer actually uses; f12/13/14 are unused metadata.)
     pub mount_quat_xyzw: Option<[f32; 4]>,
 }
 
@@ -315,6 +333,17 @@ fn parse_lens_calib(buf: &[u8]) -> Result<DjiLensCalib> {
             }
             continue;
         }
+        // Field 20 is length-delimited: 2×float32 = 8 bytes for the
+        // Brown-Conrady tangential distortion (p1, p2). DJI feeds these
+        // into the projection (verified in the runtime Intrinsic).
+        if f.field_num == 20 && matches!(f.wire, WireType::LengthDelimited) {
+            let bytes = f.bytes(buf);
+            if bytes.len() >= 8 {
+                out.p1 = Some(f32::from_le_bytes(bytes[0..4].try_into().unwrap()));
+                out.p2 = Some(f32::from_le_bytes(bytes[4..8].try_into().unwrap()));
+            }
+            continue;
+        }
         let v: Option<f32> = match f.wire {
             WireType::Fixed32 => Some(f.as_f32(buf)),
             WireType::Fixed64 => Some(f.as_f64(buf) as f32),
@@ -333,10 +362,10 @@ fn parse_lens_calib(buf: &[u8]) -> Result<DjiLensCalib> {
             8  => out.k4 = Some(v),
             10 => out.width  = Some(v),
             11 => out.height = Some(v),
-            12 => out.yaw_offset   = Some(v),
-            13 => out.half_fov     = Some(v),
-            14 => out.pitch_offset = Some(v),
-            15 => out.roll_offset  = Some(v),
+            12 => out.yaw_offset   = Some(v),  // unused metadata
+            13 => out.half_fov     = Some(v),  // unused metadata (nominal FOV°)
+            14 => out.pitch_offset = Some(v),  // unused metadata
+            15 => out.k5 = Some(v),            // 5th KB radial coeff (NOT roll!)
             _ => {}
         }
     }

@@ -5,6 +5,8 @@
 //   mode == 0 (SBS):       output is (2·eye_w × eye_h); left → x<eye_w, right → x≥eye_w
 //   mode == 1 (Anaglyph):  output is (eye_w × eye_h); R = left.R, GB = right.GB
 //   mode == 2 (Overlay):   output is (eye_w × eye_h); 50% blend of left + right
+//   mode == 3 (SingleEye): output is (eye_w × eye_h); the LEFT input verbatim
+//                          (caller swaps left/right to choose which eye)
 //
 // The caller picks output_w / output_h to match the mode so the dispatch
 // covers the whole result. Output format is rgba8unorm — this shader is
@@ -38,6 +40,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             rgba = textureLoad(right_tex, r_coord, 0);
         }
         textureStore(out_tex, coord, rgba);
+        return;
+    }
+
+    if u.mode == 3u {
+        // Single eye: output the left input verbatim. The caller swaps the
+        // left/right bindings to select which physical eye is shown.
+        textureStore(out_tex, coord, textureLoad(left_tex, coord, 0));
         return;
     }
 
