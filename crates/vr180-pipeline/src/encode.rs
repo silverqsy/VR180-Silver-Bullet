@@ -595,8 +595,32 @@ impl H265Encoder {
             match self.encoder.receive_packet(&mut packet) {
                 Ok(()) => {
                     packet.set_stream(self.stream_index);
+                    // Some encoders leave packet timing incomplete and movenc
+                    // is strict about it:
+                    // • dts = NOPTS → default to pts (exact for intra codecs;
+                    //   reorder-capable encoders always set dts themselves).
+                    // • duration = 0 (prores_ks) → movenc sets the LAST
+                    //   sample's stts delta from pkt->duration, so the track
+                    //   duration came up one frame short and the demuxer
+                    //   DROPPED the final frame of every ProRes .mov (no
+                    //   bitstream parser to recover timing, unlike HEVC).
+                    //   Our exports are CFR with pts == frame index, so one
+                    //   tick of the encoder time base (1/fps) is exact.
+                    if packet.dts().is_none() {
+                        packet.set_dts(packet.pts());
+                    }
+                    if packet.duration() == 0 {
+                        packet.set_duration(1);
+                    }
                     let stream_tb = self.octx.stream(self.stream_index).unwrap().time_base();
                     packet.rescale_ts(self.time_base, stream_tb);
+                    tracing::trace!(
+                        pts = packet.pts().unwrap_or(-1),
+                        dts = packet.dts().unwrap_or(-1),
+                        duration = packet.duration(),
+                        size = packet.size(),
+                        "encoder packet → muxer"
+                    );
                     packet.write_interleaved(&mut self.octx)
                         .map_err(|e| Error::Ffmpeg(format!("write packet: {e}")))?;
                 }
