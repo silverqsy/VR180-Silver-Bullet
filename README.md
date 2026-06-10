@@ -1,72 +1,93 @@
 # VR180 Silver Bullet 2.0
 
-A clean-room Rust rewrite of the [VR180 Silver Bullet](../vr180_processor/)
-GoPro Max 2 VR180 mod processor.
+A native, GPU-first VR180 processor for the **DJI Osmo 360** (`.osv`
+dual-fisheye), written in Rust. One self-contained binary per platform —
+no Python, no bundled runtimes. This is the `2.0` clean-room rewrite of
+the Python/PyQt6 [VR180 Silver Bullet](../vr180_processor/) app.
 
-## Why a rewrite
+## What it does
 
-The Python/PyQt6 app shipped on `main` works, but its architecture
-constrains us:
+Load a `.osv` → preview with live controls → export VR180 SBS.
 
-| Pain point in the Python app | Root cause | 2.0 fix |
-|---|---|---|
-| 3 GB Windows install | PyQt6 + Numba + cv2 + av + Python 3.11 | Single ~80 MB native binary |
-| "WinError 2 / cudart in PhysX" | Bundled-binary path detection + Numba CUDA toolkit hunt | `ffmpeg-next` links libav in-process; `wgpu` needs no CUDA toolkit |
-| "could not broadcast (944,1920) → (1008,1920)" | Hardcoded `5952×1920` stream dimensions in 7+ places | `EacDims` struct derived from `ffprobe` once, type-checked everywhere |
-| ~8 fps export with `Decode: FFmpeg (fallback)` | subprocess pipe + Python per-frame overhead | In-process libav + zero-copy GPU = 3–10× faster |
-| MLX / Numba CUDA / Numba CPU dispatch maze | Three GPU stacks, each with edge cases | `wgpu` = one path, runtime-selects Metal / Vulkan / DX12 |
-| SA3D `KeyError`, scipy phantom import | Python loose typing + duck-typed metadata dicts | Rust enums + `?` propagate errors at compile time |
+- **Exact DJI lens dewarp** — loads the per-lens factory calibration from
+  the OSV itself (fx/fy, principal point, 5-coefficient Kannala-Brandt
+  radial + Brown-Conrady tangential — the full model DJI Studio uses,
+  reverse-engineered and bit-matched). Per-eye manual override with
+  file-seeded sliders when you want to hand-tune.
+- **Stabilization from the camera IMU** — camera-lock or velocity-dampened
+  soft-stab (Gyroflow-style: adaptive smoothing that relaxes ahead of fast
+  motion, soft elastic correction limit), plus per-scanline rolling-shutter
+  correction using measured sensor-readout timing (18.301 ms @ 30 fps,
+  16.228 ms @ 50 fps).
+- **Color pipeline, 10-bit end-to-end** — CDL, 3D LUT (DJI D-LogM→Rec.709
+  bundled, autoloaded), white balance, saturation, sharpen, mid-detail;
+  identical stack in preview and export.
+- **Output projections** — half-equirect VR180 SBS (the standard), or a
+  normalized **195° equidistant fisheye** SBS.
+- **Export** — H.265 (VideoToolbox on macOS; GPU-resident NVDEC→wgpu→CUDA→
+  NVENC on Windows, libx265 fallback) or ProRes, at native resolution or
+  8192×4096, with Vision Pro (APMP) or YouTube VR180 metadata injection
+  and OSV stereo-audio passthrough.
+- **Preview niceties** — SBS / anaglyph / 50%-overlay / single-eye view
+  modes, zoom magnifier with native-res still, per-eye view adjustment
+  (pano + stereo offset), upside-down-mount support, audio.
 
-Architecture mirrors [Gyroflow](https://github.com/gyroflow/gyroflow):
-pure-Rust headless core, in-process libav for video I/O
-(`ffmpeg-next 8.1`), `wgpu` for GPU compute. The Mac-native Swift
-helpers (`mvhevc_encode`, `apac_encode`, `vt_denoise`) carry over
-unchanged from the Python app — they're already optimal and the
-Rust pipeline spawns them as external processes.
+Also reads SBS fisheye, Blackmagic `.braw` (VQF 6D stab), and GoPro Max
+`.360` (EAC) as a legacy path.
 
 ## Workspace layout
 
 ```
 crates/
-├── vr180-core/      # pure Rust: gyro/VQF, EAC math, GEOC, color math,
-│                    # project config, GPMF / SA3D / sv3d atom writing
-├── vr180-pipeline/  # ffmpeg-next decode/encode + wgpu kernels +
-│                    # Swift helper spawn glue
-└── vr180-render/    # CLI binary: reads JSON config → renders → exits.
-                     # The existing Python GUI on `main` will eventually
-                     # shell out to this for the heavy work.
+├── vr180-core/      # pure Rust: gyro/quat math, EAC dims, .cube LUT
+│                    # parse, GEOC calib — fully portable
+├── vr180-fisheye/   # camera presets + fisheye calibration (KB model,
+│                    # OSV protobuf parse, Gyroflow profile import)
+├── vr180-pipeline/  # the engine: decode (ffmpeg-next 8.1, in-process),
+│                    # wgpu compute kernels (WGSL), DJI IMU stab + RS,
+│                    # export pipeline, encoders, mp4 atom injection
+├── vr180-gui/       # the product: eframe/egui app (vr180-gui binary)
+└── vr180-render/    # legacy CLI (currently not building; ignore)
 
-apps/                # (reserved) Tauri UI shell — comes after render
-                     # CLI is at parity with the Python export pipeline.
-
-helpers/swift/       # macOS VideoToolbox / AVFoundation helpers
-                     #   mvhevc_encode  — MV-HEVC spatial video encoder
-                     #   vt_denoise     — VTTemporalNoiseFilter
-                     #   apac_encode    — Apple Positional Audio Codec
-                     # Build via helpers/build_swift.sh
+helpers/swift/       # macOS AVFoundation helpers (MV-HEVC spatial video,
+                     # APAC spatial audio, VT denoise) — spawned as
+                     # external processes when used
+docs/                # build + architecture + Windows handoff docs
 ```
 
-## Status
+GPU work is `wgpu` everywhere (Metal / DX12 / Vulkan picked at runtime);
+shaders are WGSL. Video I/O is in-process libav via `ffmpeg-next` — the
+app never shells out to a system `ffmpeg`.
 
-**Phase 0.1 — skeleton.** Workspace compiles, no functionality yet.
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the phased plan and
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design notes.
-
-## Build
-
-See [docs/BUILD.md](docs/BUILD.md) for the FFmpeg / `FFMPEG_DIR`
-prereqs. Once those are in place:
+## Build & run
 
 ```sh
-# Native build
-cargo build --release
-
-# CLI invocation (placeholder for now)
-./target/release/vr180-render --help
-
-# macOS Swift helpers
-./helpers/build_swift.sh
+# macOS
+brew install ffmpeg pkg-config
+cargo build --release -p vr180-gui
+./target/release/vr180-gui
 ```
+
+```pwsh
+# Windows — see docs/WINDOWS_BUILD.md for the full setup
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+$env:FFMPEG_DIR    = "C:\path\to\ffmpeg-7.x-dev"
+cargo build --release -p vr180-gui
+$env:PATH = "$env:FFMPEG_DIR\bin;$env:PATH"; .\target\release\vr180-gui.exe
+```
+
+Build `-p vr180-gui` (not the whole workspace). First build takes a few
+minutes (ffmpeg-sys bindgen); incrementals are seconds.
+
+## Docs
+
+- [CLAUDE.md](CLAUDE.md) — current status + the load-bearing engineering
+  decisions (start here)
+- [docs/WINDOWS_BUILD.md](docs/WINDOWS_BUILD.md) — Windows toolchain setup
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — crate boundaries, GPU
+  pipeline shape
+- [docs/BUILD.md](docs/BUILD.md) — FFmpeg / `FFMPEG_DIR` details
+- [docs/ROADMAP.md](docs/ROADMAP.md) — historical phased plan
 
 ## License
 

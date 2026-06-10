@@ -1,5 +1,14 @@
 # Architecture
 
+> **Note (June 2026):** this is the original design doc — directionally
+> right, dated in specifics. What shipped: the product is the
+> **`vr180-gui`** eframe/egui app (no Tauri shell; `vr180-render` is a
+> non-building legacy CLI), a `crates/vr180-fisheye` crate was added
+> (presets + OSV calib parse), GPU intermediates are **`Rgba16Unorm`**
+> (not Rgba16Float), and the Windows zero-copy paths (NVDEC/D3D11 →
+> Vulkan preview, CUDA→NVENC export) are **shipped**, not planned. For
+> the current state read [CLAUDE.md](../CLAUDE.md).
+
 ## Workspace shape
 
 ```

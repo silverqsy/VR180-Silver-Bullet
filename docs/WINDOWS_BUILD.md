@@ -4,54 +4,33 @@ This is a self-contained guide for building **`vr180-gui`** (the GUI app)
 on a Windows PC. Development happens on macOS; this doc gets a Windows
 machine from a clean checkout to a running `vr180-gui.exe`.
 
-> The app is **cross-platform by design**. macOS-only fast paths
-> (VideoToolbox hardware encode/decode, P010 IOSurface zero-copy, Metal
-> interop) are compiled out on Windows and replaced with portable
-> software fallbacks (`libx265` / `prores_ks` encode, ffmpeg decode,
-> wgpu DX12/Vulkan). So Windows builds and runs the full pipeline — just
-> with software encode/decode instead of Apple hardware blocks.
+> The app is **cross-platform by design**, and Windows has its OWN fast
+> paths now — it is NOT a software-fallback build: NVDEC (d3d11va) decode,
+> a zero-copy D3D11→Vulkan live preview, and a **GPU-resident NVENC H.265
+> export** (NVDEC→wgpu→CUDA→NVENC, no CPU readback; `libx265` fallback).
+> Only the Apple-specific blocks (VideoToolbox, IOSurface/Metal interop,
+> ProRes-VT) are compiled out, replaced by the Windows equivalents.
+
+> **Current state (June 2026):** the Windows build has run before (NVENC
+> export verified on a 4090). Since then a large macOS-developed feature
+> batch landed on `2.0` — exact DJI lens model (k5 + tangential), 195°
+> equidistant fisheye output, velocity-dampened soft-stab, eye-swap /
+> upside-down fixes, 8K export. It's all shared code; see the **Status**
+> section of [CLAUDE.md](../CLAUDE.md) for the verify-on-Windows checklist.
 
 ---
 
-## Step 0 — Get the CURRENT code onto the Windows PC  ⚠️ READ FIRST
+## Step 0 — Get the code
 
-A lot of this project's source is **not yet committed** on the Mac — it
-only exists in the working tree. That includes files the build *requires*:
-
-- `crates/vr180-gui/assets/dji_osmo360_dlogm_to_rec709.cube` (embedded LUT, pulled in by `include_str!`)
-- `crates/vr180-gui/src/audio_player.rs`
-- `crates/vr180-pipeline/src/panomap.rs`, `spherical_inject.rs`
-- 8 WGSL shaders under `crates/vr180-pipeline/src/shaders/` (`compose_preview.wgsl`, `lut3d_16.wgsl`, `cdl_16.wgsl`, `color_grade_16.wgsl`, `fisheye_to_fisheye*.wgsl`, `fisheye_p010_to_fisheye*_16.wgsl`) — all `include_str!`'d by `gpu.rs`
-- plus modifications across `app.rs`, `decoder.rs`, `gpu.rs`, `fisheye_export.rs`, `encode.rs`, `dji_imu.rs`, …
-
-**If you `git clone` the remote as-is, the Windows build will fail** with
-missing-file / unresolved-import errors, because the remote doesn't have
-these files.
-
-### On the Mac, before handing off — commit and push everything:
-
-```sh
-cd /path/to/VR180SilverBulletNeo
-git add -A                       # picks up the untracked assets/shaders/sources
-git status                       # sanity-check: assets/, shaders, *.rs all staged
-git commit -m "Neo: GUI color/LUT/persistence/detail-cache work"
-git push origin 2.0
-```
-
-(`Cargo.lock` is committed too, which is correct for an application — it
-pins the exact dependency versions the Windows build will use.)
-
-### On the Windows PC:
+Everything the build needs is committed on the `2.0` branch (assets,
+shaders, `Cargo.lock` — the lockfile pins the exact dependency versions
+the Windows build will use):
 
 ```pwsh
 git clone https://github.com/silverqsy/VR180-Silver-Bullet.git
 cd VR180-Silver-Bullet
 git checkout 2.0
 ```
-
-> Alternatively, copy the whole working tree to the Windows PC directly
-> (e.g. a zip **excluding** `target/`), which also captures uncommitted
-> work. Git is cleaner and reproducible — prefer it.
 
 ---
 

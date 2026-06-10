@@ -3,30 +3,51 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: Windows build works — now a macOS verification handoff
+## ⚡ Status: macOS feature batch done — Windows build + verify handoff
 
-The Windows native build of `vr180-gui` is **up and running**: it builds,
-plays OSV, and exports H.265 via **NVENC, GPU-resident** (NVDEC→wgpu→CUDA,
-no CPU readback — see "Windows GPU-resident export" below). A round of
-Windows-developed fixes touched **cross-platform display/color/decode code**.
-The macOS machine should rebuild and **verify these on Metal** (they were
-developed against Vulkan and couldn't be checked on macOS):
+(The previous handoff — Windows GPU-resident NVENC export + the egui-0.34
+gamma fix — is **verified on macOS** and landed.) Since then a large batch
+of features was developed and verified **on macOS**; the Windows session
+should pull `2.0`, build, and verify them on DX12/Vulkan + NVENC. All of it
+is cross-platform code (shared Rust + WGSL — the RGBA16 Windows variants are
+format-patched from the same WGSL sources at pipeline creation), so expect
+it to Just Work; the checklist is what to *confirm*, not to port:
 
-1. **Preview gamma — most important.** The egui display-view gamma was
-   corrected for **egui-wgpu 0.34** (see Lesson #2): the preview SBS is now
-   handed to egui with a **plain `Rgba8Unorm` view** on every platform, not
-   an sRGB view. **Verify the macOS preview matches the export** (not too
-   dark, not washed). This very likely *fixes* a latent too-dark preview on
-   macOS that the 0.28→0.34 egui upgrade introduced — the old sRGB-view
-   trick was only correct under 0.28. Do **not** revert it to an sRGB view.
-2. **Export color range.** Both export paths now emit **video-range
-   (limited / `AVCOL_RANGE_MPEG`) Rec.709** (was full-range on the Windows
-   GPU-resident path — a band-aid for the gamma bug, now removed). Verify
-   the macOS VideoToolbox/ProRes export still looks right and matches the
-   (now gamma-correct) preview.
-3. **Fisheye output mode** now previews **and** exports as a fisheye SBS
-   (was half-equirect-only in the zero-copy preview + GPU-resident export).
-   Verify on macOS.
+1. **DJI lens model is now exact** (reverse-engineered from DJI Studio —
+   verified against its export). Auto mode loads the per-lens FACTORY
+   calibration from the OSV protobuf: fx/fy, raw cx/cy (top-left, y-down,
+   NO flip), k1–k4, **k5 (field 15)**, and **Brown-Conrady tangential
+   p1/p2 (field 20)**. All KB shaders run the 5-coeff radial + tangential
+   (zeros ⟹ byte-identical to the old 4-coeff path, so non-OSV sources are
+   unchanged). Verify: load an OSV → dewarp matches DJI Studio.
+2. **Fisheye SBS output is now a normalized 195° equidistant fisheye**
+   (`FISHEYE_OUT_FULL_FOV_DEG` in `fisheye_export.rs`) — the projection is
+   canonical (source-lens distortion removed), disk edge = 97.5° off-axis.
+   Both preview + export, incl. the GPU-resident NVENC path. Was: the
+   source lens's own projection.
+3. **Soft-stab rewritten** — velocity-dampened Gyroflow-style smoothing
+   ported from the Python app (`dji_imu.rs::smooth_quats_velocity_dampened`):
+   velocity-adaptive τ with ±200 ms look-ahead, symmetric fwd/bwd passes,
+   SOFT elastic max-corr limit (no snap). New **Response** slider
+   (0.2–3.0). Camera-lock (`smooth_ms = 0`) keeps the hard clamp. Defaults:
+   smooth 1200 ms, max corr 15°.
+4. **Eye orientation**: "Swap L↔R" now actually applies live (toggling
+   auto-reloads the clip — the dual-stream iterators bind eye order at
+   open), and the per-eye factory calib **follows the stream** (was a bug:
+   swapped view used the wrong lens's calib). New **"Upside-down mount
+   (180°)"** checkbox = exact `roll+180°` in `ViewAdjust` + implicit eye
+   swap (`Settings::effective_swap_eyes()`).
+5. **8K export option** (export dialog → Resolution → 8192×4096): renders
+   the PROJECTION at 4096²/eye (single resample from the native source —
+   not a last-step upscale). Verify NVENC accepts 8192-wide @ Main10 on
+   the target GPU (4090: OK).
+6. **UI/perf**: View-adjustment panel above Stabilization (default-open);
+   "KB parameters" collapsible (k1–k5 + p1/p2 sliders, OSV-gated); Override
+   auto-reseeds from each new clip's in-file calib; camera-preset/Gyroflow
+   pickers hidden for OSV; sidebar slider tracks fixed at 150 px (do NOT
+   size sliders from `available_width()` — feedback loop, panel swallows
+   the preview; panel capped at 420 px); zoomed paused-frame drag re-render
+   throttled to 120 ms (was per pointer event on the UI thread).
 
 Build/run quick-ref (build `-p vr180-gui`, **not** the workspace):
 ```pwsh
@@ -122,6 +143,26 @@ slash string literals); `include_str!`'d shaders + `assets/` are portable.
 - `crates/vr180-fisheye` — camera presets + fisheye calib (Kannala-Brandt).
 - `crates/vr180-render` — legacy CLI (currently doesn't compile; ignore).
 
+## DJI OSV lens model (exact — don't simplify)
+
+Reverse-engineered from DJI Studio's binary and bit-matched at runtime.
+Per-lens calib block in the OSV protobuf (`vr180-fisheye/src/dji_osv.rs`):
+`1=fx 2=fy 3=cx 4=cy 5..8=k1..k4 10=W 11=H 15=k5 20=[p1,p2]
+21=mount_quat`. Projection (in every KB WGSL shader's `project_kb`):
+
+```
+θ_d = θ + k1·θ³ + k2·θ⁵ + k3·θ⁷ + k4·θ⁹ + k5·θ¹¹      # 5-coeff Kannala-Brandt
+u' = u + 2·p1·u·v + p2·(r²+2u²)                        # Brown-Conrady tangential
+v' = v + p1·(r²+2v²) + 2·p2·u·v                        #   (r² = θ_d²)
+src = (cx + fx·u',  cy − fy·v')                        # raw cx/cy, NO flip
+```
+
+k5 keeps the radial map monotonic past ~90° (the 4-coeff poly folds at
+~87–90°); the tangential is small (~2–4 px at the rim) but it's what
+finally matched DJI. Both resolvers (`decoder.rs::resolve_fisheye_calib_pair`
+and `fisheye_export.rs::resolve_calib_pair`) must stay in lockstep — every
+calib change goes in BOTH or preview ≠ export.
+
 ## Color pipeline — match the Python app
 
 The color tools (CDL, 3D LUT, white balance, saturation, sharpen,
@@ -204,10 +245,13 @@ experiment was a band-aid for the preview-gamma bug (Lesson #2) and is gone.
    GOP frames on the HW engine but runs the HW→CPU download + swscale only on
    the **target** frame (≈11 s → ≈0.6 s for a deep seek at 8K). Same
    decode-forward in the live worker's seek.
-4. **OSV gyro timing:** per-frame stab samples the IMU 8.5 ms after
-   frame-start (fps-independent); rolling-shutter uses a 19 ms (30 fps) /
-   16.23 ms (50 fps) readout window centered on it. Verified vs DJI
-   Studio. See `dji_imu.rs`.
+4. **OSV gyro timing:** measured SROT (sensor readout) is **18.301 ms @
+   30 fps / 16.228 ms @ 50 fps** (`dji_osmo_readout_ms_for_fps`). The
+   per-frame stab IMU sample point defaults to **SROT/2 after
+   frame-start** (9.15 / 8.11 ms) and is exposed as the live "IMU phase
+   (ms)" slider — re-seeded to SROT/2 on every clip load, NOT persisted
+   (`#[serde(skip)]`). The rolling-shutter readout window is centered on
+   the same point (coupled, as DJI does). See `dji_imu.rs`.
 5. **Settings persistence** lives in a per-OS config dir (macOS App
    Support / Windows `%APPDATA%` / Linux XDG) — `Settings::config_path`.
    It survives both relaunch and loading a new clip (only trim resets).
