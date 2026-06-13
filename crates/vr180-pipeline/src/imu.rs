@@ -342,6 +342,85 @@ pub fn vqf_cori_equivalent_stream(
     ))
 }
 
+/// Multi-segment VQF: aggregate the raw IMU of all GoPro `.360` segments
+/// into ONE continuous stream and integrate as a single VQF run, then
+/// resample to `n_frames` (the TOTAL across segments). This eliminates
+/// the orientation discontinuity per-segment integration would inject at
+/// every boundary — mirrors Python's `vqf_to_cori_quats_multi_segment`
+/// (each segment's gyro times are shifted by the cumulative video
+/// duration so the merged timeline is continuous). `segments.len() == 1`
+/// is identical to [`vqf_cori_equivalent_stream`].
+pub fn vqf_cori_equivalent_stream_multi(
+    segments: &[std::path::PathBuf],
+    fps: f32,
+    n_frames: usize,
+) -> Result<Vec<Quat>> {
+    use vr180_core::gyro::{
+        vqf,
+        resample::{resample_quats_to_frames_timed, cori_swap_yz, SROT_S},
+    };
+    use crate::decode::probe_video;
+
+    if segments.len() == 1 {
+        return vqf_cori_equivalent_stream(&segments[0], fps, n_frames);
+    }
+
+    let mut gyro_body: Vec<[f32; 3]> = Vec::new();
+    let mut acc_body: Vec<[f32; 3]> = Vec::new();
+    let mut mag_body: Vec<[f32; 3]> = Vec::new();
+    let mut gyro_times: Vec<f32> = Vec::new();
+    let mut all_have_mag = true;
+    let mut time_off = 0.0_f32;
+
+    for seg in segments {
+        let prep = prepare_for_vqf(seg)?;
+        let seg_dur = probe_video(seg).map(|p| p.duration_sec as f32)
+            .unwrap_or_else(|_| prep.gyro_times.last().copied().unwrap_or(0.0));
+        for &t in &prep.gyro_times { gyro_times.push(t + time_off); }
+        gyro_body.extend_from_slice(&prep.gyro_body);
+        acc_body.extend_from_slice(&prep.acc_body);
+        match prep.mag_body {
+            Some(m) => mag_body.extend_from_slice(&m),
+            None => all_have_mag = false,
+        }
+        // Advance by the segment's video duration (matches the decode
+        // chaining's `seg_start_s`), so frame i/fps lands in the right
+        // segment on resample.
+        time_off += seg_dur;
+    }
+    if gyro_body.is_empty() {
+        return Err(Error::Ffmpeg("multi-segment VQF: no gyro samples".into()));
+    }
+
+    // Constant gyro dt over the merged span (Python uses one gyro_dt for
+    // the whole aggregated stream).
+    let span = (gyro_times.last().copied().unwrap_or(0.0)
+        - gyro_times.first().copied().unwrap_or(0.0)).max(1e-6);
+    let gyr_ts = span / (gyro_body.len().saturating_sub(1).max(1) as f32);
+
+    let mag = if all_have_mag && mag_body.len() == gyro_body.len() {
+        Some(mag_body.as_slice())
+    } else {
+        None
+    };
+    tracing::info!(
+        "VQF (multi): {} segments, {} gyro samples spanning {:.2}s, mag={}",
+        segments.len(), gyro_body.len(), span, mag.is_some(),
+    );
+
+    let run = vqf::run(&gyro_body, &acc_body, mag, gyr_ts);
+    let cori_equiv: Vec<Quat> = run.quats.into_iter().map(cori_swap_yz).collect();
+
+    if gyro_times.len() != cori_equiv.len() {
+        use vr180_core::gyro::resample::resample_quats_to_frames;
+        return Ok(resample_quats_to_frames(
+            &cori_equiv, 1.0 / gyr_ts.max(1e-6), fps, n_frames,
+            SROT_S * 0.5, VQF_RESAMPLE_WINDOW_S));
+    }
+    Ok(resample_quats_to_frames_timed(
+        &gyro_times, &cori_equiv, fps, n_frames, SROT_S * 0.5, VQF_RESAMPLE_WINDOW_S))
+}
+
 fn pick_mag_source(
     raw: &RawImu,
     cori_stmps: &[vr180_core::gyro::cori_iori::CoriBlockStmp],

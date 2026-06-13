@@ -504,8 +504,20 @@ impl RsMode {
 
 pub struct DecoderConfig {
     pub path: PathBuf,
+    /// Ordered GoPro segment chain (GS01…, GS02…, …). Single-element
+    /// `[path]` for a lone clip. Played + gyro-aggregated as one.
+    pub segments: Vec<PathBuf>,
     pub settings: Settings,
     pub eye_w: u32,
+}
+
+/// Total decoded-frame count across a segment chain: `Σ round(durᵢ·fps)`.
+/// Single element → the lone clip's frame count.
+pub(crate) fn segments_total_frames(segments: &[PathBuf]) -> usize {
+    segments.iter()
+        .filter_map(|s| vr180_pipeline::decode::probe_video(s).ok())
+        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+        .sum()
 }
 
 /// Commands the UI sends to the decoder.
@@ -614,7 +626,11 @@ pub fn start_decoder(
         .map_err(|e| { tracing::error!("decoder: probe failed: {e}"); e })?;
     let fps = probe.fps.max(1e-3);
     let dt = 1.0 / fps as f64;
-    let total_frames = (probe.duration_sec as f64 * fps as f64).round() as usize;
+    let total_frames = if cfg.segments.len() > 1 {
+        segments_total_frames(&cfg.segments)
+    } else {
+        (probe.duration_sec as f64 * fps as f64).round() as usize
+    };
     tracing::info!("decoder: probed {} × {} @ {:.2} fps, {} frames total",
         probe.width, probe.height, fps, total_frames);
 
@@ -630,7 +646,7 @@ pub fn start_decoder(
     }
 
     let snapshot = control.settings.read().clone();
-    let per_eye = build_per_eye_frames(&cfg.path, &snapshot, fps, total_frames)
+    let per_eye = build_per_eye_frames_multi(&cfg.segments, &snapshot, fps, total_frames)
         .map_err(|e| { tracing::error!("decoder: per-eye frames build failed: {e}"); e })?;
     let stab_key = stab_settings_key(&snapshot);
     let cached_gen = control.settings_generation.load(Ordering::SeqCst);
@@ -2292,7 +2308,7 @@ fn run_zero_copy(
     frame_tx: Sender<DecodedFrame>,
     cmd_rx: Receiver<DecoderCommand>,
 ) -> anyhow::Result<()> {
-    let mut decoder = ZeroCopyStreamPairIter::new(&cfg.path, 0)
+    let mut decoder = vr180_pipeline::decode::SegmentedZeroCopyPairIter::new(&cfg.segments, 0)
         .map_err(|e| { tracing::error!("decoder (zc): iter init failed: {e}"); e })?;
     let dims = decoder.dims();
     tracing::info!("decoder (zc): iter ready, EAC dims tile_w={}, cross_w={}",
@@ -2317,10 +2333,14 @@ fn run_zero_copy(
     let mut force_render_next = false;
     let _ = fps;
 
-    let total_frames = (cfg.path.exists()
-        .then(|| vr180_pipeline::decode::probe_video(&cfg.path).ok())
-        .flatten().map(|p| (p.duration_sec * p.fps as f64).round() as usize)
-        .unwrap_or(0)) as usize;
+    let total_frames = if cfg.segments.len() > 1 {
+        segments_total_frames(&cfg.segments)
+    } else {
+        (cfg.path.exists()
+            .then(|| vr180_pipeline::decode::probe_video(&cfg.path).ok())
+            .flatten().map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+            .unwrap_or(0)) as usize
+    };
 
     // Initial seek to trim_in, if set.
     {
@@ -2413,7 +2433,7 @@ fn run_zero_copy(
                 // re-render. This is what keeps those sliders snappy.
                 cached_gen = current_gen;
             } else {
-                match build_per_eye_frames(&cfg.path, &snapshot, fps, total_frames) {
+                match build_per_eye_frames_multi(&cfg.segments, &snapshot, fps, total_frames) {
                     Ok(new) => {
                         per_eye = new;
                         stab_key = new_key;
@@ -2586,7 +2606,7 @@ fn run_cpu_assemble(
     frame_tx: Sender<DecodedFrame>,
     cmd_rx: Receiver<DecoderCommand>,
 ) -> anyhow::Result<()> {
-    let mut decoder = iter_stream_pairs(&cfg.path, HwDecode::Auto, 0)?;
+    let mut decoder = vr180_pipeline::decode::SegmentedStreamPairIter::new(&cfg.segments, HwDecode::Auto, 0)?;
     let dims = decoder.dims();
     if !dims.is_valid() {
         anyhow::bail!("invalid EAC layout (stream w={})", dims.stream_w);
@@ -2680,7 +2700,7 @@ fn run_cpu_assemble(
             if new_key == stab_key {
                 cached_gen = current_gen; // non-stab change: re-render only
             } else {
-                match build_per_eye_frames(&cfg.path, &snapshot, fps, total_frames) {
+                match build_per_eye_frames_multi(&cfg.segments, &snapshot, fps, total_frames) {
                     Ok(new) => { per_eye = new; stab_key = new_key; cached_gen = current_gen; }
                     Err(e) => tracing::warn!("decoder (cpu): per-eye rebuild failed: {e}"),
                 }
@@ -3271,8 +3291,57 @@ pub(crate) fn stab_settings_key(s: &Settings) -> StabKey {
 /// frame). Empty when neither stabilization nor RS is on.
 /// `pub(crate)` so the EAC export path (`app.rs`) can compute the same
 /// stab the preview uses and hand it to `export_eac`.
+/// Merge per-segment RS ω sources into one continuous `GyroAngvel`,
+/// shifting each segment's sample times by the cumulative video
+/// duration so the per-scanline readout-time lookups stay continuous
+/// across segment boundaries. Returns `None` if no segment yielded
+/// usable gyro (caller falls back to identity RS).
+fn gather_multi_angvel(
+    segments: &[std::path::PathBuf],
+    fps: f32,
+) -> Option<vr180_core::gyro::GyroAngvel> {
+    use vr180_pipeline::decode::{extract_gpmf_stream, probe_video};
+    let mut times: Vec<f32> = Vec::new();
+    let mut raw: Vec<[f32; 3]> = Vec::new();
+    let mut smoothed: Vec<[f32; 3]> = Vec::new();
+    let mut toff = 0.0_f32;
+    for seg in segments {
+        let dur = probe_video(seg).map(|p| p.duration_sec as f32).unwrap_or(0.0);
+        if let Ok(gpmf) = extract_gpmf_stream(seg) {
+            let raw_imu = vr180_core::gyro::parse_raw_imu(&gpmf);
+            let (_, stmps) = vr180_core::gyro::parse_cori_with_stmps(&gpmf);
+            if let Some(av) = vr180_core::gyro::GyroAngvel::build(
+                &raw_imu.gyro, &stmps, fps, dur.max(1e-3),
+            ) {
+                for &t in &av.times { times.push(t + toff); }
+                raw.extend_from_slice(&av.raw);
+                smoothed.extend_from_slice(&av.smoothed);
+            }
+        }
+        toff += dur;
+    }
+    if times.len() < 2 { return None; }
+    Some(vr180_core::gyro::GyroAngvel { times, raw, smoothed })
+}
+
+/// Single-segment entry — used everywhere a lone `.360` is processed.
 pub(crate) fn build_per_eye_frames(
     input: &std::path::Path,
+    s: &Settings,
+    fps: f32,
+    n_frames_video: usize,
+) -> anyhow::Result<Vec<((EquirectRotation, EquirectRsParams), (EquirectRotation, EquirectRsParams))>> {
+    build_per_eye_frames_multi(std::slice::from_ref(&input.to_path_buf()), s, fps, n_frames_video)
+}
+
+/// Multi-segment per-eye stab/RS bundle. `segments` is the ordered
+/// chain (GS01…, GS02…, …); a single-element slice is byte-identical to
+/// the single-file path. For multiple segments the gyro is aggregated
+/// across the whole recording (VQF integrated ONCE, RS ω merged with
+/// cumulative time offsets) so stabilization is continuous across
+/// boundaries — mirrors Python's `concatenate_gyro_data`.
+pub(crate) fn build_per_eye_frames_multi(
+    segments: &[std::path::PathBuf],
     s: &Settings,
     fps: f32,
     n_frames_video: usize,
@@ -3289,10 +3358,24 @@ pub(crate) fn build_per_eye_frames(
         return Ok(Vec::new());
     }
 
+    let input = segments.first()
+        .map(|p| p.as_path())
+        .ok_or_else(|| anyhow::anyhow!("build_per_eye_frames: empty segment list"))?;
+    let is_multi = segments.len() > 1;
+
+    // Segment 0 carries the grav for gravity-alignment (recording start)
+    // and the GEOC calibration; CORI/IORI concatenate across segments.
     let gpmf = extract_gpmf_stream(input)?;
     let mut cori = parse_cori(&gpmf);
-    let iori = parse_iori(&gpmf);
+    let mut iori = parse_iori(&gpmf);
     let raw_imu = parse_raw_imu(&gpmf);
+    if is_multi {
+        for seg in &segments[1..] {
+            let g = extract_gpmf_stream(seg)?;
+            cori.extend(parse_cori(&g));
+            iori.extend(parse_iori(&g));
+        }
+    }
 
     let mut used_vqf = false;
     if s.stabilize {
@@ -3329,9 +3412,13 @@ pub(crate) fn build_per_eye_frames(
             }
         };
         if want_vqf {
-            cori = vr180_pipeline::imu::vqf_cori_equivalent_stream(
-                input, fps, n_frames_video,
-            )?;
+            cori = if is_multi {
+                vr180_pipeline::imu::vqf_cori_equivalent_stream_multi(
+                    segments, fps, n_frames_video)?
+            } else {
+                vr180_pipeline::imu::vqf_cori_equivalent_stream(
+                    input, fps, n_frames_video)?
+            };
             // Re-reference to frame 0 (USER CHOICE, diverges from Python
             // here): camera lock holds the view where the camera pointed
             // at frame 0, instead of Python's world-frame lock (VQF is
@@ -3411,11 +3498,17 @@ pub(crate) fn build_per_eye_frames(
         // old `int(t/dt)` nearest-index sampler drifts ~33 ms over 71 s
         // — the documented Python bug, fixed there the same way).
         // Smoothed (15 ms box) for the single-ω value; RAW for the 32
-        // per-scanline row groups.
-        let (_, cori_stmps) = vr180_core::gyro::parse_cori_with_stmps(&gpmf);
-        let angvel = vr180_core::gyro::GyroAngvel::build(
-            &raw_imu.gyro, &cori_stmps, fps, probe.duration_sec as f32,
-        );
+        // per-scanline row groups. Multi-segment: build each segment's
+        // GyroAngvel and merge with cumulative video-duration offsets so
+        // the readout-time lookups stay continuous across boundaries.
+        let angvel = if is_multi {
+            gather_multi_angvel(segments, fps)
+        } else {
+            let (_, cori_stmps) = vr180_core::gyro::parse_cori_with_stmps(&gpmf);
+            vr180_core::gyro::GyroAngvel::build(
+                &raw_imu.gyro, &cori_stmps, fps, probe.duration_sec as f32,
+            )
+        };
 
         // Per-axis factors in SHADER order [f_ωx(pitch), f_ωy(yaw),
         // f_ωz(roll)] — matches Python's auto-set values exactly:

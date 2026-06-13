@@ -692,6 +692,69 @@ impl ZeroCopyStreamPairIter {
     }
 }
 
+/// Plays an ordered list of GoPro `.360` segments (GS01…, GS02…, …) as
+/// one continuous zero-copy stream. Transparent to the decode loop:
+/// `next_pair` crosses segment boundaries without resetting, and `seek`
+/// maps a global clip time to the right segment + local offset. A
+/// single-element `segments` is a pure passthrough — behaviour is
+/// byte-identical to using `ZeroCopyStreamPairIter` directly.
+#[cfg(target_os = "macos")]
+pub struct SegmentedZeroCopyPairIter {
+    segments: Vec<std::path::PathBuf>,
+    /// Cumulative clip-time start of each segment (seconds).
+    seg_start_s: Vec<f64>,
+    total_dur_s: f64,
+    cur_idx: usize,
+    cur: ZeroCopyStreamPairIter,
+}
+
+#[cfg(target_os = "macos")]
+impl SegmentedZeroCopyPairIter {
+    pub fn new(segments: &[std::path::PathBuf], frame_limit: u32) -> Result<Self> {
+        assert!(!segments.is_empty(), "segments must be non-empty");
+        let mut seg_start_s = Vec::with_capacity(segments.len());
+        let mut acc = 0.0_f64;
+        for seg in segments {
+            seg_start_s.push(acc);
+            acc += probe_video(seg).map(|p| p.duration_sec).unwrap_or(0.0);
+        }
+        let cur = ZeroCopyStreamPairIter::new(&segments[0], frame_limit)?;
+        Ok(Self {
+            segments: segments.to_vec(),
+            seg_start_s, total_dur_s: acc, cur_idx: 0, cur,
+        })
+    }
+
+    pub fn dims(&self) -> vr180_core::eac::Dims { self.cur.dims() }
+
+    /// Total clip duration across all segments (seconds).
+    pub fn total_duration_s(&self) -> f64 { self.total_dur_s }
+
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let t = target_s.clamp(0.0, self.total_dur_s);
+        let idx = self.seg_start_s.iter().rposition(|&s| s <= t).unwrap_or(0);
+        if idx != self.cur_idx {
+            self.cur = ZeroCopyStreamPairIter::new(&self.segments[idx], 0)?;
+            self.cur_idx = idx;
+        }
+        self.cur.seek(t - self.seg_start_s[idx])
+    }
+
+    pub fn next_pair(&mut self, device: &wgpu::Device) -> Result<Option<ZeroCopyStreamPair>> {
+        loop {
+            if let Some(p) = self.cur.next_pair(device)? {
+                return Ok(Some(p));
+            }
+            // Current segment exhausted — advance to the next, if any.
+            if self.cur_idx + 1 >= self.segments.len() {
+                return Ok(None);
+            }
+            self.cur_idx += 1;
+            self.cur = ZeroCopyStreamPairIter::new(&self.segments[self.cur_idx], 0)?;
+        }
+    }
+}
+
 /// Decode the first video frame using VideoToolbox hwaccel and return
 /// it **without** running `av_hwframe_transfer_data`. The frame's
 /// `format == AV_PIX_FMT_VIDEOTOOLBOX` and `data[3]` is the live
@@ -1186,6 +1249,61 @@ impl StreamPairIter {
         };
         self.frames_yielded += 1;
         Ok(Some(StreamPair { s0, s4, dims: self.dims, decode_path: self.decode_path }))
+    }
+}
+
+/// CPU-path counterpart to [`SegmentedZeroCopyPairIter`] — chains GoPro
+/// `.360` segments through `StreamPairIter`. Single-element passthrough.
+pub struct SegmentedStreamPairIter {
+    segments: Vec<std::path::PathBuf>,
+    seg_start_s: Vec<f64>,
+    total_dur_s: f64,
+    hw: HwDecode,
+    cur_idx: usize,
+    cur: StreamPairIter,
+}
+
+impl SegmentedStreamPairIter {
+    pub fn new(segments: &[std::path::PathBuf], hw: HwDecode, frame_limit: u32) -> Result<Self> {
+        assert!(!segments.is_empty(), "segments must be non-empty");
+        let mut seg_start_s = Vec::with_capacity(segments.len());
+        let mut acc = 0.0_f64;
+        for seg in segments {
+            seg_start_s.push(acc);
+            acc += probe_video(seg).map(|p| p.duration_sec).unwrap_or(0.0);
+        }
+        let cur = StreamPairIter::new(&segments[0], hw, frame_limit)?;
+        Ok(Self {
+            segments: segments.to_vec(),
+            seg_start_s, total_dur_s: acc, hw, cur_idx: 0, cur,
+        })
+    }
+
+    pub fn dims(&self) -> vr180_core::eac::Dims { self.cur.dims() }
+    pub fn decode_path(&self) -> DecodePath { self.cur.decode_path() }
+    pub fn total_duration_s(&self) -> f64 { self.total_dur_s }
+
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let t = target_s.clamp(0.0, self.total_dur_s);
+        let idx = self.seg_start_s.iter().rposition(|&s| s <= t).unwrap_or(0);
+        if idx != self.cur_idx {
+            self.cur = StreamPairIter::new(&self.segments[idx], self.hw, 0)?;
+            self.cur_idx = idx;
+        }
+        self.cur.seek(t - self.seg_start_s[idx])
+    }
+
+    pub fn next_pair(&mut self) -> Result<Option<StreamPair>> {
+        loop {
+            if let Some(p) = self.cur.next_pair()? {
+                return Ok(Some(p));
+            }
+            if self.cur_idx + 1 >= self.segments.len() {
+                return Ok(None);
+            }
+            self.cur_idx += 1;
+            self.cur = StreamPairIter::new(&self.segments[self.cur_idx], self.hw, 0)?;
+        }
     }
 }
 

@@ -58,6 +58,10 @@ use crate::fisheye_decode::FisheyePair as _; // satisfy `use` linter when paths 
 #[derive(Debug, Clone)]
 pub struct FisheyeExportConfig {
     pub source_path: PathBuf,
+    /// Ordered GoPro segment chain (GS01…, GS02…). For a lone clip this
+    /// is `[source_path]`. EAC export decodes + gyro-aggregates them as
+    /// one continuous clip; other sources ignore it.
+    pub segments: Vec<PathBuf>,
     pub output_path: PathBuf,
     pub source_kind: SourceKind,
     /// One eye's output dimensions (the SBS file is `2*eye_w × eye_h`).
@@ -948,8 +952,8 @@ pub fn export_eac(
         }
     }
 
-    let mut decoder = crate::decode::iter_stream_pairs(
-        &cfg.source_path, crate::decode::HwDecode::Auto, 0)?;
+    let mut decoder = crate::decode::SegmentedStreamPairIter::new(
+        &cfg.segments, crate::decode::HwDecode::Auto, 0)?;
     let dims = decoder.dims();
     if !dims.is_valid() {
         return Err(Error::Ffmpeg(format!(
@@ -1094,7 +1098,7 @@ fn export_eac_zerocopy_vt(
     use std::sync::atomic::Ordering;
     use crate::gpu::Lens;
 
-    let mut decoder = crate::decode::ZeroCopyStreamPairIter::new(&cfg.source_path, 0)?;
+    let mut decoder = crate::decode::SegmentedZeroCopyPairIter::new(&cfg.segments, 0)?;
     let dims = decoder.dims();
     if !dims.is_valid() {
         return Err(Error::Ffmpeg(format!(

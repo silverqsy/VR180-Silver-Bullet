@@ -642,6 +642,7 @@ impl App {
 
         vr180_pipeline::fisheye_export::FisheyeExportConfig {
             source_path: source_path.to_path_buf(),
+            segments: vr180_core::segments::detect_segments(source_path),
             output_path: output_path.to_path_buf(),
             source_kind,
             eye_w,
@@ -750,10 +751,14 @@ impl App {
             vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(imu_phase_ms);
             if let Some((settings, n_frames)) = eac_stab {
                 // GoPro EAC: compute the same per-eye stab the preview uses,
-                // then run the EAC export. build_per_eye_frames is empty when
-                // stabilization + RS are both off → identity (no stab).
-                let per_eye = crate::decoder::build_per_eye_frames(
-                    &cfg.source_path, &settings, cfg.fps, n_frames,
+                // then run the EAC export. build_per_eye_frames_multi is
+                // empty when stabilization + RS are both off → identity.
+                // Multi-segment: span ALL segments (gyro aggregated as one).
+                let total_n = if cfg.segments.len() > 1 {
+                    crate::decoder::segments_total_frames(&cfg.segments)
+                } else { n_frames };
+                let per_eye = crate::decoder::build_per_eye_frames_multi(
+                    &cfg.segments, &settings, cfg.fps, total_n,
                 ).unwrap_or_default();
                 vr180_pipeline::fisheye_export::export_eac(
                     pipeline, cfg, per_eye,
@@ -1527,8 +1532,15 @@ impl App {
             "spawn_decoder: starting decoder for {} (paused={})",
             path.display(), start_paused
         );
+        // Segment chain (GS01…, GS02…) for the loaded clip — played +
+        // gyro-aggregated as one. Falls back to the lone path.
+        let segments = self.clip.as_ref()
+            .map(|c| c.segments.clone())
+            .filter(|segs| !segs.is_empty())
+            .unwrap_or_else(|| vec![path.clone()]);
         let cfg = DecoderConfig {
             path,
+            segments,
             settings: self.settings.clone(),
             eye_w: self.settings.preview_eye_w,
         };
