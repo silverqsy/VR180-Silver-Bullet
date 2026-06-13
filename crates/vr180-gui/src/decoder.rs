@@ -53,6 +53,11 @@ pub struct Settings {
     pub cori_source: CoriSource,
     pub smooth_ms: f32,
     pub max_corr_deg: f32,
+    /// GoPro soft-stab velocity→smoothing response curve (Python's
+    /// "Responsiveness" slider, 0.2–3.0). < 1 = follows motion early,
+    /// 1 = linear, > 1 = holds longer then catches up. Mirrors the
+    /// OSV panel's Response slider.
+    pub gyro_responsiveness: f32,
     /// DJI OSV stabilization smoothing window. `0.0` = sharp
     /// per-frame camera-lock (legacy default — bit-identical to the
     /// pre-slider build). > 0 lowpasses the per-frame correction
@@ -179,6 +184,14 @@ pub struct Settings {
     /// Saturation. 1.0 = neutral, 0.0 = grayscale, 2.0 = double.
     pub saturation: f32,
     /// Optional 3D LUT file path. Empty string = no LUT.
+    /// Equirect-aware unsharp-mask amount (0 = off, 0.5 subtle, 1 mod,
+    /// 2 strong). Ported from the Python app; applies to every source.
+    pub sharpen_amount: f32,
+    /// Unsharp-mask radius / Gaussian sigma (px). Only used when
+    /// `sharpen_amount > 0`.
+    pub sharpen_radius: f32,
+    /// Mid-detail / clarity (midtone-weighted local contrast). 0 = off.
+    pub mid_detail: f32,
     pub lut_path: String,
     /// LUT blend strength [0..1].
     pub lut_intensity: f32,
@@ -222,6 +235,10 @@ impl Default for Settings {
             // to frame 0 instead.
             smooth_ms: 1000.0,
             max_corr_deg: 15.0,
+            gyro_responsiveness: 1.0,
+            sharpen_amount: 0.0,
+            sharpen_radius: 1.5,
+            mid_detail: 0.0,
             dji_smooth_ms: 1200.0,
             dji_max_corr_deg: 15.0,
             dji_responsiveness: 1.0,
@@ -282,6 +299,16 @@ pub const BUILTIN_OSMO_LUT_PATH: &str = "<builtin:osmo360-dlogm-rec709>";
 /// Friendly name shown in the LUT picker for the builtin.
 pub const BUILTIN_OSMO_LUT_NAME: &str = "DJI Osmo 360 D-LogM→709 (built-in)";
 
+/// The GoPro "Recommended Lut GPLOG" (GP-Log → Rec.709), embedded —
+/// byte-identical to the Python app's bundled `Recommended Lut
+/// GPLOG.cube`, which it auto-applies to `.360` clips.
+pub const BUILTIN_GPLOG_LUT: &str =
+    include_str!("../assets/gopro_gplog_recommended.cube");
+/// Sentinel `lut_path` value for the embedded GoPro GP-Log LUT.
+pub const BUILTIN_GPLOG_LUT_PATH: &str = "<builtin:gopro-gplog-rec709>";
+/// Friendly name shown in the LUT picker for the GoPro builtin.
+pub const BUILTIN_GPLOG_LUT_NAME: &str = "GoPro GP-Log→709 (built-in)";
+
 thread_local! {
     /// Per-thread cache of the most-recently-loaded parsed LUT, keyed by
     /// `lut_path`. `build_color_stack` is called once per preview frame,
@@ -302,6 +329,11 @@ pub(crate) fn load_lut_cached(lut_path: &str) -> Option<vr180_core::Cube3DLut> {
             match vr180_core::Cube3DLut::from_str(BUILTIN_OSMO_LUT) {
                 Ok(l) => Some(l),
                 Err(e) => { tracing::warn!("builtin Osmo LUT parse failed: {e}"); None }
+            }
+        } else if lut_path == BUILTIN_GPLOG_LUT_PATH {
+            match vr180_core::Cube3DLut::from_str(BUILTIN_GPLOG_LUT) {
+                Ok(l) => Some(l),
+                Err(e) => { tracing::warn!("builtin GP-Log LUT parse failed: {e}"); None }
             }
         } else {
             let p = std::path::Path::new(lut_path);
@@ -351,6 +383,15 @@ impl Settings {
                 plan.lut = Some((lut, self.lut_intensity.clamp(0.0, 1.0)));
             }
         }
+        plan.sharpen = vr180_pipeline::gpu::SharpenParams {
+            amount: self.sharpen_amount.max(0.0),
+            sigma: self.sharpen_radius.max(0.1),
+            apply_lat_weight: true, // equirect output (both EAC + OSV)
+        };
+        plan.mid_detail = vr180_pipeline::gpu::MidDetailParams {
+            amount: self.mid_detail.max(0.0),
+            ..Default::default()
+        };
         plan
     }
 
@@ -421,9 +462,11 @@ impl Settings {
 pub enum FisheyeOutputMode {
     /// Half-equirect VR180 output (default).
     HalfEquirect,
-    /// Normalized circular-fisheye SBS output: a canonical 195° EQUIDISTANT
-    /// fisheye (full reprojection — stab, panomap, stereo offset, per-row RS
-    /// all apply; the source lens's own distortion is removed).
+    /// Normalized circular-fisheye SBS output: an EQUIDISTANT fisheye
+    /// at the source lens's captured FOV (195° for the DJI/OSV lens,
+    /// 185° for the GoPro Max `.360`). Full reprojection — stab, panomap,
+    /// stereo offset, per-row RS all apply; the source lens's own
+    /// distortion is removed.
     Fisheye,
 }
 
@@ -431,7 +474,7 @@ impl FisheyeOutputMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::HalfEquirect => "Half-equirect (VR180)",
-            Self::Fisheye      => "Fisheye SBS (195° equidist.)",
+            Self::Fisheye      => "Fisheye SBS (equidist.)",
         }
     }
 }
@@ -589,14 +632,15 @@ pub fn start_decoder(
     let snapshot = control.settings.read().clone();
     let per_eye = build_per_eye_frames(&cfg.path, &snapshot, fps, total_frames)
         .map_err(|e| { tracing::error!("decoder: per-eye frames build failed: {e}"); e })?;
+    let stab_key = stab_settings_key(&snapshot);
     let cached_gen = control.settings_generation.load(Ordering::SeqCst);
     tracing::info!("decoder: per-eye bundles ready ({} entries) gen={}, eye={}×{}",
         per_eye.len(), cached_gen, eye_w, eye_h);
 
     #[cfg(target_os = "macos")]
-    return run_zero_copy(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, cached_gen, frame_tx, cmd_rx);
+    return run_zero_copy(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, frame_tx, cmd_rx);
     #[cfg(not(target_os = "macos"))]
-    return run_cpu_assemble(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, cached_gen, frame_tx, cmd_rx);
+    return run_cpu_assemble(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, frame_tx, cmd_rx);
 }
 
 /// Fisheye source decoder loop (DJI OSV, SBS fisheye, Blackmagic BRAW).
@@ -2243,6 +2287,7 @@ fn run_zero_copy(
     eye_w: u32,
     eye_h: u32,
     mut per_eye: Vec<((EquirectRotation, EquirectRsParams), (EquirectRotation, EquirectRsParams))>,
+    mut stab_key: StabKey,
     mut cached_gen: u64,
     frame_tx: Sender<DecodedFrame>,
     cmd_rx: Receiver<DecoderCommand>,
@@ -2290,7 +2335,27 @@ fn run_zero_copy(
         }
     }
 
-    'main: while let Some(pair) = decoder.next_pair(&pipeline.device)? {
+    // Hold-on-pause: the pair we last pulled stays in hand while parked,
+    // so a live settings change (View-adjust / stab / color) re-renders
+    // the SAME frame instead of advancing. `frame_idx` always indexes
+    // the frame currently in `held_pair`. Mirrors the OSV decoder's
+    // `stay_on_pair` mechanism.
+    let mut held_pair = None;
+    // Cached (frame_idx, cross_a, cross_b) so a paused re-render reuses
+    // the assembled crosses instead of rebuilding two cross_w² textures.
+    let mut cached_cross: Option<(u32, wgpu::Texture, wgpu::Texture)> = None;
+
+    'main: loop {
+        // When parked with a frame in hand, don't pull a new pair — we
+        // want to re-render it as settings change, never advance.
+        let stay_on_pair = control.paused.load(Ordering::SeqCst) && held_pair.is_some();
+        if !stay_on_pair {
+            match decoder.next_pair(&pipeline.device)? {
+                Some(p) => held_pair = Some(p),
+                None => break,
+            }
+        }
+
         // ── 1. Drain command queue. Seek wins over Stop within
         //       a single batch; subsequent Seeks overwrite earlier ones.
         let mut seek_target: Option<f64> = None;
@@ -2301,7 +2366,7 @@ fn run_zero_copy(
             }
         }
         if let Some(t) = seek_target {
-            drop(pair);
+            held_pair = None;
             decoder.seek(t)?;
             time_offset = t;
             frame_idx = 0;
@@ -2323,7 +2388,7 @@ fn run_zero_copy(
                 if frame_t_abs >= out_t {
                     let in_t = s.trim_in_s.unwrap_or(0.0);
                     drop(s);
-                    drop(pair);
+                    held_pair = None;
                     decoder.seek(in_t)?;
                     time_offset = in_t;
                     frame_idx = 0;
@@ -2336,97 +2401,99 @@ fn run_zero_copy(
             }
         }
 
-        // ── 3. Pause handling. `force_render_next` lets a freshly
-        //       seeked frame be rendered before we go back to parking.
-        if control.paused.load(Ordering::SeqCst) && !force_render_next {
-            let pause_start = std::time::Instant::now();
-            while control.paused.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(16));
-                while let Ok(cmd) = cmd_rx.try_recv() {
-                    match cmd {
-                        DecoderCommand::Stop => return Ok(()),
-                        DecoderCommand::Seek(t) => {
-                            drop(pair);
-                            decoder.seek(t)?;
-                            time_offset = t.max(0.0);
-                            frame_idx = 0;
-                            start_wall = None;
-                            paused_offset = std::time::Duration::ZERO;
-                            force_render_next = true;
-                            continue 'main;
-                        }
-                    }
-                }
-            }
-            paused_offset += pause_start.elapsed();
-        }
-
-        // ── 4. Settings changed → rebuild per-eye bundle.
+        // ── 3. Settings changed → rebuild per-eye bundle. Done before
+        //       render so a live change reflects in this frame.
         let current_gen = control.settings_generation.load(Ordering::SeqCst);
         if current_gen != cached_gen {
             let snapshot = control.settings.read().clone();
-            match build_per_eye_frames(&cfg.path, &snapshot, fps, total_frames) {
-                Ok(new) => {
-                    per_eye = new;
-                    cached_gen = current_gen;
-                    tracing::debug!("decoder (zc): per-eye bundles rebuilt @ gen {}", current_gen);
+            let new_key = stab_settings_key(&snapshot);
+            if new_key == stab_key {
+                // Settings changed but not the stab inputs (view-adjust /
+                // color / LUT / preview-mode) — keep the bundle, just
+                // re-render. This is what keeps those sliders snappy.
+                cached_gen = current_gen;
+            } else {
+                match build_per_eye_frames(&cfg.path, &snapshot, fps, total_frames) {
+                    Ok(new) => {
+                        per_eye = new;
+                        stab_key = new_key;
+                        cached_gen = current_gen;
+                        tracing::debug!("decoder (zc): per-eye bundles rebuilt @ gen {}", current_gen);
+                    }
+                    Err(e) => tracing::warn!("decoder (zc): per-eye rebuild failed: {e}"),
                 }
-                Err(e) => tracing::warn!("decoder (zc): per-eye rebuild failed: {e}"),
             }
         }
 
-        // ── 5. Wall-clock pacing + behind-real-time skip.
-        //       Bypass the skip path when force_render_next so a
-        //       post-seek-while-paused frame is always rendered.
-        let wall_t = start_wall
-            .get_or_insert_with(std::time::Instant::now)
-            .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
-
-        if !force_render_next && wall_t > frame_t_rel + dt * 0.5 {
-            frame_idx += 1;
-            skipped_count += 1;
-            if skipped_count % 30 == 0 {
-                tracing::debug!("decoder (zc): behind by {:.1} ms — skipped {}",
-                    (wall_t - frame_t_rel) * 1000.0, skipped_count);
+        // ── 4. Wall-clock pacing + behind-real-time skip (playing only;
+        //       a held paused frame and a post-seek frame never skip).
+        if !stay_on_pair && !force_render_next {
+            let wall_t = start_wall
+                .get_or_insert_with(std::time::Instant::now)
+                .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
+            if wall_t > frame_t_rel + dt * 0.5 {
+                frame_idx += 1;
+                skipped_count += 1;
+                if skipped_count % 30 == 0 {
+                    tracing::debug!("decoder (zc): behind by {:.1} ms — skipped {}",
+                        (wall_t - frame_t_rel) * 1000.0, skipped_count);
+                }
+                if wall_t > frame_t_rel + 1.0 {
+                    start_wall = Some(std::time::Instant::now()
+                        - std::time::Duration::from_secs_f64(frame_t_rel)
+                        - paused_offset);
+                }
+                held_pair = None;
+                continue 'main;
             }
-            if wall_t > frame_t_rel + 1.0 {
-                start_wall = Some(std::time::Instant::now()
-                    - std::time::Duration::from_secs_f64(frame_t_rel)
-                    - paused_offset);
-            }
-            drop(pair);
-            continue;
         }
 
-        // ── 6. GPU render.
+        // ── 5. GPU render.
         // We look up per-eye stab/RS by clip-absolute frame index so
         // that the rotation matrices stay tied to source time after
         // a seek (not segment-relative time).
+        let pair = held_pair.as_ref().expect("held_pair populated above");
         let absolute_frame_idx = ((time_offset / dt).round() as u32) + frame_idx;
 
-        let cross_a = pipeline.nv12_to_eac_cross(
-            &pair.s0_y.texture, &pair.s0_uv.texture,
-            &pair.s4_y.texture, &pair.s4_uv.texture,
-            Lens::A, dims,
-        )?;
-        let cross_b = pipeline.nv12_to_eac_cross(
-            &pair.s0_y.texture, &pair.s0_uv.texture,
-            &pair.s4_y.texture, &pair.s4_uv.texture,
-            Lens::B, dims,
-        )?;
+        // Assemble the two EAC crosses — the EAC-specific cost OSV
+        // doesn't pay (2 × cross_w² P010→RGB writes). Cache them per
+        // SOURCE frame: when re-rendering the SAME frame (paused while
+        // the user drags a View-adjust / color / LUT slider), the source
+        // pixels are unchanged, so reuse the cached crosses and only
+        // re-project + re-compose. This is what makes paused slider drags
+        // on `.360` as snappy as OSV (which has no cross to rebuild).
+        let need_cross = cached_cross.as_ref()
+            .map(|(i, _, _)| *i != absolute_frame_idx).unwrap_or(true);
+        if need_cross {
+            let a = pipeline.nv12_to_eac_cross(
+                &pair.s0_y.texture, &pair.s0_uv.texture,
+                &pair.s4_y.texture, &pair.s4_uv.texture, Lens::A, dims)?;
+            let b = pipeline.nv12_to_eac_cross(
+                &pair.s0_y.texture, &pair.s0_uv.texture,
+                &pair.s4_y.texture, &pair.s4_uv.texture, Lens::B, dims)?;
+            cached_cross = Some((absolute_frame_idx, a, b));
+        }
+        let (_, cross_a, cross_b) = cached_cross.as_ref().unwrap();
 
         let ((rl, sl), (rr, sr)) = per_eye.get(absolute_frame_idx as usize).copied()
             .unwrap_or((
                 (EquirectRotation::IDENTITY, EquirectRsParams::DISABLED),
                 (EquirectRotation::IDENTITY, EquirectRsParams::DISABLED),
             ));
+        // Compose the View-adjustment (pano-map + stereo) onto the stab
+        // rotations — same as OSV + export_eac, so the sliders work live.
+        let fisheye_out = matches!(
+            control.settings.read().fisheye_output_mode,
+            FisheyeOutputMode::Fisheye);
+        let (rl, rr) = apply_view_adjust(&control.settings.read(), rl, rr);
 
-        let left_tex = pipeline.project_cross_texture_to_equirect_texture(
-            &cross_b, eye_w, eye_h, rl, sl,
-        )?;
-        let right_tex = pipeline.project_cross_texture_to_equirect_texture(
-            &cross_a, eye_w, eye_h, rr, sr,
-        )?;
+        let (left_tex, right_tex) = if fisheye_out {
+            (pipeline.project_cross_texture_to_fisheye_texture(cross_b, eye_w, eye_h, rl, sl)?,
+             pipeline.project_cross_texture_to_fisheye_texture(cross_a, eye_w, eye_h, rr, sr)?)
+        } else {
+            (pipeline.project_cross_texture_to_equirect_texture(cross_b, eye_w, eye_h, rl, sl)?,
+             pipeline.project_cross_texture_to_equirect_texture(cross_a, eye_w, eye_h, rr, sr)?)
+        };
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex, eye_w, eye_h,
         )?;
@@ -2450,17 +2517,53 @@ fn run_zero_copy(
             Err(TrySendError::Full(_)) => { /* UI behind; drop newest */ }
             Err(TrySendError::Disconnected(_)) => return Ok(()),
         }
-        drop(pair);
-        // We rendered + shipped one frame; clear the post-seek
-        // override so subsequent iterations honor pause/pacing again.
+        // We rendered + shipped one frame; clear the post-seek override.
         force_render_next = false;
 
-        let now = start_wall.unwrap().elapsed().as_secs_f64()
-            - paused_offset.as_secs_f64();
+        // ── 6. Pause handling. We've just shown the current frame; now
+        //       park if paused. Breaking on a settings-gen change loops
+        //       back with `stay_on_pair` true, which re-renders the SAME
+        //       held frame with the new settings — sliders update live
+        //       while paused and the frame never creeps forward.
+        if control.paused.load(Ordering::SeqCst) {
+            let pause_start = std::time::Instant::now();
+            while control.paused.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                if control.settings_generation.load(Ordering::SeqCst) != cached_gen {
+                    force_render_next = true;
+                    break;
+                }
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        DecoderCommand::Stop => return Ok(()),
+                        DecoderCommand::Seek(t) => {
+                            held_pair = None;
+                            decoder.seek(t.max(0.0))?;
+                            time_offset = t.max(0.0);
+                            frame_idx = 0;
+                            start_wall = None;
+                            paused_offset = std::time::Duration::ZERO;
+                            force_render_next = true;
+                            continue 'main;
+                        }
+                    }
+                }
+            }
+            paused_offset += pause_start.elapsed();
+            continue 'main;
+        }
+
+        // ── 7. Playing: pace to this frame's wall-clock time, then
+        //       advance. Dropping `held_pair` makes the next iteration
+        //       pull the next pair (frame_idx already bumped).
+        let now = start_wall
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
         if now < frame_t_rel {
             std::thread::sleep(std::time::Duration::from_secs_f64(frame_t_rel - now));
         }
         frame_idx += 1;
+        held_pair = None;
     }
     tracing::info!("decoder (zc): finished after {} segment frames ({} skipped)",
         frame_idx, skipped_count);
@@ -2478,6 +2581,7 @@ fn run_cpu_assemble(
     eye_w: u32,
     eye_h: u32,
     mut per_eye: Vec<((EquirectRotation, EquirectRsParams), (EquirectRotation, EquirectRsParams))>,
+    mut stab_key: StabKey,
     mut cached_gen: u64,
     frame_tx: Sender<DecodedFrame>,
     cmd_rx: Receiver<DecoderCommand>,
@@ -2516,7 +2620,21 @@ fn run_cpu_assemble(
         }
     }
 
-    'main: while let Some(pair) = decoder.next_pair()? {
+    // Hold-on-pause: mirror the zero-copy decoder. `held_pair` keeps the
+    // last-pulled frame in hand while parked so a live settings change
+    // re-renders the SAME frame instead of advancing. `frame_idx` always
+    // indexes the frame currently in `held_pair`.
+    let mut held_pair = None;
+
+    'main: loop {
+        let stay_on_pair = control.paused.load(Ordering::SeqCst) && held_pair.is_some();
+        if !stay_on_pair {
+            match decoder.next_pair()? {
+                Some(p) => held_pair = Some(p),
+                None => break,
+            }
+        }
+
         let mut seek_target: Option<f64> = None;
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
@@ -2525,6 +2643,7 @@ fn run_cpu_assemble(
             }
         }
         if let Some(t) = seek_target {
+            held_pair = None;
             decoder.seek(t)?;
             time_offset = t;
             frame_idx = 0;
@@ -2542,6 +2661,7 @@ fn run_cpu_assemble(
                 if frame_t_abs >= out_t {
                     let in_t = s.trim_in_s.unwrap_or(0.0);
                     drop(s);
+                    held_pair = None;
                     decoder.seek(in_t)?;
                     time_offset = in_t;
                     frame_idx = 0;
@@ -2553,56 +2673,42 @@ fn run_cpu_assemble(
             }
         }
 
-        if control.paused.load(Ordering::SeqCst) && !force_render_next {
-            let pause_start = std::time::Instant::now();
-            while control.paused.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(16));
-                while let Ok(cmd) = cmd_rx.try_recv() {
-                    match cmd {
-                        DecoderCommand::Stop => return Ok(()),
-                        DecoderCommand::Seek(t) => {
-                            decoder.seek(t)?;
-                            time_offset = t.max(0.0);
-                            frame_idx = 0;
-                            start_wall = None;
-                            paused_offset = std::time::Duration::ZERO;
-                            force_render_next = true;
-                            continue 'main;
-                        }
-                    }
-                }
-            }
-            paused_offset += pause_start.elapsed();
-        }
-
         let current_gen = control.settings_generation.load(Ordering::SeqCst);
         if current_gen != cached_gen {
             let snapshot = control.settings.read().clone();
-            match build_per_eye_frames(&cfg.path, &snapshot, fps, total_frames) {
-                Ok(new) => { per_eye = new; cached_gen = current_gen; }
-                Err(e) => tracing::warn!("decoder (cpu): per-eye rebuild failed: {e}"),
+            let new_key = stab_settings_key(&snapshot);
+            if new_key == stab_key {
+                cached_gen = current_gen; // non-stab change: re-render only
+            } else {
+                match build_per_eye_frames(&cfg.path, &snapshot, fps, total_frames) {
+                    Ok(new) => { per_eye = new; stab_key = new_key; cached_gen = current_gen; }
+                    Err(e) => tracing::warn!("decoder (cpu): per-eye rebuild failed: {e}"),
+                }
             }
         }
 
-        let wall_t = start_wall
-            .get_or_insert_with(std::time::Instant::now)
-            .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
-
-        if !force_render_next && wall_t > frame_t_rel + dt * 0.5 {
-            frame_idx += 1;
-            skipped_count += 1;
-            if wall_t > frame_t_rel + 1.0 {
-                start_wall = Some(std::time::Instant::now()
-                    - std::time::Duration::from_secs_f64(frame_t_rel)
-                    - paused_offset);
+        if !stay_on_pair && !force_render_next {
+            let wall_t = start_wall
+                .get_or_insert_with(std::time::Instant::now)
+                .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
+            if wall_t > frame_t_rel + dt * 0.5 {
+                frame_idx += 1;
+                skipped_count += 1;
+                if wall_t > frame_t_rel + 1.0 {
+                    start_wall = Some(std::time::Instant::now()
+                        - std::time::Duration::from_secs_f64(frame_t_rel)
+                        - paused_offset);
+                }
+                if skipped_count % 30 == 0 {
+                    tracing::debug!("decoder (cpu): behind by {:.1} ms — skipped {}",
+                        (wall_t - frame_t_rel) * 1000.0, skipped_count);
+                }
+                held_pair = None;
+                continue 'main;
             }
-            if skipped_count % 30 == 0 {
-                tracing::debug!("decoder (cpu): behind by {:.1} ms — skipped {}",
-                    (wall_t - frame_t_rel) * 1000.0, skipped_count);
-            }
-            continue;
         }
 
+        let pair = held_pair.as_ref().expect("held_pair populated above");
         let absolute_frame_idx = ((time_offset / dt).round() as u32) + frame_idx;
 
         assemble_lens_a(&pair.s0, &pair.s4, dims, &mut cross_a);
@@ -2613,6 +2719,7 @@ fn run_cpu_assemble(
                 (EquirectRotation::IDENTITY, EquirectRsParams::DISABLED),
                 (EquirectRotation::IDENTITY, EquirectRsParams::DISABLED),
             ));
+        let (rl, rr) = apply_view_adjust(&control.settings.read(), rl, rr);
 
         let left_tex = pipeline.project_cross_to_equirect_texture(
             &cross_b, cross_w_px, eye_w, eye_h, rl, sl,
@@ -2637,12 +2744,45 @@ fn run_cpu_assemble(
             Err(TrySendError::Disconnected(_)) => return Ok(()),
         }
         force_render_next = false;
-        let now = start_wall.unwrap().elapsed().as_secs_f64()
-            - paused_offset.as_secs_f64();
+
+        // Park if paused (after rendering). Breaking on a gen change loops
+        // back with `stay_on_pair` true → re-render the held frame live.
+        if control.paused.load(Ordering::SeqCst) {
+            let pause_start = std::time::Instant::now();
+            while control.paused.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                if control.settings_generation.load(Ordering::SeqCst) != cached_gen {
+                    force_render_next = true;
+                    break;
+                }
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        DecoderCommand::Stop => return Ok(()),
+                        DecoderCommand::Seek(t) => {
+                            held_pair = None;
+                            decoder.seek(t.max(0.0))?;
+                            time_offset = t.max(0.0);
+                            frame_idx = 0;
+                            start_wall = None;
+                            paused_offset = std::time::Duration::ZERO;
+                            force_render_next = true;
+                            continue 'main;
+                        }
+                    }
+                }
+            }
+            paused_offset += pause_start.elapsed();
+            continue 'main;
+        }
+
+        let now = start_wall
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
         if now < frame_t_rel {
             std::thread::sleep(std::time::Duration::from_secs_f64(frame_t_rel - now));
         }
         frame_idx += 1;
+        held_pair = None;
     }
     Ok(())
 }
@@ -2653,6 +2793,36 @@ fn run_cpu_assemble(
 ///
 /// Color stack runs only when at least one knob is active — identity
 /// (all defaults) takes a zero-cost passthrough.
+/// Compose the global pano-map + per-eye stereo view adjustment (the
+/// "View adjustment" panel) onto a pair of per-eye rotations. Mirrors the
+/// OSV preview + `export_eac`: `R_eye_final = R_eye · R_view_eye`, with
+/// the fast identity short-circuit so a default (all-zero) clip is
+/// byte-identical to the no-view-adjust path. Used by the GoPro EAC
+/// preview so its View-adjustment sliders take effect live.
+fn apply_view_adjust(
+    s: &Settings,
+    rl: EquirectRotation,
+    rr: EquirectRotation,
+) -> (EquirectRotation, EquirectRotation) {
+    let va = vr180_pipeline::panomap::ViewAdjust {
+        pano_yaw_deg: s.pano_yaw_deg,
+        pano_pitch_deg: s.pano_pitch_deg,
+        pano_roll_deg: s.pano_roll_deg,
+        stereo_yaw_deg: s.stereo_yaw_deg,
+        stereo_pitch_deg: s.stereo_pitch_deg,
+        stereo_roll_deg: s.stereo_roll_deg,
+        upside_down: s.camera_upside_down,
+    };
+    if va.is_identity() {
+        return (rl, rr);
+    }
+    let (v_l, v_r) = va.per_eye_matrices();
+    (
+        EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rl.0, &v_l)),
+        EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rr.0, &v_r)),
+    )
+}
+
 fn compose_with_color_and_mode(
     pipeline: &Device,
     s: &Settings,
@@ -3075,9 +3245,33 @@ fn compose_sbs(
     Ok(sbs)
 }
 
+/// Fingerprint of the Settings fields that feed `build_per_eye_frames`.
+/// The per-eye stab/RS bundle ONLY depends on these — view-adjust,
+/// color, LUT, preview-mode, trim, etc. are applied per frame in the
+/// render loop. The decoder uses this to skip the expensive rebuild
+/// (GPMF extract + 255k-sample VQF fusion + smoothing, ~0.3-1 s) when
+/// a settings change didn't touch stabilization — THE fix for sliders
+/// feeling laggy on `.360` vs OSV.
+pub(crate) type StabKey = (bool, CoriSource, u32, u32, u32, bool, RsMode, u32);
+
+pub(crate) fn stab_settings_key(s: &Settings) -> StabKey {
+    (
+        s.stabilize,
+        s.cori_source,
+        s.smooth_ms.to_bits(),
+        s.max_corr_deg.to_bits(),
+        s.gyro_responsiveness.to_bits(),
+        s.rs_correct,
+        s.rs_mode,
+        s.rs_readout_ms.to_bits(),
+    )
+}
+
 /// Build the per-eye rotation + RS params vec (one tuple per video
 /// frame). Empty when neither stabilization nor RS is on.
-fn build_per_eye_frames(
+/// `pub(crate)` so the EAC export path (`app.rs`) can compute the same
+/// stab the preview uses and hand it to `export_eac`.
+pub(crate) fn build_per_eye_frames(
     input: &std::path::Path,
     s: &Settings,
     fps: f32,
@@ -3105,14 +3299,46 @@ fn build_per_eye_frames(
         let want_vqf = match s.cori_source {
             CoriSource::Direct => false,
             CoriSource::Vqf    => true,
-            CoriSource::Auto   => cori.first()
-                .map(|q| (q.x*q.x + q.y*q.y + q.z*q.z).sqrt() < 1e-3)
-                .unwrap_or(false),
+            // Auto: route to VQF when the firmware CORI is UNCORRECTED gyro
+            // integration (firmware ERS off) — exactly Python's detection at
+            // `vr180_gui.py:4161-4169`. Two signatures:
+            //   1. Zeroed CORI: the first ≤10 quats are all-components < 0.01.
+            //   2. Bias-drift: `cori[0]` starts at EXACT identity
+            //      (xyz_max < 5e-4). Firmware-ERS-ON clips begin with a REAL
+            //      initial orientation (the camera's tilt vs gravity, so
+            //      xyz_max > 1e-3); uncorrected integration starts at exact
+            //      zero rotation and only drifts from gyro bias later.
+            // Check `cori[0]` ONLY: a no-firmware clip's LATER frames
+            // accumulate large gyro drift (xyz → ~0.5 on GS010192), so a
+            // max-over-the-stream test mis-routes it to Direct. That was a
+            // real regression — it sent no-firmware GS010192 to drifty CORI
+            // instead of VQF, which (with the MNOR-frame fix) now matches the
+            // Python app to ~0.1°.
+            CoriSource::Auto => {
+                let head = &cori[..cori.len().min(10)];
+                let cori_is_zero = head.iter().all(|q|
+                    q.w.abs() < 0.01 && q.x.abs() < 0.01
+                        && q.y.abs() < 0.01 && q.z.abs() < 0.01);
+                let cori_is_bias_drift = !cori_is_zero
+                    && cori.len() > 30
+                    && {
+                        let q0 = cori[0];
+                        q0.x.abs().max(q0.y.abs()).max(q0.z.abs()) < 0.0005
+                    };
+                cori_is_zero || cori_is_bias_drift
+            }
         };
         if want_vqf {
             cori = vr180_pipeline::imu::vqf_cori_equivalent_stream(
                 input, fps, n_frames_video,
             )?;
+            // Re-reference to frame 0 (USER CHOICE, diverges from Python
+            // here): camera lock holds the view where the camera pointed
+            // at frame 0, instead of Python's world-frame lock (VQF is
+            // gravity+north anchored, so Python's lock target is the
+            // world axes). For soft-stab this constant right-factor
+            // provably cancels in `heading = raw·smooth⁻¹` (final
+            // matrices match Python to 0.02° either way).
             if let Some(ref0) = cori.first().copied() {
                 let inv = ref0.conjugate();
                 for q in cori.iter_mut() { *q = q.mul(inv); }
@@ -3129,27 +3355,42 @@ fn build_per_eye_frames(
                     apply_gravity_alignment_inplace(&mut cori, gq.conjugate());
                 }
             }
-            // `smooth_ms = 0` → CAMERA-LOCK to frame 0: every frame
-            // uses `cori[0]` as the smoothed anchor, so `q_heading
-            // = raw · cori[0]⁻¹` and at frame 0 it collapses to
-            // identity. Matches the OSV camera-lock semantic so both
-            // paths behave the same at the default.
+            // `smooth_ms = 0` → CAMERA LOCK, Python semantics
+            // (`vr180_gui.py:4652-4654`): `q_heading = q_raw` — counteract
+            // the FULL camera rotation, no clamp. Achieved by an identity
+            // smoothed anchor + max_corr = 0. The old code anchored to
+            // `cori[0]` AND still applied the 15° elastic clamp, so on a
+            // clip that rotates 56° the lock corrected at most ~35° — the
+            // "camera lock still moves around" bug.
             //
             // `smooth_ms > 0` → soft-stab (the legacy GoPro path):
             // anchor is a bidirectional-smoothed orientation, so
             // slow camera motion passes through and jitter is killed.
-            let smoothed = if s.smooth_ms <= 0.0 {
-                vec![cori[0]; cori.len()]
+            // The elastic max-corr clamp applies here only (Python keeps
+            // its soft-limit inside the smoother; same formula, same
+            // (raw, smoothed) operands — final matrices match to 0.02°).
+            let camera_lock = s.smooth_ms <= 0.0;
+            let smoothed = if camera_lock {
+                vec![Quat::IDENTITY; cori.len()]
             } else {
                 bidirectional_smooth(&cori, fps, &SmoothParams {
-                    smooth_ms: s.smooth_ms, ..Default::default()
+                    smooth_ms: s.smooth_ms,
+                    responsiveness: s.gyro_responsiveness.clamp(0.2, 3.0),
+                    ..Default::default()
                 })
             };
+            let eff_max_corr = if camera_lock { 0.0 } else { s.max_corr_deg };
+            // VQF mode: Python forces IORI to identity (the VQF result
+            // dict carries `iori_quat = (1,0,0,0)`); the file's parsed
+            // IORI belongs to the firmware-ERS pipeline.
             (0..cori.len()).map(|i| {
+                let iori_i = if used_vqf { Quat::IDENTITY } else {
+                    iori.get(i).copied().unwrap_or(Quat::IDENTITY)
+                };
                 let (l, r) = per_eye_rotations(
                     cori[i], smoothed[i],
-                    iori.get(i).copied().unwrap_or(Quat::IDENTITY),
-                    s.max_corr_deg,
+                    iori_i,
+                    eff_max_corr,
                 );
                 (EquirectRotation::from_quat(l), EquirectRotation::from_quat(r))
             }).collect()
@@ -3158,24 +3399,49 @@ fn build_per_eye_frames(
         };
 
     let rs_eyes: Vec<(EquirectRsParams, EquirectRsParams)> = if s.rs_correct {
+        use vr180_pipeline::gpu::RS_N_GROUPS;
         let geoc = vr180_core::geoc::parse_geoc(input)?
             .ok_or_else(|| anyhow::anyhow!("GEOC block missing"))?;
         let front = geoc.front.as_ref().ok_or_else(|| anyhow::anyhow!("GEOC FRNT missing"))?;
         let back  = geoc.back.as_ref().ok_or_else(|| anyhow::anyhow!("GEOC BACK missing"))?;
         let srot_s = s.rs_readout_ms / 1000.0;
         let probe = vr180_pipeline::decode::probe_video(input)?;
-        let omegas = compute_per_frame_omega(
-            &raw_imu.gyro, n_frames_video, fps,
-            probe.duration_sec as f32, srot_s * 0.5, SMOOTH_WINDOW_S,
+
+        // Python-parity ω source: STMP-anchored timestamps + lerp (the
+        // old `int(t/dt)` nearest-index sampler drifts ~33 ms over 71 s
+        // — the documented Python bug, fixed there the same way).
+        // Smoothed (15 ms box) for the single-ω value; RAW for the 32
+        // per-scanline row groups.
+        let (_, cori_stmps) = vr180_core::gyro::parse_cori_with_stmps(&gpmf);
+        let angvel = vr180_core::gyro::GyroAngvel::build(
+            &raw_imu.gyro, &cori_stmps, fps, probe.duration_sec as f32,
         );
-        let (left_pf, right_pf) = match s.rs_mode {
-            RsMode::NoFirmware => ((1.0_f32, 1.0, 0.0), (1.0, 1.0, 0.0)),
-            RsMode::Firmware   => ((0.0_f32, 0.0, 0.0), (2.5, 2.5, 0.0)),
+
+        // Per-axis factors in SHADER order [f_ωx(pitch), f_ωy(yaw),
+        // f_ωz(roll)] — matches Python's auto-set values exactly:
+        //   no-firmware → (1, 1, 1) on BOTH eyes (the old code zeroed
+        //   the yaw component — a real divergence);
+        //   firmware    → right eye (pitch 2, yaw 0, roll 2) to cancel
+        //   the wrong-direction firmware RS, left eye none.
+        let (left_f, right_f): ([f32; 3], [f32; 3]) = match s.rs_mode {
+            RsMode::NoFirmware => ([1.0, 1.0, 1.0], [1.0, 1.0, 1.0]),
+            RsMode::Firmware   => ([0.0, 0.0, 0.0], [2.0, 0.0, 2.0]),
         };
-        let mk = |om: [f32; 3], pf: (f32, f32, f32), cal: &vr180_core::geoc::LensCal| {
-            let active = pf.0 != 0.0 || pf.1 != 0.0 || pf.2 != 0.0;
+
+        let mk = |single: [f32; 3], groups: &[[f32; 3]], f: [f32; 3],
+                  cal: &vr180_core::geoc::LensCal| {
+            let active = f[0] != 0.0 || f[1] != 0.0 || f[2] != 0.0;
+            let mut omega_groups = [[0.0_f32; 3]; RS_N_GROUPS];
+            let ng = groups.len().min(RS_N_GROUPS);
+            for g in 0..ng {
+                for c in 0..3 {
+                    omega_groups[g][c] = groups[g][c] * f[c];
+                }
+            }
             EquirectRsParams {
-                omega: [om[0] * pf.0, om[1] * pf.2, om[2] * pf.1],
+                omega: [single[0] * f[0], single[1] * f[1], single[2] * f[2]],
+                omega_groups,
+                n_groups: ng as u32,
                 srot_s: if active { srot_s } else { 0.0 },
                 klns: [
                     cal.klns[0] as f32, cal.klns[1] as f32, cal.klns[2] as f32,
@@ -3185,9 +3451,30 @@ fn build_per_eye_frames(
                 cal_dim: geoc.cal_dim as f32,
             }
         };
-        (0..n_frames_video).map(|i| {
-            (mk(omegas[i], left_pf, back), mk(omegas[i], right_pf, front))
-        }).collect()
+
+        match angvel {
+            Some(av) => (0..n_frames_video).map(|i| {
+                // Frame time base matches Python's export precompute
+                // (`t = start + i/fps`, frame start — not readout mid).
+                let t = i as f32 / fps.max(1e-6);
+                let single = av.single_at(t);
+                let groups = av.groups_at(t, srot_s, RS_N_GROUPS);
+                (mk(single, &groups, left_f, back),
+                 mk(single, &groups, right_f, front))
+            }).collect(),
+            None => {
+                // No usable gyro stream: legacy constant-ω fallback.
+                tracing::warn!("RS: GyroAngvel build failed — using legacy sampler");
+                let omegas = compute_per_frame_omega(
+                    &raw_imu.gyro, n_frames_video, fps,
+                    probe.duration_sec as f32, 0.0, SMOOTH_WINDOW_S,
+                );
+                (0..n_frames_video).map(|i| {
+                    (mk(omegas[i], &[], left_f, back),
+                     mk(omegas[i], &[], right_f, front))
+                }).collect()
+            }
+        }
     } else {
         Vec::new()
     };

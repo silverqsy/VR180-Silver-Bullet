@@ -26,7 +26,7 @@ pub use resample::{
     resample_quats_to_frames, resample_quats_to_frames_timed,
     build_imu_sample_times, cori_swap_yz, SROT_S,
 };
-pub use rs_omega::{compute_per_frame_omega, SMOOTH_WINDOW_S};
+pub use rs_omega::{compute_per_frame_omega, GyroAngvel, SMOOTH_WINDOW_S};
 pub use stabilize::{
     SmoothParams, bidirectional_smooth, soft_elastic_clamp,
     per_eye_rotations,

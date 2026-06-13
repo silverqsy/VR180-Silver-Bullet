@@ -1136,32 +1136,42 @@ pub fn dji_imu_phase_default_ms_for_fps(fps: f32) -> f32 {
     dji_osmo_readout_ms_for_fps(fps) * 0.5
 }
 
-/// Live-tunable IMU sample offset, stored as **microseconds after
-/// frame_start**. Default 8500 (8.5 ms). Exposed as a GUI slider so the
-/// value can be A/B-tested against DJI Studio output; read by
-/// [`dji_imu_phase_offset_s_fps`], which feeds BOTH the per-frame stab
-/// sample and the rolling-shutter readout-window center — so one knob
-/// moves all IMU timing consistently.
-static DJI_IMU_PHASE_US: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(8500);
-
-/// Set the IMU sample offset (ms after frame_start). Clamped to [0, 60] ms.
-pub fn set_dji_imu_phase_after_start_ms(ms: f32) {
-    let us = (ms * 1000.0).round().clamp(0.0, 60_000.0) as u32;
-    DJI_IMU_PHASE_US.store(us, std::sync::atomic::Ordering::Relaxed);
+// Live-tunable IMU sample offset, stored as **microseconds after
+// frame_start**. Default 8500 (8.5 ms). Exposed as a GUI slider so the
+// value can be A/B-tested against DJI Studio output; read by
+// `dji_imu_phase_offset_s_fps`, which feeds BOTH the per-frame stab
+// sample and the rolling-shutter readout-window center — so one knob
+// moves all IMU timing consistently.
+//
+// THREAD-LOCAL, deliberately. Every consumer thread asserts its own
+// clip's value before computing (preview decode workers set it in their
+// loop; the export worker sets it at thread start; the UI thread sets it
+// on load + while the slider draws, covering the main-thread detail
+// still). A process-wide global here would let a batch export and a
+// concurrently-previewed DIFFERENT clip clobber each other's RS timing
+// — the per-row RS reads this per frame on the export thread.
+std::thread_local! {
+    static DJI_IMU_PHASE_US: std::cell::Cell<u32> = const { std::cell::Cell::new(8500) };
 }
 
-/// Current IMU sample offset (ms after frame_start).
+/// Set the calling thread's IMU sample offset (ms after frame_start).
+/// Clamped to [0, 60] ms.
+pub fn set_dji_imu_phase_after_start_ms(ms: f32) {
+    let us = (ms * 1000.0).round().clamp(0.0, 60_000.0) as u32;
+    DJI_IMU_PHASE_US.with(|c| c.set(us));
+}
+
+/// The calling thread's IMU sample offset (ms after frame_start).
 pub fn dji_imu_phase_after_start_ms() -> f32 {
-    DJI_IMU_PHASE_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+    DJI_IMU_PHASE_US.with(|c| c.get()) as f32 / 1000.0
 }
 
 #[inline]
 pub fn dji_imu_phase_offset_s_fps(_readout_s: f32, fps: f32) -> f32 {
-    // Target offset (s after frame_start) — a live-tunable global, default
-    // 8.5 ms. The mid-frame term cancels so the IMU is sampled at a fixed
-    // point after frame_start regardless of fps (verified 30 & 50 fps).
-    let target_s = DJI_IMU_PHASE_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1.0e6;
+    // Target offset (s after frame_start) — live-tunable, default 8.5 ms.
+    // The mid-frame term cancels so the IMU is sampled at a fixed point
+    // after frame_start regardless of fps (verified 30 & 50 fps).
+    let target_s = DJI_IMU_PHASE_US.with(|c| c.get()) as f32 / 1.0e6;
     let frame_dur = if fps > 0.0 { 1.0 / fps } else { 1.0 / 30.0 };
     target_s - 0.5 * frame_dur
 }

@@ -81,7 +81,31 @@ pub fn bidirectional_smooth(raw: &[Quat], fps: f32, params: &SmoothParams) -> Ve
     }
     let dt = 1.0 / fps.max(1e-6);
 
-    // Closure: per-step alpha from local angular velocity.
+    // ── Velocity pre-smoothing (THE load-bearing step). Compute the
+    //    per-frame angular velocity, then lowpass it with a ±200 ms
+    //    forward+backward exponential pass. The τ-schedule below is
+    //    driven by this SMOOTHED velocity, not the raw per-step value.
+    //
+    //    Without this, every jittery handheld frame spikes the raw
+    //    per-step velocity above `max_vel_deg_s` → τ collapses to
+    //    `fast_ms` → α≈1 → `smoothed ≈ raw` → the heading correction is
+    //    ≈ identity → stabilization does NOTHING visible. The 200 ms
+    //    window gives look-ahead so smoothing relaxes BEFORE a real pan
+    //    arrives instead of reacting to single-frame jitter.
+    //    Ports `vr180_gui.py:4455-4461` (same as the OSV soft-stab).
+    let mut vel = vec![0.0_f32; n];
+    for i in 1..n {
+        vel[i] = quat_angular_velocity_deg_s(raw[i - 1], raw[i], dt);
+    }
+    let vel_alpha = (dt / 0.2).min(1.0); // 200 ms time constant
+    for i in 1..n {
+        vel[i] = vel[i - 1] * (1.0 - vel_alpha) + vel[i] * vel_alpha;
+    }
+    for i in (0..n - 1).rev() {
+        vel[i] = vel[i + 1] * (1.0 - vel_alpha) + vel[i] * vel_alpha;
+    }
+
+    // Closure: per-step alpha from the (pre-smoothed) angular velocity.
     let alpha_for_velocity = |vel_deg_s: f32| -> f32 {
         let vel_norm = (vel_deg_s / params.max_vel_deg_s).clamp(0.0, 1.0);
         let vel_ratio = vel_norm.powf(params.responsiveness);
@@ -97,8 +121,7 @@ pub fn bidirectional_smooth(raw: &[Quat], fps: f32, params: &SmoothParams) -> Ve
     let mut fwd = Vec::with_capacity(n);
     fwd.push(raw[0]);
     for i in 1..n {
-        let vel = quat_angular_velocity_deg_s(raw[i - 1], raw[i], dt);
-        let alpha = alpha_for_velocity(vel);
+        let alpha = alpha_for_velocity(vel[i]);
         fwd.push(fwd[i - 1].slerp(raw[i], alpha));
     }
 
@@ -106,8 +129,7 @@ pub fn bidirectional_smooth(raw: &[Quat], fps: f32, params: &SmoothParams) -> Ve
     let mut bwd = vec![Quat::IDENTITY; n];
     bwd[n - 1] = raw[n - 1];
     for i in (0..n - 1).rev() {
-        let vel = quat_angular_velocity_deg_s(raw[i + 1], raw[i], dt);
-        let alpha = alpha_for_velocity(vel);
+        let alpha = alpha_for_velocity(vel[i]);
         bwd[i] = bwd[i + 1].slerp(raw[i], alpha);
     }
 

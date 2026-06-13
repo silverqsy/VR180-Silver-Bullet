@@ -245,12 +245,21 @@ fn pick_acc_source(
 /// short window collapses to point-sample when the rotation is
 /// slow-varying).
 ///
-/// Resample window is **1 ms** (matches Python's `window_ms=1.0` default
-/// at `parse_gyro_raw.py:1265`). Wider windows wash out the gyro's
-/// high-frequency content and add asymmetric phase lag whenever the
-/// signal is moving across the window — both of which broke OSV-style
-/// stab when we tried `window_s = SROT_S` previously.
-const VQF_RESAMPLE_WINDOW_S: f32 = 0.001;
+/// Resample window is **SROT (15.224 ms)** — the full readout-window
+/// average. This matches what the Python GUI actually passes: its
+/// "Gyro window" slider defaults to 15.224 ms (`vr180_gui.py:10956`,
+/// `ProcessingConfig.gyro_window_ms`), flowing into
+/// `vqf_to_cori_quats(window_ms=...)`. The 15 ms average attenuates
+/// 800 Hz vibration BEFORE the velocity-dampened smoother — without
+/// it, per-frame quats carry raw vibration (shaky output) AND the
+/// pre-smoother sees inflated velocities, collapsing τ exactly when
+/// vibration is worst.
+///
+/// NOTE: an earlier port used **1 ms** here, matching the *function
+/// default* (`parse_gyro_raw.py:1152`) instead of the GUI's value —
+/// that made the Rust stab visibly shakier than the Python app on
+/// vibrating footage (motorcycle clips) at "the same settings".
+const VQF_RESAMPLE_WINDOW_S: f32 = 15.224 / 1000.0;
 
 pub fn vqf_cori_equivalent_stream(
     input: &Path,
@@ -342,14 +351,22 @@ fn pick_mag_source(
 ) -> (Option<Vec<[f32; 3]>>, MagSource, usize) {
     use vr180_core::gyro::resample::build_imu_sample_times;
 
-    // MNOR — Python doesn't define an explicit axis map, so we pass it
-    // through verbatim (raw on-disk axes). If validation reveals a remap
-    // is needed we'll add one here.
+    // MNOR — magnetic-north unit vector. Python remaps it into the VQF
+    // body frame with the GRAV axis map `(0, 2, 1)` (NOT the gyro map)
+    // and scales the unit vector to ~50 µT, matching `parse_gyro_raw.py`
+    // (`MNOR_VQF_MAP = GRAV_AXIS_MAP`, then `remapped *= 50.0`). MNOR and
+    // GRAV share the same body-frame convention in GoPro GPMF; using the
+    // gyro map (or no map) puts magnetic north in the wrong frame and the
+    // 9D fusion's heading correction is 65-130° off — a large, time-
+    // aligned, motion-independent orientation error vs Python. The ×50
+    // matches the field magnitude VQF's (disabled) disturbance check
+    // expects; harmless with mag_dist_rejection off but kept for parity.
     if raw.mnor.is_empty() {
         return (None, MagSource::None, 0);
     }
-    let mnor_body: Vec<[f32; 3]> = raw.mnor.iter()
-        .flat_map(|b| b.samples.iter().copied())
+    let mnor_body: Vec<[f32; 3]> = flatten_with_remap(&raw.mnor, [0, 2, 1])
+        .into_iter()
+        .map(|s| [s[0] * 50.0, s[1] * 50.0, s[2] * 50.0])
         .collect();
     let n_input = mnor_body.len();
     let mnor_times = build_imu_sample_times(&raw.mnor, cori_stmps, fps, probe_duration);

@@ -10,7 +10,7 @@
 // One thread per output pixel. The math mirrors the Python
 // `FrameExtractor.build_cross_remap`:
 //
-//   * convert (u, v) ∈ [0,1]² to (lon, lat) ∈ [-π/2, π/2]²
+//   * convert (u, v) ∈ [0,1]² to an equidistant fisheye direction
 //   * recover unit direction vector (xn, yn, zn)
 //   * **apply per-frame rotation R** (Phase A stabilization).
 //   * **apply per-pixel RS small-angle rotation** (Phase D)
@@ -96,6 +96,11 @@ const TWO_OVER_PI: f32 = 0.63661977236;  // 2/π
 //   * but `center_w = 1920` is fixed, so we compute tile_w on-shader:
 //        tile_w = (cross_dim - center_w) / 2  // because cross_dim = 2 * tile_w + center_w
 const CENTER_W: f32 = 1920.0;
+// Output fisheye half-FOV for `.360`: 185° equidistant (92.5° half).
+// The GoPro Max captures 184.5° per eye in the EAC; 185° gives the disk
+// edge a hair of margin while staying faithful to the lens FOV — NOT the
+// OSV/DJI 195° (that lens is wider).
+const FISHEYE_HALF_FOV: f32 = 1.61442956;
 
 fn cross_dim() -> f32 {
     let sz = textureDimensions(cross_tex);
@@ -110,21 +115,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Per-pixel normalized coords + (lon, lat).
-    let u = (f32(gid.x) + 0.5) / f32(out_dim.x);
-    let v = (f32(gid.y) + 0.5) / f32(out_dim.y);
-    let lon = (u - 0.5) * PI;
-    let lat = (0.5 - v) * PI;
-
-    // Unit direction in equirect (output) frame, then rotated into
-    // camera (input) frame by the per-frame R uniform. When
-    // stabilization is off R = identity and these two frames are the
-    // same.
-    let cos_lat = cos(lat);
+    // EQUIDISTANT circular-fisheye output (FISHEYE_FULL_FOV full FOV):
+    // the inscribed circle is the visible disk, corners (r_norm > 1) are
+    // black so the result is a real fisheye. θ = r_norm · half_fov. Same
+    // output→dir mapping as the OSV fisheye-output shader, so a `.360`
+    // fisheye export matches the OSV fisheye export's framing.
+    let half = min(f32(out_dim.x), f32(out_dim.y)) * 0.5;
+    let dx = (f32(gid.x) + 0.5) - f32(out_dim.x) * 0.5;
+    let dy = f32(out_dim.y) * 0.5 - (f32(gid.y) + 0.5);
+    let r_norm = sqrt(dx * dx + dy * dy) / max(half, 1.0);
+    if (r_norm > 1.0) {
+        textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)),
+                     vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    let phi_out = atan2(dy, dx);
+    let theta_out = r_norm * FISHEYE_HALF_FOV;
+    let s_t = sin(theta_out);
+    // Unit direction in the OUTPUT frame (X=right, Y=up, Z=forward),
+    // rotated into the camera frame by R below — same as the equirect
+    // variant from here on (RS + EAC face sampling are identical).
     let dir_world = vec3<f32>(
-        cos_lat * sin(lon),
-        sin(lat),
-        cos_lat * cos(lon),
+        s_t * cos(phi_out),
+        s_t * sin(phi_out),
+        cos(theta_out),
     );
     // R · dir — manual row-vector dot products. 12-scalar uniform
     // layout (see EquirectUniforms above); each row is 3 floats +

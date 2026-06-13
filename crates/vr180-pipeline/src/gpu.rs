@@ -67,6 +67,12 @@ pub struct Device {
     pub device: std::sync::Arc<wgpu::Device>,
     pub queue: std::sync::Arc<wgpu::Queue>,
     eac_to_equirect: EacToEquirectPipeline,
+    /// 16-bit-output EAC→equirect (true-10-bit EAC export chain).
+    eac_to_equirect_16: EacToEquirectPipeline,
+    /// EAC→equidistant-fisheye output (8- and 16-bit), for `.360`
+    /// fisheye-output mode (parity with the OSV fisheye output).
+    eac_to_fisheye: EacToEquirectPipeline,
+    eac_to_fisheye_16: EacToEquirectPipeline,
     fisheye_to_hequirect: FisheyeToHequirectPipeline,
     fisheye_to_hequirect_16: FisheyeToHequirectPipeline,
     /// RS-aware variant of `fisheye_to_hequirect`. Used by the GUI
@@ -118,6 +124,8 @@ pub struct Device {
     /// so the color stack can run end-to-end at 10-bit precision.
     lut3d_16: Lut3DPipeline,
     nv12_to_eac: Nv12ToEacPipeline,
+    /// 16-bit-output NV12/P010→EAC-cross (true-10-bit EAC export chain).
+    nv12_to_eac_16: Nv12ToEacPipeline,
     cdl: PerPixelPipeline,
     /// 16-bit-output CDL — same math as `cdl`, Rgba16Unorm output.
     cdl_16: PerPixelPipeline,
@@ -335,6 +343,9 @@ impl Device {
         queue: std::sync::Arc<wgpu::Queue>,
     ) -> Result<Self> {
         let eac_to_equirect = EacToEquirectPipeline::create(&device);
+        let eac_to_equirect_16 = EacToEquirectPipeline::create_16(&device);
+        let eac_to_fisheye = EacToEquirectPipeline::create_fisheye(&device);
+        let eac_to_fisheye_16 = EacToEquirectPipeline::create_fisheye_16(&device);
         let fisheye_to_hequirect = FisheyeToHequirectPipeline::create(&device);
         let fisheye_to_hequirect_16 = FisheyeToHequirectPipeline::create_16bit(&device);
         let fisheye_to_hequirect_rs = FisheyeToHequirectRsPipeline::create(&device);
@@ -351,6 +362,7 @@ impl Device {
         let lut3d = Lut3DPipeline::create(&device);
         let lut3d_16 = Lut3DPipeline::create_16bit(&device);
         let nv12_to_eac = Nv12ToEacPipeline::create(&device);
+        let nv12_to_eac_16 = Nv12ToEacPipeline::create_16(&device);
         let cdl = PerPixelPipeline::create(
             &device, "cdl", CDL_WGSL,
             std::mem::size_of::<CdlUniforms>() as u64,
@@ -395,7 +407,7 @@ impl Device {
         });
         Ok(Self {
             instance, adapter, device, queue,
-            eac_to_equirect,
+            eac_to_equirect, eac_to_equirect_16, eac_to_fisheye, eac_to_fisheye_16,
             fisheye_to_hequirect, fisheye_to_hequirect_16,
             fisheye_to_hequirect_rs,
             fisheye_to_hequirect_rs_16,
@@ -405,7 +417,7 @@ impl Device {
             fisheye_to_fisheye_rs_16,
             fisheye_p010_to_fisheye_16, fisheye_p010_to_fisheye_rs_16,
             p010_resolve,
-            lut3d, lut3d_16, nv12_to_eac,
+            lut3d, lut3d_16, nv12_to_eac, nv12_to_eac_16,
             cdl, cdl_16,
             color_grade, color_grade_16,
             gaussian_blur, sharpen_combine, mid_detail_combine, downsample_4x,
@@ -831,9 +843,37 @@ impl Device {
 
 impl EacToEquirectPipeline {
     fn create(device: &wgpu::Device) -> Self {
+        Self::create_with_format(device, wgpu::TextureFormat::Rgba8Unorm)
+    }
+
+    /// 16-bit-output variant for the true-10-bit EAC export chain.
+    fn create_16(device: &wgpu::Device) -> Self {
+        Self::create_with_format(device, wgpu::TextureFormat::Rgba16Unorm)
+    }
+
+    fn create_with_format(device: &wgpu::Device, out_format: wgpu::TextureFormat) -> Self {
+        Self::create_with_wgsl(device, out_format, EAC_TO_EQUIRECT_WGSL)
+    }
+
+    /// Fisheye-output variant — same bind-group layout / RS / face
+    /// sampling, only the output-pixel→direction mapping differs (disk
+    /// instead of equirect). For the `.360` fisheye-output mode.
+    fn create_fisheye(device: &wgpu::Device) -> Self {
+        Self::create_with_wgsl(device, wgpu::TextureFormat::Rgba8Unorm, EAC_TO_FISHEYE_WGSL)
+    }
+    fn create_fisheye_16(device: &wgpu::Device) -> Self {
+        Self::create_with_wgsl(device, wgpu::TextureFormat::Rgba16Unorm, EAC_TO_FISHEYE_WGSL)
+    }
+
+    fn create_with_wgsl(device: &wgpu::Device, out_format: wgpu::TextureFormat, base_wgsl: &str) -> Self {
+        let wgsl = if out_format == wgpu::TextureFormat::Rgba16Unorm {
+            base_wgsl.replace("rgba8unorm, write", "rgba16unorm, write")
+        } else {
+            base_wgsl.to_string()
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("eac_to_equirect"),
-            source: wgpu::ShaderSource::Wgsl(EAC_TO_EQUIRECT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("eac_to_equirect_bgl"),
@@ -859,7 +899,7 @@ impl EacToEquirectPipeline {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: out_format,
                         view_dimension: wgpu::TextureViewDimension::D2,
                     },
                     count: None,
@@ -1656,15 +1696,26 @@ impl EquirectRotation {
     }
 }
 
+/// Number of per-scanline ω row groups (matches Python's
+/// `GyroStabilizer.RS_N_GROUPS`). Group g covers readout row-time
+/// `t_frame + (g/(N-1) − 0.5)·srot`.
+pub const RS_N_GROUPS: usize = 32;
+
 /// std140 layout for the EAC→equirect shader's RS uniform (Phase D).
-/// 12 scalars, 48 bytes — matches the WGSL `RsUniforms` struct
-/// exactly. `srot_s == 0` disables the RS pass in the shader.
+/// 12 scalars + 24 vec4s of per-scanline ω groups (96 floats packed
+/// 4-per-vec4 to satisfy WGSL's 16-byte uniform array stride) —
+/// matches the WGSL `RsUniforms` struct exactly. `srot_s == 0`
+/// disables the RS pass; `n_groups <= 1` falls back to the single
+/// `omega_*` value (constant-ω, what Python's preview does).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct RsUniforms {
     omega_x: f32, omega_y: f32, omega_z: f32, srot_s: f32,
     klns_c0: f32, klns_c1: f32, klns_c2: f32, klns_c3: f32,
-    klns_c4: f32, ctry: f32, cal_dim: f32, _pad: f32,
+    klns_c4: f32, ctry: f32, cal_dim: f32, n_groups: f32,
+    // Flat ω groups: group g component c lives at flat index g*3+c →
+    // groups[idx/4][idx%4]. Shader order (ω_x, ω_y, ω_z) per group.
+    groups: [[f32; 4]; 24],
 }
 
 impl RsUniforms {
@@ -1674,17 +1725,27 @@ impl RsUniforms {
     const DISABLED: Self = Self {
         omega_x: 0.0, omega_y: 0.0, omega_z: 0.0, srot_s: 0.0,
         klns_c0: 0.0, klns_c1: 0.0, klns_c2: 0.0, klns_c3: 0.0,
-        klns_c4: 0.0, ctry: 0.0, cal_dim: 1.0, _pad: 0.0,
+        klns_c4: 0.0, ctry: 0.0, cal_dim: 1.0, n_groups: 0.0,
+        groups: [[0.0; 4]; 24],
     };
 
     fn from_params(p: EquirectRsParams) -> Self {
+        let mut groups = [[0.0_f32; 4]; 24];
+        let ng = (p.n_groups as usize).min(RS_N_GROUPS);
+        for g in 0..ng {
+            for c in 0..3 {
+                let idx = g * 3 + c;
+                groups[idx / 4][idx % 4] = p.omega_groups[g][c];
+            }
+        }
         Self {
             omega_x: p.omega[0], omega_y: p.omega[1], omega_z: p.omega[2],
             srot_s: p.srot_s,
             klns_c0: p.klns[0], klns_c1: p.klns[1], klns_c2: p.klns[2],
             klns_c3: p.klns[3], klns_c4: p.klns[4],
             ctry: p.ctry, cal_dim: p.cal_dim,
-            _pad: 0.0,
+            n_groups: ng as f32,
+            groups,
         }
     }
 }
@@ -1699,7 +1760,20 @@ pub struct EquirectRsParams {
     /// Effective angular velocity in rad/s (already multiplied by
     /// per-axis RS factors). Components: (ω_x, ω_y, ω_z) in the
     /// equirect shader frame — X = right, Y = up, Z = forward.
+    /// Used when `n_groups <= 1` (constant-ω mode).
     pub omega: [f32; 3],
+    /// Per-scanline ω row groups (rad/s, factors applied, shader
+    /// order). Group g is the instantaneous RAW-gyro ω at row-time
+    /// `t_frame + (g/(n−1) − 0.5)·srot` — Python's
+    /// `get_perscanline_rs_angvel`. The shader linearly interpolates
+    /// between groups by each pixel's sensor-row time, capturing
+    /// angular acceleration WITHIN the readout window that a single
+    /// smoothed ω blurs out. Only the first `n_groups` entries are
+    /// meaningful.
+    pub omega_groups: [[f32; 3]; RS_N_GROUPS],
+    /// Number of valid entries in `omega_groups`. `0` or `1` →
+    /// constant-ω mode using `omega`.
+    pub n_groups: u32,
     /// Sensor readout time in seconds. `0.0` disables RS for this
     /// eye/frame regardless of any other field.
     pub srot_s: f32,
@@ -1718,7 +1792,10 @@ impl EquirectRsParams {
     /// is already right for the un-modded lens) and for both eyes
     /// when the user hasn't enabled `--rs-correct`.
     pub const DISABLED: Self = Self {
-        omega: [0.0; 3], srot_s: 0.0, klns: [0.0; 5],
+        omega: [0.0; 3],
+        omega_groups: [[0.0; 3]; RS_N_GROUPS],
+        n_groups: 0,
+        srot_s: 0.0, klns: [0.0; 5],
         ctry: 0.0, cal_dim: 1.0,
     };
 }
@@ -1877,6 +1954,7 @@ const FISHEYE_P010_TO_FISHEYE_RS_16_WGSL: &str = include_str!("shaders/fisheye_p
 const LUT3D_WGSL: &str = include_str!("shaders/lut3d.wgsl");
 const LUT3D_16_WGSL: &str = include_str!("shaders/lut3d_16.wgsl");
 const NV12_TO_EAC_WGSL: &str = include_str!("shaders/nv12_to_eac_cross.wgsl");
+const EAC_TO_FISHEYE_WGSL: &str = include_str!("shaders/eac_to_fisheye.wgsl");
 const CDL_WGSL: &str = include_str!("shaders/cdl.wgsl");
 const CDL_16_WGSL: &str = include_str!("shaders/cdl_16.wgsl");
 const COLOR_GRADE_WGSL: &str = include_str!("shaders/color_grade.wgsl");
@@ -2133,9 +2211,26 @@ struct Nv12ToEacUniforms {
 
 impl Nv12ToEacPipeline {
     fn create(device: &wgpu::Device) -> Self {
+        Self::create_with_format(device, wgpu::TextureFormat::Rgba8Unorm)
+    }
+
+    /// 16-bit-per-channel cross output for the true-10-bit EAC export
+    /// chain (P010 decode → Rgba16 cross → Rgba16 equirect → P010
+    /// encode). Same shader, `rgba16unorm` swapped into the storage
+    /// declaration at pipeline build (the established variant pattern).
+    fn create_16(device: &wgpu::Device) -> Self {
+        Self::create_with_format(device, wgpu::TextureFormat::Rgba16Unorm)
+    }
+
+    fn create_with_format(device: &wgpu::Device, out_format: wgpu::TextureFormat) -> Self {
+        let wgsl = if out_format == wgpu::TextureFormat::Rgba16Unorm {
+            NV12_TO_EAC_WGSL.replace("rgba8unorm, write", "rgba16unorm, write")
+        } else {
+            NV12_TO_EAC_WGSL.to_string()
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("nv12_to_eac"),
-            source: wgpu::ShaderSource::Wgsl(NV12_TO_EAC_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("nv12_to_eac_bgl"),
@@ -2159,7 +2254,7 @@ impl Nv12ToEacPipeline {
                     binding: 5, visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: out_format,
                         view_dimension: wgpu::TextureViewDimension::D2,
                     },
                     count: None,
@@ -2874,14 +2969,43 @@ impl Device {
         lens: Lens,
         dims: vr180_core::eac::Dims,
     ) -> Result<wgpu::Texture> {
+        self.nv12_to_eac_cross_with(s0_y, s0_uv, s4_y, s4_uv, lens, dims, false)
+    }
+
+    /// 16-bit cross variant: P010's 10 bits survive into Rgba16Unorm
+    /// instead of being quantized to 8. For the 10-bit EAC export chain.
+    pub fn nv12_to_eac_cross_16(
+        &self,
+        s0_y:  &wgpu::Texture,
+        s0_uv: &wgpu::Texture,
+        s4_y:  &wgpu::Texture,
+        s4_uv: &wgpu::Texture,
+        lens: Lens,
+        dims: vr180_core::eac::Dims,
+    ) -> Result<wgpu::Texture> {
+        self.nv12_to_eac_cross_with(s0_y, s0_uv, s4_y, s4_uv, lens, dims, true)
+    }
+
+    fn nv12_to_eac_cross_with(
+        &self,
+        s0_y:  &wgpu::Texture,
+        s0_uv: &wgpu::Texture,
+        s4_y:  &wgpu::Texture,
+        s4_uv: &wgpu::Texture,
+        lens: Lens,
+        dims: vr180_core::eac::Dims,
+        sixteen: bool,
+    ) -> Result<wgpu::Texture> {
         let cw = dims.cross_w();
+        let pl = if sixteen { &self.nv12_to_eac_16 } else { &self.nv12_to_eac };
 
         let out_tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(match lens { Lens::A => "cross_a", Lens::B => "cross_b" }),
             size: wgpu::Extent3d { width: cw, height: cw, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: if sixteen { wgpu::TextureFormat::Rgba16Unorm }
+                    else       { wgpu::TextureFormat::Rgba8Unorm },
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                  | wgpu::TextureUsages::STORAGE_BINDING
                  | wgpu::TextureUsages::COPY_SRC,
@@ -2912,13 +3036,13 @@ impl Device {
         let out_v   = out_tex.create_view(&Default::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("nv12_to_eac_bg"),
-            layout: &self.nv12_to_eac.bind_group_layout,
+            layout: &pl.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&s0_y_v) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&s0_uv_v) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&s4_y_v) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&s4_uv_v) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.nv12_to_eac.sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&pl.sampler) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&out_v) },
                 wgpu::BindGroupEntry { binding: 6, resource: uniform_buf.as_entire_binding() },
             ],
@@ -2931,7 +3055,7 @@ impl Device {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("nv12_to_eac_pass"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.nv12_to_eac.pipeline);
+            pass.set_pipeline(&pl.pipeline);
             pass.set_bind_group(0, Some(&bind_group), &[]);
             let wg = (cw + 7) / 8;
             pass.dispatch_workgroups(wg, wg, 1);
@@ -3630,6 +3754,88 @@ impl Device {
         Ok(output_tex)
     }
 
+    /// EAC cross → equidistant-fisheye output (Rgba8Unorm).
+    pub fn project_cross_texture_to_fisheye_texture(
+        &self,
+        cross_tex: &wgpu::Texture,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        rs: EquirectRsParams,
+    ) -> Result<wgpu::Texture> {
+        let output_tex = make_rw_texture(&self.device, "eac_fisheye_out", out_w, out_h,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("eac_fisheye_enc"),
+        });
+        self.record_equirect_project_with(
+            &mut encoder, &self.eac_to_fisheye,
+            cross_tex, &output_tex, out_w, out_h, rotation, rs);
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// 16-bit EAC cross → equidistant-fisheye output (Rgba16Unorm).
+    pub fn project_cross_texture_to_fisheye_texture_16(
+        &self,
+        cross_tex: &wgpu::Texture,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        rs: EquirectRsParams,
+    ) -> Result<wgpu::Texture> {
+        let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("eac_fisheye_out_16"),
+            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("eac_fisheye_enc_16"),
+        });
+        self.record_equirect_project_with(
+            &mut encoder, &self.eac_to_fisheye_16,
+            cross_tex, &output_tex, out_w, out_h, rotation, rs);
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
+    /// 16-bit-output EAC→equirect projection (Rgba16Unorm), taking a
+    /// 16-bit cross from `nv12_to_eac_cross_16`. The 10-bit EAC export
+    /// chain: P010 → Rgba16 cross → Rgba16 equirect → P010 encode.
+    pub fn project_cross_texture_to_equirect_texture_16(
+        &self,
+        cross_tex: &wgpu::Texture,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        rs: EquirectRsParams,
+    ) -> Result<wgpu::Texture> {
+        let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("equirect_tex_out_16"),
+            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("project_tex_enc_16"),
+        });
+        self.record_equirect_project_with(
+            &mut encoder, &self.eac_to_equirect_16,
+            cross_tex, &output_tex, out_w, out_h, rotation, rs);
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
     /// CPU-input version of the above: takes a packed RGB8 cross,
     /// uploads it as an Rgba8Unorm texture, projects, returns the
     /// projected texture (no readback). For the CPU-assemble path.
@@ -3647,6 +3853,24 @@ impl Device {
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         self.upload_rgba(&cross_tex, &cross_rgba, cross_w, cross_w);
         self.project_cross_texture_to_equirect_texture(&cross_tex, out_w, out_h, rotation, rs)
+    }
+
+    /// CPU-input EAC cross → equidistant-fisheye output (fisheye-output
+    /// mode on the portable / CPU-assemble path).
+    pub fn project_cross_to_fisheye_texture(
+        &self,
+        cross_rgb: &[u8],
+        cross_w: u32,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        rs: EquirectRsParams,
+    ) -> Result<wgpu::Texture> {
+        let cross_rgba = rgb_to_rgba(cross_rgb, cross_w as usize, cross_w as usize);
+        let cross_tex = make_rw_texture(&self.device, "cross_for_project",
+            cross_w, cross_w,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        self.upload_rgba(&cross_tex, &cross_rgba, cross_w, cross_w);
+        self.project_cross_texture_to_fisheye_texture(&cross_tex, out_w, out_h, rotation, rs)
     }
 
     /// Apply the full Phase 0.7.5 color stack to one equirect texture,
@@ -3810,6 +4034,20 @@ impl Device {
         rotation: EquirectRotation,
         rs: EquirectRsParams,
     ) {
+        self.record_equirect_project_with(
+            encoder, &self.eac_to_equirect, cross_tex, dst, out_w, out_h, rotation, rs)
+    }
+
+    fn record_equirect_project_with(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pl: &EacToEquirectPipeline,
+        cross_tex: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        rs: EquirectRsParams,
+    ) {
         let cross_v = cross_tex.create_view(&Default::default());
         let dst_v = dst.create_view(&Default::default());
         let r_uniform = self.write_uniform("equirect_R_record",
@@ -3818,10 +4056,10 @@ impl Device {
             &RsUniforms::from_params(rs));
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("equirect_project_bg"),
-            layout: &self.eac_to_equirect.bind_group_layout,
+            layout: &pl.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&cross_v) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.eac_to_equirect.sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&pl.sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_v) },
                 wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: rs_uniform.as_entire_binding() },
@@ -3830,7 +4068,7 @@ impl Device {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("equirect_project_pass"), timestamp_writes: None,
         });
-        pass.set_pipeline(&self.eac_to_equirect.pipeline);
+        pass.set_pipeline(&pl.pipeline);
         pass.set_bind_group(0, Some(&bg), &[]);
         pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
     }

@@ -135,6 +135,125 @@ fn moving_average_3(samples: &[[f32; 3]], win: usize) -> Vec<[f32; 3]> {
     out
 }
 
+/// Python-parity per-frame angular velocity source. Mirrors
+/// `vr180_gui.py` exactly:
+/// - **STMP-anchored sample timestamps** (`gyro_to_timestamps`) +
+///   linear interpolation — NOT `int(t/dt)` nearest-index, which
+///   accumulates ~33 ms of drift over a 71 s clip (the documented
+///   Python bug, fixed there the same way).
+/// - **`raw`** stream for per-scanline groups (smoothing would destroy
+///   the angular-acceleration detail inside the 15 ms readout window).
+/// - **`smoothed`** stream (15 ms box, reflect-padded — byte-matches
+///   `GyroStabilizer.__init__`) for the single-ω fallback.
+///
+/// All values are in the equirect-shader frame `[ω_x=pitch, ω_y=yaw,
+/// ω_z=roll] = [raw[1], raw[0], raw[2]]`, rad/s, **no factors applied**
+/// (the caller multiplies per-axis RS factors).
+pub struct GyroAngvel {
+    pub times: Vec<f32>,
+    pub raw: Vec<[f32; 3]>,
+    pub smoothed: Vec<[f32; 3]>,
+}
+
+impl GyroAngvel {
+    /// Build from raw GYRO blocks + CORI STMP blocks.
+    /// `fallback_duration_s` is used for uniform spacing when STMP
+    /// tags are missing (same fallback as the VQF input prep).
+    pub fn build(
+        gyro_blocks: &[ImuBlock],
+        cori_stmps: &[super::cori_iori::CoriBlockStmp],
+        fps: f32,
+        fallback_duration_s: f32,
+    ) -> Option<Self> {
+        let times = super::resample::build_imu_sample_times(
+            gyro_blocks, cori_stmps, fps, fallback_duration_s,
+        );
+        if times.len() < 10 {
+            return None;
+        }
+        let raw: Vec<[f32; 3]> = gyro_blocks.iter()
+            .flat_map(|b| b.samples.iter())
+            .map(|s| [s[1], s[0], s[2]])
+            .collect();
+        if raw.len() != times.len() {
+            return None;
+        }
+
+        // 15 ms box smooth with reflect padding — matches Python:
+        //   win = max(3, round(0.015 / dt_med)) forced odd,
+        //   padded = col[pad:0:-1] + col + col[-2:-2-pad:-1]
+        let n = raw.len();
+        let mut diffs: Vec<f32> = times.windows(2).take(200)
+            .map(|w| w[1] - w[0]).collect();
+        diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let dt_med = diffs.get(diffs.len() / 2).copied().unwrap_or(1.0 / 800.0);
+        let mut win = ((0.015 / dt_med.max(1e-6)).round() as usize).max(3);
+        if win % 2 == 0 { win += 1; }
+        let pad = win / 2;
+
+        let mut smoothed = vec![[0.0_f32; 3]; n];
+        for ax in 0..3 {
+            // Reflect-padded column (Python's col[pad:0:-1] … col[-2:-2-pad:-1]).
+            let mut padded = Vec::with_capacity(n + 2 * pad);
+            for i in (1..=pad.min(n - 1)).rev() { padded.push(raw[i][ax]); }
+            while padded.len() < pad { padded.push(raw[0][ax]); } // degenerate short input
+            for s in raw.iter() { padded.push(s[ax]); }
+            for i in 1..=pad.min(n - 1) { padded.push(raw[n - 1 - i][ax]); }
+            while padded.len() < n + 2 * pad { padded.push(raw[n - 1][ax]); }
+
+            let mut csum = vec![0.0_f64; padded.len() + 1];
+            for (i, v) in padded.iter().enumerate() {
+                csum[i + 1] = csum[i] + *v as f64;
+            }
+            let inv = 1.0 / win as f64;
+            for i in 0..n {
+                smoothed[i][ax] = ((csum[i + win] - csum[i]) * inv) as f32;
+            }
+        }
+
+        Some(Self { times, raw, smoothed })
+    }
+
+    fn lerp_at(stream: &[[f32; 3]], times: &[f32], t: f32) -> [f32; 3] {
+        let n = stream.len();
+        let t = t.clamp(times[0], times[n - 1]);
+        // bisect_right(times, t) - 1, clamped to [0, n-2]
+        let mut idx = match times.binary_search_by(|x| x.partial_cmp(&t)
+            .unwrap_or(std::cmp::Ordering::Equal)) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        idx = idx.min(n - 2);
+        let (t0, t1) = (times[idx], times[idx + 1]);
+        let dt = t1 - t0;
+        if dt < 1e-9 { return stream[idx]; }
+        let a = ((t - t0) / dt).clamp(0.0, 1.0);
+        let (s0, s1) = (stream[idx], stream[idx + 1]);
+        [
+            s0[0] * (1.0 - a) + s1[0] * a,
+            s0[1] * (1.0 - a) + s1[1] * a,
+            s0[2] * (1.0 - a) + s1[2] * a,
+        ]
+    }
+
+    /// Smoothed ω lerped at frame time `t` — Python's
+    /// `get_angular_velocity_at_time` (GYRO path).
+    pub fn single_at(&self, t: f32) -> [f32; 3] {
+        Self::lerp_at(&self.smoothed, &self.times, t)
+    }
+
+    /// RAW ω at `n_groups` row-times spanning `t ± srot/2` — Python's
+    /// `get_perscanline_rs_angvel` (without factors; caller applies).
+    pub fn groups_at(&self, t: f32, srot_s: f32, n_groups: usize) -> Vec<[f32; 3]> {
+        let n_groups = n_groups.max(2);
+        (0..n_groups).map(|g| {
+            let frac = g as f32 / (n_groups - 1) as f32; // 0..=1
+            let gt = t + (frac - 0.5) * srot_s;
+            Self::lerp_at(&self.raw, &self.times, gt)
+        }).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

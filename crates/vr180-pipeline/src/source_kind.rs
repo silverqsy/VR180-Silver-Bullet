@@ -49,6 +49,13 @@ impl SourceKind {
         matches!(self, Self::DjiOsv | Self::SbsFisheye | Self::BlackmagicRaw)
     }
 
+    /// True if we can preview AND export this source to VR180 SBS —
+    /// every fisheye source plus GoPro EAC. Drives the export button,
+    /// the clip list, and batch eligibility.
+    pub fn is_exportable(self) -> bool {
+        self.is_fisheye() || self.is_eac()
+    }
+
     /// Human-readable name (e.g. for log messages / status bars).
     pub fn display(self) -> &'static str {
         match self {

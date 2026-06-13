@@ -90,6 +90,33 @@ pub struct App {
     /// True while the export-options window is open.
     export_opts_visible: bool,
 
+    // ─── Source clip list + batch export ──────────────────────────
+    /// The working set: every loaded file, each with its own Settings
+    /// (see `BatchItem`). Shown in the Source panel; the batch runs it.
+    batch: Vec<BatchItem>,
+    /// Index of the ACTIVE clip (preview + sidebar). Kept in sync with
+    /// `loaded_path`; `None` when nothing is loaded or the active file
+    /// was removed from the list.
+    active_clip: Option<usize>,
+    batch_visible: bool,
+    batch_running: bool,
+    /// Index of the item the current `export_job` belongs to (only
+    /// meaningful while `batch_running`). `None` = the running job is
+    /// a regular single export.
+    batch_current: Option<usize>,
+    /// The batch's OWN output settings (codec / bitrate / resolution /
+    /// metadata) — edited in the batch window, independent of the
+    /// single-export options.
+    batch_ui_opts: ExportOptions,
+    /// Copy of `batch_ui_opts` frozen at batch start so mid-run edits
+    /// can't change later items.
+    batch_opts: Option<ExportOptions>,
+    /// Output folder override. `None` = next to each source file.
+    batch_out_dir: Option<PathBuf>,
+    /// Set by the "Skip current" button so completion marks the item
+    /// Skipped instead of Done.
+    batch_skip_flag: bool,
+
     /// Preview magnifier for alignment inspection. `preview_zoom` is the
     /// magnification (1.0 = fit-to-window); `preview_center` is the point
     /// of the image kept centered, in UV [0,1]. Scroll zooms toward the
@@ -133,6 +160,9 @@ pub struct App {
     /// Override is re-seeded from it (so Override tracks the new clip's
     /// factory calib instead of the previous clip's stale values).
     fisheye_last_seeded: Option<crate::decoder::DetectedLensCalib>,
+    /// One-shot guard set by `select_clip`: the just-restored settings
+    /// carry per-clip Override values — skip the next auto-reseed.
+    suppress_reseed_once: bool,
 }
 
 /// Codec choice for the export pipeline.
@@ -190,7 +220,7 @@ impl ProResProfile {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct ExportOptions {
     codec: ExportCodec,
     /// Output resolution target (Native / 8192×4096).
@@ -242,6 +272,50 @@ struct ExportJob {
     /// frame so the progress bar / counters don't lag.
     last_progress: Option<vr180_pipeline::fisheye_export::ExportProgress>,
     started_at: std::time::Instant,
+}
+
+/// One entry in the SOURCE CLIP LIST — the app's primary working set.
+/// Every loaded file lives here with its OWN `settings`; the ACTIVE
+/// entry (`App::active_clip`) is what the preview shows and what the
+/// sidebar edits (its settings mirror `App::settings` live, and sync
+/// back on clip switch / batch start). The batch export simply runs
+/// this list. Probe data is captured at add time (cheap header read).
+struct BatchItem {
+    path: PathBuf,
+    fps: f32,
+    duration_sec: f64,
+    source_kind: vr180_pipeline::SourceKind,
+    fisheye_eye_w: u32,
+    fisheye_eye_h: u32,
+    width: u32,
+    height: u32,
+    settings: crate::decoder::Settings,
+    status: BatchStatus,
+}
+
+#[derive(Clone, PartialEq)]
+enum BatchStatus {
+    /// Never exported (or explicitly re-armed). The default.
+    Idle,
+    /// Armed for the current batch run.
+    Queued,
+    Running,
+    Done,
+    Skipped,
+    Failed(String),
+}
+
+impl BatchStatus {
+    fn label(&self) -> String {
+        match self {
+            BatchStatus::Idle       => "—".into(),
+            BatchStatus::Queued     => "queued".into(),
+            BatchStatus::Running    => "running…".into(),
+            BatchStatus::Done       => "done".into(),
+            BatchStatus::Skipped    => "skipped".into(),
+            BatchStatus::Failed(e)  => format!("failed: {e}"),
+        }
+    }
 }
 
 struct DisplayFrame {
@@ -371,6 +445,15 @@ impl App {
             audio_player: None,
             export_opts: ExportOptions::default(),
             export_opts_visible: false,
+            batch: Vec::new(),
+            active_clip: None,
+            batch_visible: false,
+            batch_running: false,
+            batch_current: None,
+            batch_ui_opts: ExportOptions::default(),
+            batch_opts: None,
+            batch_out_dir: None,
+            batch_skip_flag: false,
             preview_zoom: 1.0,
             preview_center: egui::vec2(0.5, 0.5),
             full_res_display: None,
@@ -381,6 +464,7 @@ impl App {
             detail_key_changed_at: std::time::Instant::now(),
             detail_cache: None,
             fisheye_last_seeded: None,
+            suppress_reseed_once: false,
         }
     }
 
@@ -392,7 +476,7 @@ impl App {
     fn start_export(&mut self) {
         if self.export_job.is_some() { return; }
         if !matches!(self.clip.as_ref().map(|c| c.source_kind),
-            Some(k) if k.is_fisheye())
+            Some(k) if k.is_exportable())
         {
             tracing::warn!("export: only fisheye sources supported");
             return;
@@ -410,22 +494,12 @@ impl App {
             (Some(p), Some(c)) => (p.clone(), c.clone()),
             _ => return,
         };
-        if !clip.source_kind.is_fisheye() {
+        if !clip.source_kind.is_exportable() {
             return;
         }
 
         // Default output path: same dir, _SBS.mp4 / .mov suffix.
-        let stem = path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("output");
-        let ext_default = match self.export_opts.codec {
-            ExportCodec::H265 => "mp4",
-            ExportCodec::ProRes => "mov", // ProRes is conventional in MOV
-        };
-        let default_out = path.parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-            .join(format!("{stem}_SBS.{ext_default}"));
+        let default_out = Self::default_output_for(&path, self.export_opts.codec);
 
         let chosen = rfd::FileDialog::new()
             .add_filter(
@@ -442,16 +516,62 @@ impl App {
             .save_file();
         let Some(output_path) = chosen else { return; };
 
+        let opts = self.export_opts;
+        let cfg = Self::build_export_cfg(
+            &path, &output_path,
+            clip.fps, clip.source_kind,
+            clip.fisheye_eye_w, clip.fisheye_eye_h, clip.width, clip.height,
+            &self.settings, &opts,
+        );
+        // GoPro EAC computes stab in the export thread from the same
+        // Settings the preview uses; fisheye sources compute it inside
+        // export_fisheye (eac_stab = None).
+        let eac_stab = if clip.source_kind.is_eac() {
+            Some((self.settings.clone(), clip.frame_count as usize))
+        } else { None };
+        self.spawn_export_job(cfg, self.settings.dji_imu_phase_ms, eac_stab);
+    }
+
+    /// `<source_stem>_SBS.<ext-for-codec>` next to the source.
+    fn default_output_for(source: &std::path::Path, codec: ExportCodec) -> PathBuf {
+        let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+        let ext = match codec {
+            ExportCodec::H265 => "mp4",
+            ExportCodec::ProRes => "mov", // ProRes is conventional in MOV
+        };
+        source.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+            .join(format!("{stem}_SBS.{ext}"))
+    }
+
+    /// Build the full `FisheyeExportConfig` for one (source, output) pair
+    /// from explicit clip facts + a Settings/ExportOptions pair. Pure —
+    /// used by both the single export (current clip + live settings) and
+    /// the batch (per-item probe + per-item settings snapshot).
+    #[allow(clippy::too_many_arguments)]
+    fn build_export_cfg(
+        source_path: &std::path::Path,
+        output_path: &std::path::Path,
+        fps: f32,
+        source_kind: vr180_pipeline::SourceKind,
+        fisheye_eye_w: u32,
+        fisheye_eye_h: u32,
+        width: u32,
+        height: u32,
+        settings: &crate::decoder::Settings,
+        opts: &ExportOptions,
+    ) -> vr180_pipeline::fisheye_export::FisheyeExportConfig {
         // Pick the backend based on the chosen codec + platform. On
         // Windows/Linux, H.265 defaults to NVENC (hardware) — libx265 is
         // the VR180 export bottleneck — but the user can pick software in
         // the options; either way `open_h265_encoder` falls back to libx265
         // if NVENC can't be opened. macOS always uses VideoToolbox.
         use vr180_pipeline::encode::EncoderBackend;
-        let backend = match (self.export_opts.codec, cfg!(target_os = "macos")) {
+        let backend = match (opts.codec, cfg!(target_os = "macos")) {
             (ExportCodec::H265, true) => EncoderBackend::VideoToolbox,
             (ExportCodec::H265, false) =>
-                if self.export_opts.h265_hardware {
+                if opts.h265_hardware {
                     EncoderBackend::HevcNvenc
                 } else {
                     EncoderBackend::Libx265
@@ -464,21 +584,27 @@ impl App {
         // half-equirect VR180 we use the source eye dims (or fallback
         // for non-fisheye sources). For fisheye pass-through we use
         // the raw source eye dims since the projection is bypassed.
-        let (mut eye_w, mut eye_h) = if clip.fisheye_eye_w > 0 {
-            (clip.fisheye_eye_w, clip.fisheye_eye_h)
+        let (mut eye_w, mut eye_h) = if fisheye_eye_w > 0 {
+            (fisheye_eye_w, fisheye_eye_h)
+        } else if source_kind.is_eac() {
+            // GoPro EAC: a SQUARE half-equirect per eye at the cross's
+            // native resolution (cross_w = 2·tile_w + 1920; 3936 on Max).
+            // Full quality vs the preview's ≤2048-clamped square.
+            let cross_w = 2 * (width.saturating_sub(1920) / 4) + 1920;
+            (cross_w.max(512), cross_w.max(512))
         } else {
-            (clip.width.max(512), clip.height.max(512))
+            (width.max(512), height.max(512))
         };
         // 8K target: render the projection itself at 4096² per eye
         // (8192×4096 SBS). The projection samples the native source
         // directly into the 4096 grid — full resolution end-to-end,
         // not a last-step upscale.
-        if self.export_opts.resolution == ExportResolution::R8k {
+        if opts.resolution == ExportResolution::R8k {
             eye_w = 4096;
             eye_h = 4096;
         }
 
-        let projection = match self.settings.fisheye_output_mode {
+        let projection = match settings.fisheye_output_mode {
             crate::decoder::FisheyeOutputMode::HalfEquirect =>
                 vr180_pipeline::fisheye_export::FisheyeExportProjection::HalfEquirect,
             crate::decoder::FisheyeOutputMode::Fisheye =>
@@ -493,83 +619,101 @@ impl App {
             eye_w = side;
             eye_h = side;
         }
-        let color_stack = self.settings.build_color_stack();
+        let color_stack = settings.build_color_stack();
 
         // Bitrate / bit-depth come from the options window. ProRes
         // ignores the bitrate field (the profile picks the rate)
         // and is always 10-bit / 12-bit per profile.
-        let (bitrate_kbps, bit_depth) = match self.export_opts.codec {
+        let (bitrate_kbps, bit_depth) = match opts.codec {
             ExportCodec::H265 => (
-                self.export_opts.h265_bitrate_mbps.saturating_mul(1000),
-                self.export_opts.h265_bit_depth,
+                opts.h265_bitrate_mbps.saturating_mul(1000),
+                opts.h265_bit_depth,
             ),
             ExportCodec::ProRes => {
                 // The encoder ignores bitrate for ProRes but the config
                 // field is non-optional — pass a sane default.
                 let pix_is_12bit = matches!(
-                    self.export_opts.prores_profile,
+                    opts.prores_profile,
                     ProResProfile::P4444 | ProResProfile::P4444Xq,
                 );
                 (0, if pix_is_12bit { 10 } else { 10 })
             }
         };
 
-        // Snapshot the IMU-phase tuning value into the pipeline global so
-        // the export's stabilization uses the value shown in the UI.
-        vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(self.settings.dji_imu_phase_ms);
-        let cfg = vr180_pipeline::fisheye_export::FisheyeExportConfig {
-            source_path: path,
-            output_path: output_path.clone(),
-            source_kind: clip.source_kind,
+        vr180_pipeline::fisheye_export::FisheyeExportConfig {
+            source_path: source_path.to_path_buf(),
+            output_path: output_path.to_path_buf(),
+            source_kind,
             eye_w,
             eye_h,
-            fps: clip.fps,
+            fps,
             bitrate_kbps,
             encoder: backend,
             bit_depth,
-            prores_profile: self.export_opts.prores_profile as i32,
-            inject_apmp: self.export_opts.inject_apmp,
-            inject_youtube_vr180: self.export_opts.inject_youtube,
-            apmp_baseline_mm: self.export_opts.apmp_baseline_mm,
-            stabilize: self.settings.stabilize,
-            dji_max_corr_deg: self.settings.dji_max_corr_deg,
-            dji_smooth_ms: self.settings.dji_smooth_ms,
-            dji_responsiveness: self.settings.dji_responsiveness,
+            prores_profile: opts.prores_profile as i32,
+            inject_apmp: opts.inject_apmp,
+            inject_youtube_vr180: opts.inject_youtube,
+            apmp_baseline_mm: opts.apmp_baseline_mm,
+            stabilize: settings.stabilize,
+            dji_max_corr_deg: settings.dji_max_corr_deg,
+            dji_smooth_ms: settings.dji_smooth_ms,
+            dji_responsiveness: settings.dji_responsiveness,
             view_adjust: vr180_pipeline::panomap::ViewAdjust {
-                pano_yaw_deg: self.settings.pano_yaw_deg,
-                pano_pitch_deg: self.settings.pano_pitch_deg,
-                pano_roll_deg: self.settings.pano_roll_deg,
-                stereo_yaw_deg: self.settings.stereo_yaw_deg,
-                stereo_pitch_deg: self.settings.stereo_pitch_deg,
-                stereo_roll_deg: self.settings.stereo_roll_deg,
-                upside_down: self.settings.camera_upside_down,
+                pano_yaw_deg: settings.pano_yaw_deg,
+                pano_pitch_deg: settings.pano_pitch_deg,
+                pano_roll_deg: settings.pano_roll_deg,
+                stereo_yaw_deg: settings.stereo_yaw_deg,
+                stereo_pitch_deg: settings.stereo_pitch_deg,
+                stereo_roll_deg: settings.stereo_roll_deg,
+                upside_down: settings.camera_upside_down,
             },
-            fisheye_preset: self.settings.fisheye_preset.clone(),
-            fisheye_override_left: self.settings.fisheye_override_left,
-            fisheye_override_right: self.settings.fisheye_override_right,
-            fisheye_fov_deg_left: self.settings.fisheye_fov_deg_left,
-            fisheye_fov_deg_right: self.settings.fisheye_fov_deg_right,
-            fisheye_k_left: self.settings.fisheye_k_left,
-            fisheye_k_right: self.settings.fisheye_k_right,
-            fisheye_k5_left: self.settings.fisheye_k5_left,
-            fisheye_k5_right: self.settings.fisheye_k5_right,
-            fisheye_p_left: self.settings.fisheye_p_left,
-            fisheye_p_right: self.settings.fisheye_p_right,
-            fisheye_cx_norm_left: self.settings.fisheye_cx_norm_left,
-            fisheye_cy_norm_left: self.settings.fisheye_cy_norm_left,
-            fisheye_cx_norm_right: self.settings.fisheye_cx_norm_right,
-            fisheye_cy_norm_right: self.settings.fisheye_cy_norm_right,
+            fisheye_preset: settings.fisheye_preset.clone(),
+            fisheye_override_left: settings.fisheye_override_left,
+            fisheye_override_right: settings.fisheye_override_right,
+            fisheye_fov_deg_left: settings.fisheye_fov_deg_left,
+            fisheye_fov_deg_right: settings.fisheye_fov_deg_right,
+            fisheye_k_left: settings.fisheye_k_left,
+            fisheye_k_right: settings.fisheye_k_right,
+            fisheye_k5_left: settings.fisheye_k5_left,
+            fisheye_k5_right: settings.fisheye_k5_right,
+            fisheye_p_left: settings.fisheye_p_left,
+            fisheye_p_right: settings.fisheye_p_right,
+            fisheye_cx_norm_left: settings.fisheye_cx_norm_left,
+            fisheye_cy_norm_left: settings.fisheye_cy_norm_left,
+            fisheye_cx_norm_right: settings.fisheye_cx_norm_right,
+            fisheye_cy_norm_right: settings.fisheye_cy_norm_right,
             // Effective swap: manual toggle XOR upside-down mount.
-            fisheye_swap_eyes: self.settings.effective_swap_eyes(),
-            trim_in_s: self.settings.trim_in_s,
-            trim_out_s: self.settings.trim_out_s,
+            fisheye_swap_eyes: settings.effective_swap_eyes(),
+            trim_in_s: settings.trim_in_s,
+            trim_out_s: settings.trim_out_s,
             color_stack,
             projection,
-        };
+        }
+    }
 
-        // Stop preview playback for the duration of the export — they'd
-        // otherwise race on the same ffmpeg input contexts / decoder.
-        self.stop_playback();
+    /// Spawn the export worker thread for a prepared config and install
+    /// it as the (single) running `export_job`. `imu_phase_ms` is the
+    /// per-clip IMU sample point — written into the pipeline global
+    /// before the worker starts (jobs are strictly sequential, so a
+    /// per-job global is safe).
+    /// `eac_stab`: for a GoPro `.360` (EAC) export, the `(Settings,
+    /// n_frames)` needed to compute the per-eye stabilization (the
+    /// preview's `build_per_eye_frames`); `None` for fisheye sources,
+    /// which compute stab inside `export_fisheye`.
+    fn spawn_export_job(
+        &mut self,
+        cfg: vr180_pipeline::fisheye_export::FisheyeExportConfig,
+        imu_phase_ms: f32,
+        eac_stab: Option<(crate::decoder::Settings, usize)>,
+    ) {
+        let output_path = cfg.output_path.clone();
+
+        // Stop preview playback when it reads the SAME file as the export
+        // (they'd race on the decoder / file). Previewing a DIFFERENT clip
+        // is fine — that's what lets you keep tuning clips mid-batch.
+        if self.loaded_path.as_ref() == Some(&cfg.source_path) {
+            self.stop_playback();
+        }
 
         let (progress_tx, progress_rx) = crossbeam_channel::bounded(256);
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -598,13 +742,31 @@ impl App {
         };
         #[cfg(not(target_os = "windows"))]
         let pipeline = self.pipeline.clone();
+        let progress_tx2 = progress_tx.clone();
         let handle = std::thread::spawn(move || {
-            vr180_pipeline::fisheye_export::export_fisheye(
-                pipeline,
-                cfg,
-                move |p| { let _ = progress_tx.try_send(p); },
-                cancel_for_thread,
-            )
+            // The IMU-phase store is THREAD-LOCAL — assert this clip's
+            // value on the worker itself (stab + per-frame RS read it
+            // here, immune to whatever the preview threads set).
+            vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(imu_phase_ms);
+            if let Some((settings, n_frames)) = eac_stab {
+                // GoPro EAC: compute the same per-eye stab the preview uses,
+                // then run the EAC export. build_per_eye_frames is empty when
+                // stabilization + RS are both off → identity (no stab).
+                let per_eye = crate::decoder::build_per_eye_frames(
+                    &cfg.source_path, &settings, cfg.fps, n_frames,
+                ).unwrap_or_default();
+                vr180_pipeline::fisheye_export::export_eac(
+                    pipeline, cfg, per_eye,
+                    move |p| { let _ = progress_tx.try_send(p); },
+                    cancel_for_thread,
+                )
+            } else {
+                vr180_pipeline::fisheye_export::export_fisheye(
+                    pipeline, cfg,
+                    move |p| { let _ = progress_tx2.try_send(p); },
+                    cancel_for_thread,
+                )
+            }
         });
         tracing::info!("export: spawned worker → {}", output_path.display());
 
@@ -619,7 +781,9 @@ impl App {
     }
 
     /// Drain progress channel, check if the worker has finished, and
-    /// promote `export_job` to None when it has.
+    /// promote `export_job` to None when it has. When a batch is
+    /// running, completion records the item's outcome and immediately
+    /// starts the next queued item.
     fn poll_export_job(&mut self) {
         let Some(job) = self.export_job.as_mut() else { return; };
         // Drain the channel.
@@ -629,7 +793,8 @@ impl App {
         // Check completion. JoinHandle::is_finished is stable in 1.61+.
         if job.handle.is_finished() {
             let job = self.export_job.take().unwrap();
-            match job.handle.join() {
+            let result = job.handle.join();
+            match &result {
                 Ok(Ok(())) => tracing::info!(
                     "export: done → {} (took {:.2?})",
                     job.output_path.display(), job.started_at.elapsed()
@@ -637,6 +802,248 @@ impl App {
                 Ok(Err(e)) => tracing::error!("export: failed: {e}"),
                 Err(_) => tracing::error!("export: worker panicked"),
             }
+            // Batch bookkeeping: record this item's outcome, then chain
+            // the next queued item. A failed item never stops the batch
+            // (that's the unattended-run contract) — it records the error
+            // and moves on.
+            if let Some(idx) = self.batch_current.take() {
+                if let Some(item) = self.batch.get_mut(idx) {
+                    item.status = if self.batch_skip_flag {
+                        BatchStatus::Skipped
+                    } else {
+                        match result {
+                            Ok(Ok(())) => BatchStatus::Done,
+                            Ok(Err(e)) => BatchStatus::Failed(e.to_string()),
+                            Err(_) => BatchStatus::Failed("worker panicked".into()),
+                        }
+                    };
+                }
+                self.batch_skip_flag = false;
+                if self.batch_running {
+                    self.start_next_batch_item();
+                }
+            }
+        }
+    }
+
+    // ─── Source clip list + batch export ──────────────────────────
+
+    /// Save the live sidebar settings back into the ACTIVE clip's list
+    /// entry. Call before switching clips / starting a batch so edits
+    /// aren't lost (the sidebar edits `self.settings`, not the entry).
+    fn sync_active_clip_settings(&mut self) {
+        if let Some(idx) = self.active_clip {
+            if let Some(item) = self.batch.get_mut(idx) {
+                if self.loaded_path.as_ref() == Some(&item.path) {
+                    item.settings = self.settings.clone();
+                }
+            }
+        }
+    }
+
+    /// Make clip `idx` the active one: preview it and point the sidebar
+    /// at ITS settings. The outgoing clip's edits are saved first.
+    fn select_clip(&mut self, idx: usize) {
+        if self.active_clip == Some(idx) { return; }
+        let Some(path) = self.batch.get(idx).map(|b| b.path.clone()) else { return; };
+        self.sync_active_clip_settings();
+        self.settings = self.batch[idx].settings.clone();
+        self.active_clip = Some(idx);
+        // The restored settings may carry hand-tuned Override values for
+        // THIS clip — don't let the auto-reseed overwrite them when the
+        // clip's in-file calib arrives.
+        self.suppress_reseed_once = true;
+        // The entry's settings already hold the right per-clip trim + IMU
+        // phase (normalized at add, or saved from a previous edit session)
+        // — preserve them through the load.
+        self.load_file_inner(path, true);
+    }
+
+    /// Probe + add files to the clip list. Each entry starts from a copy
+    /// of the CURRENT settings (matching the app's "a new clip keeps your
+    /// last setup" behavior), with the per-clip fields normalized: IMU
+    /// phase re-seeds to SROT/2 of the file's own fps and trim clears —
+    /// unless it IS the currently loaded clip (its live values apply).
+    /// If nothing is loaded yet, the first added clip becomes active.
+    fn add_batch_files(&mut self, paths: Vec<PathBuf>) {
+        let mut first_new: Option<usize> = None;
+        for path in paths {
+            if self.batch.iter().any(|b| b.path == path) {
+                continue; // already in the list
+            }
+            let source_kind = vr180_pipeline::source_kind::detect(&path)
+                .unwrap_or(vr180_pipeline::SourceKind::Unknown);
+            if !source_kind.is_exportable() {
+                tracing::warn!("batch: skipping non-exportable source {}", path.display());
+                continue;
+            }
+            let probe = match vr180_pipeline::decode::probe_video(&path) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("batch: probe failed for {}: {e}", path.display());
+                    continue;
+                }
+            };
+            let (fisheye_eye_w, fisheye_eye_h) = match source_kind {
+                vr180_pipeline::SourceKind::SbsFisheye => (probe.width / 2, probe.height),
+                vr180_pipeline::SourceKind::DjiOsv     => (probe.width, probe.height),
+                vr180_pipeline::SourceKind::BlackmagicRaw => {
+                    if let Ok(info) = vr180_braw::BrawInfo::probe(&path) {
+                        if info.is_dual_track() { (info.width / 2, info.height) }
+                        else { (info.width, info.height) }
+                    } else {
+                        (probe.width, probe.height)
+                    }
+                }
+                _ => (0, 0),
+            };
+            let is_loaded_clip = self.loaded_path.as_deref() == Some(path.as_path());
+            let mut settings = self.settings.clone();
+            if !is_loaded_clip {
+                settings.dji_imu_phase_ms =
+                    vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(probe.fps);
+                settings.trim_in_s = None;
+                settings.trim_out_s = None;
+            }
+            self.batch.push(BatchItem {
+                path,
+                fps: probe.fps,
+                duration_sec: probe.duration_sec,
+                source_kind,
+                fisheye_eye_w, fisheye_eye_h,
+                width: probe.width, height: probe.height,
+                settings,
+                status: BatchStatus::Idle,
+            });
+            if is_loaded_clip {
+                // The loaded clip just joined the list — link it up.
+                self.active_clip = Some(self.batch.len() - 1);
+            }
+            first_new.get_or_insert(self.batch.len() - 1);
+        }
+        // Nothing on screen yet → activate the first added clip so the
+        // preview + sidebar have something to work on.
+        if self.loaded_path.is_none() {
+            if let Some(idx) = first_new {
+                self.select_clip(idx);
+            }
+        }
+    }
+
+    /// Overwrite an item's settings snapshot with the CURRENT settings,
+    /// preserving its per-clip fields (trim + IMU phase) — "apply my
+    /// grade/stab/output choices", not "copy clip A's trim everywhere".
+    fn apply_current_settings_to_item(&mut self, idx: usize) {
+        let Some(item) = self.batch.get_mut(idx) else { return; };
+        if item.status == BatchStatus::Running { return; }
+        let keep_trim = (item.settings.trim_in_s, item.settings.trim_out_s);
+        let keep_phase = item.settings.dji_imu_phase_ms;
+        item.settings = self.settings.clone();
+        item.settings.trim_in_s = keep_trim.0;
+        item.settings.trim_out_s = keep_trim.1;
+        item.settings.dji_imu_phase_ms = keep_phase;
+        // Re-arm a previously finished item so the change exports on the
+        // next Start.
+        if !matches!(item.status, BatchStatus::Queued) {
+            item.status = BatchStatus::Idle;
+        }
+    }
+
+    /// Output path for a batch item: `<stem>_SBS.<ext>` in the override
+    /// folder (or next to the source), auto-renamed ` (2)`, ` (3)`… on
+    /// collision rather than overwriting or silently skipping.
+    fn batch_output_for(&self, item: &BatchItem, opts: &ExportOptions) -> PathBuf {
+        let mut out = Self::default_output_for(&item.path, opts.codec);
+        if let Some(dir) = &self.batch_out_dir {
+            if let Some(name) = out.file_name() {
+                out = dir.join(name);
+            }
+        }
+        if out.exists() {
+            let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("output").to_string();
+            let ext = out.extension().and_then(|s| s.to_str()).unwrap_or("mp4").to_string();
+            let dir = out.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            for n in 2.. {
+                let cand = dir.join(format!("{stem} ({n}).{ext}"));
+                if !cand.exists() { out = cand; break; }
+            }
+        }
+        out
+    }
+
+    fn start_batch(&mut self) {
+        if self.batch_running || self.export_job.is_some() { return; }
+        // Capture the active clip's latest sidebar edits, then arm every
+        // not-yet-exported clip (Done stays done — re-arm one explicitly
+        // with its Re-run button, or via "apply settings", which re-arms too).
+        self.sync_active_clip_settings();
+        for item in &mut self.batch {
+            if matches!(item.status,
+                BatchStatus::Idle | BatchStatus::Failed(_) | BatchStatus::Skipped)
+            {
+                item.status = BatchStatus::Queued;
+            }
+        }
+        if !self.batch.iter().any(|b| b.status == BatchStatus::Queued) { return; }
+        // Freeze the batch's output settings for the whole run so mid-run
+        // edits can't change later items.
+        self.batch_opts = Some(self.batch_ui_opts);
+        self.batch_running = true;
+        self.batch_skip_flag = false;
+        self.start_next_batch_item();
+    }
+
+    fn start_next_batch_item(&mut self) {
+        let Some(idx) = self.batch.iter().position(|b| b.status == BatchStatus::Queued) else {
+            // Queue drained — batch complete.
+            let done = self.batch.iter().filter(|b| b.status == BatchStatus::Done).count();
+            let failed = self.batch.iter().filter(|b| matches!(b.status, BatchStatus::Failed(_))).count();
+            tracing::info!("batch: complete — {done} done, {failed} failed, {} total", self.batch.len());
+            self.batch_running = false;
+            self.batch_opts = None;
+            return;
+        };
+        let opts = self.batch_opts.unwrap_or(self.batch_ui_opts);
+        let output = self.batch_output_for(&self.batch[idx], &opts);
+        let (cfg, imu_phase, eac_stab) = {
+            let item = &self.batch[idx];
+            let n_frames = (item.duration_sec * item.fps as f64).round() as usize;
+            let eac_stab = if item.source_kind.is_eac() {
+                Some((item.settings.clone(), n_frames))
+            } else { None };
+            (
+                Self::build_export_cfg(
+                    &item.path, &output,
+                    item.fps, item.source_kind,
+                    item.fisheye_eye_w, item.fisheye_eye_h, item.width, item.height,
+                    &item.settings, &opts,
+                ),
+                item.settings.dji_imu_phase_ms,
+                eac_stab,
+            )
+        };
+        self.batch[idx].status = BatchStatus::Running;
+        self.batch_current = Some(idx);
+        tracing::info!("batch: item {}/{} → {}", idx + 1, self.batch.len(), output.display());
+        self.spawn_export_job(cfg, imu_phase, eac_stab);
+    }
+
+    /// Cancel the running item but keep the batch going (poll marks it
+    /// Skipped and chains the next).
+    fn skip_current_batch_item(&mut self) {
+        if let (Some(_), Some(job)) = (self.batch_current, self.export_job.as_ref()) {
+            self.batch_skip_flag = true;
+            job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Stop the whole batch: cancel the running item and don't chain.
+    fn stop_batch(&mut self) {
+        self.batch_running = false;
+        self.batch_opts = None;
+        if let (Some(_), Some(job)) = (self.batch_current, self.export_job.as_ref()) {
+            self.batch_skip_flag = true; // mark the cut-short item Skipped
+            job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -884,21 +1291,42 @@ impl App {
     // ─── File loading ────────────────────────────────────────────
 
     fn pick_and_load_file(&mut self) {
-        let path = rfd::FileDialog::new()
-            .add_filter(
-                "All supported video",
-                &["360", "osv", "OSV", "braw", "BRAW",
-                  "mp4", "MP4", "mov", "MOV"],
-            )
-            .add_filter("DJI Osmo 360 (.osv)", &["osv", "OSV"])
-            .add_filter("Blackmagic RAW (.braw)", &["braw", "BRAW"])
-            .add_filter("Side-by-side fisheye (.mp4 / .mov)",
-                &["mp4", "MP4", "mov", "MOV"])
-            .pick_file();
-        if let Some(p) = path { self.load_file(p); }
+        if let Some(paths) = Self::video_file_dialog().pick_files() {
+            self.open_paths(paths);
+        }
+    }
+
+    /// Open one or more files: fisheye sources join the clip list (and
+    /// the first picked becomes active); legacy non-fisheye sources
+    /// (GoPro `.360` EAC) bypass the list and load directly, exactly as
+    /// before — they aren't batchable.
+    fn open_paths(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() { return; }
+        let first = paths[0].clone();
+        let (fisheye, other): (Vec<PathBuf>, Vec<PathBuf>) =
+            paths.into_iter().partition(|p| {
+                vr180_pipeline::source_kind::detect(p)
+                    .map(|k| k.is_exportable()).unwrap_or(false)
+            });
+        self.add_batch_files(fisheye);
+        if let Some(idx) = self.batch.iter().position(|b| b.path == first) {
+            self.select_clip(idx);
+        } else if let Some(p) = other.into_iter().next() {
+            self.load_file(p);
+            self.active_clip = None; // legacy clip isn't a list entry
+        }
     }
 
     fn load_file(&mut self, path: PathBuf) {
+        self.load_file_inner(path, false);
+    }
+
+    /// `preserve_clip_settings = true` keeps the per-clip fields (trim +
+    /// IMU phase) currently in `self.settings` instead of resetting them
+    /// — used when re-activating a clip whose own settings were just
+    /// restored from the clip list (and for same-clip reloads like the
+    /// eye-orientation toggle).
+    fn load_file_inner(&mut self, path: PathBuf, preserve_clip_settings: bool) {
         let t_load = std::time::Instant::now();
         // ── Tear down everything tied to the previous clip ──────────
         // 1. Stop the decoder thread + drop the IPC channels.
@@ -923,8 +1351,10 @@ impl App {
         //    (preset + built-in LUT) below only fill in still-unset values,
         //    so an explicit choice always wins.
         self.fps_stats = FpsStats::default();
-        self.settings.trim_in_s = None;
-        self.settings.trim_out_s = None;
+        if !preserve_clip_settings {
+            self.settings.trim_in_s = None;
+            self.settings.trim_out_s = None;
+        }
         // 4. Drop ClipInfo + path so the sidebar shows "no file"
         //    momentarily if probe / detection below fails.
         self.clip = None;
@@ -999,25 +1429,44 @@ impl App {
             };
             self.settings.fisheye_preset = auto.to_string();
         }
-        // Autoload the embedded DJI Osmo 360 "D-Log M → Rec.709" LUT for OSV
-        // footage so the preview and export show corrected Rec.709 color by
-        // default — but only when no LUT is set, so a remembered choice (a
-        // different LUT, or a deliberately cleared one within a session) is
-        // preserved. The user can clear or swap it in the Color panel.
-        if source_kind == vr180_pipeline::SourceKind::DjiOsv
-            && self.settings.lut_path.is_empty()
+        // Autoload the embedded log→Rec.709 LUT matching the source —
+        // DJI D-Log M for OSV, GoPro GP-Log for `.360` (same behavior as
+        // the Python app's bundled "Recommended Lut GPLOG") — but only
+        // when no LUT is set, so a remembered choice (a different LUT,
+        // or a deliberately cleared one within a session) is preserved.
+        // If the OTHER source's builtin is set (clip switch), swap it —
+        // the log curves are camera-specific. The user can clear or
+        // swap it in the Color panel.
         {
-            self.settings.lut_path = crate::decoder::BUILTIN_OSMO_LUT_PATH.to_string();
-            self.settings.lut_intensity = 1.0;
+            use crate::decoder::{BUILTIN_OSMO_LUT_PATH, BUILTIN_GPLOG_LUT_PATH};
+            let wanted = match source_kind {
+                vr180_pipeline::SourceKind::DjiOsv   => Some(BUILTIN_OSMO_LUT_PATH),
+                vr180_pipeline::SourceKind::GoProEac => Some(BUILTIN_GPLOG_LUT_PATH),
+                _ => None,
+            };
+            let cur_is_builtin = self.settings.lut_path == BUILTIN_OSMO_LUT_PATH
+                || self.settings.lut_path == BUILTIN_GPLOG_LUT_PATH;
+            match wanted {
+                Some(w) if self.settings.lut_path.is_empty() || cur_is_builtin => {
+                    if self.settings.lut_path != w {
+                        self.settings.lut_path = w.to_string();
+                        self.settings.lut_intensity = 1.0;
+                    }
+                }
+                None if cur_is_builtin => self.settings.lut_path.clear(),
+                _ => {}
+            }
         }
         // Refresh the (non-persisted) IMU-phase to SROT/2 for THIS clip's fps
         // — fps-aware (9.15 ms @30 fps, 8.11 ms @50 fps), re-seeded on every
         // load so a prior clip's tweak never carries over. Set before the
         // snapshot below so the decoder spawns with it and gen isn't bumped
         // on frame 0.
-        let imu_phase = vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(probe.fps);
-        self.settings.dji_imu_phase_ms = imu_phase;
-        vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(imu_phase);
+        if !preserve_clip_settings {
+            let imu_phase = vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(probe.fps);
+            self.settings.dji_imu_phase_ms = imu_phase;
+        }
+        vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(self.settings.dji_imu_phase_ms);
 
         // Snapshot settings so the next spawn_decoder doesn't bump
         // generation unnecessarily on the first frame.
@@ -1292,6 +1741,12 @@ impl App {
         }
         self.fisheye_last_seeded = detected;
         let Some(d) = detected else { return; }; // cleared mid-load → wait for next
+        // Clip-list restore in flight: the settings carry hand-tuned
+        // per-clip Override values — keep them instead of re-seeding
+        // from the file. One-shot (the next clip change reseeds again).
+        if std::mem::take(&mut self.suppress_reseed_once) {
+            return;
+        }
         if self.settings.fisheye_override_left {
             self.settings.fisheye_fov_deg_left = d.left.fov_deg;
             self.settings.fisheye_cx_norm_left = d.left.cx_norm;
@@ -1347,6 +1802,321 @@ impl App {
     /// is set. The window is dismissable; "Start Export…" hands off to
     /// `commit_export()` which pops the save-file dialog and spawns the
     /// encode worker.
+    /// Batch-export window: stage files with per-item Settings
+    /// snapshots, run them sequentially through the single-job export
+    /// runner. See `BatchItem` for the snapshot semantics.
+    fn draw_batch_window(&mut self, ctx: &egui::Context) {
+        if !self.batch_visible { return; }
+        let mut open = true;
+        // Deferred actions — the list iteration borrows `self.batch`.
+        let mut remove_idx: Option<usize> = None;
+        let mut apply_idx: Option<usize> = None;
+        let mut requeue_idx: Option<usize> = None;
+        let mut do_add_files = false;
+        let mut do_apply_all = false;
+        let mut do_start = false;
+        let mut do_skip = false;
+        let mut do_stop = false;
+
+        egui::Window::new("Batch export")
+            .resizable(true)
+            .collapsible(true)
+            .default_width(520.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                // ── Staging row ─────────────────────────────────────
+                ui.horizontal(|ui| {
+                    if ui.button("Add files…").clicked() { do_add_files = true; }
+                    ui.label(RichText::new(
+                        "The list is shared with the Source panel — select a \
+                         clip there to edit its settings."
+                    ).small().color(Color32::GRAY));
+                });
+
+                // ── Output folder ───────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.label("Output:");
+                    match &self.batch_out_dir {
+                        Some(d) => { ui.monospace(d.to_string_lossy()); }
+                        None => { ui.label(RichText::new("next to each source").color(Color32::GRAY)); }
+                    }
+                    if ui.small_button("Choose folder…").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            self.batch_out_dir = Some(dir);
+                        }
+                    }
+                    if self.batch_out_dir.is_some() && ui.small_button("Clear").clicked() {
+                        self.batch_out_dir = None;
+                    }
+                });
+
+                // ── The batch's own output settings (codec / bitrate /
+                //    resolution / metadata) — independent of the single-
+                //    export options window. Frozen at Start; grayed while
+                //    a run is in flight so the freeze is visible.
+                let summary = format!(
+                    "Output settings — {} · {}{}",
+                    self.batch_ui_opts.codec.label(),
+                    self.batch_ui_opts.resolution.label(),
+                    match self.batch_ui_opts.codec {
+                        ExportCodec::H265 => format!(" · {} Mbps · {}-bit",
+                            self.batch_ui_opts.h265_bitrate_mbps,
+                            self.batch_ui_opts.h265_bit_depth),
+                        ExportCodec::ProRes => format!(" · {}",
+                            self.batch_ui_opts.prores_profile.label()),
+                    },
+                );
+                egui::CollapsingHeader::new(summary)
+                    .id_source("batch_output_settings")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.add_enabled_ui(!self.batch_running, |ui| {
+                            Self::export_options_ui(ui, &mut self.batch_ui_opts, "batch");
+                        });
+                        if self.batch_running {
+                            ui.label(RichText::new(
+                                "Locked while the batch runs (settings were \
+                                 frozen at Start)."
+                            ).small().color(Color32::GRAY));
+                        }
+                    });
+                ui.separator();
+
+                // ── Queue list (the shared source clip list) ────────
+                if self.batch.is_empty() {
+                    ui.label(RichText::new(
+                        "No clips loaded. Add files here or in the Source \
+                         panel — every clip keeps its OWN settings: select \
+                         it in Source, tune, and the batch exports each \
+                         clip with its own look. Calibration and \
+                         stabilization always come from each file itself."
+                    ).color(Color32::GRAY));
+                }
+                let progress_pct = self.export_job.as_ref()
+                    .and_then(|j| j.last_progress.as_ref())
+                    .map(|p| (p.frame_idx, p.total_frames, p.fps_avg));
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    for (i, item) in self.batch.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let name = item.path.file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let running = item.status == BatchStatus::Running;
+                            let status_col = match &item.status {
+                                BatchStatus::Done       => Color32::from_rgb(120, 200, 120),
+                                BatchStatus::Failed(_)  => Color32::from_rgb(230, 110, 110),
+                                BatchStatus::Running    => Color32::from_rgb(120, 180, 255),
+                                BatchStatus::Idle
+                                | BatchStatus::Skipped
+                                | BatchStatus::Queued   => Color32::GRAY,
+                            };
+                            ui.label(RichText::new(format!("{:>2}.", i + 1)).color(Color32::GRAY));
+                            ui.label(RichText::new(name).strong());
+                            ui.label(RichText::new(format!("{:.0}s", item.duration_sec)).color(Color32::GRAY));
+                            let status_txt = if running {
+                                if let Some((f, t, fps)) = progress_pct {
+                                    format!("running {} / {} ({:.1} fps)", f, t.max(1), fps)
+                                } else { item.status.label() }
+                            } else { item.status.label() };
+                            ui.label(RichText::new(status_txt).color(status_col));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if !running {
+                                    if ui.small_button("X").on_hover_text("Remove from list").clicked() {
+                                        remove_idx = Some(i);
+                                    }
+                                    if matches!(item.status,
+                                        BatchStatus::Done | BatchStatus::Skipped | BatchStatus::Failed(_))
+                                        && ui.small_button("Re-run").on_hover_text(
+                                            "Re-arm this clip for export"
+                                        ).clicked()
+                                    {
+                                        requeue_idx = Some(i);
+                                    }
+                                    if ui.small_button("Set").on_hover_text(
+                                        "Apply the ACTIVE clip's settings to this clip (keeps its trim)"
+                                    ).clicked() {
+                                        apply_idx = Some(i);
+                                    }
+                                }
+                            });
+                        });
+                    }
+                });
+                ui.separator();
+
+                // ── Controls ────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    // "Will run" = everything Start would arm + already armed.
+                    let will_run = self.batch.iter().filter(|b| matches!(b.status,
+                        BatchStatus::Idle | BatchStatus::Queued
+                        | BatchStatus::Failed(_) | BatchStatus::Skipped)).count();
+                    if !self.batch_running {
+                        let can_start = will_run > 0 && self.export_job.is_none();
+                        ui.add_enabled_ui(can_start, |ui| {
+                            if ui.button(format!("▶ Start batch ({will_run})")).clicked() {
+                                do_start = true;
+                            }
+                        });
+                        ui.label(RichText::new("Done clips are skipped — re-arm with Re-run")
+                            .small().color(Color32::GRAY));
+                    } else {
+                        if ui.button("Skip current").clicked() { do_skip = true; }
+                        if ui.button("Stop batch").clicked() { do_stop = true; }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let any_idle = self.batch.iter().any(|b| b.status != BatchStatus::Running);
+                        ui.add_enabled_ui(any_idle, |ui| {
+                            if ui.button("Apply active clip's settings to all")
+                                .on_hover_text("Overwrites every clip's settings with the active \
+                                                clip's. Per-clip trim and IMU phase are kept.")
+                                .clicked()
+                            {
+                                do_apply_all = true;
+                            }
+                        });
+                    });
+                });
+            });
+        self.batch_visible = open;
+
+        // ── Apply deferred actions ──────────────────────────────────
+        if do_add_files {
+            if let Some(paths) = Self::video_file_dialog().pick_files() {
+                // Staging from the batch window doesn't yank the preview —
+                // it only adds to the shared list.
+                self.add_batch_files(paths);
+            }
+        }
+        if let Some(i) = remove_idx { self.remove_clip(i); }
+        if let Some(i) = apply_idx { self.apply_current_settings_to_item(i); }
+        if let Some(i) = requeue_idx {
+            if let Some(item) = self.batch.get_mut(i) {
+                // Mid-run a re-armed clip joins the current run; otherwise
+                // it waits for the next Start.
+                item.status = if self.batch_running {
+                    BatchStatus::Queued
+                } else {
+                    BatchStatus::Idle
+                };
+            }
+        }
+        if do_apply_all {
+            for i in 0..self.batch.len() {
+                self.apply_current_settings_to_item(i);
+            }
+        }
+        if do_start { self.start_batch(); }
+        if do_skip { self.skip_current_batch_item(); }
+        if do_stop { self.stop_batch(); }
+    }
+
+    /// The export-output controls (resolution / codec / codec-specific /
+    /// VR180 metadata), shared between the single-export options window
+    /// and the batch window's "Output settings" section. `id_prefix`
+    /// keeps the ComboBox ids distinct when both windows are open.
+    fn export_options_ui(ui: &mut egui::Ui, opts: &mut ExportOptions, id_prefix: &str) {
+        ui.label(RichText::new("Resolution").strong());
+        egui::ComboBox::from_id_source(format!("{id_prefix}_resolution"))
+            .selected_text(opts.resolution.label())
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut opts.resolution,
+                    ExportResolution::Native, ExportResolution::Native.label());
+                ui.selectable_value(&mut opts.resolution,
+                    ExportResolution::R8k, ExportResolution::R8k.label());
+            });
+        ui.add_space(8.0);
+
+        ui.label(RichText::new("Codec").strong());
+        egui::ComboBox::from_id_source(format!("{id_prefix}_codec"))
+            .selected_text(opts.codec.label())
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut opts.codec, ExportCodec::H265,   ExportCodec::H265.label());
+                ui.selectable_value(&mut opts.codec, ExportCodec::ProRes, ExportCodec::ProRes.label());
+            });
+        ui.add_space(8.0);
+
+        match opts.codec {
+            ExportCodec::H265 => {
+                ui.label(RichText::new("H.265 bitrate").strong());
+                ui.add(egui::Slider::new(&mut opts.h265_bitrate_mbps, 20..=500)
+                    .text("Mbps"));
+                ui.add_space(4.0);
+                // 10-bit (Main10) is the default and stays 10-bit
+                // end-to-end; 8-bit (Main) is offered for users who
+                // need the wider-compatibility profile.
+                ui.label(RichText::new("Bit depth").strong());
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut opts.h265_bit_depth, 10u8, "10-bit (Main10)");
+                    ui.selectable_value(&mut opts.h265_bit_depth, 8u8,  "8-bit (Main)");
+                });
+                // Encoder choice — hardware vs software. macOS always
+                // uses VideoToolbox, so only surface this elsewhere.
+                if !cfg!(target_os = "macos") {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Encoder").strong());
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut opts.h265_hardware, true,  "Hardware (NVENC)");
+                        ui.selectable_value(&mut opts.h265_hardware, false, "Software (libx265)");
+                    });
+                    ui.label(RichText::new(if opts.h265_hardware {
+                        "GPU HEVC — fast (NVIDIA); auto-falls back to libx265 if unavailable."
+                    } else {
+                        "CPU HEVC — slow at VR180 resolutions, max software quality."
+                    }).weak().size(11.0));
+                }
+            }
+            ExportCodec::ProRes => {
+                ui.label(RichText::new("ProRes profile").strong());
+                egui::ComboBox::from_id_source(format!("{id_prefix}_prores_profile"))
+                    .selected_text(opts.prores_profile.label())
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        use ProResProfile::*;
+                        for p in [Proxy, Lt, Standard, Hq, P4444, P4444Xq] {
+                            ui.selectable_value(&mut opts.prores_profile, p, p.label());
+                        }
+                    });
+            }
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.label(RichText::new("VR180 metadata").strong());
+        // Mutually exclusive — they overwrite the same atoms.
+        // Show as radio so it's obvious only one is active.
+        #[derive(PartialEq, Eq, Copy, Clone)]
+        enum MetaTarget { None, Apmp, Youtube }
+        let mut target = match (opts.inject_apmp, opts.inject_youtube) {
+            (true, _)        => MetaTarget::Apmp,
+            (false, true)    => MetaTarget::Youtube,
+            _                => MetaTarget::None,
+        };
+        ui.radio_value(&mut target, MetaTarget::Apmp,
+            "Apple Vision Pro (APMP — vexu + hfov)");
+        if matches!(target, MetaTarget::Apmp) {
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label("Camera baseline");
+                ui.add(egui::Slider::new(&mut opts.apmp_baseline_mm, 30.0..=120.0)
+                    .suffix(" mm").fixed_decimals(1));
+            });
+        }
+        ui.radio_value(&mut target, MetaTarget::Youtube,
+            "YouTube (Spherical V2 — st3d + sv3d)");
+        ui.radio_value(&mut target, MetaTarget::None,
+            "None (no VR180 metadata)");
+        opts.inject_apmp    = matches!(target, MetaTarget::Apmp);
+        opts.inject_youtube = matches!(target, MetaTarget::Youtube);
+        ui.label(RichText::new(
+            "APMP and Spatial V2 conflict in the same atoms, so \
+             only one can be active per file. Re-run the export \
+             with the other target if you need a second copy."
+        ).small().color(Color32::GRAY));
+    }
+
     fn draw_export_options_window(&mut self, ctx: &egui::Context) {
         if !self.export_opts_visible { return; }
         let mut open = true;
@@ -1358,107 +2128,7 @@ impl App {
             .default_width(360.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                let opts = &mut self.export_opts;
-                ui.label(RichText::new("Resolution").strong());
-                egui::ComboBox::from_id_source("export_resolution")
-                    .selected_text(opts.resolution.label())
-                    .width(220.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut opts.resolution,
-                            ExportResolution::Native, ExportResolution::Native.label());
-                        ui.selectable_value(&mut opts.resolution,
-                            ExportResolution::R8k, ExportResolution::R8k.label());
-                    });
-                ui.add_space(8.0);
-
-                ui.label(RichText::new("Codec").strong());
-                egui::ComboBox::from_id_source("export_codec")
-                    .selected_text(opts.codec.label())
-                    .width(220.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut opts.codec, ExportCodec::H265,   ExportCodec::H265.label());
-                        ui.selectable_value(&mut opts.codec, ExportCodec::ProRes, ExportCodec::ProRes.label());
-                    });
-                ui.add_space(8.0);
-
-                match opts.codec {
-                    ExportCodec::H265 => {
-                        ui.label(RichText::new("H.265 bitrate").strong());
-                        ui.add(egui::Slider::new(&mut opts.h265_bitrate_mbps, 20..=500)
-                            .text("Mbps"));
-                        ui.add_space(4.0);
-                        // 10-bit (Main10) is the default and stays 10-bit
-                        // end-to-end; 8-bit (Main) is offered for users who
-                        // need the wider-compatibility profile.
-                        ui.label(RichText::new("Bit depth").strong());
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut opts.h265_bit_depth, 10u8, "10-bit (Main10)");
-                            ui.selectable_value(&mut opts.h265_bit_depth, 8u8,  "8-bit (Main)");
-                        });
-                        // Encoder choice — hardware vs software. macOS always
-                        // uses VideoToolbox, so only surface this elsewhere.
-                        if !cfg!(target_os = "macos") {
-                            ui.add_space(4.0);
-                            ui.label(RichText::new("Encoder").strong());
-                            ui.horizontal(|ui| {
-                                ui.selectable_value(&mut opts.h265_hardware, true,  "Hardware (NVENC)");
-                                ui.selectable_value(&mut opts.h265_hardware, false, "Software (libx265)");
-                            });
-                            ui.label(RichText::new(if opts.h265_hardware {
-                                "GPU HEVC — fast (NVIDIA); auto-falls back to libx265 if unavailable."
-                            } else {
-                                "CPU HEVC — slow at VR180 resolutions, max software quality."
-                            }).weak().size(11.0));
-                        }
-                    }
-                    ExportCodec::ProRes => {
-                        ui.label(RichText::new("ProRes profile").strong());
-                        egui::ComboBox::from_id_source("prores_profile")
-                            .selected_text(opts.prores_profile.label())
-                            .width(220.0)
-                            .show_ui(ui, |ui| {
-                                use ProResProfile::*;
-                                for p in [Proxy, Lt, Standard, Hq, P4444, P4444Xq] {
-                                    ui.selectable_value(&mut opts.prores_profile, p, p.label());
-                                }
-                            });
-                    }
-                }
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(RichText::new("VR180 metadata").strong());
-                // Mutually exclusive — they overwrite the same atoms.
-                // Show as radio so it's obvious only one is active.
-                #[derive(PartialEq, Eq, Copy, Clone)]
-                enum MetaTarget { None, Apmp, Youtube }
-                let mut target = match (opts.inject_apmp, opts.inject_youtube) {
-                    (true, _)        => MetaTarget::Apmp,
-                    (false, true)    => MetaTarget::Youtube,
-                    _                => MetaTarget::None,
-                };
-                ui.radio_value(&mut target, MetaTarget::Apmp,
-                    "Apple Vision Pro (APMP — vexu + hfov)");
-                if matches!(target, MetaTarget::Apmp) {
-                    ui.horizontal(|ui| {
-                        ui.add_space(20.0);
-                        ui.label("Camera baseline");
-                        ui.add(egui::Slider::new(&mut opts.apmp_baseline_mm, 30.0..=120.0)
-                            .suffix(" mm").fixed_decimals(1));
-                    });
-                }
-                ui.radio_value(&mut target, MetaTarget::Youtube,
-                    "YouTube (Spherical V2 — st3d + sv3d)");
-                ui.radio_value(&mut target, MetaTarget::None,
-                    "None (no VR180 metadata)");
-                opts.inject_apmp    = matches!(target, MetaTarget::Apmp);
-                opts.inject_youtube = matches!(target, MetaTarget::Youtube);
-                ui.label(RichText::new(
-                    "APMP and Spatial V2 conflict in the same atoms, so \
-                     only one can be active per file. Re-run the export \
-                     with the other target if you need a second copy."
-                ).small().color(Color32::GRAY));
+                Self::export_options_ui(ui, &mut self.export_opts, "export");
 
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
@@ -1467,7 +2137,7 @@ impl App {
                         self.export_opts_visible = false;
                     }
                     ui.add_space(8.0);
-                    let label = match opts.codec {
+                    let label = match self.export_opts.codec {
                         ExportCodec::H265   => "Start Export… (H.265)",
                         ExportCodec::ProRes => "Start Export… (ProRes)",
                     };
@@ -1508,7 +2178,8 @@ impl eframe::App for App {
             if let Some(p) = self.loaded_path.clone() {
                 tracing::info!("eye orientation changed (swap={}, upside_down={}) — reloading clip",
                     eye_orient.0, eye_orient.1);
-                self.load_file(p);
+                // Same clip — keep its trim + IMU phase across the reload.
+                self.load_file_inner(p, true);
             }
         }
         // Drain export-job progress + check for completion.
@@ -1517,21 +2188,27 @@ impl eframe::App for App {
         self.poll_full_res(ctx);
         // Export options floating window (shown on Export click).
         self.draw_export_options_window(ctx);
+        // Batch-export window + keep repainting while a batch is mid-run
+        // so completion chaining doesn't wait for mouse input.
+        self.draw_batch_window(ctx);
+        if self.batch_running {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
         // Force a continuous repaint while an export is in flight so
         // the progress bar updates without needing mouse input.
         if self.export_job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        // Handle dropped files (drag-and-drop into the window).
-        ctx.input(|i| {
-            for f in &i.raw.dropped_files {
-                if let Some(p) = f.path.clone() {
-                    self.load_file(p);
-                    break;
-                }
-            }
+        // Handle dropped files (drag-and-drop into the window). All
+        // dropped fisheye files join the clip list; the first becomes
+        // active.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
         });
+        if !dropped.is_empty() {
+            self.open_paths(dropped);
+        }
 
         // Keyboard shortcuts. Only fire when no text widget owns the
         // focus — egui's `wants_keyboard_input` handles that for us.
@@ -1578,18 +2255,32 @@ impl eframe::App for App {
                         self.pick_and_load_file();
                     }
 
-                    // Export — only enabled for fisheye sources with no
-                    // export already in flight.
+                    // Export — enabled for any exportable source (fisheye
+                    // or GoPro EAC) with no export already in flight.
                     let can_export = self.export_job.is_none()
                         && matches!(
                             self.clip.as_ref().map(|c| c.source_kind),
-                            Some(k) if k.is_fisheye()
+                            Some(k) if k.is_exportable()
                         );
                     ui.add_enabled_ui(can_export, |ui| {
                         if ui.button("Export SBS…").clicked() {
                             self.start_export();
                         }
                     });
+                    // Batch window toggle — always available (the queue can
+                    // be staged while a clip plays or an export runs).
+                    let batch_label = if self.batch_running {
+                        format!("Batch ({}/{})…",
+                            self.batch.iter().filter(|b| !matches!(b.status, BatchStatus::Queued | BatchStatus::Running)).count() + 1,
+                            self.batch.len())
+                    } else if self.batch.is_empty() {
+                        "Batch…".to_string()
+                    } else {
+                        format!("Batch ({})…", self.batch.len())
+                    };
+                    if ui.button(batch_label).clicked() {
+                        self.batch_visible = !self.batch_visible;
+                    }
 
                     ui.separator();
                     ui.label(RichText::new("Preview size").color(Color32::GRAY));
@@ -1690,7 +2381,7 @@ impl eframe::App for App {
                 ui.add_space(8.0);
                 egui::CollapsingHeader::new(RichText::new("Source").strong())
                     .default_open(true)
-                    .show(ui, |ui| { self.draw_source_info(ui); });
+                    .show(ui, |ui| { self.draw_source_panel(ui); });
 
                 // Fisheye sources (OSV / SBS / BRAW): Stabilization +
                 // Output are top-level sections; the camera-preset /
@@ -1725,6 +2416,16 @@ impl eframe::App for App {
                     .default_open(false)
                     .show(ui, |ui| { self.draw_fisheye_panel(ui); });
                 } else {
+                    // GoPro EAC: the same View adjustment (global pano-map +
+                    // per-eye stereo offset) the OSV path has, then the
+                    // GoPro stab + RS panels.
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new("View adjustment").strong()
+                    )
+                    .default_open(true)
+                    .show(ui, |ui| { self.draw_view_adjust_panel(ui); });
+
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new(
                         RichText::new("Stabilization").strong()
@@ -1738,6 +2439,15 @@ impl eframe::App for App {
                     )
                     .default_open(true)
                     .show(ui, |ui| { self.draw_rs_panel(ui); });
+
+                    // Output projection (half-equirect VR180 / fisheye) —
+                    // same panel + setting the OSV path uses.
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new("Output").strong()
+                    )
+                    .default_open(true)
+                    .show(ui, |ui| { self.draw_fisheye_output_panel(ui); });
                 }
 
                 ui.add_space(4.0);
@@ -1833,16 +2543,16 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             // Copy out the display handle so we can borrow `self` mutably for
             // the zoom/pan state below. When zoomed + paused we show the
-            // `DetailCache` still — but only while it's CURRENT for both the
-            // live frame and the live settings (`full_res_key == desired`).
-            // During a drag/scrub the desired key moves ahead, so we show the
-            // live preview instead: it renders on the decoder thread (so the
-            // adjustment stays responsive) and is now frame-aligned with the
-            // still, so the swap to the crisp still on settle doesn't shift.
+            // `DetailCache` still whenever it is for the CURRENT FRAME
+            // (timestamp match). A stale-SETTINGS still (mid slider-drag,
+            // waiting out the 120 ms re-render throttle) stays on screen —
+            // dropping to the low-res live preview during adjustments was
+            // exactly the flicker the user asked to remove; the throttled
+            // re-render refreshes it in place. Only a FRAME change (scrub)
+            // falls back to the live preview while the new still decodes.
             let cur_ts = self.current_display.as_ref()
                 .map(|d| d.timestamp_s).unwrap_or(0.0);
             let use_full_res = self.preview_zoom > 1.001 && !self.playing
-                && self.full_res_key == self.full_res_desired_key
                 && self.full_res_display.as_ref()
                     .map(|d| (d.timestamp_s - cur_ts).abs() < 0.02).unwrap_or(false);
             let disp = if use_full_res {
@@ -1962,6 +2672,107 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Source panel = the CLIP LIST (click to select → preview + sidebar
+    /// edit that clip's settings) + the active clip's metadata below.
+    fn draw_source_panel(&mut self, ui: &mut egui::Ui) {
+        let mut select_idx: Option<usize> = None;
+        let mut remove_idx: Option<usize> = None;
+
+        if !self.batch.is_empty() {
+            for (i, item) in self.batch.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let active = self.active_clip == Some(i);
+                    let name = item.path.file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let label = if active {
+                        RichText::new(format!("▶ {name}")).strong()
+                            .color(Color32::from_rgb(255, 200, 120))
+                    } else {
+                        RichText::new(format!("   {name}"))
+                    };
+                    if ui.add(egui::Label::new(label).sense(egui::Sense::click()))
+                        .on_hover_text("Click to make this the active clip")
+                        .clicked() && !active
+                    {
+                        select_idx = Some(i);
+                    }
+                    // Status chip (only interesting once exports ran).
+                    if item.status != BatchStatus::Idle {
+                        let col = match &item.status {
+                            BatchStatus::Done      => Color32::from_rgb(120, 200, 120),
+                            BatchStatus::Failed(_) => Color32::from_rgb(230, 110, 110),
+                            BatchStatus::Running   => Color32::from_rgb(120, 180, 255),
+                            _ => Color32::GRAY,
+                        };
+                        ui.label(RichText::new(item.status.label()).small().color(col));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let removable = item.status != BatchStatus::Running;
+                        ui.add_enabled_ui(removable, |ui| {
+                            if ui.small_button("X").on_hover_text("Remove from list").clicked() {
+                                remove_idx = Some(i);
+                            }
+                        });
+                    });
+                });
+            }
+            ui.add_space(2.0);
+        }
+        ui.horizontal(|ui| {
+            if ui.small_button("+ Add clips…").clicked() {
+                if let Some(paths) = Self::video_file_dialog().pick_files() {
+                    self.open_paths(paths);
+                }
+            }
+            if self.batch.len() > 1 {
+                ui.label(RichText::new(format!("{} clips", self.batch.len()))
+                    .small().color(Color32::GRAY));
+            }
+        });
+
+        if let Some(i) = select_idx { self.select_clip(i); }
+        if let Some(i) = remove_idx { self.remove_clip(i); }
+
+        if !self.batch.is_empty() || self.loaded_path.is_some() {
+            ui.separator();
+        }
+        self.draw_source_info(ui);
+    }
+
+    /// Remove a clip from the list, keeping `active_clip` /
+    /// `batch_current` indices coherent. The preview keeps playing the
+    /// file even if its list entry goes away (it just loses selection).
+    fn remove_clip(&mut self, idx: usize) {
+        if idx >= self.batch.len() { return; }
+        if self.batch[idx].status == BatchStatus::Running { return; }
+        self.batch.remove(idx);
+        self.active_clip = match self.active_clip {
+            Some(a) if a == idx => None,
+            Some(a) if a > idx  => Some(a - 1),
+            other => other,
+        };
+        self.batch_current = match self.batch_current {
+            Some(c) if c > idx => Some(c - 1),
+            // c == idx impossible (Running rows can't be removed).
+            other => other,
+        };
+    }
+
+    /// The shared open-dialog filter for every "add video" entry point.
+    fn video_file_dialog() -> rfd::FileDialog {
+        rfd::FileDialog::new()
+            .add_filter(
+                "All supported video",
+                &["360", "osv", "OSV", "braw", "BRAW",
+                  "mp4", "MP4", "mov", "MOV"],
+            )
+            .add_filter("DJI Osmo 360 (.osv)", &["osv", "OSV"])
+            .add_filter("Blackmagic RAW (.braw)", &["braw", "BRAW"])
+            .add_filter("Side-by-side fisheye (.mp4 / .mov)",
+                &["mp4", "MP4", "mov", "MOV"])
+    }
+
     fn draw_source_info(&self, ui: &mut egui::Ui) {
         match (&self.loaded_path, &self.clip) {
             (Some(p), Some(c)) => {
@@ -2044,6 +2855,10 @@ impl App {
             });
             ui.add(egui::Slider::new(&mut s.smooth_ms, 0.0..=3000.0).text("Smooth (ms)"));
             ui.add(egui::Slider::new(&mut s.max_corr_deg, 0.0..=45.0).text("Max corr (°)"));
+            ui.add(egui::Slider::new(&mut s.gyro_responsiveness, 0.2..=3.0)
+                .text("Response"))
+                .on_hover_text("Velocity response curve: <1 follows motion early, \
+                    1 linear, >1 holds longer then catches up (cinematic lag).");
         });
         ui.add_space(6.0);
         ui.label(RichText::new(
@@ -2081,6 +2896,10 @@ impl App {
     /// All knobs apply live to the preview through the
     /// `Settings::build_color_stack()` plumbing.
     fn draw_color_panel(&mut self, ui: &mut egui::Ui) {
+        // Source kind drives which built-in log→709 LUT is offered
+        // (DJI D-LogM for OSV, GoPro GP-Log for `.360`) — never show the
+        // wrong camera's curve.
+        let kind = self.clip.as_ref().map(|c| c.source_kind);
         let s = &mut self.settings;
 
         // CDL: lift / gamma / gain / shadow / highlight.
@@ -2123,6 +2942,8 @@ impl App {
                 "(none)".to_string()
             } else if s.lut_path == crate::decoder::BUILTIN_OSMO_LUT_PATH {
                 crate::decoder::BUILTIN_OSMO_LUT_NAME.to_string()
+            } else if s.lut_path == crate::decoder::BUILTIN_GPLOG_LUT_PATH {
+                crate::decoder::BUILTIN_GPLOG_LUT_NAME.to_string()
             } else {
                 std::path::Path::new(&s.lut_path)
                     .file_name().and_then(|f| f.to_str()).unwrap_or("(invalid)")
@@ -2141,18 +2962,53 @@ impl App {
                 s.lut_path.clear();
             }
         });
-        // Quick re-apply of the embedded Osmo 360 D-LogM → Rec.709 LUT
-        // (autoloaded for OSV clips; offered here in case it was cleared).
-        if s.lut_path != crate::decoder::BUILTIN_OSMO_LUT_PATH
-            && ui.button("Use built-in Osmo 360 D-LogM→709").clicked()
-        {
-            s.lut_path = crate::decoder::BUILTIN_OSMO_LUT_PATH.to_string();
-            s.lut_intensity = 1.0;
+        // Quick re-apply of the embedded log→709 LUT for THIS source
+        // (autoloaded on open; offered here in case it was cleared). Only
+        // the source-matching builtin is shown — no DJI LUT on a `.360`,
+        // no GoPro LUT on an `.osv`.
+        match kind {
+            Some(vr180_pipeline::SourceKind::DjiOsv)
+                if s.lut_path != crate::decoder::BUILTIN_OSMO_LUT_PATH =>
+            {
+                if ui.button("Use built-in Osmo 360 D-LogM→709").clicked() {
+                    s.lut_path = crate::decoder::BUILTIN_OSMO_LUT_PATH.to_string();
+                    s.lut_intensity = 1.0;
+                }
+            }
+            Some(vr180_pipeline::SourceKind::GoProEac)
+                if s.lut_path != crate::decoder::BUILTIN_GPLOG_LUT_PATH =>
+            {
+                if ui.button("Use built-in GoPro GP-Log→709").clicked() {
+                    s.lut_path = crate::decoder::BUILTIN_GPLOG_LUT_PATH.to_string();
+                    s.lut_intensity = 1.0;
+                }
+            }
+            _ => {}
         }
         ui.add_enabled_ui(!s.lut_path.is_empty(), |ui| {
             ui.add(egui::Slider::new(&mut s.lut_intensity, 0.0..=1.0)
                 .text("Intensity").fixed_decimals(2));
         });
+
+        ui.separator();
+
+        // Detail: equirect-aware sharpening + mid-detail clarity (ported
+        // from the Python app; runs on every exportable source).
+        ui.label(RichText::new("Detail").strong());
+        ui.add(egui::Slider::new(&mut s.sharpen_amount, 0.0..=2.0)
+            .text("Sharpen").fixed_decimals(2))
+            .on_hover_text("Equirect-aware unsharp mask (cos-latitude weighted). \
+                0.5 subtle, 1.0 moderate, 2.0 strong.");
+        ui.add_enabled_ui(s.sharpen_amount > 0.0, |ui| {
+            ui.add(egui::Slider::new(&mut s.sharpen_radius, 0.5..=3.0)
+                .text("Radius").fixed_decimals(2));
+        });
+        ui.add(egui::Slider::new(&mut s.mid_detail, 0.0..=2.0)
+            .text("Mid-detail").fixed_decimals(2))
+            .on_hover_text("Midtone-weighted local-contrast boost (clarity).");
+        if ui.button("Reset detail").clicked() {
+            s.sharpen_amount = 0.0; s.sharpen_radius = 1.5; s.mid_detail = 0.0;
+        }
     }
 
     fn draw_view_adjust_panel(&mut self, ui: &mut egui::Ui) {
@@ -2254,6 +3110,14 @@ impl App {
                         M::Fisheye, M::Fisheye.as_str());
                 });
         });
+
+        // Show the actual output FOV for the current source — the GoPro
+        // Max `.360` captures 185°, the DJI/OSV lens 195°.
+        if matches!(s.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Fisheye) {
+            let fov = if is_osv { "195°" } else { "185°" };
+            ui.label(RichText::new(format!("{fov} equidistant — source lens FOV"))
+                .small().color(Color32::GRAY));
+        }
 
         if is_osv {
             ui.add_space(4.0);

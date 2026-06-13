@@ -595,8 +595,12 @@ struct RsFactor {
 
 impl RsFactor {
     const ZERO:           Self = Self { pitch: 0.0, roll: 0.0, yaw: 0.0 };
-    const NO_FIRMWARE:    Self = Self { pitch: 1.0, roll: 1.0, yaw: 0.0 };
-    const FIRMWARE_RIGHT: Self = Self { pitch: 2.5, roll: 2.5, yaw: 0.0 };
+    // Python-parity values (`vr180_gui.py:11574-11600` auto-set):
+    // no-firmware = (1, 1, 1) ALL axes both eyes; firmware = right
+    // eye (pitch 2, roll 2, yaw 0). The old (1,1,0) silently dropped
+    // the yaw RS component, and firmware used 2.5 vs Python's 2.0.
+    const NO_FIRMWARE:    Self = Self { pitch: 1.0, roll: 1.0, yaw: 1.0 };
+    const FIRMWARE_RIGHT: Self = Self { pitch: 2.0, roll: 2.0, yaw: 0.0 };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -865,26 +869,45 @@ fn compute_per_eye_frames(
             rs.right_factor.pitch, rs.right_factor.roll, rs.right_factor.yaw,
         );
 
-        // Per-frame ω in shader frame (rad/s), sampled at frame
-        // center. `total_duration_s` is the sum across all segments,
-        // giving the right dt = duration / total_gyro_samples.
+        // Per-frame ω in shader frame (rad/s) — Python-parity source:
+        // STMP-anchored timestamps + lerp (smoothed for the single
+        // value, RAW for the 32 per-scanline row groups), sampled at
+        // frame time `t = i/fps`.
         let duration_s = total_duration_s as f32;
         let n = n_frames_video;
-        let omegas = compute_per_frame_omega(
-            &raw_imu.gyro, n, fps, duration_s,
-            srot_s * 0.5,    // sample at center of readout window
-            SMOOTH_WINDOW_S,
+        let (_, cori_stmps) = vr180_core::gyro::parse_cori_with_stmps(&gpmf);
+        let angvel = vr180_core::gyro::GyroAngvel::build(
+            &raw_imu.gyro, &cori_stmps, fps, duration_s,
         );
 
-        // Pre-build per-eye RsParams shells (everything except omega +
-        // srot_s is constant across frames). Note: `srot_s` here is
-        // the auto-detected value (or the user override fallback).
         let mut out: Vec<(EquirectRsParams, EquirectRsParams)> = Vec::with_capacity(n);
-        for i in 0..n {
-            let om = omegas[i];
-            let left = make_rs_params(om, rs.left_factor,  srot_s, back,  geoc.cal_dim);
-            let right = make_rs_params(om, rs.right_factor, srot_s, front, geoc.cal_dim);
-            out.push((left, right));
+        match angvel {
+            Some(av) => {
+                for i in 0..n {
+                    let t = i as f32 / fps.max(1e-6);
+                    let single = av.single_at(t);
+                    let groups = av.groups_at(
+                        t, srot_s, vr180_pipeline::gpu::RS_N_GROUPS);
+                    let left = make_rs_params(
+                        single, &groups, rs.left_factor, srot_s, back, geoc.cal_dim);
+                    let right = make_rs_params(
+                        single, &groups, rs.right_factor, srot_s, front, geoc.cal_dim);
+                    out.push((left, right));
+                }
+            }
+            None => {
+                // No usable gyro stream: legacy constant-ω fallback.
+                let omegas = compute_per_frame_omega(
+                    &raw_imu.gyro, n, fps, duration_s, 0.0, SMOOTH_WINDOW_S,
+                );
+                for i in 0..n {
+                    let left = make_rs_params(
+                        omegas[i], &[], rs.left_factor, srot_s, back, geoc.cal_dim);
+                    let right = make_rs_params(
+                        omegas[i], &[], rs.right_factor, srot_s, front, geoc.cal_dim);
+                    out.push((left, right));
+                }
+            }
         }
         out
     } else {
@@ -939,11 +962,13 @@ fn is_cori_bias_drifting(cori: &[vr180_core::gyro::Quat]) -> bool {
 /// `× factor` and the implicit `deg2rad`).
 fn make_rs_params(
     omega_rad_s: [f32; 3],
+    omega_groups_raw: &[[f32; 3]],
     factor: RsFactor,
     srot_s: f32,
     cal: &vr180_core::geoc::LensCal,
     cal_dim: u32,
 ) -> vr180_pipeline::gpu::EquirectRsParams {
+    use vr180_pipeline::gpu::RS_N_GROUPS;
     // ω input is in rad/s (shader frame). Factors are unitless
     // multipliers applied per axis. Matches Python's
     // `pitch_coeff = pitch_rate * rs_pitch_factor * deg2rad`
@@ -958,12 +983,23 @@ fn make_rs_params(
         cal.klns[0] as f32, cal.klns[1] as f32, cal.klns[2] as f32,
         cal.klns[3] as f32, cal.klns[4] as f32,
     ];
+    // Shader-order factors: (X = pitch, Y = yaw, Z = roll).
+    let f = [factor.pitch, factor.yaw, factor.roll];
+    let mut omega_groups = [[0.0_f32; 3]; RS_N_GROUPS];
+    let ng = omega_groups_raw.len().min(RS_N_GROUPS);
+    for g in 0..ng {
+        for c in 0..3 {
+            omega_groups[g][c] = omega_groups_raw[g][c] * f[c];
+        }
+    }
     vr180_pipeline::gpu::EquirectRsParams {
         omega: [
-            omega_rad_s[0] * factor.pitch,   // shader X axis = pitch
-            omega_rad_s[1] * factor.yaw,     // shader Y axis = yaw
-            omega_rad_s[2] * factor.roll,    // shader Z axis = roll
+            omega_rad_s[0] * f[0],
+            omega_rad_s[1] * f[1],
+            omega_rad_s[2] * f[2],
         ],
+        omega_groups,
+        n_groups: ng as u32,
         srot_s: effective_srot,
         klns,
         ctry: cal.ctry,

@@ -452,6 +452,18 @@ pub struct ZeroCopyStreamPairIter {
     dims: vr180_core::eac::Dims,
     frame_limit: u32,
     frames_yielded: u32,
+    /// s0 stream time_base as seconds-per-tick (for frame pts → seconds).
+    tb0_s: f64,
+    /// Nominal frame duration of s0 (1 / avg_frame_rate).
+    dt_s: f64,
+    /// Precise-seek state: after `seek(t)` the container lands on the
+    /// keyframe ≤ t (GoPro HEVC GOP is 1-2 s ≈ 30-60 frames). `next_pair`
+    /// decodes-and-discards until the pair's pts reaches this target, so
+    /// the first pair RETURNED is the exact requested frame. Without
+    /// this, the caller's frame indexing (stab/RS lookup by
+    /// `time_offset/dt + n`) is off by up to a GOP after every scrub —
+    /// the stabilization fights the content and the preview shakes.
+    skip_until_s: Option<f64>,
 }
 
 /// One zero-copy NV12 plane tuple — two `IOSurfacePlaneTexture`s
@@ -511,23 +523,36 @@ impl ZeroCopyStreamPairIter {
         if !dims.is_valid() {
             return Err(Error::Ffmpeg(format!("stream width {w0} not a valid EAC layout")));
         }
-        Ok(Self { ictx, video_indices, decoders, dims, frame_limit, frames_yielded: 0 })
+        let s0 = ictx.stream(video_indices[0]).unwrap();
+        let tb = s0.time_base();
+        let tb0_s = tb.numerator() as f64 / tb.denominator().max(1) as f64;
+        let fr = s0.avg_frame_rate();
+        let dt_s = if fr.numerator() > 0 {
+            fr.denominator() as f64 / fr.numerator() as f64
+        } else {
+            1.0 / 30.0
+        };
+        Ok(Self {
+            ictx, video_indices, decoders, dims, frame_limit,
+            frames_yielded: 0, tb0_s, dt_s, skip_until_s: None,
+        })
     }
 
     pub fn dims(&self) -> vr180_core::eac::Dims { self.dims }
 
-    /// Seek both decoders to (at most) `target_s` seconds. Internally:
+    /// PRECISE seek: the next `next_pair` call returns the frame AT
+    /// `target_s` (±½ frame). Internally:
     /// 1. `av_seek_frame` to the nearest keyframe ≤ target_s.
     /// 2. Flush both decoder contexts so old packets are dropped.
-    /// 3. Reset the frame counter so `frame_limit` semantics still
-    ///    apply post-seek.
-    ///
-    /// The caller is responsible for stepping forward with
-    /// `next_pair` until they reach the exact target frame they
-    /// wanted — keyframe granularity is typically 1-2 s on GoPro
-    /// HEVC.
+    /// 3. Arm `skip_until_s` — `next_pair` decodes-and-discards the
+    ///    keyframe→target run-in (≤ 1 GOP, 1-2 s on GoPro HEVC) before
+    ///    returning. Callers index stab/RS bundles by
+    ///    `round(target/dt) + frames_since_seek`; without the run-in
+    ///    discard that index is off by up to a GOP after every scrub
+    ///    and the stabilization visibly fights the content.
     pub fn seek(&mut self, target_s: f64) -> Result<()> {
-        let ts = (target_s.max(0.0) * 1_000_000.0) as i64; // AV_TIME_BASE
+        let target_s = target_s.max(0.0);
+        let ts = (target_s * 1_000_000.0) as i64; // AV_TIME_BASE
         self.ictx.seek(ts, ..ts)
             .map_err(|e| Error::Ffmpeg(format!("seek to {target_s:.3}s: {e}")))?;
         // Flush both decoders so leftover packets / frames from the
@@ -536,6 +561,7 @@ impl ZeroCopyStreamPairIter {
             d.flush();
         }
         self.frames_yielded = 0;
+        self.skip_until_s = Some(target_s);
         Ok(())
     }
 
@@ -553,52 +579,70 @@ impl ZeroCopyStreamPairIter {
         let mut frames: [Option<ffmpeg_next::frame::Video>; 2] = [None, None];
         let mut decoded = ffmpeg_next::frame::Video::empty();
 
-        // Drain any pre-buffered frames first.
-        for pos in 0..2 {
-            if frames[pos].is_some() { continue; }
-            if self.decoders[pos].receive_frame(&mut decoded).is_ok() {
-                frames[pos] = Some(std::mem::replace(&mut decoded, ffmpeg_next::frame::Video::empty()));
-            }
-        }
-
-        // Then pump packets.
-        //
-        // Invariant: every packet for a video stream we care about
-        // gets forwarded to its decoder, even if we already have a
-        // frame for that stream this iteration. Otherwise the dropped
-        // packet's frame is lost forever, and that stream falls behind
-        // the other one — pairing (s0_K, s4_K+1) etc. — which shows up
-        // visually as EAC faces sourced from different temporal frames.
-        //
-        // We only need to `receive_frame` from streams we're still
-        // missing; the dropped packets pile up in the decoder's queue
-        // and feed the NEXT next_pair call's `drain pre-buffered` step.
-        if frames.iter().any(|f| f.is_none()) {
-            loop {
-                let (stream, packet) = match self.ictx.packets().next() {
-                    Some(x) => x, None => break,
-                };
-                let pos = match self.video_indices.iter().position(|&i| i == stream.index()) {
-                    Some(p) => p,
-                    None => continue,  // not one of our video streams (audio/data/etc.)
-                };
-                // Always feed the packet to its decoder. Send errors
-                // are non-fatal — the decoder might be flushing.
-                if self.decoders[pos].send_packet(&packet).is_err() { continue; }
-                // Only consume a frame from this decoder if we still
-                // need it this iteration. Extras stay queued for next call.
-                if frames[pos].is_none()
-                    && self.decoders[pos].receive_frame(&mut decoded).is_ok()
-                {
-                    frames[pos] = Some(std::mem::replace(
-                        &mut decoded, ffmpeg_next::frame::Video::empty()));
+        // Fill-and-maybe-discard loop. Each iteration assembles one
+        // (s0, s4) pair; if a precise seek is pending and the pair is
+        // still in the keyframe→target run-in, both frames are dropped
+        // (decode cost only — no IOSurface wrapping) and we assemble
+        // the next pair.
+        let (f0, f4) = 'fill: loop {
+            // Drain any pre-buffered frames first.
+            for pos in 0..2 {
+                if frames[pos].is_some() { continue; }
+                if self.decoders[pos].receive_frame(&mut decoded).is_ok() {
+                    frames[pos] = Some(std::mem::replace(&mut decoded, ffmpeg_next::frame::Video::empty()));
                 }
-                if frames.iter().all(|f| f.is_some()) { break; }
             }
-        }
 
-        let (Some(f0), Some(f4)) = (frames[0].take(), frames[1].take()) else {
-            return Ok(None);
+            // Then pump packets.
+            //
+            // Invariant: every packet for a video stream we care about
+            // gets forwarded to its decoder, even if we already have a
+            // frame for that stream this iteration. Otherwise the dropped
+            // packet's frame is lost forever, and that stream falls behind
+            // the other one — pairing (s0_K, s4_K+1) etc. — which shows up
+            // visually as EAC faces sourced from different temporal frames.
+            //
+            // We only need to `receive_frame` from streams we're still
+            // missing; the dropped packets pile up in the decoder's queue
+            // and feed the NEXT iteration's `drain pre-buffered` step.
+            if frames.iter().any(|f| f.is_none()) {
+                loop {
+                    let (stream, packet) = match self.ictx.packets().next() {
+                        Some(x) => x, None => break,
+                    };
+                    let pos = match self.video_indices.iter().position(|&i| i == stream.index()) {
+                        Some(p) => p,
+                        None => continue,  // not one of our video streams (audio/data/etc.)
+                    };
+                    // Always feed the packet to its decoder. Send errors
+                    // are non-fatal — the decoder might be flushing.
+                    if self.decoders[pos].send_packet(&packet).is_err() { continue; }
+                    // Only consume a frame from this decoder if we still
+                    // need it this iteration. Extras stay queued for next call.
+                    if frames[pos].is_none()
+                        && self.decoders[pos].receive_frame(&mut decoded).is_ok()
+                    {
+                        frames[pos] = Some(std::mem::replace(
+                            &mut decoded, ffmpeg_next::frame::Video::empty()));
+                    }
+                    if frames.iter().all(|f| f.is_some()) { break; }
+                }
+            }
+
+            let (Some(f0), Some(f4)) = (frames[0].take(), frames[1].take()) else {
+                return Ok(None);
+            };
+
+            // Precise-seek run-in: discard pairs before the target.
+            if let Some(target) = self.skip_until_s {
+                let t = f0.pts().unwrap_or(0) as f64 * self.tb0_s;
+                if t < target - 0.5 * self.dt_s {
+                    // Not there yet — drop this pair and assemble the next.
+                    continue 'fill;
+                }
+                self.skip_until_s = None;
+            }
+            break 'fill (f0, f4);
         };
 
         // Both frames are VT-format; extract IOSurfaces and wrap planes.
@@ -931,6 +975,12 @@ pub struct StreamPairIter {
     decode_path: DecodePath,
     frame_limit: u32,
     frames_yielded: u32,
+    /// Per-stream time_base (seconds per pts tick), for precise seek.
+    tbs: [f64; 2],
+    /// Nominal frame duration of s0 (1 / avg_frame_rate).
+    dt_s: f64,
+    /// Precise-seek state — see `ZeroCopyStreamPairIter::skip_until_s`.
+    skip_until_s: Option<f64>,
 }
 
 impl StreamPairIter {
@@ -996,28 +1046,45 @@ impl StreamPairIter {
         } else {
             DecodePath::Software
         };
+        let mut tbs = [0.0_f64; 2];
+        for (i, &idx) in video_indices.iter().take(2).enumerate() {
+            let tb = ictx.stream(idx).unwrap().time_base();
+            tbs[i] = tb.numerator() as f64 / tb.denominator().max(1) as f64;
+        }
+        let fr = ictx.stream(video_indices[0]).unwrap().avg_frame_rate();
+        let dt_s = if fr.numerator() > 0 {
+            fr.denominator() as f64 / fr.numerator() as f64
+        } else {
+            1.0 / 30.0
+        };
         Ok(Self {
             ictx, video_indices, decoders,
             scalers: vec![None, None],
             hw_active, dims, decode_path,
             frame_limit,
             frames_yielded: 0,
+            tbs, dt_s, skip_until_s: None,
         })
     }
 
     pub fn dims(&self) -> vr180_core::eac::Dims { self.dims }
     pub fn decode_path(&self) -> DecodePath { self.decode_path }
 
-    /// CPU-path counterpart to `ZeroCopyStreamPairIter::seek`. See
-    /// that method's docstring for semantics.
+    /// CPU-path counterpart to `ZeroCopyStreamPairIter::seek` — same
+    /// PRECISE semantics: the next `next_pair` returns the frame at
+    /// `target_s` (±½ frame), decoding-and-discarding the keyframe
+    /// run-in internally (repack to RGB is skipped for discarded
+    /// frames, so the run-in costs decode only).
     pub fn seek(&mut self, target_s: f64) -> Result<()> {
-        let ts = (target_s.max(0.0) * 1_000_000.0) as i64;
+        let target_s = target_s.max(0.0);
+        let ts = (target_s * 1_000_000.0) as i64;
         self.ictx.seek(ts, ..ts)
             .map_err(|e| Error::Ffmpeg(format!("seek to {target_s:.3}s: {e}")))?;
         for d in &mut self.decoders {
             d.flush();
         }
         self.frames_yielded = 0;
+        self.skip_until_s = Some(target_s);
         Ok(())
     }
 
@@ -1031,57 +1098,91 @@ impl StreamPairIter {
         let mut decoded = ffmpeg_next::frame::Video::empty();
         let mut sw_storage = ffmpeg_next::frame::Video::empty();
 
-        // Try receiving leftover-buffered frames first (the HEVC decoder
-        // often has prepared frames from previous packets).
-        for pos in 0..2 {
-            if frames[pos].is_some() { continue; }
-            let dec = &mut self.decoders[pos];
-            if dec.receive_frame(&mut decoded).is_ok() {
-                frames[pos] = Some(repack_to_rgb8(
-                    &mut decoded, &mut sw_storage,
-                    self.hw_active[pos], &mut self.scalers[pos],
-                )?);
+        // Fill-and-maybe-discard loop (precise seek): pairs in the
+        // keyframe→target run-in are decoded but NOT repacked to RGB
+        // (empty placeholder) and dropped; the first pair at/after the
+        // target is repacked and returned. A frame is in the run-in iff
+        // its OWN pts is below target − ½dt, so the target pair itself
+        // always gets the real repack (both streams cross the threshold
+        // on the same pair — the pairing invariant keeps them lockstep).
+        let in_run_in = |skip: Option<f64>, pts: Option<i64>, tb: f64, dt: f64| -> bool {
+            match skip {
+                Some(target) => (pts.unwrap_or(0) as f64 * tb) < target - 0.5 * dt,
+                None => false,
             }
-        }
-
-        // Then drive the packet loop until both slots are filled or EOF.
-        //
-        // Same invariant as ZeroCopyStreamPairIter::next_pair: every
-        // packet for a video stream we care about must be forwarded to
-        // its decoder, even if we already have a frame for that stream
-        // this iteration. Dropping packets causes that stream to fall
-        // behind the other → pairing s0_K with s4_K+1 → EAC faces from
-        // different temporal frames in the same output.
-        if frames.iter().any(|f| f.is_none()) {
-            loop {
-                let res = self.ictx.packets().next();
-                let (stream, packet) = match res {
-                    Some(x) => x,
-                    None => break,
-                };
-                let pos = match self.video_indices.iter().position(|&i| i == stream.index()) {
-                    Some(p) => p,
-                    None => continue,
-                };
+        };
+        let (s0, s4) = 'fill: loop {
+            // Try receiving leftover-buffered frames first (the HEVC decoder
+            // often has prepared frames from previous packets).
+            for pos in 0..2 {
+                if frames[pos].is_some() { continue; }
                 let dec = &mut self.decoders[pos];
-                if dec.send_packet(&packet).is_err() { continue; }
-                // Only repack a frame from this decoder if we still
-                // need it this iteration. Extras stay in the decoder's
-                // queue and feed the next next_pair call.
-                if frames[pos].is_none()
-                    && dec.receive_frame(&mut decoded).is_ok()
-                {
-                    frames[pos] = Some(repack_to_rgb8(
-                        &mut decoded, &mut sw_storage,
-                        self.hw_active[pos], &mut self.scalers[pos],
-                    )?);
+                if dec.receive_frame(&mut decoded).is_ok() {
+                    frames[pos] = Some(
+                        if in_run_in(self.skip_until_s, decoded.pts(), self.tbs[pos], self.dt_s) {
+                            Vec::new()
+                        } else {
+                            repack_to_rgb8(
+                                &mut decoded, &mut sw_storage,
+                                self.hw_active[pos], &mut self.scalers[pos],
+                            )?
+                        });
                 }
-                if frames.iter().all(|f| f.is_some()) { break; }
             }
-        }
 
-        let (Some(s0), Some(s4)) = (frames[0].take(), frames[1].take()) else {
-            return Ok(None);  // EOF before both streams had a frame
+            // Then drive the packet loop until both slots are filled or EOF.
+            //
+            // Same invariant as ZeroCopyStreamPairIter::next_pair: every
+            // packet for a video stream we care about must be forwarded to
+            // its decoder, even if we already have a frame for that stream
+            // this iteration. Dropping packets causes that stream to fall
+            // behind the other → pairing s0_K with s4_K+1 → EAC faces from
+            // different temporal frames in the same output.
+            if frames.iter().any(|f| f.is_none()) {
+                loop {
+                    let res = self.ictx.packets().next();
+                    let (stream, packet) = match res {
+                        Some(x) => x,
+                        None => break,
+                    };
+                    let pos = match self.video_indices.iter().position(|&i| i == stream.index()) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let dec = &mut self.decoders[pos];
+                    if dec.send_packet(&packet).is_err() { continue; }
+                    // Only repack a frame from this decoder if we still
+                    // need it this iteration. Extras stay in the decoder's
+                    // queue and feed the next next_pair call.
+                    if frames[pos].is_none()
+                        && dec.receive_frame(&mut decoded).is_ok()
+                    {
+                        frames[pos] = Some(
+                            if in_run_in(self.skip_until_s, decoded.pts(), self.tbs[pos], self.dt_s) {
+                                Vec::new()
+                            } else {
+                                repack_to_rgb8(
+                                    &mut decoded, &mut sw_storage,
+                                    self.hw_active[pos], &mut self.scalers[pos],
+                                )?
+                            });
+                    }
+                    if frames.iter().all(|f| f.is_some()) { break; }
+                }
+            }
+
+            let (Some(s0), Some(s4)) = (frames[0].take(), frames[1].take()) else {
+                return Ok(None);  // EOF before both streams had a frame
+            };
+            if self.skip_until_s.is_some() {
+                if s0.is_empty() || s4.is_empty() {
+                    // Run-in pair — discard and assemble the next one.
+                    frames = [None, None];
+                    continue 'fill;
+                }
+                self.skip_until_s = None;
+            }
+            break 'fill (s0, s4);
         };
         self.frames_yielded += 1;
         Ok(Some(StreamPair { s0, s4, dims: self.dims, decode_path: self.decode_path }))
