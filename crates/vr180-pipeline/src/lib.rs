@@ -33,6 +33,11 @@ pub use interop_macos::{
     extract_iosurface_from_vt_frame, wgpu_texture_from_iosurface_plane,
 };
 
+// In-process VideoToolbox temporal noise reduction (objc2 FFI, no Swift
+// helper). macOS-only; the consuming paths are gated the same way.
+#[cfg(target_os = "macos")]
+pub mod vt_denoise;
+
 #[cfg(target_os = "windows")]
 pub mod interop_windows;
 

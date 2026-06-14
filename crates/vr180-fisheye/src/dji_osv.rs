@@ -136,6 +136,35 @@ impl DjiOsvImu {
 
         Ok(out)
     }
+
+    /// Parse and concatenate the IMU of several OSV files that form ONE
+    /// continuous recording (sequential `_0023`, `_0024`, … segments),
+    /// end to end. The per-frame streams (`frame_quats` / `gravity` /
+    /// `high_rate_quats`) are appended in segment order so they index by
+    /// ABSOLUTE frame number across the whole merged timeline — exactly
+    /// what `compute_dji_stabilization` expects when given the total frame
+    /// count. Calibration is taken from the first segment (it's identical
+    /// across a recording). `blobs` are the raw `djmd` payloads, one per
+    /// segment, already extracted by the caller.
+    ///
+    /// NOTE: the camera writes orientation continuously across a split
+    /// recording, so a straight concatenation keeps the timeline coherent.
+    /// (If a future camera referenced each segment to its own start, this
+    /// is where a boundary re-base would go.)
+    pub fn parse_multi(blobs: &[Vec<u8>]) -> Result<Self> {
+        let mut out = DjiOsvImu::default();
+        for (i, blob) in blobs.iter().enumerate() {
+            let seg = Self::parse(blob)?;
+            if i == 0 {
+                out.lens_a = seg.lens_a;
+                out.lens_b = seg.lens_b;
+            }
+            out.frame_quats.extend(seg.frame_quats);
+            out.gravity.extend(seg.gravity);
+            out.high_rate_quats.extend(seg.high_rate_quats);
+        }
+        Ok(out)
+    }
 }
 
 // ── Internal protobuf walker ────────────────────────────────────────

@@ -161,6 +161,8 @@ pub struct Settings {
     /// and writes the raw fisheye eyes as SBS — useful for VFX or
     /// re-grade pipelines.
     pub fisheye_output_mode: FisheyeOutputMode,
+    /// Export audio track choice for `.360` (stereo / ambisonic / APAC).
+    pub audio_format: AudioFormat,
 
     // ─── Color grade ─────────────────────────────────────────────
     // All defaults are identity (no change). Mirrors
@@ -190,8 +192,11 @@ pub struct Settings {
     /// Unsharp-mask radius / Gaussian sigma (px). Only used when
     /// `sharpen_amount > 0`.
     pub sharpen_radius: f32,
-    /// Mid-detail / clarity (midtone-weighted local contrast). 0 = off.
-    pub mid_detail: f32,
+    /// Temporal noise-reduction strength (0 = off, 1 = max). macOS-only
+    /// (VideoToolbox `VTTemporalNoiseFilter`), applied to the source fisheye
+    /// frames before projection on export — the in-process equivalent of the
+    /// Python app's "VT noise reduction". Ignored where unsupported.
+    pub denoise_strength: f32,
     pub lut_path: String,
     /// LUT blend strength [0..1].
     pub lut_intensity: f32,
@@ -238,7 +243,7 @@ impl Default for Settings {
             gyro_responsiveness: 1.0,
             sharpen_amount: 0.0,
             sharpen_radius: 1.5,
-            mid_detail: 0.0,
+            denoise_strength: 0.0,
             dji_smooth_ms: 1200.0,
             dji_max_corr_deg: 15.0,
             dji_responsiveness: 1.0,
@@ -273,6 +278,7 @@ impl Default for Settings {
             fisheye_swap_eyes: false,
             camera_upside_down: false,
             fisheye_output_mode: FisheyeOutputMode::HalfEquirect,
+            audio_format: AudioFormat::Stereo,
             lift: 0.0,
             gamma: 1.0,
             gain: 1.0,
@@ -388,10 +394,6 @@ impl Settings {
             sigma: self.sharpen_radius.max(0.1),
             apply_lat_weight: true, // equirect output (both EAC + OSV)
         };
-        plan.mid_detail = vr180_pipeline::gpu::MidDetailParams {
-            amount: self.mid_detail.max(0.0),
-            ..Default::default()
-        };
         plan
     }
 
@@ -456,6 +458,41 @@ impl Settings {
             Err(e) => tracing::warn!("settings: serialize failed: {e}"),
         }
     }
+
+    /// Path for the PER-KIND settings map (sibling of `settings.json`).
+    fn kind_map_config_path() -> Option<std::path::PathBuf> {
+        Self::config_path().map(|p| p.with_file_name("settings_by_kind.json"))
+    }
+
+    /// Load the per-source-kind settings map (`"osv"` / `"eac"` / `"sbs"` /
+    /// `"braw"` → Settings). Lets each camera type keep its OWN setup,
+    /// independent of the others. Missing → migrate by seeding every kind
+    /// from the legacy single `settings.json` so existing tuning carries.
+    pub fn load_kind_map() -> std::collections::HashMap<String, Settings> {
+        if let Some(path) = Self::kind_map_config_path() {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(m) = serde_json::from_str::<std::collections::HashMap<String, Settings>>(&text) {
+                    tracing::info!("settings: per-kind map restored from {}", path.display());
+                    return m;
+                }
+            }
+        }
+        let legacy = Self::load_persisted();
+        ["osv", "eac", "sbs", "braw"].into_iter()
+            .map(|k| (k.to_string(), legacy.clone()))
+            .collect()
+    }
+
+    /// Persist the per-kind settings map (best-effort).
+    pub fn save_kind_map(map: &std::collections::HashMap<String, Settings>) {
+        let Some(path) = Self::kind_map_config_path() else { return };
+        if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+        if let Ok(json) = serde_json::to_string_pretty(map) {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!("settings: write per-kind {} failed: {e}", path.display());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,6 +512,32 @@ impl FisheyeOutputMode {
         match self {
             Self::HalfEquirect => "Half-equirect (VR180)",
             Self::Fisheye      => "Fisheye SBS (equidist.)",
+        }
+    }
+}
+
+/// Audio track to write on export, for sources that carry both a stereo
+/// AAC track and a 4-channel ambisonic track (GoPro MAX `.360`). Mirrors
+/// the Python app's audio-format choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioFormat {
+    /// Stereo AAC passthrough — max compatibility (every player). Default.
+    Stereo,
+    /// 4-channel 1st-order ambisonic (AmbiX W,Y,Z,X) passthrough + SA3D
+    /// metadata, so VR-aware players (YouTube VR, Quest Browser) head-track
+    /// the audio. (Vision Pro ignores SA3D → use APAC for it.)
+    Ambisonic,
+    /// Re-encode the 4ch ambisonic to Apple Positional Audio Codec for
+    /// true head-tracked spatial audio on Vision Pro. macOS-only (needs
+    /// the `apac_encode` helper).
+    Apac,
+}
+impl AudioFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stereo    => "Stereo AAC",
+            Self::Ambisonic => "Ambisonic 4ch (+SA3D)",
+            Self::Apac      => "APAC (Vision Pro spatial)",
         }
     }
 }
@@ -554,6 +617,15 @@ pub struct DecoderControl {
     /// display the actual calibration and to seed the per-eye Override
     /// fields, instead of guessing image-center.
     pub detected_calib: parking_lot::Mutex<Option<DetectedLensCalib>>,
+    /// Set by the UI while paused + zoomed on an EAC (.360) clip: asks
+    /// the decoder to ALSO emit a native-resolution still of the current
+    /// frame on `detail_tx` for the zoom magnifier. The live preview
+    /// stays at the capped working size; this is the full-detail copy.
+    /// Fisheye sources use `DetailCache` instead and ignore this.
+    pub want_detail: AtomicBool,
+    /// Sender for the native-res zoom stills (see `want_detail`). Installed
+    /// by the UI at decoder spawn; `None` for paths that never produce them.
+    pub detail_tx: parking_lot::Mutex<Option<Sender<DecodedFrame>>>,
 }
 
 /// One eye's in-file calibration, in the same units the UI's per-eye
@@ -659,12 +731,48 @@ pub fn start_decoder(
     return run_cpu_assemble(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, frame_tx, cmd_rx);
 }
 
+/// Open ONE fisheye segment into a `FisheyePairIter`, at the working
+/// resolution the live preview uses. Shared by the single-file worker and
+/// the multi-segment [`SegmentedFisheyeIter`] opener so both decode a
+/// merged OSV/SBS/BRAW recording identically. Returns `vr180_pipeline`'s
+/// `Result` so it can be the segmented iterator's opener directly.
+fn open_fisheye_segment(
+    path: &std::path::Path,
+    kind: vr180_pipeline::SourceKind,
+    swap_eyes: bool,
+    fps: f32,
+) -> vr180_pipeline::Result<Box<dyn vr180_pipeline::fisheye_decode::FisheyePairIter>> {
+    use vr180_pipeline::fisheye_decode::{
+        SbsFisheyeIter, DualStreamFisheyeIter, BrawFisheyeIter, max_decode_side_for_fps,
+    };
+    use vr180_pipeline::decode::HwDecode;
+    use vr180_pipeline::Error;
+    Ok(match kind {
+        vr180_pipeline::SourceKind::DjiOsv => {
+            let cap = max_decode_side_for_fps(fps);
+            // XOR with DJI's "swap by default" (stream 0 = right eye).
+            Box::new(DualStreamFisheyeIter::new_with_options(
+                path, HwDecode::Auto, 0, !swap_eyes, cap, 8)?)
+        }
+        vr180_pipeline::SourceKind::SbsFisheye =>
+            Box::new(SbsFisheyeIter::new(path, HwDecode::Auto, 0)?),
+        vr180_pipeline::SourceKind::BlackmagicRaw => {
+            let info = vr180_braw::BrawInfo::probe(path)
+                .map_err(|e| Error::Ffmpeg(format!("braw probe: {e}")))?;
+            let opts = vr180_braw::decoder::DecodeOptions::default();
+            Box::new(BrawFisheyeIter::new(path, &info, &opts, 0)
+                .map_err(|e| Error::Ffmpeg(format!("braw start: {e}")))?)
+        }
+        _ => return Err(Error::Ffmpeg(format!("non-fisheye source: {kind:?}"))),
+    })
+}
+
 /// Fisheye source decoder loop (DJI OSV, SBS fisheye, Blackmagic BRAW).
 ///
 /// Same wall-clock pacing / pause-resume / seek / trim semantics as the
-/// GoPro paths above. Stabilization is identity for this first cut —
-/// Task #8 will wire in BRAW VQF; DJI OSV stab needs a follow-up that
-/// parses the embedded protobuf gyro stream.
+/// GoPro paths above. Multi-segment (`cfg.segments.len() > 1`) chains the
+/// files via `SegmentedFisheyeIter` with aggregated DJI IMU — one
+/// continuous timeline for decode, stabilization, and seek.
 fn run_fisheye(
     pipeline: Arc<Device>,
     cfg: &DecoderConfig,
@@ -677,11 +785,7 @@ fn run_fisheye(
     frame_tx: Sender<DecodedFrame>,
     cmd_rx: Receiver<DecoderCommand>,
 ) -> anyhow::Result<()> {
-    use vr180_pipeline::fisheye_decode::{
-        FisheyePairIter, SbsFisheyeIter, DualStreamFisheyeIter, BrawFisheyeIter,
-    };
-    use vr180_pipeline::decode::HwDecode;
-    use vr180_pipeline::gpu::FisheyeCalib;
+    use vr180_pipeline::fisheye_decode::FisheyePairIter;
     use vr180_fisheye::presets;
 
     // ── Windows zero-copy fast path (DJI OSV only) ───────────────────
@@ -766,33 +870,29 @@ fn run_fisheye(
     let (dims_tx, dims_rx) = crossbeam_channel::bounded::<(u32, u32)>(1);
 
     let path_for_worker = cfg.path.clone();
+    let segments_for_worker = cfg.segments.clone();
     let kind_for_worker = kind;
     let initial_swap_eyes = control.settings.read().effective_swap_eyes();
     let initial_trim_in = control.settings.read().trim_in_s;
 
     let _decode_handle = std::thread::spawn(move || -> anyhow::Result<()> {
-        let mut iter: Box<dyn FisheyePairIter> = match kind_for_worker {
-            vr180_pipeline::SourceKind::DjiOsv => {
-                let swap = !initial_swap_eyes; // XOR with DJI's "swap by default"
-                let cap = vr180_pipeline::fisheye_decode::max_decode_side_for_fps(fps);
-                tracing::info!("decoder (fisheye/osv): fps={:.2} → max_decode_side={}", fps, cap);
-                Box::new(DualStreamFisheyeIter::new_with_options(
-                    &path_for_worker, HwDecode::Auto, 0, swap, cap, 8,
-                )?)
-            }
-            vr180_pipeline::SourceKind::SbsFisheye => Box::new(
-                SbsFisheyeIter::new(&path_for_worker, HwDecode::Auto, 0)?
-            ),
-            vr180_pipeline::SourceKind::BlackmagicRaw => {
-                let info = vr180_braw::BrawInfo::probe(&path_for_worker)
-                    .map_err(|e| anyhow::anyhow!("braw probe: {e}"))?;
-                let opts = vr180_braw::decoder::DecodeOptions::default();
-                Box::new(
-                    BrawFisheyeIter::new(&path_for_worker, &info, &opts, 0)
-                        .map_err(|e| anyhow::anyhow!("braw start: {e}"))?
-                )
-            }
-            _ => anyhow::bail!("decode-worker: non-fisheye source: {kind_for_worker:?}"),
+        let mut iter: Box<dyn FisheyePairIter> = if segments_for_worker.len() > 1 {
+            // Merged recording (sequential OSV / SBS files): chain the
+            // segments into one continuous timeline. Per-segment durations
+            // (probed) rebase timestamps and map seeks across boundaries.
+            let durations: Vec<f64> = segments_for_worker.iter()
+                .map(|p| vr180_pipeline::decode::probe_video(p)
+                    .map(|pr| pr.duration_sec).unwrap_or(0.0))
+                .collect();
+            tracing::info!(
+                "decoder (fisheye): {} segments, {:.1}s total — SegmentedFisheyeIter",
+                segments_for_worker.len(), durations.iter().sum::<f64>());
+            let opener = Box::new(move |p: &std::path::Path|
+                open_fisheye_segment(p, kind_for_worker, initial_swap_eyes, fps));
+            Box::new(vr180_pipeline::fisheye_decode::SegmentedFisheyeIter::new(
+                &segments_for_worker, &durations, opener)?)
+        } else {
+            open_fisheye_segment(&path_for_worker, kind_for_worker, initial_swap_eyes, fps)?
         };
         if let Some(t_in) = initial_trim_in {
             if t_in > 0.001 { let _ = iter.seek(t_in); }
@@ -870,26 +970,42 @@ fn run_fisheye(
     let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = if matches!(
         kind, vr180_pipeline::SourceKind::DjiOsv
     ) {
-        match vr180_pipeline::decode::extract_dji_meta_stream(&cfg.path) {
-            Ok(blob) => match vr180_fisheye::DjiOsvImu::parse(&blob) {
-                Ok(imu) => {
-                    tracing::info!(
-                        "decoder (fisheye/osv): protobuf parsed — lens_a.fx={:?}, lens_a.cx={:?}, lens_b.fx={:?}, lens_b.cx={:?}",
-                        imu.lens_a.fx, imu.lens_a.cx, imu.lens_b.fx, imu.lens_b.cx
-                    );
-                    // Factory per-lens extrinsics intentionally ignored:
-                    // this is a VR180-modded camera with displaced
-                    // lenses, so the protobuf rotation-vector offsets
-                    // don't describe our optics. Intrinsics only.
-                    Some(imu)
+        // Single file → parse; merged recording → parse_multi (concatenate
+        // each segment's `djmd` protobuf so the IMU indexes by ABSOLUTE
+        // frame across the whole timeline). Intrinsics come from segment 0.
+        let parsed: vr180_pipeline::Result<vr180_fisheye::DjiOsvImu> = if cfg.segments.len() > 1 {
+            let mut blobs = Vec::with_capacity(cfg.segments.len());
+            let mut acc: vr180_pipeline::Result<()> = Ok(());
+            for p in &cfg.segments {
+                match vr180_pipeline::decode::extract_dji_meta_stream(p) {
+                    Ok(b) => blobs.push(b),
+                    Err(e) => { acc = Err(e); break; }
                 }
-                Err(e) => {
-                    tracing::warn!("dji protobuf parse failed: {e} — using preset calib for both eyes");
-                    None
-                }
-            },
+            }
+            acc.and_then(|()| vr180_fisheye::DjiOsvImu::parse_multi(&blobs)
+                .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("dji parse_multi: {e}"))))
+        } else {
+            vr180_pipeline::decode::extract_dji_meta_stream(&cfg.path)
+                .and_then(|blob| vr180_fisheye::DjiOsvImu::parse(&blob)
+                    .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("dji parse: {e}"))))
+        };
+        match parsed {
+            Ok(imu) => {
+                tracing::info!(
+                    "decoder (fisheye/osv): protobuf parsed — lens_a.fx={:?}, lens_b.fx={:?}, {} frame_quats ({} segs)",
+                    imu.lens_a.fx, imu.lens_b.fx, imu.frame_quats.len(), cfg.segments.len()
+                );
+                // Factory per-lens extrinsics intentionally ignored:
+                // this is a VR180-modded camera with displaced lenses, so
+                // the protobuf rotation-vector offsets don't describe our
+                // optics. Intrinsics only.
+                // Publish to the shared cache so the main-thread `DetailCache`
+                // reads it instead of re-extracting (avoids the load freeze).
+                cache_dji_imu(&cfg.path, std::sync::Arc::new(imu.clone()));
+                Some(imu)
+            }
             Err(e) => {
-                tracing::warn!("dji metadata extract failed: {e} — using preset calib for both eyes");
+                tracing::warn!("dji metadata failed: {e} — using preset calib for both eyes");
                 None
             }
         }
@@ -959,9 +1075,11 @@ fn run_fisheye(
     let mut compute_stab = |dji_osv_imu: Option<&vr180_fisheye::DjiOsvImu>,
                             control: &DecoderControl,
                             fps: f32| -> Option<Vec<EquirectRotation>> {
-        let total_frames = (vr180_pipeline::decode::probe_video(&cfg.path)
-            .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
-            .unwrap_or(0)).max(1);
+        // Merged recording: total frames across ALL segments (the IMU is
+        // aggregated the same way, so the per-frame rotations span the whole
+        // timeline). For a lone clip `segments` is `[path]`, so this is the
+        // single-file count.
+        let total_frames = segments_total_frames(&cfg.segments).max(1);
         match kind {
             vr180_pipeline::SourceKind::BlackmagicRaw => {
                 match vr180_braw::BrawGyroData::extract(&cfg.path) {
@@ -2290,6 +2408,47 @@ pub(crate) fn resolve_fisheye_calib_pair(
     }
 }
 
+/// Project an already-assembled native EAC cross into a full-resolution
+/// SBS still for the zoom magnifier, using the SAME stab/RS/view-adjust/
+/// color/compose path as the live preview — just at `detail_eye` output
+/// resolution. Called only from the paused branch of `run_zero_copy`, so
+/// it never interacts with playback pacing or frame advance.
+#[cfg(target_os = "macos")]
+fn render_zoom_detail(
+    pipeline: &Device,
+    control: &DecoderControl,
+    per_eye: &[((EquirectRotation, EquirectRsParams), (EquirectRotation, EquirectRsParams))],
+    cross: &(u32, wgpu::Texture, wgpu::Texture),
+    abs_frame_idx: u32,
+    timestamp_s: f64,
+    detail_eye: u32,
+    tx: &Sender<DecodedFrame>,
+) -> anyhow::Result<()> {
+    let (_, cross_a, cross_b) = cross;
+    let ((rl, sl), (rr, sr)) = per_eye.get(abs_frame_idx as usize).copied()
+        .unwrap_or((
+            (EquirectRotation::IDENTITY, EquirectRsParams::DISABLED),
+            (EquirectRotation::IDENTITY, EquirectRsParams::DISABLED),
+        ));
+    let s = control.settings.read();
+    let fisheye_out = matches!(s.fisheye_output_mode, FisheyeOutputMode::Fisheye);
+    let (rl, rr) = apply_view_adjust(&s, rl, rr);
+    let (dl, dr) = if fisheye_out {
+        (pipeline.project_cross_texture_to_fisheye_texture(cross_b, detail_eye, detail_eye, rl, sl)?,
+         pipeline.project_cross_texture_to_fisheye_texture(cross_a, detail_eye, detail_eye, rr, sr)?)
+    } else {
+        (pipeline.project_cross_texture_to_equirect_texture(cross_b, detail_eye, detail_eye, rl, sl)?,
+         pipeline.project_cross_texture_to_equirect_texture(cross_a, detail_eye, detail_eye, rr, sr)?)
+    };
+    let (dsbs, dw, dh) = compose_with_color_and_mode(
+        pipeline, &s, &dl, &dr, detail_eye, detail_eye)?;
+    let _ = tx.try_send(DecodedFrame {
+        texture: Arc::new(dsbs), width: dw, height: dh,
+        frame_idx: abs_frame_idx, timestamp_s,
+    });
+    Ok(())
+}
+
 /// macOS zero-copy path. Decode → IOSurface → wgpu::Texture → GPU
 /// EAC assembly → GPU equirect projection → GPU SBS compose. No CPU
 /// readback, no swscale, no IPC.
@@ -2365,11 +2524,34 @@ fn run_zero_copy(
     // the assembled crosses instead of rebuilding two cross_w² textures.
     let mut cached_cross: Option<(u32, wgpu::Texture, wgpu::Texture)> = None;
 
+    // ── Native-res zoom still (the .360 equivalent of the fisheye
+    //    `DetailCache`). When the UI is paused + zoomed it sets
+    //    `control.want_detail`; we then ALSO project the already-native
+    //    cross at full source resolution and ship it on `detail_tx` for
+    //    the magnifier — the live preview keeps its capped working size.
+    //    One render per (frame, settings-gen), throttled so a slider drag
+    //    while zoomed doesn't pay a native render per pointer event.
+    let detail_tx = control.detail_tx.lock().clone();
+    // Full-detail per-eye output = the assembled cross resolution, capped
+    // so the SBS width (2×) stays within the GPU's max texture dimension.
+    let detail_eye = dims.cross_w().min(4096);
+    let mut last_detail_key: (u32, u64) = (u32::MAX, u64::MAX);
+    let mut last_detail_at: Option<std::time::Instant> = None;
+    const DETAIL_THROTTLE: std::time::Duration = std::time::Duration::from_millis(120);
+
     'main: loop {
-        // When parked with a frame in hand, don't pull a new pair — we
-        // want to re-render it as settings change, never advance.
+        // Pull the next pair ONLY when we don't already hold one. While
+        // paused we re-render the held frame (settings update live, frame
+        // never advances). Crucially this is also what keeps RESUME aligned:
+        // on unpause we still hold the paused frame, so we render IT at its
+        // own `frame_idx` and let step 7 advance — instead of immediately
+        // pulling the NEXT pair while `frame_idx` still points at the paused
+        // frame. The old `if !stay_on_pair` gate did the latter, desyncing
+        // the displayed pixels from the per-frame stab/RS by one frame on
+        // EVERY pause→play (the offset compounds, so stabilization visibly
+        // drifts apart after a few replays until a full decoder restart).
         let stay_on_pair = control.paused.load(Ordering::SeqCst) && held_pair.is_some();
-        if !stay_on_pair {
+        if held_pair.is_none() {
             match decoder.next_pair(&pipeline.device)? {
                 Some(p) => held_pair = Some(p),
                 None => break,
@@ -2553,6 +2735,35 @@ fn run_zero_copy(
                     force_render_next = true;
                     break;
                 }
+                // Native-res zoom still for the magnifier. While paused +
+                // zoomed the UI sets `want_detail`; render it HERE, fully
+                // inside the pause path, reusing the cross already assembled
+                // for this frame. The playback loop (pacing / frame advance /
+                // `force_render_next`) is NEVER touched by the zoom feature,
+                // so it cannot desync stabilization on resume. One render per
+                // (frame, settings-gen), throttled so a zoomed slider-drag
+                // stays fluid. Best-effort: a detail-render error is logged,
+                // never propagated (it must not kill playback).
+                if let Some(tx) = detail_tx.as_ref() {
+                    if control.want_detail.load(Ordering::SeqCst) {
+                        let abs = ((time_offset / dt).round() as u32) + frame_idx;
+                        let throttle_ok = last_detail_at
+                            .map(|t| t.elapsed() >= DETAIL_THROTTLE).unwrap_or(true);
+                        let have_cross = cached_cross.as_ref()
+                            .map(|(i, _, _)| *i == abs).unwrap_or(false);
+                        if have_cross && (abs, cached_gen) != last_detail_key && throttle_ok {
+                            if let Err(e) = render_zoom_detail(
+                                &pipeline, &control, &per_eye,
+                                cached_cross.as_ref().unwrap(), abs,
+                                time_offset + frame_idx as f64 * dt, detail_eye, tx)
+                            {
+                                tracing::debug!("decoder (zc): zoom detail failed: {e}");
+                            }
+                            last_detail_key = (abs, cached_gen);
+                            last_detail_at = Some(std::time::Instant::now());
+                        }
+                    }
+                }
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
                         DecoderCommand::Stop => return Ok(()),
@@ -2647,8 +2858,11 @@ fn run_cpu_assemble(
     let mut held_pair = None;
 
     'main: loop {
+        // Pull only when we don't already hold a pair — see `run_zero_copy`
+        // for why: pulling on resume (while still holding the paused frame)
+        // desyncs the EAC frame-index-keyed stab/RS by one frame per replay.
         let stay_on_pair = control.paused.load(Ordering::SeqCst) && held_pair.is_some();
-        if !stay_on_pair {
+        if held_pair.is_none() {
             match decoder.next_pair()? {
                 Some(p) => held_pair = Some(p),
                 None => break,
@@ -2924,11 +3138,36 @@ fn compose_with_color_and_mode(
 /// Net: zooming/seeking no longer freezes — the live preview stays
 /// interactive while the still streams in, then swaps in when decoded.
 /// Stabilization is recomputed only when stab params change.
+/// Process-wide cache of parsed DJI OSV IMU, keyed by source path. The
+/// DECODER thread (`run_fisheye`) parses it once (off the main thread —
+/// extracting the scattered `djmd` samples from a cold file on a network
+/// volume is slow) and publishes it here; the main-thread `DetailCache`
+/// READS it instead of re-extracting, so opening an OSV never freezes the
+/// UI. Bounded to the few most-recent clips so it can't grow unbounded.
+fn dji_imu_cache(
+) -> &'static parking_lot::Mutex<Vec<(PathBuf, std::sync::Arc<vr180_fisheye::DjiOsvImu>)>> {
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<Vec<(PathBuf, std::sync::Arc<vr180_fisheye::DjiOsvImu>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+pub(crate) fn cache_dji_imu(path: &std::path::Path, imu: std::sync::Arc<vr180_fisheye::DjiOsvImu>) {
+    let mut c = dji_imu_cache().lock();
+    c.retain(|(p, _)| p != path);
+    c.push((path.to_path_buf(), imu));
+    let n = c.len();
+    if n > 4 { c.drain(0..n - 4); } // keep the 4 most recent
+}
+
+fn cached_dji_imu(path: &std::path::Path) -> Option<std::sync::Arc<vr180_fisheye::DjiOsvImu>> {
+    dji_imu_cache().lock().iter().find(|(p, _)| p == path).map(|(_, imu)| imu.clone())
+}
+
 pub(crate) struct DetailCache {
     path: PathBuf,
     kind: vr180_pipeline::SourceKind,
     fps: f32,
-    imu: Option<vr180_fisheye::DjiOsvImu>,
     /// Background decode worker: send a requested timestamp, receive the
     /// decoded native pair `(ts_ms, pair)`.
     req_tx: crossbeam_channel::Sender<f64>,
@@ -2949,10 +3188,9 @@ impl DetailCache {
         swap_eyes: bool,
         ctx: egui::Context,
     ) -> Self {
-        let imu = if matches!(kind, vr180_pipeline::SourceKind::DjiOsv) {
-            vr180_pipeline::decode::extract_dji_meta_stream(&path).ok()
-                .and_then(|blob| vr180_fisheye::DjiOsvImu::parse(&blob).ok())
-        } else { None };
+        // NOTE: the DJI IMU is NOT extracted here — that read is slow on a
+        // cold network volume and `new()` runs on the main thread. The
+        // decoder thread publishes it to `dji_imu_cache`; `render()` reads it.
         let (req_tx, req_rx) = crossbeam_channel::bounded::<f64>(1);
         let (res_tx, res_rx) =
             crossbeam_channel::unbounded::<(i64, vr180_pipeline::fisheye_decode::FisheyePair)>();
@@ -2961,7 +3199,7 @@ impl DetailCache {
             detail_decode_worker(path_w, kind, swap_eyes, fps, req_rx, res_tx, ctx);
         });
         Self {
-            path, kind, fps, imu,
+            path, kind, fps,
             req_tx, res_rx, _handle: handle,
             cached_ts: i64::MIN,
             cached_pair: None,
@@ -3000,18 +3238,26 @@ impl DetailCache {
         }
         let pair = self.cached_pair.as_ref()?;
 
-        // Stabilization — only when the stab params changed.
-        let sk = stab_key(s);
+        // IMU read from the cache the decoder thread populated (None until
+        // it finishes parsing — the still renders un-stabilized until then,
+        // which only matters if you zoom during the initial cold load).
+        let imu = if matches!(self.kind, vr180_pipeline::SourceKind::DjiOsv) {
+            cached_dji_imu(&self.path)
+        } else { None };
+
+        // Stabilization — recompute when the stab params change OR when the
+        // IMU first becomes available (folded into the key).
+        let sk = stab_key(s) ^ (imu.is_some() as u64);
         if self.cached_stab_key != sk {
             self.cached_stab = compute_stab_for(
-                self.kind, &self.path, self.imu.as_ref(), s, self.fps);
+                self.kind, &self.path, imu.as_deref(), s, self.fps);
             self.cached_stab_key = sk;
         }
 
         // Project + color + compose on THIS (main) thread (≈10 ms).
         render_still_from_pair(
             pipeline, self.kind, s, self.fps, pair,
-            self.imu.as_ref(), self.cached_stab.as_deref(), out_cap,
+            imu.as_deref(), self.cached_stab.as_deref(), out_cap,
         ).ok().flatten()
     }
 }

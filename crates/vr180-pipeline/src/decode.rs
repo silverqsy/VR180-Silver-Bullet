@@ -11,6 +11,7 @@
 //! IOSurface ↔ Metal or CUDA ↔ Vulkan interop into wgpu.
 
 use crate::{Error, Result};
+use crate::spherical_inject::find_atom;
 use std::path::Path;
 
 /// Initialize libav once per process (idempotent — `ffmpeg::init()`
@@ -46,6 +47,29 @@ const GPMD_TAG: u32 = u32::from_le_bytes(*b"gpmd");
 pub fn extract_gpmf_stream(path: &Path) -> Result<Vec<u8>> {
     init();
 
+    // Fast path: read ONLY the `gpmd` track's samples by parsing the MP4
+    // sample table, instead of demuxing the whole file. GoPro `.360`
+    // chapters are ~11 GB each but carry only tens of MB of telemetry.
+    // Demuxing reads the ENTIRE file — the mov demuxer reads every video
+    // sample's bytes even with AVDISCARD_ALL set, since the discard check
+    // happens only after the packet is read. On load we do this once for
+    // the info panel and once per segment for the stab build, so a
+    // multi-segment clip was tens of seconds of pure I/O before the first
+    // frame. The sample-table read touches ~moov + the gpmd samples (a few
+    // tens of MB) — ~0.05 s. Fall back to the demuxer on any parse miss so
+    // an unusual container still works (just slower).
+    match extract_gpmf_via_sample_table(path) {
+        Ok(blob) if !blob.is_empty() => return Ok(blob),
+        Ok(_) => tracing::debug!("gpmf: sample-table read empty for {path:?}; demuxing"),
+        Err(e) => tracing::debug!("gpmf: sample-table read failed for {path:?}: {e}; demuxing"),
+    }
+    extract_gpmf_via_demux(path)
+}
+
+/// Original full-demux GPMF extraction — reads every packet and keeps the
+/// `gpmd` ones. Correct but reads the whole file; used only as a fallback
+/// when [`extract_gpmf_via_sample_table`] can't parse the container.
+fn extract_gpmf_via_demux(path: &Path) -> Result<Vec<u8>> {
     let mut ictx = ffmpeg_next::format::input(path)
         .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
 
@@ -72,6 +96,257 @@ pub fn extract_gpmf_stream(path: &Path) -> Result<Vec<u8>> {
         )));
     }
     Ok(out)
+}
+
+/// Read only the `gpmd` telemetry track by walking the ISO-BMFF sample
+/// table: locate `moov` (cheap — seeks past `mdat`), find the `trak` whose
+/// `stsd` sample-entry format is `gpmd`, then concatenate that track's
+/// samples chunk-by-chunk via direct file reads. The concatenation of the
+/// samples is byte-identical to demuxing the `gpmd` packets in order.
+fn extract_gpmf_via_sample_table(path: &Path) -> Result<Vec<u8>> {
+    extract_data_track_via_sample_table(path, b"gpmd")
+}
+
+/// Read ONLY a data track's samples (GoPro `gpmd` telemetry / DJI `djmd`
+/// metadata) by parsing the MP4 sample table — locate `moov` (seeking past
+/// `mdat`), find EVERY `trak` whose `stsd` sample-entry format is `tag`,
+/// concat each one's samples chunk-by-chunk, and return the LARGEST blob.
+/// (DJI writes two `djmd` tracks; the big one carries the per-frame
+/// protobuf — `extract_dji_meta_stream` picks the largest the same way.)
+/// The concatenation is byte-identical to demuxing that track's packets.
+fn extract_data_track_via_sample_table(path: &Path, tag: &[u8; 4]) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path)?;
+    let fsize = f.metadata()?.len();
+
+    // 1. Top-level scan for `moov` — reads box headers only, seeking past
+    //    the multi-GB `mdat` without reading it.
+    let mut moov_off: Option<u64> = None;
+    let mut moov_sz: u64 = 0;
+    let mut pos: u64 = 0;
+    while pos + 8 <= fsize {
+        let mut hdr = [0u8; 16];
+        f.seek(SeekFrom::Start(pos))?;
+        f.read_exact(&mut hdr[..8])?;
+        let sz32 = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+        let btag = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        let sz: u64 = if sz32 == 1 {
+            f.read_exact(&mut hdr[8..16])?;
+            u64::from_be_bytes(hdr[8..16].try_into().unwrap())
+        } else if sz32 == 0 {
+            fsize - pos
+        } else {
+            sz32 as u64
+        };
+        if sz < 8 { break; }
+        if &btag == b"moov" { moov_off = Some(pos); moov_sz = sz; break; }
+        pos = pos.checked_add(sz).ok_or_else(|| Error::Ffmpeg("mp4: box overflow".into()))?;
+    }
+    let moov_off = moov_off.ok_or_else(|| Error::Ffmpeg("mp4: no moov".into()))?;
+    if moov_sz < 8 || moov_off + moov_sz > fsize {
+        return Err(Error::Ffmpeg("mp4: bad moov size".into()));
+    }
+
+    // 2. Read moov into memory (small relative to the file).
+    let mut moov = vec![0u8; moov_sz as usize];
+    f.seek(SeekFrom::Start(moov_off))?;
+    f.read_exact(&mut moov)?;
+    let (mv0, mvsz) = find_atom(&moov, 0, moov.len(), b"moov")
+        .ok_or_else(|| Error::Ffmpeg("mp4: moov header".into()))?;
+
+    // 3. Read every matching track; keep the largest concatenation.
+    let stbls = find_data_track_stbls(&moov, mv0, mvsz, tag);
+    if stbls.is_empty() {
+        return Err(Error::Ffmpeg(format!(
+            "mp4: no {} trak", std::str::from_utf8(tag).unwrap_or("?"))));
+    }
+    let mut best: Vec<u8> = Vec::new();
+    for stbl in stbls {
+        let blob = read_stbl_samples(&mut f, fsize, &moov, stbl)?;
+        if blob.len() > best.len() { best = blob; }
+    }
+    if best.is_empty() {
+        return Err(Error::Ffmpeg("mp4: data track empty".into()));
+    }
+    Ok(best)
+}
+
+/// Concatenate ONE track's samples via direct file reads, using its
+/// `stsz` (sizes) + `stsc` (sample→chunk) + `stco`/`co64` (chunk offsets).
+/// Samples within a chunk are contiguous, so one read per chunk = the
+/// concatenated samples.
+fn read_stbl_samples(
+    f: &mut std::fs::File,
+    fsize: u64,
+    moov: &[u8],
+    stbl: (usize, usize),
+) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let be32 = |b: &[u8], o: usize| -> Result<u32> {
+        b.get(o..o + 4).map(|s| u32::from_be_bytes(s.try_into().unwrap()))
+            .ok_or_else(|| Error::Ffmpeg("mp4: short read (u32)".into()))
+    };
+    let be64 = |b: &[u8], o: usize| -> Result<u64> {
+        b.get(o..o + 8).map(|s| u64::from_be_bytes(s.try_into().unwrap()))
+            .ok_or_else(|| Error::Ffmpeg("mp4: short read (u64)".into()))
+    };
+    let (sb0, sbsz) = stbl;
+
+    // Sample sizes (stsz: constant or per-sample).
+    let (zo, zsz) = find_atom(moov, sb0 + 8, sb0 + sbsz, b"stsz")
+        .ok_or_else(|| Error::Ffmpeg("mp4: stsz".into()))?;
+    let const_size = be32(moov, zo + 12)?;
+    let sample_count = be32(moov, zo + 16)? as usize;
+    let sizes: Vec<u32> = if const_size != 0 {
+        vec![const_size; sample_count]
+    } else {
+        let base = zo + 20;
+        if base + sample_count * 4 > zo + zsz {
+            return Err(Error::Ffmpeg("mp4: stsz entries".into()));
+        }
+        (0..sample_count).map(|i| be32(moov, base + i * 4)).collect::<Result<_>>()?
+    };
+
+    // Chunk offsets (stco 32-bit or co64 64-bit).
+    let chunk_offsets: Vec<u64> = if let Some((o, s)) = find_atom(moov, sb0 + 8, sb0 + sbsz, b"stco") {
+        let n = be32(moov, o + 12)? as usize;
+        if o + 16 + n * 4 > o + s { return Err(Error::Ffmpeg("mp4: stco entries".into())); }
+        (0..n).map(|i| be32(moov, o + 16 + i * 4).map(|v| v as u64)).collect::<Result<_>>()?
+    } else if let Some((o, s)) = find_atom(moov, sb0 + 8, sb0 + sbsz, b"co64") {
+        let n = be32(moov, o + 12)? as usize;
+        if o + 16 + n * 8 > o + s { return Err(Error::Ffmpeg("mp4: co64 entries".into())); }
+        (0..n).map(|i| be64(moov, o + 16 + i * 8)).collect::<Result<_>>()?
+    } else {
+        return Err(Error::Ffmpeg("mp4: no stco/co64".into()));
+    };
+
+    // Sample-to-chunk runs (first_chunk 1-based, samples_per_chunk).
+    let (co, csz) = find_atom(moov, sb0 + 8, sb0 + sbsz, b"stsc")
+        .ok_or_else(|| Error::Ffmpeg("mp4: stsc".into()))?;
+    let stsc_n = be32(moov, co + 12)? as usize;
+    if co + 16 + stsc_n * 12 > co + csz {
+        return Err(Error::Ffmpeg("mp4: stsc entries".into()));
+    }
+    let runs: Vec<(u32, u32)> = (0..stsc_n)
+        .map(|i| Ok((be32(moov, co + 16 + i * 12)?, be32(moov, co + 16 + i * 12 + 4)?)))
+        .collect::<Result<_>>()?;
+    if runs.is_empty() {
+        return Err(Error::Ffmpeg("mp4: empty stsc".into()));
+    }
+
+    let total: usize = sizes.iter().map(|&s| s as usize).sum();
+    let mut out = Vec::with_capacity(total);
+    let mut sample_cursor = 0usize;
+    for (c, &chunk_off) in chunk_offsets.iter().enumerate() {
+        let chunk_1 = (c + 1) as u32;
+        let mut spc = 0u32;
+        for &(fc, s) in &runs {
+            if fc <= chunk_1 { spc = s; } else { break; }
+        }
+        let mut chunk_len: u64 = 0;
+        for k in 0..spc as usize {
+            match sizes.get(sample_cursor + k) {
+                Some(&s) => chunk_len += s as u64,
+                None => break,
+            }
+        }
+        if chunk_len > 0 {
+            if chunk_off + chunk_len > fsize {
+                return Err(Error::Ffmpeg("mp4: chunk past EOF".into()));
+            }
+            let mut buf = vec![0u8; chunk_len as usize];
+            f.seek(SeekFrom::Start(chunk_off))?;
+            f.read_exact(&mut buf)?;
+            out.extend_from_slice(&buf);
+        }
+        sample_cursor += spc as usize;
+        if sample_cursor >= sizes.len() { break; }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod gpmf_fast_tests {
+    use super::*;
+    /// The sample-table read must be byte-identical to demuxing, and far
+    /// faster. Skips when the reference clip isn't mounted.
+    #[test]
+    fn fast_matches_demux() {
+        let p = std::path::Path::new("/Volumes/Silver/0407rider/GS010191.360");
+        if !p.exists() { eprintln!("skip fast_matches_demux: {p:?} not present"); return; }
+        super::init();
+        let t0 = std::time::Instant::now();
+        let fast = extract_gpmf_via_sample_table(p).expect("sample-table");
+        let t_fast = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let slow = extract_gpmf_via_demux(p).expect("demux");
+        let t_slow = t1.elapsed();
+        eprintln!("gpmf fast={} bytes in {t_fast:?}  demux={} bytes in {t_slow:?}",
+            fast.len(), slow.len());
+        assert_eq!(fast.len(), slow.len(), "gpmf length differs");
+        assert!(fast == slow, "gpmf bytes differ");
+    }
+
+    /// DJI `djmd` sample-table read must equal the demux (largest track),
+    /// and be far faster. Skips when no reference `.osv` is mounted.
+    #[test]
+    fn djmd_fast_matches_demux() {
+        let p = std::path::Path::new("/Volumes/Silver/060613GC/CAM_20260613172639_0038_D.OSV");
+        if !p.exists() { eprintln!("skip djmd test: no reference .osv"); return; }
+        super::init();
+        let fast = extract_data_track_via_sample_table(p, b"djmd").expect("sample-table");
+        let slow = extract_dji_meta_stream_demux(p).expect("demux");
+        assert_eq!(fast.len(), slow.len(), "djmd length differs");
+        assert!(fast == slow, "djmd bytes differ");
+    }
+}
+
+/// `stbl` (off, size) of EVERY track whose `stsd` sample-entry format is
+/// `tag`, by walking `trak` siblings inside `moov`. (Usually one for
+/// `gpmd`; two for DJI `djmd` — the caller picks the largest.)
+fn find_data_track_stbls(
+    moov: &[u8], moov_off: usize, moov_sz: usize, tag: &[u8; 4],
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let end = moov_off + moov_sz;
+    let mut pos = moov_off + 8;
+    while pos + 8 <= end {
+        let sz32 = match moov.get(pos..pos + 4) {
+            Some(b) => u32::from_be_bytes(b.try_into().unwrap()),
+            None => break,
+        };
+        let btag = &moov[pos + 4..pos + 8];
+        let sz = if sz32 == 1 {
+            match moov.get(pos + 8..pos + 16) {
+                Some(b) => u64::from_be_bytes(b.try_into().unwrap()) as usize,
+                None => break,
+            }
+        } else if sz32 == 0 {
+            end - pos
+        } else {
+            sz32 as usize
+        };
+        if sz < 8 || pos + sz > end { break; }
+        if btag == b"trak" {
+            // trak → mdia → minf → stbl → stsd; check the first entry fourcc.
+            if let Some(mdia) = find_atom(moov, pos + 8, pos + sz, b"mdia") {
+                if let Some(minf) = find_atom(moov, mdia.0 + 8, mdia.0 + mdia.1, b"minf") {
+                    if let Some(stbl) = find_atom(moov, minf.0 + 8, minf.0 + minf.1, b"stbl") {
+                        if let Some(stsd) = find_atom(moov, stbl.0 + 8, stbl.0 + stbl.1, b"stsd") {
+                            // stsd: 8 hdr + 4 ver/flags + 4 entry_count, then
+                            // entry: 4 size + 4 format fourcc.
+                            if moov.get(stsd.0 + 20..stsd.0 + 24) == Some(tag.as_slice()) {
+                                out.push(stbl);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pos += sz;
+    }
+    out
 }
 
 /// Find the stream index whose codec tag is `gpmd`. Returns the first
@@ -104,6 +379,23 @@ const DJMD_TAG: u32 = u32::from_le_bytes(*b"djmd");
 /// terms), not the first — this is robust against firmware variants
 /// where the track order might differ.
 pub fn extract_dji_meta_stream(path: &Path) -> Result<Vec<u8>> {
+    init();
+    // Fast path: read only the largest `djmd` track's samples (the per-frame
+    // protobuf) via the MP4 sample table, instead of demuxing the WHOLE OSV
+    // file — several GB on a long clip → tens of seconds, and it ran on the
+    // UI thread inside `DetailCache::new` (the slow clip-switch). Falls back
+    // to the demuxer on a parse miss. Same fix as `extract_gpmf_stream`.
+    match extract_data_track_via_sample_table(path, b"djmd") {
+        Ok(blob) if !blob.is_empty() => return Ok(blob),
+        Ok(_) => tracing::debug!("djmd: sample-table read empty for {path:?}; demuxing"),
+        Err(e) => tracing::debug!("djmd: sample-table read failed for {path:?}: {e}; demuxing"),
+    }
+    extract_dji_meta_stream_demux(path)
+}
+
+/// Original full-demux DJI metadata extraction — reads the whole file and
+/// keeps the largest `djmd` track. Fallback for `extract_dji_meta_stream`.
+fn extract_dji_meta_stream_demux(path: &Path) -> Result<Vec<u8>> {
     init();
 
     let mut ictx = ffmpeg_next::format::input(path)
@@ -568,11 +860,13 @@ impl ZeroCopyStreamPairIter {
     /// Pull the next zero-copy `(s0, s4)` IOSurface pair. Returns
     /// `Ok(None)` at EOF or frame limit. Each call may issue multiple
     /// packets to the decoder before both streams yield a frame.
-    pub fn next_pair(&mut self, wgpu_device: &wgpu::Device) -> Result<Option<ZeroCopyStreamPair>> {
-        use crate::interop_macos::{
-            extract_iosurface_from_vt_frame, wgpu_texture_from_iosurface_plane,
-            IOSurfaceNv12Descriptor,
-        };
+    /// Decode the next (s0, s4) frame pair, honouring the precise-seek
+    /// run-in discard. Shared by [`next_pair`](Self::next_pair) (texture
+    /// wrapping) and [`next_p010_streams`](Self::next_p010_streams) (raw
+    /// `CVPixelBuffer`s for the zero-copy EAC denoise path).
+    fn decode_stream_frame_pair(
+        &mut self,
+    ) -> Result<Option<[ffmpeg_next::frame::Video; 2]>> {
         if self.frame_limit > 0 && self.frames_yielded >= self.frame_limit {
             return Ok(None);
         }
@@ -644,6 +938,40 @@ impl ZeroCopyStreamPairIter {
             }
             break 'fill (f0, f4);
         };
+        self.frames_yielded += 1;
+        Ok(Some([f0, f4]))
+    }
+
+    /// Raw VT-decoded P010 `CVPixelBuffer`s for both streams (s0, s4),
+    /// retained, for the zero-copy EAC denoise path. The caller transfers
+    /// them into the denoiser and may drop them after.
+    #[allow(clippy::type_complexity)]
+    pub fn next_p010_streams(
+        &mut self,
+    ) -> Result<Option<(
+        crate::interop_macos::RetainedCVPixelBuffer,
+        crate::interop_macos::RetainedCVPixelBuffer,
+    )>> {
+        use crate::interop_macos::extract_cvpixelbuffer_from_vt_frame;
+        let [f0, f4] = match self.decode_stream_frame_pair()? {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        Ok(Some((
+            extract_cvpixelbuffer_from_vt_frame(&f0)?,
+            extract_cvpixelbuffer_from_vt_frame(&f4)?,
+        )))
+    }
+
+    pub fn next_pair(&mut self, wgpu_device: &wgpu::Device) -> Result<Option<ZeroCopyStreamPair>> {
+        use crate::interop_macos::{
+            extract_iosurface_from_vt_frame, wgpu_texture_from_iosurface_plane,
+            IOSurfaceNv12Descriptor,
+        };
+        let [f0, f4] = match self.decode_stream_frame_pair()? {
+            Some(x) => x,
+            None => return Ok(None),
+        };
 
         // Both frames are VT-format; extract IOSurfaces and wrap planes.
         let surf0 = extract_iosurface_from_vt_frame(&f0)?;
@@ -687,7 +1015,6 @@ impl ZeroCopyStreamPairIter {
         )?;
         drop(desc4);
 
-        self.frames_yielded += 1;
         Ok(Some(ZeroCopyStreamPair { s0_y, s0_uv, s4_y, s4_uv, dims: self.dims }))
     }
 }
@@ -751,6 +1078,169 @@ impl SegmentedZeroCopyPairIter {
             }
             self.cur_idx += 1;
             self.cur = ZeroCopyStreamPairIter::new(&self.segments[self.cur_idx], 0)?;
+        }
+    }
+
+    /// Segment-chaining counterpart of
+    /// [`ZeroCopyStreamPairIter::next_p010_streams`] — raw s0/s4 P010
+    /// buffers for the zero-copy EAC denoise path.
+    #[allow(clippy::type_complexity)]
+    pub fn next_p010_streams(
+        &mut self,
+    ) -> Result<Option<(
+        crate::interop_macos::RetainedCVPixelBuffer,
+        crate::interop_macos::RetainedCVPixelBuffer,
+    )>> {
+        loop {
+            if let Some(p) = self.cur.next_p010_streams()? {
+                return Ok(Some(p));
+            }
+            if self.cur_idx + 1 >= self.segments.len() {
+                return Ok(None);
+            }
+            self.cur_idx += 1;
+            self.cur = ZeroCopyStreamPairIter::new(&self.segments[self.cur_idx], 0)?;
+        }
+    }
+}
+
+/// Repackage two denoised stream [`EncodePixelBufferP010`]s as a
+/// [`ZeroCopyStreamPair`] (s0 + s4, each split into Y + UV plane textures).
+#[cfg(target_os = "macos")]
+fn eac_epb_to_pair(
+    s0: crate::interop_macos::EncodePixelBufferP010,
+    s4: crate::interop_macos::EncodePixelBufferP010,
+    dims: vr180_core::eac::Dims,
+) -> ZeroCopyStreamPair {
+    use crate::interop_macos::{EncodePixelBufferP010, IOSurfacePlaneTexture};
+    fn split(epb: EncodePixelBufferP010) -> (IOSurfacePlaneTexture, IOSurfacePlaneTexture) {
+        let (w, h) = (epb.width, epb.height);
+        let y = IOSurfacePlaneTexture {
+            surface: epb.iosurface.clone(),
+            texture: epb.y_tex,
+            width: w,
+            height: h,
+            format: wgpu::TextureFormat::R16Unorm,
+        };
+        let uv = IOSurfacePlaneTexture {
+            surface: epb.iosurface,
+            texture: epb.uv_tex,
+            width: w / 2,
+            height: h / 2,
+            format: wgpu::TextureFormat::Rg16Unorm,
+        };
+        (y, uv)
+    }
+    let (s0_y, s0_uv) = split(s0);
+    let (s4_y, s4_uv) = split(s4);
+    ZeroCopyStreamPair { s0_y, s0_uv, s4_y, s4_uv, dims }
+}
+
+/// Wraps [`SegmentedZeroCopyPairIter`] and denoises the s0/s4 P010 streams on
+/// the GPU (one [`P010Denoiser`](crate::vt_denoise::P010Denoiser) each) BEFORE
+/// EAC cross assembly — the GoPro `.360` analogue of
+/// [`DenoisingZeroCopyIter`](crate::fisheye_decode::DenoisingZeroCopyIter),
+/// matching the Python app which denoises the source streams. No CPU readback.
+/// Yields denoised [`ZeroCopyStreamPair`]s; count/order preserved 1:1.
+#[cfg(target_os = "macos")]
+pub struct DenoisingZeroCopyEacIter {
+    inner: SegmentedZeroCopyPairIter,
+    s0: crate::vt_denoise::P010Denoiser,
+    s4: crate::vt_denoise::P010Denoiser,
+    dims: vr180_core::eac::Dims,
+    strength: f32,
+    ready: std::collections::VecDeque<ZeroCopyStreamPair>,
+    inner_done: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl DenoisingZeroCopyEacIter {
+    pub fn new(inner: SegmentedZeroCopyPairIter, strength: f32) -> Result<Self> {
+        let dims = inner.dims();
+        let s0 = crate::vt_denoise::P010Denoiser::new(dims.stream_w, dims.stream_h, strength)?;
+        let s4 = crate::vt_denoise::P010Denoiser::new(dims.stream_w, dims.stream_h, strength)?;
+        Ok(Self {
+            inner,
+            s0,
+            s4,
+            dims,
+            strength,
+            ready: std::collections::VecDeque::new(),
+            inner_done: false,
+        })
+    }
+
+    pub fn dims(&self) -> vr180_core::eac::Dims {
+        self.dims
+    }
+
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        self.inner.seek(target_s)?;
+        // Temporal window meaningless across a seek — rebuild the denoisers.
+        self.s0 = crate::vt_denoise::P010Denoiser::new(self.dims.stream_w, self.dims.stream_h, self.strength)?;
+        self.s4 = crate::vt_denoise::P010Denoiser::new(self.dims.stream_w, self.dims.stream_h, self.strength)?;
+        self.ready.clear();
+        self.inner_done = false;
+        Ok(())
+    }
+
+    pub fn next_pair(&mut self, device: &wgpu::Device) -> Result<Option<ZeroCopyStreamPair>> {
+        loop {
+            if let Some(p) = self.ready.pop_front() {
+                return Ok(Some(p));
+            }
+            if self.inner_done {
+                return Ok(None);
+            }
+            match self.inner.next_p010_streams()? {
+                Some((s0_src, s4_src)) => {
+                    let s0_outs = self.s0.push(device, s0_src.as_raw())?;
+                    let s4_outs = self.s4.push(device, s4_src.as_raw())?;
+                    drop(s0_src);
+                    drop(s4_src);
+                    for (a, b) in s0_outs.into_iter().zip(s4_outs.into_iter()) {
+                        self.ready.push_back(eac_epb_to_pair(a, b, self.dims));
+                    }
+                }
+                None => {
+                    self.inner_done = true;
+                    let s0_outs = self.s0.finish(device)?;
+                    let s4_outs = self.s4.finish(device)?;
+                    for (a, b) in s0_outs.into_iter().zip(s4_outs.into_iter()) {
+                        self.ready.push_back(eac_epb_to_pair(a, b, self.dims));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Either the raw EAC zero-copy decoder or the denoising wrapper — lets
+/// `export_eac_zerocopy_vt` call `next_pair`/`seek`/`dims` uniformly.
+#[cfg(target_os = "macos")]
+pub enum ZcEacDecoder {
+    Raw(SegmentedZeroCopyPairIter),
+    Denoising(DenoisingZeroCopyEacIter),
+}
+
+#[cfg(target_os = "macos")]
+impl ZcEacDecoder {
+    pub fn dims(&self) -> vr180_core::eac::Dims {
+        match self {
+            Self::Raw(d) => d.dims(),
+            Self::Denoising(d) => d.dims(),
+        }
+    }
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        match self {
+            Self::Raw(d) => d.seek(target_s),
+            Self::Denoising(d) => d.seek(target_s),
+        }
+    }
+    pub fn next_pair(&mut self, device: &wgpu::Device) -> Result<Option<ZeroCopyStreamPair>> {
+        match self {
+            Self::Raw(d) => d.next_pair(device),
+            Self::Denoising(d) => d.next_pair(device),
         }
     }
 }

@@ -95,6 +95,87 @@ pub trait FisheyePairIter {
     }
 }
 
+// ── Segmented fisheye (chain several files of one recording) ───────
+
+/// Chains several fisheye files (DJI OSV / SBS / BRAW segments of one
+/// recording) into a single continuous `FisheyePairIter`, mirroring the
+/// EAC [`crate::decode::SegmentedStreamPairIter`]. The per-segment opener
+/// is supplied by the caller (it varies by source kind). Yielded `pts_s`
+/// is rebased onto the GLOBAL clip timeline so stabilization-by-pts and
+/// trim stay aligned across segment boundaries.
+pub struct SegmentedFisheyeIter {
+    seg_paths: Vec<std::path::PathBuf>,
+    /// Cumulative clip-time start of each segment (seconds).
+    seg_start_s: Vec<f64>,
+    total_dur_s: f64,
+    cur_idx: usize,
+    cur: Box<dyn FisheyePairIter>,
+    opener: Box<dyn FnMut(&Path) -> Result<Box<dyn FisheyePairIter>>>,
+}
+
+impl SegmentedFisheyeIter {
+    /// `opener` opens one segment into a `FisheyePairIter` (source-kind
+    /// specific — e.g. a `DualStreamFisheyeIter` for OSV). `seg_durations_s`
+    /// are the per-segment durations (probed by the caller) used to rebase
+    /// timestamps and to map a global seek to (segment, local time).
+    pub fn new(
+        segments: &[std::path::PathBuf],
+        seg_durations_s: &[f64],
+        mut opener: Box<dyn FnMut(&Path) -> Result<Box<dyn FisheyePairIter>>>,
+    ) -> Result<Self> {
+        assert!(!segments.is_empty(), "segments must be non-empty");
+        let mut seg_start_s = Vec::with_capacity(segments.len());
+        let mut acc = 0.0_f64;
+        for i in 0..segments.len() {
+            seg_start_s.push(acc);
+            acc += seg_durations_s.get(i).copied().unwrap_or(0.0);
+        }
+        let cur = opener(&segments[0])?;
+        Ok(Self {
+            seg_paths: segments.to_vec(),
+            seg_start_s,
+            total_dur_s: acc,
+            cur_idx: 0,
+            cur,
+            opener,
+        })
+    }
+
+    /// Total clip duration across all segments (seconds).
+    pub fn total_duration_s(&self) -> f64 { self.total_dur_s }
+}
+
+impl FisheyePairIter for SegmentedFisheyeIter {
+    fn next_pair(&mut self) -> Result<Option<FisheyePair>> {
+        loop {
+            if let Some(mut p) = self.cur.next_pair()? {
+                p.pts_s += self.seg_start_s[self.cur_idx]; // local → global
+                return Ok(Some(p));
+            }
+            // Current segment exhausted — advance to the next, if any.
+            if self.cur_idx + 1 >= self.seg_paths.len() {
+                return Ok(None);
+            }
+            self.cur_idx += 1;
+            let path = self.seg_paths[self.cur_idx].clone();
+            self.cur = (self.opener)(&path)?;
+        }
+    }
+
+    fn seek(&mut self, target_s: f64) -> Result<()> {
+        let t = target_s.clamp(0.0, self.total_dur_s);
+        let idx = self.seg_start_s.iter().rposition(|&s| s <= t).unwrap_or(0);
+        if idx != self.cur_idx {
+            let path = self.seg_paths[idx].clone();
+            self.cur = (self.opener)(&path)?;
+            self.cur_idx = idx;
+        }
+        self.cur.seek(t - self.seg_start_s[idx])
+    }
+
+    fn eye_dims(&self) -> (u32, u32) { self.cur.eye_dims() }
+}
+
 // ── SBS fisheye (single ffmpeg stream, split horizontally) ─────────
 
 /// SBS fisheye `.mp4` iterator. One ffmpeg video stream, each frame
@@ -1137,14 +1218,13 @@ impl ZeroCopyDualStreamFisheyeIter {
     /// VT-decoded CVPixelBuffer Y and UV planes as wgpu textures
     /// backed by the same IOSurface. Returns `Ok(None)` at EOF /
     /// frame-limit.
-    pub fn next_pair(
+    /// Decode the next paired frame from both streams. Shared by
+    /// [`next_pair`](Self::next_pair) (texture wrapping, the clean path) and
+    /// [`next_p010_pair`](Self::next_p010_pair) (raw `CVPixelBuffer`s for the
+    /// zero-copy denoise path). Returns the two VT frames + clip-time pts.
+    fn decode_frame_pair(
         &mut self,
-        wgpu_device: &wgpu::Device,
-    ) -> Result<Option<ZeroCopyFisheyePair>> {
-        use crate::interop_macos::{
-            extract_iosurface_from_vt_frame, wgpu_texture_from_iosurface_plane,
-            IOSurfaceNv12Descriptor, RetainedIOSurface,
-        };
+    ) -> Result<Option<([ffmpeg_next::frame::Video; 2], f64)>> {
         if self.frame_limit > 0 && self.frames_yielded >= self.frame_limit {
             return Ok(None);
         }
@@ -1194,6 +1274,49 @@ impl ZeroCopyDualStreamFisheyeIter {
             return Ok(None);
         };
         let pts_s = pts0 as f64 * self.time_base_s;
+        self.frames_yielded += 1;
+        Ok(Some(([f0, f1], pts_s)))
+    }
+
+    /// Pull the next pair as raw VT-decoded P010 `CVPixelBuffer`s (retained),
+    /// for the zero-copy denoise path. Same swap convention as
+    /// [`next_pair`](Self::next_pair). The buffers feed
+    /// `VTPixelTransferSession`; the caller may drop them once denoised.
+    #[allow(clippy::type_complexity)]
+    pub fn next_p010_pair(
+        &mut self,
+    ) -> Result<Option<(
+        crate::interop_macos::RetainedCVPixelBuffer,
+        crate::interop_macos::RetainedCVPixelBuffer,
+        f64,
+    )>> {
+        use crate::interop_macos::extract_cvpixelbuffer_from_vt_frame;
+        let ([f0, f1], pts_s) = match self.decode_frame_pair()? {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        let pb0 = extract_cvpixelbuffer_from_vt_frame(&f0)?;
+        let pb1 = extract_cvpixelbuffer_from_vt_frame(&f1)?;
+        let (left, right) = if self.swap_eyes { (pb1, pb0) } else { (pb0, pb1) };
+        Ok(Some((left, right, pts_s)))
+    }
+
+    /// Pull the next zero-copy fisheye pair. Wraps each stream's
+    /// VT-decoded CVPixelBuffer Y and UV planes as wgpu textures
+    /// backed by the same IOSurface. Returns `Ok(None)` at EOF /
+    /// frame-limit.
+    pub fn next_pair(
+        &mut self,
+        wgpu_device: &wgpu::Device,
+    ) -> Result<Option<ZeroCopyFisheyePair>> {
+        use crate::interop_macos::{
+            extract_iosurface_from_vt_frame, wgpu_texture_from_iosurface_plane,
+            IOSurfaceNv12Descriptor, RetainedIOSurface,
+        };
+        let ([f0, f1], pts_s) = match self.decode_frame_pair()? {
+            Some(x) => x,
+            None => return Ok(None),
+        };
 
         // Extract IOSurfaces + wrap planes for both eyes. Each plane
         // wrapper holds its own retain on the IOSurface so the original
@@ -1236,12 +1359,177 @@ impl ZeroCopyDualStreamFisheyeIter {
             (s0_y, s0_uv, s1_y, s1_uv)
         };
 
-        self.frames_yielded += 1;
         Ok(Some(ZeroCopyFisheyePair {
             left_y, left_uv, right_y, right_uv,
             eye_w: self.eye_w, eye_h: self.eye_h,
             pts_s,
         }))
+    }
+}
+
+/// Repackage a pair of denoised P010 [`EncodePixelBufferP010`]s as a
+/// [`ZeroCopyFisheyePair`] — splitting each into its Y + UV plane textures.
+/// The plane textures retain the IOSurface, so the source CVPixelBuffer can
+/// drop while the pixels stay alive for the projection dispatch.
+#[cfg(target_os = "macos")]
+fn epb_pair_to_zerocopy(
+    left: crate::interop_macos::EncodePixelBufferP010,
+    right: crate::interop_macos::EncodePixelBufferP010,
+    eye_w: u32,
+    eye_h: u32,
+    pts_s: f64,
+) -> ZeroCopyFisheyePair {
+    use crate::interop_macos::{EncodePixelBufferP010, IOSurfacePlaneTexture};
+    fn split(epb: EncodePixelBufferP010) -> (IOSurfacePlaneTexture, IOSurfacePlaneTexture) {
+        let (w, h) = (epb.width, epb.height);
+        let y = IOSurfacePlaneTexture {
+            surface: epb.iosurface.clone(),
+            texture: epb.y_tex,
+            width: w,
+            height: h,
+            format: wgpu::TextureFormat::R16Unorm,
+        };
+        let uv = IOSurfacePlaneTexture {
+            surface: epb.iosurface,
+            texture: epb.uv_tex,
+            width: w / 2,
+            height: h / 2,
+            format: wgpu::TextureFormat::Rg16Unorm,
+        };
+        (y, uv)
+    }
+    let (left_y, left_uv) = split(left);
+    let (right_y, right_uv) = split(right);
+    ZeroCopyFisheyePair { left_y, left_uv, right_y, right_uv, eye_w, eye_h, pts_s }
+}
+
+/// Wraps [`ZeroCopyDualStreamFisheyeIter`] and runs each eye's P010 frames
+/// through an in-process [`P010Denoiser`](crate::vt_denoise::P010Denoiser)
+/// — temporal noise reduction with NO CPU readback, so the zero-copy OSV
+/// export keeps its speed. Yields denoised [`ZeroCopyFisheyePair`]s with the
+/// same shape as the raw iterator, so the export loop is unchanged. Output
+/// count/order preserved 1:1 (delayed by the filter look-ahead, drained at
+/// EOF); pts mapped FIFO.
+#[cfg(target_os = "macos")]
+pub struct DenoisingZeroCopyIter {
+    inner: ZeroCopyDualStreamFisheyeIter,
+    left: crate::vt_denoise::P010Denoiser,
+    right: crate::vt_denoise::P010Denoiser,
+    eye_w: u32,
+    eye_h: u32,
+    strength: f32,
+    pending_pts: std::collections::VecDeque<f64>,
+    ready: std::collections::VecDeque<ZeroCopyFisheyePair>,
+    inner_done: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl DenoisingZeroCopyIter {
+    pub fn new(inner: ZeroCopyDualStreamFisheyeIter, strength: f32) -> Result<Self> {
+        let (eye_w, eye_h) = inner.eye_dims();
+        let left = crate::vt_denoise::P010Denoiser::new(eye_w, eye_h, strength)?;
+        let right = crate::vt_denoise::P010Denoiser::new(eye_w, eye_h, strength)?;
+        Ok(Self {
+            inner,
+            left,
+            right,
+            eye_w,
+            eye_h,
+            strength,
+            pending_pts: std::collections::VecDeque::new(),
+            ready: std::collections::VecDeque::new(),
+            inner_done: false,
+        })
+    }
+
+    pub fn eye_dims(&self) -> (u32, u32) {
+        (self.eye_w, self.eye_h)
+    }
+
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        self.inner.seek(target_s)?;
+        // Temporal window is meaningless across a seek — rebuild the
+        // denoisers so the next frame restarts the filter cleanly.
+        self.left = crate::vt_denoise::P010Denoiser::new(self.eye_w, self.eye_h, self.strength)?;
+        self.right = crate::vt_denoise::P010Denoiser::new(self.eye_w, self.eye_h, self.strength)?;
+        self.pending_pts.clear();
+        self.ready.clear();
+        self.inner_done = false;
+        Ok(())
+    }
+
+    pub fn next_pair(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Result<Option<ZeroCopyFisheyePair>> {
+        loop {
+            if let Some(p) = self.ready.pop_front() {
+                return Ok(Some(p));
+            }
+            if self.inner_done {
+                return Ok(None);
+            }
+            match self.inner.next_p010_pair()? {
+                Some((l_src, r_src, pts)) => {
+                    self.pending_pts.push_back(pts);
+                    let louts = self.left.push(device, l_src.as_raw())?;
+                    let routs = self.right.push(device, r_src.as_raw())?;
+                    // Source P010 buffers are now converted into the windows.
+                    drop(l_src);
+                    drop(r_src);
+                    for (lo, ro) in louts.into_iter().zip(routs.into_iter()) {
+                        let pts = self.pending_pts.pop_front().unwrap_or(0.0);
+                        self.ready.push_back(epb_pair_to_zerocopy(
+                            lo, ro, self.eye_w, self.eye_h, pts,
+                        ));
+                    }
+                }
+                None => {
+                    self.inner_done = true;
+                    let louts = self.left.finish(device)?;
+                    let routs = self.right.finish(device)?;
+                    for (lo, ro) in louts.into_iter().zip(routs.into_iter()) {
+                        let pts = self.pending_pts.pop_front().unwrap_or(0.0);
+                        self.ready.push_back(epb_pair_to_zerocopy(
+                            lo, ro, self.eye_w, self.eye_h, pts,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Either the raw zero-copy decoder or the denoising wrapper — lets the
+/// export loop call `next_pair`/`seek`/`eye_dims` uniformly.
+#[cfg(target_os = "macos")]
+pub enum ZcDecoder {
+    Raw(ZeroCopyDualStreamFisheyeIter),
+    Denoising(DenoisingZeroCopyIter),
+}
+
+#[cfg(target_os = "macos")]
+impl ZcDecoder {
+    pub fn eye_dims(&self) -> (u32, u32) {
+        match self {
+            Self::Raw(d) => d.eye_dims(),
+            Self::Denoising(d) => d.eye_dims(),
+        }
+    }
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        match self {
+            Self::Raw(d) => d.seek(target_s),
+            Self::Denoising(d) => d.seek(target_s),
+        }
+    }
+    pub fn next_pair(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Result<Option<ZeroCopyFisheyePair>> {
+        match self {
+            Self::Raw(d) => d.next_pair(device),
+            Self::Denoising(d) => d.next_pair(device),
+        }
     }
 }
 
@@ -1474,6 +1762,148 @@ fn bgra_to_rgba8_row(src: &[u8], bytes_per_pixel: usize, dst: &mut Vec<u8>) {
         _ => {
             tracing::error!("unexpected BRAW bpp={bytes_per_pixel}");
         }
+    }
+}
+
+// ── Temporal noise reduction wrapper (macOS VideoToolbox) ─────────
+//
+// Wraps any [`FisheyePairIter`] and runs each eye's frames through an
+// in-process `VTTemporalNoiseFilter` (see [`crate::vt_denoise`]) — the
+// same algorithm the Python app reaches through its Swift helper, matched
+// here without a subprocess. Source-domain denoise (before projection),
+// mirroring the Python pipeline. Output order and frame count are
+// preserved 1:1 (delayed by the filter's look-ahead, drained at EOF), so
+// stabilization-by-index and audio sync downstream stay aligned.
+#[cfg(target_os = "macos")]
+pub struct DenoisingFisheyeIter {
+    inner: Box<dyn FisheyePairIter>,
+    strength: f32,
+    eye_w: u32,
+    eye_h: u32,
+    bit_depth: u8,
+    // Lazily created on the first pair (we need its bit depth).
+    left: Option<crate::vt_denoise::VtDenoiser>,
+    right: Option<crate::vt_denoise::VtDenoiser>,
+    pending_pts: std::collections::VecDeque<f64>,
+    ready: std::collections::VecDeque<FisheyePair>,
+    /// First pair, kept only as the passthrough fallback for the
+    /// degenerate single-frame clip (no temporal reference possible).
+    first_pair: Option<FisheyePair>,
+    pushed: usize,
+    emitted: usize,
+    inner_done: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl DenoisingFisheyeIter {
+    /// Wrap `inner`, denoising at `strength` (0.0–1.0). Cheap — the
+    /// VideoToolbox sessions are built lazily on the first frame.
+    pub fn new(inner: Box<dyn FisheyePairIter>, strength: f32) -> Result<Self> {
+        let (eye_w, eye_h) = inner.eye_dims();
+        Ok(Self {
+            inner,
+            strength,
+            eye_w,
+            eye_h,
+            bit_depth: 8,
+            left: None,
+            right: None,
+            pending_pts: std::collections::VecDeque::new(),
+            ready: std::collections::VecDeque::new(),
+            first_pair: None,
+            pushed: 0,
+            emitted: 0,
+            inner_done: false,
+        })
+    }
+
+    fn ensure_denoisers(&mut self, bit_depth: u8) -> Result<()> {
+        if self.left.is_none() {
+            self.bit_depth = bit_depth;
+            self.left = Some(crate::vt_denoise::VtDenoiser::new(
+                self.eye_w, self.eye_h, bit_depth, self.strength,
+            )?);
+            self.right = Some(crate::vt_denoise::VtDenoiser::new(
+                self.eye_w, self.eye_h, bit_depth, self.strength,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn emit(&mut self, lefts: Vec<Vec<u8>>, rights: Vec<Vec<u8>>) {
+        for (l, r) in lefts.into_iter().zip(rights.into_iter()) {
+            let pts = self.pending_pts.pop_front().unwrap_or(0.0);
+            self.emitted += 1;
+            self.ready.push_back(FisheyePair {
+                left: l,
+                right: r,
+                eye_w: self.eye_w,
+                eye_h: self.eye_h,
+                bit_depth: self.bit_depth,
+                pts_s: pts,
+            });
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl FisheyePairIter for DenoisingFisheyeIter {
+    fn next_pair(&mut self) -> Result<Option<FisheyePair>> {
+        loop {
+            if let Some(p) = self.ready.pop_front() {
+                return Ok(Some(p));
+            }
+            if self.inner_done {
+                return Ok(None);
+            }
+            match self.inner.next_pair()? {
+                Some(pair) => {
+                    self.ensure_denoisers(pair.bit_depth)?;
+                    if self.pushed == 0 {
+                        self.first_pair = Some(pair.clone());
+                    }
+                    self.pushed += 1;
+                    self.pending_pts.push_back(pair.pts_s);
+                    let lefts = self.left.as_mut().unwrap().push(&pair.left)?;
+                    let rights = self.right.as_mut().unwrap().push(&pair.right)?;
+                    self.emit(lefts, rights);
+                }
+                None => {
+                    self.inner_done = true;
+                    if let (Some(l), Some(r)) = (self.left.as_mut(), self.right.as_mut()) {
+                        let lefts = l.finish()?;
+                        let rights = r.finish()?;
+                        self.emit(lefts, rights);
+                    }
+                    // Single-frame clip: nothing could be denoised — pass the
+                    // one frame through untouched so the count is preserved.
+                    if self.emitted == 0 {
+                        if let Some(fp) = self.first_pair.take() {
+                            self.ready.push_back(fp);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn seek(&mut self, target_s: f64) -> Result<()> {
+        self.inner.seek(target_s)?;
+        // The temporal window is meaningless across a seek — reset so the
+        // next frame restarts the filter (fresh discontinuity).
+        self.left = None;
+        self.right = None;
+        self.pending_pts.clear();
+        self.ready.clear();
+        self.first_pair = None;
+        self.pushed = 0;
+        self.emitted = 0;
+        self.inner_done = false;
+        Ok(())
+    }
+
+    fn eye_dims(&self) -> (u32, u32) {
+        (self.eye_w, self.eye_h)
     }
 }
 

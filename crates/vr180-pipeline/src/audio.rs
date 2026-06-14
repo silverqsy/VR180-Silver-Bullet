@@ -44,7 +44,7 @@ pub struct AmbisonicInfo {
 /// uncompressed PCM).
 pub fn probe_ambisonic(input: &Path) -> Result<Option<AmbisonicInfo>> {
     crate::decode::init();
-    let ictx = ffmpeg::format::input(&input)
+    let ictx = open_input_concat_aware(input)
         .map_err(|e| Error::Ffmpeg(format!("open {input:?}: {e}")))?;
     for stream in ictx.streams() {
         let params = stream.parameters();
@@ -96,14 +96,31 @@ fn is_pcm_codec_id(codec_id: i32) -> bool {
 /// AND to choose between APAC vs stereo-AAC paths. This function
 /// errors if the source has no ambisonic stream.
 pub fn extract_ambisonic_to_wav(input: &Path, output_wav: &Path) -> Result<AmbisonicInfo> {
+    extract_ambisonic_to_wav_window(input, output_wav, 0.0, None)
+}
+
+/// Window-aware ambisonic extraction: only the `[offset_s, offset_s +
+/// dur_s)` slice of the source's 4-ch track is written (rebased to start
+/// at 0), so a TRIMMED export's APAC/ambisonic audio matches the
+/// exported video. `offset_s = 0, dur_s = None` extracts the whole track.
+pub fn extract_ambisonic_to_wav_window(
+    input: &Path,
+    output_wav: &Path,
+    offset_s: f64,
+    dur_s: Option<f64>,
+) -> Result<AmbisonicInfo> {
     crate::decode::init();
     let info = probe_ambisonic(input)?
         .ok_or_else(|| Error::Ffmpeg(format!(
             "no ambisonic audio track in {input:?}"
         )))?;
 
-    let mut ictx = ffmpeg::format::input(&input)
+    let mut ictx = open_input_concat_aware(input)
         .map_err(|e| Error::Ffmpeg(format!("open input: {e}")))?;
+    if offset_s > 0.001 {
+        let ts = (offset_s * 1_000_000.0) as i64;
+        let _ = ictx.seek(ts, ..ts);
+    }
     let mut octx = ffmpeg::format::output(&output_wav)
         .map_err(|e| Error::Ffmpeg(format!("open output WAV {output_wav:?}: {e}")))?;
 
@@ -135,9 +152,17 @@ pub fn extract_ambisonic_to_wav(input: &Path, output_wav: &Path) -> Result<Ambis
     octx.write_header()
         .map_err(|e| Error::Ffmpeg(format!("WAV write_header: {e}")))?;
 
+    // Window bounds in source seconds (None dur → to EOF).
+    let tb_s = src_time_base.numerator() as f64 / src_time_base.denominator().max(1) as f64;
+    let win_end = dur_s.map(|d| offset_s + d);
     let mut packet_count = 0u64;
     for (stream, mut packet) in ictx.packets() {
         if stream.index() != info.stream_index { continue; }
+        // Window by the packet's source time. (Seek lands on/near the
+        // keyframe before `offset`; skip the run-in, stop past the end.)
+        let t = packet.pts().or(packet.dts()).unwrap_or(0) as f64 * tb_s;
+        if t < offset_s - 0.05 { continue; }
+        if let Some(end) = win_end { if t >= end { break; } }
         packet.set_stream(out_stream_index);
         // The wav muxer derives its own packet timing from sample count;
         // we just need PTS to monotonically increase. Rescale from
@@ -171,7 +196,9 @@ pub fn extract_ambisonic_to_wav(input: &Path, output_wav: &Path) -> Result<Ambis
 /// has no audio.
 pub fn probe_any_audio(input: &Path) -> Result<Option<(usize, u32, u32)>> {
     crate::decode::init();
-    let ictx = ffmpeg::format::input(&input)
+    // concat-aware so a multi-segment `.ffconcat` playlist probes the
+    // first audio of the chain (preview player passes the playlist).
+    let ictx = open_input_concat_aware(input)
         .map_err(|e| Error::Ffmpeg(format!("open {input:?}: {e}")))?;
     for stream in ictx.streams() {
         let params = stream.parameters();
@@ -199,12 +226,60 @@ pub fn probe_any_audio(input: &Path) -> Result<Option<(usize, u32, u32)>> {
 /// Returns the number of audio packets copied. If `audio_src` has no
 /// audio track the function returns `Ok(0)` and the output still
 /// contains the video — caller can decide whether to keep using it.
+/// Open an input, transparently handling an ffconcat playlist (the
+/// multi-segment `.360` audio source). The concat demuxer needs
+/// `safe=0` to accept the absolute segment paths; a normal file opens
+/// plainly. Detected by the `.ffconcat` extension.
+pub fn open_input_concat_aware(
+    path: &Path,
+) -> std::result::Result<ffmpeg::format::context::Input, ffmpeg::Error> {
+    if path.extension().and_then(|e| e.to_str()) == Some("ffconcat") {
+        let mut d = ffmpeg::Dictionary::new();
+        d.set("safe", "0");
+        ffmpeg::format::input_with_dictionary(&path, d)
+    } else {
+        ffmpeg::format::input(&path)
+    }
+}
+
+/// Write an ffconcat playlist for a multi-segment chain to a temp file
+/// so the segments present as ONE continuous audio timeline via the
+/// concat demuxer. Returns `None` for a single segment (open it
+/// directly). `tag` disambiguates concurrent playlists (export vs
+/// preview). Caller deletes the returned temp when done.
+pub fn build_segment_playlist(segments: &[std::path::PathBuf], tag: &str) -> Option<std::path::PathBuf> {
+    if segments.len() <= 1 { return None; }
+    let mut pl = String::from("ffconcat version 1.0\n");
+    for s in segments {
+        // ffconcat single-quote escaping: ' → '\''
+        let esc = s.display().to_string().replace('\'', "'\\''");
+        pl.push_str(&format!("file '{esc}'\n"));
+    }
+    let path = std::env::temp_dir().join(format!("vr180_segs_{tag}.ffconcat"));
+    std::fs::write(&path, pl).ok()?;
+    Some(path)
+}
+
 pub fn mux_video_with_passthrough_audio(
     audio_src: &Path,
     video_src: &Path,
     final_out: &Path,
     audio_offset_s: f64,
     max_duration_s: Option<f64>,
+) -> Result<u64> {
+    mux_video_with_audio_stream(audio_src, video_src, final_out, audio_offset_s, max_duration_s, None)
+}
+
+/// Like [`mux_video_with_passthrough_audio`] but lets the caller pick a
+/// SPECIFIC audio stream index (e.g. the 4-channel ambisonic track of a
+/// `.360`, which isn't the first audio). `None` = first audio stream.
+pub fn mux_video_with_audio_stream(
+    audio_src: &Path,
+    video_src: &Path,
+    final_out: &Path,
+    audio_offset_s: f64,
+    max_duration_s: Option<f64>,
+    audio_stream_idx: Option<usize>,
 ) -> Result<u64> {
     // `audio_offset_s` / `max_duration_s` implement TRIMMED exports: the
     // video temp starts at source-time `trim_in` but its own timeline at 0,
@@ -214,18 +289,22 @@ pub fn mux_video_with_passthrough_audio(
     // wrong length and out of sync by trim_in seconds.
     crate::decode::init();
 
-    let mut a_in = ffmpeg::format::input(&audio_src)
+    let mut a_in = open_input_concat_aware(audio_src)
         .map_err(|e| Error::Ffmpeg(format!("open audio src {audio_src:?}: {e}")))?;
     let mut v_in = ffmpeg::format::input(&video_src)
         .map_err(|e| Error::Ffmpeg(format!("open video src {video_src:?}: {e}")))?;
 
-    // Locate the first audio stream in the audio source.
-    let a_idx = a_in.streams()
-        .filter(|s| {
-            s.parameters().medium() == ffmpeg::media::Type::Audio
-        })
-        .map(|s| s.index())
-        .next();
+    // Locate the audio stream: the caller-specified index (verified to
+    // be audio), else the first audio stream.
+    let a_idx = match audio_stream_idx {
+        Some(i) if a_in.stream(i)
+            .map(|s| s.parameters().medium() == ffmpeg::media::Type::Audio)
+            .unwrap_or(false) => Some(i),
+        _ => a_in.streams()
+            .filter(|s| s.parameters().medium() == ffmpeg::media::Type::Audio)
+            .map(|s| s.index())
+            .next(),
+    };
     let a_idx = match a_idx {
         Some(i) => i,
         None => {
@@ -274,6 +353,16 @@ pub fn mux_video_with_passthrough_audio(
         unsafe {
             let raw = s.parameters().as_mut_ptr();
             (*raw).codec_tag = 0;
+            // GoPro's 4-ch ambisonic PCM carries an "ambisonic 1" channel
+            // layout the MP4/MOV muxer rejects ("unsupported channel
+            // layout" → write_trailer fails). Replace it with the plain
+            // N-channel native layout so the container accepts it; the
+            // SA3D atom (injected after) carries the ambisonic semantics.
+            let nch = (*raw).ch_layout.nb_channels;
+            if nch >= 3 {
+                ffmpeg::ffi::av_channel_layout_uninit(&mut (*raw).ch_layout);
+                ffmpeg::ffi::av_channel_layout_default(&mut (*raw).ch_layout, nch);
+            }
         }
         s.index()
     };

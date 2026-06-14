@@ -221,7 +221,7 @@ fn decoder_worker(
     use ffmpeg_next as ffmpeg;
     use ffmpeg::software::resampling::Context as Resampler;
 
-    let mut ictx = ffmpeg::format::input(&path)
+    let mut ictx = vr180_pipeline::audio::open_input_concat_aware(&path)
         .map_err(|e| anyhow!("open {path:?}: {e}"))?;
 
     // Locate the audio stream.

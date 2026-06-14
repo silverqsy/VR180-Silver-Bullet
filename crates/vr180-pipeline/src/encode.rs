@@ -118,6 +118,32 @@ pub struct H265Encoder {
     /// does the YUV conversion, so the GPU readback skips the per-pixel
     /// RGBA64→RGB48 repack (a 30M-iteration/frame CPU loop at 8K SBS).
     scaler_rgba64: Option<ffmpeg::software::scaling::Context>,
+    /// Optional ONE-PASS audio passthrough: the source's audio is muxed
+    /// into the SAME output during encode (no `.video.tmp` + re-mux). See
+    /// [`H265Encoder::attach_audio_passthrough`]. `None` → video-only
+    /// output (the caller adds audio afterwards, the legacy path).
+    audio: Option<AudioPassthrough>,
+}
+
+/// State for muxing the source's audio inline with the encoded video.
+/// Packets are pulled from `a_in` and written, rebased onto the trim
+/// window, interleaved with the video in `drain_packets`/`finish`.
+struct AudioPassthrough {
+    a_in: ffmpeg::format::context::Input,
+    /// Source audio stream index, and the muxer's output audio stream.
+    a_idx: usize,
+    out_a_idx: usize,
+    in_tb: ffmpeg::Rational,
+    out_tb: ffmpeg::Rational,
+    /// Trim window in SOURCE seconds: keep `[offset_s, offset_s + dur_s)`,
+    /// rebased so the first kept packet lands at ≈0 on the output.
+    offset_s: f64,
+    dur_s: f64,
+    off_ticks: i64,
+    /// A packet read but not yet due (held until the video catches up).
+    pending: Option<ffmpeg::Packet>,
+    finished: bool,
+    written: u64,
 }
 
 /// Which `encode_*` entry point this encoder was configured for.
@@ -353,6 +379,7 @@ impl H265Encoder {
             enc_pix_fmt,
             scaler_rgb48: None,
             scaler_rgba64: None,
+            audio: None,
         })
     }
 
@@ -366,7 +393,117 @@ impl H265Encoder {
         self.octx.write_header()
             .map_err(|e| Error::Ffmpeg(format!("write_header: {e}")))?;
         self.header_written = true;
+        // The muxer finalizes the output time base in write_header; capture
+        // it now so the inline audio rebases onto the right scale.
+        if let Some(oa) = self.audio.as_ref().map(|a| a.out_a_idx) {
+            let tb = self.octx.stream(oa).unwrap().time_base();
+            if let Some(ap) = self.audio.as_mut() { ap.out_tb = tb; }
+        }
         Ok(())
+    }
+
+    /// Mux the source's audio into THIS output during encode — one pass, no
+    /// `.video.tmp` + re-mux. MUST be called before the first encode (the
+    /// audio output stream is added before the muxer header). Keeps the trim
+    /// window `[offset_s, offset_s + dur_s)` of the source's FIRST audio
+    /// stream, rebased to start at 0, interleaved with the video. Returns
+    /// `Ok(false)` (stays video-only) when the source has no audio.
+    pub fn attach_audio_passthrough(
+        &mut self,
+        audio_src: &std::path::Path,
+        offset_s: f64,
+        dur_s: f64,
+    ) -> Result<bool> {
+        if self.header_written {
+            return Err(Error::Ffmpeg("attach_audio_passthrough after header".into()));
+        }
+        if self.audio.is_some() {
+            return Err(Error::Ffmpeg("audio passthrough already attached".into()));
+        }
+        let a_in = crate::audio::open_input_concat_aware(audio_src)
+            .map_err(|e| Error::Ffmpeg(format!("open audio src {audio_src:?}: {e}")))?;
+        let a_idx = match a_in.streams()
+            .filter(|s| s.parameters().medium() == ffmpeg::media::Type::Audio)
+            .map(|s| s.index()).next()
+        {
+            Some(i) => i,
+            None => {
+                tracing::info!("one-pass audio: no audio in {audio_src:?} — video-only output");
+                return Ok(false);
+            }
+        };
+        let in_tb = a_in.stream(a_idx).unwrap().time_base();
+        let params = a_in.stream(a_idx).unwrap().parameters();
+        // Add the output audio stream (params copy). Clear codec_tag so the
+        // muxer picks the right MOV/MP4 tag; normalize any >2ch "ambisonic"
+        // layout the MP4 muxer rejects (stereo never hits this).
+        let out_a_idx = {
+            let mut s = self.octx.add_stream(ffmpeg::codec::Id::None)
+                .map_err(|e| Error::Ffmpeg(format!("add audio stream: {e}")))?;
+            s.set_parameters(params);
+            s.set_time_base(in_tb);
+            unsafe {
+                let raw = s.parameters().as_mut_ptr();
+                (*raw).codec_tag = 0;
+                let nch = (*raw).ch_layout.nb_channels;
+                if nch >= 3 {
+                    ffmpeg::ffi::av_channel_layout_uninit(&mut (*raw).ch_layout);
+                    ffmpeg::ffi::av_channel_layout_default(&mut (*raw).ch_layout, nch);
+                }
+            }
+            s.index()
+        };
+        let off_ticks = (offset_s * in_tb.denominator() as f64
+            / in_tb.numerator() as f64).round() as i64;
+        self.audio = Some(AudioPassthrough {
+            a_in, a_idx, out_a_idx, in_tb, out_tb: in_tb /* fixed post-header */,
+            offset_s, dur_s, off_ticks,
+            pending: None, finished: false, written: 0,
+        });
+        tracing::info!(
+            "one-pass audio: source audio muxed inline (offset {offset_s:.2}s, dur {dur_s:.2}s)");
+        Ok(true)
+    }
+
+    /// Write source audio packets due by `video_time_s` (output-timeline
+    /// seconds), interleaving with the encoded video so the muxer buffer
+    /// stays bounded. `f64::INFINITY` flushes all remaining audio.
+    fn pump_audio_until(&mut self, video_time_s: f64) -> Result<()> {
+        let mut ap = match self.audio.take() { Some(a) => a, None => return Ok(()) };
+        let r = self.pump_audio_inner(&mut ap, video_time_s);
+        self.audio = Some(ap);
+        r
+    }
+
+    fn pump_audio_inner(&mut self, ap: &mut AudioPassthrough, until_s: f64) -> Result<()> {
+        if ap.finished { return Ok(()); }
+        let in_per_s = ap.in_tb.numerator() as f64 / ap.in_tb.denominator() as f64;
+        loop {
+            let mut pkt = match ap.pending.take() {
+                Some(p) => p,
+                None => {
+                    let mut got = None;
+                    for (s, p) in ap.a_in.packets() {
+                        if s.index() == ap.a_idx { got = Some(p); break; }
+                    }
+                    match got { Some(p) => p, None => { ap.finished = true; return Ok(()); } }
+                }
+            };
+            let t = pkt.dts().or(pkt.pts()).unwrap_or(0);
+            let src_s = t as f64 * in_per_s;
+            if src_s < ap.offset_s - 1e-6 { continue; }        // before trim_in → drop
+            let out_s = src_s - ap.offset_s;
+            if out_s >= ap.dur_s { ap.finished = true; return Ok(()); } // past trim_out
+            if out_s > until_s + 0.5 { ap.pending = Some(pkt); return Ok(()); } // not due yet
+            if let Some(pts) = pkt.pts() { pkt.set_pts(Some((pts - ap.off_ticks).max(0))); }
+            if let Some(dts) = pkt.dts() { pkt.set_dts(Some((dts - ap.off_ticks).max(0))); }
+            pkt.set_stream(ap.out_a_idx);
+            pkt.set_position(-1);
+            pkt.rescale_ts(ap.in_tb, ap.out_tb);
+            pkt.write_interleaved(&mut self.octx)
+                .map_err(|e| Error::Ffmpeg(format!("write audio packet: {e}")))?;
+            ap.written += 1;
+        }
     }
 
     /// Encode one packed RGB8 frame. Length must equal `w * h * 3`.
@@ -614,6 +751,10 @@ impl H265Encoder {
                     }
                     let stream_tb = self.octx.stream(self.stream_index).unwrap().time_base();
                     packet.rescale_ts(self.time_base, stream_tb);
+                    // Video timestamp on the OUTPUT timeline — used to pace
+                    // the inline audio (written just after, up to this time).
+                    let v_time_s = packet.pts().map(|p|
+                        p as f64 * stream_tb.numerator() as f64 / stream_tb.denominator() as f64);
                     tracing::trace!(
                         pts = packet.pts().unwrap_or(-1),
                         dts = packet.dts().unwrap_or(-1),
@@ -623,6 +764,12 @@ impl H265Encoder {
                     );
                     packet.write_interleaved(&mut self.octx)
                         .map_err(|e| Error::Ffmpeg(format!("write packet: {e}")))?;
+                    // One-pass audio: write source audio up to this video
+                    // time so both streams interleave incrementally (no-op
+                    // when no audio passthrough is attached).
+                    if let Some(v_time_s) = v_time_s {
+                        self.pump_audio_until(v_time_s)?;
+                    }
                 }
                 Err(ffmpeg::Error::Other { errno }) if errno == EAGAIN => break,
                 Err(ffmpeg::Error::Eof) => break,
@@ -739,6 +886,12 @@ impl H265Encoder {
         self.encoder.send_eof()
             .map_err(|e| Error::Ffmpeg(format!("send_eof: {e}")))?;
         self.drain_packets()?;
+        // Flush any audio past the last video packet's time (the trailing
+        // ~frame of audio) before the trailer. No-op without passthrough.
+        self.pump_audio_until(f64::INFINITY)?;
+        if let Some(ap) = self.audio.as_ref() {
+            tracing::info!("one-pass audio: {} packets muxed inline", ap.written);
+        }
         self.octx.write_trailer()
             .map_err(|e| Error::Ffmpeg(format!("write_trailer: {e}")))?;
         self.finished = true;
@@ -1171,6 +1324,7 @@ impl H265Encoder {
             enc_pix_fmt: ffmpeg::format::Pixel::YUV420P,
             scaler_rgb48: None,
             scaler_rgba64: None,
+            audio: None,
         })
     }
 }

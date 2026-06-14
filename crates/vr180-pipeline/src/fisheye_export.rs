@@ -13,7 +13,7 @@
 use crate::encode::{EncoderBackend, H265Encoder};
 use crate::fisheye_decode::{
     BrawFisheyeIter, DualStreamFisheyeIter, FisheyePair, FisheyePairIter,
-    SbsFisheyeIter,
+    SbsFisheyeIter, SegmentedFisheyeIter,
 };
 use crate::gpu::{ColorStackPlan, Device, EquirectRotation, FisheyeCalib};
 use crate::source_kind::SourceKind;
@@ -52,6 +52,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[allow(unused_imports)]
 use crate::fisheye_decode::FisheyePair as _; // satisfy `use` linter when paths fall through
 
+/// Export audio-track selection for `.360` (which carries both a
+/// stereo AAC and a 4-channel ambisonic track). Mirrors the GUI's
+/// `AudioFormat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioTrack {
+    /// Stereo AAC passthrough (default, universal).
+    Stereo,
+    /// 4-channel ambisonic passthrough + SA3D spatial-audio metadata.
+    Ambisonic,
+    /// Re-encode the ambisonic to Apple Positional Audio Codec (Vision
+    /// Pro head-tracked spatial). macOS-only; needs the apac_encode helper.
+    Apac,
+}
+
 /// Complete export configuration. The fields mirror the GUI's
 /// `Settings` plus the encoding knobs that have no equivalent in the
 /// preview side.
@@ -64,6 +78,8 @@ pub struct FisheyeExportConfig {
     pub segments: Vec<PathBuf>,
     pub output_path: PathBuf,
     pub source_kind: SourceKind,
+    /// Which audio track to write (`.360` stereo / ambisonic / APAC).
+    pub audio_track: AudioTrack,
     /// One eye's output dimensions (the SBS file is `2*eye_w × eye_h`).
     pub eye_w: u32,
     pub eye_h: u32,
@@ -101,6 +117,14 @@ pub struct FisheyeExportConfig {
     /// Soft-stab velocity→smoothing response curve (0.2–3.0, 1 = linear).
     /// Mirrors `Settings.dji_responsiveness`.
     pub dji_responsiveness: f32,
+    /// Temporal noise-reduction strength (0.0 = off, 1.0 = max), applied to
+    /// the source fisheye frames before projection via the in-process
+    /// VideoToolbox temporal filter ([`crate::vt_denoise`]). macOS-only;
+    /// ignored (treated as off) on other platforms. Non-zero forces the
+    /// portable CPU decode path (the zero-copy GPU path keeps frames on the
+    /// GPU, out of reach of the CPU-side filter). Mirrors
+    /// `Settings.denoise_strength`.
+    pub denoise_strength: f32,
     /// Per-eye view adjustment (global pano-map + stereo offset).
     /// `ViewAdjust::IDENTITY` (all zeros) = no-op, composed AFTER
     /// stabilization in the projection step.
@@ -157,17 +181,61 @@ pub struct ExportProgress {
     pub fps_avg: f32,
 }
 
-/// Build a temp video-only path next to the final export target. The
-/// encoder writes here; once it finishes we mux the source's audio
-/// onto a final file at `final_out` and clean this up.
-fn video_only_temp_path(final_out: &std::path::Path) -> std::path::PathBuf {
+/// Available bytes on the filesystem holding `dir`, via `df -kP`
+/// (POSIX one-line-per-fs output). Best-effort — `None` on any failure.
+fn fs_avail_bytes(dir: &std::path::Path) -> Option<u64> {
+    let out = std::process::Command::new("df").arg("-kP").arg(dir).output().ok()?;
+    if !out.status.success() { return None; }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Columns: Filesystem 1024-blocks Used Available Capacity Mounted-on.
+    let avail_kb: u64 = text.lines().last()?.split_whitespace().nth(3)?.parse().ok()?;
+    Some(avail_kb.saturating_mul(1024))
+}
+
+/// Move `src` → `dst`, handling a cross-device boundary (local scratch →
+/// network output) by copy-then-remove when a plain rename can't span it.
+fn move_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    std::fs::remove_file(dst).ok(); // clear any stale target
+    if std::fs::rename(src, dst).is_ok() { return Ok(()); }
+    std::fs::copy(src, dst).map_err(Error::Io)?;
+    std::fs::remove_file(src).ok();
+    Ok(())
+}
+
+/// `final_out` with a `.video.tmp.<ext>` suffix — the next-to-output
+/// fallback location for the working video.
+fn video_tmp_next_to_output(final_out: &std::path::Path) -> std::path::PathBuf {
     let mut s = final_out.as_os_str().to_owned();
     s.push(".video.tmp");
-    if let Some(ext) = final_out.extension() {
-        s.push(".");
-        s.push(ext);
-    }
+    if let Some(ext) = final_out.extension() { s.push("."); s.push(ext); }
     std::path::PathBuf::from(s)
+}
+
+/// Where the encoder writes the video-only intermediate. Prefer LOCAL
+/// scratch (`temp_dir`) so the encode-write AND the finalize re-mux read of
+/// the multi-GB video stay OFF a network / slow output volume (e.g. an SMB
+/// NAS — that read+write was the "export keeps growing after 100%" tail);
+/// the final muxed file still lands at `final_out`. Falls back to
+/// next-to-output when local scratch is short on space, or when
+/// `VR180_TEMP_NEXT_TO_OUTPUT` is set.
+fn video_only_temp_path(final_out: &std::path::Path) -> std::path::PathBuf {
+    if std::env::var_os("VR180_TEMP_NEXT_TO_OUTPUT").is_some() {
+        return video_tmp_next_to_output(final_out);
+    }
+    // Generous floor so a large export can't fill a near-full boot disk; the
+    // fallback (next-to-output) is always safe.
+    const MIN_LOCAL_FREE: u64 = 96 * 1024 * 1024 * 1024; // 96 GiB
+    let tmp_dir = std::env::temp_dir();
+    if fs_avail_bytes(&tmp_dir).map(|a| a >= MIN_LOCAL_FREE).unwrap_or(false) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        final_out.hash(&mut h);
+        let stem = final_out.file_name().and_then(|s| s.to_str()).unwrap_or("vr180_export");
+        let ext = final_out.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
+        tracing::info!("export: working video on local scratch {}", tmp_dir.display());
+        return tmp_dir.join(format!("{stem}.{:x}.video.tmp.{ext}", h.finish()));
+    }
+    video_tmp_next_to_output(final_out)
 }
 
 /// Open the H.265 encoder, transparently falling back from the NVIDIA
@@ -234,6 +302,105 @@ fn finalize_metadata(
 /// audio track onto it. When the source has no audio we just rename
 /// the temp into place. Caller already passed `final_out` to the GUI;
 /// we don't move the file anywhere else.
+/// Audio source for an EAC export: a temp ffconcat playlist spanning
+/// the segment chain (multi-segment) or the lone source file. The
+/// returned temp (when `Some`) must be deleted after the mux.
+fn eac_audio_source(cfg: &FisheyeExportConfig) -> (PathBuf, Option<PathBuf>) {
+    let tag = cfg.output_path.file_stem().and_then(|s| s.to_str())
+        .unwrap_or("eac").to_string();
+    match crate::audio::build_segment_playlist(&cfg.segments, &tag) {
+        Some(pl) => (pl.clone(), Some(pl)),
+        None => (cfg.source_path.clone(), None),
+    }
+}
+
+/// Finalize EAC audio per `cfg.audio_track`. The video temp is consumed
+/// (renamed or muxed away) regardless of branch.
+/// - **Stereo**: passthrough-mux the source's stereo AAC (universal).
+/// - **Ambisonic**: passthrough-mux the 4-channel ambisonic track + an
+///   SA3D atom so VR players head-track it.
+/// - **Apac** (macOS): extract the 4-ch ambisonic to WAV and let the
+///   `apac_encode` helper re-encode it to Apple Positional Audio onto
+///   the video (Vision Pro head-tracked spatial). Stereo fallback if the
+///   helper / ambisonic track is missing.
+/// Multi-segment: the audio source is the ffconcat playlist, so the
+/// `(offset, dur)` window cuts from the unified chain timeline.
+fn finalize_eac_audio(
+    cfg: &FisheyeExportConfig,
+    video_tmp: &std::path::Path,
+    offset_s: f64,
+    dur_s: f64,
+) -> Result<()> {
+    let (audio_src, audio_tmp) = eac_audio_source(cfg);
+    let drop_tmp = |t: &Option<PathBuf>| { if let Some(p) = t { std::fs::remove_file(p).ok(); } };
+    let out = &cfg.output_path;
+
+    let stereo = |audio_tmp: &Option<PathBuf>| -> Result<()> {
+        finalize_with_audio(&audio_src, video_tmp, out, offset_s, dur_s)?;
+        drop_tmp(audio_tmp);
+        Ok(())
+    };
+
+    match cfg.audio_track {
+        AudioTrack::Stereo => stereo(&audio_tmp)?,
+
+        AudioTrack::Ambisonic => match crate::audio::probe_ambisonic(&audio_src) {
+            Ok(Some(info)) => {
+                let n = crate::audio::mux_video_with_audio_stream(
+                    &audio_src, video_tmp, out, offset_s, Some(dur_s),
+                    Some(info.stream_index))?;
+                drop_tmp(&audio_tmp);
+                if n > 0 {
+                    std::fs::remove_file(video_tmp).ok();
+                    // Tag the 4-ch track as 1st-order AmbiX so VR players
+                    // head-track it (YouTube/Quest). Non-fatal on failure.
+                    if let Err(e) = crate::spherical_inject::inject_sa3d_ambix(out, info.channels) {
+                        tracing::warn!("SA3D inject failed (audio still present): {e}");
+                    }
+                } else {
+                    move_file(video_tmp, out)?;
+                }
+            }
+            _ => {
+                tracing::warn!("ambisonic requested but no 4-ch track found — stereo fallback");
+                stereo(&audio_tmp)?;
+            }
+        },
+
+        AudioTrack::Apac => {
+            #[cfg(target_os = "macos")]
+            {
+                let wav = video_tmp.with_extension("ambi.wav");
+                match crate::audio::extract_ambisonic_to_wav_window(
+                    &audio_src, &wav, offset_s, Some(dur_s)) {
+                    Ok(_) => {
+                        let r = crate::helpers::spawn_apac_encode(
+                            &wav, Some(video_tmp), out, 256_000);
+                        std::fs::remove_file(&wav).ok();
+                        match r {
+                            Ok(()) => { std::fs::remove_file(video_tmp).ok(); drop_tmp(&audio_tmp); }
+                            Err(e) => {
+                                tracing::warn!("apac_encode failed ({e}) — stereo fallback");
+                                stereo(&audio_tmp)?;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("APAC: ambisonic extract failed ({e}) — stereo fallback");
+                        stereo(&audio_tmp)?;
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                tracing::warn!("APAC is macOS-only — stereo fallback");
+                stereo(&audio_tmp)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn finalize_with_audio(
     audio_src: &std::path::Path,
     video_tmp: &std::path::Path,
@@ -249,12 +416,11 @@ fn finalize_with_audio(
         audio_offset_s, Some(video_dur_s),
     ) {
         Ok(0) => {
-            // Source had no audio — promote the temp video to the
-            // final location and we're done.
-            std::fs::remove_file(final_out).ok(); // in case a stale exists
-            std::fs::rename(video_tmp, final_out).map_err(|e| Error::Io(e))?;
+            // Source had no audio — promote the temp video to the final
+            // location (cross-device move if the temp is on local scratch).
+            move_file(video_tmp, final_out)?;
             tracing::info!(
-                "fisheye_export: no audio in source, renamed video-only output to {}",
+                "fisheye_export: no audio in source, moved video-only output to {}",
                 final_out.display()
             );
         }
@@ -267,11 +433,13 @@ fn finalize_with_audio(
             );
         }
         Err(e) => {
-            // Mux failed — leave the temp video so the user at least
-            // has a video-only file. Surface the error.
+            // Mux failed — salvage the video-only temp next to the output
+            // (the temp may be on local scratch) so the user keeps a file.
+            let salvage = video_tmp_next_to_output(final_out);
+            if salvage != video_tmp { let _ = move_file(video_tmp, &salvage); }
             tracing::warn!(
-                "fisheye_export: audio mux failed: {e} — temp video left at {}",
-                video_tmp.display()
+                "fisheye_export: audio mux failed: {e} — video-only file left at {}",
+                salvage.display()
             );
             return Err(e);
         }
@@ -288,6 +456,44 @@ fn finalize_with_audio(
 /// On cancel: closes the encoder cleanly (the muxer flushes its
 /// header) so the partial output file is still playable up to the
 /// last written frame.
+/// Whether this export can mux audio in ONE pass (inline with the encode,
+/// straight to the final file — no `.video.tmp` + re-mux). True for plain
+/// stereo passthrough; the `.360` ambisonic + APAC formats need post-encode
+/// steps (SA3D atom / APAC re-encode) so they keep the temp+finalize path.
+fn one_pass_audio_eligible(cfg: &FisheyeExportConfig) -> bool {
+    !matches!(cfg.source_kind, SourceKind::GoProEac)
+        || matches!(cfg.audio_track, AudioTrack::Stereo)
+}
+
+/// Build a per-segment opener for the portable fisheye export decode loop
+/// — native resolution (no cap), bit-depth matched to the output codec.
+/// Shared by the single-file path and the multi-segment
+/// [`SegmentedFisheyeIter`] so a merged recording decodes identically.
+fn fisheye_export_opener(
+    kind: SourceKind,
+    swap_eyes: bool,
+    bit_depth: u8,
+) -> Box<dyn FnMut(&std::path::Path) -> Result<Box<dyn FisheyePairIter>>> {
+    let bd = if bit_depth >= 10 { 16u8 } else { 8u8 };
+    Box::new(move |p: &std::path::Path| -> Result<Box<dyn FisheyePairIter>> {
+        Ok(match kind {
+            SourceKind::DjiOsv => Box::new(DualStreamFisheyeIter::new_with_options(
+                p, crate::decode::HwDecode::Auto, 0, !swap_eyes, 0, bd)?),
+            SourceKind::SbsFisheye => Box::new(
+                SbsFisheyeIter::new(p, crate::decode::HwDecode::Auto, 0)?),
+            SourceKind::BlackmagicRaw => {
+                let info = vr180_braw::BrawInfo::probe(p)
+                    .map_err(|e| Error::Ffmpeg(format!("braw probe: {e}")))?;
+                let opts = vr180_braw::decoder::DecodeOptions::default();
+                Box::new(BrawFisheyeIter::new(p, &info, &opts, 0)
+                    .map_err(|e| Error::Ffmpeg(format!("braw start: {e}")))?)
+            }
+            other => return Err(Error::Ffmpeg(format!(
+                "export_fisheye non-fisheye source: {other:?}"))),
+        })
+    })
+}
+
 pub fn export_fisheye(
     pipeline: Arc<Device>,
     cfg: FisheyeExportConfig,
@@ -324,9 +530,17 @@ pub fn export_fisheye(
         // This means 8-bit no longer pays the CPU-roundtrip decode the
         // general path uses (download → swscale → re-upload per frame),
         // which made 8-bit export slower than 10-bit.
+        // Single-segment only: the zero-copy iterator opens one file. A
+        // merged recording (cfg.segments.len() > 1) falls through to the
+        // portable loop below, which chains segments via SegmentedFisheyeIter.
         let can_zero_copy_decode = matches!(cfg.source_kind, SourceKind::DjiOsv)
             && on_macos_vt
-            && (cfg.bit_depth == 10 || cfg.bit_depth == 8);
+            && (cfg.bit_depth == 10 || cfg.bit_depth == 8)
+            && cfg.segments.len() <= 1;
+        // NB: denoise (cfg.denoise_strength > 0) STAYS on this fast path — the
+        // zero-copy export denoises the P010 IOSurfaces on the GPU via
+        // DenoisingZeroCopyIter, with no CPU bounce (≈3× faster than dropping
+        // to the portable readback path).
         if can_zero_copy_decode {
             return export_fisheye_osv_zerocopy_p010(
                 pipeline, cfg, &mut progress_cb, cancel,
@@ -357,8 +571,10 @@ pub fn export_fisheye(
             && matches!(cfg.encoder, EncoderBackend::HevcNvenc)
             && cfg.bit_depth == 10
             && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye)
+            && cfg.segments.len() <= 1 // merged recording → portable segmented loop
             && crate::interop_windows::is_vulkan_backend(&pipeline.device)
-            && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010);
+            && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010)
+            && cfg.denoise_strength <= 0.0; // denoise needs CPU frames → portable path
         if try_gpu_resident {
             let swap = !cfg.fisheye_swap_eyes;
             let ctx = crate::interop_windows::VulkanImportCtx::from_wgpu(
@@ -412,8 +628,10 @@ pub fn export_fisheye(
             && matches!(cfg.encoder, EncoderBackend::Libx265 | EncoderBackend::HevcNvenc)
             && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye)
             && (cfg.bit_depth == 10 || cfg.bit_depth == 8)
+            && cfg.segments.len() <= 1 // merged recording → portable segmented loop
             && crate::interop_windows::is_vulkan_backend(&pipeline.device)
-            && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010);
+            && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010)
+            && cfg.denoise_strength <= 0.0; // denoise needs CPU frames → portable path
         if can_try {
             // OSV swap-by-default ⊕ user override (matches preview + CPU path).
             let swap = !cfg.fisheye_swap_eyes;
@@ -450,48 +668,82 @@ pub fn export_fisheye(
     // Export always passes max_decode_side=0 (no cap) so we get the
     // source's native fisheye resolution. The preview path is the
     // only consumer that caps to MAX_DECODE_SIDE for real-time fps.
-    let mut decoder: Box<dyn FisheyePairIter> = match cfg.source_kind {
-        SourceKind::DjiOsv => Box::new(
-            DualStreamFisheyeIter::new_with_options(
-                &cfg.source_path, crate::decode::HwDecode::Auto, 0,
-                // OSV swap-by-default ⊕ user override (matches preview).
-                !cfg.fisheye_swap_eyes,
-                0, // no resolution cap — export at full native size
-                // 16-bit RGBA scaler output when targeting 10-bit codec
-                // so the projection input keeps P010's 10 bits of source
-                // precision instead of being quantized to 8 by the
-                // scaler. 8-bit codec → 8-bit scaler (the standard path).
-                if cfg.bit_depth >= 10 { 16 } else { 8 },
-            )?
-        ),
-        SourceKind::SbsFisheye => Box::new(
-            SbsFisheyeIter::new(&cfg.source_path, crate::decode::HwDecode::Auto, 0)?
-        ),
-        SourceKind::BlackmagicRaw => {
-            let info = vr180_braw::BrawInfo::probe(&cfg.source_path)
-                .map_err(|e| Error::Ffmpeg(format!("braw probe: {e}")))?;
-            let opts = vr180_braw::decoder::DecodeOptions::default();
-            Box::new(
-                BrawFisheyeIter::new(&cfg.source_path, &info, &opts, 0)
-                    .map_err(|e| Error::Ffmpeg(format!("braw start: {e}")))?
-            )
-        }
-        other => return Err(Error::Ffmpeg(format!(
-            "export_fisheye called with non-fisheye source: {other:?}"
-        ))),
+    let mut decoder: Box<dyn FisheyePairIter> = if cfg.segments.len() > 1 {
+        // Merged recording: chain the segments into one continuous timeline
+        // (the IMU is aggregated the same way below, so stab indexes by
+        // absolute frame across the whole export).
+        let durations: Vec<f64> = cfg.segments.iter()
+            .map(|p| crate::decode::probe_video(p).map(|pr| pr.duration_sec).unwrap_or(0.0))
+            .collect();
+        tracing::info!(
+            "fisheye_export: {} segments, {:.1}s total — SegmentedFisheyeIter",
+            cfg.segments.len(), durations.iter().sum::<f64>());
+        Box::new(SegmentedFisheyeIter::new(
+            &cfg.segments, &durations,
+            fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth))?)
+    } else {
+        let mut open = fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth);
+        open(&cfg.source_path)?
     };
+
+    // ── Temporal noise reduction (macOS VideoToolbox) ────────────
+    // Source-domain denoise, before projection — matches the Python app.
+    // Wraps the iterator so each eye's frames stream through the in-process
+    // VTTemporalNoiseFilter. The zero-copy decode paths above are already
+    // gated off when `denoise_strength > 0`, so we always have CPU frames
+    // here. Frame count/order are preserved, so stab + audio stay aligned.
+    #[cfg(target_os = "macos")]
+    if cfg.denoise_strength > 0.0 {
+        if crate::vt_denoise::is_supported() {
+            match crate::fisheye_decode::DenoisingFisheyeIter::new(decoder, cfg.denoise_strength) {
+                Ok(d) => {
+                    tracing::info!(
+                        "fisheye_export: temporal NR ENGAGED (strength={:.2})",
+                        cfg.denoise_strength
+                    );
+                    decoder = Box::new(d);
+                }
+                Err(e) => {
+                    return Err(Error::Ffmpeg(format!("denoise init failed: {e}")));
+                }
+            }
+        } else {
+            tracing::warn!(
+                "fisheye_export: denoise requested but VTTemporalNoiseFilter \
+                 unsupported on this machine — exporting without NR"
+            );
+            // `decoder` was moved into the match arm only on the Ok path; on
+            // this branch it's untouched and still bound.
+        }
+    }
+
     let (src_w, src_h) = decoder.eye_dims();
 
     // ── DJI: extract protobuf for per-eye calib + (optional) stab ─
     let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = if matches!(
         cfg.source_kind, SourceKind::DjiOsv
     ) {
-        match crate::decode::extract_dji_meta_stream(&cfg.source_path) {
-            Ok(blob) => match vr180_fisheye::DjiOsvImu::parse(&blob) {
-                Ok(imu) => Some(imu),
-                Err(e) => { tracing::warn!("dji protobuf parse: {e}"); None }
-            },
-            Err(e) => { tracing::warn!("dji meta extract: {e}"); None }
+        // Single file → parse; merged recording → parse_multi (concatenate
+        // each segment's protobuf so IMU indexes by absolute frame).
+        let parsed: Result<vr180_fisheye::DjiOsvImu> = if cfg.segments.len() > 1 {
+            let mut blobs = Vec::with_capacity(cfg.segments.len());
+            let mut acc: Result<()> = Ok(());
+            for p in &cfg.segments {
+                match crate::decode::extract_dji_meta_stream(p) {
+                    Ok(b) => blobs.push(b),
+                    Err(e) => { acc = Err(e); break; }
+                }
+            }
+            acc.and_then(|()| vr180_fisheye::DjiOsvImu::parse_multi(&blobs)
+                .map_err(|e| Error::Ffmpeg(format!("dji parse_multi: {e}"))))
+        } else {
+            crate::decode::extract_dji_meta_stream(&cfg.source_path)
+                .and_then(|blob| vr180_fisheye::DjiOsvImu::parse(&blob)
+                    .map_err(|e| Error::Ffmpeg(format!("dji parse: {e}"))))
+        };
+        match parsed {
+            Ok(imu) => Some(imu),
+            Err(e) => { tracing::warn!("dji meta: {e}"); None }
         }
     } else { None };
 
@@ -501,11 +753,15 @@ pub fn export_fisheye(
     );
 
     // ── Stab rotations (one per source frame) ────────────────────
-    let total_clip_frames = {
-        let probe = crate::decode::probe_video(&cfg.source_path)
+    let total_clip_frames = if cfg.segments.len() > 1 {
+        cfg.segments.iter()
+            .filter_map(|p| crate::decode::probe_video(p).ok())
             .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
-            .unwrap_or(0).max(1);
-        probe
+            .sum::<usize>().max(1)
+    } else {
+        crate::decode::probe_video(&cfg.source_path)
+            .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+            .unwrap_or(0).max(1)
     };
     let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
         match cfg.source_kind {
@@ -574,11 +830,14 @@ pub fn export_fisheye(
     let is_prores_vt = cfg.encoder == EncoderBackend::ProResVideoToolbox;
     let use_zero_copy_bgra = on_macos_vt && cfg.bit_depth == 8 && !is_prores_vt;
     let use_zero_copy_p010 = on_macos_vt && (cfg.bit_depth == 10 || is_prores_vt);
-    // Write video first to a temp path next to the final output, then
-    // mux the source's audio onto it at the very end. The video alone
-    // would always be a complete playable file; the extra mux step is
-    // what lets us preserve the OSV's stereo AAC track.
-    let video_tmp = video_only_temp_path(&cfg.output_path);
+    // One-pass: encode STRAIGHT to the final file and mux the source's
+    // audio inline (no temp + re-mux). Otherwise write a local-scratch
+    // video temp and mux audio onto it afterwards (ambisonic / APAC).
+    // `video_tmp` aliases the final file in the one-pass case, so the
+    // encoder ctors below need no change.
+    let one_pass = one_pass_audio_eligible(&cfg);
+    let video_tmp = if one_pass { cfg.output_path.clone() }
+                    else { video_only_temp_path(&cfg.output_path) };
     let mut encoder = if use_zero_copy_bgra {
         // macOS/VideoToolbox-only zero-copy BGRA path. `use_zero_copy_bgra`
         // is always `false` on non-macOS targets, so this arm is dead there
@@ -633,6 +892,16 @@ pub fn export_fisheye(
             cfg.bit_depth, cfg.encoder
         );
     }
+
+    // Inline audio passthrough — must attach before the first frame.
+    let one_pass_audio_tmp = if one_pass {
+        let (asrc, atmp) = eac_audio_source(&cfg);
+        let dur = total_frames_to_write as f64 / cfg.fps as f64;
+        if let Err(e) = encoder.attach_audio_passthrough(&asrc, t_in, dur) {
+            tracing::warn!("one-pass audio attach failed: {e} — video-only output");
+        }
+        atmp
+    } else { None };
 
     // ── Encode loop ──────────────────────────────────────────────
     let dt = 1.0 / cfg.fps as f64;
@@ -874,8 +1143,18 @@ pub fn export_fisheye(
     }
 
     encoder.finish()?;
-    finalize_with_audio(&cfg.source_path, &video_tmp, &cfg.output_path,
-        t_in, frame_idx as f64 * dt)?;
+    if one_pass {
+        // Audio already muxed inline — drop the playlist temp, if any.
+        if let Some(tmp) = one_pass_audio_tmp { std::fs::remove_file(tmp).ok(); }
+    } else {
+        // Multi-segment uses an ffconcat playlist so the merged recording's
+        // audio is one continuous track the trim window cuts from; a lone
+        // file muxes its own. (`eac_audio_source` is segment-generic.)
+        let (audio_src, audio_tmp) = eac_audio_source(&cfg);
+        finalize_with_audio(&audio_src, &video_tmp, &cfg.output_path,
+            t_in, frame_idx as f64 * dt)?;
+        if let Some(tmp) = audio_tmp { std::fs::remove_file(tmp).ok(); }
+    }
     finalize_metadata(
         &cfg.output_path,
         cfg.inject_youtube_vr180,
@@ -1053,9 +1332,11 @@ pub fn export_eac(
 
     encoder.finish()?;
     // Audio: trim window in source time = (trim_in, written·dt). Passthrough
-    // mux copies the source's first audio track (GoPro `.360` carries AAC).
-    finalize_with_audio(
-        &cfg.source_path, &video_tmp, &cfg.output_path,
+    // mux copies the source's first audio track (GoPro `.360` carries AAC);
+    // multi-segment uses an ffconcat playlist so the chain's audio is one
+    // continuous timeline the global (trim_in, dur) window cuts from.
+    finalize_eac_audio(
+        &cfg, &video_tmp,
         trim_in_frame as f64 * dt, written as f64 * dt,
     )?;
     finalize_metadata(
@@ -1098,7 +1379,21 @@ fn export_eac_zerocopy_vt(
     use std::sync::atomic::Ordering;
     use crate::gpu::Lens;
 
-    let mut decoder = crate::decode::SegmentedZeroCopyPairIter::new(&cfg.segments, 0)?;
+    let raw = crate::decode::SegmentedZeroCopyPairIter::new(&cfg.segments, 0)?;
+    // Temporal NR, if requested, denoises the s0/s4 P010 streams on the GPU
+    // before EAC cross assembly (matches the Python app's source-stream
+    // denoise) — no CPU readback.
+    let mut decoder = if cfg.denoise_strength > 0.0 && crate::vt_denoise::is_supported() {
+        tracing::info!(
+            "export_eac (zc): temporal NR ENGAGED on GPU (strength={:.2})",
+            cfg.denoise_strength
+        );
+        crate::decode::ZcEacDecoder::Denoising(
+            crate::decode::DenoisingZeroCopyEacIter::new(raw, cfg.denoise_strength)?,
+        )
+    } else {
+        crate::decode::ZcEacDecoder::Raw(raw)
+    };
     let dims = decoder.dims();
     if !dims.is_valid() {
         return Err(Error::Ffmpeg(format!(
@@ -1243,8 +1538,8 @@ fn export_eac_zerocopy_vt(
     }
 
     encoder.finish()?;
-    finalize_with_audio(
-        &cfg.source_path, &video_tmp, &cfg.output_path,
+    finalize_eac_audio(
+        &cfg, &video_tmp,
         trim_in_frame as f64 * dt, written as f64 * dt,
     )?;
     finalize_metadata(
@@ -1273,16 +1568,30 @@ fn export_fisheye_osv_zerocopy_p010(
     progress_cb: &mut dyn FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
-    use crate::fisheye_decode::ZeroCopyDualStreamFisheyeIter;
+    use crate::fisheye_decode::{
+        DenoisingZeroCopyIter, ZcDecoder, ZeroCopyDualStreamFisheyeIter,
+    };
 
     // Open zero-copy decoder. OSV swap convention mirrors
     // DualStreamFisheyeIter: !cfg.fisheye_swap_eyes means swap on by
     // default (Lens A == stream 0 == right eye).
-    let mut decoder = ZeroCopyDualStreamFisheyeIter::new(
+    let raw = ZeroCopyDualStreamFisheyeIter::new(
         &cfg.source_path,
         0, // no frame limit
         !cfg.fisheye_swap_eyes,
     )?;
+    // Temporal NR, if requested, wraps the decoder and denoises the P010
+    // IOSurfaces on the GPU (no CPU readback) — the whole reason this path
+    // is fast. Falls back to the raw decoder when off / unsupported.
+    let mut decoder = if cfg.denoise_strength > 0.0 && crate::vt_denoise::is_supported() {
+        tracing::info!(
+            "fisheye_export (zero-copy): temporal NR ENGAGED on GPU (strength={:.2})",
+            cfg.denoise_strength
+        );
+        ZcDecoder::Denoising(DenoisingZeroCopyIter::new(raw, cfg.denoise_strength)?)
+    } else {
+        ZcDecoder::Raw(raw)
+    };
     let (src_w, src_h) = decoder.eye_dims();
 
     // Extract DJI protobuf for per-eye calibration (and stab data).
@@ -1336,9 +1645,12 @@ fn export_fisheye_osv_zerocopy_p010(
 
     let sbs_w = cfg.eye_w * 2;
     let sbs_h = cfg.eye_h;
-    // Encode video to a temp path; the source's audio is muxed onto
-    // the final output after `encoder.finish()` returns.
-    let video_tmp = video_only_temp_path(&cfg.output_path);
+    // One-pass: encode STRAIGHT to the final file and mux the source's
+    // audio inline (no temp + re-mux). Otherwise encode to a local-scratch
+    // temp the finalize muxes audio onto (ambisonic / APAC).
+    let one_pass = one_pass_audio_eligible(&cfg);
+    let enc_out = if one_pass { cfg.output_path.clone() }
+                  else { video_only_temp_path(&cfg.output_path) };
     // ProRes-VT → P010 IOSurface straight into Apple's ProRes engine;
     // HEVC 10-bit → P010 IOSurface encode (Main10); HEVC 8-bit → BGRA
     // IOSurface encode (Main). All consume the same zero-copy P010
@@ -1348,17 +1660,26 @@ fn export_fisheye_osv_zerocopy_p010(
     let ten_bit = cfg.bit_depth == 10 || is_prores;
     let mut encoder = if is_prores {
         H265Encoder::create_zero_copy_vt_prores(
-            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.prores_profile,
+            &enc_out, sbs_w, sbs_h, cfg.fps, cfg.prores_profile,
         )?
     } else if ten_bit {
         H265Encoder::create_zero_copy_vt_p010(
-            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
+            &enc_out, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
         )?
     } else {
         H265Encoder::create_zero_copy_vt(
-            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
+            &enc_out, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
         )?
     };
+    // Inline audio passthrough (must be attached before the first frame).
+    let one_pass_audio_tmp = if one_pass {
+        let (asrc, atmp) = eac_audio_source(&cfg);
+        let dur = total_frames_to_write as f64 / cfg.fps as f64;
+        if let Err(e) = encoder.attach_audio_passthrough(&asrc, t_in, dur) {
+            tracing::warn!("one-pass audio attach failed: {e} — video-only output");
+        }
+        atmp
+    } else { None };
     // APMP / YouTube metadata is now injected as a post-process atom
     // write on the final muxed file (see `finalize_with_audio` →
     // `finalize_metadata`); the ffmpeg side-data path is no longer
@@ -1549,8 +1870,13 @@ fn export_fisheye_osv_zerocopy_p010(
     }
 
     encoder.finish()?;
-    finalize_with_audio(&cfg.source_path, &video_tmp, &cfg.output_path,
-        t_in, frame_idx as f64 * dt)?;
+    if one_pass {
+        // Audio already muxed inline — drop the playlist temp, if any.
+        if let Some(t) = one_pass_audio_tmp { std::fs::remove_file(t).ok(); }
+    } else {
+        finalize_with_audio(&cfg.source_path, &enc_out, &cfg.output_path,
+            t_in, frame_idx as f64 * dt)?;
+    }
     finalize_metadata(
         &cfg.output_path,
         cfg.inject_youtube_vr180,

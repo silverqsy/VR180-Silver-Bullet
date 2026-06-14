@@ -184,7 +184,7 @@ pub fn inject_apmp_vr180(path: &Path, baseline_mm: f32) -> Result<()> {
 /// `(offset, size)` relative to the start of `buf`. Handles 64-bit
 /// extended-size atoms (size==1, real size in the next 8 bytes) and
 /// extends-to-end atoms (size==0, runs to `end`).
-fn find_atom(buf: &[u8], start: usize, end: usize, tag: &[u8; 4]) -> Option<(usize, usize)> {
+pub(crate) fn find_atom(buf: &[u8], start: usize, end: usize, tag: &[u8; 4]) -> Option<(usize, usize)> {
     let mut pos = start;
     while pos + 8 <= end {
         let sz = u32::from_be_bytes(buf[pos..pos + 4].try_into().ok()?);
@@ -206,6 +206,170 @@ fn find_atom(buf: &[u8], start: usize, end: usize, tag: &[u8; 4]) -> Option<(usi
         pos += sz;
     }
     None
+}
+
+/// Build the Google spatial-media `SA3D` box for an N-channel 1st-order
+/// AmbiX ambisonic track (ACN ordering, SN3D normalization, identity
+/// channel map). Goes inside the audio sample entry; VR-aware players
+/// (YouTube VR, Quest Browser) read it to head-track the audio.
+fn sa3d_box(num_channels: u32) -> Vec<u8> {
+    let mut c = Vec::new();
+    c.push(0u8);                                   // version
+    c.push(0u8);                                   // ambisonic_type = 0 (periphonic)
+    c.extend_from_slice(&1u32.to_be_bytes());      // ambisonic_order = 1
+    c.push(0u8);                                   // channel_ordering = 0 (ACN)
+    c.push(0u8);                                   // normalization = 0 (SN3D)
+    c.extend_from_slice(&num_channels.to_be_bytes());
+    for ch in 0..num_channels { c.extend_from_slice(&ch.to_be_bytes()); } // channel_map
+    let mut b = Vec::with_capacity(8 + c.len());
+    b.extend_from_slice(&((8 + c.len()) as u32).to_be_bytes());
+    b.extend_from_slice(b"SA3D");
+    b.extend_from_slice(&c);
+    b
+}
+
+/// Find the audio track (`trak` containing a `soun` handler) inside `moov`.
+fn find_audio_trak(buf: &[u8], moov_off: usize, moov_sz: usize) -> Option<(usize, usize)> {
+    let mut pos = moov_off + 8;
+    let end = moov_off + moov_sz;
+    while pos + 8 <= end {
+        let sz = u32::from_be_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
+        let t = &buf[pos + 4..pos + 8];
+        if sz < 8 || pos + sz > end { return None; }
+        if t == b"trak" && memmem(&buf[pos..pos + sz], b"soun").is_some() {
+            return Some((pos, sz));
+        }
+        pos += sz;
+    }
+    None
+}
+
+/// Inject an `SA3D` ambisonic-spatial-audio box into the FIRST audio
+/// sample entry, appended after the entry's existing child boxes (the
+/// spatial-media convention). Mirrors the visual injector's moov
+/// surgery: load moov → splice the larger entry → patch the parent size
+/// chain + stco/co64. No-op-safe: returns an error (caller logs, keeps
+/// the audio) if the file has no audio track / sample entry.
+pub fn inject_sa3d_ambix(path: &Path, num_channels: u32) -> Result<()> {
+    let mut f = OpenOptions::new().read(true).write(true).open(path).map_err(Error::Io)?;
+    let fsize = f.metadata().map_err(Error::Io)?.len();
+
+    // Locate moov.
+    let (mut moov_off, mut moov_sz) = (None, None);
+    let mut pos: u64 = 0;
+    while pos + 8 <= fsize {
+        let mut hdr = [0u8; 8];
+        f.seek(SeekFrom::Start(pos)).map_err(Error::Io)?;
+        f.read_exact(&mut hdr).map_err(Error::Io)?;
+        let sz32 = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+        let tag = &hdr[4..8];
+        let sz: u64 = if sz32 == 1 {
+            let mut ext = [0u8; 8]; f.read_exact(&mut ext).map_err(Error::Io)?;
+            u64::from_be_bytes(ext)
+        } else if sz32 == 0 { fsize - pos } else { sz32 as u64 };
+        if sz < 8 { break; }
+        if tag == b"moov" { moov_off = Some(pos); moov_sz = Some(sz); break; }
+        pos += sz;
+    }
+    let moov_off = moov_off.ok_or_else(|| Error::Ffmpeg("moov not found".into()))?;
+    let moov_sz = moov_sz.unwrap();
+
+    let mut data = vec![0u8; moov_sz as usize];
+    f.seek(SeekFrom::Start(moov_off)).map_err(Error::Io)?;
+    f.read_exact(&mut data).map_err(Error::Io)?;
+
+    let moov = find_atom(&data, 0, data.len(), b"moov")
+        .ok_or_else(|| Error::Ffmpeg("moov not in buffer".into()))?;
+    let trak = find_audio_trak(&data, moov.0, moov.1)
+        .ok_or_else(|| Error::Ffmpeg("audio trak not found".into()))?;
+    let mdia = find_atom(&data, trak.0 + 8, trak.0 + trak.1, b"mdia")
+        .ok_or_else(|| Error::Ffmpeg("audio mdia not found".into()))?;
+    let minf = find_atom(&data, mdia.0 + 8, mdia.0 + mdia.1, b"minf")
+        .ok_or_else(|| Error::Ffmpeg("audio minf not found".into()))?;
+    let stbl = find_atom(&data, minf.0 + 8, minf.0 + minf.1, b"stbl")
+        .ok_or_else(|| Error::Ffmpeg("audio stbl not found".into()))?;
+    let stsd = find_atom(&data, stbl.0 + 8, stbl.0 + stbl.1, b"stsd")
+        .ok_or_else(|| Error::Ffmpeg("audio stsd not found".into()))?;
+
+    // First sample entry = first box after the stsd FullBox+count (16 bytes).
+    let entry_off = stsd.0 + 16;
+    if entry_off + 8 > stsd.0 + stsd.1 {
+        return Err(Error::Ffmpeg("audio sample entry not found".into()));
+    }
+    let entry_sz = u32::from_be_bytes(data[entry_off..entry_off + 4].try_into().unwrap()) as usize;
+    if entry_sz < 8 || entry_off + entry_sz > stsd.0 + stsd.1 {
+        return Err(Error::Ffmpeg("bad audio sample entry size".into()));
+    }
+    // Bail if SA3D already present (idempotent).
+    if memmem(&data[entry_off..entry_off + entry_sz], b"SA3D").is_some() {
+        return Ok(());
+    }
+
+    let sa3d = sa3d_box(num_channels);
+    let new_entry_sz = entry_sz + sa3d.len();
+    let size_delta = sa3d.len() as i64;
+
+    // Splice: entry grows by SA3D appended at its end.
+    let mut new_data = Vec::with_capacity(data.len() + sa3d.len());
+    new_data.extend_from_slice(&data[..entry_off]);
+    new_data.extend_from_slice(&(new_entry_sz as u32).to_be_bytes());     // new entry size
+    new_data.extend_from_slice(&data[entry_off + 4..entry_off + entry_sz]); // entry body
+    new_data.extend_from_slice(&sa3d);                                     // SA3D at end
+    new_data.extend_from_slice(&data[entry_off + entry_sz..]);
+    data = new_data;
+
+    // Patch parent size chain.
+    for (off, _) in [stsd, stbl, minf, mdia, trak, moov] {
+        let old = u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as i64;
+        data[off..off + 4].copy_from_slice(&((old + size_delta) as u32).to_be_bytes());
+    }
+
+    // Patch chunk offsets if moov precedes mdat.
+    let moov_at_end = (moov_off + moov_sz) >= fsize;
+    if !moov_at_end {
+        for tag in [b"stco" as &[u8; 4], b"co64"] {
+            let mut search = 0usize;
+            while let Some(rel) = memmem(&data[search..], tag) {
+                let idx = search + rel;
+                if idx < 4 { break; }
+                let n = u32::from_be_bytes(data[idx + 8..idx + 12].try_into().unwrap()) as usize;
+                if tag == b"stco" {
+                    for e in 0..n {
+                        let eo = idx + 12 + e * 4;
+                        if eo + 4 > data.len() { break; }
+                        let v = u32::from_be_bytes(data[eo..eo + 4].try_into().unwrap()) as i64;
+                        data[eo..eo + 4].copy_from_slice(&((v + size_delta) as u32).to_be_bytes());
+                    }
+                } else {
+                    for e in 0..n {
+                        let eo = idx + 12 + e * 8;
+                        if eo + 8 > data.len() { break; }
+                        let v = u64::from_be_bytes(data[eo..eo + 8].try_into().unwrap()) as i64;
+                        data[eo..eo + 8].copy_from_slice(&((v + size_delta) as u64).to_be_bytes());
+                    }
+                }
+                let atom_sz = u32::from_be_bytes(data[idx - 4..idx].try_into().unwrap()) as usize;
+                search = idx + atom_sz.max(8);
+            }
+        }
+    }
+
+    // Write back.
+    if moov_at_end {
+        f.seek(SeekFrom::Start(moov_off)).map_err(Error::Io)?;
+        f.write_all(&data).map_err(Error::Io)?;
+        f.set_len(moov_off + data.len() as u64).map_err(Error::Io)?;
+    } else {
+        let mut after = Vec::new();
+        f.seek(SeekFrom::Start(moov_off + moov_sz)).map_err(Error::Io)?;
+        f.read_to_end(&mut after).map_err(Error::Io)?;
+        f.seek(SeekFrom::Start(moov_off)).map_err(Error::Io)?;
+        f.write_all(&data).map_err(Error::Io)?;
+        f.write_all(&after).map_err(Error::Io)?;
+        f.set_len(moov_off + data.len() as u64 + after.len() as u64).map_err(Error::Io)?;
+    }
+    tracing::info!(path=%path.display(), num_channels, "SA3D ambisonic metadata injected");
+    Ok(())
 }
 
 /// Find the video track (`trak` containing `vide` handler) inside `moov`.

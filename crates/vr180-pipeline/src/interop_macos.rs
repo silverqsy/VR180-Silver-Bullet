@@ -71,6 +71,7 @@ extern "C" {
     /// Get-Rule: returned IOSurface is NOT retained by this call.
     /// Returns NULL if the pixel buffer isn't IOSurface-backed.
     fn CVPixelBufferGetIOSurface(pixel_buffer: CVPixelBufferRef) -> IOSurfaceRef;
+    fn CVPixelBufferGetPixelFormatType(pixel_buffer: CVPixelBufferRef) -> u32;
 
     /// Create a CVPixelBuffer with the given width / height / pixel
     /// format and attribute dictionary. Returns 0 (kCVReturnSuccess)
@@ -213,6 +214,36 @@ pub fn extract_iosurface_from_vt_frame(
     }
     // Get-Rule → we own no retain yet. Retain to extend lifetime.
     Ok(unsafe { RetainedIOSurface::retain(iosurface) })
+}
+
+/// Retain the `CVPixelBuffer` a VideoToolbox-decoded frame holds at
+/// `AVFrame::data[3]`, so it outlives the AVFrame (reused on the next
+/// decode). Used by the zero-copy denoise path, which feeds the decoded
+/// P010 buffer to `VTPixelTransferSession` (it wants a `CVPixelBuffer`,
+/// not a bare IOSurface).
+pub fn extract_cvpixelbuffer_from_vt_frame(
+    frame: &ffmpeg::frame::Video,
+) -> Result<RetainedCVPixelBuffer> {
+    let fmt = frame.format();
+    if fmt != ffmpeg::format::Pixel::VIDEOTOOLBOX {
+        return Err(Error::Ffmpeg(format!(
+            "frame is not VideoToolbox-decoded (format = {fmt:?})"
+        )));
+    }
+    let cv_pix_buf: CVPixelBufferRef = unsafe {
+        let raw_frame = frame.as_ptr();
+        (*raw_frame).data[3] as CVPixelBufferRef
+    };
+    if cv_pix_buf.is_null() {
+        return Err(Error::Ffmpeg(
+            "AVFrame::data[3] NULL (VT decoder produced no CVPixelBuffer)".into(),
+        ));
+    }
+    // Get-Rule → CFRetain so we own a +1 the AVFrame reuse can't pull out.
+    unsafe {
+        CFRetain(cv_pix_buf as CFTypeRef);
+        Ok(RetainedCVPixelBuffer::from_create_rule(cv_pix_buf))
+    }
 }
 
 // ─── Metal texture wrapping (selector: newTextureWithDescriptor:iosurface:plane:) ──
@@ -620,12 +651,48 @@ pub struct EncodePixelBufferP010 {
     pub height: u32,
 }
 
-/// Create an IOSurface-backed P010 CVPixelBuffer and wrap each plane
-/// as a wgpu storage texture. `width` and `height` must be even (the
+/// Full-range counterpart of the video-range P010 fourcc, for sources that
+/// decode full-range (`color_range=pc`, e.g. GoPro `.360`).
+const K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR_10_BIPLANAR_FULLRANGE: u32 =
+    u32::from_be_bytes(*b"xf20");
+
+/// Pixel-format type (fourcc) of a `CVPixelBuffer`. The zero-copy denoiser
+/// uses it to match the denoised output buffer's range to its source.
+pub fn cvpixelbuffer_pixel_format(pb: CVPixelBufferRef) -> u32 {
+    unsafe { CVPixelBufferGetPixelFormatType(pb) }
+}
+
+/// Map a decoded P010 source format to the matching encode-buffer format so
+/// the denoise round-trip is range-symmetric (full→full, video→video).
+/// Falls back to video-range for anything unexpected.
+pub fn p010_format_for_source(src_fmt: u32) -> u32 {
+    if src_fmt == K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR_10_BIPLANAR_FULLRANGE {
+        K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR_10_BIPLANAR_FULLRANGE
+    } else {
+        K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR_10_BIPLANAR_VIDEORANGE
+    }
+}
+
+/// Create an IOSurface-backed P010 CVPixelBuffer (video-range) and wrap each
+/// plane as a wgpu storage texture. `width` and `height` must be even (the
 /// UV plane is half-res so odd sizes won't divide cleanly).
 pub fn create_p010_encode_buffer(
     device: &wgpu::Device,
     width: u32, height: u32,
+) -> Result<EncodePixelBufferP010> {
+    create_p010_encode_buffer_fmt(
+        device, width, height,
+        K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR_10_BIPLANAR_VIDEORANGE,
+    )
+}
+
+/// Like [`create_p010_encode_buffer`] but with an explicit P010 fourcc
+/// (`x420` video-range / `xf20` full-range), so a denoised output buffer can
+/// match its source's range.
+pub fn create_p010_encode_buffer_fmt(
+    device: &wgpu::Device,
+    width: u32, height: u32,
+    pixel_format: u32,
 ) -> Result<EncodePixelBufferP010> {
     if width % 2 != 0 || height % 2 != 0 {
         return Err(Error::Wgpu(format!(
@@ -639,7 +706,7 @@ pub fn create_p010_encode_buffer(
             std::ptr::null(),
             width as usize,
             height as usize,
-            K_CV_PIXEL_FORMAT_TYPE_420_YPCBCR_10_BIPLANAR_VIDEORANGE,
+            pixel_format,
             attrs as CFDictionaryRef,
             &mut pb,
         )

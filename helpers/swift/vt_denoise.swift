@@ -25,6 +25,7 @@ var skipFrames = 0
 var maxFrames = Int.max
 var outputBGR48 = true  // true = bgr48le (uint16), false = bgr24 (uint8)
 var pipeMode = false
+var probeMode = false
 var pipeWidth = 0
 var pipeHeight = 0
 
@@ -33,6 +34,7 @@ while i < CommandLine.arguments.count {
     let arg = CommandLine.arguments[i]
     switch arg {
     case "--pipe": pipeMode = true
+    case "--probe": probeMode = true
     case "--width": i += 1; pipeWidth = Int(CommandLine.arguments[i]) ?? 0
     case "--height": i += 1; pipeHeight = Int(CommandLine.arguments[i]) ?? 0
     case "--stream": i += 1; streamIndex = Int(CommandLine.arguments[i]) ?? 0
@@ -48,8 +50,45 @@ while i < CommandLine.arguments.count {
     i += 1
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// PROBE MODE: report VTTemporalNoiseFilter capability + exit
+//
+// Used by vr180_gui.py at startup to decide whether to enable the denoise
+// slider. Hardware that doesn't support the filter (older Apple Silicon,
+// or any chip where VTTemporalNoiseFilterConfiguration.isSupported is
+// false) would otherwise silently produce 0-frame exports.
+//
+// Stdout format (machine-readable, one key=value per line):
+//   supported=true|false
+//   max_width=<int>     # 0 if unsupported
+//   max_height=<int>    # 0 if unsupported
+//   min_width=<int>
+//   min_height=<int>
+//
+// Exit codes: 0 = supported, 2 = not supported, 1 = error.
+// ═══════════════════════════════════════════════════════════════════════
+if probeMode {
+    var supported = false
+    var maxW = 0, maxH = 0, minW = 0, minH = 0
+    if #available(macOS 26.0, *) {
+        supported = VTTemporalNoiseFilterConfiguration.isSupported
+        if let m = VTTemporalNoiseFilterConfiguration.maximumDimensions {
+            maxW = Int(m.width); maxH = Int(m.height)
+        }
+        if let m = VTTemporalNoiseFilterConfiguration.minimumDimensions {
+            minW = Int(m.width); minH = Int(m.height)
+        }
+    }
+    print("supported=\(supported)")
+    print("max_width=\(maxW)")
+    print("max_height=\(maxH)")
+    print("min_width=\(minW)")
+    print("min_height=\(minH)")
+    exit(supported ? 0 : 2)
+}
+
 guard !inputPath.isEmpty || pipeMode else {
-    fputs("Usage:\n  File: vt_denoise <input> [--stream <idx>] [--strength <0.0-1.0>] [--skip <n>] [--max <n>]\n  Pipe: vt_denoise --pipe --width <w> --height <h> [--strength <0.0-1.0>] [--max <n>]\n", stderr)
+    fputs("Usage:\n  File: vt_denoise <input> [--stream <idx>] [--strength <0.0-1.0>] [--skip <n>] [--max <n>]\n  Pipe: vt_denoise --pipe --width <w> --height <h> [--strength <0.0-1.0>] [--max <n>]\n  Probe: vt_denoise --probe   (reports hardware support + max dimensions, exit 0 if supported, 2 if not)\n", stderr)
     exit(1)
 }
 

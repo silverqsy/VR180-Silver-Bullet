@@ -56,6 +56,11 @@ pub struct App {
     /// repaint and pick the most recent one — naturally drops frames
     /// the UI couldn't keep up with.
     frame_rx: Option<Receiver<DecodedFrame>>,
+    /// Native-res zoom stills for EAC (.360) clips. The decoder thread
+    /// emits these while `control.want_detail` is set (paused + zoomed);
+    /// we register them into `full_res_display`. Fisheye sources use the
+    /// main-thread `DetailCache` instead and leave this idle.
+    detail_frame_rx: Option<Receiver<DecodedFrame>>,
     cmd_tx: Option<Sender<DecoderCommand>>,
     /// Shared with the decoder for pause / live-settings.
     control: Option<Arc<DecoderControl>>,
@@ -72,6 +77,12 @@ pub struct App {
     /// the persisted-settings save so a slider drag doesn't hammer disk.
     last_saved_settings: Settings,
     last_settings_save_at: std::time::Instant,
+    /// Per-source-kind settings template (`"osv"` / `"eac"` / `"sbs"` /
+    /// `"braw"`). A newly-added clip inherits ITS kind's template (not the
+    /// previously-active clip's, which may be a different camera), and the
+    /// active clip's edits flow back into its kind's slot — so OSV and
+    /// `.360` setups stay independent and each persists across same-kind files.
+    kind_settings: std::collections::HashMap<String, Settings>,
 
     // ─── Export job (fisheye sources only for now) ───────────────
     /// `Some` while an export is in flight. `None` once the worker
@@ -116,6 +127,15 @@ pub struct App {
     /// Set by the "Skip current" button so completion marks the item
     /// Skipped instead of Done.
     batch_skip_flag: bool,
+
+    /// Per-clip segment override chosen at import: representative path →
+    /// the files that make up that clip. `clip_segments` consults this
+    /// before falling back to `detect_segments` (GoPro auto-chapters), so
+    /// the import "merge vs individual" choice flows to decode AND export.
+    merge_groups: std::collections::HashMap<PathBuf, Vec<PathBuf>>,
+    /// An import awaiting the user's merge/individual decision (drives the
+    /// modal). `None` when no decision is pending.
+    pending_import: Option<PendingImport>,
 
     /// Preview magnifier for alignment inspection. `preview_zoom` is the
     /// magnification (1.0 = fit-to-window); `preview_center` is the point
@@ -334,6 +354,32 @@ struct FpsStats {
     last_fps: f32,
 }
 
+/// One recording detected among the files the user just picked. GoPro
+/// `.360` members are auto-detected chapters (`detect_segments`); OSV
+/// members are exactly the files the user multi-selected (OSV segments are
+/// indistinguishable from separate clips by name, so the user chooses
+/// them). A group with >1 member is offered "merge into one clip vs import
+/// individually".
+struct ImportGroup {
+    /// Files the user actually selected for this group (segment order).
+    picked: Vec<PathBuf>,
+    /// Full recording in segment order — chapters for GoPro, == picked for OSV.
+    members: Vec<PathBuf>,
+    /// Short human label for the prompt (e.g. "GoPro · 4 chapters").
+    label: String,
+}
+
+impl ImportGroup {
+    fn mergeable(&self) -> bool { self.members.len() > 1 }
+}
+
+/// An import awaiting the user's merge/individual decision (modal).
+struct PendingImport {
+    groups: Vec<ImportGroup>,
+    /// First picked path — re-activated after the import completes.
+    first: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 struct ClipInfo {
     width: u32,
@@ -434,12 +480,14 @@ impl App {
             decoder_alive: false,
             current_display: None,
             frame_rx: None,
+            detail_frame_rx: None,
             cmd_tx: None,
             control: None,
             fps_stats: FpsStats::default(),
             settings: defaults.clone(),
             last_saved_settings: defaults.clone(),
             last_settings_save_at: std::time::Instant::now(),
+            kind_settings: Settings::load_kind_map(),
             last_pushed_settings: defaults,
             export_job: None,
             audio_player: None,
@@ -454,6 +502,8 @@ impl App {
             batch_opts: None,
             batch_out_dir: None,
             batch_skip_flag: false,
+            merge_groups: std::collections::HashMap::new(),
+            pending_import: None,
             preview_zoom: 1.0,
             preview_center: egui::vec2(0.5, 0.5),
             full_res_display: None,
@@ -522,6 +572,7 @@ impl App {
             clip.fps, clip.source_kind,
             clip.fisheye_eye_w, clip.fisheye_eye_h, clip.width, clip.height,
             &self.settings, &opts,
+            clip.segments.clone(),
         );
         // GoPro EAC computes stab in the export thread from the same
         // Settings the preview uses; fisheye sources compute it inside
@@ -561,6 +612,7 @@ impl App {
         height: u32,
         settings: &crate::decoder::Settings,
         opts: &ExportOptions,
+        segments: Vec<PathBuf>,
     ) -> vr180_pipeline::fisheye_export::FisheyeExportConfig {
         // Pick the backend based on the chosen codec + platform. On
         // Windows/Linux, H.265 defaults to NVENC (hardware) — libx265 is
@@ -642,9 +694,14 @@ impl App {
 
         vr180_pipeline::fisheye_export::FisheyeExportConfig {
             source_path: source_path.to_path_buf(),
-            segments: vr180_core::segments::detect_segments(source_path),
+            segments,
             output_path: output_path.to_path_buf(),
             source_kind,
+            audio_track: match settings.audio_format {
+                crate::decoder::AudioFormat::Stereo    => vr180_pipeline::fisheye_export::AudioTrack::Stereo,
+                crate::decoder::AudioFormat::Ambisonic => vr180_pipeline::fisheye_export::AudioTrack::Ambisonic,
+                crate::decoder::AudioFormat::Apac      => vr180_pipeline::fisheye_export::AudioTrack::Apac,
+            },
             eye_w,
             eye_h,
             fps,
@@ -659,6 +716,7 @@ impl App {
             dji_max_corr_deg: settings.dji_max_corr_deg,
             dji_smooth_ms: settings.dji_smooth_ms,
             dji_responsiveness: settings.dji_responsiveness,
+            denoise_strength: settings.denoise_strength,
             view_adjust: vr180_pipeline::panomap::ViewAdjust {
                 pano_yaw_deg: settings.pano_yaw_deg,
                 pano_pitch_deg: settings.pano_pitch_deg,
@@ -836,6 +894,34 @@ impl App {
     /// Save the live sidebar settings back into the ACTIVE clip's list
     /// entry. Call before switching clips / starting a batch so edits
     /// aren't lost (the sidebar edits `self.settings`, not the entry).
+    /// Persisted-settings bucket for a source kind. OSV / EAC / SBS / BRAW
+    /// each keep an independent setup; anything else shares `"other"`.
+    fn settings_class_key(kind: vr180_pipeline::SourceKind) -> &'static str {
+        use vr180_pipeline::SourceKind as K;
+        match kind {
+            K::DjiOsv         => "osv",
+            K::GoProEac       => "eac",
+            K::SbsFisheye     => "sbs",
+            K::BlackmagicRaw  => "braw",
+            _                 => "other",
+        }
+    }
+
+    /// Remembered settings template for `kind` (defaults if none saved yet).
+    fn kind_template(&self, kind: vr180_pipeline::SourceKind) -> Settings {
+        self.kind_settings.get(Self::settings_class_key(kind))
+            .cloned().unwrap_or_default()
+    }
+
+    /// Fold the active clip's live settings into ITS kind's template, so the
+    /// next same-kind clip inherits them (kept independent across kinds).
+    fn save_active_kind_template(&mut self) {
+        if let Some(kind) = self.clip.as_ref().map(|c| c.source_kind) {
+            self.kind_settings.insert(
+                Self::settings_class_key(kind).to_string(), self.settings.clone());
+        }
+    }
+
     fn sync_active_clip_settings(&mut self) {
         if let Some(idx) = self.active_clip {
             if let Some(item) = self.batch.get_mut(idx) {
@@ -844,6 +930,9 @@ impl App {
                 }
             }
         }
+        // Also update the active clip's KIND template (so a later same-kind
+        // clip inherits these edits, and a different-kind clip does not).
+        self.save_active_kind_template();
     }
 
     /// Make clip `idx` the active one: preview it and point the sidebar
@@ -903,7 +992,13 @@ impl App {
                 _ => (0, 0),
             };
             let is_loaded_clip = self.loaded_path.as_deref() == Some(path.as_path());
-            let mut settings = self.settings.clone();
+            // A NEW clip inherits ITS kind's template (OSV / .360 / … kept
+            // independent); the already-loaded clip keeps its live edits.
+            let mut settings = if is_loaded_clip {
+                self.settings.clone()
+            } else {
+                self.kind_template(source_kind)
+            };
             if !is_loaded_clip {
                 settings.dji_imu_phase_ms =
                     vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(probe.fps);
@@ -1010,9 +1105,13 @@ impl App {
         };
         let opts = self.batch_opts.unwrap_or(self.batch_ui_opts);
         let output = self.batch_output_for(&self.batch[idx], &opts);
+        let item_path = self.batch[idx].path.clone();
+        let segments = self.clip_segments(&item_path);
         let (cfg, imu_phase, eac_stab) = {
             let item = &self.batch[idx];
-            let n_frames = (item.duration_sec * item.fps as f64).round() as usize;
+            // Total across the merged recording (== single-file count when
+            // `segments` is one file) so EAC stab spans the whole timeline.
+            let n_frames = crate::decoder::segments_total_frames(&segments).max(1);
             let eac_stab = if item.source_kind.is_eac() {
                 Some((item.settings.clone(), n_frames))
             } else { None };
@@ -1022,6 +1121,7 @@ impl App {
                     item.fps, item.source_kind,
                     item.fisheye_eye_w, item.fisheye_eye_h, item.width, item.height,
                     &item.settings, &opts,
+                    segments,
                 ),
                 item.settings.dji_imu_phase_ms,
                 eac_stab,
@@ -1066,6 +1166,13 @@ impl App {
     /// low-res frame and we skip the heavy render until you stop.
     fn poll_full_res(&mut self, ctx: &egui::Context) {
         use std::sync::atomic::Ordering;
+        // EAC (.360): the native-res zoom still is produced by the decoder
+        // thread (it already holds the native cross) and ferried in via
+        // `detail_frame_rx` — not the fisheye main-thread `DetailCache`.
+        if self.clip.as_ref().map(|c| c.source_kind.is_eac()).unwrap_or(false) {
+            self.poll_full_res_eac(ctx);
+            return;
+        }
         // Keep the detail cache alive whenever we're paused on a fisheye clip
         // — independent of zoom. Zoom only gates whether we RENDER a still,
         // not whether the cache (and its decoded native frame) exists. That
@@ -1218,6 +1325,67 @@ impl App {
         }
     }
 
+    /// EAC (.360) zoom magnifier. While paused + zoomed we ask the decoder
+    /// thread for a native-resolution still of the current frame (it already
+    /// has the assembled native cross, so this is a re-projection, not a
+    /// re-decode) and register the freshest one into `full_res_display`. The
+    /// central panel's `use_full_res` check then prefers it over the capped
+    /// live preview whenever its timestamp matches the shown frame.
+    ///
+    /// Mirrors the fisheye `DetailCache` UX (debounce/throttle live on the
+    /// decoder side) but reuses the live render path as the single source of
+    /// truth, so the still is pixel-identical to the preview at native res.
+    fn poll_full_res_eac(&mut self, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering;
+        let want = self.decoder_alive && !self.playing && self.preview_zoom > 1.001;
+        if let Some(c) = &self.control {
+            c.want_detail.store(want, Ordering::SeqCst);
+        }
+        if !want {
+            // Keep the still across a zoom-OUT while still paused (zoom-in
+            // reuses it instantly via the timestamp match). Only drop it when
+            // playback resumes or the decoder is gone — then it's stale.
+            if (self.playing || !self.decoder_alive) && self.full_res_display.is_some() {
+                if let Some(prev) = self.full_res_display.take() {
+                    self.egui_renderer.write().free_texture(&prev.egui_id);
+                }
+            }
+            return;
+        }
+        // Pick up the freshest native-res still the decoder shipped (drop
+        // any older ones queued behind it).
+        if let Some(rx) = &self.detail_frame_rx {
+            let mut newest: Option<DecodedFrame> = None;
+            while let Ok(f) = rx.try_recv() { newest = Some(f); }
+            if let Some(f) = newest {
+                let mut rend = self.egui_renderer.write();
+                if let Some(prev) = self.full_res_display.take() {
+                    rend.free_texture(&prev.egui_id);
+                }
+                // Plain Unorm pass-through view (`preview_view_format`) — same
+                // as the live preview, so no sRGB double-decode vs compose.
+                let view = f.texture.create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(self.preview_view_format),
+                    usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+                    ..Default::default()
+                });
+                let id = rend.register_native_texture(
+                    &self.pipeline.device, &view, wgpu::FilterMode::Linear);
+                drop(rend);
+                self.full_res_display = Some(DisplayFrame {
+                    texture: f.texture, egui_id: id,
+                    width: f.width, height: f.height,
+                    frame_idx: f.frame_idx, timestamp_s: f.timestamp_s,
+                });
+            }
+        }
+        // Keep a slow poll alive while zoomed + paused so the TRAILING still
+        // (the crisp one the decoder emits ~one throttle window after a slider
+        // settles, when egui would otherwise have stopped repainting) is always
+        // picked up. Cheap — this is a paused, hold-still inspection mode.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
     /// Drain whatever's in the frame channel, register the newest
     /// frame's texture with egui (freeing the previous one).
     ///
@@ -1308,17 +1476,156 @@ impl App {
     fn open_paths(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() { return; }
         let first = paths[0].clone();
-        let (fisheye, other): (Vec<PathBuf>, Vec<PathBuf>) =
-            paths.into_iter().partition(|p| {
-                vr180_pipeline::source_kind::detect(p)
-                    .map(|k| k.is_exportable()).unwrap_or(false)
+        let groups = self.group_imports(&paths);
+        // If anything looks like a multi-file recording, ask the user
+        // whether to merge it; otherwise import every file straight away.
+        if groups.iter().any(|g| g.mergeable()) {
+            self.pending_import = Some(PendingImport { groups, first });
+        } else {
+            self.apply_import(groups, false, first);
+        }
+    }
+
+    /// Group the just-picked files into recordings. GoPro `.360` files
+    /// expand to their auto-detected chapters; a multi-selection of OSV
+    /// files becomes ONE merge candidate (their segments can't be told
+    /// from separate clips by name, so the user picks them explicitly).
+    fn group_imports(&self, paths: &[PathBuf]) -> Vec<ImportGroup> {
+        use vr180_pipeline::SourceKind;
+        let kind_of = |p: &std::path::Path|
+            vr180_pipeline::source_kind::detect(p).unwrap_or(SourceKind::Unknown);
+        let mut groups: Vec<ImportGroup> = Vec::new();
+        let mut claimed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+        // 1) The OSV multi-selection → one merge candidate (sorted by name,
+        //    which for `CAM_<timestamp>_<idx>_…` is chronological = segment
+        //    order). A lone OSV falls through to step 2 as a singleton.
+        let mut osv: Vec<PathBuf> = paths.iter()
+            .filter(|p| matches!(kind_of(p), SourceKind::DjiOsv))
+            .cloned().collect();
+        osv.sort();
+        if osv.len() > 1 {
+            for p in &osv { claimed.insert(p.clone()); }
+            groups.push(ImportGroup {
+                label: format!("OSV · {} files merged", osv.len()),
+                picked: osv.clone(),
+                members: osv,
             });
-        self.add_batch_files(fisheye);
-        if let Some(idx) = self.batch.iter().position(|b| b.path == first) {
+        }
+
+        // 2) Remaining picked files, in pick order. GoPro `.360` expands to
+        //    its chapters; everything else is a singleton.
+        for p in paths {
+            if claimed.contains(p) { continue; }
+            let kind = kind_of(p);
+            if !kind.is_exportable() {
+                tracing::warn!("import: skipping non-exportable {}", p.display());
+                continue;
+            }
+            let members = vr180_core::segments::detect_segments(p);
+            if members.iter().any(|m| claimed.contains(m)) { continue; } // sibling already grouped
+            for m in &members { claimed.insert(m.clone()); }
+            let label = if members.len() > 1 {
+                format!("GoPro · {} chapters", members.len())
+            } else {
+                p.file_name().and_then(|s| s.to_str()).unwrap_or("clip").to_string()
+            };
+            groups.push(ImportGroup { picked: vec![p.clone()], members, label });
+        }
+        groups
+    }
+
+    /// Carry out a (possibly resolved) import. `merge` merges every
+    /// multi-file group into one clip; otherwise each PICKED file becomes
+    /// its own clip. Records the per-clip segment choice in `merge_groups`
+    /// so decode + export both honor it, then activates the first pick.
+    fn apply_import(&mut self, groups: Vec<ImportGroup>, merge: bool, first: PathBuf) {
+        let mut to_add: Vec<PathBuf> = Vec::new();
+        let mut active_rep: Option<PathBuf> = None;
+        for g in groups {
+            if merge && g.mergeable() {
+                let rep = g.members[0].clone();
+                self.merge_groups.insert(rep.clone(), g.members.clone());
+                if g.members.contains(&first) { active_rep = Some(rep.clone()); }
+                to_add.push(rep);
+            } else {
+                // Individual: pin each picked file's segments to itself so a
+                // GoPro chapter doesn't silently re-merge via detect_segments.
+                for p in &g.picked {
+                    self.merge_groups.insert(p.clone(), vec![p.clone()]);
+                    if *p == first { active_rep = Some(p.clone()); }
+                    to_add.push(p.clone());
+                }
+            }
+        }
+        self.add_batch_files(to_add);
+        let active = active_rep.unwrap_or(first);
+        if let Some(idx) = self.batch.iter().position(|b| b.path == active) {
             self.select_clip(idx);
-        } else if let Some(p) = other.into_iter().next() {
-            self.load_file(p);
-            self.active_clip = None; // legacy clip isn't a list entry
+        }
+    }
+
+    /// The files that make up the clip rooted at `path`: the import-time
+    /// choice if one was recorded, else GoPro auto-chapter detection (for
+    /// OSV this is just the file — segments aren't detectable by name).
+    fn clip_segments(&self, path: &std::path::Path) -> Vec<PathBuf> {
+        self.merge_groups.get(path).cloned()
+            .unwrap_or_else(|| vr180_core::segments::detect_segments(path))
+    }
+
+    /// Modal asking whether to merge a multi-file recording. Shown while
+    /// `pending_import` is `Some`; resolves to `apply_import(merge)`.
+    fn draw_import_prompt(&mut self, ctx: &egui::Context) {
+        if self.pending_import.is_none() { return; }
+        let mut decision: Option<bool> = None; // Some(true)=merge, Some(false)=individual
+        let mut cancel = false;
+        {
+            let pending = self.pending_import.as_ref().unwrap();
+            let n_files: usize = pending.groups.iter()
+                .filter(|g| g.mergeable()).map(|g| g.members.len()).sum();
+            egui::Window::new("Import — merge segments?")
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_width(440.0)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new(format!(
+                        "{n_files} files look like one continuous recording:")).strong());
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        for g in pending.groups.iter().filter(|g| g.mergeable()) {
+                            ui.label(RichText::new(format!("▸ {}", g.label)).strong());
+                            for m in &g.members {
+                                ui.label(RichText::new(format!("     {}",
+                                    m.file_name().and_then(|s| s.to_str()).unwrap_or("?")))
+                                    .small().color(Color32::GRAY));
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(
+                        "Merge plays + exports each recording as ONE clip with continuous \
+                         stabilization across the join. Individual imports every file \
+                         as its own clip.").small().color(Color32::GRAY));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Merge into one clip").strong()).clicked() {
+                            decision = Some(true);
+                        }
+                        ui.add_space(6.0);
+                        if ui.button("Import individually").clicked() {
+                            decision = Some(false);
+                        }
+                        ui.add_space(6.0);
+                        if ui.button("Cancel").clicked() { cancel = true; }
+                    });
+                });
+        }
+        if cancel {
+            self.pending_import = None;
+        } else if let Some(merge) = decision {
+            let pending = self.pending_import.take().unwrap();
+            self.apply_import(pending.groups, merge, pending.first);
         }
     }
 
@@ -1477,13 +1784,34 @@ impl App {
         // generation unnecessarily on the first frame.
         self.last_pushed_settings = self.settings.clone();
 
-        let segments = vr180_core::segments::detect_segments(&path);
-        tracing::info!("load_timing: after detect_segments @ {:?}", t_load.elapsed());
+        let segments = self.clip_segments(&path);
+        tracing::info!("load_timing: after clip_segments ({} segs) @ {:?}",
+            segments.len(), t_load.elapsed());
+
+        // Duration + frame count span the WHOLE segment chain (GS01…,
+        // GS02…, …) — the timeline, seek, and trim all run on global
+        // clip time. Single-segment: just this file's probe.
+        let (duration_sec, frame_count) = if segments.len() > 1 {
+            let total_dur: f64 = segments.iter()
+                .filter_map(|s| vr180_pipeline::decode::probe_video(s).ok())
+                .map(|p| p.duration_sec)
+                .sum();
+            let total_frames: u32 = segments.iter()
+                .filter_map(|s| vr180_pipeline::decode::probe_video(s).ok())
+                .map(|p| (p.duration_sec * p.fps as f64).round() as u32)
+                .sum();
+            tracing::info!(
+                "multi-segment: {} chapters → {:.1}s, {} frames total",
+                segments.len(), total_dur, total_frames);
+            (total_dur, total_frames)
+        } else {
+            (probe.duration_sec, (probe.duration_sec * probe.fps as f64).round() as u32)
+        };
 
         self.clip = Some(ClipInfo {
             width: probe.width, height: probe.height,
-            fps: probe.fps, duration_sec: probe.duration_sec,
-            frame_count: (probe.duration_sec * probe.fps as f64).round() as u32,
+            fps: probe.fps, duration_sec,
+            frame_count,
             segments,
             eac_tile_w: dims.tile_w(),
             cori_count, grav_count, srot_ms,
@@ -1545,12 +1873,17 @@ impl App {
             eye_w: self.settings.preview_eye_w,
         };
         let (frame_tx, frame_rx) = crossbeam_channel::bounded(2);
+        // Native-res zoom stills (.360 EAC) flow on their own bounded(1)
+        // channel — drained-to-latest, so a slow UI just drops stale stills.
+        let (detail_tx, detail_rx) = crossbeam_channel::bounded(1);
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let control = Arc::new(DecoderControl {
             paused: std::sync::atomic::AtomicBool::new(start_paused),
             settings: parking_lot::RwLock::new(self.settings.clone()),
             settings_generation: std::sync::atomic::AtomicU64::new(0),
             detected_calib: parking_lot::Mutex::new(None),
+            want_detail: std::sync::atomic::AtomicBool::new(false),
+            detail_tx: parking_lot::Mutex::new(Some(detail_tx)),
         });
         let pipeline = self.pipeline.clone();
         let control_for_thread = control.clone();
@@ -1562,6 +1895,7 @@ impl App {
             }
         });
         self.frame_rx = Some(frame_rx);
+        self.detail_frame_rx = Some(detail_rx);
         self.cmd_tx = Some(cmd_tx);
         self.control = Some(control);
         self.playing = !start_paused;
@@ -1571,8 +1905,14 @@ impl App {
 
         // Spawn the audio player alongside the video decoder. It runs
         // its own thread + cpal output stream and is held by the App
-        // for the lifetime of the playback session.
+        // for the lifetime of the playback session. Multi-segment: feed
+        // it an ffconcat playlist so the chain's audio plays + seeks as
+        // one continuous timeline (matches the video chaining).
         if let Some(audio_path) = self.loaded_path.clone() {
+            let audio_path = self.clip.as_ref()
+                .filter(|c| c.segments.len() > 1)
+                .and_then(|c| vr180_pipeline::audio::build_segment_playlist(&c.segments, "preview"))
+                .unwrap_or(audio_path);
             let t_audio = std::time::Instant::now();
             self.audio_player = match crate::audio_player::AudioPlayer::open(
                 audio_path, start_paused,
@@ -1731,6 +2071,7 @@ impl App {
             ctl.paused.store(false, Ordering::SeqCst);
         }
         self.frame_rx = None;
+        self.detail_frame_rx = None;
         self.cmd_tx = None;
         self.control = None;
         self.playing = false;
@@ -1804,6 +2145,10 @@ impl App {
         if closing
             || self.last_settings_save_at.elapsed() >= std::time::Duration::from_millis(1200)
         {
+            // Per-kind map is the source of truth; the legacy single
+            // `settings.json` is kept in sync for the no-clip startup state.
+            self.save_active_kind_template();
+            Settings::save_kind_map(&self.kind_settings);
             self.settings.save_persisted();
             self.last_saved_settings = self.settings.clone();
             self.last_settings_save_at = std::time::Instant::now();
@@ -2198,6 +2543,9 @@ impl eframe::App for App {
         self.poll_export_job();
         // Drive the full-res still for the zoom magnifier.
         self.poll_full_res(ctx);
+        // Import merge/individual prompt (shown when a multi-file recording
+        // is picked). Modal-ish: it sits on top until resolved.
+        self.draw_import_prompt(ctx);
         // Export options floating window (shown on Export click).
         self.draw_export_options_window(ctx);
         // Batch-export window + keep repainting while a batch is mid-run
@@ -2460,6 +2808,14 @@ impl eframe::App for App {
                     )
                     .default_open(true)
                     .show(ui, |ui| { self.draw_fisheye_output_panel(ui); });
+
+                    // Audio track (.360 carries stereo AAC + 4-ch ambisonic).
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new("Audio").strong()
+                    )
+                    .default_open(false)
+                    .show(ui, |ui| { self.draw_audio_panel(ui); });
                 }
 
                 ui.add_space(4.0);
@@ -2468,6 +2824,21 @@ impl eframe::App for App {
                 )
                 .default_open(false)
                 .show(ui, |ui| { self.draw_color_panel(ui); });
+
+                // Noise Reduction — its own section for emphasis. Only shown
+                // on macOS with a capable VideoToolbox temporal filter and an
+                // exportable clip loaded; auto-hidden on Windows / older macOS
+                // / incapable hardware (see `denoise_supported`).
+                let nr_show = Self::denoise_supported()
+                    && self.clip.as_ref().map_or(false, |c| c.source_kind.is_exportable());
+                if nr_show {
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new("Noise Reduction").strong()
+                    )
+                    .default_open(false)
+                    .show(ui, |ui| { self.draw_denoise_panel(ui); });
+                }
                 }); // ScrollArea
             });
 
@@ -2880,6 +3251,33 @@ impl App {
         ).small().color(Color32::GRAY));
     }
 
+    /// Audio-track choice for GoPro `.360` (it carries both a stereo AAC
+    /// and a 4-channel ambisonic track). Lives in its own controls section
+    /// (not the export window) so it's visible while reviewing the clip.
+    /// Applies to export only — the live preview always plays stereo.
+    fn draw_audio_panel(&mut self, ui: &mut egui::Ui) {
+        use crate::decoder::AudioFormat as AF;
+        let s = &mut self.settings;
+        ui.horizontal(|ui| {
+            ui.label("Export track");
+            egui::ComboBox::from_id_source("audio_format")
+                .selected_text(s.audio_format.as_str())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut s.audio_format, AF::Stereo, AF::Stereo.as_str());
+                    ui.selectable_value(&mut s.audio_format, AF::Ambisonic, AF::Ambisonic.as_str());
+                    ui.selectable_value(&mut s.audio_format, AF::Apac, AF::Apac.as_str());
+                });
+        });
+        let hint = match s.audio_format {
+            AF::Stereo    => "Stereo AAC — universal compatibility.",
+            AF::Ambisonic => "4-channel 1st-order ambisonic (AmbiX) + SA3D — \
+                              YouTube VR / Quest head-track it.",
+            AF::Apac      => "Apple Positional Audio — Vision Pro head-tracked \
+                              spatial (macOS only; re-encodes the ambisonic).",
+        };
+        ui.label(RichText::new(hint).small().color(Color32::GRAY));
+    }
+
     fn draw_rs_panel(&mut self, ui: &mut egui::Ui) {
         let s = &mut self.settings;
         ui.checkbox(&mut s.rs_correct, "Enable RS correction");
@@ -2907,6 +3305,22 @@ impl App {
     /// controls from the Python app (`vr180_gui.py:11132-11290`).
     /// All knobs apply live to the preview through the
     /// `Settings::build_color_stack()` plumbing.
+    /// Whether temporal noise reduction is available — a cached VideoToolbox
+    /// capability probe (always false off macOS). Gates the NR slider so it
+    /// never appears on hardware that can't run `VTTemporalNoiseFilter`.
+    fn denoise_supported() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use std::sync::OnceLock;
+            static CAP: OnceLock<bool> = OnceLock::new();
+            *CAP.get_or_init(vr180_pipeline::vt_denoise::is_supported)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
     fn draw_color_panel(&mut self, ui: &mut egui::Ui) {
         // Source kind drives which built-in log→709 LUT is offered
         // (DJI D-LogM for OSV, GoPro GP-Log for `.360`) — never show the
@@ -3004,8 +3418,9 @@ impl App {
 
         ui.separator();
 
-        // Detail: equirect-aware sharpening + mid-detail clarity (ported
-        // from the Python app; runs on every exportable source).
+        // Detail: equirect-aware sharpening (ported from the Python app;
+        // runs on every exportable source). Noise reduction has its own
+        // section.
         ui.label(RichText::new("Detail").strong());
         ui.add(egui::Slider::new(&mut s.sharpen_amount, 0.0..=2.0)
             .text("Sharpen").fixed_decimals(2))
@@ -3015,12 +3430,35 @@ impl App {
             ui.add(egui::Slider::new(&mut s.sharpen_radius, 0.5..=3.0)
                 .text("Radius").fixed_decimals(2));
         });
-        ui.add(egui::Slider::new(&mut s.mid_detail, 0.0..=2.0)
-            .text("Mid-detail").fixed_decimals(2))
-            .on_hover_text("Midtone-weighted local-contrast boost (clarity).");
         if ui.button("Reset detail").clicked() {
-            s.sharpen_amount = 0.0; s.sharpen_radius = 1.5; s.mid_detail = 0.0;
+            s.sharpen_amount = 0.0; s.sharpen_radius = 1.5;
         }
+        // (Noise reduction has moved to its own "Noise Reduction" section.)
+    }
+
+    /// Dedicated Noise Reduction section. The caller only shows this when
+    /// [`denoise_supported`](Self::denoise_supported) is true (macOS 26+ on
+    /// capable Apple Silicon) and an exportable clip is loaded.
+    fn draw_denoise_panel(&mut self, ui: &mut egui::Ui) {
+        let s = &mut self.settings;
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut s.denoise_strength, 0.0..=1.0)
+                .text("Strength").fixed_decimals(2));
+            if ui.button("Reset").clicked() {
+                s.denoise_strength = 0.0;
+            }
+        });
+        ui.add_space(6.0);
+        ui.label(RichText::new(
+            "Temporal noise reduction (Apple VideoToolbox). Averages sensor \
+             noise across neighbouring frames before projection — most \
+             effective on low-light / high-ISO footage. Runs fully in 10-bit."
+        ).small().color(Color32::GRAY));
+        ui.add_space(4.0);
+        ui.label(RichText::new("⚠ Applied on export only — not shown in the preview.")
+            .small().color(Color32::from_rgb(220, 180, 90)));
+        ui.label(RichText::new("⚠ Slows the export down (Apple's temporal filter runs at full source resolution).")
+            .small().color(Color32::from_rgb(220, 180, 90)));
     }
 
     fn draw_view_adjust_panel(&mut self, ui: &mut egui::Ui) {
