@@ -544,6 +544,10 @@ pub enum HwDecode {
 pub enum DecodePath {
     Software,
     VideoToolbox,
+    /// D3D11VA (NVDEC on NVIDIA) hardware decode — the Windows analogue of
+    /// VideoToolbox. Frames decode on the GPU video engine and are
+    /// downloaded to host memory before swscale.
+    D3d11va,
 }
 
 impl std::fmt::Display for DecodePath {
@@ -551,6 +555,7 @@ impl std::fmt::Display for DecodePath {
         match self {
             DecodePath::Software => f.write_str("software"),
             DecodePath::VideoToolbox => f.write_str("VideoToolbox"),
+            DecodePath::D3d11va => f.write_str("D3D11VA"),
         }
     }
 }
@@ -1570,7 +1575,24 @@ impl StreamPairIter {
                     }
                 }
             }
-            #[cfg(not(target_os = "macos"))]
+            // Windows: offload the two GoPro HEVC streams to the GPU video
+            // engine via D3D11VA (NVDEC), the same accelerator the OSV
+            // dual-stream path uses. Decoded surfaces arrive as
+            // AV_PIX_FMT_D3D11 and are downloaded in `repack_to_rgb8`. This
+            // is the Windows analogue of the macOS VideoToolbox branch above
+            // — without it GoPro .360 decode is CPU-only (the hw-accel gap).
+            #[cfg(target_os = "windows")]
+            {
+                if matches!(hw, HwDecode::Auto)
+                    && try_enable_d3d11va_decode(&mut codec_ctx)
+                {
+                    hw_active[i] = true;
+                    tracing::info!("StreamPairIter: D3D11VA hw decode active on stream {i}");
+                } else if matches!(hw, HwDecode::VideoToolbox) {
+                    return Err(Error::Ffmpeg("VT is macOS-only".into()));
+                }
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
                 let _ = (i, hw);
                 if matches!(hw, HwDecode::VideoToolbox) {
@@ -1595,7 +1617,8 @@ impl StreamPairIter {
             )));
         }
         let decode_path = if hw_active.iter().all(|&a| a) {
-            DecodePath::VideoToolbox
+            #[cfg(target_os = "windows")] { DecodePath::D3d11va }
+            #[cfg(not(target_os = "windows"))] { DecodePath::VideoToolbox }
         } else {
             DecodePath::Software
         };
@@ -1805,8 +1828,14 @@ fn repack_to_rgb8(
     hw_active: bool,
     scaler: &mut Option<ffmpeg_next::software::scaling::Context>,
 ) -> Result<Vec<u8>> {
+    // HW-decoded surfaces (VideoToolbox on macOS, D3D11/NVDEC on Windows)
+    // live in GPU memory — download to host before swscale. The downloaded
+    // sw frame is NV12 (8-bit) / P010 (10-bit), which swscale handles.
     let frame_ref: &ffmpeg_next::frame::Video = if hw_active
-        && decoded.format() == ffmpeg_next::format::Pixel::VIDEOTOOLBOX
+        && matches!(
+            decoded.format(),
+            ffmpeg_next::format::Pixel::VIDEOTOOLBOX | ffmpeg_next::format::Pixel::D3D11
+        )
     {
         download_hw_frame(decoded, sw_storage)?;
         sw_storage

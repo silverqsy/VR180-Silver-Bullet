@@ -1093,6 +1093,354 @@ impl D3d11SharedDualStreamIter {
     }
 }
 
+/// One GPU-resident EAC stream pair — the two GoPro `.360` HEVC streams
+/// (s0, s4), each decoded P010 by `d3d11va`/NVDEC and converted to a
+/// single-plane Rgba16Unorm D3D11 texture shared out as an NT handle. The
+/// EAC cross assembly (`Device::rgba*_to_eac_cross`) reads BOTH streams to
+/// build each lens's cross, so — unlike the OSV [`SharedFisheyePair`] —
+/// these stay in STREAM order (s0/s4), not eye order; the lens→eye mapping
+/// happens in the cross shader. Hold alive until the import + GPU read has
+/// been submitted; dropping closes the NT handles.
+#[cfg(target_os = "windows")]
+pub struct SharedEacPair {
+    pub s0: crate::interop_windows::D3d11SharedTexture,
+    pub s4: crate::interop_windows::D3d11SharedTexture,
+    /// EAC layout (stream/tile/cross dims), derived from the s0 stream.
+    pub dims: vr180_core::eac::Dims,
+    /// Presentation timestamp in seconds, `0.0` if unknown.
+    pub pts_s: f64,
+}
+
+// SAFETY: identical reasoning to `SharedFisheyePair` — the COM interfaces are
+// agile and the NT handles are process-global; we only import (Vulkan side)
+// and CloseHandle on drop on the consuming thread, never D3D11 immediate-
+// context calls. Moving across the decode→project thread boundary is sound.
+#[cfg(target_os = "windows")]
+unsafe impl Send for SharedEacPair {}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for SharedEacPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedEacPair")
+            .field("dims", &self.dims)
+            .field("pts_s", &self.pts_s)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Windows zero-copy EAC decoder — the GoPro `.360` analog of
+/// [`D3d11SharedDualStreamIter`]. Decodes both EAC HEVC streams with
+/// `d3d11va` (NVDEC), converts each P010 frame to single-plane Rgba16Unorm
+/// at NATIVE stream resolution (the cross assembly indexes exact stream
+/// pixels, so there is NO downscale), shares each as an NT-handle texture,
+/// and yields [`SharedEacPair`]s. No CPU download, no swscale, no CPU
+/// `assemble_lens_*`. Returns an error from `new` (so the caller can fall
+/// back to the CPU `StreamPairIter` path) if there aren't two video streams,
+/// they disagree on dims, the width isn't a valid EAC layout, or `d3d11va`
+/// can't attach.
+#[cfg(target_os = "windows")]
+pub struct D3d11SharedStreamPairIter {
+    ictx: ffmpeg_next::format::context::Input,
+    video_indices: [usize; 2],
+    decoders: Vec<ffmpeg_next::codec::decoder::Video>,
+    dims: vr180_core::eac::Dims,
+    /// One converter per stream (each stream decodes on its own d3d11va
+    /// device), built lazily on the first frame.
+    converters: [Option<crate::interop_windows::P010Converter>; 2],
+    frames_yielded: u32,
+    time_base_s: f64,
+    /// Nominal frame duration (1 / avg_frame_rate), for the precise-seek
+    /// run-in window.
+    dt_s: f64,
+    /// PRECISE-seek state — mirrors `ZeroCopyStreamPairIter::skip_until_s`.
+    /// After `seek(t)` the container lands on the keyframe ≤ t; `next_pair`
+    /// decodes-and-discards the keyframe→target run-in (WITHOUT the expensive
+    /// P010→RGBA convert) so the first pair RETURNED is the exact target frame.
+    /// Without this, the consumer's stab/RS index `round(t/dt)+n` is off by up
+    /// to a GOP after every scrub and the stabilization visibly fights the
+    /// content (the preview shakes).
+    skip_until_s: Option<f64>,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for D3d11SharedStreamPairIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("D3d11SharedStreamPairIter")
+            .field("video_indices", &self.video_indices)
+            .field("dims", &self.dims)
+            .field("frames_yielded", &self.frames_yielded)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl D3d11SharedStreamPairIter {
+    /// Open a GoPro `.360` and enable `d3d11va` HEVC decode on both EAC
+    /// streams. The two video streams (s0, s4) are the first two video
+    /// tracks — same selection as `StreamPairIter` / the macOS
+    /// `ZeroCopyStreamPairIter`.
+    pub fn new(path: &Path) -> Result<Self> {
+        ffmpeg_init();
+        let ictx = ffmpeg_next::format::input(path)
+            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+        let video_indices: Vec<usize> = ictx
+            .streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+            .map(|s| s.index())
+            .take(2)
+            .collect();
+        if video_indices.len() < 2 {
+            return Err(Error::Ffmpeg(format!(
+                "expected 2 video streams (.360 EAC), found {}",
+                video_indices.len()
+            )));
+        }
+        let video_indices = [video_indices[0], video_indices[1]];
+        let mut decoders = Vec::with_capacity(2);
+        for &idx in video_indices.iter() {
+            let stream = ictx.stream(idx).unwrap();
+            let mut codec_ctx =
+                ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+                    .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+            if !crate::decode::try_enable_d3d11va_decode(&mut codec_ctx) {
+                return Err(Error::Ffmpeg(format!(
+                    "zero-copy EAC path requires d3d11va hwaccel — setup failed on stream {idx}"
+                )));
+            }
+            decoders.push(
+                codec_ctx.decoder().video()
+                    .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?,
+            );
+        }
+        let (w0, h0) = (decoders[0].width(), decoders[0].height());
+        let (w1, h1) = (decoders[1].width(), decoders[1].height());
+        if (w0, h0) != (w1, h1) {
+            return Err(Error::Ffmpeg(format!(
+                "EAC zero-copy streams disagree on dims: {w0}x{h0} vs {w1}x{h1}"
+            )));
+        }
+        let dims = vr180_core::eac::Dims::new(w0, h0);
+        if !dims.is_valid() {
+            return Err(Error::Ffmpeg(format!(
+                "EAC zero-copy: stream width {w0} not a valid EAC layout"
+            )));
+        }
+        let s0_stream = ictx.stream(video_indices[0]).unwrap();
+        let time_base = s0_stream.time_base();
+        let time_base_s = time_base.numerator() as f64 / time_base.denominator().max(1) as f64;
+        let fr = s0_stream.avg_frame_rate();
+        let dt_s = if fr.numerator() > 0 {
+            fr.denominator() as f64 / fr.numerator() as f64
+        } else {
+            1.0 / 30.0
+        };
+        tracing::info!(
+            "D3d11SharedStreamPairIter: EAC streams {:?}, native {}x{}, cross_w={} \
+             (D3D11 P010→RGBA16, no downscale)",
+            video_indices, w0, h0, dims.cross_w()
+        );
+        Ok(Self {
+            ictx, video_indices, decoders, dims,
+            converters: [None, None],
+            frames_yielded: 0,
+            time_base_s,
+            dt_s,
+            skip_until_s: None,
+        })
+    }
+
+    pub fn dims(&self) -> vr180_core::eac::Dims { self.dims }
+    pub fn native_dims(&self) -> (u32, u32) { (self.dims.stream_w, self.dims.stream_h) }
+
+    /// PRECISE seek: the next `next_pair` returns the frame AT `target_s`
+    /// (±½ frame). `av_seek_frame` lands on the keyframe ≤ target; arming
+    /// `skip_until_s` makes `next_pair` decode-and-discard the keyframe→target
+    /// run-in before returning, so the consumer's frame-index-keyed stab/RS
+    /// stays aligned after a scrub (otherwise the preview shakes — see the
+    /// `skip_until_s` field doc and `ZeroCopyStreamPairIter::seek`).
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let target_s = target_s.max(0.0);
+        let ts = (target_s * 1_000_000.0) as i64;
+        self.ictx.seek(ts, ..ts)
+            .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        for d in &mut self.decoders { d.flush(); }
+        self.frames_yielded = 0;
+        self.skip_until_s = Some(target_s);
+        Ok(())
+    }
+
+    /// Pull the next GPU-resident `(s0, s4)` pair. Decodes one frame from
+    /// each stream (held simultaneously), converts + shares each at native
+    /// res, then releases the source frames. Returns `Ok(None)` at EOF.
+    pub fn next_pair(&mut self) -> Result<Option<SharedEacPair>> {
+        // Outer loop so a precise-seek run-in pair can be decoded+dropped and
+        // the next pair pulled, all without converting/sharing the discards.
+        loop {
+            let mut frames: [Option<(ffmpeg_next::frame::Video, i64)>; 2] = [None, None];
+            let mut decoded = ffmpeg_next::frame::Video::empty();
+
+            // Drain any pre-buffered frames first.
+            for pos in 0..2 {
+                if frames[pos].is_some() { continue; }
+                if self.decoders[pos].receive_frame(&mut decoded).is_ok() {
+                    let pts = decoded.pts().unwrap_or(0);
+                    frames[pos] = Some((
+                        std::mem::replace(&mut decoded, ffmpeg_next::frame::Video::empty()),
+                        pts,
+                    ));
+                }
+            }
+
+            if frames.iter().any(|f| f.is_none()) {
+                loop {
+                    let (stream, packet) = match self.ictx.packets().next() {
+                        Some(x) => x,
+                        None => break,
+                    };
+                    let pos = match self.video_indices.iter().position(|&i| i == stream.index()) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    // Feed every packet to its decoder even if that stream's
+                    // frame is already in hand, so the decoders stay in lockstep.
+                    if self.decoders[pos].send_packet(&packet).is_err() { continue; }
+                    if frames[pos].is_none()
+                        && self.decoders[pos].receive_frame(&mut decoded).is_ok()
+                    {
+                        let pts = decoded.pts().unwrap_or(0);
+                        frames[pos] = Some((
+                            std::mem::replace(&mut decoded, ffmpeg_next::frame::Video::empty()),
+                            pts,
+                        ));
+                    }
+                    if frames.iter().all(|f| f.is_some()) { break; }
+                }
+            }
+
+            let (Some((f0, pts0)), Some((f4, _pts4))) = (frames[0].take(), frames[1].take()) else {
+                return Ok(None);
+            };
+            let pts_s = pts0 as f64 * self.time_base_s;
+
+            // Precise-seek run-in: drop pairs before the target WITHOUT the
+            // expensive P010→RGBA convert — only the target frame is converted.
+            // (Same convention as `ZeroCopyStreamPairIter`; keeps the consumer's
+            // stab/RS frame index aligned after a scrub so the preview doesn't
+            // shake.)
+            if let Some(target) = self.skip_until_s {
+                if pts_s < target - 0.5 * self.dt_s {
+                    drop(f0);
+                    drop(f4);
+                    continue;
+                }
+                self.skip_until_s = None;
+            }
+
+            // Convert each stream P010 → shareable single-plane Rgba16Unorm at
+            // NATIVE res (D3D11-side BT.709 YCbCr→RGB, no downscale), then NT
+            // share. After this the source frames can drop.
+            let (nw, nh) = (self.dims.stream_w, self.dims.stream_h);
+            let s0 = unsafe {
+                crate::interop_windows::share_eye_converted(&f0, &mut self.converters[0], nw, nh)
+            }
+            .ok_or_else(|| Error::Ffmpeg("zero-copy EAC: convert s0 failed".into()))?;
+            let s4 = unsafe {
+                crate::interop_windows::share_eye_converted(&f4, &mut self.converters[1], nw, nh)
+            }
+            .ok_or_else(|| Error::Ffmpeg("zero-copy EAC: convert s4 failed".into()))?;
+            // Both stream converts were submitted on their own d3d11va devices
+            // with no intervening fence (concurrent on the GPU). Fence both
+            // before handing off — the importer must see completed pixels.
+            unsafe { s0.wait_gpu_idle(); s4.wait_gpu_idle(); }
+            drop(f0);
+            drop(f4);
+
+            self.frames_yielded += 1;
+            return Ok(Some(SharedEacPair { s0, s4, dims: self.dims, pts_s }));
+        }
+    }
+}
+
+/// Windows zero-copy counterpart to [`crate::decode::SegmentedStreamPairIter`]
+/// — chains GoPro `.360` segments (a long recording GoPro splits into
+/// GS01…/GS02…/…) through [`D3d11SharedStreamPairIter`], so a merged clip
+/// previews on the fast NVDEC→D3D11→Vulkan path instead of falling back to the
+/// CPU-assemble path. Single-element passthrough. Yielded pts are GLOBALIZED to
+/// clip time (segment start + local pts) so the consumer's frame-index-keyed
+/// stab/RS stays continuous across segment boundaries.
+#[cfg(target_os = "windows")]
+pub struct SegmentedD3d11SharedStreamPairIter {
+    segments: Vec<std::path::PathBuf>,
+    seg_start_s: Vec<f64>,
+    total_dur_s: f64,
+    cur_idx: usize,
+    cur: D3d11SharedStreamPairIter,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for SegmentedD3d11SharedStreamPairIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentedD3d11SharedStreamPairIter")
+            .field("segments", &self.segments.len())
+            .field("cur_idx", &self.cur_idx)
+            .field("total_dur_s", &self.total_dur_s)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl SegmentedD3d11SharedStreamPairIter {
+    pub fn new(segments: &[std::path::PathBuf]) -> Result<Self> {
+        assert!(!segments.is_empty(), "segments must be non-empty");
+        let mut seg_start_s = Vec::with_capacity(segments.len());
+        let mut acc = 0.0_f64;
+        for seg in segments {
+            seg_start_s.push(acc);
+            acc += crate::decode::probe_video(seg).map(|p| p.duration_sec).unwrap_or(0.0);
+        }
+        let cur = D3d11SharedStreamPairIter::new(&segments[0])?;
+        tracing::info!(
+            "SegmentedD3d11SharedStreamPairIter: {} segment(s), {:.1}s total",
+            segments.len(), acc,
+        );
+        Ok(Self {
+            segments: segments.to_vec(),
+            seg_start_s, total_dur_s: acc, cur_idx: 0, cur,
+        })
+    }
+
+    pub fn dims(&self) -> vr180_core::eac::Dims { self.cur.dims() }
+    pub fn native_dims(&self) -> (u32, u32) { self.cur.native_dims() }
+    pub fn total_duration_s(&self) -> f64 { self.total_dur_s }
+
+    /// PRECISE seek to a GLOBAL clip time: map to the owning segment + local
+    /// time, (re)open that segment, and precise-seek within it.
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let t = target_s.clamp(0.0, self.total_dur_s);
+        let idx = self.seg_start_s.iter().rposition(|&s| s <= t).unwrap_or(0);
+        if idx != self.cur_idx {
+            self.cur = D3d11SharedStreamPairIter::new(&self.segments[idx])?;
+            self.cur_idx = idx;
+        }
+        self.cur.seek(t - self.seg_start_s[idx])
+    }
+
+    pub fn next_pair(&mut self) -> Result<Option<SharedEacPair>> {
+        loop {
+            if let Some(mut p) = self.cur.next_pair()? {
+                // Segment-local → global clip time.
+                p.pts_s += self.seg_start_s[self.cur_idx];
+                return Ok(Some(p));
+            }
+            if self.cur_idx + 1 >= self.segments.len() {
+                return Ok(None);
+            }
+            self.cur_idx += 1;
+            self.cur = D3d11SharedStreamPairIter::new(&self.segments[self.cur_idx])?;
+        }
+    }
+}
+
 // ── Zero-copy dual-stream (macOS only) ─────────────────────────────
 //
 // Mirrors the GoPro `ZeroCopyStreamPairIter` in decode.rs, but for the

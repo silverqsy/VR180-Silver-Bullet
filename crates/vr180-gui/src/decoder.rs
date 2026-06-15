@@ -46,6 +46,13 @@ fn default_dji_imu_phase_ms() -> f32 {
     vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(30.0)
 }
 
+/// PER-CLIP GoPro RS defaults. `rs_mode` + `rs_readout_ms` are `#[serde(skip)]`
+/// and re-seeded to these on every clip load (see `app.rs`), so a prior clip's
+/// tweak never carries over — same lifecycle as the IMU phase. (`rs_correct`
+/// stays a persisted preference.) 15.224 ms is the GoPro Max firmware SROT.
+pub(crate) fn default_rs_mode() -> RsMode { RsMode::Firmware }
+pub(crate) fn default_rs_readout_ms() -> f32 { 15.224 }
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -95,7 +102,12 @@ pub struct Settings {
     pub stereo_pitch_deg: f32,
     pub stereo_roll_deg: f32,
     pub rs_correct: bool,
+    /// RS mode + readout are PER-CLIP, not persisted: each clip load resets them
+    /// to the GoPro firmware default (`default_rs_*`) so a prior clip's tweak
+    /// never carries over. `rs_correct` (the on/off) stays a persisted preference.
+    #[serde(skip, default = "default_rs_mode")]
     pub rs_mode: RsMode,
+    #[serde(skip, default = "default_rs_readout_ms")]
     pub rs_readout_ms: f32,
     pub preview_eye_w: u32,
     /// Trim-in time in seconds. `None` = play from clip start.
@@ -255,8 +267,8 @@ impl Default for Settings {
             stereo_pitch_deg: 0.0,
             stereo_roll_deg: 0.0,
             rs_correct: false,
-            rs_mode: RsMode::Firmware,
-            rs_readout_ms: 15.224,
+            rs_mode: default_rs_mode(),
+            rs_readout_ms: default_rs_readout_ms(),
             preview_eye_w: 768,
             trim_in_s: None,
             trim_out_s: None,
@@ -727,7 +739,37 @@ pub fn start_decoder(
 
     #[cfg(target_os = "macos")]
     return run_zero_copy(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, frame_tx, cmd_rx);
-    #[cfg(not(target_os = "macos"))]
+
+    // Windows: try the GPU-resident zero-copy EAC preview (NVDEC→D3D11→Vulkan,
+    // GPU cross assembly), matching the macOS zero-copy path. Handles merged
+    // multi-segment recordings via SegmentedD3d11SharedStreamPairIter (chained
+    // segments, globalized pts). Falls back to the CPU-assemble path only when
+    // the backend isn't Vulkan or d3d11va can't attach.
+    #[cfg(target_os = "windows")]
+    {
+        let zc = vr180_pipeline::interop_windows::VulkanImportCtx::from_wgpu(
+            &pipeline.adapter, &pipeline.device,
+        ).and_then(|ctx| {
+            match vr180_pipeline::fisheye_decode::SegmentedD3d11SharedStreamPairIter::new(&cfg.segments) {
+                Ok(iter) => Some((ctx, iter)),
+                Err(e) => { tracing::warn!("decoder: EAC zero-copy iter unavailable ({e})"); None }
+            }
+        });
+        match zc {
+            Some((ctx, iter)) => {
+                tracing::info!(
+                    "decoder: EAC zero-copy (d3d11va→Vulkan, GPU cross) preview ENGAGED ({} segment(s))",
+                    cfg.segments.len()
+                );
+                return run_eac_zerocopy(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, ctx, iter, frame_tx, cmd_rx);
+            }
+            None => {
+                tracing::info!("decoder: EAC CPU-assemble preview (zero-copy unavailable)");
+                return run_cpu_assemble(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, frame_tx, cmd_rx);
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     return run_cpu_assemble(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, frame_tx, cmd_rx);
 }
 
@@ -2803,6 +2845,232 @@ fn run_zero_copy(
 
 /// Non-macOS fallback — CPU EAC assembly path.
 #[cfg(not(target_os = "macos"))]
+/// Windows zero-copy EAC preview (GoPro `.360`) — the GPU-resident sibling of
+/// [`run_cpu_assemble`], and the Windows counterpart of the macOS
+/// [`run_zero_copy`]. Decode + EAC cross assembly stay on the GPU: NVDEC
+/// (`d3d11va`) decodes both EAC HEVC streams, each P010 is converted to a
+/// single-plane Rgba16Unorm on the D3D11 side and shared into wgpu's Vulkan
+/// device (zero-copy alias), then `rgba8_to_eac_cross` assembles each lens's
+/// cross on the GPU and `project_cross_texture_to_equirect_texture` projects it
+/// — no CPU download, no swscale, no CPU `assemble_lens_*`. Identical conversion
+/// math + cross geometry to the macOS zero-copy path. All pacing / pause-resume
+/// / seek / trim / live-stab / live-view-adjust semantics mirror
+/// `run_cpu_assemble` exactly; only the decode + assemble change.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn run_eac_zerocopy(
+    pipeline: Arc<Device>,
+    cfg: &DecoderConfig,
+    control: Arc<DecoderControl>,
+    fps: f32,
+    dt: f64,
+    eye_w: u32,
+    eye_h: u32,
+    mut per_eye: Vec<((EquirectRotation, EquirectRsParams), (EquirectRotation, EquirectRsParams))>,
+    mut stab_key: StabKey,
+    mut cached_gen: u64,
+    ctx: vr180_pipeline::interop_windows::VulkanImportCtx,
+    iter: vr180_pipeline::fisheye_decode::SegmentedD3d11SharedStreamPairIter,
+    frame_tx: Sender<DecodedFrame>,
+    cmd_rx: Receiver<DecoderCommand>,
+) -> anyhow::Result<()> {
+    use vr180_pipeline::fisheye_decode::SharedEacPair;
+    use vr180_pipeline::gpu::Lens;
+
+    let mut iter = iter;
+    let dims = iter.dims();
+    if !dims.is_valid() {
+        anyhow::bail!("invalid EAC layout (stream w={})", dims.stream_w);
+    }
+
+    let mut frame_idx: u32 = 0;
+    let mut time_offset: f64 = 0.0;
+    let mut skipped_count: u32 = 0;
+    let mut start_wall: Option<std::time::Instant> = None;
+    let mut paused_offset = std::time::Duration::ZERO;
+    let mut force_render_next = false;
+    let _ = fps;
+    let total_frames = vr180_pipeline::decode::probe_video(&cfg.path)
+        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+        .unwrap_or(0);
+
+    {
+        let s = control.settings.read();
+        if let Some(t_in) = s.trim_in_s {
+            if t_in > 0.001 { drop(s); iter.seek(t_in)?; time_offset = t_in; }
+        }
+    }
+
+    let mut held_pair: Option<SharedEacPair> = None;
+
+    'main: loop {
+        let stay_on_pair = control.paused.load(Ordering::SeqCst) && held_pair.is_some();
+        if held_pair.is_none() {
+            match iter.next_pair()? {
+                Some(p) => held_pair = Some(p),
+                None => break,
+            }
+        }
+
+        let mut seek_target: Option<f64> = None;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                DecoderCommand::Stop => return Ok(()),
+                DecoderCommand::Seek(t) => seek_target = Some(t.max(0.0)),
+            }
+        }
+        if let Some(t) = seek_target {
+            held_pair = None;
+            iter.seek(t)?;
+            time_offset = t;
+            frame_idx = 0;
+            start_wall = None;
+            paused_offset = std::time::Duration::ZERO;
+            force_render_next = true;
+            continue 'main;
+        }
+
+        let frame_t_rel = frame_idx as f64 * dt;
+        let frame_t_abs = time_offset + frame_t_rel;
+        {
+            let s = control.settings.read();
+            if let Some(out_t) = s.trim_out_s {
+                if frame_t_abs >= out_t {
+                    let in_t = s.trim_in_s.unwrap_or(0.0);
+                    drop(s);
+                    held_pair = None;
+                    iter.seek(in_t)?;
+                    time_offset = in_t;
+                    frame_idx = 0;
+                    start_wall = None;
+                    paused_offset = std::time::Duration::ZERO;
+                    force_render_next = true;
+                    continue 'main;
+                }
+            }
+        }
+
+        let current_gen = control.settings_generation.load(Ordering::SeqCst);
+        if current_gen != cached_gen {
+            let snapshot = control.settings.read().clone();
+            let new_key = stab_settings_key(&snapshot);
+            if new_key == stab_key {
+                cached_gen = current_gen;
+            } else {
+                match build_per_eye_frames_multi(&cfg.segments, &snapshot, fps, total_frames) {
+                    Ok(new) => { per_eye = new; stab_key = new_key; cached_gen = current_gen; }
+                    Err(e) => tracing::warn!("decoder (eac/zc): per-eye rebuild failed: {e}"),
+                }
+            }
+        }
+
+        if !stay_on_pair && !force_render_next {
+            let wall_t = start_wall
+                .get_or_insert_with(std::time::Instant::now)
+                .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
+            if wall_t > frame_t_rel + dt * 0.5 {
+                frame_idx += 1;
+                skipped_count += 1;
+                if wall_t > frame_t_rel + 1.0 {
+                    start_wall = Some(std::time::Instant::now()
+                        - std::time::Duration::from_secs_f64(frame_t_rel)
+                        - paused_offset);
+                }
+                if skipped_count % 30 == 0 {
+                    tracing::debug!("decoder (eac/zc): behind by {:.1} ms — skipped {}",
+                        (wall_t - frame_t_rel) * 1000.0, skipped_count);
+                }
+                held_pair = None;
+                continue 'main;
+            }
+        }
+
+        let pair = held_pair.as_ref().expect("held_pair populated above");
+        let absolute_frame_idx = ((time_offset / dt).round() as u32) + frame_idx;
+
+        // GPU EAC cross assembly from the two zero-copy stream textures.
+        let s0 = unsafe { ctx.import_rgba16(&pipeline.device, &pair.s0) };
+        let s4 = unsafe { ctx.import_rgba16(&pipeline.device, &pair.s4) };
+        let cross_a = pipeline.rgba8_to_eac_cross(&s0, &s4, Lens::A, dims)?;
+        let cross_b = pipeline.rgba8_to_eac_cross(&s0, &s4, Lens::B, dims)?;
+
+        let ((rl, sl), (rr, sr)) = per_eye.get(absolute_frame_idx as usize).copied()
+            .unwrap_or((
+                (EquirectRotation::IDENTITY, EquirectRsParams::DISABLED),
+                (EquirectRotation::IDENTITY, EquirectRsParams::DISABLED),
+            ));
+        let (rl, rr) = apply_view_adjust(&control.settings.read(), rl, rr);
+
+        // Left eye = Lens B, right eye = Lens A (same as the CPU + export paths).
+        // Honor the Fisheye output mode (normalized fisheye SBS) like the macOS
+        // run_zero_copy + the export; default is half-equirect (VR180).
+        let (left_tex, right_tex) = if matches!(
+            control.settings.read().fisheye_output_mode, FisheyeOutputMode::Fisheye
+        ) {
+            (pipeline.project_cross_texture_to_fisheye_texture(&cross_b, eye_w, eye_h, rl, sl)?,
+             pipeline.project_cross_texture_to_fisheye_texture(&cross_a, eye_w, eye_h, rr, sr)?)
+        } else {
+            (pipeline.project_cross_texture_to_equirect_texture(&cross_b, eye_w, eye_h, rl, sl)?,
+             pipeline.project_cross_texture_to_equirect_texture(&cross_a, eye_w, eye_h, rr, sr)?)
+        };
+        let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
+            &pipeline, &control.settings.read(), &left_tex, &right_tex, eye_w, eye_h,
+        )?;
+
+        let out = DecodedFrame {
+            texture: Arc::new(sbs_tex),
+            width: out_w,
+            height: out_h,
+            frame_idx: absolute_frame_idx,
+            timestamp_s: frame_t_abs,
+        };
+        match frame_tx.try_send(out) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => return Ok(()),
+        }
+        force_render_next = false;
+
+        if control.paused.load(Ordering::SeqCst) {
+            let pause_start = std::time::Instant::now();
+            while control.paused.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                if control.settings_generation.load(Ordering::SeqCst) != cached_gen {
+                    force_render_next = true;
+                    break;
+                }
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        DecoderCommand::Stop => return Ok(()),
+                        DecoderCommand::Seek(t) => {
+                            held_pair = None;
+                            iter.seek(t.max(0.0))?;
+                            time_offset = t.max(0.0);
+                            frame_idx = 0;
+                            start_wall = None;
+                            paused_offset = std::time::Duration::ZERO;
+                            force_render_next = true;
+                            continue 'main;
+                        }
+                    }
+                }
+            }
+            paused_offset += pause_start.elapsed();
+            continue 'main;
+        }
+
+        let now = start_wall
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
+        if now < frame_t_rel {
+            std::thread::sleep(std::time::Duration::from_secs_f64(frame_t_rel - now));
+        }
+        frame_idx += 1;
+        held_pair = None;
+    }
+    Ok(())
+}
+
 fn run_cpu_assemble(
     pipeline: Arc<Device>,
     cfg: &DecoderConfig,
@@ -2955,12 +3223,17 @@ fn run_cpu_assemble(
             ));
         let (rl, rr) = apply_view_adjust(&control.settings.read(), rl, rr);
 
-        let left_tex = pipeline.project_cross_to_equirect_texture(
-            &cross_b, cross_w_px, eye_w, eye_h, rl, sl,
-        )?;
-        let right_tex = pipeline.project_cross_to_equirect_texture(
-            &cross_a, cross_w_px, eye_w, eye_h, rr, sr,
-        )?;
+        // Honor the Fisheye output mode (parity with the zero-copy preview + the
+        // export); default is half-equirect (VR180).
+        let (left_tex, right_tex) = if matches!(
+            control.settings.read().fisheye_output_mode, FisheyeOutputMode::Fisheye
+        ) {
+            (pipeline.project_cross_to_fisheye_texture(&cross_b, cross_w_px, eye_w, eye_h, rl, sl)?,
+             pipeline.project_cross_to_fisheye_texture(&cross_a, cross_w_px, eye_w, eye_h, rr, sr)?)
+        } else {
+            (pipeline.project_cross_to_equirect_texture(&cross_b, cross_w_px, eye_w, eye_h, rl, sl)?,
+             pipeline.project_cross_to_equirect_texture(&cross_a, cross_w_px, eye_w, eye_h, rr, sr)?)
+        };
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex, eye_w, eye_h,
         )?;

@@ -741,7 +741,16 @@ unsafe fn copy_slice_to_shader_p010(
     let mut tex: Option<ID3D11Texture2D> = None;
     device.CreateTexture2D(&desc, None, Some(&mut tex)).ok()?;
     let tex = tex.unwrap();
-    context.CopySubresourceRegion(&tex, 0, 0, 0, 0, src, slice, None);
+    // Copy ONLY the requested w×h top-left region, not the whole source
+    // subresource. The d3d11va DPB texture is frequently allocated wider than
+    // the coded frame (NVDEC aligns the width — e.g. 5952 → 6016), and those
+    // extra columns are black padding. An explicit box copies just the valid
+    // pixels into the (w×h) shader texture so the converter never samples the
+    // padding. (P010 is 4:2:0, so w/h must be even — coded dims always are.)
+    let src_box = windows::Win32::Graphics::Direct3D11::D3D11_BOX {
+        left: 0, top: 0, front: 0, right: w, bottom: h, back: 1,
+    };
+    context.CopySubresourceRegion(&tex, 0, 0, 0, 0, src, slice, Some(&src_box));
     // No flush here — `convert` flushes + GPU-fences after its compute pass,
     // which is ordered after this copy on the same context.
     Some(tex)
@@ -774,7 +783,16 @@ pub unsafe fn share_eye_converted(
     let conv = converter.as_ref().unwrap();
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     tex.GetDesc(&mut desc);
-    let (nw, nh) = (desc.Width, desc.Height);
+    // Use the frame's CODED dims as the valid content size, NOT the D3D11
+    // texture's allocated dims — d3d11va/NVDEC often pads the DPB texture wider
+    // than the coded frame (e.g. 5952 → 6016) with black padding columns. The
+    // copy + convert work on the coded region only, so the box-downscale can't
+    // fold that padding into the right edge (which showed as a black vertical
+    // bar on the EAC Lens-B s0 right face; latent on the OSV fisheye corner).
+    let (nw, nh) = (
+        frame.width().min(desc.Width).max(2) & !1,
+        frame.height().min(desc.Height).max(2) & !1,
+    );
     let p010 = copy_slice_to_shader_p010(&dev, &dctx, &tex, slice, nw, nh)?;
     match conv.convert(&dev, &dctx, &p010, nw, nh, work_w, work_h) {
         Ok(shared) => Some(shared),

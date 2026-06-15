@@ -124,6 +124,10 @@ pub struct Device {
     /// so the color stack can run end-to-end at 10-bit precision.
     lut3d_16: Lut3DPipeline,
     nv12_to_eac: Nv12ToEacPipeline,
+    #[allow(dead_code)] // Windows zero-copy EAC only
+    rgba_to_eac: RgbaToEacPipeline,
+    #[allow(dead_code)] // Windows zero-copy EAC only
+    rgba_to_eac_16: RgbaToEacPipeline,
     /// 16-bit-output NV12/P010→EAC-cross (true-10-bit EAC export chain).
     nv12_to_eac_16: Nv12ToEacPipeline,
     cdl: PerPixelPipeline,
@@ -265,6 +269,17 @@ struct Nv12ToEacPipeline {
     sampler: wgpu::Sampler,
 }
 
+/// Windows zero-copy EAC cross assembly: same shape as `Nv12ToEacPipeline`
+/// but the input is two already-RGB stream textures (the d3d11va P010 is
+/// converted to single-plane Rgba16Unorm before Vulkan import) instead of
+/// four NV12/P010 planes. See `shaders/rgba_to_eac_cross.wgsl`.
+#[derive(Debug)]
+struct RgbaToEacPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
 /// Reusable pipeline shape for any "per-pixel" color tool that takes
 /// one input 2D texture + uniform buffer and writes to one output
 /// storage texture (Rgba8Unorm). Used by CDL and color_grade, and
@@ -363,6 +378,8 @@ impl Device {
         let lut3d_16 = Lut3DPipeline::create_16bit(&device);
         let nv12_to_eac = Nv12ToEacPipeline::create(&device);
         let nv12_to_eac_16 = Nv12ToEacPipeline::create_16(&device);
+        let rgba_to_eac = RgbaToEacPipeline::create(&device);
+        let rgba_to_eac_16 = RgbaToEacPipeline::create_16(&device);
         let cdl = PerPixelPipeline::create(
             &device, "cdl", CDL_WGSL,
             std::mem::size_of::<CdlUniforms>() as u64,
@@ -418,6 +435,7 @@ impl Device {
             fisheye_p010_to_fisheye_16, fisheye_p010_to_fisheye_rs_16,
             p010_resolve,
             lut3d, lut3d_16, nv12_to_eac, nv12_to_eac_16,
+            rgba_to_eac, rgba_to_eac_16,
             cdl, cdl_16,
             color_grade, color_grade_16,
             gaussian_blur, sharpen_combine, mid_detail_combine, downsample_4x,
@@ -1954,6 +1972,7 @@ const FISHEYE_P010_TO_FISHEYE_RS_16_WGSL: &str = include_str!("shaders/fisheye_p
 const LUT3D_WGSL: &str = include_str!("shaders/lut3d.wgsl");
 const LUT3D_16_WGSL: &str = include_str!("shaders/lut3d_16.wgsl");
 const NV12_TO_EAC_WGSL: &str = include_str!("shaders/nv12_to_eac_cross.wgsl");
+const RGBA_TO_EAC_WGSL: &str = include_str!("shaders/rgba_to_eac_cross.wgsl");
 const EAC_TO_FISHEYE_WGSL: &str = include_str!("shaders/eac_to_fisheye.wgsl");
 const CDL_WGSL: &str = include_str!("shaders/cdl.wgsl");
 const CDL_16_WGSL: &str = include_str!("shaders/cdl_16.wgsl");
@@ -2286,6 +2305,90 @@ impl Nv12ToEacPipeline {
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("nv12_smp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        Self { pipeline, bind_group_layout, sampler }
+    }
+}
+
+impl RgbaToEacPipeline {
+    fn create(device: &wgpu::Device) -> Self {
+        Self::create_with_format(device, wgpu::TextureFormat::Rgba8Unorm)
+    }
+
+    /// 16-bit cross output for the true-10-bit EAC export chain (P010
+    /// decode → Rgba16 stream → Rgba16 cross → Rgba16 equirect → P010
+    /// encode). Same shader, `rgba16unorm` swapped into the storage decl.
+    fn create_16(device: &wgpu::Device) -> Self {
+        Self::create_with_format(device, wgpu::TextureFormat::Rgba16Unorm)
+    }
+
+    fn create_with_format(device: &wgpu::Device, out_format: wgpu::TextureFormat) -> Self {
+        let wgsl = if out_format == wgpu::TextureFormat::Rgba16Unorm {
+            RGBA_TO_EAC_WGSL.replace("rgba8unorm, write", "rgba16unorm, write")
+        } else {
+            RGBA_TO_EAC_WGSL.to_string()
+        };
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rgba_to_eac"),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rgba_to_eac_bgl"),
+            entries: &[
+                // 0: s0 RGBA stream texture
+                bgle_tex(0),
+                // 1: s4 RGBA stream texture
+                bgle_tex(1),
+                // 2: sampler (bilinear)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // 3: cross output storage texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: out_format,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                // 4: uniforms
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rgba_to_eac_pll"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rgba_to_eac_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("rgba_eac_smp"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -3054,6 +3157,106 @@ impl Device {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("nv12_to_eac_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&pl.pipeline);
+            pass.set_bind_group(0, Some(&bind_group), &[]);
+            let wg = (cw + 7) / 8;
+            pass.dispatch_workgroups(wg, wg, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        Ok(out_tex)
+    }
+
+    /// Windows zero-copy EAC cross assembly (8-bit cross output, for the
+    /// live preview). `s0_rgba`/`s4_rgba` are the two EAC stream textures
+    /// already converted P010→Rgba16Unorm on the D3D11 side. Same cross
+    /// geometry as `nv12_to_eac_cross` (the macOS NV12-plane path) so the
+    /// assembled cross is pixel-identical.
+    pub fn rgba8_to_eac_cross(
+        &self,
+        s0_rgba: &wgpu::Texture,
+        s4_rgba: &wgpu::Texture,
+        lens: Lens,
+        dims: vr180_core::eac::Dims,
+    ) -> Result<wgpu::Texture> {
+        self.rgba_to_eac_cross_with(s0_rgba, s4_rgba, lens, dims, false)
+    }
+
+    /// 16-bit cross variant — the source's 10 bits survive into Rgba16Unorm
+    /// for the GPU-resident 10-bit EAC export chain.
+    pub fn rgba16_to_eac_cross(
+        &self,
+        s0_rgba: &wgpu::Texture,
+        s4_rgba: &wgpu::Texture,
+        lens: Lens,
+        dims: vr180_core::eac::Dims,
+    ) -> Result<wgpu::Texture> {
+        self.rgba_to_eac_cross_with(s0_rgba, s4_rgba, lens, dims, true)
+    }
+
+    fn rgba_to_eac_cross_with(
+        &self,
+        s0_rgba: &wgpu::Texture,
+        s4_rgba: &wgpu::Texture,
+        lens: Lens,
+        dims: vr180_core::eac::Dims,
+        sixteen: bool,
+    ) -> Result<wgpu::Texture> {
+        let cw = dims.cross_w();
+        let pl = if sixteen { &self.rgba_to_eac_16 } else { &self.rgba_to_eac };
+
+        let out_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(match lens { Lens::A => "rgba_cross_a", Lens::B => "rgba_cross_b" }),
+            size: wgpu::Extent3d { width: cw, height: cw, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: if sixteen { wgpu::TextureFormat::Rgba16Unorm }
+                    else       { wgpu::TextureFormat::Rgba8Unorm },
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                 | wgpu::TextureUsages::STORAGE_BINDING
+                 | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let uniforms = Nv12ToEacUniforms {
+            stream_w: dims.stream_w,
+            stream_h: dims.stream_h,
+            tile_w:   dims.tile_w(),
+            center_w: vr180_core::eac::CENTER_W,
+            cross_w:  cw,
+            lens:     match lens { Lens::A => 0, Lens::B => 1 },
+            _pad0: 0, _pad1: 0,
+        };
+        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rgba_to_eac_uniforms"),
+            size: std::mem::size_of::<Nv12ToEacUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+
+        let s0_v  = s0_rgba.create_view(&Default::default());
+        let s4_v  = s4_rgba.create_view(&Default::default());
+        let out_v = out_tex.create_view(&Default::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rgba_to_eac_bg"),
+            layout: &pl.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&s0_v) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&s4_v) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&pl.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&out_v) },
+                wgpu::BindGroupEntry { binding: 4, resource: uniform_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rgba_to_eac_enc"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rgba_to_eac_pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&pl.pipeline);
             pass.set_bind_group(0, Some(&bind_group), &[]);

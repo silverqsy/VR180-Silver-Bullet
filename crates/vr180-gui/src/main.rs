@@ -8,6 +8,11 @@
 //! path (MDK → QRhi compute → QQuickItem), but pure-Rust and built on
 //! wgpu instead of Qt RHI.
 
+// Release Windows builds run as a GUI-subsystem app — no console window pops up
+// on launch. Logs go to a file in the per-OS data dir instead (see `main`).
+// Debug builds keep the console so `cargo run` still prints to the terminal.
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod audio_player;
 mod decoder;
@@ -15,11 +20,38 @@ mod decoder;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info,vr180_gui=debug,wgpu_core=warn,wgpu_hal=warn,naga=warn")))
-        .with_target(false)
-        .try_init();
+    // Logs go to `<data dir>/vr180-gui.log` (truncated each launch) so the
+    // release GUI-subsystem build — which has no console — still leaves a
+    // troubleshooting trail. Falls back to stderr (debug `cargo run`) if the
+    // file can't be opened. Set RUST_LOG to override the filter.
+    let log_filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("info,vr180_gui=debug,wgpu_core=warn,wgpu_hal=warn,naga=warn")
+    });
+    let log_path = decoder::Settings::config_path()
+        .and_then(|p| p.parent().map(|d| d.join("vr180-gui.log")));
+    let log_file = log_path.as_ref().and_then(|p| {
+        if let Some(dir) = p.parent() { std::fs::create_dir_all(dir).ok()?; }
+        std::fs::File::create(p).ok()
+    });
+    match log_file {
+        Some(f) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(log_filter())
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(f))
+                .try_init();
+            if let Some(p) = log_path.as_ref() {
+                tracing::info!("log file: {}", p.display());
+            }
+        }
+        None => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(log_filter())
+                .with_target(false)
+                .try_init();
+        }
+    }
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -1231,6 +1231,53 @@ pub fn export_eac(
         }
     }
 
+    // ── Fast path: GPU-resident EAC → CUDA → NVENC (Windows, default) ────
+    // The GoPro `.360` analog of the OSV GPU-resident path: NVDEC decodes
+    // both EAC HEVC streams, D3D11 converts each P010→RGBA16, wgpu assembles
+    // the two lens crosses + projects + colors + composes P010, and the frame
+    // is fed to NVENC over CUDA — no CPU readback, no swscale, no CPU
+    // `assemble_lens_*`. Same gate shape + safe fallback as the OSV path:
+    // NVENC + 10-bit + either projection + single-segment + Vulkan + P010 +
+    // no denoise; ANY failure falls through to the portable path below.
+    #[cfg(target_os = "windows")]
+    {
+        let try_gpu_resident = std::env::var_os("VR180_NO_GPU_RESIDENT").is_none()
+            && std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
+            && matches!(cfg.encoder, EncoderBackend::HevcNvenc)
+            && cfg.bit_depth == 10
+            && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye)
+            && crate::interop_windows::is_vulkan_backend(&pipeline.device)
+            && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010)
+            && cfg.denoise_strength <= 0.0; // denoise is macOS-only anyway
+        if try_gpu_resident {
+            let ctx = crate::interop_windows::VulkanImportCtx::from_wgpu(
+                &pipeline.adapter, &pipeline.device,
+            );
+            // Segmented iterator chains a merged recording's GS01…/GS02…/… on
+            // the fast path (globalized pts → stab index stays continuous).
+            let iter = crate::fisheye_decode::SegmentedD3d11SharedStreamPairIter::new(&cfg.segments);
+            match (ctx, iter) {
+                (Some(ctx), Ok(iter)) => {
+                    tracing::info!("export_eac: GPU-RESIDENT NVENC(CUDA) path ENGAGED");
+                    match export_eac_gpu_resident(
+                        Arc::clone(&pipeline), cfg.clone(), per_eye.clone(),
+                        ctx, iter, &mut progress_cb, Arc::clone(&cancel),
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => tracing::warn!(
+                            "export_eac: GPU-resident path failed ({e}) — \
+                             falling back to the portable path"
+                        ),
+                    }
+                }
+                (c, i) => tracing::warn!(
+                    "export_eac: GPU-resident unavailable (vulkan_ctx={}, iter_ok={}) — \
+                     falling through to portable path", c.is_some(), i.is_ok()
+                ),
+            }
+        }
+    }
+
     let mut decoder = crate::decode::SegmentedStreamPairIter::new(
         &cfg.segments, crate::decode::HwDecode::Auto, 0)?;
     let dims = decoder.dims();
@@ -1546,6 +1593,220 @@ fn export_eac_zerocopy_vt(
         &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm,
     )?;
     tracing::info!("export_eac (zc): done, {} frames in {:.2?}", written, t_start.elapsed());
+    Ok(())
+}
+
+/// Windows GPU-resident EAC export — the GoPro `.360` analog of
+/// [`export_fisheye_osv_gpu_resident`], with the EAC per-frame core of the
+/// macOS [`export_eac_zerocopy_vt`]. NVDEC decodes both EAC HEVC streams;
+/// D3D11 converts each P010→RGBA16; wgpu assembles the two lens crosses
+/// (`rgba16_to_eac_cross`), projects each eye (equirect or normalized
+/// fisheye, with the GUI-computed stab/RS + view-adjust), runs the color
+/// stack, and composes a video-range P010 SBS fed to NVENC over CUDA — no
+/// CPU readback, no swscale, no CPU `assemble_lens_*`.
+///
+/// `per_eye[absolute_frame_idx]` carries the precomputed per-frame
+/// `(rotation, RS)` (built by the GUI, same as the portable path). The
+/// absolute frame index is derived from each pair's pts, so the keyframe
+/// run-in after a trim seek stays aligned. Any failure returns `Err` so
+/// `export_eac` falls back to the portable path.
+///
+/// 10-bit only (the gate requires `bit_depth == 10`): the source's 10 bits
+/// survive end to end (P010 → Rgba16 cross → Rgba16 project → P010 encode),
+/// matching the macOS VT 10-bit arm. 8-bit output / libx265 / multi-segment
+/// take the portable path.
+#[cfg(target_os = "windows")]
+fn export_eac_gpu_resident(
+    pipeline: Arc<Device>,
+    cfg: FisheyeExportConfig,
+    per_eye: Vec<EacPerEyeFrame>,
+    ctx: crate::interop_windows::VulkanImportCtx,
+    iter: crate::fisheye_decode::SegmentedD3d11SharedStreamPairIter,
+    progress_cb: &mut impl FnMut(ExportProgress),
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    use crate::nvenc_cuda::{CudaNvencEncoder, SharedP010Frame};
+    use crate::gpu::Lens;
+    use crate::fisheye_decode::SharedEacPair;
+
+    // Bind the device-0 primary CUDA context to THIS thread; ffmpeg's CUDA
+    // hwdevice + our external-memory imports both share it.
+    let _cuda = cudarc::driver::CudaDevice::new(0)
+        .map_err(|e| Error::Ffmpeg(format!("cuda primary ctx: {e:?}")))?;
+
+    let dims = iter.dims();
+    let (nw, nh) = iter.native_dims();
+    let sbs_w = cfg.eye_w * 2;
+    let sbs_h = cfg.eye_h;
+    let fisheye_out = matches!(cfg.projection, FisheyeExportProjection::Fisheye);
+    tracing::info!(
+        "export_eac (GPU-resident): EAC native {}x{} (cross_w={}) → {}x{} SBS → NVENC(CUDA), proj={:?}",
+        nw, nh, dims.cross_w(), sbs_w, sbs_h, cfg.projection
+    );
+
+    let dt = 1.0 / cfg.fps as f64;
+    let t_in = cfg.trim_in_s.unwrap_or(0.0).max(0.0);
+    let t_out = cfg.trim_out_s.map(|t| t.max(t_in + 1e-3)).unwrap_or(f64::INFINITY);
+    let trim_in_frame = (t_in * cfg.fps as f64).round() as u32;
+    let total_frames_to_write = if t_out.is_finite() {
+        ((t_out - t_in) * cfg.fps as f64).round() as u64
+    } else {
+        (per_eye.len() as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
+    };
+
+    let mut iter = iter;
+    if t_in > 0.001 { iter.seek(t_in)?; }
+
+    let video_tmp = video_only_temp_path(&cfg.output_path);
+    // Ring of shared P010 frames — main composes frame N+k while the encode
+    // thread feeds NVENC frame N. (Identical pacing to the OSV path.)
+    const RING: usize = 4;
+    let ring: Vec<SharedP010Frame> = (0..RING)
+        .map(|_| SharedP010Frame::new(&ctx, &pipeline.device, sbs_w, sbs_h))
+        .collect::<Result<Vec<_>>>()?;
+    tracing::info!("export_eac (GPU-resident): {RING}-slot shared P010 ring ready");
+
+    struct EncMsg { y_ptr: u64, y_pitch: usize, uv_ptr: u64, uv_pitch: usize }
+    let (enc_tx, enc_rx) = std::sync::mpsc::sync_channel::<EncMsg>(RING - 2);
+    let (efps, ebr, etmp) = (cfg.fps, cfg.bitrate_kbps, video_tmp.clone());
+    let encode_handle = std::thread::spawn(move || -> Result<u64> {
+        let _cuda = cudarc::driver::CudaDevice::new(0)
+            .map_err(|e| Error::Ffmpeg(format!("encode-thread cuda ctx: {e:?}")))?;
+        let mut encoder = CudaNvencEncoder::new(&etmp, sbs_w, sbs_h, efps, ebr)?;
+        let mut n: u64 = 0;
+        while let Ok(m) = enc_rx.recv() {
+            unsafe { encoder.encode_cuda_planes(m.y_ptr, m.y_pitch, m.uv_ptr, m.uv_pitch)?; }
+            n += 1;
+        }
+        encoder.finish()?;
+        Ok(n)
+    });
+    tracing::info!("export_eac (GPU-resident): NVENC(CUDA) encode thread up");
+
+    let color_plan = cfg.color_stack.clone();
+    let view = cfg.view_adjust;
+    let view_active = !view.is_identity();
+    let (v_l, v_r) = view.per_eye_matrices();
+
+    // Decode sub-thread (D3D11/NVDEC only — never touches CUDA/wgpu), so the
+    // ~10 ms dual-stream decode overlaps the GPU compose + NVENC on this thread.
+    let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<SharedEacPair>(3);
+    let cancel_dec = cancel.clone();
+    let decode_handle = std::thread::spawn(move || {
+        loop {
+            if cancel_dec.load(Ordering::SeqCst) { break; }
+            match iter.next_pair() {
+                Ok(Some(p)) => { if pair_tx.send(p).is_err() { break; } }
+                Ok(None) => break,
+                Err(e) => { tracing::warn!("gpu-resident EAC decode: {e}"); break; }
+            }
+        }
+    });
+
+    let t_start = std::time::Instant::now();
+    let mut written: u64 = 0;
+
+    loop {
+        let sp = match pair_rx.recv() { Ok(s) => s, Err(_) => break };
+        if cancel.load(Ordering::SeqCst) { break; }
+        if sp.pts_s.is_finite() && sp.pts_s >= t_out { break; }
+        // Drop the keyframe run-in (pts before trim-in).
+        if sp.pts_s.is_finite() && sp.pts_s < t_in - 0.5 * dt { continue; }
+
+        // Absolute source frame index → per-eye stab/RS lookup (identity
+        // past the end / when stabilization is off and per_eye is empty).
+        let abs_idx = if sp.pts_s.is_finite() && sp.pts_s >= 0.0 {
+            (sp.pts_s / dt).round() as usize
+        } else { trim_in_frame as usize + written as usize };
+        let ((mut rl, sl), (mut rr, sr)) = per_eye.get(abs_idx).copied()
+            .unwrap_or((
+                (EquirectRotation::IDENTITY, crate::gpu::EquirectRsParams::DISABLED),
+                (EquirectRotation::IDENTITY, crate::gpu::EquirectRsParams::DISABLED),
+            ));
+        // View-adjust (pano ± stereo) AFTER stab — same convention as the
+        // portable/macOS EAC path. Left eye = Lens B, right eye = Lens A.
+        if view_active {
+            rl = EquirectRotation(crate::panomap::mat3_mul_row_major(&rl.0, &v_l));
+            rr = EquirectRotation(crate::panomap::mat3_mul_row_major(&rr.0, &v_r));
+        }
+
+        // Import both streams (RGBA16, native res) + assemble the two lens
+        // crosses on the GPU (16-bit, so the 10 bits survive).
+        let s0_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.s0) };
+        let s4_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.s4) };
+        let cross_a = pipeline.rgba16_to_eac_cross(&s0_tex, &s4_tex, Lens::A, dims)?;
+        let cross_b = pipeline.rgba16_to_eac_cross(&s0_tex, &s4_tex, Lens::B, dims)?;
+
+        let (left16, right16) = if fisheye_out {
+            (pipeline.project_cross_texture_to_fisheye_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl)?,
+             pipeline.project_cross_texture_to_fisheye_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr)?)
+        } else {
+            (pipeline.project_cross_texture_to_equirect_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl)?,
+             pipeline.project_cross_texture_to_equirect_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr)?)
+        };
+        let left_g = pipeline.apply_color_stack_per_eye_16(&left16, cfg.eye_w, cfg.eye_h, &color_plan)?;
+        let right_g = pipeline.apply_color_stack_per_eye_16(&right16, cfg.eye_w, cfg.eye_h, &color_plan)?;
+        let l_final = left_g.as_ref().unwrap_or(&left16);
+        let r_final = right_g.as_ref().unwrap_or(&right16);
+
+        // Compose video-range Rec.709 P010 plane textures (AVCOL_RANGE_MPEG —
+        // the distribution standard, consistent with the portable path), then
+        // copy into this ring slot's CUDA-shared linear images.
+        let sh = &ring[written as usize % RING];
+        let (y_opt, uv_opt) = pipeline.compose_sbs_to_p010_textures(l_final, r_final, cfg.eye_w, cfg.eye_h, false)?;
+        {
+            let mut enc = pipeline.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpu_resident_eac_copy_to_shared"),
+            });
+            let copy = |enc: &mut wgpu::CommandEncoder, src: &wgpu::Texture, dst: &wgpu::Texture, w: u32, h: u32| {
+                enc.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo { texture: src, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyTextureInfo { texture: dst, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+            };
+            copy(&mut enc, &y_opt, sh.y_texture(), sbs_w, sbs_h);
+            copy(&mut enc, &uv_opt, sh.uv_texture(), sbs_w / 2, sbs_h / 2);
+            pipeline.queue.submit(Some(enc.finish()));
+        }
+        let _ = pipeline.device.poll(wgpu::PollType::wait_indefinitely());
+
+        // Hand the (Copy) CUDA plane pointers to the encode thread.
+        let (y_ptr, y_pitch) = sh.y_cuda();
+        let (uv_ptr, uv_pitch) = sh.uv_cuda();
+        if enc_tx.send(EncMsg { y_ptr, y_pitch, uv_ptr, uv_pitch }).is_err() {
+            break; // encode thread died — surfaced at join
+        }
+
+        drop(sp);
+        written += 1;
+        progress_cb(ExportProgress {
+            frame_idx: written,
+            total_frames: total_frames_to_write,
+            fps_avg: written as f32 / t_start.elapsed().as_secs_f32().max(1e-3),
+        });
+    }
+
+    drop(pair_rx);
+    let _ = decode_handle.join();
+    drop(enc_tx); // end the encode thread's recv loop → flush + finish
+    let enc_result = encode_handle.join();
+    drop(ring);   // free shared frames only AFTER the encoder is done reading
+    match enc_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(Error::Ffmpeg("gpu-resident EAC encode thread panicked".into())),
+    }
+    // Audio + metadata: same finalize as the portable EAC path (handles the
+    // GoPro ambisonic / APAC tracks + multi-segment ffconcat).
+    finalize_eac_audio(&cfg, &video_tmp, trim_in_frame as f64 * dt, written as f64 * dt)?;
+    finalize_metadata(
+        &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm,
+    )?;
+    tracing::info!(
+        "export_eac (GPU-resident): done, {} frames in {:.2?} ({:.1} fps)",
+        written, t_start.elapsed(), written as f32 / t_start.elapsed().as_secs_f32().max(1e-3)
+    );
     Ok(())
 }
 

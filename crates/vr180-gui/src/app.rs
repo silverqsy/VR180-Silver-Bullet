@@ -579,9 +579,12 @@ fn install_cjk_font(ctx: &egui::Context) {
     let mut fd = egui::FontData::from_owned(bytes);
     fd.index = index;
     // CJK faces sit lower than egui's Latin baseline (more descent), so mixed
-    // rows look misaligned — nudge the glyphs up to centre them on the row.
+    // rows look misaligned. The needed nudge is font-specific: macOS PingFang
+    // centres at 0.24, but Windows' Microsoft YaHei (msyh) is already aligned
+    // there — 0.24 pushes 中文 too low. Windows → 0; macOS untouched.
+    let y_offset_factor = if cfg!(target_os = "windows") { 0.0 } else { 0.24 };
     fd.tweak = egui::FontTweak {
-        y_offset_factor: 0.24,
+        y_offset_factor,
         ..Default::default()
     };
     fonts.font_data.insert("cjk".to_owned(), std::sync::Arc::new(fd));
@@ -1359,6 +1362,10 @@ impl App {
             if !is_loaded_clip {
                 settings.dji_imu_phase_ms =
                     vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(probe.fps);
+                // RS mode + readout are per-clip — start at the firmware default
+                // (not carried from the saved per-kind template).
+                settings.rs_mode = crate::decoder::default_rs_mode();
+                settings.rs_readout_ms = crate::decoder::default_rs_readout_ms();
                 settings.trim_in_s = None;
                 settings.trim_out_s = None;
             }
@@ -1396,10 +1403,14 @@ impl App {
         if item.status == BatchStatus::Running { return; }
         let keep_trim = (item.settings.trim_in_s, item.settings.trim_out_s);
         let keep_phase = item.settings.dji_imu_phase_ms;
+        let keep_rs = (item.settings.rs_mode, item.settings.rs_readout_ms);
         item.settings = self.settings.clone();
         item.settings.trim_in_s = keep_trim.0;
         item.settings.trim_out_s = keep_trim.1;
         item.settings.dji_imu_phase_ms = keep_phase;
+        // RS mode + readout are per-clip — keep this item's own, don't copy mine.
+        item.settings.rs_mode = keep_rs.0;
+        item.settings.rs_readout_ms = keep_rs.1;
         // Re-arm a previously finished item so the change exports on the
         // next Start.
         if !matches!(item.status, BatchStatus::Queued) {
@@ -2145,6 +2156,11 @@ impl App {
         if !preserve_clip_settings {
             let imu_phase = vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(probe.fps);
             self.settings.dji_imu_phase_ms = imu_phase;
+            // RS mode + readout are per-clip — reset to the firmware default on
+            // each fresh load so a prior clip's tweak never carries over (same
+            // lifecycle as the IMU phase above).
+            self.settings.rs_mode = crate::decoder::default_rs_mode();
+            self.settings.rs_readout_ms = crate::decoder::default_rs_readout_ms();
         }
         vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(self.settings.dji_imu_phase_ms);
 
@@ -3617,8 +3633,8 @@ impl App {
                         ui.selectable_value(&mut s.rs_mode, R::NoFirmware, tr("no-firmware"));
                     });
             });
-            ui.add(egui::Slider::new(&mut s.rs_readout_ms, 5.0..=33.0)
-                .text(tr("SROT (ms)")).fixed_decimals(3));
+            // SROT readout is fixed at the GoPro firmware value (15.224 ms),
+            // re-seeded per clip — no manual override needed, slider hidden.
         });
     }
 
@@ -3853,13 +3869,10 @@ impl App {
                 ui.add(egui::Slider::new(&mut s.dji_responsiveness, 0.2..=3.0)
                     .fixed_decimals(1)
                     .text(tr("Response")));
-                // IMU sample-timing test knob (see dji_imu.rs). Defaults to
-                // SROT/2 (readout midpoint), re-seeded per file and NOT
-                // persisted. Feeds stab + rolling-shutter timing.
-                ui.add(egui::Slider::new(&mut s.dji_imu_phase_ms, 0.0..=17.0)
-                    .step_by(0.001)
-                    .fixed_decimals(3)
-                    .text(tr("IMU phase (ms)")));
+                // IMU sample timing is fixed at SROT/2 (readout midpoint),
+                // re-seeded per clip from its own fps — no manual override, so
+                // the slider is hidden. Still assert the main-thread thread-local
+                // so paused detail-still renders use this clip's phase.
                 vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
             }
         });
