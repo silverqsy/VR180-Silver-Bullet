@@ -1362,9 +1362,10 @@ impl App {
             if !is_loaded_clip {
                 settings.dji_imu_phase_ms =
                     vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(probe.fps);
-                // RS mode + readout are per-clip — start at the firmware default
-                // (not carried from the saved per-kind template).
-                settings.rs_mode = crate::decoder::default_rs_mode();
+                // RS mode + readout are per-clip — auto-detect firmware vs
+                // no-firmware RS from the GoPro CORI stream (the toggle still
+                // overrides). Non-EAC sources fall back to the default.
+                settings.rs_mode = crate::decoder::detect_rs_mode_for_path(&path, source_kind);
                 settings.rs_readout_ms = crate::decoder::default_rs_readout_ms();
                 settings.trim_in_s = None;
                 settings.trim_out_s = None;
@@ -2067,7 +2068,7 @@ impl App {
         let dims = vr180_core::eac::Dims::new(probe.width, probe.height);
 
         // GoPro family: parse GPMF + GEOC for metadata display.
-        let (cori_count, grav_count, srot_ms) = if source_kind == vr180_pipeline::SourceKind::GoProEac {
+        let (cori_count, grav_count, srot_ms, detected_rs_mode) = if source_kind == vr180_pipeline::SourceKind::GoProEac {
             match vr180_pipeline::decode::extract_gpmf_stream(&path) {
                 Ok(gpmf) => {
                     let cori = vr180_core::gyro::parse_cori(&gpmf);
@@ -2077,12 +2078,13 @@ impl App {
                             vr180_core::geoc::lookup_srot_s(&path, None)
                                 .ok().flatten().map(|s| s * 1000.0)
                         });
-                    (cori.len(), raw.grav.len(), srot)
+                    let rs_mode = crate::decoder::detect_rs_mode(&cori);
+                    (cori.len(), raw.grav.len(), srot, rs_mode)
                 }
-                Err(_) => (0, 0, None),
+                Err(_) => (0, 0, None, crate::decoder::default_rs_mode()),
             }
         } else {
-            (0, 0, None)
+            (0, 0, None, crate::decoder::default_rs_mode())
         };
 
         // Fisheye family: compute one-eye dimensions for FOV slider hints.
@@ -2156,10 +2158,11 @@ impl App {
         if !preserve_clip_settings {
             let imu_phase = vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(probe.fps);
             self.settings.dji_imu_phase_ms = imu_phase;
-            // RS mode + readout are per-clip — reset to the firmware default on
-            // each fresh load so a prior clip's tweak never carries over (same
-            // lifecycle as the IMU phase above).
-            self.settings.rs_mode = crate::decoder::default_rs_mode();
+            // RS mode + readout are per-clip — auto-detected from the CORI
+            // stream above (firmware vs no-firmware), re-seeded on each fresh
+            // load so a prior clip's tweak never carries over (same lifecycle
+            // as the IMU phase above). The UI toggle still overrides it.
+            self.settings.rs_mode = detected_rs_mode;
             self.settings.rs_readout_ms = crate::decoder::default_rs_readout_ms();
         }
         vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(self.settings.dji_imu_phase_ms);

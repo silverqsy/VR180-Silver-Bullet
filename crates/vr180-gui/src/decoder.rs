@@ -33,11 +33,14 @@ use vr180_pipeline::gpu::ColorStackPlan;
 
 #[cfg(target_os = "macos")]
 use vr180_pipeline::{decode::ZeroCopyStreamPairIter, gpu::Lens};
+// `run_cpu_assemble` (the cross-platform CPU EAC fallback) is compiled on
+// every platform, so the symbols it references must be in scope everywhere —
+// not only on non-macOS (macOS just never reaches it at runtime).
+use vr180_core::eac::{assemble_lens_a, assemble_lens_b};
+use vr180_pipeline::decode::HwDecode;
 #[cfg(not(target_os = "macos"))]
-use {
-    vr180_core::eac::{assemble_lens_a, assemble_lens_b},
-    vr180_pipeline::decode::{iter_stream_pairs, HwDecode},
-};
+#[allow(unused_imports)]
+use vr180_pipeline::decode::iter_stream_pairs;
 
 /// Serde default + pre-file-load seed for the (non-persisted) IMU-phase
 /// slider: SROT/2 at 30 fps (9.15 ms). Refreshed to the actual clip fps in
@@ -52,6 +55,71 @@ fn default_dji_imu_phase_ms() -> f32 {
 /// stays a persisted preference.) 15.224 ms is the GoPro Max firmware SROT.
 pub(crate) fn default_rs_mode() -> RsMode { RsMode::Firmware }
 pub(crate) fn default_rs_readout_ms() -> f32 { 15.224 }
+
+/// Firmware-RS detector from the GoPro CORI stream — the signal that tells a
+/// firmware-stabilised clip from a no-firmware one.
+///
+/// A no-firmware clip's CORI is raw gyro integration starting from an
+/// assumed-identity orientation, so `cori[0]` ≈ exact identity (the real
+/// physical tilt lives in GRAV, not CORI) and only drifts later from gyro
+/// bias. A firmware-RS clip's `cori[0]` already carries a real initial
+/// orientation because the in-camera EIS/RS pipeline ran. This is the SAME
+/// signal `CoriSource::Auto` keys on — verified on the test set: no-firmware
+/// `cori[0]` xyz≈6e-5 vs firmware ≥2.5e-3 (threshold 5e-4).
+///
+/// Returns `true` when the firmware pipeline was OFF. Empty CORI counts as
+/// "off" to mirror the `CoriSource::Auto` routing; callers that want a
+/// no-signal fallback guard on `cori.len()` first (see [`detect_rs_mode`]).
+pub(crate) fn cori_indicates_no_firmware(cori: &[vr180_core::gyro::Quat]) -> bool {
+    let head = &cori[..cori.len().min(10)];
+    let cori_is_zero = head.iter().all(|q|
+        q.w.abs() < 0.01 && q.x.abs() < 0.01
+            && q.y.abs() < 0.01 && q.z.abs() < 0.01);
+    let cori_is_bias_drift = !cori_is_zero
+        && cori.len() > 30
+        && {
+            let q0 = cori[0];
+            q0.x.abs().max(q0.y.abs()).max(q0.z.abs()) < 0.0005
+        };
+    cori_is_zero || cori_is_bias_drift
+}
+
+/// Auto-seed the per-clip RS mode from the CORI stream. Needs a real CORI
+/// stream (≥30 samples) to trust the signal; otherwise keeps the firmware
+/// default (matches prior behaviour for files without usable gyro). The UI
+/// toggle still overrides this seed.
+pub(crate) fn detect_rs_mode(cori: &[vr180_core::gyro::Quat]) -> RsMode {
+    if cori.len() < 30 {
+        return default_rs_mode();
+    }
+    let mode = if cori_indicates_no_firmware(cori) {
+        RsMode::NoFirmware
+    } else {
+        RsMode::Firmware
+    };
+    let q0 = cori[0];
+    tracing::info!(
+        "rs_mode auto-detect: cori[0] xyz_max={:.2e} over {} samples → {}",
+        q0.x.abs().max(q0.y.abs()).max(q0.z.abs()), cori.len(), mode.as_str()
+    );
+    mode
+}
+
+/// Path-based convenience for the batch-add path (no CORI parsed yet). Only
+/// GoPro `.360` (EAC) has the firmware-RS distinction; every other source
+/// keeps the firmware default.
+pub(crate) fn detect_rs_mode_for_path(
+    path: &std::path::Path,
+    kind: vr180_pipeline::SourceKind,
+) -> RsMode {
+    if kind != vr180_pipeline::SourceKind::GoProEac {
+        return default_rs_mode();
+    }
+    match vr180_pipeline::decode::extract_gpmf_stream(path) {
+        Ok(gpmf) => detect_rs_mode(&vr180_core::gyro::parse_cori(&gpmf)),
+        Err(_) => default_rs_mode(),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -3916,19 +3984,7 @@ pub(crate) fn build_per_eye_frames_multi(
             // real regression — it sent no-firmware GS010192 to drifty CORI
             // instead of VQF, which (with the MNOR-frame fix) now matches the
             // Python app to ~0.1°.
-            CoriSource::Auto => {
-                let head = &cori[..cori.len().min(10)];
-                let cori_is_zero = head.iter().all(|q|
-                    q.w.abs() < 0.01 && q.x.abs() < 0.01
-                        && q.y.abs() < 0.01 && q.z.abs() < 0.01);
-                let cori_is_bias_drift = !cori_is_zero
-                    && cori.len() > 30
-                    && {
-                        let q0 = cori[0];
-                        q0.x.abs().max(q0.y.abs()).max(q0.z.abs()) < 0.0005
-                    };
-                cori_is_zero || cori_is_bias_drift
-            }
+            CoriSource::Auto => cori_indicates_no_firmware(&cori),
         };
         if want_vqf {
             cori = if is_multi {
