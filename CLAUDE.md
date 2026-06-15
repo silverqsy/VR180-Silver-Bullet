@@ -3,15 +3,37 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: macOS feature batch done — Windows build + verify handoff
+## ⚡ Status: 2.0 — feature-complete on macOS + Windows
 
-(The previous handoff — Windows GPU-resident NVENC export + the egui-0.34
-gamma fix — is **verified on macOS** and landed.) Since then a large batch
-of features was developed and verified **on macOS**; the Windows session
-should pull `2.0`, build, and verify them on DX12/Vulkan + NVENC. All of it
-is cross-platform code (shared Rust + WGSL — the RGBA16 Windows variants are
-format-patched from the same WGSL sources at pipeline creation), so expect
-it to Just Work; the checklist is what to *confirm*, not to port:
+VR180 Silver Bullet **2.0** is feature-complete and building/running on both
+**macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
+NVENC path and the macOS feature batch below were verified on both platforms
+(DX12/Vulkan + NVENC on an RTX 4090; Metal on Apple Silicon). See
+[CHANGELOG.md](CHANGELOG.md) for the user-facing 2.0 summary.
+
+**Most recent batch (developed on macOS, then merged with the Windows EAC work):**
+- **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
+  Swift helper); GPU-resident zero-copy P010 for OSV **and** `.360`/EAC. The
+  output P010 range must match the source range (full for `.360`, video for
+  OSV) or you get a uniform brightness shift. See `vt_denoise.rs`.
+- **Unified export/batch UX** — a single export is a batch-of-one; one queue
+  runner + one `ExportOptions`; a persistent bottom export bar
+  (`draw_export_bar`) with overall progress + ETA. The separate batch and
+  export-options windows were deleted.
+- **Chinese (中文) localization** — process-global `UI_LANG` + `tr()`/`zh()`
+  table, EN/中文 toggle, bundled CJK system font (macOS `y_offset_factor`
+  0.24; Windows 0.0).
+- **GoPro `.360` firmware-RS auto-detect** — `decoder::detect_rs_mode` seeds
+  the per-clip RS mode from the CORI signal (`cori_indicates_no_firmware`,
+  the same predicate `CoriSource::Auto` uses); the toggle still overrides.
+- **Windows GoPro `.360`** — zero-copy EAC preview + GPU-resident NVENC
+  export (merged Windows work) + an Inno Setup installer.
+
+> ⚠️ Building the WHOLE workspace on macOS fails on `vr180-render` (a legacy
+> CLI on a stale wgpu API) — ignore it, build `-p vr180-gui`.
+
+The macOS feature batch that the Windows session verified (kept as the
+engineering record — the checklist was what to *confirm*, not to port):
 
 1. **DJI lens model is now exact** (reverse-engineered from DJI Studio —
    verified against its export). Auto mode loads the per-lens FACTORY

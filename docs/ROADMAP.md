@@ -1,5 +1,11 @@
 # Roadmap
 
+> **Historical build log.** This is the phased development record of the 2.0
+> rewrite, which has **shipped** — see [CHANGELOG.md](../CHANGELOG.md) for the
+> released feature set and [CLAUDE.md](../CLAUDE.md) for current state. Early
+> phases reference the `vr180-render` CLI, which was superseded by the
+> `vr180-gui` app and is no longer maintained. Kept as the engineering record.
+
 Each phase ends with a commit and a `cargo run -p vr180-render -- …`
 demo that exercises the new capability end-to-end. The numbering
 leaves room for half-step phases (0.6.5, 0.6.6, …) so deferred

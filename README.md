@@ -1,39 +1,56 @@
 # VR180 Silver Bullet 2.0
 
-A native, GPU-first VR180 processor for the **DJI Osmo 360** (`.osv`
-dual-fisheye), written in Rust. One self-contained binary per platform —
-no Python, no bundled runtimes. This is the `2.0` clean-room rewrite of
-the Python/PyQt6 [VR180 Silver Bullet](../vr180_processor/) app.
+A native, GPU-first VR180 processor written in Rust. One self-contained
+binary per platform — no Python, no bundled runtimes, and it never shells
+out to a system `ffmpeg`. This is the `2.0` clean-room rewrite of the
+Python/PyQt6 [VR180 Silver Bullet](../vr180_processor/) app, running
+natively on **macOS (Apple Silicon)** and **Windows (NVIDIA)**.
 
-## What it does
+Load a clip → preview with live controls → export VR180 SBS.
 
-Load a `.osv` → preview with live controls → export VR180 SBS.
+## Supported cameras & formats
 
-- **Exact DJI lens dewarp** — loads the per-lens factory calibration from
-  the OSV itself (fx/fy, principal point, 5-coefficient Kannala-Brandt
-  radial + Brown-Conrady tangential — the full model DJI Studio uses,
-  reverse-engineered and bit-matched). Per-eye manual override with
-  file-seeded sliders when you want to hand-tune.
+| Source | Notes |
+|---|---|
+| **DJI Osmo 360** — `.osv` | Primary path. Dual-stream fisheye, exact factory lens dewarp from the file. |
+| **GoPro Max** — `.360` | EAC dual-fisheye. Zero-copy GPU decode, firmware-RS auto-detect, noise reduction. |
+| **SBS fisheye** — `.mp4` / `.mov` | Insta360, Vuze XR, QooCam, Canon RF dual-fisheye, generic dual-camera rigs. |
+| **Blackmagic RAW** — `.braw` | Pyxis 12K, URSA Cine Immersive (VQF 6D stabilization). |
+
+## Features
+
+- **Exact lens dewarp** — for the DJI Osmo 360, loads the per-lens factory
+  calibration straight from the `.osv` (fx/fy, principal point, 5-coefficient
+  Kannala-Brandt radial + Brown-Conrady tangential — the full model DJI
+  Studio uses, reverse-engineered and bit-matched). Per-eye manual override
+  with file-seeded sliders when you want to hand-tune.
 - **Stabilization from the camera IMU** — camera-lock or velocity-dampened
-  soft-stab (Gyroflow-style: adaptive smoothing that relaxes ahead of fast
-  motion, soft elastic correction limit), plus per-scanline rolling-shutter
-  correction using measured sensor-readout timing (18.301 ms @ 30 fps,
-  16.228 ms @ 50 fps).
+  soft-stab (Gyroflow-style adaptive smoothing that relaxes ahead of fast
+  motion, soft elastic correction limit, **Response** slider), plus
+  per-scanline rolling-shutter correction from measured sensor-readout
+  timing. For GoPro `.360`, **firmware rolling-shutter is auto-detected**
+  from the CORI stream (firmware vs no-firmware), with a manual override.
 - **Color pipeline, 10-bit end-to-end** — CDL, 3D LUT (DJI D-LogM→Rec.709
-  bundled, autoloaded), white balance, saturation, sharpen, mid-detail;
-  identical stack in preview and export.
+  bundled and autoloaded), white balance, saturation, sharpen, mid-detail;
+  the identical stack runs in preview and export.
+- **Noise reduction** — temporal NR via Apple VideoToolbox
+  (`VTTemporalNoiseFilter`), run **in-process** (objc2 FFI, no helper
+  binary), fully 10-bit and GPU-resident zero-copy. Export-only; macOS-only
+  (auto-hidden on Windows / unsupported hardware).
 - **Output projections** — half-equirect VR180 SBS (the standard), or a
   normalized **195° equidistant fisheye** SBS.
 - **Export** — H.265 (VideoToolbox on macOS; GPU-resident NVDEC→wgpu→CUDA→
-  NVENC on Windows, libx265 fallback) or ProRes, at native resolution or
-  8192×4096, with Vision Pro (APMP) or YouTube VR180 metadata injection
+  NVENC on Windows, with a libx265 software fallback) or ProRes, at native
+  resolution or **8192×4096 (8K)**, with **Vision Pro (APMP)** or **YouTube
+  VR180** metadata injection, **APAC spatial** / ambisonic / stereo audio,
   and OSV stereo-audio passthrough.
-- **Preview niceties** — SBS / anaglyph / 50%-overlay / single-eye view
-  modes, zoom magnifier with native-res still, per-eye view adjustment
-  (pano + stereo offset), upside-down-mount support, audio.
-
-Also reads SBS fisheye, Blackmagic `.braw` (VQF 6D stab), and GoPro Max
-`.360` (EAC) as a legacy path.
+- **Batch + unified export** — load many clips, tune each independently,
+  then export all (or a checked subset) through one queue with a persistent
+  progress + ETA bar and a completion notification.
+- **Preview** — SBS / anaglyph / 50%-overlay / single-eye view modes, zoom
+  magnifier with a native-resolution still, per-eye view adjustment (pano +
+  stereo offset), upside-down-mount support, audio playback.
+- **Localized UI** — English / 简体中文, live toggle.
 
 ## Workspace layout
 
@@ -45,14 +62,16 @@ crates/
 │                    # OSV protobuf parse, Gyroflow profile import)
 ├── vr180-pipeline/  # the engine: decode (ffmpeg-next 8.1, in-process),
 │                    # wgpu compute kernels (WGSL), DJI IMU stab + RS,
-│                    # export pipeline, encoders, mp4 atom injection
+│                    # in-process VT noise reduction, export pipeline,
+│                    # encoders, mp4 atom injection
 ├── vr180-gui/       # the product: eframe/egui app (vr180-gui binary)
 └── vr180-render/    # legacy CLI (currently not building; ignore)
 
-helpers/swift/       # macOS AVFoundation helpers (MV-HEVC spatial video,
-                     # APAC spatial audio, VT denoise) — spawned as
-                     # external processes when used
-docs/                # build + architecture + Windows handoff docs
+helpers/swift/       # macOS APAC spatial-audio helper (spawned only when
+                     # exporting Vision Pro spatial audio). Noise reduction
+                     # and decode/encode are all in-process now.
+docs/                # build + architecture + Windows notes
+installer/           # Windows Inno Setup script
 ```
 
 GPU work is `wgpu` everywhere (Metal / DX12 / Vulkan picked at runtime);
@@ -62,7 +81,7 @@ app never shells out to a system `ffmpeg`.
 ## Build & run
 
 ```sh
-# macOS
+# macOS (Apple Silicon)
 brew install ffmpeg pkg-config
 cargo build --release -p vr180-gui
 ./target/release/vr180-gui
@@ -76,18 +95,24 @@ cargo build --release -p vr180-gui
 $env:PATH = "$env:FFMPEG_DIR\bin;$env:PATH"; .\target\release\vr180-gui.exe
 ```
 
-Build `-p vr180-gui` (not the whole workspace). First build takes a few
-minutes (ffmpeg-sys bindgen); incrementals are seconds.
+Build `-p vr180-gui` (not the whole workspace — `vr180-render` is a legacy
+CLI that intentionally isn't kept building). First build takes a few minutes
+(ffmpeg-sys bindgen); incrementals are seconds.
+
+A signed/notarized macOS app bundle and a Windows installer are produced for
+releases — see [docs/BUILD.md](docs/BUILD.md) and
+[installer/windows.iss](installer/windows.iss).
 
 ## Docs
 
 - [CLAUDE.md](CLAUDE.md) — current status + the load-bearing engineering
-  decisions (start here)
+  decisions (start here if you're working on the code)
+- [CHANGELOG.md](CHANGELOG.md) — what's in 2.0.0
 - [docs/WINDOWS_BUILD.md](docs/WINDOWS_BUILD.md) — Windows toolchain setup
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — crate boundaries, GPU
   pipeline shape
-- [docs/BUILD.md](docs/BUILD.md) — FFmpeg / `FFMPEG_DIR` details
-- [docs/ROADMAP.md](docs/ROADMAP.md) — historical phased plan
+- [docs/BUILD.md](docs/BUILD.md) — FFmpeg / `FFMPEG_DIR` details, packaging
+- [docs/ROADMAP.md](docs/ROADMAP.md) — historical phased build log
 
 ## License
 
