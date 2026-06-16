@@ -26,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 /// running window, so we set it explicitly here too. Returns `None` (the app
 /// still launches, just without an icon) rather than panicking if the bundled
 /// asset can't be decoded.
+#[cfg(not(target_os = "macos"))]
 fn load_app_icon() -> Option<egui::IconData> {
     let bytes = include_bytes!("../../../assets/icon.ico");
     let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
@@ -67,11 +68,17 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    #[cfg_attr(target_os = "macos", allow(unused_mut))]
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("VR180 Silver Bullet 2.0")
         .with_inner_size([1480.0, 920.0])
         .with_min_inner_size([1100.0, 720.0])
         .with_drag_and_drop(true);
+    // macOS takes the Dock/window icon from the `.app` bundle's `icon.icns`
+    // (Info.plist → CFBundleIconFile). Setting a runtime icon there overrides
+    // the bundle icon with the raw image — the wrong icon while running — so
+    // only set it on Windows/Linux, which have no bundle to carry it.
+    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
