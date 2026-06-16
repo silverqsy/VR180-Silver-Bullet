@@ -32,6 +32,9 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayName=VR180 Silver Bullet 2.0
+; Installer wizard icon + Add/Remove Programs icon (shared app artwork).
+SetupIconFile=..\assets\icon.ico
+UninstallDisplayIcon={app}\vr180-gui.exe
 LicenseFile=
 
 [Tasks]

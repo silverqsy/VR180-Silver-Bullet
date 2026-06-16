@@ -19,6 +19,20 @@ mod decoder;
 
 use tracing_subscriber::EnvFilter;
 
+/// Decode the bundled `.ico` into an egui window icon (its largest frame) for
+/// the live window — title bar + taskbar while the app is running. The .exe's
+/// *file* icon (Explorer, the installer's shortcut) is a separate build-time
+/// Win32 resource (see `build.rs`); winit doesn't reliably adopt that for the
+/// running window, so we set it explicitly here too. Returns `None` (the app
+/// still launches, just without an icon) rather than panicking if the bundled
+/// asset can't be decoded.
+fn load_app_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../../../assets/icon.ico");
+    let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Some(egui::IconData { rgba: rgba.into_raw(), width, height })
+}
+
 fn main() -> anyhow::Result<()> {
     // Logs go to `<data dir>/vr180-gui.log` (truncated each launch) so the
     // release GUI-subsystem build — which has no console — still leaves a
@@ -53,12 +67,17 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("VR180 Silver Bullet 2.0")
+        .with_inner_size([1480.0, 920.0])
+        .with_min_inner_size([1100.0, 720.0])
+        .with_drag_and_drop(true);
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("VR180 Silver Bullet 2.0")
-            .with_inner_size([1480.0, 920.0])
-            .with_min_inner_size([1100.0, 720.0])
-            .with_drag_and_drop(true),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         // 10-bit P010 IOSurfaces need TEXTURE_FORMAT_16BIT_NORM. We
         // request it on the wgpu device eframe creates for us so the

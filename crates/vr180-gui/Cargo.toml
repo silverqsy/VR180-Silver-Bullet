@@ -24,6 +24,11 @@ wgpu = { workspace = true }
 # Native file picker.
 rfd = "0.14"
 
+# Decode the bundled .ico for the live window icon (title bar + taskbar).
+# `ico` pulls in the png/bmp sub-decoders the icon frames use. The .exe's
+# *file* icon is embedded separately at build time (see build.rs).
+image = { version = "0.25", default-features = false, features = ["ico"] }
+
 # Threading + sync.
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
@@ -50,3 +55,8 @@ vr180-core = { workspace = true }
 vr180-pipeline = { workspace = true }
 vr180-fisheye = { workspace = true }
 vr180-braw = { workspace = true }
+
+# Embed the app icon into the Windows .exe as a Win32 resource (see build.rs).
+# Windows host only — macOS uses the .icns app bundle and never builds this.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
