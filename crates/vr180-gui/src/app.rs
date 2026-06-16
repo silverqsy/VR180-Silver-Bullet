@@ -493,6 +493,7 @@ fn tr(en: &'static str) -> &'static str {
         "Pitch (°)" => "俯仰 (°)",
         "Roll (°)" => "翻滚 (°)",
         "Stereo offset (right = +, left = −)" => "立体偏移（右 = +，左 = −）",
+        "Tip: select a field and press ↑ / ↓ to step its value precisely." => "提示：选中字段后按 ↑ / ↓ 键可精细微调数值。",
         "Reset to 0" => "重置为 0",
         // Fisheye output / stab / lens
         "Format" => "格式",
@@ -3829,6 +3830,8 @@ impl App {
         fine_slider(ui, zoom, &mut s.stereo_yaw_deg, -10.0..=10.0, tr("Yaw (°)"), 3, rot_fine, stereo_key_step);
         fine_slider(ui, zoom, &mut s.stereo_pitch_deg, -10.0..=10.0, tr("Pitch (°)"), 3, rot_fine, stereo_key_step);
         fine_slider(ui, zoom, &mut s.stereo_roll_deg, -10.0..=10.0, tr("Roll (°)"), 3, rot_fine, stereo_key_step);
+        ui.label(RichText::new(tr("Tip: select a field and press ↑ / ↓ to step its value precisely."))
+            .small().color(Color32::from_rgb(130, 150, 175)));
         ui.add_space(4.0);
         if ui.button(tr("Reset to 0")).clicked() {
             s.pano_yaw_deg = 0.0;

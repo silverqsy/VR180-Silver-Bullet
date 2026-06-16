@@ -65,15 +65,23 @@ Load a clip → preview with live controls → export VR180 SBS.
 
 1. **Load** — drag a `.osv` (DJI Osmo 360) or `.360` (GoPro Max) onto the
    window, or click **Load video**. Drop several to build a batch.
-2. **Preview & adjust** — press play and scrub; every control applies live:
+2. **Preview & adjust** — press play and scrub; every control applies live.
+   - **Align the stereo first** — scrub to a part of the clip with a
+     **far-away subject**, switch the **view** to **50% overlay** or
+     **anaglyph**, and adjust the **stereo offset** (in *View adjustment*)
+     until that distant subject's two eyes line up. Do this before grading
+     or stabilizing.
+
+     > **Tip:** with a numeric field selected, press **↑ / ↓** to step its
+     > value precisely.
    - **Color** — CDL, 3D LUT (the DJI D-LogM→Rec.709 LUT autoloads for OSV),
      white balance, saturation, sharpen.
    - **Stabilization** + **Rolling shutter** — camera-lock or velocity-
      dampened soft-stab (tune the **Response** slider); RS mode auto-detects
      for `.360`.
    - **Noise Reduction** — temporal NR (export-only; macOS).
-   - Switch the **view** (SBS / anaglyph / 50% overlay / single eye), zoom in
-     to check sharpness, and set **Mark In / Mark Out** (`I` / `O`) to trim.
+   - Use the **SBS / single-eye** views and zoom in to check sharpness, then
+     set **Mark In / Mark Out** (`I` / `O`) to trim.
 3. **Export** — in the bottom bar, choose the output folder and **Format**
    (resolution incl. 8K, codec, bit depth, VR180 metadata target — Vision Pro
    APMP or YouTube — and audio), then **Export selected** or **Export all**.

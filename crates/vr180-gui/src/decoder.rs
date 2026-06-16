@@ -313,7 +313,7 @@ impl PreviewMode {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            stabilize: false,
+            stabilize: true,
             cori_source: CoriSource::Auto,
             // Defaults match across both paths: 1000 ms soft-stab +
             // 15° soft cap. Drop smooth_ms to 0 for sharp camera-lock
@@ -334,7 +334,7 @@ impl Default for Settings {
             stereo_yaw_deg: 0.0,
             stereo_pitch_deg: 0.0,
             stereo_roll_deg: 0.0,
-            rs_correct: false,
+            rs_correct: true,
             rs_mode: default_rs_mode(),
             rs_readout_ms: default_rs_readout_ms(),
             preview_eye_w: 768,
