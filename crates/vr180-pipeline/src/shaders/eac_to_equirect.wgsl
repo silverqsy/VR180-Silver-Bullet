@@ -219,13 +219,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var sx: f32 = 0.0;  // pixel x in cross (absolute, before 0.5 sample offset)
     var sy: f32 = 0.0;
     let edge = tw - 1.0;  // last captured column/row in a side tile
+    // SEAM FIX: every face's CENTER-spanning coordinate (the 1920-wide extent)
+    // is clamped to [0, CENTER_W-1] below — not just the side tiles' primary
+    // coordinate. Without it, a face's bilinear footprint at a ±45° boundary
+    // reaches onto the NEIGHBOURING face's first pixel; since adjacent faces
+    // come from different streams (s0 vs s4), that blends across the s0↔s4
+    // stitch and surfaces as a faint vertical/horizontal seam at azimuth /
+    // elevation ±45° (the GoPro EAC seam the Python app also had to fix).
 
     // ── Front face ── (z > 0, |x| ≤ z, |y| ≤ z) ───────────────────────
     if (zn > 0.0 && ax <= zn && ay <= zn) {
         let u_eac = TWO_OVER_PI * atan(xn / zn) + 0.5;
         let v_eac = 0.5 - TWO_OVER_PI * atan(yn / zn);
-        sx = center_top + u_eac * CENTER_W;
-        sy = center_top + v_eac * CENTER_W;
+        sx = center_top + clamp(u_eac * CENTER_W, 0.0, CENTER_W - 1.0);
+        sy = center_top + clamp(v_eac * CENTER_W, 0.0, CENTER_W - 1.0);
         hit = true;
     }
     // ── Right face ── (x > 0, z ≤ x, |y| ≤ x) ────────────────────────
@@ -234,7 +241,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let v_eac = 0.5 - TWO_OVER_PI * atan(yn / xn);
         let full_col = clamp(u_eac * CENTER_W, 0.0, edge);
         sx = center_bot + full_col;
-        sy = center_top + v_eac * CENTER_W;
+        sy = center_top + clamp(v_eac * CENTER_W, 0.0, CENTER_W - 1.0);
         hit = true;
     }
     // ── Left face ── (x < 0, z ≤ |x|, |y| ≤ |x|) ─────────────────────
@@ -243,7 +250,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let v_eac = 0.5 - TWO_OVER_PI * atan(yn / ax);
         let partial_col = clamp(u_eac * CENTER_W - (CENTER_W - tw), 0.0, edge);
         sx = partial_col;
-        sy = center_top + v_eac * CENTER_W;
+        sy = center_top + clamp(v_eac * CENTER_W, 0.0, CENTER_W - 1.0);
         hit = true;
     }
     // ── Top face ── (y > 0, |x| ≤ y, z ≤ y) ──────────────────────────
@@ -251,7 +258,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let u_eac = TWO_OVER_PI * atan(xn / yn) + 0.5;
         let v_eac = TWO_OVER_PI * atan(zn / yn) + 0.5;
         let partial_row = clamp(v_eac * CENTER_W - (CENTER_W - tw), 0.0, edge);
-        sx = center_top + u_eac * CENTER_W;
+        sx = center_top + clamp(u_eac * CENTER_W, 0.0, CENTER_W - 1.0);
         sy = partial_row;
         hit = true;
     }
@@ -260,7 +267,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let u_eac = TWO_OVER_PI * atan(xn / ay) + 0.5;
         let v_eac = 0.5 - TWO_OVER_PI * atan(zn / ay);
         let full_row = clamp(v_eac * CENTER_W, 0.0, edge);
-        sx = center_top + u_eac * CENTER_W;
+        sx = center_top + clamp(u_eac * CENTER_W, 0.0, CENTER_W - 1.0);
         sy = center_bot + full_row;
         hit = true;
     }

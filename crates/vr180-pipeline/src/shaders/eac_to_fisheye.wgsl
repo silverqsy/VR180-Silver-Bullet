@@ -238,8 +238,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (zn > 0.0 && ax <= zn && ay <= zn) {
         let u_eac = TWO_OVER_PI * atan(xn / zn) + 0.5;
         let v_eac = 0.5 - TWO_OVER_PI * atan(yn / zn);
-        sx = center_top + u_eac * CENTER_W;
-        sy = center_top + v_eac * CENTER_W;
+        sx = center_top + clamp(u_eac * CENTER_W, 0.0, CENTER_W - 1.0);
+        sy = center_top + clamp(v_eac * CENTER_W, 0.0, CENTER_W - 1.0);
         hit = true;
     }
     // ── Right face ── (x > 0, z ≤ x, |y| ≤ x) ────────────────────────
@@ -248,7 +248,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let v_eac = 0.5 - TWO_OVER_PI * atan(yn / xn);
         let full_col = clamp(u_eac * CENTER_W, 0.0, edge);
         sx = center_bot + full_col;
-        sy = center_top + v_eac * CENTER_W;
+        sy = center_top + clamp(v_eac * CENTER_W, 0.0, CENTER_W - 1.0);
         hit = true;
     }
     // ── Left face ── (x < 0, z ≤ |x|, |y| ≤ |x|) ─────────────────────
@@ -257,7 +257,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let v_eac = 0.5 - TWO_OVER_PI * atan(yn / ax);
         let partial_col = clamp(u_eac * CENTER_W - (CENTER_W - tw), 0.0, edge);
         sx = partial_col;
-        sy = center_top + v_eac * CENTER_W;
+        sy = center_top + clamp(v_eac * CENTER_W, 0.0, CENTER_W - 1.0);
         hit = true;
     }
     // ── Top face ── (y > 0, |x| ≤ y, z ≤ y) ──────────────────────────
@@ -265,7 +265,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let u_eac = TWO_OVER_PI * atan(xn / yn) + 0.5;
         let v_eac = TWO_OVER_PI * atan(zn / yn) + 0.5;
         let partial_row = clamp(v_eac * CENTER_W - (CENTER_W - tw), 0.0, edge);
-        sx = center_top + u_eac * CENTER_W;
+        sx = center_top + clamp(u_eac * CENTER_W, 0.0, CENTER_W - 1.0);
         sy = partial_row;
         hit = true;
     }
@@ -274,7 +274,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let u_eac = TWO_OVER_PI * atan(xn / ay) + 0.5;
         let v_eac = 0.5 - TWO_OVER_PI * atan(zn / ay);
         let full_row = clamp(v_eac * CENTER_W, 0.0, edge);
-        sx = center_top + u_eac * CENTER_W;
+        sx = center_top + clamp(u_eac * CENTER_W, 0.0, CENTER_W - 1.0);
         sy = center_bot + full_row;
         hit = true;
     }
