@@ -1094,6 +1094,12 @@ fn run_fisheye(
             }
             acc.and_then(|()| vr180_fisheye::DjiOsvImu::parse_multi(&blobs)
                 .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("dji parse_multi: {e}"))))
+        } else if let Some(arc) = cached_dji_imu(&cfg.path) {
+            // Reuse a prior parse of this file (the path-keyed cache) instead
+            // of re-reading the metadata track off disk on every respawn —
+            // the load-freeze fix. In-memory clone, no I/O.
+            tracing::info!("decoder (fisheye/osv): reusing cached DJI metadata for {}", cfg.path.display());
+            Ok((*arc).clone())
         } else {
             vr180_pipeline::decode::extract_dji_meta_stream(&cfg.path)
                 .and_then(|blob| vr180_fisheye::DjiOsvImu::parse(&blob)

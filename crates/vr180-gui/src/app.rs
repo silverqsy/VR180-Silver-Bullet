@@ -49,6 +49,11 @@ pub struct App {
     /// True while a decoder thread is alive (started but not Stopped).
     /// Lets Pause toggle the `paused` flag instead of killing the worker.
     decoder_alive: bool,
+    /// True from `spawn_decoder` until the decoder delivers its FIRST frame.
+    /// While set, play/seek respawns are ignored — clicking Play repeatedly
+    /// during a slow load would otherwise pile up detached decoder threads
+    /// all contending for the same file (the "click play too fast" freeze).
+    decoder_starting: bool,
     /// Currently displayed frame texture (kept alive while egui still
     /// references it) + the egui texture id we registered it under.
     current_display: Option<DisplayFrame>,
@@ -739,6 +744,7 @@ impl App {
             clip: None,
             playing: false,
             decoder_alive: false,
+            decoder_starting: false,
             current_display: None,
             frame_rx: None,
             detail_frame_rx: None,
@@ -1582,7 +1588,12 @@ impl App {
         // Spin up the native-res renderer on entering detail mode. It owns a
         // background decode thread; `ctx` lets that thread poke a repaint
         // when a frame finishes decoding so the still appears promptly.
-        if self.detail_cache.is_none() {
+        // Defer the full-res native decoder until the user actually zooms in.
+        // Opening it eagerly on load adds a second 3840² decode of the same
+        // file, contending with the preview worker (a slow first frame off an
+        // external drive). The cache still persists on zoom-out (keep_alive),
+        // so only the FIRST zoom-in pays the open.
+        if self.detail_cache.is_none() && self.preview_zoom > 1.001 {
             self.detail_cache = Some(crate::decoder::DetailCache::new(
                 path, kind, fps, self.settings.effective_swap_eyes(), ctx.clone()));
             self.full_res_key = 0;
@@ -1788,6 +1799,7 @@ impl App {
         }
         if let Some(f) = newest {
             self.replace_display(f);
+            self.decoder_starting = false; // first frame in → load done, ungate respawns
             ctx.request_repaint();
         }
         // FPS aggregation.
@@ -2243,6 +2255,15 @@ impl App {
             tracing::warn!("spawn_decoder: no path loaded");
             return;
         };
+        // Gate against play/seek respawns while a decoder is still coming up.
+        // A fresh paused load (`start_paused`) always proceeds; only the
+        // unpaused play/seek respawns are debounced. Without this, mashing
+        // Play during a slow load spawns several detached decoder threads
+        // that all block reading the same file, multiplying contention.
+        if !start_paused && self.decoder_starting {
+            tracing::info!("spawn_decoder: ignored — a decoder is still starting up");
+            return;
+        }
         self.stop_playback();
         tracing::info!(
             "spawn_decoder: starting decoder for {} (paused={})",
@@ -2288,6 +2309,7 @@ impl App {
         self.control = Some(control);
         self.playing = !start_paused;
         self.decoder_alive = true;
+        self.decoder_starting = true;
         self.last_pushed_settings = self.settings.clone();
         self.fps_stats = FpsStats::default();
 
