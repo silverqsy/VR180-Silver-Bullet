@@ -115,7 +115,7 @@ pub(crate) fn detect_rs_mode_for_path(
     if kind != vr180_pipeline::SourceKind::GoProEac {
         return default_rs_mode();
     }
-    match vr180_pipeline::decode::extract_gpmf_stream(path) {
+    match extract_gpmf_cached(path) {
         Ok(gpmf) => detect_rs_mode(&vr180_core::gyro::parse_cori(&gpmf)),
         Err(_) => default_rs_mode(),
     }
@@ -3511,6 +3511,34 @@ fn cached_dji_imu(path: &std::path::Path) -> Option<std::sync::Arc<vr180_fisheye
     dji_imu_cache().lock().iter().find(|(p, _)| p == path).map(|(_, imu)| imu.clone())
 }
 
+fn gpmf_cache(
+) -> &'static parking_lot::Mutex<Vec<(PathBuf, std::sync::Arc<Vec<u8>>)>> {
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<Vec<(PathBuf, std::sync::Arc<Vec<u8>>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+/// Extract the GoPro GPMF metadata blob, reusing a path-keyed cache so the
+/// `load_file` read, the decoder's stab read, and any respawn share ONE disk
+/// read of the `gpmd` stream instead of re-extracting it each time (the
+/// `.360` analogue of [`cached_dji_imu`]). Preview-only — the export pipeline
+/// reads the file fresh and never touches this cache.
+pub(crate) fn extract_gpmf_cached(path: &std::path::Path) -> vr180_pipeline::Result<Vec<u8>> {
+    if let Some(blob) = gpmf_cache().lock().iter()
+        .find(|(p, _)| p == path).map(|(_, b)| b.clone())
+    {
+        return Ok((*blob).clone());
+    }
+    let arc = std::sync::Arc::new(vr180_pipeline::decode::extract_gpmf_stream(path)?);
+    let mut c = gpmf_cache().lock();
+    c.retain(|(p, _)| p != path);
+    c.push((path.to_path_buf(), arc.clone()));
+    let n = c.len();
+    if n > 4 { c.drain(0..n - 4); } // keep the 4 most recent
+    Ok((*arc).clone())
+}
+
 pub(crate) struct DetailCache {
     path: PathBuf,
     kind: vr180_pipeline::SourceKind,
@@ -3893,14 +3921,14 @@ fn gather_multi_angvel(
     segments: &[std::path::PathBuf],
     fps: f32,
 ) -> Option<vr180_core::gyro::GyroAngvel> {
-    use vr180_pipeline::decode::{extract_gpmf_stream, probe_video};
+    use vr180_pipeline::decode::probe_video;
     let mut times: Vec<f32> = Vec::new();
     let mut raw: Vec<[f32; 3]> = Vec::new();
     let mut smoothed: Vec<[f32; 3]> = Vec::new();
     let mut toff = 0.0_f32;
     for seg in segments {
         let dur = probe_video(seg).map(|p| p.duration_sec as f32).unwrap_or(0.0);
-        if let Ok(gpmf) = extract_gpmf_stream(seg) {
+        if let Ok(gpmf) = extract_gpmf_cached(seg) {
             let raw_imu = vr180_core::gyro::parse_raw_imu(&gpmf);
             let (_, stmps) = vr180_core::gyro::parse_cori_with_stmps(&gpmf);
             if let Some(av) = vr180_core::gyro::GyroAngvel::build(
@@ -3945,8 +3973,6 @@ pub(crate) fn build_per_eye_frames_multi(
         gravity_alignment_quat, apply_gravity_alignment_inplace,
         compute_per_frame_omega, SmoothParams, SMOOTH_WINDOW_S,
     };
-    use vr180_pipeline::decode::extract_gpmf_stream;
-
     if !s.stabilize && !s.rs_correct {
         return Ok(Vec::new());
     }
@@ -3958,13 +3984,13 @@ pub(crate) fn build_per_eye_frames_multi(
 
     // Segment 0 carries the grav for gravity-alignment (recording start)
     // and the GEOC calibration; CORI/IORI concatenate across segments.
-    let gpmf = extract_gpmf_stream(input)?;
+    let gpmf = extract_gpmf_cached(input)?;
     let mut cori = parse_cori(&gpmf);
     let mut iori = parse_iori(&gpmf);
     let raw_imu = parse_raw_imu(&gpmf);
     if is_multi {
         for seg in &segments[1..] {
-            let g = extract_gpmf_stream(seg)?;
+            let g = extract_gpmf_cached(seg)?;
             cori.extend(parse_cori(&g));
             iori.extend(parse_iori(&g));
         }

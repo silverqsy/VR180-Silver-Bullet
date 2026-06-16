@@ -2082,7 +2082,7 @@ impl App {
 
         // GoPro family: parse GPMF + GEOC for metadata display.
         let (cori_count, grav_count, srot_ms, detected_rs_mode) = if source_kind == vr180_pipeline::SourceKind::GoProEac {
-            match vr180_pipeline::decode::extract_gpmf_stream(&path) {
+            match crate::decoder::extract_gpmf_cached(&path) {
                 Ok(gpmf) => {
                     let cori = vr180_core::gyro::parse_cori(&gpmf);
                     let raw = vr180_core::gyro::parse_raw_imu(&gpmf);
