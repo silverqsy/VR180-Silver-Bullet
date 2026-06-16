@@ -3,9 +3,10 @@
 A native, GPU-first VR180 processor written in Rust. **The headline of 2.0
 is full support for the DJI Osmo 360 VR180 mod:** it reads the camera's
 `.osv` dual-fisheye recordings, dewarps each lens with its exact factory
-calibration (reverse-engineered from DJI Studio), and exports stereoscopic
-VR180 SBS — with a real-time preview the whole way. (GoPro Max `.360` is
-fully supported too.)
+calibration, applies precise IMU stabilization and per-scanline
+rolling-shutter correction, and exports stereoscopic VR180 SBS — with output
+quality on par with DJI Studio and a real-time preview the whole way. (GoPro
+Max `.360` is fully supported too.)
 
 One self-contained binary per platform — no Python, no bundled runtimes, and
 it never shells out to a system `ffmpeg` — running natively on **macOS (Apple
@@ -41,9 +42,8 @@ Load a clip → preview with live controls → export VR180 SBS.
   progress + ETA bar and a completion notification.
 - **Exact lens dewarp (DJI Osmo 360 VR180 mod)** — loads the per-lens factory
   calibration straight from the `.osv` (fx/fy, principal point, 5-coefficient
-  Kannala-Brandt radial + Brown-Conrady tangential — the full model DJI
-  Studio uses, reverse-engineered and bit-matched). Per-eye manual override
-  with file-seeded sliders.
+  Kannala-Brandt radial + Brown-Conrady tangential), with dewarp output on
+  par with DJI Studio. Per-eye manual override with file-seeded sliders.
 - **IMU stabilization + rolling shutter** — camera-lock or velocity-dampened
   soft-stab (Gyroflow-style adaptive smoothing with a **Response** slider and
   a soft elastic correction limit), plus per-scanline rolling-shutter
@@ -60,6 +60,29 @@ Load a clip → preview with live controls → export VR180 SBS.
   equidistant fisheye SBS matched to the lens (**195°** for the Osmo 360,
   **185°** for the GoPro Max).
 - **Localized UI** — English / 简体中文, live toggle.
+
+## Using it
+
+1. **Load** — drag a `.osv` (DJI Osmo 360) or `.360` (GoPro Max) onto the
+   window, or click **Load video**. Drop several to build a batch.
+2. **Preview & adjust** — press play and scrub; every control applies live:
+   - **Color** — CDL, 3D LUT (the DJI D-LogM→Rec.709 LUT autoloads for OSV),
+     white balance, saturation, sharpen.
+   - **Stabilization** + **Rolling shutter** — camera-lock or velocity-
+     dampened soft-stab (tune the **Response** slider); RS mode auto-detects
+     for `.360`.
+   - **Noise Reduction** — temporal NR (export-only; macOS).
+   - Switch the **view** (SBS / anaglyph / 50% overlay / single eye), zoom in
+     to check sharpness, and set **Mark In / Mark Out** (`I` / `O`) to trim.
+3. **Export** — in the bottom bar, choose the output folder and **Format**
+   (resolution incl. 8K, codec, bit depth, VR180 metadata target — Vision Pro
+   APMP or YouTube — and audio), then **Export selected** or **Export all**.
+   Progress + ETA show in the bar.
+
+**Batch** — load several clips, tune each (or set one up and **Apply settings
+to all** of the same camera type), tick the ones you want, and **Export all**.
+
+**Language** — toggle **EN / 中文** in the top bar.
 
 ## Workspace layout
 

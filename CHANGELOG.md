@@ -11,8 +11,7 @@ Silicon)** and **Windows (NVIDIA)**.
 ### Cameras & formats
 - **DJI Osmo 360 VR180 mod** (`.osv`) — **the headline of 2.0.** Exact
   per-lens factory dewarp loaded from the file (5-coefficient Kannala-Brandt
-  + Brown-Conrady tangential, reverse-engineered and bit-matched to DJI
-  Studio).
+  + Brown-Conrady tangential), with output on par with DJI Studio.
 - **GoPro Max** (`.360`, EAC) — full GPU pipeline: zero-copy decode,
   noise reduction, and **automatic firmware vs no-firmware rolling-shutter
   detection** from the CORI stream (manual override retained).
@@ -32,7 +31,7 @@ Silicon)** and **Windows (NVIDIA)**.
   **Response** slider and a soft elastic correction limit).
 - Per-scanline rolling-shutter correction from measured sensor-readout
   timing; gravity/horizon alignment.
-- OSV IMU timing reverse-engineered from DJI Studio (SROT, IMU phase).
+- Precise OSV IMU stabilization + rolling-shutter timing (SROT, IMU phase), matched to DJI Studio.
 - **New:** GoPro `.360` firmware-RS mode is auto-detected per clip from the
   CORI signal (the toggle still overrides).
 
