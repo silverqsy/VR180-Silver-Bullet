@@ -19,8 +19,8 @@ Load a clip → preview with live controls → export VR180 SBS.
 
 | Source | Notes |
 |---|---|
-| **DJI Osmo 360** (VR180 mod) — `.osv` | **The headline of 2.0.** Dual-stream fisheye, exact factory lens dewarp loaded from the file. |
-| **GoPro Max** — `.360` | EAC dual-fisheye. Zero-copy GPU decode, firmware-RS auto-detect, noise reduction. |
+| **DJI Osmo VR180 mod** — `.osv` | **The headline of 2.0.** Dual-stream fisheye, exact factory lens dewarp loaded from the file. |
+| **GoPro Max 2 VR180 mod** — `.360` | EAC dual-fisheye. Zero-copy GPU decode, firmware-RS auto-detect, noise reduction. |
 
 ## Features
 
