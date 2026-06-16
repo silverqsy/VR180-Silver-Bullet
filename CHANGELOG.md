@@ -4,15 +4,15 @@
 
 The `2.0` clean-room rewrite of VR180 Silver Bullet — a native Rust + wgpu
 application replacing the Python/PyQt6 app. **The headline addition is full
-support for the DJI Osmo 360 VR180 mod** (`.osv`). One self-contained binary
+support for the OSMO VR180 Mod** (`.osv`). One self-contained binary
 per platform, no Python runtime, no system `ffmpeg`. Runs on **macOS (Apple
 Silicon)** and **Windows (NVIDIA)**.
 
 ### Cameras & formats
-- **DJI Osmo 360 VR180 mod** (`.osv`) — **the headline of 2.0.** Exact
+- **OSMO VR180 Mod** (`.osv`) — **the headline of 2.0.** Exact
   per-lens factory dewarp loaded from the file (5-coefficient Kannala-Brandt
   + Brown-Conrady tangential), with output on par with DJI Studio.
-- **GoPro Max** (`.360`, EAC) — full GPU pipeline: zero-copy decode,
+- **GoPro Max 2 VR180 Mod** (`.360`, EAC) — full GPU pipeline: zero-copy decode,
   noise reduction, and **automatic firmware vs no-firmware rolling-shutter
   detection** from the CORI stream (manual override retained).
 
@@ -32,8 +32,8 @@ Silicon)** and **Windows (NVIDIA)**.
 - Per-scanline rolling-shutter correction from measured sensor-readout
   timing; gravity/horizon alignment.
 - Precise OSV IMU stabilization + rolling-shutter timing (SROT, IMU phase), matched to DJI Studio.
-- **New:** GoPro `.360` firmware-RS mode is auto-detected per clip from the
-  CORI signal (the toggle still overrides).
+- **New:** GoPro Max 2 VR180 Mod (`.360`) firmware-RS mode is auto-detected
+  per clip from the CORI signal (the toggle still overrides).
 
 ### Color
 - CDL, 3D LUT (DJI D-LogM→Rec.709 bundled + autoloaded), white balance,
@@ -47,7 +47,8 @@ Silicon)** and **Windows (NVIDIA)**.
 
 ### Output & delivery
 - Half-equirect VR180 SBS, or a normalized equidistant fisheye SBS matched
-  to the lens — **195°** for the Osmo 360, **185°** for the GoPro Max.
+  to the lens — **195°** for the OSMO VR180 Mod, **185°** for the
+  GoPro Max 2 VR180 Mod.
 - Native or **8192×4096 (8K)** resolution.
 - H.265 or ProRes; **Vision Pro (APMP)** and **YouTube VR180** metadata
   injection; **APAC spatial** / ambisonic / stereo audio; OSV audio

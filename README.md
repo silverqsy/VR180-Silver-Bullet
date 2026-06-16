@@ -1,12 +1,12 @@
 # VR180 Silver Bullet 2.0
 
 A native, GPU-first VR180 processor written in Rust. **The headline of 2.0
-is full support for the DJI Osmo 360 VR180 mod:** it reads the camera's
+is full support for the [OSMO VR180 Mod][osmo]:** it reads the camera's
 `.osv` dual-fisheye recordings, dewarps each lens with its exact factory
 calibration, applies precise IMU stabilization and per-scanline
 rolling-shutter correction, and exports stereoscopic VR180 SBS — with output
-quality on par with DJI Studio and a real-time preview the whole way. (GoPro
-Max `.360` is fully supported too.)
+quality on par with DJI Studio and a real-time preview the whole way. (The
+[GoPro Max 2 VR180 Mod][gopro] is fully supported too.)
 
 One self-contained binary per platform — no Python, no bundled runtimes, and
 it never shells out to a system `ffmpeg` — running natively on **macOS (Apple
@@ -19,8 +19,8 @@ Load a clip → preview with live controls → export VR180 SBS.
 
 | Source | Notes |
 |---|---|
-| **DJI Osmo VR180 mod** — `.osv` | **The headline of 2.0.** Dual-stream fisheye, exact factory lens dewarp loaded from the file. |
-| **GoPro Max 2 VR180 mod** — `.360` | EAC dual-fisheye. Zero-copy GPU decode, firmware-RS auto-detect, noise reduction. |
+| **[OSMO VR180 Mod][osmo]** — `.osv` | **The headline of 2.0.** Dual-stream fisheye, exact factory lens dewarp loaded from the file. |
+| **[GoPro Max 2 VR180 Mod][gopro]** — `.360` | EAC dual-fisheye. Zero-copy GPU decode, firmware-RS auto-detect, noise reduction. |
 
 ## Features
 
@@ -40,16 +40,17 @@ Load a clip → preview with live controls → export VR180 SBS.
 - **Batch processing** — load many clips, tune each independently, then
   export all (or a checked subset) from one queue with a persistent
   progress + ETA bar and a completion notification.
-- **Exact lens dewarp (DJI Osmo 360 VR180 mod)** — loads the per-lens factory
+- **Exact lens dewarp ([OSMO VR180 Mod][osmo])** — loads the per-lens factory
   calibration straight from the `.osv` (fx/fy, principal point, 5-coefficient
   Kannala-Brandt radial + Brown-Conrady tangential), with dewarp output on
   par with DJI Studio. Per-eye manual override with file-seeded sliders.
 - **IMU stabilization + rolling shutter** — camera-lock or velocity-dampened
   soft-stab (Gyroflow-style adaptive smoothing with a **Response** slider and
   a soft elastic correction limit), plus per-scanline rolling-shutter
-  correction from measured sensor-readout timing. For GoPro `.360`, firmware
-  rolling-shutter is **auto-detected** from the CORI stream (firmware vs
-  no-firmware), with a manual override.
+  correction from measured sensor-readout timing. For the
+  [GoPro Max 2 VR180 Mod][gopro] (`.360`), firmware rolling-shutter is
+  **auto-detected** from the CORI stream (firmware vs no-firmware), with a
+  manual override.
 - **Color pipeline, 10-bit end-to-end** — CDL, 3D LUT (DJI D-LogM→Rec.709
   bundled and autoloaded), white balance, saturation, sharpen, mid-detail;
   the identical stack runs in preview and export.
@@ -57,14 +58,15 @@ Load a clip → preview with live controls → export VR180 SBS.
   (`VTTemporalNoiseFilter`), run in-process and fully 10-bit, GPU-resident
   zero-copy. Export-only; macOS-only (auto-hidden where unsupported).
 - **Output projections** — half-equirect VR180 SBS, or a normalized
-  equidistant fisheye SBS matched to the lens (**195°** for the Osmo 360,
-  **185°** for the GoPro Max).
+  equidistant fisheye SBS matched to the lens (**195°** for the
+  [OSMO VR180 Mod][osmo], **185°** for the [GoPro Max 2 VR180 Mod][gopro]).
 - **Localized UI** — English / 简体中文, live toggle.
 
 ## Using it
 
-1. **Load** — drag a `.osv` (DJI Osmo 360) or `.360` (GoPro Max) onto the
-   window, or click **Load video**. Drop several to build a batch.
+1. **Load** — drag a `.osv` ([OSMO VR180 Mod][osmo]) or `.360`
+   ([GoPro Max 2 VR180 Mod][gopro]) onto the window, or click **Load video**.
+   Drop several to build a batch.
 2. **Preview & adjust** — press play and scrub; every control applies live.
    - **Align the stereo first** — scrub to a part of the clip with a
      **far-away subject**, switch the **view** to **50% overlay** or
@@ -157,3 +159,6 @@ releases — see [docs/BUILD.md](docs/BUILD.md) and
 ## License
 
 MIT.
+
+[osmo]: https://www.facebook.com/share/p/1J1WBwKhfy/
+[gopro]: https://www.facebook.com/share/p/1QUDsLvWS8/
