@@ -26,9 +26,16 @@ use tracing_subscriber::EnvFilter;
 /// running window, so we set it explicitly here too. Returns `None` (the app
 /// still launches, just without an icon) rather than panicking if the bundled
 /// asset can't be decoded.
-#[cfg(not(target_os = "macos"))]
+/// The live window/Dock icon while the app runs, decoded from the bundled
+/// PNG. egui applies its OWN default icon when none is supplied — which would
+/// replace the launch (bundle) icon the moment the window opens — so we always
+/// provide ours. The PNG matches the macOS `.app` `icon.icns`, so the Dock
+/// tile stays the same from launch through GUI. (The Windows `.exe` *file*
+/// icon is a separate build-time Win32 resource — see `build.rs`.) A single
+/// PNG decodes unambiguously, unlike picking a frame out of the multi-size
+/// `.ico`. Returns `None` (launch icon-less) on decode error rather than panic.
 fn load_app_icon() -> Option<egui::IconData> {
-    let bytes = include_bytes!("../../../assets/icon.ico");
+    let bytes = include_bytes!("../../../assets/icon.png");
     let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (width, height) = rgba.dimensions();
     Some(egui::IconData { rgba: rgba.into_raw(), width, height })
@@ -68,17 +75,15 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    #[cfg_attr(target_os = "macos", allow(unused_mut))]
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("VR180 Silver Bullet 2.0")
         .with_inner_size([1480.0, 920.0])
         .with_min_inner_size([1100.0, 720.0])
         .with_drag_and_drop(true);
-    // macOS takes the Dock/window icon from the `.app` bundle's `icon.icns`
-    // (Info.plist → CFBundleIconFile). Setting a runtime icon there overrides
-    // the bundle icon with the raw image — the wrong icon while running — so
-    // only set it on Windows/Linux, which have no bundle to carry it.
-    #[cfg(not(target_os = "macos"))]
+    // Always set the live window icon (all platforms): egui otherwise applies
+    // its own default icon when the window opens, which would replace the
+    // launch/Dock icon mid-startup. Ours matches the macOS `.app` icon, so the
+    // tile is stable from launch through GUI.
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
