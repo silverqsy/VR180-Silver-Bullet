@@ -3,19 +3,19 @@
 ## 2.0.0
 
 The `2.0` clean-room rewrite of VR180 Silver Bullet — a native Rust + wgpu
-application replacing the Python/PyQt6 app. One self-contained binary per
-platform, no Python runtime, no system `ffmpeg`. Runs on **macOS (Apple
+application replacing the Python/PyQt6 app. **The headline addition is full
+support for the DJI Osmo 360 VR180 mod** (`.osv`). One self-contained binary
+per platform, no Python runtime, no system `ffmpeg`. Runs on **macOS (Apple
 Silicon)** and **Windows (NVIDIA)**.
 
 ### Cameras & formats
-- **DJI Osmo 360** (`.osv`) — primary path, with exact per-lens factory
-  dewarp loaded from the file (5-coefficient Kannala-Brandt + Brown-Conrady
-  tangential, reverse-engineered and bit-matched to DJI Studio).
+- **DJI Osmo 360 VR180 mod** (`.osv`) — **the headline of 2.0.** Exact
+  per-lens factory dewarp loaded from the file (5-coefficient Kannala-Brandt
+  + Brown-Conrady tangential, reverse-engineered and bit-matched to DJI
+  Studio).
 - **GoPro Max** (`.360`, EAC) — full GPU pipeline: zero-copy decode,
   noise reduction, and **automatic firmware vs no-firmware rolling-shutter
   detection** from the CORI stream (manual override retained).
-- **SBS fisheye** (Insta360 / Vuze XR / QooCam / Canon RF / generic rigs).
-- **Blackmagic RAW** (`.braw`) with VQF 6D stabilization.
 
 ### Engine
 - GPU-first: `wgpu` compute (Metal / DX12 / Vulkan) with WGSL shaders.
@@ -47,7 +47,8 @@ Silicon)** and **Windows (NVIDIA)**.
   `.360`. Export-only; macOS-only (auto-hidden where unsupported).
 
 ### Output & delivery
-- Half-equirect VR180 SBS or normalized **195° equidistant fisheye** SBS.
+- Half-equirect VR180 SBS, or a normalized equidistant fisheye SBS matched
+  to the lens — **195°** for the Osmo 360, **185°** for the GoPro Max.
 - Native or **8192×4096 (8K)** resolution.
 - H.265 or ProRes; **Vision Pro (APMP)** and **YouTube VR180** metadata
   injection; **APAC spatial** / ambisonic / stereo audio; OSV audio

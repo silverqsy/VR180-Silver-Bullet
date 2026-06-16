@@ -1,10 +1,16 @@
 # VR180 Silver Bullet 2.0
 
-A native, GPU-first VR180 processor written in Rust. One self-contained
-binary per platform — no Python, no bundled runtimes, and it never shells
-out to a system `ffmpeg`. This is the `2.0` clean-room rewrite of the
-Python/PyQt6 [VR180 Silver Bullet](../vr180_processor/) app, running
-natively on **macOS (Apple Silicon)** and **Windows (NVIDIA)**.
+A native, GPU-first VR180 processor written in Rust. **The headline of 2.0
+is full support for the DJI Osmo 360 VR180 mod:** it reads the camera's
+`.osv` dual-fisheye recordings, dewarps each lens with its exact factory
+calibration (reverse-engineered from DJI Studio), and exports stereoscopic
+VR180 SBS — with a real-time preview the whole way. (GoPro Max `.360` is
+fully supported too.)
+
+One self-contained binary per platform — no Python, no bundled runtimes, and
+it never shells out to a system `ffmpeg` — running natively on **macOS (Apple
+Silicon)** and **Windows (NVIDIA)**. This is the ground-up rewrite of the
+Python/PyQt6 [VR180 Silver Bullet](../vr180_processor/) (1.1) app.
 
 Load a clip → preview with live controls → export VR180 SBS.
 
@@ -12,44 +18,47 @@ Load a clip → preview with live controls → export VR180 SBS.
 
 | Source | Notes |
 |---|---|
-| **DJI Osmo 360** — `.osv` | Primary path. Dual-stream fisheye, exact factory lens dewarp from the file. |
+| **DJI Osmo 360** (VR180 mod) — `.osv` | **The headline of 2.0.** Dual-stream fisheye, exact factory lens dewarp loaded from the file. |
 | **GoPro Max** — `.360` | EAC dual-fisheye. Zero-copy GPU decode, firmware-RS auto-detect, noise reduction. |
-| **SBS fisheye** — `.mp4` / `.mov` | Insta360, Vuze XR, QooCam, Canon RF dual-fisheye, generic dual-camera rigs. |
-| **Blackmagic RAW** — `.braw` | Pyxis 12K, URSA Cine Immersive (VQF 6D stabilization). |
 
 ## Features
 
-- **Exact lens dewarp** — for the DJI Osmo 360, loads the per-lens factory
+- **Real-time, WYSIWYG preview** — scrub and tune color *and* stabilization
+  with the full pipeline applied live; the preview runs the exact 10-bit
+  stack the export uses, so what you see is what you ship. SBS / anaglyph /
+  50%-overlay / single-eye view modes, a zoom magnifier with a
+  native-resolution still, per-eye view adjustment (pano + stereo offset),
+  upside-down-mount support, and audio playback.
+- **Fast, hardware-accelerated export** — an end-to-end zero-copy GPU
+  pipeline, **up to 2× as fast as the previous version at 10-bit**. H.265
+  (VideoToolbox zero-copy on macOS; GPU-resident NVDEC→wgpu→CUDA→NVENC on
+  Windows, libx265 fallback) or ProRes, at native resolution or
+  **8192×4096 (8K)**, with **Vision Pro (APMP)** / **YouTube VR180** metadata,
+  **APAC spatial** / ambisonic / stereo audio, and OSV stereo-audio
+  passthrough.
+- **Batch processing** — load many clips, tune each independently, then
+  export all (or a checked subset) from one queue with a persistent
+  progress + ETA bar and a completion notification.
+- **Exact lens dewarp (DJI Osmo 360 VR180 mod)** — loads the per-lens factory
   calibration straight from the `.osv` (fx/fy, principal point, 5-coefficient
   Kannala-Brandt radial + Brown-Conrady tangential — the full model DJI
   Studio uses, reverse-engineered and bit-matched). Per-eye manual override
-  with file-seeded sliders when you want to hand-tune.
-- **Stabilization from the camera IMU** — camera-lock or velocity-dampened
-  soft-stab (Gyroflow-style adaptive smoothing that relaxes ahead of fast
-  motion, soft elastic correction limit, **Response** slider), plus
-  per-scanline rolling-shutter correction from measured sensor-readout
-  timing. For GoPro `.360`, **firmware rolling-shutter is auto-detected**
-  from the CORI stream (firmware vs no-firmware), with a manual override.
+  with file-seeded sliders.
+- **IMU stabilization + rolling shutter** — camera-lock or velocity-dampened
+  soft-stab (Gyroflow-style adaptive smoothing with a **Response** slider and
+  a soft elastic correction limit), plus per-scanline rolling-shutter
+  correction from measured sensor-readout timing. For GoPro `.360`, firmware
+  rolling-shutter is **auto-detected** from the CORI stream (firmware vs
+  no-firmware), with a manual override.
 - **Color pipeline, 10-bit end-to-end** — CDL, 3D LUT (DJI D-LogM→Rec.709
   bundled and autoloaded), white balance, saturation, sharpen, mid-detail;
   the identical stack runs in preview and export.
 - **Noise reduction** — temporal NR via Apple VideoToolbox
-  (`VTTemporalNoiseFilter`), run **in-process** (objc2 FFI, no helper
-  binary), fully 10-bit and GPU-resident zero-copy. Export-only; macOS-only
-  (auto-hidden on Windows / unsupported hardware).
-- **Output projections** — half-equirect VR180 SBS (the standard), or a
-  normalized **195° equidistant fisheye** SBS.
-- **Export** — H.265 (VideoToolbox on macOS; GPU-resident NVDEC→wgpu→CUDA→
-  NVENC on Windows, with a libx265 software fallback) or ProRes, at native
-  resolution or **8192×4096 (8K)**, with **Vision Pro (APMP)** or **YouTube
-  VR180** metadata injection, **APAC spatial** / ambisonic / stereo audio,
-  and OSV stereo-audio passthrough.
-- **Batch + unified export** — load many clips, tune each independently,
-  then export all (or a checked subset) through one queue with a persistent
-  progress + ETA bar and a completion notification.
-- **Preview** — SBS / anaglyph / 50%-overlay / single-eye view modes, zoom
-  magnifier with a native-resolution still, per-eye view adjustment (pano +
-  stereo offset), upside-down-mount support, audio playback.
+  (`VTTemporalNoiseFilter`), run in-process and fully 10-bit, GPU-resident
+  zero-copy. Export-only; macOS-only (auto-hidden where unsupported).
+- **Output projections** — half-equirect VR180 SBS, or a normalized
+  equidistant fisheye SBS matched to the lens (**195°** for the Osmo 360,
+  **185°** for the GoPro Max).
 - **Localized UI** — English / 简体中文, live toggle.
 
 ## Workspace layout
@@ -58,8 +67,8 @@ Load a clip → preview with live controls → export VR180 SBS.
 crates/
 ├── vr180-core/      # pure Rust: gyro/quat math, EAC dims, .cube LUT
 │                    # parse, GEOC calib — fully portable
-├── vr180-fisheye/   # camera presets + fisheye calibration (KB model,
-│                    # OSV protobuf parse, Gyroflow profile import)
+├── vr180-fisheye/   # fisheye lens calibration (Kannala-Brandt model,
+│                    # DJI OSV protobuf parse)
 ├── vr180-pipeline/  # the engine: decode (ffmpeg-next 8.1, in-process),
 │                    # wgpu compute kernels (WGSL), DJI IMU stab + RS,
 │                    # in-process VT noise reduction, export pipeline,
