@@ -1,0 +1,18 @@
+[package]
+name = "vr180-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pure-Rust headless core for VR180 Silver Bullet 2.0: gyro, EAC math, color, atom writers."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+nalgebra = { workspace = true }
+vqf-rs = { version = "0.3.0", features = ["std", "motion-bias-estimation", "f32"] }

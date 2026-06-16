@@ -1,0 +1,62 @@
+[package]
+name = "vr180-gui"
+version = "2.0.0"
+description = "VR180 Silver Bullet 2.0 — egui+wgpu native GUI"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "vr180-gui"
+path = "src/main.rs"
+
+[dependencies]
+# eframe 0.34 ships with wgpu 29 — same major as our workspace
+# `wgpu = "29"` pin. Matching versions is non-negotiable: sharing
+# `wgpu::Texture` between our pipeline and eframe-wgpu's renderer
+# requires that both sides instantiate the same wgpu type layout.
+# Modernized from 0.28/wgpu 0.20 to unlock GPU-texture interop
+# (create_texture_from_hal) for zero-copy decode — Gyroflow blueprint.
+eframe = { version = "0.34", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui = "0.34"
+egui-wgpu = "0.34"
+wgpu = { workspace = true }
+
+# Native file picker.
+rfd = "0.14"
+
+# Decode the bundled .ico for the live window icon (title bar + taskbar).
+# `ico` pulls in the png/bmp sub-decoders the icon frames use. The .exe's
+# *file* icon is embedded separately at build time (see build.rs).
+image = { version = "0.25", default-features = false, features = ["ico"] }
+
+# Threading + sync.
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+
+# Audio output (cross-platform OS device). The audio-decoder thread
+# pushes resampled f32 samples into a parking_lot Mutex<VecDeque>;
+# the cpal callback pops from it. AAC decode reuses the workspace
+# ffmpeg-next.
+cpal = "0.17"
+ffmpeg-next = { workspace = true }
+bytemuck = { workspace = true }
+
+# Settings persistence (serialize the GUI Settings to JSON on disk).
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Errors / logging.
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Our pipeline + core + fisheye/BRAW shims.
+vr180-core = { workspace = true }
+vr180-pipeline = { workspace = true }
+vr180-fisheye = { workspace = true }
+vr180-braw = { workspace = true }
+
+# Embed the app icon into the Windows .exe as a Win32 resource (see build.rs).
+# Windows host only — macOS uses the .icns app bundle and never builds this.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

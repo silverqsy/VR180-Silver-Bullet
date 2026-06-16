@@ -1,0 +1,29 @@
+[package]
+name = "vr180-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI render binary for VR180 Silver Bullet 2.0."
+
+[[bin]]
+name = "vr180-render"
+path = "src/main.rs"
+
+[dependencies]
+vr180-core = { workspace = true }
+vr180-pipeline = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+wgpu = "29"
+
+# probe-iosurface CLI demo path uses metal::MTLPixelFormat directly.
+# Whole subcommand is `#[cfg(target_os = "macos")]` so make the dep
+# match — Windows builds skip it entirely.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.28"

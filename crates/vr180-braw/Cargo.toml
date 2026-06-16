@@ -1,0 +1,18 @@
+[package]
+name = "vr180-braw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Blackmagic RAW (.braw) decoder wrapper. Spawns the helpers/bin/braw_helper subprocess and parses its --info / --decode / --gyro / --audio output."
+
+[dependencies]
+# JSON parsing for --info and --gyro stderr headers
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Errors / logging
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

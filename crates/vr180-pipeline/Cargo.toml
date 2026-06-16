@@ -1,0 +1,88 @@
+[package]
+name = "vr180-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "I/O + GPU pipeline for VR180 Silver Bullet 2.0: ffmpeg-next decode/encode, wgpu compute, Swift helper spawn."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+vr180-core = { workspace = true }
+vr180-fisheye = { workspace = true }
+vr180-braw = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# In-process libav decode/encode. Pinned at 8.1.x to match the
+# avbuild distributions most Windows users build against; see
+# `docs/BUILD.md` for the dev install steps per platform.
+ffmpeg-next = { workspace = true }
+
+# GPU compute
+wgpu = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }
+
+# IOSurface↔Metal↔wgpu zero-copy interop deps (macOS only).
+# Gated as target-specific so Windows / Linux builds don't try to
+# compile them. The consuming module (`src/interop_macos.rs`) is
+# `#![cfg(target_os = "macos")]` so the user-visible types don't
+# leak either.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.28"
+core-foundation = "0.9"
+objc = "0.2"
+foreign-types = "0.5"
+# wgpu-hal 29 migrated its Metal backend off the `metal` (metal-rs) crate
+# to objc2-metal, so the hal boundary (`Device::texture_from_raw` /
+# `raw_device`) now speaks objc2 types. We keep metal-rs for the
+# IOSurface→MTLTexture *creation* (self-contained, still compiles) and
+# bridge to objc2 only at that boundary. Versions MUST match what
+# wgpu-hal 29 pulls in (objc2 0.6 / objc2-metal 0.3) so the
+# `Retained<ProtocolObject<dyn MTLTexture>>` we hand over is the exact
+# crate type the hal escape consumes.
+objc2 = "0.6"
+objc2-metal = "0.3"
+
+# D3D11 (NVDEC / D3D11VA decode output) ↔ Vulkan (wgpu) zero-copy interop
+# (Windows only). `ash` MUST resolve to the same minor wgpu-hal 29 uses,
+# so the `vk::Image` we import is the exact type `create_texture_from_hal`
+# expects. The `windows` crate drives the D3D11 side (texture share +
+# keyed mutex). Original MIT-licensed implementation in `interop_windows.rs`
+# (standard external-memory technique; not derived from GPL sources).
+[target.'cfg(target_os = "windows")'.dependencies]
+ash = "0.38"
+# CUDA driver API (dynamic-loaded nvcuda.dll, no toolkit needed) for the
+# GPU-resident encode path: import the Vulkan-composed P010 into CUDA and feed
+# NVENC directly (no CPU readback). Used via its raw `sys` layer for the
+# external-memory / external-semaphore interop the safe wrappers don't cover.
+cudarc = { version = "0.12", default-features = false, features = ["driver", "dynamic-linking", "cuda-12040"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[dev-dependencies]
+# PNG dump for the headless preview-repro example (lets us eyeball the exact
+# zero-copy preview output without the GUI).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Surfaces the pipeline's `tracing` logs (perf timings, path-engaged lines) in
+# the headless examples — the lib emits via `tracing`, which needs a subscriber.
+tracing-subscriber = "0.3"
+
+[features]
+default = []
+# Lets us compile without an FFmpeg dev install during very early
+# scaffolding work (only the GPU side stays available). Drop once
+# Phase 0.4 lands.
+no-ffmpeg = []
