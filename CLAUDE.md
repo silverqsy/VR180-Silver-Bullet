@@ -365,7 +365,6 @@ experiment was a band-aid for the preview-gamma bug (Lesson #2) and is gone.
 - Don't remove a `#[cfg(target_os = "...")]` gate without confirming the
   API exists on the other platform; the Mac-only paths are FAST paths
   with deliberate cross-platform fallbacks.
-- Don't push to `main` (this is the `2.0` branch).
 - Don't drop the graded path to 8-bit; don't re-introduce the off-thread GPU
   deadlock; don't switch the preview back to an sRGB texture view (Lesson #2)
   or the H.265 export back to full-range.
