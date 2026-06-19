@@ -1712,67 +1712,151 @@ pub struct ZeroCopyDualStreamFisheyeIter {
     /// DJI OSV convention: stream 0 = Lens A = right eye after the
     /// yaw-mod-equivalent ordering in the protobuf).
     swap_eyes: bool,
+    /// Segment chain (a merged recording's OSV parts). One entry for a lone
+    /// file. The decoder transparently rolls over to the next segment at EOF,
+    /// so a consumer (incl. the temporal denoiser) sees ONE continuous stream.
+    seg_paths: Vec<std::path::PathBuf>,
+    /// Cumulative clip-time start of each segment (s); yielded pts are rebased
+    /// onto this GLOBAL timeline so stab-by-pts + trim stay aligned across seams.
+    seg_start_s: Vec<f64>,
+    cur_idx: usize,
+}
+
+/// Open one OSV/dual-camera file's two VT-hwaccel video decoders. Shared by the
+/// single-file and segmented constructors and by the segment roll-over.
+#[cfg(target_os = "macos")]
+fn open_dual_stream_vt(path: &Path) -> Result<(
+    ffmpeg_next::format::context::Input,
+    [usize; 2],
+    Vec<ffmpeg_next::codec::decoder::Video>,
+    u32, u32, f64,
+)> {
+    ffmpeg_init();
+    let ictx = ffmpeg_next::format::input(path)
+        .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+    let video_indices: Vec<usize> = ictx
+        .streams()
+        .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+        .map(|s| s.index())
+        .take(2)
+        .collect();
+    if video_indices.len() < 2 {
+        return Err(Error::Ffmpeg(format!(
+            "expected 2 video streams (OSV / dual-camera), found {}",
+            video_indices.len()
+        )));
+    }
+    let video_indices = [video_indices[0], video_indices[1]];
+    let mut decoders = Vec::with_capacity(2);
+    for &idx in video_indices.iter() {
+        let stream = ictx.stream(idx).unwrap();
+        let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+            .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+        if !crate::decode::try_enable_videotoolbox_decode(&mut codec_ctx) {
+            return Err(Error::Ffmpeg(format!(
+                "zero-copy fisheye path requires VideoToolbox hwaccel \
+                 — VT setup failed on stream {idx}"
+            )));
+        }
+        decoders.push(codec_ctx.decoder().video()
+            .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?);
+    }
+    let (w0, h0) = (decoders[0].width(), decoders[0].height());
+    let (w1, h1) = (decoders[1].width(), decoders[1].height());
+    if (w0, h0) != (w1, h1) {
+        return Err(Error::Ffmpeg(format!(
+            "OSV zero-copy streams disagree on dims: {w0}x{h0} vs {w1}x{h1}"
+        )));
+    }
+    let time_base = ictx.stream(video_indices[0]).unwrap().time_base();
+    let time_base_s = time_base.numerator() as f64 / time_base.denominator() as f64;
+    Ok((ictx, video_indices, decoders, w0, h0, time_base_s))
 }
 
 #[cfg(target_os = "macos")]
 impl ZeroCopyDualStreamFisheyeIter {
     pub fn new(path: &Path, frame_limit: u32, swap_eyes: bool) -> Result<Self> {
-        ffmpeg_init();
-        let ictx = ffmpeg_next::format::input(path)
-            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
-        let video_indices: Vec<usize> = ictx
-            .streams()
-            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
-            .map(|s| s.index())
-            .take(2)
-            .collect();
-        if video_indices.len() < 2 {
-            return Err(Error::Ffmpeg(format!(
-                "expected 2 video streams (OSV / dual-camera), found {}",
-                video_indices.len()
-            )));
-        }
-        let video_indices = [video_indices[0], video_indices[1]];
-        let mut decoders = Vec::with_capacity(2);
-        for &idx in video_indices.iter() {
-            let stream = ictx.stream(idx).unwrap();
-            let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
-                .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
-            if !crate::decode::try_enable_videotoolbox_decode(&mut codec_ctx) {
-                return Err(Error::Ffmpeg(format!(
-                    "zero-copy fisheye path requires VideoToolbox hwaccel \
-                     — VT setup failed on stream {idx}"
-                )));
-            }
-            decoders.push(codec_ctx.decoder().video()
-                .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?);
-        }
-        let (w0, h0) = (decoders[0].width(), decoders[0].height());
-        let (w1, h1) = (decoders[1].width(), decoders[1].height());
-        if (w0, h0) != (w1, h1) {
-            return Err(Error::Ffmpeg(format!(
-                "OSV zero-copy streams disagree on dims: {w0}x{h0} vs {w1}x{h1}"
-            )));
-        }
-        let time_base = ictx.stream(video_indices[0]).unwrap().time_base();
-        let time_base_s = time_base.numerator() as f64 / time_base.denominator() as f64;
+        let (ictx, video_indices, decoders, eye_w, eye_h, time_base_s) = open_dual_stream_vt(path)?;
         tracing::info!(
             "ZeroCopyDualStreamFisheyeIter: native {}x{}, swap_eyes={}",
-            w0, h0, swap_eyes
+            eye_w, eye_h, swap_eyes
         );
         Ok(Self {
             ictx, video_indices, decoders,
-            eye_w: w0, eye_h: h0,
+            eye_w, eye_h,
             frame_limit, frames_yielded: 0,
             time_base_s,
             swap_eyes,
+            seg_paths: vec![path.to_path_buf()],
+            seg_start_s: vec![0.0],
+            cur_idx: 0,
         })
+    }
+
+    /// Chain several OSV segments of one recording into one continuous zero-copy
+    /// stream. `seg_durations_s` are per-segment durations (used to rebase pts +
+    /// map a global seek to a segment). Yielded pts are GLOBAL (chain-relative).
+    pub fn new_segmented(
+        segments: &[std::path::PathBuf],
+        seg_durations_s: &[f64],
+        frame_limit: u32,
+        swap_eyes: bool,
+    ) -> Result<Self> {
+        assert!(!segments.is_empty(), "segments must be non-empty");
+        let (ictx, video_indices, decoders, eye_w, eye_h, time_base_s) =
+            open_dual_stream_vt(&segments[0])?;
+        let mut seg_start_s = Vec::with_capacity(segments.len());
+        let mut acc = 0.0_f64;
+        for i in 0..segments.len() {
+            seg_start_s.push(acc);
+            acc += seg_durations_s.get(i).copied().unwrap_or(0.0);
+        }
+        tracing::info!(
+            "ZeroCopyDualStreamFisheyeIter: {} segments ({:.1}s), native {}x{}, swap_eyes={}",
+            segments.len(), acc, eye_w, eye_h, swap_eyes
+        );
+        Ok(Self {
+            ictx, video_indices, decoders,
+            eye_w, eye_h,
+            frame_limit, frames_yielded: 0,
+            time_base_s,
+            swap_eyes,
+            seg_paths: segments.to_vec(),
+            seg_start_s,
+            cur_idx: 0,
+        })
+    }
+
+    /// Re-open the decoder onto `path` (a segment roll-over or a cross-segment
+    /// seek). Keeps the recording's eye dims (warns if a segment disagrees).
+    fn reopen(&mut self, path: &Path) -> Result<()> {
+        let (ictx, video_indices, decoders, w, h, time_base_s) = open_dual_stream_vt(path)?;
+        if (w, h) != (self.eye_w, self.eye_h) {
+            tracing::warn!(
+                "ZeroCopy segment {path:?} dims {w}x{h} != first {}x{} — keeping first",
+                self.eye_w, self.eye_h
+            );
+        }
+        self.ictx = ictx;
+        self.video_indices = video_indices;
+        self.decoders = decoders;
+        self.time_base_s = time_base_s;
+        Ok(())
     }
 
     pub fn eye_dims(&self) -> (u32, u32) { (self.eye_w, self.eye_h) }
 
     pub fn seek(&mut self, target_s: f64) -> Result<()> {
-        let ts = (target_s.max(0.0) * 1_000_000.0) as i64;
+        // Map the global target to (segment, local time) across the chain.
+        let t = target_s.max(0.0);
+        let idx = self.seg_start_s.iter().rposition(|&s| s <= t).unwrap_or(0);
+        if idx != self.cur_idx {
+            let path = self.seg_paths[idx].clone();
+            self.reopen(&path)?;
+            self.cur_idx = idx;
+        }
+        let local = (t - self.seg_start_s.get(idx).copied().unwrap_or(0.0)).max(0.0);
+        let ts = (local * 1_000_000.0) as i64;
         self.ictx.seek(ts, ..ts)
             .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
         for d in &mut self.decoders {
@@ -1790,7 +1874,37 @@ impl ZeroCopyDualStreamFisheyeIter {
     /// [`next_pair`](Self::next_pair) (texture wrapping, the clean path) and
     /// [`next_p010_pair`](Self::next_p010_pair) (raw `CVPixelBuffer`s for the
     /// zero-copy denoise path). Returns the two VT frames + clip-time pts.
+    /// Decode the next pair, rolling over to the next segment at EOF and
+    /// rebasing the pts onto the global chain timeline.
     fn decode_frame_pair(
+        &mut self,
+    ) -> Result<Option<([ffmpeg_next::frame::Video; 2], f64)>> {
+        loop {
+            match self.decode_one_segment()? {
+                Some(([f0, f1], local_pts)) => {
+                    let pts_s = local_pts
+                        + self.seg_start_s.get(self.cur_idx).copied().unwrap_or(0.0);
+                    return Ok(Some(([f0, f1], pts_s)));
+                }
+                None => {
+                    if self.cur_idx + 1 >= self.seg_paths.len() {
+                        return Ok(None);
+                    }
+                    self.cur_idx += 1;
+                    let path = self.seg_paths[self.cur_idx].clone();
+                    tracing::info!(
+                        "ZeroCopyDualStreamFisheyeIter: → segment {}/{}",
+                        self.cur_idx + 1, self.seg_paths.len()
+                    );
+                    self.reopen(&path)?;
+                }
+            }
+        }
+    }
+
+    /// Decode one pair from the CURRENT segment (local pts). `None` at this
+    /// segment's EOF — [`decode_frame_pair`] then advances the chain.
+    fn decode_one_segment(
         &mut self,
     ) -> Result<Option<([ffmpeg_next::frame::Video; 2], f64)>> {
         if self.frame_limit > 0 && self.frames_yielded >= self.frame_limit {
@@ -1989,6 +2103,13 @@ pub struct DenoisingZeroCopyIter {
     pending_pts: std::collections::VecDeque<f64>,
     ready: std::collections::VecDeque<ZeroCopyFisheyePair>,
     inner_done: bool,
+    /// Don't denoise frames before this pts (the trim-in, set by `seek`): pre-trim
+    /// frames are still DECODED (P-frame dependency) but skipping their denoise
+    /// avoids burning GPU on frames the export's trim discards — which is what
+    /// made a deep trim_in take a long time to produce the first output frame.
+    /// `NEG_INFINITY` = denoise everything.
+    skip_until_pts: f64,
+    n_skipped: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -2007,6 +2128,8 @@ impl DenoisingZeroCopyIter {
             pending_pts: std::collections::VecDeque::new(),
             ready: std::collections::VecDeque::new(),
             inner_done: false,
+            skip_until_pts: f64::NEG_INFINITY,
+            n_skipped: 0,
         })
     }
 
@@ -2023,6 +2146,10 @@ impl DenoisingZeroCopyIter {
         self.pending_pts.clear();
         self.ready.clear();
         self.inner_done = false;
+        // The seek target is the trim-in: skip denoising everything before it
+        // (decode-only) so a deep trim doesn't denoise thousands of dropped frames.
+        self.skip_until_pts = target_s;
+        self.n_skipped = 0;
         Ok(())
     }
 
@@ -2039,6 +2166,22 @@ impl DenoisingZeroCopyIter {
             }
             match self.inner.next_p010_pair()? {
                 Some((l_src, r_src, pts)) => {
+                    // Pre-trim frames: decode is required (P-frame chain) but skip
+                    // the denoise — the export's trim discards them anyway, and the
+                    // filter restarts at the trim point regardless.
+                    if pts < self.skip_until_pts {
+                        drop(l_src);
+                        drop(r_src);
+                        self.n_skipped += 1;
+                        continue;
+                    }
+                    if self.n_skipped > 0 {
+                        tracing::info!(
+                            "DenoisingZeroCopyIter: skipped denoise on {} pre-trim frames (decode-only)",
+                            self.n_skipped
+                        );
+                        self.n_skipped = 0;
+                    }
                     self.pending_pts.push_back(pts);
                     let louts = self.left.push(device, l_src.as_raw())?;
                     let routs = self.right.push(device, r_src.as_raw())?;

@@ -78,6 +78,10 @@ pub struct FisheyeExportConfig {
     pub segments: Vec<PathBuf>,
     pub output_path: PathBuf,
     pub source_kind: SourceKind,
+    /// Optional pre-loaded IMU handed in by the caller (the GUI's preview cache),
+    /// so a clip you already previewed isn't re-read from disk on export. `None`
+    /// → resolve it here (calib-only when not stabilizing).
+    pub preloaded_imu: Option<std::sync::Arc<vr180_fisheye::DjiOsvImu>>,
     /// Which audio track to write (`.360` stereo / ambisonic / APAC).
     pub audio_track: AudioTrack,
     /// One eye's output dimensions (the SBS file is `2*eye_w × eye_h`).
@@ -494,6 +498,48 @@ fn fisheye_export_opener(
     })
 }
 
+/// Resolve the DJI OSV IMU for an export, cheapest path first:
+///   1. reuse a `preloaded_imu` handed in by the GUI (its preview cache), so a
+///      clip already previewed doesn't re-read the (minutes-long) djmd;
+///   2. if NOT stabilizing, read only the lens-calib head (fast) — the heavy
+///      per-frame quats aren't needed, just the dewarp calibration;
+///   3. otherwise read the full IMU (single file, or parse_multi over segments
+///      so quats index by absolute frame across a merged recording).
+/// Returns `None` for non-OSV or on failure (caller falls back to preset calib).
+fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
+    if !matches!(cfg.source_kind, SourceKind::DjiOsv) { return None; }
+    if let Some(arc) = &cfg.preloaded_imu {
+        // Reuse only if it covers what this export needs (full quats if stabilizing).
+        if !cfg.stabilize || !arc.frame_quats.is_empty() {
+            return Some((**arc).clone());
+        }
+    }
+    if !cfg.stabilize {
+        let calib_src = cfg.segments.first().unwrap_or(&cfg.source_path);
+        return crate::decode::extract_dji_calib_blob(calib_src).ok()
+            .and_then(|b| vr180_fisheye::DjiOsvImu::parse(&b).ok());
+    }
+    let parsed: Result<vr180_fisheye::DjiOsvImu> = if cfg.segments.len() > 1 {
+        let mut blobs = Vec::with_capacity(cfg.segments.len());
+        for p in &cfg.segments {
+            match crate::decode::extract_dji_meta_stream(p) {
+                Ok(b) => blobs.push(b),
+                Err(e) => { tracing::warn!("dji meta: {e}"); return None; }
+            }
+        }
+        vr180_fisheye::DjiOsvImu::parse_multi(&blobs)
+            .map_err(|e| Error::Ffmpeg(format!("dji parse_multi: {e}")))
+    } else {
+        crate::decode::extract_dji_meta_stream(&cfg.source_path)
+            .and_then(|blob| vr180_fisheye::DjiOsvImu::parse(&blob)
+                .map_err(|e| Error::Ffmpeg(format!("dji parse: {e}"))))
+    };
+    match parsed {
+        Ok(imu) => Some(imu),
+        Err(e) => { tracing::warn!("dji meta: {e}"); None }
+    }
+}
+
 pub fn export_fisheye(
     pipeline: Arc<Device>,
     cfg: FisheyeExportConfig,
@@ -530,13 +576,12 @@ pub fn export_fisheye(
         // This means 8-bit no longer pays the CPU-roundtrip decode the
         // general path uses (download → swscale → re-upload per frame),
         // which made 8-bit export slower than 10-bit.
-        // Single-segment only: the zero-copy iterator opens one file. A
-        // merged recording (cfg.segments.len() > 1) falls through to the
-        // portable loop below, which chains segments via SegmentedFisheyeIter.
+        // Handles a merged recording too: the zero-copy iterator chains its
+        // segments internally (new_segmented), so denoise + stab stay on the
+        // fast GPU path across seams instead of dropping to the portable loop.
         let can_zero_copy_decode = matches!(cfg.source_kind, SourceKind::DjiOsv)
             && on_macos_vt
-            && (cfg.bit_depth == 10 || cfg.bit_depth == 8)
-            && cfg.segments.len() <= 1;
+            && (cfg.bit_depth == 10 || cfg.bit_depth == 8);
         // NB: denoise (cfg.denoise_strength > 0) STAYS on this fast path — the
         // zero-copy export denoises the P010 IOSurfaces on the GPU via
         // DenoisingZeroCopyIter, with no CPU bounce (≈3× faster than dropping
@@ -720,32 +765,7 @@ pub fn export_fisheye(
     let (src_w, src_h) = decoder.eye_dims();
 
     // ── DJI: extract protobuf for per-eye calib + (optional) stab ─
-    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = if matches!(
-        cfg.source_kind, SourceKind::DjiOsv
-    ) {
-        // Single file → parse; merged recording → parse_multi (concatenate
-        // each segment's protobuf so IMU indexes by absolute frame).
-        let parsed: Result<vr180_fisheye::DjiOsvImu> = if cfg.segments.len() > 1 {
-            let mut blobs = Vec::with_capacity(cfg.segments.len());
-            let mut acc: Result<()> = Ok(());
-            for p in &cfg.segments {
-                match crate::decode::extract_dji_meta_stream(p) {
-                    Ok(b) => blobs.push(b),
-                    Err(e) => { acc = Err(e); break; }
-                }
-            }
-            acc.and_then(|()| vr180_fisheye::DjiOsvImu::parse_multi(&blobs)
-                .map_err(|e| Error::Ffmpeg(format!("dji parse_multi: {e}"))))
-        } else {
-            crate::decode::extract_dji_meta_stream(&cfg.source_path)
-                .and_then(|blob| vr180_fisheye::DjiOsvImu::parse(&blob)
-                    .map_err(|e| Error::Ffmpeg(format!("dji parse: {e}"))))
-        };
-        match parsed {
-            Ok(imu) => Some(imu),
-            Err(e) => { tracing::warn!("dji meta: {e}"); None }
-        }
-    } else { None };
+    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = resolve_export_imu(&cfg);
 
     // ── Resolve per-eye calibrations ─────────────────────────────
     let (calib_left, calib_right) = resolve_calib_pair(
@@ -1833,14 +1853,26 @@ fn export_fisheye_osv_zerocopy_p010(
         DenoisingZeroCopyIter, ZcDecoder, ZeroCopyDualStreamFisheyeIter,
     };
 
-    // Open zero-copy decoder. OSV swap convention mirrors
-    // DualStreamFisheyeIter: !cfg.fisheye_swap_eyes means swap on by
-    // default (Lens A == stream 0 == right eye).
-    let raw = ZeroCopyDualStreamFisheyeIter::new(
-        &cfg.source_path,
-        0, // no frame limit
-        !cfg.fisheye_swap_eyes,
-    )?;
+    // Per-segment durations (for a merged recording): chain the decoder, rebase
+    // pts, and total the frame count. Fast moov probe (no find_stream_info).
+    let seg_durs: Vec<f64> = if cfg.segments.len() > 1 {
+        cfg.segments.iter()
+            .map(|p| crate::decode::probe_duration_via_moov(p).ok()
+                .or_else(|| crate::decode::probe_video(p).ok().map(|pr| pr.duration_sec))
+                .unwrap_or(0.0))
+            .collect()
+    } else { Vec::new() };
+
+    // Open zero-copy decoder. OSV swap convention mirrors DualStreamFisheyeIter:
+    // !cfg.fisheye_swap_eyes means swap on by default (Lens A == stream 0 ==
+    // right eye). A merged recording chains its segments into one stream.
+    let raw = if cfg.segments.len() > 1 {
+        ZeroCopyDualStreamFisheyeIter::new_segmented(
+            &cfg.segments, &seg_durs, 0, !cfg.fisheye_swap_eyes,
+        )?
+    } else {
+        ZeroCopyDualStreamFisheyeIter::new(&cfg.source_path, 0, !cfg.fisheye_swap_eyes)?
+    };
     // Temporal NR, if requested, wraps the decoder and denoises the P010
     // IOSurfaces on the GPU (no CPU readback) — the whole reason this path
     // is fast. Falls back to the raw decoder when off / unsupported.
@@ -1856,21 +1888,20 @@ fn export_fisheye_osv_zerocopy_p010(
     let (src_w, src_h) = decoder.eye_dims();
 
     // Extract DJI protobuf for per-eye calibration (and stab data).
-    let dji_osv_imu = match crate::decode::extract_dji_meta_stream(&cfg.source_path) {
-        Ok(blob) => match vr180_fisheye::DjiOsvImu::parse(&blob) {
-            Ok(imu) => Some(imu),
-            Err(e) => { tracing::warn!("dji protobuf parse: {e}"); None }
-        },
-        Err(e) => { tracing::warn!("dji meta extract: {e}"); None }
-    };
+    let dji_osv_imu = resolve_export_imu(&cfg);
     let (calib_left, calib_right) = resolve_calib_pair(
         &cfg, src_w, src_h, dji_osv_imu.as_ref(),
     );
 
-    // Stab rotations (OSV is locked to camera-lock per the GUI panel).
-    let total_clip_frames = crate::decode::probe_video(&cfg.source_path)
-        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
-        .unwrap_or(0).max(1);
+    // Stab rotations span the whole chain (a merged recording indexes by
+    // absolute frame). Total = chain duration × fps for multi-segment.
+    let total_clip_frames = if cfg.segments.len() > 1 {
+        (seg_durs.iter().sum::<f64>() * cfg.fps as f64).round() as usize
+    } else {
+        crate::decode::probe_video(&cfg.source_path)
+            .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+            .unwrap_or(0)
+    }.max(1);
     let stab_rotations: Option<Vec<crate::gpu::EquirectRotation>> = if cfg.stabilize {
         dji_osv_imu.as_ref().and_then(|osv| {
             let max_corr = if cfg.dji_max_corr_deg > 0.0 {
@@ -2182,14 +2213,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     );
 
     // ── Per-eye calib + stab from the OSV protobuf (same as portable) ──
-    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> =
-        match crate::decode::extract_dji_meta_stream(&cfg.source_path) {
-            Ok(blob) => match vr180_fisheye::DjiOsvImu::parse(&blob) {
-                Ok(imu) => Some(imu),
-                Err(e) => { tracing::warn!("zc export: dji protobuf parse: {e}"); None }
-            },
-            Err(e) => { tracing::warn!("zc export: dji meta extract: {e}"); None }
-        };
+    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = resolve_export_imu(&cfg);
     let (calib_left, calib_right) =
         resolve_calib_pair(&cfg, src_w, src_h, dji_osv_imu.as_ref());
 
@@ -2565,11 +2589,7 @@ fn export_fisheye_osv_gpu_resident(
         src_w, src_h, nw, nh, sbs_w, sbs_h
     );
 
-    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> =
-        match crate::decode::extract_dji_meta_stream(&cfg.source_path) {
-            Ok(blob) => vr180_fisheye::DjiOsvImu::parse(&blob).ok(),
-            Err(_) => None,
-        };
+    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = resolve_export_imu(&cfg);
     let (calib_left, calib_right) = resolve_calib_pair(&cfg, src_w, src_h, dji_osv_imu.as_ref());
 
     let total_clip_frames = crate::decode::probe_video(&cfg.source_path)

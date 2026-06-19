@@ -1119,6 +1119,9 @@ impl App {
         vr180_pipeline::fisheye_export::FisheyeExportConfig {
             source_path: source_path.to_path_buf(),
             segments,
+            // Reuse the IMU the preview already loaded for this clip (if cached),
+            // so exporting a just-previewed file skips the djmd re-read.
+            preloaded_imu: crate::decoder::cached_dji_imu(source_path),
             output_path: output_path.to_path_buf(),
             source_kind,
             audio_track: match settings.audio_format {
@@ -1947,13 +1950,22 @@ impl App {
         let mut groups: Vec<ImportGroup> = Vec::new();
         let mut claimed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-        // 1) The OSV multi-selection → one merge candidate (sorted by name,
-        //    which for `CAM_<timestamp>_<idx>_…` is chronological = segment
-        //    order). A lone OSV falls through to step 2 as a singleton.
+        // 1) The OSV multi-selection → one merge candidate, ordered by the DJI
+        //    file index so the merge concatenates in CAPTURE sequence. A lone
+        //    OSV falls through to step 2 as a singleton.
         let mut osv: Vec<PathBuf> = paths.iter()
             .filter(|p| matches!(kind_of(p), SourceKind::DjiOsv))
             .cloned().collect();
-        osv.sort();
+        // `CAM_<timestamp>_<index>_D.OSV` → sort by the numeric <index>
+        // (…_0040_… < …_0041_… < …_0042_…). The index is the reliable monotonic
+        // counter; a plain name/path sort keys on the timestamp first and can
+        // disagree if it differs between segments. Tie-break by name for any
+        // non-conforming filename so the order stays deterministic.
+        osv.sort_by_cached_key(|p| {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let idx = name.split('_').nth(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(u64::MAX);
+            (idx, name)
+        });
         if osv.len() > 1 {
             for p in &osv { claimed.insert(p.clone()); }
             groups.push(ImportGroup {
@@ -2220,13 +2232,21 @@ impl App {
         // Duration + frame count span the WHOLE segment chain (GS01…, GS02…).
         // Single-segment: just this file's probe.
         let (duration_sec, frame_count) = if segments.len() > 1 {
-            let probes: Vec<_> = segments.iter()
-                .filter_map(|s| vr180_pipeline::decode::probe_video(s).ok())
-                .collect();
-            let total_dur: f64 = probes.iter().map(|p| p.duration_sec).sum();
-            let total_frames: u32 = probes.iter()
-                .map(|p| (p.duration_sec * p.fps as f64).round() as u32)
-                .sum();
+            // Sum each segment's duration via the FAST moov/mvhd probe, run
+            // concurrently. ffmpeg's find_stream_info (probe_video) does scattered
+            // packet reads (~10 s per cold segment on SMB) — for a 5-chapter clip
+            // that blocked the load ~40 s. fps is uniform across the chain.
+            let fps = probe.fps.max(1e-3) as f64;
+            let durs: Vec<f64> = std::thread::scope(|sc| {
+                let hs: Vec<_> = segments.iter().map(|s| sc.spawn(move || {
+                    vr180_pipeline::decode::probe_duration_via_moov(s).ok()
+                        .or_else(|| vr180_pipeline::decode::probe_video(s).ok().map(|p| p.duration_sec))
+                        .unwrap_or(0.0)
+                })).collect();
+                hs.into_iter().map(|h| h.join().unwrap_or(0.0)).collect()
+            });
+            let total_dur: f64 = durs.iter().sum();
+            let total_frames = (total_dur * fps).round() as u32;
             tracing::info!(
                 "multi-segment: {} chapters → {:.1}s, {} frames total",
                 segments.len(), total_dur, total_frames);
@@ -2433,6 +2453,8 @@ impl App {
             detail_tx: parking_lot::Mutex::new(Some(detail_tx)),
             finished: std::sync::atomic::AtomicBool::new(false),
             imu_ready: std::sync::atomic::AtomicBool::new(false),
+            imu_progress: Default::default(),
+            stab_loading: std::sync::atomic::AtomicBool::new(false),
         });
         let pipeline = self.pipeline.clone();
         let control_for_thread = control.clone();
@@ -2445,6 +2467,9 @@ impl App {
             // Signal the UI that this decoder is gone. If it never delivered
             // a frame, `poll_load` uses this to clear `decoder_starting` so a
             // cold-read failure can't wedge Play permanently.
+            // Abort any in-flight/paused background IMU read so it doesn't leak
+            // its thread + file handle past the decoder's life.
+            control_for_thread.imu_progress.abort.store(true, std::sync::atomic::Ordering::SeqCst);
             control_for_thread.finished.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         self.frame_rx = Some(frame_rx);
@@ -4048,8 +4073,21 @@ impl App {
         // per-frame quaternions — needed for stabilization — in the background.
         // While they load, gray the controls; the decoder auto-applies stab the
         // moment they're in (if the box is checked).
-        let imu_loading = is_osv && self.control.as_ref()
-            .map(|c| !c.imu_ready.load(Ordering::SeqCst)).unwrap_or(false);
+        // OSV streams the per-frame quats in the background, but ONLY while
+        // stabilization is on. `stab_loading` = a read is in flight (spinner +
+        // Cancel); `imu_ready` = the quats are loaded (sliders usable).
+        let stab_loading = is_osv && self.control.as_ref()
+            .map(|c| c.stab_loading.load(Ordering::SeqCst)).unwrap_or(false);
+        // Paused = user turned stab off mid-load: the read stays alive under the
+        // hood (and resumes on re-enable), but the loading UI is hidden.
+        let stab_paused = is_osv && self.control.as_ref()
+            .map(|c| c.imu_progress.pause.load(Ordering::SeqCst)).unwrap_or(false);
+        let show_loading = stab_loading && !stab_paused;
+        let quats_ready = !is_osv || self.control.as_ref()
+            .map(|c| c.imu_ready.load(Ordering::SeqCst)).unwrap_or(false);
+        let imu_pct = if show_loading {
+            self.control.as_ref().map(|c| c.imu_progress.percent()).unwrap_or(0)
+        } else { 0 };
         let s = &mut self.settings;
 
         if !(is_braw || is_osv) {
@@ -4063,37 +4101,46 @@ impl App {
         } else {
             tr("Stabilization (DJI camera quats)")
         };
-        ui.add_enabled_ui(!imu_loading, |ui| {
-            ui.checkbox(&mut s.stabilize, stab_label);
-            ui.add_enabled_ui(s.stabilize, |ui| {
-                if is_osv {
-                    // smooth_ms = 0 → sharp camera-lock (legacy).
-                    // smooth_ms > 0 → soft-stab (GoPro-style).
-                    ui.add(egui::Slider::new(&mut s.dji_smooth_ms, 0.0..=3000.0)
-                        .text(tr("Smooth (ms)")));
-                    ui.add(egui::Slider::new(&mut s.dji_max_corr_deg, 0.0..=45.0)
-                        .text(tr("Max corr (°)")));
-                    // Velocity→smoothing response curve (Python "Response").
-                    // <1 follows motion early; >1 holds longer, then catches up.
-                    ui.add(egui::Slider::new(&mut s.dji_responsiveness, 0.2..=3.0)
-                        .fixed_decimals(1)
-                        .text(tr("Response")));
-                    // IMU sample timing is fixed at SROT/2 (readout midpoint),
-                    // re-seeded per clip from its own fps — no manual override, so
-                    // the slider is hidden. Still assert the main-thread thread-local
-                    // so paused detail-still renders use this clip's phase.
-                    vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
-                }
-            });
+        // The checkbox is ALWAYS enabled: turning it ON starts the quat load,
+        // turning it OFF cancels an in-flight load — so it doubles as Cancel.
+        ui.checkbox(&mut s.stabilize, stab_label);
+        // Stab sliders need the loaded quats — enabled only once ready.
+        ui.add_enabled_ui(s.stabilize && quats_ready, |ui| {
+            if is_osv {
+                // smooth_ms = 0 → sharp camera-lock (legacy).
+                // smooth_ms > 0 → soft-stab (GoPro-style).
+                ui.add(egui::Slider::new(&mut s.dji_smooth_ms, 0.0..=3000.0)
+                    .text(tr("Smooth (ms)")));
+                ui.add(egui::Slider::new(&mut s.dji_max_corr_deg, 0.0..=45.0)
+                    .text(tr("Max corr (°)")));
+                // Velocity→smoothing response curve (Python "Response").
+                // <1 follows motion early; >1 holds longer, then catches up.
+                ui.add(egui::Slider::new(&mut s.dji_responsiveness, 0.2..=3.0)
+                    .fixed_decimals(1)
+                    .text(tr("Response")));
+                // IMU sample timing is fixed at SROT/2 (readout midpoint),
+                // re-seeded per clip from its own fps — no manual override, so
+                // the slider is hidden. Still assert the main-thread thread-local
+                // so paused detail-still renders use this clip's phase.
+                vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
+            }
         });
-        if imu_loading {
+        if show_loading {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(RichText::new(tr("Loading stabilization data…"))
+                let txt = if imu_pct > 0 {
+                    format!("{} {}%", tr("Loading stabilization data…"), imu_pct)
+                } else {
+                    tr("Loading stabilization data…").to_string()
+                };
+                ui.label(RichText::new(txt)
                     .small().color(Color32::from_rgb(120, 180, 120)));
+                // Cancel = turn stabilization off, which aborts the in-flight read.
+                if ui.button(tr("Cancel")).clicked() {
+                    s.stabilize = false;
+                }
             });
-            // Keep the UI repainting so the spinner animates + the controls
-            // un-gray promptly when the background IMU load finishes.
+            // Keep repainting so the spinner animates + the % updates while loading.
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
     }

@@ -719,6 +719,15 @@ pub struct DecoderControl {
     /// once they're in (or immediately for non-OSV / already-cached clips). The
     /// UI grays the Stabilization panel + shows a spinner while this is `false`.
     pub imu_ready: AtomicBool,
+    /// Progress of the background per-frame IMU (quaternion) read, for the UI's
+    /// "Loading stabilization data… NN%". Chunk `done`/`total`; 0% until the
+    /// sample table is parsed. `Arc` so the background reader thread updates it
+    /// while the UI polls it. See [`load_dji_imu_progressive`].
+    pub imu_progress: std::sync::Arc<vr180_pipeline::decode::ReadProgress>,
+    /// True while the background per-frame quat read is in flight (drives the
+    /// loading spinner + a double-spawn guard). The read runs ONLY when
+    /// stabilization is on; canceling stab aborts it via `imu_progress.cancel`.
+    pub stab_loading: AtomicBool,
 }
 
 /// One eye's in-file calibration, in the same units the UI's per-eye
@@ -788,7 +797,7 @@ fn load_or_publish_dji_imu(
         }
         vr180_fisheye::DjiOsvImu::parse_multi(&blobs)
             .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("dji parse_multi: {e}")))
-    } else if let Some(arc) = cached_dji_imu(&cfg.path) {
+    } else if let Some(arc) = cached_dji_imu(&cfg.path).filter(|a| !a.frame_quats.is_empty()) {
         tracing::info!("decoder (fisheye/osv): reusing cached DJI metadata for {}", cfg.path.display());
         Ok((*arc).clone())
     } else {
@@ -853,7 +862,7 @@ fn seed_detected_calib(
 fn load_dji_imu_progressive(
     cfg: &DecoderConfig,
     kind: vr180_pipeline::SourceKind,
-    control: &DecoderControl,
+    control: &std::sync::Arc<DecoderControl>,
     src_w: u32,
     src_h: u32,
 ) -> Option<vr180_fisheye::DjiOsvImu> {
@@ -873,36 +882,43 @@ fn load_dji_imu_progressive(
     }
     // Merged recording (parse_multi) has no single-file fast-calib path — load
     // it fully (blocking). Same for a fast-calib miss below.
-    let fast = if cfg.segments.len() > 1 {
-        None
-    } else {
-        vr180_pipeline::decode::extract_dji_calib_blob(&cfg.path).ok()
-            .and_then(|b| vr180_fisheye::DjiOsvImu::parse(&b).ok())
-            .filter(|imu| imu.lens_a.fx.is_some() || imu.lens_b.fx.is_some())
-    };
+    // Fast calib from the FIRST segment's head (single file → that IS cfg.path).
+    // Works for merged recordings too: the per-lens calib is identical across
+    // segments, so we can dewarp immediately and stream ALL segments' quats in
+    // the background — same progressive/pausable path as a single file.
+    let calib_src = cfg.segments.first().cloned().unwrap_or_else(|| cfg.path.clone());
+    let fast = vr180_pipeline::decode::extract_dji_calib_blob(&calib_src).ok()
+        .and_then(|b| vr180_fisheye::DjiOsvImu::parse(&b).ok())
+        .filter(|imu| imu.lens_a.fx.is_some() || imu.lens_b.fx.is_some());
     match fast {
         Some(partial) => {
             tracing::info!(
                 "decoder (fisheye/osv): fast calib loaded (lens_a.fx={:?}) — preview now; \
                  full IMU streaming in background", partial.lens_a.fx);
             seed_detected_calib(control, &partial, src_w, src_h);
+            // Publish a CALIB-ONLY copy (quats stripped) so the full-res zoom-still
+            // resolves the SAME lens calibration as the live preview *during*
+            // loading. Without it the still's cache lookup misses and falls back to
+            // the centered preset — the image shifts when you zoom until the full
+            // IMU lands. Quats are cleared so (a) the still doesn't stabilize while
+            // the live view (gated on imu_ready) doesn't, and (b) the "cache is
+            // full" check (`!frame_quats.is_empty()`) still skips it. The
+            // background thread overwrites this with the full IMU below.
+            {
+                let mut calib_only = partial.clone();
+                calib_only.frame_quats.clear();
+                calib_only.gravity.clear();
+                calib_only.high_rate_quats.clear();
+                cache_dji_imu(&cfg.path, std::sync::Arc::new(calib_only));
+            }
             control.imu_ready.store(false, Ordering::SeqCst);
-            // Background: full extract + parse + cache. The decode loop polls the
-            // cache (try_upgrade_dji_imu) and swaps it in + recomputes stab.
-            let path = cfg.path.clone();
-            std::thread::spawn(move || {
-                match vr180_pipeline::decode::extract_dji_meta_stream(&path)
-                    .and_then(|b| vr180_fisheye::DjiOsvImu::parse(&b)
-                        .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("dji parse: {e}"))))
-                {
-                    Ok(full) => {
-                        tracing::info!("decoder (fisheye/osv): full IMU ready ({} frame_quats) for {}",
-                            full.frame_quats.len(), path.display());
-                        cache_dji_imu(&path, std::sync::Arc::new(full));
-                    }
-                    Err(e) => tracing::warn!("background full IMU load failed: {e}"),
-                }
-            });
+            // Only read the heavy per-frame quats if stabilization is ON. If it's
+            // off, skip the (minutes-long on SMB) read entirely — it starts when the
+            // user enables stabilization (the decode loop's live toggle calls
+            // spawn_dji_quat_load). The calib above is already cached for dewarp.
+            if control.settings.read().stabilize {
+                spawn_dji_quat_load(cfg, control);
+            }
             Some(partial)
         }
         None => {
@@ -914,19 +930,82 @@ fn load_dji_imu_progressive(
     }
 }
 
-/// Decode-loop helper for [`load_dji_imu_progressive`]: if we're currently on a
-/// calib-only partial (empty `frame_quats`) and the background thread has now
-/// cached the full IMU, return it so the loop can swap it in + recompute stab.
-/// Returns `None` otherwise (already full, or not ready yet).
+/// Spawn the background per-frame IMU (quaternion) read for a DJI OSV clip and
+/// publish the full IMU to the cache when done. Only called when stabilization
+/// is ON (at load, or when the user toggles it on). Resets progress + the cancel
+/// flag, marks `stab_loading`, and on completion bumps `settings_generation` so
+/// the decode loop (even paused) wakes to swap it in. Canceling stabilization
+/// sets `imu_progress.cancel`, which aborts the in-flight read.
+fn spawn_dji_quat_load(cfg: &DecoderConfig, control: &std::sync::Arc<DecoderControl>) {
+    use std::sync::atomic::Ordering;
+    control.imu_progress.done.store(0, Ordering::SeqCst);
+    control.imu_progress.total.store(0, Ordering::SeqCst);
+    control.imu_progress.pause.store(false, Ordering::SeqCst);
+    control.imu_progress.abort.store(false, Ordering::SeqCst);
+    control.stab_loading.store(true, Ordering::SeqCst);
+    let path = cfg.path.clone();
+    // Segments to read: a merged recording reads + concatenates each segment's
+    // djmd (parse_multi indexes by ABSOLUTE frame); a single file is one segment.
+    // The shared `progress` accumulates `total`/`done` across all segments, so the
+    // % spans the whole recording, and pause/abort are honored per-segment read.
+    let segments: Vec<std::path::PathBuf> = if cfg.segments.len() > 1 {
+        cfg.segments.clone()
+    } else {
+        vec![path.clone()]
+    };
+    let progress = control.imu_progress.clone();
+    let control_bg = std::sync::Arc::clone(control);
+    std::thread::spawn(move || {
+        let parsed = (|| -> vr180_pipeline::Result<vr180_fisheye::DjiOsvImu> {
+            if segments.len() == 1 {
+                let b = vr180_pipeline::decode::extract_dji_meta_stream_with_progress(&segments[0], &progress)?;
+                vr180_fisheye::DjiOsvImu::parse(&b)
+                    .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("dji parse: {e}")))
+            } else {
+                let mut blobs = Vec::with_capacity(segments.len());
+                for seg in &segments {
+                    blobs.push(vr180_pipeline::decode::extract_dji_meta_stream_with_progress(seg, &progress)?);
+                }
+                vr180_fisheye::DjiOsvImu::parse_multi(&blobs)
+                    .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("dji parse_multi: {e}")))
+            }
+        })();
+        match parsed {
+            Ok(full) => {
+                tracing::info!("decoder (fisheye/osv): full IMU ready ({} frame_quats, {} seg) for {}",
+                    full.frame_quats.len(), segments.len(), path.display());
+                cache_dji_imu(&path, std::sync::Arc::new(full));
+                // Wake the decode loop to swap it in (even when paused); the loop
+                // clears `stab_loading` once it applies the IMU.
+                control_bg.settings_generation.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(e) => {
+                // Failed OR aborted — stop the spinner; quats just aren't loaded.
+                tracing::warn!("background full IMU load ended: {e}");
+                control_bg.stab_loading.store(false, Ordering::SeqCst);
+                control_bg.settings_generation.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+}
+
+/// Decode-loop helper for [`load_dji_imu_progressive`]: while we're on the
+/// calib-fast partial and the background thread has since cached the full IMU
+/// (MORE frame_quats than we hold now), return it so the loop can swap it in +
+/// recompute stab. `None` otherwise (non-OSV, or no newer IMU yet).
 fn try_upgrade_dji_imu(
     cfg: &DecoderConfig, current: Option<&vr180_fisheye::DjiOsvImu>,
 ) -> Option<vr180_fisheye::DjiOsvImu> {
-    if current.map_or(true, |i| !i.frame_quats.is_empty()) {
-        return None; // non-OSV, or already have the full IMU
-    }
+    // Compare COUNTS, not emptiness: the first djmd sample can already carry the
+    // first frame's quat, so the calib-fast partial isn't necessarily empty — an
+    // `is_empty()` test would wrongly conclude "already full" and never upgrade.
+    let cur_n = current?.frame_quats.len(); // None ⇒ non-OSV ⇒ never upgrade
     let arc = cached_dji_imu(&cfg.path)?;
-    if arc.frame_quats.is_empty() { return None; }
-    Some((*arc).clone())
+    if arc.frame_quats.len() > cur_n {
+        Some((*arc).clone())
+    } else {
+        None
+    }
 }
 
 /// One frame ready for display. `texture` is a square BGRA-bytes
@@ -1509,7 +1588,7 @@ fn run_fisheye(
         // ── Progressive IMU: swap the calib-only partial for the full IMU once
         //    the background load finishes, then compute stabilization (auto-on
         //    if `stabilize` is set). Cheap no-op once `imu_ready`.
-        if !control.imu_ready.load(Ordering::SeqCst) {
+        if !control.imu_ready.load(Ordering::SeqCst) && control.stab_loading.load(Ordering::SeqCst) {
             if let Some(full) = try_upgrade_dji_imu(cfg, dji_osv_imu.as_ref()) {
                 dji_osv_imu = Some(full);
                 if control.settings.read().stabilize {
@@ -1517,6 +1596,8 @@ fn run_fisheye(
                     last_stabilize_state = true;
                 }
                 control.imu_ready.store(true, Ordering::SeqCst);
+                control.stab_loading.store(false, Ordering::SeqCst);
+                force_render_next = true; // re-render the held frame with the new IMU/stab
                 tracing::info!("decoder (fisheye): full IMU applied — stabilization enabled");
             }
         }
@@ -1527,11 +1608,20 @@ fn run_fisheye(
         let now_stabilize = control.settings.read().stabilize;
         if now_stabilize != last_stabilize_state {
             if now_stabilize {
-                tracing::info!("decoder (fisheye): stabilize ON → computing stab");
-                stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control, fps);
+                if control.imu_ready.load(Ordering::SeqCst) {
+                    tracing::info!("decoder (fisheye): stabilize ON → computing stab");
+                    stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control, fps);
+                } else if control.stab_loading.load(Ordering::SeqCst) {
+                    tracing::info!("decoder (fisheye): stabilize ON → resuming IMU load");
+                    control.imu_progress.pause.store(false, Ordering::SeqCst);
+                } else {
+                    tracing::info!("decoder (fisheye): stabilize ON → starting IMU load");
+                    spawn_dji_quat_load(cfg, &control);
+                }
             } else {
-                tracing::info!("decoder (fisheye): stabilize OFF → dropping stab cache");
+                tracing::info!("decoder (fisheye): stabilize OFF → pausing IMU load");
                 stab_rotations = None;
+                control.imu_progress.pause.store(true, Ordering::SeqCst);
             }
             last_stabilize_state = now_stabilize;
             // Keep the live-recompute hash in sync so the settings-change
@@ -2177,7 +2267,7 @@ fn run_fisheye_zerocopy(
         // Progressive IMU: swap the calib-only partial for the full IMU once the
         // background load finishes, then compute stabilization (auto-on if
         // `stabilize` is set). Cheap no-op once `imu_ready`.
-        if !control.imu_ready.load(Ordering::SeqCst) {
+        if !control.imu_ready.load(Ordering::SeqCst) && control.stab_loading.load(Ordering::SeqCst) {
             if let Some(full) = try_upgrade_dji_imu(cfg, dji_osv_imu.as_ref()) {
                 dji_osv_imu = Some(full);
                 if control.settings.read().stabilize {
@@ -2185,6 +2275,8 @@ fn run_fisheye_zerocopy(
                     last_stabilize_state = true;
                 }
                 control.imu_ready.store(true, Ordering::SeqCst);
+                control.stab_loading.store(false, Ordering::SeqCst);
+                force_render_next = true; // re-render the held frame with the new IMU/stab
                 tracing::info!("decoder (fisheye): full IMU applied — stabilization enabled");
             }
         }
@@ -2192,7 +2284,21 @@ fn run_fisheye_zerocopy(
         // Live stabilize toggle.
         let now_stabilize = control.settings.read().stabilize;
         if now_stabilize != last_stabilize_state {
-            stab_rotations = if now_stabilize { compute_stab(dji_osv_imu.as_ref(), &control) } else { None };
+            if now_stabilize {
+                if control.imu_ready.load(Ordering::SeqCst) {
+                    stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control);
+                } else if control.stab_loading.load(Ordering::SeqCst) {
+                    tracing::info!("decoder (fisheye): stabilize ON → resuming IMU load");
+                    control.imu_progress.pause.store(false, Ordering::SeqCst);
+                } else {
+                    tracing::info!("decoder (fisheye): stabilize ON → starting IMU load");
+                    spawn_dji_quat_load(cfg, &control);
+                }
+            } else {
+                tracing::info!("decoder (fisheye): stabilize OFF → pausing IMU load");
+                stab_rotations = None;
+                control.imu_progress.pause.store(true, Ordering::SeqCst);
+            }
             last_stabilize_state = now_stabilize;
         }
 
@@ -2610,7 +2716,7 @@ fn run_fisheye_vt_zerocopy(
         // Progressive IMU: swap the calib-only partial for the full IMU once the
         // background load finishes, then compute stabilization (auto-on if
         // `stabilize` is set). Cheap no-op once `imu_ready`.
-        if !control.imu_ready.load(Ordering::SeqCst) {
+        if !control.imu_ready.load(Ordering::SeqCst) && control.stab_loading.load(Ordering::SeqCst) {
             if let Some(full) = try_upgrade_dji_imu(cfg, dji_osv_imu.as_ref()) {
                 dji_osv_imu = Some(full);
                 if control.settings.read().stabilize {
@@ -2618,6 +2724,8 @@ fn run_fisheye_vt_zerocopy(
                     last_stabilize_state = true;
                 }
                 control.imu_ready.store(true, Ordering::SeqCst);
+                control.stab_loading.store(false, Ordering::SeqCst);
+                force_render_next = true; // re-render the held frame with the new IMU/stab
                 tracing::info!("decoder (fisheye): full IMU applied — stabilization enabled");
             }
         }
@@ -2625,7 +2733,21 @@ fn run_fisheye_vt_zerocopy(
         // Live stabilize toggle.
         let now_stabilize = control.settings.read().stabilize;
         if now_stabilize != last_stabilize_state {
-            stab_rotations = if now_stabilize { compute_stab(dji_osv_imu.as_ref(), &control) } else { None };
+            if now_stabilize {
+                if control.imu_ready.load(Ordering::SeqCst) {
+                    stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control);
+                } else if control.stab_loading.load(Ordering::SeqCst) {
+                    tracing::info!("decoder (fisheye): stabilize ON → resuming IMU load");
+                    control.imu_progress.pause.store(false, Ordering::SeqCst);
+                } else {
+                    tracing::info!("decoder (fisheye): stabilize ON → starting IMU load");
+                    spawn_dji_quat_load(cfg, &control);
+                }
+            } else {
+                tracing::info!("decoder (fisheye): stabilize OFF → pausing IMU load");
+                stab_rotations = None;
+                control.imu_progress.pause.store(true, Ordering::SeqCst);
+            }
             last_stabilize_state = now_stabilize;
         }
 
@@ -4057,10 +4179,10 @@ pub(crate) fn cache_dji_imu(path: &std::path::Path, imu: std::sync::Arc<vr180_fi
     c.retain(|(p, _)| p != path);
     c.push((path.to_path_buf(), imu));
     let n = c.len();
-    if n > 4 { c.drain(0..n - 4); } // keep the 4 most recent
+    if n > 8 { c.drain(0..n - 8); } // keep the 8 most recent
 }
 
-fn cached_dji_imu(path: &std::path::Path) -> Option<std::sync::Arc<vr180_fisheye::DjiOsvImu>> {
+pub(crate) fn cached_dji_imu(path: &std::path::Path) -> Option<std::sync::Arc<vr180_fisheye::DjiOsvImu>> {
     dji_imu_cache().lock().iter().find(|(p, _)| p == path).map(|(_, imu)| imu.clone())
 }
 
@@ -4088,7 +4210,7 @@ pub(crate) fn extract_gpmf_cached(path: &std::path::Path) -> vr180_pipeline::Res
     c.retain(|(p, _)| p != path);
     c.push((path.to_path_buf(), arc.clone()));
     let n = c.len();
-    if n > 4 { c.drain(0..n - 4); } // keep the 4 most recent
+    if n > 8 { c.drain(0..n - 8); } // keep the 8 most recent
     Ok((*arc).clone())
 }
 
@@ -4175,7 +4297,7 @@ impl DetailCache {
 
         // Stabilization — recompute when the stab params change OR when the
         // IMU first becomes available (folded into the key).
-        let sk = stab_key(s) ^ (imu.is_some() as u64);
+        let sk = stab_key(s) ^ imu.as_ref().map_or(0, |i| i.frame_quats.len() as u64);
         if self.cached_stab_key != sk {
             self.cached_stab = compute_stab_for(
                 self.kind, &self.path, imu.as_deref(), s, self.fps);

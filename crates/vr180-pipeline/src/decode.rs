@@ -35,6 +35,40 @@ pub fn init() {
 /// field is a u32 in host (LE) byte order on Apple Silicon / x86.
 const GPMD_TAG: u32 = u32::from_le_bytes(*b"gpmd");
 
+/// Progress sink for a long, scattered metadata read — e.g. the DJI `djmd`
+/// per-frame quaternion track, which is one tiny sample per video frame
+/// interleaved across the whole file and takes tens of seconds to read cold
+/// over a high-latency mount (SMB/NAS). `total` is the chunk count of the
+/// dominant track (set once the sample table is parsed); `done` is bumped per
+/// chunk as the concurrent reader completes it. The GUI polls
+/// [`ReadProgress::percent`] to show a "% loaded" while stabilization data
+/// streams in.
+#[derive(Default)]
+pub struct ReadProgress {
+    pub done: std::sync::atomic::AtomicUsize,
+    pub total: std::sync::atomic::AtomicUsize,
+    /// PAUSE the scattered read between chunks: the chunk reader sleeps (keeping
+    /// the buffer + `done` count) until resumed or aborted, so it can RESUME
+    /// later — used when the user toggles stabilization off then on. The reader
+    /// thread stays alive (and holds the file handle) while paused.
+    pub pause: std::sync::atomic::AtomicBool,
+    /// ABORT the read entirely (the chunk reader bails with an error). Set on
+    /// decoder teardown so a paused read doesn't leak its thread / file handle.
+    pub abort: std::sync::atomic::AtomicBool,
+}
+
+impl ReadProgress {
+    /// Completion as 0..=100. Returns 0 until `total` is known (the sample
+    /// table is still being parsed), then climbs monotonically to 100.
+    pub fn percent(&self) -> u32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let total = self.total.load(Relaxed);
+        if total == 0 { return 0; }
+        let done = self.done.load(Relaxed).min(total);
+        ((done as u64 * 100) / total as u64) as u32
+    }
+}
+
 /// Pull the entire GPMF (GoPro Metadata Format) data stream from a
 /// .360 file into memory. Equivalent to the Python pipeline's
 /// `ffmpeg -i <path> -map 0:3 -c copy -f rawvideo -` subprocess.
@@ -104,7 +138,7 @@ fn extract_gpmf_via_demux(path: &Path) -> Result<Vec<u8>> {
 /// samples chunk-by-chunk via direct file reads. The concatenation of the
 /// samples is byte-identical to demuxing the `gpmd` packets in order.
 fn extract_gpmf_via_sample_table(path: &Path) -> Result<Vec<u8>> {
-    extract_data_track_via_sample_table(path, b"gpmd")
+    extract_data_track_via_sample_table(path, b"gpmd", None)
 }
 
 /// Read ONLY a data track's samples (GoPro `gpmd` telemetry / DJI `djmd`
@@ -114,7 +148,7 @@ fn extract_gpmf_via_sample_table(path: &Path) -> Result<Vec<u8>> {
 /// (DJI writes two `djmd` tracks; the big one carries the per-frame
 /// protobuf — `extract_dji_meta_stream` picks the largest the same way.)
 /// The concatenation is byte-identical to demuxing that track's packets.
-fn extract_data_track_via_sample_table(path: &Path, tag: &[u8; 4]) -> Result<Vec<u8>> {
+fn extract_data_track_via_sample_table(path: &Path, tag: &[u8; 4], progress: Option<&ReadProgress>) -> Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut f = std::fs::File::open(path)?;
@@ -161,9 +195,15 @@ fn extract_data_track_via_sample_table(path: &Path, tag: &[u8; 4]) -> Result<Vec
         return Err(Error::Ffmpeg(format!(
             "mp4: no {} trak", std::str::from_utf8(tag).unwrap_or("?"))));
     }
+    // Attach progress to the DOMINANT track only (the per-frame metadata one),
+    // so the % climbs monotonically instead of dipping when a second, tiny
+    // track's chunks get added to the total. (An OSV has two `djmd` tracks.)
+    let big_idx = (0..stbls.len())
+        .max_by_key(|&i| stbl_total_sample_bytes(&moov, stbls[i]));
     let mut best: Vec<u8> = Vec::new();
-    for stbl in stbls {
-        let blob = read_stbl_samples(&mut f, fsize, &moov, stbl)?;
+    for (i, stbl) in stbls.into_iter().enumerate() {
+        let prog = if Some(i) == big_idx { progress } else { None };
+        let blob = read_stbl_samples(&mut f, fsize, &moov, stbl, prog)?;
         if blob.len() > best.len() { best = blob; }
     }
     if best.is_empty() {
@@ -181,6 +221,7 @@ fn read_stbl_samples(
     fsize: u64,
     moov: &[u8],
     stbl: (usize, usize),
+    progress: Option<&ReadProgress>,
 ) -> Result<Vec<u8>> {
     let be32 = |b: &[u8], o: usize| -> Result<u32> {
         b.get(o..o + 4).map(|s| u32::from_be_bytes(s.try_into().unwrap()))
@@ -268,7 +309,10 @@ fn read_stbl_samples(
     // mount (SMB/NAS), where each read is a full request round-trip. Issue them
     // concurrently (positioned reads on the shared handle) so the latency
     // overlaps; the total bytes are only a few MB, so it's never bandwidth-bound.
-    let parts = read_ranges_concurrent(f, &ranges)?;
+    if let Some(p) = progress {
+        p.total.fetch_add(ranges.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+    let parts = read_ranges_concurrent(f, &ranges, progress)?;
     let mut out = Vec::with_capacity(total);
     for p in &parts { out.extend_from_slice(p); }
     Ok(out)
@@ -281,14 +325,16 @@ fn read_stbl_samples(
 /// between a long OSV's metadata loading in ~1 s vs. ~minute over SMB. Other
 /// platforms fall back to a sequential clone-and-seek read.
 #[cfg(unix)]
-fn read_ranges_concurrent(f: &std::fs::File, ranges: &[(u64, usize)]) -> Result<Vec<Vec<u8>>> {
+fn read_ranges_concurrent(f: &std::fs::File, ranges: &[(u64, usize)], progress: Option<&ReadProgress>) -> Result<Vec<Vec<u8>>> {
     use std::os::unix::fs::FileExt;
+    use std::sync::atomic::Ordering::Relaxed;
     let n = ranges.len();
     let mut out: Vec<Vec<u8>> = ranges.iter().map(|&(_, l)| vec![0u8; l]).collect();
     if n <= 1 {
         if n == 1 {
             f.read_exact_at(&mut out[0], ranges[0].0)
                 .map_err(|e| Error::Ffmpeg(format!("mp4: chunk read: {e}")))?;
+            if let Some(p) = progress { p.done.fetch_add(1, Relaxed); }
         }
         return Ok(out);
     }
@@ -307,16 +353,27 @@ fn read_ranges_concurrent(f: &std::fs::File, ranges: &[(u64, usize)]) -> Result<
             let errref = &err;
             scope.spawn(move || {
                 for (buf, &(off, _)) in head.iter_mut().zip(rs) {
+                    if let Some(p) = progress {
+                        // Pause (sleep, keep state) until resumed or aborted.
+                        while p.pause.load(Relaxed) && !p.abort.load(Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        if p.abort.load(Relaxed) { return; }
+                    }
                     if let Err(e) = f.read_exact_at(buf, off) {
                         *errref.lock().unwrap() = Some(format!("{e}"));
                         return;
                     }
+                    if let Some(p) = progress { p.done.fetch_add(1, Relaxed); }
                 }
             });
             rest = tail;
             base += take;
         }
     });
+    if progress.map_or(false, |p| p.abort.load(Relaxed)) {
+        return Err(Error::Ffmpeg("mp4: chunk read aborted".into()));
+    }
     if let Some(e) = err.into_inner().unwrap() {
         return Err(Error::Ffmpeg(format!("mp4: concurrent chunk read: {e}")));
     }
@@ -324,15 +381,25 @@ fn read_ranges_concurrent(f: &std::fs::File, ranges: &[(u64, usize)]) -> Result<
 }
 
 #[cfg(not(unix))]
-fn read_ranges_concurrent(f: &std::fs::File, ranges: &[(u64, usize)]) -> Result<Vec<Vec<u8>>> {
+fn read_ranges_concurrent(f: &std::fs::File, ranges: &[(u64, usize)], progress: Option<&ReadProgress>) -> Result<Vec<Vec<u8>>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut fh = f.try_clone().map_err(|e| Error::Ffmpeg(format!("mp4: clone handle: {e}")))?;
     let mut out = Vec::with_capacity(ranges.len());
     for &(off, len) in ranges {
+        if let Some(p) = progress {
+            use std::sync::atomic::Ordering::Relaxed;
+            while p.pause.load(Relaxed) && !p.abort.load(Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if p.abort.load(Relaxed) {
+                return Err(Error::Ffmpeg("mp4: chunk read aborted".into()));
+            }
+        }
         let mut buf = vec![0u8; len];
         fh.seek(SeekFrom::Start(off)).map_err(|e| Error::Ffmpeg(format!("mp4: seek: {e}")))?;
         fh.read_exact(&mut buf).map_err(|e| Error::Ffmpeg(format!("mp4: read: {e}")))?;
         out.push(buf);
+        if let Some(p) = progress { p.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
     }
     Ok(out)
 }
@@ -366,7 +433,7 @@ mod gpmf_fast_tests {
         let p = std::path::Path::new("/Volumes/Silver/060613GC/CAM_20260613172639_0038_D.OSV");
         if !p.exists() { eprintln!("skip djmd test: no reference .osv"); return; }
         super::init();
-        let fast = extract_data_track_via_sample_table(p, b"djmd").expect("sample-table");
+        let fast = extract_data_track_via_sample_table(p, b"djmd", None).expect("sample-table");
         let slow = extract_dji_meta_stream_demux(p).expect("demux");
         assert_eq!(fast.len(), slow.len(), "djmd length differs");
         assert!(fast == slow, "djmd bytes differ");
@@ -383,7 +450,7 @@ mod gpmf_fast_tests {
         if !p.exists() { eprintln!("skip djmd calib test: no reference .osv"); return; }
         super::init();
         let head = extract_dji_calib_blob(p).expect("calib blob");
-        let full = extract_data_track_via_sample_table(p, b"djmd").expect("sample-table");
+        let full = extract_data_track_via_sample_table(p, b"djmd", None).expect("sample-table");
         eprintln!("calib head = {} bytes; full djmd = {} bytes", head.len(), full.len());
         assert!(!head.is_empty(), "calib head empty");
         assert!(head.len() <= full.len(), "head longer than full");
@@ -478,7 +545,22 @@ pub fn extract_dji_meta_stream(path: &Path) -> Result<Vec<u8>> {
     // file — several GB on a long clip → tens of seconds, and it ran on the
     // UI thread inside `DetailCache::new` (the slow clip-switch). Falls back
     // to the demuxer on a parse miss. Same fix as `extract_gpmf_stream`.
-    match extract_data_track_via_sample_table(path, b"djmd") {
+    match extract_data_track_via_sample_table(path, b"djmd", None) {
+        Ok(blob) if !blob.is_empty() => return Ok(blob),
+        Ok(_) => tracing::debug!("djmd: sample-table read empty for {path:?}; demuxing"),
+        Err(e) => tracing::debug!("djmd: sample-table read failed for {path:?}: {e}; demuxing"),
+    }
+    extract_dji_meta_stream_demux(path)
+}
+
+/// Like [`extract_dji_meta_stream`] but reports per-chunk read progress into
+/// `progress` (chunk `done`/`total`), so the GUI can show a "% loaded" while
+/// the scattered per-frame `djmd` track streams in over a slow mount. Same
+/// result bytes as `extract_dji_meta_stream`; falls back to the demuxer (no
+/// progress) on a sample-table miss.
+pub fn extract_dji_meta_stream_with_progress(path: &Path, progress: &ReadProgress) -> Result<Vec<u8>> {
+    init();
+    match extract_data_track_via_sample_table(path, b"djmd", Some(progress)) {
         Ok(blob) if !blob.is_empty() => return Ok(blob),
         Ok(_) => tracing::debug!("djmd: sample-table read empty for {path:?}; demuxing"),
         Err(e) => tracing::debug!("djmd: sample-table read failed for {path:?}: {e}; demuxing"),
@@ -659,6 +741,69 @@ pub struct VideoProbe {
     pub height: u32,
     pub fps: f32,
     pub duration_sec: f64,
+}
+
+/// FAST clip duration (seconds) via the MP4 `moov`/`mvhd`, WITHOUT ffmpeg's
+/// `find_stream_info` (which reads scattered packets to identify codecs — ~10 s
+/// per cold segment on SMB). Reads box headers to locate `moov` (seeking past
+/// `mdat`), loads it, and reads `mvhd`'s timescale + duration. Used to sum a
+/// multi-segment chain's total duration quickly; callers fall back to
+/// [`probe_video`] on a parse miss.
+pub fn probe_duration_via_moov(path: &Path) -> Result<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let fsize = f.metadata()?.len();
+    // Locate `moov` reading box headers only (seeks past the multi-GB `mdat`).
+    let mut moov_off: Option<u64> = None;
+    let mut moov_sz: u64 = 0;
+    let mut pos: u64 = 0;
+    while pos + 8 <= fsize {
+        let mut hdr = [0u8; 16];
+        f.seek(SeekFrom::Start(pos))?;
+        f.read_exact(&mut hdr[..8])?;
+        let sz32 = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+        let btag = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        let sz: u64 = if sz32 == 1 {
+            f.read_exact(&mut hdr[8..16])?;
+            u64::from_be_bytes(hdr[8..16].try_into().unwrap())
+        } else if sz32 == 0 { fsize - pos } else { sz32 as u64 };
+        if sz < 8 { break; }
+        if &btag == b"moov" { moov_off = Some(pos); moov_sz = sz; break; }
+        pos = pos.checked_add(sz).ok_or_else(|| Error::Ffmpeg("mp4: box overflow".into()))?;
+    }
+    let moov_off = moov_off.ok_or_else(|| Error::Ffmpeg("mp4: no moov".into()))?;
+    if moov_sz < 8 || moov_off + moov_sz > fsize {
+        return Err(Error::Ffmpeg("mp4: bad moov size".into()));
+    }
+    let mut moov = vec![0u8; moov_sz as usize];
+    f.seek(SeekFrom::Start(moov_off))?;
+    f.read_exact(&mut moov)?;
+    let (mv0, mvsz) = find_atom(&moov, 0, moov.len(), b"moov")
+        .ok_or_else(|| Error::Ffmpeg("mp4: moov header".into()))?;
+    let (mh0, _) = find_atom(&moov, mv0 + 8, mv0 + mvsz, b"mvhd")
+        .ok_or_else(|| Error::Ffmpeg("mp4: no mvhd".into()))?;
+    // mvhd content begins at mh0+8: version(1) + flags(3), then time fields.
+    let c = mh0 + 8;
+    let version = *moov.get(c).ok_or_else(|| Error::Ffmpeg("mp4: mvhd short".into()))?;
+    let be32 = |o: usize| -> Result<u32> {
+        moov.get(o..o + 4).map(|s| u32::from_be_bytes(s.try_into().unwrap()))
+            .ok_or_else(|| Error::Ffmpeg("mp4: mvhd short".into()))
+    };
+    let be64 = |o: usize| -> Result<u64> {
+        moov.get(o..o + 8).map(|s| u64::from_be_bytes(s.try_into().unwrap()))
+            .ok_or_else(|| Error::Ffmpeg("mp4: mvhd short".into()))
+    };
+    // v0: creation(4) modification(4) timescale(4) duration(4)
+    // v1: creation(8) modification(8) timescale(4) duration(8)
+    let (timescale, duration) = if version == 1 {
+        (be32(c + 20)? as u64, be64(c + 24)?)
+    } else {
+        (be32(c + 12)? as u64, be32(c + 16)? as u64)
+    };
+    if timescale == 0 {
+        return Err(Error::Ffmpeg("mp4: mvhd timescale 0".into()));
+    }
+    Ok(duration as f64 / timescale as f64)
 }
 
 pub fn probe_video(path: &Path) -> Result<VideoProbe> {
