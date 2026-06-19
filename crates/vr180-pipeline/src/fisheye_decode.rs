@@ -1093,6 +1093,226 @@ impl D3d11SharedDualStreamIter {
     }
 }
 
+/// One VideoToolbox zero-copy OSV pair: each eye's Y + UV planes wrapped as
+/// wgpu textures that ALIAS the decoded P010 IOSurface (no host download, no
+/// swscale). The consumer box-downscales to the preview working res with
+/// `Device::resolve_p010_planes_to_rgba16` and projects from there — same
+/// anti-aliased working res as the CPU path, but kept on the GPU. Hold the
+/// pair alive until the resolve pass that reads it has been submitted (and
+/// given the GPU a frame to finish); dropping it releases the IOSurface
+/// retains. macOS analogue of [`SharedFisheyePair`].
+#[cfg(target_os = "macos")]
+pub struct VtSharedFisheyePair {
+    pub left_y:   crate::interop_macos::IOSurfacePlaneTexture,
+    pub left_uv:  crate::interop_macos::IOSurfacePlaneTexture,
+    pub right_y:  crate::interop_macos::IOSurfacePlaneTexture,
+    pub right_uv: crate::interop_macos::IOSurfacePlaneTexture,
+    /// Native fisheye (Y-plane) dims — the resolve downscales from these.
+    pub native_w: u32,
+    pub native_h: u32,
+    /// Presentation timestamp in seconds, `0.0` if unknown.
+    pub pts_s: f64,
+}
+
+/// Dual-stream OSV iterator that keeps frames GPU-resident via VideoToolbox
+/// and yields [`VtSharedFisheyePair`]s of P010 plane textures. macOS analogue
+/// of [`D3d11SharedDualStreamIter`]; the EAC sibling is
+/// [`crate::decode::ZeroCopyStreamPairIter`] (same IOSurface-plane recipe,
+/// different output topology). Single-segment only — merged OSV recordings
+/// stay on the CPU path for now.
+#[cfg(target_os = "macos")]
+pub struct VtSharedDualStreamIter {
+    ictx: ffmpeg_next::format::context::Input,
+    video_indices: [usize; 2],
+    decoders: Vec<ffmpeg_next::codec::decoder::Video>,
+    native_w: u32,
+    native_h: u32,
+    /// When true output left = stream[1], right = stream[0] (DJI OSV
+    /// convention; the caller XORs in the user swap, same as
+    /// [`DualStreamFisheyeIter`]).
+    swap_eyes: bool,
+    time_base_s: f64,
+    /// Nominal frame duration (1/fps) for the precise-seek run-in window.
+    dt_s: f64,
+    frames_yielded: u32,
+    /// Precise-seek state — `next_pair` decodes-and-discards the keyframe→target
+    /// run-in so the first pair returned is the exact requested frame (matches
+    /// [`crate::decode::ZeroCopyStreamPairIter::seek`]).
+    skip_until_s: Option<f64>,
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Debug for VtSharedDualStreamIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VtSharedDualStreamIter")
+            .field("native", &(self.native_w, self.native_h))
+            .field("swap_eyes", &self.swap_eyes)
+            .field("frames_yielded", &self.frames_yielded)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl VtSharedDualStreamIter {
+    /// Open a dual-stream OSV and force VideoToolbox decode on both streams.
+    /// Returns an error (so the caller can fall back to the CPU path) if there
+    /// aren't two matching video streams or VT can't attach to either.
+    pub fn new(path: &Path, swap_eyes: bool) -> Result<Self> {
+        ffmpeg_init();
+        let ictx = ffmpeg_next::format::input(path)
+            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+        let video_indices: Vec<usize> = ictx.streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+            .map(|s| s.index())
+            .take(2)
+            .collect();
+        if video_indices.len() < 2 {
+            return Err(Error::Ffmpeg(format!(
+                "expected 2 video streams (OSV), found {}", video_indices.len()
+            )));
+        }
+        let video_indices = [video_indices[0], video_indices[1]];
+        let mut decoders = Vec::with_capacity(2);
+        for &idx in video_indices.iter() {
+            let stream = ictx.stream(idx).unwrap();
+            let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+                .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+            if !crate::decode::try_enable_videotoolbox_decode(&mut codec_ctx) {
+                return Err(Error::Ffmpeg(format!(
+                    "VT zero-copy OSV path requires VideoToolbox — setup failed on stream {idx}"
+                )));
+            }
+            decoders.push(codec_ctx.decoder().video()
+                .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?);
+        }
+        let (w0, h0) = (decoders[0].width(), decoders[0].height());
+        let (w1, h1) = (decoders[1].width(), decoders[1].height());
+        if (w0, h0) != (w1, h1) {
+            return Err(Error::Ffmpeg(format!(
+                "OSV VT streams disagree on dims: {w0}x{h0} vs {w1}x{h1}"
+            )));
+        }
+        let s0 = ictx.stream(video_indices[0]).unwrap();
+        let tb = s0.time_base();
+        let time_base_s = tb.numerator() as f64 / tb.denominator().max(1) as f64;
+        let fr = s0.avg_frame_rate();
+        let dt_s = if fr.numerator() > 0 {
+            fr.denominator() as f64 / fr.numerator() as f64
+        } else { 1.0 / 30.0 };
+        Ok(Self {
+            ictx, video_indices, decoders,
+            native_w: w0, native_h: h0,
+            swap_eyes, time_base_s, dt_s,
+            frames_yielded: 0, skip_until_s: None,
+        })
+    }
+
+    /// Native fisheye dims — the consumer downscales to the working res itself.
+    pub fn eye_dims(&self) -> (u32, u32) { (self.native_w, self.native_h) }
+
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let target_s = target_s.max(0.0);
+        let ts = (target_s * 1_000_000.0) as i64;
+        self.ictx.seek(ts, ..ts)
+            .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        for d in &mut self.decoders { d.flush(); }
+        self.frames_yielded = 0;
+        self.skip_until_s = Some(target_s);
+        Ok(())
+    }
+
+    /// Wrap a VT-decoded P010 frame's IOSurface as (Y: `R16Unorm`,
+    /// UV: `Rg16Unorm`) plane textures aliasing the surface — the proven
+    /// `ZeroCopyStreamPairIter` recipe (10-bit GoPro/OSV both produce P010).
+    fn wrap_p010_planes(
+        device: &wgpu::Device,
+        frame: &ffmpeg_next::frame::Video,
+    ) -> Result<(crate::interop_macos::IOSurfacePlaneTexture,
+                 crate::interop_macos::IOSurfacePlaneTexture)> {
+        use crate::interop_macos::{
+            extract_iosurface_from_vt_frame, wgpu_texture_from_iosurface_plane,
+            IOSurfaceNv12Descriptor, RetainedIOSurface,
+        };
+        let surf = extract_iosurface_from_vt_frame(frame)?;
+        let desc = IOSurfaceNv12Descriptor::new(surf)?;
+        let y_surf  = unsafe { RetainedIOSurface::retain(desc.surface.as_raw()) };
+        let uv_surf = unsafe { RetainedIOSurface::retain(desc.surface.as_raw()) };
+        let y = wgpu_texture_from_iosurface_plane(
+            device, y_surf, 0,
+            metal::MTLPixelFormat::R16Unorm, wgpu::TextureFormat::R16Unorm,
+            desc.width, desc.height, "osv_vt_y")?;
+        let uv = wgpu_texture_from_iosurface_plane(
+            device, uv_surf, 1,
+            metal::MTLPixelFormat::RG16Unorm, wgpu::TextureFormat::Rg16Unorm,
+            desc.width / 2, desc.height / 2, "osv_vt_uv")?;
+        drop(desc);
+        Ok((y, uv))
+    }
+
+    /// Decode the next (s0, s1) frame pair, wrap each eye's P010 planes, apply
+    /// the eye swap, and return them. Honours the precise-seek run-in discard.
+    pub fn next_pair(&mut self, device: &wgpu::Device)
+        -> Result<Option<VtSharedFisheyePair>>
+    {
+        let mut frames: [Option<ffmpeg_next::frame::Video>; 2] = [None, None];
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+
+        let (f0, f1) = 'fill: loop {
+            for pos in 0..2 {
+                if frames[pos].is_some() { continue; }
+                if self.decoders[pos].receive_frame(&mut decoded).is_ok() {
+                    frames[pos] = Some(std::mem::replace(
+                        &mut decoded, ffmpeg_next::frame::Video::empty()));
+                }
+            }
+            if frames.iter().any(|f| f.is_none()) {
+                loop {
+                    let (stream, packet) = match self.ictx.packets().next() {
+                        Some(x) => x, None => break,
+                    };
+                    let pos = match self.video_indices.iter().position(|&i| i == stream.index()) {
+                        Some(p) => p, None => continue,
+                    };
+                    if self.decoders[pos].send_packet(&packet).is_err() { continue; }
+                    if frames[pos].is_none()
+                        && self.decoders[pos].receive_frame(&mut decoded).is_ok()
+                    {
+                        frames[pos] = Some(std::mem::replace(
+                            &mut decoded, ffmpeg_next::frame::Video::empty()));
+                    }
+                    if frames.iter().all(|f| f.is_some()) { break; }
+                }
+            }
+            let (Some(f0), Some(f1)) = (frames[0].take(), frames[1].take()) else {
+                return Ok(None);
+            };
+            // Precise-seek run-in: discard pairs before the target frame.
+            if let Some(target) = self.skip_until_s {
+                let t = f0.pts().unwrap_or(0) as f64 * self.time_base_s;
+                if t < target - 0.5 * self.dt_s { continue 'fill; }
+                self.skip_until_s = None;
+            }
+            break 'fill (f0, f1);
+        };
+
+        let pts_s = f0.pts().unwrap_or(0) as f64 * self.time_base_s;
+        let (s0_y, s0_uv) = Self::wrap_p010_planes(device, &f0)?;
+        let (s1_y, s1_uv) = Self::wrap_p010_planes(device, &f1)?;
+        self.frames_yielded += 1;
+        // Eye mapping mirrors DualStreamFisheyeIter: swap → left = stream[1].
+        let (left_y, left_uv, right_y, right_uv) = if self.swap_eyes {
+            (s1_y, s1_uv, s0_y, s0_uv)
+        } else {
+            (s0_y, s0_uv, s1_y, s1_uv)
+        };
+        Ok(Some(VtSharedFisheyePair {
+            left_y, left_uv, right_y, right_uv,
+            native_w: self.native_w, native_h: self.native_h,
+            pts_s,
+        }))
+    }
+}
+
 /// One GPU-resident EAC stream pair — the two GoPro `.360` HEVC streams
 /// (s0, s4), each decoded P010 by `d3d11va`/NVDEC and converted to a
 /// single-plane Rgba16Unorm D3D11 texture shared out as an NT handle. The

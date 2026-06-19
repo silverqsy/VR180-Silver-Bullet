@@ -706,6 +706,19 @@ pub struct DecoderControl {
     /// Sender for the native-res zoom stills (see `want_detail`). Installed
     /// by the UI at decoder spawn; `None` for paths that never produce them.
     pub detail_tx: parking_lot::Mutex<Option<Sender<DecodedFrame>>>,
+    /// Set true by the spawning thread once `start_decoder` returns (clean
+    /// EOS, error, or Stop). The UI watches this so that a decoder which dies
+    /// *before* delivering its first frame — e.g. a transient failure on a
+    /// cold network read — doesn't wedge playback: `decoder_starting` would
+    /// otherwise stay set forever and silently gate every Play/seek respawn.
+    pub finished: AtomicBool,
+    /// Progressive IMU state for DJI OSV. The decoder loads the lens calib FAST
+    /// (first metadata sample) so the preview dewarps immediately, then streams
+    /// the heavy per-frame quaternions (needed for stabilization) in the
+    /// background. `false` while those quats are still loading; flips `true`
+    /// once they're in (or immediately for non-OSV / already-cached clips). The
+    /// UI grays the Stabilization panel + shows a spinner while this is `false`.
+    pub imu_ready: AtomicBool,
 }
 
 /// One eye's in-file calibration, in the same units the UI's per-eye
@@ -731,6 +744,189 @@ pub struct EyeCalibSeed {
 pub struct DetectedLensCalib {
     pub left: EyeCalibSeed,
     pub right: EyeCalibSeed,
+}
+
+/// Resolve the DJI OSV per-lens factory IMU/calibration for a fisheye decoder
+/// AND publish it everywhere it's needed, so every decode path stays in sync.
+/// In one call it:
+///   1. reuses the path-keyed cache, else extracts+parses (single file, or
+///      `parse_multi` concatenating each segment's `djmd` protobuf so the IMU
+///      indexes by ABSOLUTE frame across a merged recording);
+///   2. PUBLISHES to the shared cache so the main-thread zoom-still
+///      (`DetailCache`) resolves the SAME factory calib instead of the centered
+///      preset — the publish each new decode path used to forget (zoom-shift
+///      bug);
+///   3. seeds `control.detected_calib` so the Override UI shows/seeds the
+///      in-file per-lens values.
+/// Returns `None` for non-OSV sources or on parse failure (caller falls back to
+/// the preset calib). `src_w`/`src_h` only backstop the seed's normalized dims
+/// when the file omits per-lens width/height.
+///
+/// EVERY fisheye decode path must call this — that is the point: centralizing
+/// the publish makes it impossible for a future path to drop it.
+fn load_or_publish_dji_imu(
+    cfg: &DecoderConfig,
+    kind: vr180_pipeline::SourceKind,
+    control: &DecoderControl,
+    src_w: u32,
+    src_h: u32,
+) -> Option<vr180_fisheye::DjiOsvImu> {
+    if !matches!(kind, vr180_pipeline::SourceKind::DjiOsv) {
+        return None;
+    }
+    // 1. Get the IMU.
+    let parsed: vr180_pipeline::Result<vr180_fisheye::DjiOsvImu> = if cfg.segments.len() > 1 {
+        let mut blobs = Vec::with_capacity(cfg.segments.len());
+        for p in &cfg.segments {
+            match vr180_pipeline::decode::extract_dji_meta_stream(p) {
+                Ok(b) => blobs.push(b),
+                Err(e) => {
+                    tracing::warn!("dji metadata failed: {e} — using preset calib for both eyes");
+                    return None;
+                }
+            }
+        }
+        vr180_fisheye::DjiOsvImu::parse_multi(&blobs)
+            .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("dji parse_multi: {e}")))
+    } else if let Some(arc) = cached_dji_imu(&cfg.path) {
+        tracing::info!("decoder (fisheye/osv): reusing cached DJI metadata for {}", cfg.path.display());
+        Ok((*arc).clone())
+    } else {
+        vr180_pipeline::decode::extract_dji_meta_stream(&cfg.path)
+            .and_then(|blob| vr180_fisheye::DjiOsvImu::parse(&blob)
+                .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("dji parse: {e}"))))
+    };
+    let imu = match parsed {
+        Ok(imu) => imu,
+        Err(e) => {
+            tracing::warn!("dji metadata failed: {e} — using preset calib for both eyes");
+            return None;
+        }
+    };
+    tracing::info!(
+        "decoder (fisheye/osv): protobuf parsed — lens_a.fx={:?}, lens_b.fx={:?}, {} frame_quats ({} segs)",
+        imu.lens_a.fx, imu.lens_b.fx, imu.frame_quats.len(), cfg.segments.len()
+    );
+    // 2. Publish to the shared cache (the main-thread zoom-still reads it).
+    cache_dji_imu(&cfg.path, std::sync::Arc::new(imu.clone()));
+    // 3. Seed the Override UI's per-eye fields from the in-file calib.
+    seed_detected_calib(control, &imu, src_w, src_h);
+    Some(imu)
+}
+
+/// Seed `control.detected_calib` (the Override UI's per-eye defaults) from a
+/// parsed OSV IMU, following the user swap so each output eye shows the lens
+/// actually on it. Works on a calib-only (no-quats) partial too — only
+/// `lens_a`/`lens_b` are read.
+fn seed_detected_calib(
+    control: &DecoderControl, imu: &vr180_fisheye::DjiOsvImu, src_w: u32, src_h: u32,
+) {
+    let seed = |lens: &vr180_fisheye::DjiLensCalib| -> EyeCalibSeed {
+        let w = lens.width.unwrap_or(src_w as f32).max(1.0);
+        let h = lens.height.unwrap_or(src_h as f32).max(1.0);
+        // fx = w/(2·half) ⟹ fov = w/fx radians, so feeding it back reproduces fx.
+        let fov_deg = lens.fx.map(|fx| (w / fx.max(1.0)).to_degrees()).unwrap_or(180.0);
+        EyeCalibSeed {
+            fov_deg,
+            cx_norm: lens.cx.map(|v| v / w).unwrap_or(0.5),
+            cy_norm: lens.cy.map(|v| v / h).unwrap_or(0.5),
+            k: [lens.k1.unwrap_or(0.0), lens.k2.unwrap_or(0.0),
+                lens.k3.unwrap_or(0.0), lens.k4.unwrap_or(0.0)],
+            k5: lens.k5.unwrap_or(0.0),
+            p: [lens.p1.unwrap_or(0.0), lens.p2.unwrap_or(0.0)],
+        }
+    };
+    let swapped = control.settings.read().effective_swap_eyes();
+    let (sl, sr) = if swapped { (&imu.lens_a, &imu.lens_b) } else { (&imu.lens_b, &imu.lens_a) };
+    *control.detected_calib.lock() = Some(DetectedLensCalib { left: seed(sl), right: seed(sr) });
+}
+
+/// Progressive DJI OSV IMU load: get the lens calibration FAST (first metadata
+/// sample → the preview dewarps in ~1 s) and stream the heavy per-frame
+/// quaternions (needed for stabilization) in the BACKGROUND, so a huge clip's
+/// minutes-long metadata read doesn't block the first frame. Returns a
+/// calib-only partial (empty `frame_quats`) immediately; the decode loop calls
+/// [`try_upgrade_dji_imu`] each iteration and swaps in the full IMU once the
+/// background thread caches it. Sets `control.imu_ready` accordingly (`false`
+/// while quats load; `true` for non-OSV / already-cached / fallback). The UI
+/// grays Stabilization while it's `false`.
+fn load_dji_imu_progressive(
+    cfg: &DecoderConfig,
+    kind: vr180_pipeline::SourceKind,
+    control: &DecoderControl,
+    src_w: u32,
+    src_h: u32,
+) -> Option<vr180_fisheye::DjiOsvImu> {
+    use std::sync::atomic::Ordering;
+    if !matches!(kind, vr180_pipeline::SourceKind::DjiOsv) {
+        control.imu_ready.store(true, Ordering::SeqCst);
+        return None;
+    }
+    // Already have the full IMU cached → use it, stabilization is ready now.
+    if let Some(arc) = cached_dji_imu(&cfg.path) {
+        if !arc.frame_quats.is_empty() {
+            let imu = (*arc).clone();
+            seed_detected_calib(control, &imu, src_w, src_h);
+            control.imu_ready.store(true, Ordering::SeqCst);
+            return Some(imu);
+        }
+    }
+    // Merged recording (parse_multi) has no single-file fast-calib path — load
+    // it fully (blocking). Same for a fast-calib miss below.
+    let fast = if cfg.segments.len() > 1 {
+        None
+    } else {
+        vr180_pipeline::decode::extract_dji_calib_blob(&cfg.path).ok()
+            .and_then(|b| vr180_fisheye::DjiOsvImu::parse(&b).ok())
+            .filter(|imu| imu.lens_a.fx.is_some() || imu.lens_b.fx.is_some())
+    };
+    match fast {
+        Some(partial) => {
+            tracing::info!(
+                "decoder (fisheye/osv): fast calib loaded (lens_a.fx={:?}) — preview now; \
+                 full IMU streaming in background", partial.lens_a.fx);
+            seed_detected_calib(control, &partial, src_w, src_h);
+            control.imu_ready.store(false, Ordering::SeqCst);
+            // Background: full extract + parse + cache. The decode loop polls the
+            // cache (try_upgrade_dji_imu) and swaps it in + recomputes stab.
+            let path = cfg.path.clone();
+            std::thread::spawn(move || {
+                match vr180_pipeline::decode::extract_dji_meta_stream(&path)
+                    .and_then(|b| vr180_fisheye::DjiOsvImu::parse(&b)
+                        .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("dji parse: {e}"))))
+                {
+                    Ok(full) => {
+                        tracing::info!("decoder (fisheye/osv): full IMU ready ({} frame_quats) for {}",
+                            full.frame_quats.len(), path.display());
+                        cache_dji_imu(&path, std::sync::Arc::new(full));
+                    }
+                    Err(e) => tracing::warn!("background full IMU load failed: {e}"),
+                }
+            });
+            Some(partial)
+        }
+        None => {
+            // No fast calib (merged clip, or sample-table miss) → full blocking.
+            let imu = load_or_publish_dji_imu(cfg, kind, control, src_w, src_h);
+            control.imu_ready.store(true, Ordering::SeqCst);
+            imu
+        }
+    }
+}
+
+/// Decode-loop helper for [`load_dji_imu_progressive`]: if we're currently on a
+/// calib-only partial (empty `frame_quats`) and the background thread has now
+/// cached the full IMU, return it so the loop can swap it in + recompute stab.
+/// Returns `None` otherwise (already full, or not ready yet).
+fn try_upgrade_dji_imu(
+    cfg: &DecoderConfig, current: Option<&vr180_fisheye::DjiOsvImu>,
+) -> Option<vr180_fisheye::DjiOsvImu> {
+    if current.map_or(true, |i| !i.frame_quats.is_empty()) {
+        return None; // non-OSV, or already have the full IMU
+    }
+    let arc = cached_dji_imu(&cfg.path)?;
+    if arc.frame_quats.is_empty() { return None; }
+    Some((*arc).clone())
 }
 
 /// One frame ready for display. `texture` is a square BGRA-bytes
@@ -952,6 +1148,35 @@ fn run_fisheye(
         }
     }
 
+    // ── macOS zero-copy fast path (DJI OSV, single-segment) ──────────
+    // VideoToolbox-decoded P010 IOSurfaces, wrapped zero-copy and resolved →
+    // projected on the GPU — eliminates the per-eye HW→host download + libswscale
+    // the CPU `DualStreamFisheyeIter` pays. Single-segment only (merged OSV stays
+    // on the CPU path); any failure falls through to the CPU path below untouched.
+    #[cfg(target_os = "macos")]
+    {
+        if matches!(kind, vr180_pipeline::SourceKind::DjiOsv) && cfg.segments.len() <= 1 {
+            // XOR with DJI's "swap by default" (matches open_fisheye_segment).
+            let swap = !control.settings.read().effective_swap_eyes();
+            match vr180_pipeline::fisheye_decode::VtSharedDualStreamIter::new(&cfg.path, swap) {
+                Ok(iter) => {
+                    tracing::info!(
+                        "decoder (fisheye): macOS ZERO-COPY VideoToolbox path ENGAGED \
+                         (P010 IOSurface → resolve → project, no host download/swscale)"
+                    );
+                    return run_fisheye_vt_zerocopy(
+                        pipeline, cfg, control, kind, fps, dt, eye_w, eye_h,
+                        iter, frame_tx, cmd_rx,
+                    );
+                }
+                Err(e) => {
+                    tracing::info!(
+                        "decoder (fisheye): macOS zero-copy unavailable ({e}) — CPU path");
+                }
+            }
+        }
+    }
+
     // === Pipelined decode ===
     //
     // The iter is created and run inside a worker thread so decode and
@@ -1074,93 +1299,10 @@ fn run_fisheye(
         //  defer wiring until we expose swap_eyes on the trait.)
     }
 
-    // ── DJI OSV: extract the protobuf once at startup for per-eye
-    //    calibration (lens_a cx/cy differs from lens_b). Cheap and we
-    //    can reuse the same blob below for stabilization.
-    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = if matches!(
-        kind, vr180_pipeline::SourceKind::DjiOsv
-    ) {
-        // Single file → parse; merged recording → parse_multi (concatenate
-        // each segment's `djmd` protobuf so the IMU indexes by ABSOLUTE
-        // frame across the whole timeline). Intrinsics come from segment 0.
-        let parsed: vr180_pipeline::Result<vr180_fisheye::DjiOsvImu> = if cfg.segments.len() > 1 {
-            let mut blobs = Vec::with_capacity(cfg.segments.len());
-            let mut acc: vr180_pipeline::Result<()> = Ok(());
-            for p in &cfg.segments {
-                match vr180_pipeline::decode::extract_dji_meta_stream(p) {
-                    Ok(b) => blobs.push(b),
-                    Err(e) => { acc = Err(e); break; }
-                }
-            }
-            acc.and_then(|()| vr180_fisheye::DjiOsvImu::parse_multi(&blobs)
-                .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("dji parse_multi: {e}"))))
-        } else if let Some(arc) = cached_dji_imu(&cfg.path) {
-            // Reuse a prior parse of this file (the path-keyed cache) instead
-            // of re-reading the metadata track off disk on every respawn —
-            // the load-freeze fix. In-memory clone, no I/O.
-            tracing::info!("decoder (fisheye/osv): reusing cached DJI metadata for {}", cfg.path.display());
-            Ok((*arc).clone())
-        } else {
-            vr180_pipeline::decode::extract_dji_meta_stream(&cfg.path)
-                .and_then(|blob| vr180_fisheye::DjiOsvImu::parse(&blob)
-                    .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("dji parse: {e}"))))
-        };
-        match parsed {
-            Ok(imu) => {
-                tracing::info!(
-                    "decoder (fisheye/osv): protobuf parsed — lens_a.fx={:?}, lens_b.fx={:?}, {} frame_quats ({} segs)",
-                    imu.lens_a.fx, imu.lens_b.fx, imu.frame_quats.len(), cfg.segments.len()
-                );
-                // Factory per-lens extrinsics intentionally ignored:
-                // this is a VR180-modded camera with displaced lenses, so
-                // the protobuf rotation-vector offsets don't describe our
-                // optics. Intrinsics only.
-                // Publish to the shared cache so the main-thread `DetailCache`
-                // reads it instead of re-extracting (avoids the load freeze).
-                cache_dji_imu(&cfg.path, std::sync::Arc::new(imu.clone()));
-                Some(imu)
-            }
-            Err(e) => {
-                tracing::warn!("dji metadata failed: {e} — using preset calib for both eyes");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Publish the in-file per-lens calibration so the UI can show the
-    // actual values and seed the per-eye Override fields from them
-    // (instead of guessing image-center). Left = lens_b, right = lens_a
-    // (matches the DJI iter's default eye swap).
-    if let Some(imu) = dji_osv_imu.as_ref() {
-        let seed = |lens: &vr180_fisheye::DjiLensCalib| -> EyeCalibSeed {
-            let w = lens.width.unwrap_or(src_w as f32).max(1.0);
-            let h = lens.height.unwrap_or(src_h as f32).max(1.0);
-            // fov in this app's equidistant fov↔fx convention so feeding
-            // it back into the override reproduces the same fx:
-            //   fx = w / (2·half) ⟹ fov = w / fx  (radians).
-            let fov_deg = lens.fx.map(|fx| (w / fx.max(1.0)).to_degrees())
-                .unwrap_or(180.0);
-            EyeCalibSeed {
-                fov_deg,
-                cx_norm: lens.cx.map(|v| v / w).unwrap_or(0.5),
-                cy_norm: lens.cy.map(|v| v / h).unwrap_or(0.5),
-                k: [lens.k1.unwrap_or(0.0), lens.k2.unwrap_or(0.0),
-                    lens.k3.unwrap_or(0.0), lens.k4.unwrap_or(0.0)],
-                k5: lens.k5.unwrap_or(0.0),
-                p: [lens.p1.unwrap_or(0.0), lens.p2.unwrap_or(0.0)],
-            }
-        };
-        // Per-output-eye seeds — follow the user swap so the Override
-        // panel shows/seeds the calib of the lens actually on that eye.
-        let swapped = control.settings.read().effective_swap_eyes();
-        let (sl, sr) = if swapped { (&imu.lens_a, &imu.lens_b) } else { (&imu.lens_b, &imu.lens_a) };
-        *control.detected_calib.lock() = Some(DetectedLensCalib {
-            left:  seed(sl),
-            right: seed(sr),
-        });
-    }
+    // ── DJI OSV: load the per-lens factory calib + IMU, publish to the shared
+    //    cache (so the zoom-still matches) and seed the Override UI — one call,
+    //    so no decode path can forget a step.
+    let mut dji_osv_imu = load_dji_imu_progressive(cfg, kind, &control, src_w, src_h);
 
     // ── Resolve initial calibrations from settings + preset + protobuf
     let mut cached_gen = control.settings_generation.load(Ordering::SeqCst);
@@ -1254,8 +1396,13 @@ fn run_fisheye(
     // imu-phase) re-derive stabilization mid-playback, like the toggle.
     let mut last_stab_key = stab_key(&control.settings.read());
     if control.settings.read().stabilize {
-        stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control, fps);
         last_stabilize_state = true;
+        // Compute now only if the full IMU is already in (cached). For a fresh
+        // OSV clip the calib-only partial has no quats yet — the progressive-
+        // upgrade block computes stab once the background load finishes.
+        if control.imu_ready.load(Ordering::SeqCst) {
+            stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control, fps);
+        }
     }
     tracing::info!(
         "decoder (fisheye): startup stab_rotations = {} (toggle is now LIVE)",
@@ -1359,6 +1506,20 @@ fn run_fisheye(
         }
         let pair = maybe_pair.as_ref().expect("maybe_pair populated above");
         decode_us = last_iter_end.elapsed().as_micros();
+        // ── Progressive IMU: swap the calib-only partial for the full IMU once
+        //    the background load finishes, then compute stabilization (auto-on
+        //    if `stabilize` is set). Cheap no-op once `imu_ready`.
+        if !control.imu_ready.load(Ordering::SeqCst) {
+            if let Some(full) = try_upgrade_dji_imu(cfg, dji_osv_imu.as_ref()) {
+                dji_osv_imu = Some(full);
+                if control.settings.read().stabilize {
+                    stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control, fps);
+                    last_stabilize_state = true;
+                }
+                control.imu_ready.store(true, Ordering::SeqCst);
+                tracing::info!("decoder (fisheye): full IMU applied — stabilization enabled");
+            }
+        }
         // ── 0. Live stabilize toggle. When the user flips the
         //       checkbox during playback, recompute on this iteration.
         //       The compute takes a few hundred ms (a brief stutter)
@@ -1750,7 +1911,10 @@ fn run_fisheye(
             width: out_w,
             height: out_h,
             frame_idx: absolute_frame_idx,
-            timestamp_s: frame_t_abs,
+            // Shown frame's own time (pts via stab_idx), not the pacing clock —
+            // keeps the zoom still (DetailCache) on the same frame as the preview
+            // even after render-bound skips. See the macOS vt-zc path.
+            timestamp_s: absolute_frame_idx as f64 * dt,
         };
         match frame_tx.try_send(out) {
             Ok(()) => {}
@@ -1890,36 +2054,7 @@ fn run_fisheye_zerocopy(
     tracing::info!("decoder (fisheye/zc): native eye dims = {}x{} (full-res zero-copy)", src_w, src_h);
 
     // ── Per-eye calibration + stabilization from the OSV protobuf ────
-    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> =
-        match vr180_pipeline::decode::extract_dji_meta_stream(&cfg.path) {
-            Ok(blob) => match vr180_fisheye::DjiOsvImu::parse(&blob) {
-                Ok(imu) => Some(imu),
-                Err(e) => { tracing::warn!("zc: dji protobuf parse failed: {e}"); None }
-            },
-            Err(e) => { tracing::warn!("zc: dji metadata extract failed: {e}"); None }
-        };
-    if let Some(imu) = dji_osv_imu.as_ref() {
-        let seed = |lens: &vr180_fisheye::DjiLensCalib| -> EyeCalibSeed {
-            let w = lens.width.unwrap_or(src_w as f32).max(1.0);
-            let h = lens.height.unwrap_or(src_h as f32).max(1.0);
-            let fov_deg = lens.fx.map(|fx| (w / fx.max(1.0)).to_degrees()).unwrap_or(180.0);
-            EyeCalibSeed {
-                fov_deg,
-                cx_norm: lens.cx.map(|v| v / w).unwrap_or(0.5),
-                cy_norm: lens.cy.map(|v| v / h).unwrap_or(0.5),
-                k: [lens.k1.unwrap_or(0.0), lens.k2.unwrap_or(0.0),
-                    lens.k3.unwrap_or(0.0), lens.k4.unwrap_or(0.0)],
-                k5: lens.k5.unwrap_or(0.0),
-                p: [lens.p1.unwrap_or(0.0), lens.p2.unwrap_or(0.0)],
-            }
-        };
-        let swapped = control.settings.read().effective_swap_eyes();
-        let (sl, sr) = if swapped { (&imu.lens_a, &imu.lens_b) } else { (&imu.lens_b, &imu.lens_a) };
-        *control.detected_calib.lock() = Some(DetectedLensCalib {
-            left: seed(sl),
-            right: seed(sr),
-        });
-    }
+    let mut dji_osv_imu = load_dji_imu_progressive(cfg, kind, &control, src_w, src_h);
 
     // `src_w`/`src_h` ARE the working (downscaled) dims the worker yields — the
     // D3D11 side already converted P010→RGBA16 AND box-downscaled to this res,
@@ -1958,8 +2093,12 @@ fn run_fisheye_zerocopy(
     let mut stab_rotations: Option<Vec<EquirectRotation>> = None;
     let mut last_stabilize_state = false;
     if control.settings.read().stabilize {
-        stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control);
         last_stabilize_state = true;
+        // Compute now only if the full IMU is cached; the progressive-upgrade
+        // block computes stab once the background quats finish loading.
+        if control.imu_ready.load(Ordering::SeqCst) {
+            stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control);
+        }
     }
 
     // ── Pacing / control state (same model as run_fisheye) ───────────
@@ -2034,6 +2173,21 @@ fn run_fisheye_zerocopy(
         }
         let fh = current.as_ref().expect("current populated above");
         decode_us = last_iter_end.elapsed().as_micros();
+
+        // Progressive IMU: swap the calib-only partial for the full IMU once the
+        // background load finishes, then compute stabilization (auto-on if
+        // `stabilize` is set). Cheap no-op once `imu_ready`.
+        if !control.imu_ready.load(Ordering::SeqCst) {
+            if let Some(full) = try_upgrade_dji_imu(cfg, dji_osv_imu.as_ref()) {
+                dji_osv_imu = Some(full);
+                if control.settings.read().stabilize {
+                    stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control);
+                    last_stabilize_state = true;
+                }
+                control.imu_ready.store(true, Ordering::SeqCst);
+                tracing::info!("decoder (fisheye): full IMU applied — stabilization enabled");
+            }
+        }
 
         // Live stabilize toggle.
         let now_stabilize = control.settings.read().stabilize;
@@ -2280,7 +2434,406 @@ fn run_fisheye_zerocopy(
             texture: Arc::new(sbs_tex),
             width: out_w, height: out_h,
             frame_idx: absolute_frame_idx,
-            timestamp_s: frame_t_abs,
+            // Shown frame's own time (pts via stab_idx), not the pacing clock —
+            // keeps the zoom still (DetailCache) on the same frame as the preview
+            // even after render-bound skips. See the macOS vt-zc path.
+            timestamp_s: absolute_frame_idx as f64 * dt,
+        };
+        match frame_tx.try_send(out) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => return Ok(()),
+        }
+        force_render_next = false;
+        let now = start_wall.unwrap().elapsed().as_secs_f64() - paused_offset.as_secs_f64();
+        if now < frame_t_rel {
+            std::thread::sleep(std::time::Duration::from_secs_f64(frame_t_rel - now));
+        }
+        if !control.paused.load(Ordering::SeqCst) { frame_idx += 1; }
+        last_iter_end = std::time::Instant::now();
+    }
+    Ok(())
+}
+
+/// Defer-drop a just-replaced VT zero-copy pair so its IOSurface isn't
+/// released until a couple of frames after the GPU last read it (the macOS
+/// analogue of the Windows [`retire_frame`]; we can't fence on this thread).
+#[cfg(target_os = "macos")]
+fn retire_vt_pair(
+    q: &mut std::collections::VecDeque<vr180_pipeline::fisheye_decode::VtSharedFisheyePair>,
+    old: Option<vr180_pipeline::fisheye_decode::VtSharedFisheyePair>,
+) {
+    if let Some(p) = old { q.push_back(p); while q.len() > 2 { q.pop_front(); } }
+}
+
+/// macOS VideoToolbox zero-copy fisheye decoder loop (DJI OSV dual-stream).
+///
+/// The macOS counterpart to [`run_fisheye_zerocopy`] (Windows): same pacing /
+/// pause-resume / seek / trim / live-stab / live-calib / projection logic, but
+/// the pixel source is GPU-resident. VideoToolbox decodes both streams; each
+/// eye's P010 IOSurface planes are wrapped as wgpu textures aliasing the
+/// surface (no host download, no swscale — the win over the CPU
+/// `DualStreamFisheyeIter` path), box-downscaled to the working res with
+/// `resolve_p010_planes_to_rgba16`, then projected via the same
+/// `project_fisheye_rgba16_texture_to_*` family the Windows path uses. Decode
+/// is inline (no worker sub-thread) so the IOSurface textures never cross a
+/// thread — matching the proven macOS EAC zero-copy loop [`run_zero_copy`].
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn run_fisheye_vt_zerocopy(
+    pipeline: Arc<vr180_pipeline::gpu::Device>,
+    cfg: &DecoderConfig,
+    control: Arc<DecoderControl>,
+    kind: vr180_pipeline::SourceKind,
+    fps: f32,
+    dt: f64,
+    eye_w: u32,
+    eye_h: u32,
+    mut iter: vr180_pipeline::fisheye_decode::VtSharedDualStreamIter,
+    frame_tx: Sender<DecodedFrame>,
+    cmd_rx: Receiver<DecoderCommand>,
+) -> anyhow::Result<()> {
+    use vr180_pipeline::fisheye_decode::VtSharedFisheyePair;
+
+    // Native fisheye dims (what the iterator yields) → working preview res (what
+    // we resolve to + project from). Calib resolves against the WORKING res,
+    // exactly like the Windows zero-copy path (which yields already-downscaled
+    // frames). Matches the CPU path's anti-aliased 1280-cap working res.
+    let (native_w, native_h) = iter.eye_dims();
+    let cap = vr180_pipeline::fisheye_decode::max_decode_side_for_fps(fps);
+    let scale = (cap as f32 / native_w.max(native_h) as f32).min(1.0);
+    let work_w = (((native_w as f32 * scale) as u32 + 1) & !1).max(2);
+    let work_h = (((native_h as f32 * scale) as u32 + 1) & !1).max(2);
+    let (src_w, src_h) = (work_w, work_h);
+    tracing::info!(
+        "decoder (fisheye/vt-zc): native {}x{} → working {}x{} (zero-copy P010 → resolve → project)",
+        native_w, native_h, work_w, work_h
+    );
+
+    // Initial seek to trim_in.
+    let initial_trim_in = control.settings.read().trim_in_s;
+    if let Some(t_in) = initial_trim_in {
+        if t_in > 0.001 { let _ = iter.seek(t_in); }
+    }
+
+    // ── Per-eye calibration + stabilization from the OSV protobuf ────
+    let mut dji_osv_imu = load_dji_imu_progressive(cfg, kind, &control, src_w, src_h);
+
+    let mut cached_gen = control.settings_generation.load(Ordering::SeqCst);
+    let (mut calib_left, mut calib_right) = resolve_fisheye_calib_pair(
+        &control.settings.read(), kind, src_w, src_h, dji_osv_imu.as_ref(),
+    );
+    tracing::info!(
+        "decoder (fisheye/vt-zc): initial calib L fx={:.1} cx={:.1} cy={:.1} | R fx={:.1} cx={:.1} cy={:.1}",
+        calib_left.fx, calib_left.cx, calib_left.cy, calib_right.fx, calib_right.cx, calib_right.cy
+    );
+
+    let total_frames = vr180_pipeline::decode::probe_video(&cfg.path)
+        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+        .unwrap_or(0).max(1);
+    let compute_stab = |osv: Option<&vr180_fisheye::DjiOsvImu>,
+                        control: &DecoderControl| -> Option<Vec<EquirectRotation>> {
+        let osv = osv?;
+        let s = control.settings.read();
+        let max_corr_deg = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
+        let smooth_ms = s.dji_smooth_ms;
+        let responsiveness = s.dji_responsiveness;
+        vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
+        drop(s);
+        match vr180_pipeline::dji_imu::compute_dji_stabilization(
+            osv, total_frames, max_corr_deg, smooth_ms, fps, responsiveness,
+        ) {
+            Ok(stab) => Some(stab.per_frame),
+            Err(e) => { tracing::warn!("vt-zc: dji stab failed: {e}"); None }
+        }
+    };
+    let mut stab_rotations: Option<Vec<EquirectRotation>> = None;
+    let mut last_stabilize_state = false;
+    if control.settings.read().stabilize {
+        last_stabilize_state = true;
+        // Compute now only if the full IMU is cached; the progressive-upgrade
+        // block computes stab once the background quats finish loading.
+        if control.imu_ready.load(Ordering::SeqCst) {
+            stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control);
+        }
+    }
+
+    // ── Pacing / control state (same model as run_fisheye_zerocopy) ──
+    let mut frame_idx: u32 = 0;
+    let mut time_offset: f64 = 0.0;
+    let mut skipped_count: u32 = 0;
+    let mut start_wall: Option<std::time::Instant> = None;
+    let mut paused_offset = std::time::Duration::ZERO;
+    let mut force_render_next = false;
+    if let Some(t_in) = initial_trim_in {
+        if t_in > 0.001 { time_offset = t_in; }
+    }
+
+    let preview_decimation: u32 = if fps > 30.5 { 2 } else { 1 };
+    let preview_fps = fps / preview_decimation as f32;
+    let preview_dt = 1.0_f64 / preview_fps as f64;
+    if preview_decimation > 1 {
+        tracing::info!("decoder (fisheye/vt-zc): fps={:.2} → decimation {}× → {:.2} fps",
+            fps, preview_decimation, preview_fps);
+    }
+
+    let mut last_iter_end = std::time::Instant::now();
+    let mut decode_us: u128;
+
+    // `held` is the frame currently in hand (re-rendered while paused);
+    // `retire` defers the drop of replaced frames so the GPU finishes reading
+    // their IOSurfaces first.
+    let mut held: Option<VtSharedFisheyePair> = None;
+    let mut retire: std::collections::VecDeque<VtSharedFisheyePair> = std::collections::VecDeque::new();
+
+    'main: loop {
+        let stay_on_pair = control.paused.load(Ordering::SeqCst) && held.is_some();
+        if !stay_on_pair {
+            // Pull one new pair (drop up to decimation-1 extra to thin >30 fps).
+            let mut pulled = match iter.next_pair(&pipeline.device)? {
+                Some(p) => Some(p),
+                None => break 'main,
+            };
+            for _ in 1..preview_decimation {
+                match iter.next_pair(&pipeline.device) {
+                    Ok(Some(np)) => pulled = Some(np),
+                    Ok(None) => break,
+                    Err(e) => { tracing::warn!("vt-zc decode: {e}"); break; }
+                }
+            }
+            retire_vt_pair(&mut retire, held.take());
+            held = pulled;
+        }
+        let pair = held.as_ref().expect("held populated above");
+        decode_us = last_iter_end.elapsed().as_micros();
+
+        // Progressive IMU: swap the calib-only partial for the full IMU once the
+        // background load finishes, then compute stabilization (auto-on if
+        // `stabilize` is set). Cheap no-op once `imu_ready`.
+        if !control.imu_ready.load(Ordering::SeqCst) {
+            if let Some(full) = try_upgrade_dji_imu(cfg, dji_osv_imu.as_ref()) {
+                dji_osv_imu = Some(full);
+                if control.settings.read().stabilize {
+                    stab_rotations = compute_stab(dji_osv_imu.as_ref(), &control);
+                    last_stabilize_state = true;
+                }
+                control.imu_ready.store(true, Ordering::SeqCst);
+                tracing::info!("decoder (fisheye): full IMU applied — stabilization enabled");
+            }
+        }
+
+        // Live stabilize toggle.
+        let now_stabilize = control.settings.read().stabilize;
+        if now_stabilize != last_stabilize_state {
+            stab_rotations = if now_stabilize { compute_stab(dji_osv_imu.as_ref(), &control) } else { None };
+            last_stabilize_state = now_stabilize;
+        }
+
+        // Drain commands (seek/stop).
+        let mut seek_target: Option<f64> = None;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                DecoderCommand::Stop => return Ok(()),
+                DecoderCommand::Seek(t) => seek_target = Some(t.max(0.0)),
+            }
+        }
+        if let Some(t) = seek_target {
+            iter.seek(t)?;
+            time_offset = t; frame_idx = 0; start_wall = None;
+            paused_offset = std::time::Duration::ZERO; force_render_next = true;
+            retire_vt_pair(&mut retire, held.take());
+            continue 'main;
+        }
+
+        // Trim-out loop.
+        let frame_t_rel = frame_idx as f64 * preview_dt;
+        let frame_t_abs = time_offset + frame_t_rel;
+        {
+            let s = control.settings.read();
+            if let Some(out_t) = s.trim_out_s {
+                if frame_t_abs >= out_t {
+                    let in_t = s.trim_in_s.unwrap_or(0.0);
+                    drop(s);
+                    iter.seek(in_t)?;
+                    time_offset = in_t; frame_idx = 0; start_wall = None;
+                    paused_offset = std::time::Duration::ZERO; force_render_next = true;
+                    retire_vt_pair(&mut retire, held.take());
+                    continue 'main;
+                }
+            }
+        }
+
+        // Pause handling (re-render held frame on slider changes).
+        if control.paused.load(Ordering::SeqCst) && !force_render_next && stay_on_pair {
+            let pause_start = std::time::Instant::now();
+            while control.paused.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                if control.settings_generation.load(Ordering::SeqCst) != cached_gen {
+                    force_render_next = true; break;
+                }
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        DecoderCommand::Stop => return Ok(()),
+                        DecoderCommand::Seek(t) => {
+                            iter.seek(t.max(0.0))?;
+                            time_offset = t.max(0.0); frame_idx = 0; start_wall = None;
+                            paused_offset = std::time::Duration::ZERO; force_render_next = true;
+                            retire_vt_pair(&mut retire, held.take());
+                            continue 'main;
+                        }
+                    }
+                }
+            }
+            paused_offset += pause_start.elapsed();
+        }
+
+        // Settings changed → re-resolve per-eye calib.
+        let current_gen = control.settings_generation.load(Ordering::SeqCst);
+        if current_gen != cached_gen {
+            let snap = control.settings.read();
+            let (l, r) = resolve_fisheye_calib_pair(&snap, kind, src_w, src_h, dji_osv_imu.as_ref());
+            calib_left = l; calib_right = r; drop(snap); cached_gen = current_gen;
+        }
+
+        // Wall-clock pacing.
+        let wall_t = start_wall
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
+        let decode_bound = (decode_us as f64) > preview_dt * 0.5e6;
+        if decode_bound {
+            start_wall = Some(std::time::Instant::now()
+                - std::time::Duration::from_secs_f64(frame_t_rel) - paused_offset);
+        } else if !force_render_next && wall_t > frame_t_rel + preview_dt * 0.5 {
+            frame_idx += 1; skipped_count += 1;
+            if wall_t > frame_t_rel + 1.0 {
+                start_wall = Some(std::time::Instant::now()
+                    - std::time::Duration::from_secs_f64(frame_t_rel) - paused_offset);
+            }
+            if skipped_count % 30 == 0 {
+                tracing::debug!("decoder (fisheye/vt-zc): render-bound, behind {:.1} ms, skipped {}",
+                    (wall_t - frame_t_rel) * 1000.0, skipped_count);
+            }
+            // Drop the held frame so the next iteration pulls a fresh one.
+            retire_vt_pair(&mut retire, held.take());
+            last_iter_end = std::time::Instant::now();
+            continue;
+        }
+
+        // ── Resolve P010 planes → working-res RGBA16 (GPU, zero host hop) ──
+        let phase_t0 = std::time::Instant::now();
+        let l_tex = pipeline.resolve_p010_planes_to_rgba16(
+            &pair.left_y.texture, &pair.left_uv.texture, native_w, native_h, work_w, work_h)?;
+        let r_tex = pipeline.resolve_p010_planes_to_rgba16(
+            &pair.right_y.texture, &pair.right_uv.texture, native_w, native_h, work_w, work_h)?;
+
+        // Frame-level stab rotation.
+        let stab_idx = if pair.pts_s.is_finite() && pair.pts_s >= 0.0 {
+            (pair.pts_s / dt).round() as usize
+        } else {
+            (((time_offset / dt).round() as i64) + frame_idx as i64).max(0) as usize
+        };
+        let absolute_frame_idx = stab_idx as u32;
+        let rot = stab_rotations.as_ref().and_then(|v| v.get(stab_idx).copied())
+            .unwrap_or(EquirectRotation::IDENTITY);
+
+        // Per-row rolling-shutter correction (OSV; gated on stabilize, like the
+        // CPU/paused-still path). `src_h` is the working-res fisheye height.
+        let rs_rows_f32: Option<Vec<f32>> = if control.settings.read().stabilize {
+            dji_osv_imu.as_ref().and_then(|osv| {
+                vr180_pipeline::dji_imu::compute_per_row_quaternions_for_frame(
+                    osv, stab_idx,
+                    vr180_pipeline::dji_imu::dji_osmo_readout_ms_for_fps(fps) / 1000.0,
+                    src_h, fps,
+                )
+            }).map(|q| {
+                let lens_a = dji_osv_imu.as_ref()
+                    .and_then(|osv| osv.lens_a.mount_quat_xyzw)
+                    .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
+                vr180_pipeline::dji_imu::pack_per_row_camera_matrices(&q, lens_a)
+            })
+        } else {
+            None
+        };
+
+        let view_adjust = {
+            let s = control.settings.read();
+            vr180_pipeline::panomap::ViewAdjust {
+                pano_yaw_deg: s.pano_yaw_deg, pano_pitch_deg: s.pano_pitch_deg, pano_roll_deg: s.pano_roll_deg,
+                stereo_yaw_deg: s.stereo_yaw_deg, stereo_pitch_deg: s.stereo_pitch_deg, stereo_roll_deg: s.stereo_roll_deg,
+                upside_down: s.camera_upside_down,
+            }
+        };
+        let (rot_left, rot_right) = if view_adjust.is_identity() {
+            (rot, rot)
+        } else {
+            let (v_l, v_r) = view_adjust.per_eye_matrices();
+            (
+                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &v_l)),
+                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &v_r)),
+            )
+        };
+
+        let (left_tex, right_tex) = {
+            let mode = control.settings.read().fisheye_output_mode;
+            let (ow, oh) = match mode {
+                FisheyeOutputMode::HalfEquirect => (eye_w, eye_h),
+                FisheyeOutputMode::Fisheye => { let side = eye_w.min(eye_h); (side, side) }
+            };
+            match mode {
+                FisheyeOutputMode::Fisheye => {
+                    if let Some(rs) = rs_rows_f32.as_deref() {
+                        let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
+                            &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs, 0)?;
+                        let r = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
+                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs, 1)?;
+                        (l, r)
+                    } else {
+                        let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                            &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, 0)?;
+                        let r = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1)?;
+                        (l, r)
+                    }
+                }
+                FisheyeOutputMode::HalfEquirect => {
+                    if let Some(rs) = rs_rows_f32.as_deref() {
+                        let l = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                            &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs, 0)?;
+                        let r = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs, 1)?;
+                        (l, r)
+                    } else {
+                        let l = pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                            &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, 0)?;
+                        let r = pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1)?;
+                        (l, r)
+                    }
+                }
+            }
+        };
+        let (pe_w, pe_h) = (left_tex.width(), left_tex.height());
+        let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
+            &pipeline, &control.settings.read(), &left_tex, &right_tex, pe_w, pe_h,
+        )?;
+
+        if frame_idx < 10 || frame_idx % 60 == 0 {
+            tracing::info!(
+                "perf(vt-zc) f={:>4} wait={:>5}µs render={:>5}µs budget@{:.0}fps={:.0}µs (dec={}× native {}×{})",
+                frame_idx, decode_us, phase_t0.elapsed().as_micros(),
+                preview_fps, 1_000_000.0 / preview_fps, preview_decimation, native_w, native_h,
+            );
+        }
+
+        let out = DecodedFrame {
+            texture: Arc::new(sbs_tex),
+            width: out_w, height: out_h,
+            frame_idx: absolute_frame_idx,
+            // Report the SHOWN frame's own time (its pts, via stab_idx), NOT the
+            // pacing clock: render-bound frame-skips drift `frame_t_abs` ahead of
+            // the frame actually on screen, and the zoom still (DetailCache) is
+            // keyed on this timestamp — a drift makes it decode a DIFFERENT frame.
+            timestamp_s: absolute_frame_idx as f64 * dt,
         };
         match frame_tx.try_send(out) {
             Ok(()) => {}

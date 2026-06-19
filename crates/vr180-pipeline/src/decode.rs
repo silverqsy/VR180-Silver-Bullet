@@ -182,7 +182,6 @@ fn read_stbl_samples(
     moov: &[u8],
     stbl: (usize, usize),
 ) -> Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
     let be32 = |b: &[u8], o: usize| -> Result<u32> {
         b.get(o..o + 4).map(|s| u32::from_be_bytes(s.try_into().unwrap()))
             .ok_or_else(|| Error::Ffmpeg("mp4: short read (u32)".into()))
@@ -236,7 +235,9 @@ fn read_stbl_samples(
     }
 
     let total: usize = sizes.iter().map(|&s| s as usize).sum();
-    let mut out = Vec::with_capacity(total);
+
+    // First pass — pure arithmetic, no I/O: resolve every chunk's (offset, len).
+    let mut ranges: Vec<(u64, usize)> = Vec::with_capacity(chunk_offsets.len());
     let mut sample_cursor = 0usize;
     for (c, &chunk_off) in chunk_offsets.iter().enumerate() {
         let chunk_1 = (c + 1) as u32;
@@ -255,13 +256,83 @@ fn read_stbl_samples(
             if chunk_off + chunk_len > fsize {
                 return Err(Error::Ffmpeg("mp4: chunk past EOF".into()));
             }
-            let mut buf = vec![0u8; chunk_len as usize];
-            f.seek(SeekFrom::Start(chunk_off))?;
-            f.read_exact(&mut buf)?;
-            out.extend_from_slice(&buf);
+            ranges.push((chunk_off, chunk_len as usize));
         }
         sample_cursor += spc as usize;
         if sample_cursor >= sizes.len() { break; }
+    }
+
+    // Second pass — read the chunks. A long OSV / `.360` interleaves ONE tiny
+    // metadata sample per chunk, so this is thousands of small, SCATTERED reads.
+    // Done sequentially it is latency-bound — tens of seconds on a high-latency
+    // mount (SMB/NAS), where each read is a full request round-trip. Issue them
+    // concurrently (positioned reads on the shared handle) so the latency
+    // overlaps; the total bytes are only a few MB, so it's never bandwidth-bound.
+    let parts = read_ranges_concurrent(f, &ranges)?;
+    let mut out = Vec::with_capacity(total);
+    for p in &parts { out.extend_from_slice(p); }
+    Ok(out)
+}
+
+/// Read many `(offset, len)` byte ranges from `f` and return them in order.
+/// On Unix this fans the reads out across worker threads using positioned reads
+/// (`read_exact_at`, which doesn't touch the shared file cursor) so per-request
+/// latency on a high-latency mount overlaps instead of summing — the difference
+/// between a long OSV's metadata loading in ~1 s vs. ~minute over SMB. Other
+/// platforms fall back to a sequential clone-and-seek read.
+#[cfg(unix)]
+fn read_ranges_concurrent(f: &std::fs::File, ranges: &[(u64, usize)]) -> Result<Vec<Vec<u8>>> {
+    use std::os::unix::fs::FileExt;
+    let n = ranges.len();
+    let mut out: Vec<Vec<u8>> = ranges.iter().map(|&(_, l)| vec![0u8; l]).collect();
+    if n <= 1 {
+        if n == 1 {
+            f.read_exact_at(&mut out[0], ranges[0].0)
+                .map_err(|e| Error::Ffmpeg(format!("mp4: chunk read: {e}")))?;
+        }
+        return Ok(out);
+    }
+    // Enough concurrency to hide ~1-2 ms SMB request latency over thousands of
+    // chunks, capped so we don't spawn absurd thread counts on short clips.
+    let workers = n.min(64);
+    let per = (n + workers - 1) / workers;
+    let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    std::thread::scope(|scope| {
+        let mut rest: &mut [Vec<u8>] = &mut out;
+        let mut base = 0usize;
+        while base < n {
+            let take = per.min(n - base);
+            let (head, tail) = rest.split_at_mut(take);
+            let rs = &ranges[base..base + take];
+            let errref = &err;
+            scope.spawn(move || {
+                for (buf, &(off, _)) in head.iter_mut().zip(rs) {
+                    if let Err(e) = f.read_exact_at(buf, off) {
+                        *errref.lock().unwrap() = Some(format!("{e}"));
+                        return;
+                    }
+                }
+            });
+            rest = tail;
+            base += take;
+        }
+    });
+    if let Some(e) = err.into_inner().unwrap() {
+        return Err(Error::Ffmpeg(format!("mp4: concurrent chunk read: {e}")));
+    }
+    Ok(out)
+}
+
+#[cfg(not(unix))]
+fn read_ranges_concurrent(f: &std::fs::File, ranges: &[(u64, usize)]) -> Result<Vec<Vec<u8>>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut fh = f.try_clone().map_err(|e| Error::Ffmpeg(format!("mp4: clone handle: {e}")))?;
+    let mut out = Vec::with_capacity(ranges.len());
+    for &(off, len) in ranges {
+        let mut buf = vec![0u8; len];
+        fh.seek(SeekFrom::Start(off)).map_err(|e| Error::Ffmpeg(format!("mp4: seek: {e}")))?;
+        fh.read_exact(&mut buf).map_err(|e| Error::Ffmpeg(format!("mp4: read: {e}")))?;
+        out.push(buf);
     }
     Ok(out)
 }
@@ -299,6 +370,28 @@ mod gpmf_fast_tests {
         let slow = extract_dji_meta_stream_demux(p).expect("demux");
         assert_eq!(fast.len(), slow.len(), "djmd length differs");
         assert!(fast == slow, "djmd bytes differ");
+    }
+
+    /// The fast calib-only read must be a byte-prefix of the full djmd blob
+    /// (the first sample sits at the head), and must actually contain the
+    /// `video_meta` calib container (protobuf field 2) — i.e. begin with a
+    /// length-delimited field-2 tag (0x12). If this holds, the preview can
+    /// dewarp from the first sample without reading the per-frame quats.
+    #[test]
+    fn djmd_calib_blob_is_prefix_with_field2() {
+        let p = std::path::Path::new("/Volumes/Silver/060613GC/CAM_20260613172639_0038_D.OSV");
+        if !p.exists() { eprintln!("skip djmd calib test: no reference .osv"); return; }
+        super::init();
+        let head = extract_dji_calib_blob(p).expect("calib blob");
+        let full = extract_data_track_via_sample_table(p, b"djmd").expect("sample-table");
+        eprintln!("calib head = {} bytes; full djmd = {} bytes", head.len(), full.len());
+        assert!(!head.is_empty(), "calib head empty");
+        assert!(head.len() <= full.len(), "head longer than full");
+        assert_eq!(&full[..head.len()], &head[..], "calib head is not a prefix of full blob");
+        // The top-level message must carry field 2 (video_meta/calib) somewhere
+        // in the first sample. protobuf tag for field 2, length-delimited = 0x12.
+        assert!(head.iter().any(|&b| b == 0x12),
+            "first djmd sample has no field-2 (calib) tag — calib not in sample 0");
     }
 }
 
@@ -391,6 +484,111 @@ pub fn extract_dji_meta_stream(path: &Path) -> Result<Vec<u8>> {
         Err(e) => tracing::debug!("djmd: sample-table read failed for {path:?}: {e}; demuxing"),
     }
     extract_dji_meta_stream_demux(path)
+}
+
+/// FAST read of ONLY the lens-calibration head of the DJI `djmd` track. The
+/// `video_meta` calib container (protobuf field 2: lens_A/lens_B intrinsics)
+/// sits at the START of the track, before the per-frame quaternion samples
+/// (field 3, repeated ~once per frame). This reads just the FIRST `djmd` sample
+/// via the MP4 sample table — one small read after the moov — so the preview can
+/// dewarp correctly in ~1 s while the huge, scattered per-frame IMU loads in the
+/// background. Returns the first sample's bytes; the caller runs
+/// `DjiOsvImu::parse` and uses only `lens_a`/`lens_b`. Errs if the sample table
+/// can't be read or the calib isn't in the first sample (caller then waits for
+/// the full extract).
+pub fn extract_dji_calib_blob(path: &Path) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let fsize = f.metadata()?.len();
+
+    // Top-level scan for `moov` (headers only; seeks past the multi-GB mdat).
+    let mut moov_off: Option<u64> = None;
+    let mut moov_sz: u64 = 0;
+    let mut pos: u64 = 0;
+    while pos + 8 <= fsize {
+        let mut hdr = [0u8; 16];
+        f.seek(SeekFrom::Start(pos))?;
+        f.read_exact(&mut hdr[..8])?;
+        let sz32 = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+        let btag = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        let sz: u64 = if sz32 == 1 {
+            f.read_exact(&mut hdr[8..16])?;
+            u64::from_be_bytes(hdr[8..16].try_into().unwrap())
+        } else if sz32 == 0 { fsize - pos } else { sz32 as u64 };
+        if sz < 8 { break; }
+        if &btag == b"moov" { moov_off = Some(pos); moov_sz = sz; break; }
+        pos = pos.checked_add(sz).ok_or_else(|| Error::Ffmpeg("mp4: box overflow".into()))?;
+    }
+    let moov_off = moov_off.ok_or_else(|| Error::Ffmpeg("mp4: no moov".into()))?;
+    if moov_sz < 8 || moov_off + moov_sz > fsize {
+        return Err(Error::Ffmpeg("mp4: bad moov size".into()));
+    }
+    let mut moov = vec![0u8; moov_sz as usize];
+    f.seek(SeekFrom::Start(moov_off))?;
+    f.read_exact(&mut moov)?;
+    let (mv0, mvsz) = find_atom(&moov, 0, moov.len(), b"moov")
+        .ok_or_else(|| Error::Ffmpeg("mp4: moov header".into()))?;
+
+    // Pick the SAME track the full extract keeps — the largest by total sample
+    // bytes (an OSV has two `djmd` tracks; the metadata/calib one is the larger).
+    let stbls = find_data_track_stbls(&moov, mv0, mvsz, b"djmd");
+    let stbl = stbls.into_iter()
+        .max_by_key(|&s| stbl_total_sample_bytes(&moov, s))
+        .ok_or_else(|| Error::Ffmpeg("mp4: no djmd trak".into()))?;
+
+    let blob = read_stbl_first_sample(&mut f, fsize, &moov, stbl)?;
+    if blob.is_empty() {
+        return Err(Error::Ffmpeg("mp4: djmd first sample empty".into()));
+    }
+    Ok(blob)
+}
+
+/// Total bytes of all samples in a track (sum of `stsz`) — used to pick the
+/// same `djmd` track the full extract keeps (largest by bytes).
+fn stbl_total_sample_bytes(moov: &[u8], stbl: (usize, usize)) -> u64 {
+    let (sb0, sbsz) = stbl;
+    let Some((zo, _)) = find_atom(moov, sb0 + 8, sb0 + sbsz, b"stsz") else { return 0 };
+    let g = |o: usize| moov.get(o..o + 4)
+        .map(|b| u32::from_be_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let const_size = g(zo + 12);
+    let count = g(zo + 16) as u64;
+    if const_size != 0 { return const_size as u64 * count; }
+    let base = zo + 20;
+    (0..count as usize).map(|i| g(base + i * 4) as u64).sum()
+}
+
+/// Read ONLY the first sample of a track (chunk 0, sample 0) — the calib head.
+fn read_stbl_first_sample(
+    f: &mut std::fs::File, fsize: u64, moov: &[u8], stbl: (usize, usize),
+) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let be32 = |b: &[u8], o: usize| -> Result<u32> {
+        b.get(o..o + 4).map(|s| u32::from_be_bytes(s.try_into().unwrap()))
+            .ok_or_else(|| Error::Ffmpeg("mp4: short read (u32)".into()))
+    };
+    let be64 = |b: &[u8], o: usize| -> Result<u64> {
+        b.get(o..o + 8).map(|s| u64::from_be_bytes(s.try_into().unwrap()))
+            .ok_or_else(|| Error::Ffmpeg("mp4: short read (u64)".into()))
+    };
+    let (sb0, sbsz) = stbl;
+    let (zo, _) = find_atom(moov, sb0 + 8, sb0 + sbsz, b"stsz")
+        .ok_or_else(|| Error::Ffmpeg("mp4: stsz".into()))?;
+    let const_size = be32(moov, zo + 12)?;
+    let first_size = if const_size != 0 { const_size } else { be32(moov, zo + 20)? };
+    let chunk0: u64 = if let Some((o, _)) = find_atom(moov, sb0 + 8, sb0 + sbsz, b"stco") {
+        be32(moov, o + 16)? as u64
+    } else if let Some((o, _)) = find_atom(moov, sb0 + 8, sb0 + sbsz, b"co64") {
+        be64(moov, o + 16)?
+    } else {
+        return Err(Error::Ffmpeg("mp4: no stco/co64".into()));
+    };
+    if first_size == 0 || chunk0 + first_size as u64 > fsize {
+        return Err(Error::Ffmpeg("mp4: bad first sample".into()));
+    }
+    let mut buf = vec![0u8; first_size as usize];
+    f.seek(SeekFrom::Start(chunk0))?;
+    f.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 /// Original full-demux DJI metadata extraction — reads the whole file and
