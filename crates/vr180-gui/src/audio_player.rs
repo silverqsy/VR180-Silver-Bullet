@@ -200,8 +200,15 @@ impl Drop for AudioPlayer {
     fn drop(&mut self) {
         let _ = self.cmd_tx.send(AudioCmd::Stop);
         if let Some(h) = self.worker_handle.take() {
-            // Best-effort join.
-            let _ = h.join();
+            // Do NOT join on the dropping thread. `AudioPlayer` is dropped on
+            // the UI thread during a clip switch (`stop_playback`), and the
+            // worker may be parked inside a cold network read (SMB/NAS source)
+            // that won't return — and thus won't observe `Stop` — for many
+            // seconds. Joining there would freeze the whole GUI. The cpal
+            // stream is already stopping as `_stream` drops; hand the join to
+            // a throwaway thread so the worker is still reaped (no leak) but
+            // the UI never blocks on it.
+            std::thread::spawn(move || { let _ = h.join(); });
         }
     }
 }

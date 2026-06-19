@@ -54,6 +54,22 @@ pub struct App {
     /// during a slow load would otherwise pile up detached decoder threads
     /// all contending for the same file (the "click play too fast" freeze).
     decoder_starting: bool,
+    /// In-flight async clip load. The blocking metadata reads (probe, format
+    /// detect, GoPro GPMF, segment scan, per-segment probes) run on a worker
+    /// thread instead of the UI thread, so a cold/slow source — notably a
+    /// spun-down SMB/NAS share, where the first access stalls for seconds
+    /// while the disks wake — never freezes the GUI. `update` polls `rx`;
+    /// `finish_load` applies the result. `None` when no load is in flight.
+    load_pending: Option<LoadPending>,
+    /// Monotonic load id. Bumped on every `load_file_inner`; a delivered
+    /// `LoadedMeta` is applied only if its token still matches, so a newer
+    /// load (clip switch mid-read) cleanly supersedes an older one.
+    load_token: u64,
+    /// Set when the user presses Play DURING the async-load window (the clip
+    /// isn't ready yet, so the press can't spawn a decoder). `finish_load`
+    /// honors it by spawning unpaused instead of paused, so the intent isn't
+    /// lost. Reset on each fresh load.
+    play_when_ready: bool,
     /// Currently displayed frame texture (kept alive while egui still
     /// references it) + the egui texture id we registered it under.
     current_display: Option<DisplayFrame>,
@@ -390,6 +406,9 @@ fn tr(en: &'static str) -> &'static str {
         // Top bar
         "Load video…" => "加载视频…",
         "Drop a video file here, or click Load video." => "将视频文件拖到此处，或点击“加载视频”。",
+        "Loading" => "加载中",
+        "Loading stabilization data…" => "正在加载防抖数据……",
+        "Reading from the source — network drives can take a moment." => "正在读取源文件——网络驱动器可能需要片刻。",
         "Preview size" => "预览尺寸",
         // Side-panel section headers
         "Source" => "素材",
@@ -667,6 +686,41 @@ struct ClipInfo {
     fisheye_eye_h: u32,
 }
 
+/// An async clip load in flight (see `App::load_pending`). The worker
+/// thread does all the blocking source I/O and posts a [`LoadOutcome`]
+/// back on `rx`; the UI thread shows a "Loading…" state until it arrives.
+struct LoadPending {
+    token: u64,
+    path: PathBuf,
+    rx: Receiver<LoadOutcome>,
+    started: std::time::Instant,
+}
+
+/// Result of the off-thread metadata read: either the resolved clip
+/// metadata to apply, or a human-readable error string to log.
+type LoadOutcome = std::result::Result<LoadedMeta, String>;
+
+/// Everything `finish_load` needs to build the `ClipInfo`, seed per-clip
+/// settings, and spawn the decoder — all gathered off the UI thread.
+struct LoadedMeta {
+    token: u64,
+    path: PathBuf,
+    preserve_clip_settings: bool,
+    source_kind: vr180_pipeline::SourceKind,
+    width: u32,
+    height: u32,
+    fps: f32,
+    duration_sec: f64,
+    frame_count: u32,
+    segments: Vec<PathBuf>,
+    cori_count: usize,
+    grav_count: usize,
+    srot_ms: Option<f32>,
+    detected_rs_mode: crate::decoder::RsMode,
+    fisheye_eye_w: u32,
+    fisheye_eye_h: u32,
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Force dark visuals regardless of the OS appearance preference.
@@ -784,6 +838,9 @@ impl App {
             detail_cache: None,
             fisheye_last_seeded: None,
             suppress_reseed_once: false,
+            load_pending: None,
+            load_token: 0,
+            play_when_ready: false,
         }
     }
 
@@ -2032,73 +2089,109 @@ impl App {
     /// restored from the clip list (and for same-clip reloads like the
     /// eye-orientation toggle).
     fn load_file_inner(&mut self, path: PathBuf, preserve_clip_settings: bool) {
-        let t_load = std::time::Instant::now();
         // ── Tear down everything tied to the previous clip ──────────
+        // Everything here is UI-thread-only state (egui textures, playback
+        // flags). The actual SOURCE I/O — probe, format detect, GoPro GPMF,
+        // segment scan, per-segment probes — is NOT done here: it runs on a
+        // worker thread (`load_clip_metadata`) and lands in `finish_load`.
+        // Doing it inline used to freeze the whole GUI whenever the source
+        // was cold/slow — most painfully a spun-down SMB/NAS share, where the
+        // first access stalls for seconds while the disks wake (every later
+        // access is instant once cached, which is exactly the "first time
+        // hangs, second time instant" report).
         // 1. Stop the decoder thread + drop the IPC channels.
         self.stop_playback();
-        tracing::info!("load_timing: after stop_playback @ {:?}", t_load.elapsed());
-        // 2. Free the egui-registered preview texture from the old
-        //    clip. Without this the previous frame stays painted in
-        //    the central panel until the new decoder produces output.
+        // 2. Free the egui-registered preview texture from the old clip, so
+        //    the previous frame doesn't stay painted while the new one loads.
         if let Some(prev) = self.current_display.take() {
-            let mut renderer = self.egui_renderer.write();
-            renderer.free_texture(&prev.egui_id);
-            // Dropping `prev.texture` (the Arc<wgpu::Texture>) below
-            // releases the GPU memory when the last reference goes.
+            self.egui_renderer.write().free_texture(&prev.egui_id);
         }
-        // 3. Reset volatile playback state. Everything in `Settings` is now
-        //    REMEMBERED across loads (and across launches, via
-        //    `Settings::save_persisted`) — stabilization, view-adjust,
-        //    per-eye override / calibration, output mode, color, LUT — so a
-        //    new clip keeps your last setup. The only exception is the trim
-        //    range, which is clip-specific (time offsets) and would be
-        //    meaningless on a different clip. Per-clip camera defaults
-        //    (preset + built-in LUT) below only fill in still-unset values,
-        //    so an explicit choice always wins.
+        // 3. Drop the zoom-magnifier caches so they can't serve the PREVIOUS
+        //    clip's still after the swap.
+        if let Some(prev) = self.full_res_display.take() {
+            self.egui_renderer.write().free_texture(&prev.egui_id);
+        }
+        self.detail_cache = None;
+        self.full_res_key = 0;
+        self.full_res_desired_key = 0;
+        self.detail_last_key = 0;
+        // 4. Reset volatile playback state. Everything in `Settings` is now
+        //    REMEMBERED across loads, except the clip-specific trim range.
         self.fps_stats = FpsStats::default();
         if !preserve_clip_settings {
             self.settings.trim_in_s = None;
             self.settings.trim_out_s = None;
         }
-        // 4. Drop ClipInfo + path so the sidebar shows "no file"
-        //    momentarily if probe / detection below fails.
+        // 5. Drop ClipInfo + path so the sidebar shows the "Loading…" state.
         self.clip = None;
         self.loaded_path = None;
+        // Fresh load → drop any stale "play when ready" intent from a prior
+        // (possibly superseded) load.
+        self.play_when_ready = false;
 
-        // ── Detect new clip and load metadata ──────────────────────
+        // Resolve the segment list on the UI thread when it's a cheap
+        // import-time choice (a HashMap lookup); otherwise leave it to the
+        // worker (`None` → on-disk chapter detection, which scans sibling
+        // files and can be slow on a network share).
+        let merge_entry = self.merge_groups.get(&path).cloned();
+
+        // Bump the load id so a result from a superseded load is ignored,
+        // then hand all blocking source I/O to a worker thread.
+        self.load_token = self.load_token.wrapping_add(1);
+        let token = self.load_token;
+        let (tx, rx) = crossbeam_channel::bounded::<LoadOutcome>(1);
+        let path_for_worker = path.clone();
+        std::thread::spawn(move || {
+            let outcome = Self::load_clip_metadata(
+                token, path_for_worker, preserve_clip_settings, merge_entry);
+            let _ = tx.send(outcome);
+        });
+        self.load_pending = Some(LoadPending {
+            token, path, rx, started: std::time::Instant::now(),
+        });
+    }
+
+    /// Read everything `finish_load` needs, OFF the UI thread: format
+    /// detect, video probe, GoPro GPMF (CORI/GRAV/SROT/RS), per-eye dims,
+    /// segment chain, and the chain's total duration/frame count. All the
+    /// potentially-slow source reads live here so the GUI stays responsive
+    /// even when the source is on a cold/slow share. Pure function — touches
+    /// no `&self` state, so it's safe to run on a detached thread.
+    fn load_clip_metadata(
+        token: u64,
+        path: PathBuf,
+        preserve_clip_settings: bool,
+        merge_entry: Option<Vec<PathBuf>>,
+    ) -> LoadOutcome {
+        let t_load = std::time::Instant::now();
         let source_kind = vr180_pipeline::source_kind::detect(&path)
             .unwrap_or(vr180_pipeline::SourceKind::Unknown);
         tracing::info!("load_file: {} → kind={:?}", path.display(), source_kind);
 
-        let probe = match vr180_pipeline::decode::probe_video(&path) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("probe failed: {e}");
-                return;
-            }
-        };
+        let probe = vr180_pipeline::decode::probe_video(&path)
+            .map_err(|e| format!("probe failed: {e}"))?;
         tracing::info!("load_timing: after probe_video @ {:?}", t_load.elapsed());
-        let dims = vr180_core::eac::Dims::new(probe.width, probe.height);
 
-        // GoPro family: parse GPMF + GEOC for metadata display.
-        let (cori_count, grav_count, srot_ms, detected_rs_mode) = if source_kind == vr180_pipeline::SourceKind::GoProEac {
-            match crate::decoder::extract_gpmf_cached(&path) {
-                Ok(gpmf) => {
-                    let cori = vr180_core::gyro::parse_cori(&gpmf);
-                    let raw = vr180_core::gyro::parse_raw_imu(&gpmf);
-                    let srot = vr180_core::geoc::find_srot_ms(&gpmf)
-                        .or_else(|| {
-                            vr180_core::geoc::lookup_srot_s(&path, None)
-                                .ok().flatten().map(|s| s * 1000.0)
-                        });
-                    let rs_mode = crate::decoder::detect_rs_mode(&cori);
-                    (cori.len(), raw.grav.len(), srot, rs_mode)
+        // GoPro family: parse GPMF + GEOC for metadata display + RS auto-detect.
+        let (cori_count, grav_count, srot_ms, detected_rs_mode) =
+            if source_kind == vr180_pipeline::SourceKind::GoProEac {
+                match crate::decoder::extract_gpmf_cached(&path) {
+                    Ok(gpmf) => {
+                        let cori = vr180_core::gyro::parse_cori(&gpmf);
+                        let raw = vr180_core::gyro::parse_raw_imu(&gpmf);
+                        let srot = vr180_core::geoc::find_srot_ms(&gpmf)
+                            .or_else(|| {
+                                vr180_core::geoc::lookup_srot_s(&path, None)
+                                    .ok().flatten().map(|s| s * 1000.0)
+                            });
+                        let rs_mode = crate::decoder::detect_rs_mode(&cori);
+                        (cori.len(), raw.grav.len(), srot, rs_mode)
+                    }
+                    Err(_) => (0, 0, None, crate::decoder::default_rs_mode()),
                 }
-                Err(_) => (0, 0, None, crate::decoder::default_rs_mode()),
-            }
-        } else {
-            (0, 0, None, crate::decoder::default_rs_mode())
-        };
+            } else {
+                (0, 0, None, crate::decoder::default_rs_mode())
+            };
 
         // Fisheye family: compute one-eye dimensions for FOV slider hints.
         let (fisheye_eye_w, fisheye_eye_h) = match source_kind {
@@ -2119,10 +2212,49 @@ impl App {
             _ => (0, 0),
         };
 
-        // Auto-fill the preset name in settings based on detection.
-        // Unconditional — we just cleared it above, so this lands the
-        // right default for the NEW clip regardless of what the prior
-        // clip was.
+        let segments = merge_entry
+            .unwrap_or_else(|| vr180_core::segments::detect_segments(&path));
+        tracing::info!("load_timing: after clip_segments ({} segs) @ {:?}",
+            segments.len(), t_load.elapsed());
+
+        // Duration + frame count span the WHOLE segment chain (GS01…, GS02…).
+        // Single-segment: just this file's probe.
+        let (duration_sec, frame_count) = if segments.len() > 1 {
+            let probes: Vec<_> = segments.iter()
+                .filter_map(|s| vr180_pipeline::decode::probe_video(s).ok())
+                .collect();
+            let total_dur: f64 = probes.iter().map(|p| p.duration_sec).sum();
+            let total_frames: u32 = probes.iter()
+                .map(|p| (p.duration_sec * p.fps as f64).round() as u32)
+                .sum();
+            tracing::info!(
+                "multi-segment: {} chapters → {:.1}s, {} frames total",
+                segments.len(), total_dur, total_frames);
+            (total_dur, total_frames)
+        } else {
+            (probe.duration_sec, (probe.duration_sec * probe.fps as f64).round() as u32)
+        };
+
+        // NOTE: no DJI metadata read here — the decoder loads the lens calib
+        // FAST (first sample) for an immediate preview and streams the heavy
+        // per-frame quats in the background (see `load_dji_imu_progressive`), so
+        // the load worker stays fast and the giant metadata read never blocks.
+
+        Ok(LoadedMeta {
+            token, path, preserve_clip_settings, source_kind,
+            width: probe.width, height: probe.height, fps: probe.fps,
+            duration_sec, frame_count, segments,
+            cori_count, grav_count, srot_ms,
+            detected_rs_mode, fisheye_eye_w, fisheye_eye_h,
+        })
+    }
+
+    /// Apply a finished async load on the UI thread: seed the per-clip
+    /// settings, publish `ClipInfo`, and spawn the (paused) decoder. By now
+    /// the worker has already read the source, so it's warm — `spawn_decoder`
+    /// and its audio open don't block.
+    fn finish_load(&mut self, meta: LoadedMeta) {
+        let source_kind = meta.source_kind;
         // Per-camera default preset — only when none is set yet, so a
         // remembered/explicit choice is preserved.
         if source_kind != vr180_pipeline::SourceKind::GoProEac
@@ -2135,14 +2267,10 @@ impl App {
             };
             self.settings.fisheye_preset = auto.to_string();
         }
-        // Autoload the embedded log→Rec.709 LUT matching the source —
-        // DJI D-Log M for OSV, GoPro GP-Log for `.360` (same behavior as
-        // the Python app's bundled "Recommended Lut GPLOG") — but only
-        // when no LUT is set, so a remembered choice (a different LUT,
-        // or a deliberately cleared one within a session) is preserved.
-        // If the OTHER source's builtin is set (clip switch), swap it —
-        // the log curves are camera-specific. The user can clear or
-        // swap it in the Color panel.
+        // Autoload the embedded log→Rec.709 LUT matching the source — DJI
+        // D-Log M for OSV, GoPro GP-Log for `.360` — only when no LUT is set
+        // (preserve a remembered/cleared choice); swap the OTHER source's
+        // builtin on a clip switch since the log curves are camera-specific.
         {
             use crate::decoder::{BUILTIN_OSMO_LUT_PATH, BUILTIN_GPLOG_LUT_PATH};
             let wanted = match source_kind {
@@ -2163,82 +2291,92 @@ impl App {
                 _ => {}
             }
         }
-        // Refresh the (non-persisted) IMU-phase to SROT/2 for THIS clip's fps
-        // — fps-aware (9.15 ms @30 fps, 8.11 ms @50 fps), re-seeded on every
-        // load so a prior clip's tweak never carries over. Set before the
-        // snapshot below so the decoder spawns with it and gen isn't bumped
-        // on frame 0.
-        if !preserve_clip_settings {
-            let imu_phase = vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(probe.fps);
-            self.settings.dji_imu_phase_ms = imu_phase;
-            // RS mode + readout are per-clip — auto-detected from the CORI
-            // stream above (firmware vs no-firmware), re-seeded on each fresh
-            // load so a prior clip's tweak never carries over (same lifecycle
-            // as the IMU phase above). The UI toggle still overrides it.
-            self.settings.rs_mode = detected_rs_mode;
+        // Refresh the (non-persisted) IMU-phase to SROT/2 for THIS clip's fps,
+        // and seed the per-clip RS mode from the auto-detect — fresh loads
+        // only, so a prior clip's tweak never carries over. The UI toggles
+        // still override. Set before the snapshot so the decoder spawns with
+        // them and gen isn't bumped on frame 0.
+        if !meta.preserve_clip_settings {
+            self.settings.dji_imu_phase_ms =
+                vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(meta.fps);
+            self.settings.rs_mode = meta.detected_rs_mode;
             self.settings.rs_readout_ms = crate::decoder::default_rs_readout_ms();
         }
         vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(self.settings.dji_imu_phase_ms);
-
-        // Snapshot settings so the next spawn_decoder doesn't bump
-        // generation unnecessarily on the first frame.
         self.last_pushed_settings = self.settings.clone();
 
-        let segments = self.clip_segments(&path);
-        tracing::info!("load_timing: after clip_segments ({} segs) @ {:?}",
-            segments.len(), t_load.elapsed());
-
-        // Duration + frame count span the WHOLE segment chain (GS01…,
-        // GS02…, …) — the timeline, seek, and trim all run on global
-        // clip time. Single-segment: just this file's probe.
-        let (duration_sec, frame_count) = if segments.len() > 1 {
-            let total_dur: f64 = segments.iter()
-                .filter_map(|s| vr180_pipeline::decode::probe_video(s).ok())
-                .map(|p| p.duration_sec)
-                .sum();
-            let total_frames: u32 = segments.iter()
-                .filter_map(|s| vr180_pipeline::decode::probe_video(s).ok())
-                .map(|p| (p.duration_sec * p.fps as f64).round() as u32)
-                .sum();
-            tracing::info!(
-                "multi-segment: {} chapters → {:.1}s, {} frames total",
-                segments.len(), total_dur, total_frames);
-            (total_dur, total_frames)
-        } else {
-            (probe.duration_sec, (probe.duration_sec * probe.fps as f64).round() as u32)
-        };
-
+        let dims = vr180_core::eac::Dims::new(meta.width, meta.height);
         self.clip = Some(ClipInfo {
-            width: probe.width, height: probe.height,
-            fps: probe.fps, duration_sec,
-            frame_count,
-            segments,
+            width: meta.width, height: meta.height,
+            fps: meta.fps, duration_sec: meta.duration_sec,
+            frame_count: meta.frame_count,
+            segments: meta.segments,
             eac_tile_w: dims.tile_w(),
-            cori_count, grav_count, srot_ms,
+            cori_count: meta.cori_count, grav_count: meta.grav_count,
+            srot_ms: meta.srot_ms,
             source_kind,
-            fisheye_eye_w, fisheye_eye_h,
+            fisheye_eye_w: meta.fisheye_eye_w, fisheye_eye_h: meta.fisheye_eye_h,
         });
-        self.loaded_path = Some(path);
+        self.loaded_path = Some(meta.path);
 
-        // Drop the zoom-magnifier cache so it can't serve the PREVIOUS clip's
-        // decoded native frame / still on the first zoom-in into this one.
-        // (poll_full_res only resets these on leaving detail mode, not on a
-        // clip swap while still paused+zoomed.)
-        if let Some(prev) = self.full_res_display.take() {
-            self.egui_renderer.write().free_texture(&prev.egui_id);
+        // Kick off the decoder. Paused by default so the first frame paints
+        // without the user pressing Play — unless they DID press Play during the
+        // load (`play_when_ready`), in which case start playing so the intent
+        // isn't lost.
+        let start_paused = !std::mem::take(&mut self.play_when_ready);
+        self.spawn_decoder(start_paused);
+    }
+
+    /// Poll the in-flight async load (if any) and apply it when ready; also
+    /// recover from a decoder that died before delivering its first frame.
+    /// Called once per `update`.
+    fn poll_load(&mut self, ctx: &egui::Context) {
+        // What to do once we've stopped borrowing `self.load_pending`.
+        enum LoadStep { None, Clear, Apply(Box<LoadedMeta>) }
+        let step = if let Some(pending) = &self.load_pending {
+            // Keep repainting while a load is in flight — the worker thread
+            // won't wake the UI on its own, so without this the "Loading…"
+            // state could sit stale until the next user input.
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            match pending.rx.try_recv() {
+                Ok(Ok(meta)) if meta.token == pending.token => {
+                    tracing::info!("load: metadata ready in {:?} — applying",
+                        pending.started.elapsed());
+                    LoadStep::Apply(Box::new(meta))
+                }
+                Ok(Ok(_)) => LoadStep::Clear, // superseded by a newer load
+                Ok(Err(e)) => { tracing::error!("load failed: {e}"); LoadStep::Clear }
+                Err(crossbeam_channel::TryRecvError::Empty) => LoadStep::None,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    tracing::error!("load worker disconnected before sending a result");
+                    LoadStep::Clear
+                }
+            }
+        } else {
+            LoadStep::None
+        };
+        match step {
+            LoadStep::Apply(meta) => { self.load_pending = None; self.finish_load(*meta); }
+            LoadStep::Clear => { self.load_pending = None; }
+            LoadStep::None => {}
         }
-        self.detail_cache = None;
-        self.full_res_key = 0;
-        self.full_res_desired_key = 0;
-        self.detail_last_key = 0;
-
-        // Kick off the decoder in paused state right away so the first
-        // frame paints without forcing the user to press Play. The pause
-        // loop in the decoder is wired to skip its sleep on the FIRST
-        // pulled pair, so the user sees the clip's opening frame and
-        // can immediately use the view-adjust / stabilization sliders.
-        self.spawn_decoder(true);
-        tracing::info!("load_timing: load_file TOTAL @ {:?}", t_load.elapsed());
+        // No-wedge: if the decoder thread has EXITED — a failure before frame 0,
+        // a mid-stream error, or a clean end-of-clip — while we still believe
+        // it's alive, reset the playback flags so Play/seek respawn a fresh
+        // decoder instead of toggling a dead one (which would silently do
+        // nothing). `control` is set to None by `stop_playback` on an explicit
+        // stop, so a normal teardown doesn't trip this; the stale channels of a
+        // self-exited decoder are released on the next `spawn_decoder`.
+        if self.decoder_alive {
+            if let Some(ctl) = &self.control {
+                if ctl.finished.load(Ordering::SeqCst) {
+                    tracing::info!("decoder thread exited — resetting playback flags so Play respawns");
+                    self.decoder_starting = false;
+                    self.decoder_alive = false;
+                    self.playing = false;
+                }
+            }
+        }
     }
 
     // ─── Playback control ────────────────────────────────────────
@@ -2293,15 +2431,21 @@ impl App {
             detected_calib: parking_lot::Mutex::new(None),
             want_detail: std::sync::atomic::AtomicBool::new(false),
             detail_tx: parking_lot::Mutex::new(Some(detail_tx)),
+            finished: std::sync::atomic::AtomicBool::new(false),
+            imu_ready: std::sync::atomic::AtomicBool::new(false),
         });
         let pipeline = self.pipeline.clone();
         let control_for_thread = control.clone();
         std::thread::spawn(move || {
-            if let Err(e) = start_decoder(pipeline, cfg, control_for_thread, frame_tx, cmd_rx) {
+            if let Err(e) = start_decoder(pipeline, cfg, control_for_thread.clone(), frame_tx, cmd_rx) {
                 tracing::error!("decoder error: {e}");
             } else {
                 tracing::info!("decoder thread exited cleanly");
             }
+            // Signal the UI that this decoder is gone. If it never delivered
+            // a frame, `poll_load` uses this to clear `decoder_starting` so a
+            // cold-read failure can't wedge Play permanently.
+            control_for_thread.finished.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         self.frame_rx = Some(frame_rx);
         self.detail_frame_rx = Some(detail_rx);
@@ -2343,6 +2487,15 @@ impl App {
     /// decoder thread keeps its position so resume picks up
     /// exactly where pause left it.
     fn toggle_play_pause(&mut self) {
+        // Pressed during the async-load window (clip not ready, no decoder yet):
+        // remember the intent instead of dropping it — `finish_load` starts the
+        // decoder playing once the clip is ready. Toggling lets a second press
+        // cancel it. (The on-screen Play button is gated to a loaded clip; this
+        // is reached via the Space shortcut.)
+        if self.load_pending.is_some() {
+            self.play_when_ready = !self.play_when_ready;
+            return;
+        }
         if !self.decoder_alive {
             self.spawn_decoder(false); // Play button → start playing
             return;
@@ -2845,6 +2998,10 @@ impl eframe::App for App {
         // Drain decoder frames first so the most recent texture is
         // ready by the time we render the central panel.
         self.drain_frames(ctx);
+        // Apply a finished async clip load (and recover a decoder that died
+        // before its first frame). Kept right after frame drain so a clip
+        // that just finished loading spawns its decoder this same frame.
+        self.poll_load(ctx);
         // Re-seed Override calib when a new clip's in-file calibration
         // arrives (so Override tracks the new clip, not the old one). Runs
         // before maybe_push_settings so the re-seeded values reach the decoder.
@@ -3331,6 +3488,26 @@ impl eframe::App for App {
                     egui::FontId::proportional(12.0),
                     Color32::from_rgba_unmultiplied(255, 255, 255, 180),
                 );
+            } else if let Some(pending) = &self.load_pending {
+                // Async load in flight — keep the GUI responsive while the
+                // worker reads the source (slow/cold network shares).
+                let name = pending.path.file_name()
+                    .and_then(|s| s.to_str()).unwrap_or("clip").to_string();
+                let secs = pending.started.elapsed().as_secs();
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(format!("{} {}…", tr("Loading"), name))
+                            .size(14.0).color(Color32::GRAY));
+                        if secs >= 3 {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(tr(
+                                "Reading from the source — network drives can take a moment."))
+                                .size(12.0).color(Color32::DARK_GRAY));
+                        }
+                    });
+                });
             } else if self.loaded_path.is_some() {
                 ui.centered_and_justified(|ui| {
                     ui.label(RichText::new(tr("Click ▶ Play to start preview."))
@@ -3832,10 +4009,6 @@ impl App {
         let zoom = self.preview_zoom;
         let s = &mut self.settings;
         ui.label(RichText::new(tr("Global (both eyes)")).small().color(Color32::GRAY));
-        if zoom > 1.001 {
-            ui.label(RichText::new(format!("fine drag ×{:.0} (zoomed)", zoom))
-                .small().color(Color32::from_rgb(120, 180, 120)));
-        }
         // Rotational alignment: extra-fine (0.15×) on top of the zoom
         // scaling, since these need sub-degree precision.
         let rot_fine = 0.15;
@@ -3867,9 +4040,16 @@ impl App {
 
     /// Stabilization panel for fisheye sources (own sidebar section).
     fn draw_fisheye_stab_panel(&mut self, ui: &mut egui::Ui) {
+        use std::sync::atomic::Ordering;
         let kind = self.clip.as_ref().map(|c| c.source_kind);
         let is_braw = matches!(kind, Some(vr180_pipeline::SourceKind::BlackmagicRaw));
         let is_osv  = matches!(kind, Some(vr180_pipeline::SourceKind::DjiOsv));
+        // DJI OSV loads the lens calib first (instant preview) and streams the
+        // per-frame quaternions — needed for stabilization — in the background.
+        // While they load, gray the controls; the decoder auto-applies stab the
+        // moment they're in (if the box is checked).
+        let imu_loading = is_osv && self.control.as_ref()
+            .map(|c| !c.imu_ready.load(Ordering::SeqCst)).unwrap_or(false);
         let s = &mut self.settings;
 
         if !(is_braw || is_osv) {
@@ -3883,27 +4063,39 @@ impl App {
         } else {
             tr("Stabilization (DJI camera quats)")
         };
-        ui.checkbox(&mut s.stabilize, stab_label);
-        ui.add_enabled_ui(s.stabilize, |ui| {
-            if is_osv {
-                // smooth_ms = 0 → sharp camera-lock (legacy).
-                // smooth_ms > 0 → soft-stab (GoPro-style).
-                ui.add(egui::Slider::new(&mut s.dji_smooth_ms, 0.0..=3000.0)
-                    .text(tr("Smooth (ms)")));
-                ui.add(egui::Slider::new(&mut s.dji_max_corr_deg, 0.0..=45.0)
-                    .text(tr("Max corr (°)")));
-                // Velocity→smoothing response curve (Python "Response").
-                // <1 follows motion early; >1 holds longer, then catches up.
-                ui.add(egui::Slider::new(&mut s.dji_responsiveness, 0.2..=3.0)
-                    .fixed_decimals(1)
-                    .text(tr("Response")));
-                // IMU sample timing is fixed at SROT/2 (readout midpoint),
-                // re-seeded per clip from its own fps — no manual override, so
-                // the slider is hidden. Still assert the main-thread thread-local
-                // so paused detail-still renders use this clip's phase.
-                vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
-            }
+        ui.add_enabled_ui(!imu_loading, |ui| {
+            ui.checkbox(&mut s.stabilize, stab_label);
+            ui.add_enabled_ui(s.stabilize, |ui| {
+                if is_osv {
+                    // smooth_ms = 0 → sharp camera-lock (legacy).
+                    // smooth_ms > 0 → soft-stab (GoPro-style).
+                    ui.add(egui::Slider::new(&mut s.dji_smooth_ms, 0.0..=3000.0)
+                        .text(tr("Smooth (ms)")));
+                    ui.add(egui::Slider::new(&mut s.dji_max_corr_deg, 0.0..=45.0)
+                        .text(tr("Max corr (°)")));
+                    // Velocity→smoothing response curve (Python "Response").
+                    // <1 follows motion early; >1 holds longer, then catches up.
+                    ui.add(egui::Slider::new(&mut s.dji_responsiveness, 0.2..=3.0)
+                        .fixed_decimals(1)
+                        .text(tr("Response")));
+                    // IMU sample timing is fixed at SROT/2 (readout midpoint),
+                    // re-seeded per clip from its own fps — no manual override, so
+                    // the slider is hidden. Still assert the main-thread thread-local
+                    // so paused detail-still renders use this clip's phase.
+                    vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
+                }
+            });
         });
+        if imu_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(tr("Loading stabilization data…"))
+                    .small().color(Color32::from_rgb(120, 180, 120)));
+            });
+            // Keep the UI repainting so the spinner animates + the controls
+            // un-gray promptly when the background IMU load finishes.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
 
     /// Output panel for fisheye sources — projection target + L↔R swap.
@@ -4164,11 +4356,6 @@ fn draw_eye_lens(
                     .small().color(Color32::GRAY));
             }
             return;
-        }
-
-        if zoom > 1.001 {
-            ui.label(RichText::new(format!("fine drag ×{:.0} (zoomed)", zoom))
-                .small().color(Color32::from_rgb(120, 180, 120)));
         }
 
         // FOV (zoom-scaled fine drag).
