@@ -1766,7 +1766,15 @@ fn run_fisheye(
         // case (channel full → decode_us ≈ 0, but the GPU render fell
         // behind real time): there, skipping a frame DOES let us catch
         // up to the audio clock.
-        let decode_bound = (decode_us as f64) > preview_dt * 0.5e6;
+        // Decode-bound only when the decode of the whole decimation group overruns
+        // its real-time budget (preview_dt). `decode_us` covers all `preview_decimation`
+        // frames, so comparing against the FULL budget (not ½) is what keeps the 2×-
+        // decimated 50p path classified the same as the un-decimated 30p path: below
+        // budget → render-bound → drop frames and stay locked to the clock; only above
+        // it (decode truly can't sustain real time) do we rewind into smooth slow-mo.
+        // (½-budget here mis-flagged 50p as decode-bound on Macs that decode 2 frames
+        // in 20–40 ms → slow motion even though dropping frames would have kept up.)
+        let decode_bound = (decode_us as f64) > preview_dt * 1.0e6;
         if decode_bound {
             // Pace to actual decode throughput — drop accumulated debt.
             start_wall = Some(std::time::Instant::now()
@@ -2375,7 +2383,15 @@ fn run_fisheye_zerocopy(
         let wall_t = start_wall
             .get_or_insert_with(std::time::Instant::now)
             .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
-        let decode_bound = (decode_us as f64) > preview_dt * 0.5e6;
+        // Decode-bound only when the decode of the whole decimation group overruns
+        // its real-time budget (preview_dt). `decode_us` covers all `preview_decimation`
+        // frames, so comparing against the FULL budget (not ½) is what keeps the 2×-
+        // decimated 50p path classified the same as the un-decimated 30p path: below
+        // budget → render-bound → drop frames and stay locked to the clock; only above
+        // it (decode truly can't sustain real time) do we rewind into smooth slow-mo.
+        // (½-budget here mis-flagged 50p as decode-bound on Macs that decode 2 frames
+        // in 20–40 ms → slow motion even though dropping frames would have kept up.)
+        let decode_bound = (decode_us as f64) > preview_dt * 1.0e6;
         if decode_bound {
             start_wall = Some(std::time::Instant::now()
                 - std::time::Duration::from_secs_f64(frame_t_rel) - paused_offset);
@@ -2821,7 +2837,15 @@ fn run_fisheye_vt_zerocopy(
         let wall_t = start_wall
             .get_or_insert_with(std::time::Instant::now)
             .elapsed().as_secs_f64() - paused_offset.as_secs_f64();
-        let decode_bound = (decode_us as f64) > preview_dt * 0.5e6;
+        // Decode-bound only when the decode of the whole decimation group overruns
+        // its real-time budget (preview_dt). `decode_us` covers all `preview_decimation`
+        // frames, so comparing against the FULL budget (not ½) is what keeps the 2×-
+        // decimated 50p path classified the same as the un-decimated 30p path: below
+        // budget → render-bound → drop frames and stay locked to the clock; only above
+        // it (decode truly can't sustain real time) do we rewind into smooth slow-mo.
+        // (½-budget here mis-flagged 50p as decode-bound on Macs that decode 2 frames
+        // in 20–40 ms → slow motion even though dropping frames would have kept up.)
+        let decode_bound = (decode_us as f64) > preview_dt * 1.0e6;
         if decode_bound {
             start_wall = Some(std::time::Instant::now()
                 - std::time::Duration::from_secs_f64(frame_t_rel) - paused_offset);
