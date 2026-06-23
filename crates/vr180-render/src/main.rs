@@ -436,6 +436,8 @@ fn main() -> anyhow::Result<()> {
                 mid_detail: MidDetailParams {
                     amount: mid_detail, sigma: mid_detail_sigma,
                 },
+                eye_match_ct: 0.0,
+                eye_match_tint: 0.0,
             };
             let post = PostProcess { apac_audio, apac_bitrate, apmp };
             let stab = StabilizeParams {

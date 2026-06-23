@@ -3930,6 +3930,22 @@ impl App {
 
         ui.separator();
 
+        // ── Matching Eyes — inter-eye white-balance trim. CT/Tint apply
+        //    OPPOSITELY to each eye (left +, right −) to correct an inter-lens
+        //    color discrepancy without shifting overall color. ↑/↓ = 0.01. ──
+        ui.label(RichText::new(tr("Matching Eyes")).strong());
+        ui.label(RichText::new(tr(
+            "Fixes a color difference between the two lenses — CT and Tint \
+             apply oppositely to each eye."
+        )).small().color(Color32::GRAY));
+        fine_slider(ui, 1.0, &mut s.eye_match_ct, -1.0..=1.0, "Eye CT (±)", 2, 1.0, 0.01);
+        fine_slider(ui, 1.0, &mut s.eye_match_tint, -1.0..=1.0, "Eye Tint (±)", 2, 1.0, 0.01);
+        if ui.button(tr("Reset matching")).clicked() {
+            s.eye_match_ct = 0.0; s.eye_match_tint = 0.0;
+        }
+
+        ui.separator();
+
         // 3D LUT.
         ui.label(RichText::new(tr("3D LUT (.cube)")).strong());
         ui.horizontal(|ui| {
@@ -4405,48 +4421,44 @@ fn draw_eye_lens(
             return;
         }
 
-        // FOV (zoom-scaled fine drag).
-        fine_slider(ui, zoom, fov, 90.0..=230.0, "Full FOV (°)", 2, 1.0, 0.0);
+        // FOV (zoom-scaled fine drag). Up/Down arrows nudge by 0.1°.
+        fine_slider(ui, zoom, fov, 90.0..=230.0, "Full FOV (°)", 2, 1.0, 0.1);
 
         // Principal point — absolute pixels at native res, stored as norm.
-        // DragValue speed scales with 1/zoom for sub-pixel control.
-        let drag_speed = (0.5 / zoom.max(1.0)) as f64;
+        // Slider track + zoom-scaled fine drag; Up/Down arrows nudge by 0.1 px.
         let mut cx_px = *cx_norm * native_w;
         let mut cy_px = *cy_norm * native_h;
-        ui.horizontal(|ui| {
-            ui.label("cx (px)");
-            if ui.add(egui::DragValue::new(&mut cx_px).speed(drag_speed)
-                .range(0.0..=native_w)).changed()
-            {
-                *cx_norm = (cx_px / native_w).clamp(0.0, 1.0);
-            }
-            ui.label("cy (px)");
-            if ui.add(egui::DragValue::new(&mut cy_px).speed(drag_speed)
-                .range(0.0..=native_h)).changed()
-            {
-                *cy_norm = (cy_px / native_h).clamp(0.0, 1.0);
-            }
-        });
+        if fine_slider(ui, zoom, &mut cx_px, 0.0..=native_w, "cx (px)", 2, 1.0, 0.1)
+            .changed()
+        {
+            *cx_norm = (cx_px / native_w).clamp(0.0, 1.0);
+        }
+        if fine_slider(ui, zoom, &mut cy_px, 0.0..=native_h, "cy (px)", 2, 1.0, 0.1)
+            .changed()
+        {
+            *cy_norm = (cy_px / native_h).clamp(0.0, 1.0);
+        }
         if ui.small_button("Center").clicked() {
             *cx_norm = 0.5;
             *cy_norm = 0.5;
         }
 
-        // KB distortion (zoom-scaled fine drag). k5 only for OSV (DJI's
-        // 5-coefficient model); other cameras use the 4-coeff KB.
+        // KB distortion (zoom-scaled fine drag; Up/Down arrows nudge by 1e-5).
+        // k5 only for OSV (DJI's 5-coefficient model); other cameras use the
+        // 4-coeff KB.
         let k_title = "KB parameters";
         ui.collapsing(k_title, |ui| {
             for (i, ki) in k.iter_mut().enumerate() {
-                fine_slider(ui, zoom, ki, -0.5..=0.5, &format!("k{}", i + 1), 6, 1.0, 0.0);
+                fine_slider(ui, zoom, ki, -0.5..=0.5, &format!("k{}", i + 1), 6, 1.0, 0.00001);
             }
             if is_osv {
                 // 5th radial coeff (θ¹¹ term). Keeps the projection monotonic
                 // past ~90° out to the full lens FOV.
-                fine_slider(ui, zoom, k5, -0.05..=0.05, "k5", 6, 1.0, 0.0);
+                fine_slider(ui, zoom, k5, -0.05..=0.05, "k5", 6, 1.0, 0.00001);
                 // Brown-Conrady tangential (decentering) — small but visible at
                 // the rim. Seeded from the file (field 20) when Override engages.
-                fine_slider(ui, zoom, &mut p[0], -0.01..=0.01, "p1 (tangential)", 6, 1.0, 0.0);
-                fine_slider(ui, zoom, &mut p[1], -0.01..=0.01, "p2 (tangential)", 6, 1.0, 0.0);
+                fine_slider(ui, zoom, &mut p[0], -0.01..=0.01, "p1 (tangential)", 6, 1.0, 0.00001);
+                fine_slider(ui, zoom, &mut p[1], -0.01..=0.01, "p2 (tangential)", 6, 1.0, 0.00001);
             }
             if ui.small_button("Reset k to preset").clicked() {
                 *k = preset_k;

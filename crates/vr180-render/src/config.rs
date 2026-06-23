@@ -338,6 +338,8 @@ impl ExportConfig {
             sharpen:     (&self.sharpen).into(),
             mid_detail:  (&self.mid_detail).into(),
             lut:         None,
+            eye_match_ct: 0.0,
+            eye_match_tint: 0.0,
         }
     }
 

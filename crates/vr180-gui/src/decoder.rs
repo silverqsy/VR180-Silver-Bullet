@@ -265,6 +265,12 @@ pub struct Settings {
     pub tint: f32,
     /// Saturation. 1.0 = neutral, 0.0 = grayscale, 2.0 = double.
     pub saturation: f32,
+    /// "Matching Eyes" inter-eye white-balance trim [-1..+1]. Applied
+    /// OPPOSITELY to the two eyes (left `+`, right `−`) to correct an
+    /// inter-lens color discrepancy without shifting overall color. 0 = off.
+    pub eye_match_ct: f32,
+    /// "Matching Eyes" inter-eye tint trim [-1..+1] (opposite per eye).
+    pub eye_match_tint: f32,
     /// Optional 3D LUT file path. Empty string = no LUT.
     /// Equirect-aware unsharp-mask amount (0 = off, 0.5 subtle, 1 mod,
     /// 2 strong). Ported from the Python app; applies to every source.
@@ -367,6 +373,8 @@ impl Default for Settings {
             temperature: 0.0,
             tint: 0.0,
             saturation: 1.0,
+            eye_match_ct: 0.0,
+            eye_match_tint: 0.0,
             lut_path: String::new(),
             lut_intensity: 1.0,
             preview_mode: PreviewMode::Sbs,
@@ -464,6 +472,10 @@ impl Settings {
             tint: self.tint,
             saturation: self.saturation,
         };
+        // "Matching Eyes" inter-eye trim — applied oppositely per eye by
+        // `ColorStackPlan::for_eye` at each per-eye color-stack apply site.
+        plan.eye_match_ct = self.eye_match_ct;
+        plan.eye_match_tint = self.eye_match_tint;
         if !self.lut_path.is_empty() {
             if let Some(lut) = load_lut_cached(&self.lut_path) {
                 plan.lut = Some((lut, self.lut_intensity.clamp(0.0, 1.0)));
@@ -4158,8 +4170,8 @@ fn compose_with_color_and_mode(
     // Rgba16Unorm graded eyes feed it directly and it writes the Rgba8Unorm
     // SBS that egui displays. (The source is still the preview's working-res
     // 8-bit decode, but the grade math now matches the export exactly.)
-    let left_g  = pipeline.apply_color_stack_per_eye_16(left_tex,  eye_w, eye_h, &color_plan)?;
-    let right_g = pipeline.apply_color_stack_per_eye_16(right_tex, eye_w, eye_h, &color_plan)?;
+    let left_g  = pipeline.apply_color_stack_per_eye_16(left_tex,  eye_w, eye_h, &color_plan.for_eye(true))?;
+    let right_g = pipeline.apply_color_stack_per_eye_16(right_tex, eye_w, eye_h, &color_plan.for_eye(false))?;
     let left_post  = left_g .as_ref().unwrap_or(left_tex);
     let right_post = right_g.as_ref().unwrap_or(right_tex);
     let sbs_tex = pipeline.compose_preview(

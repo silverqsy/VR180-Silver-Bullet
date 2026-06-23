@@ -1094,10 +1094,10 @@ pub fn export_fisheye(
                     projection, rs_rows.as_deref(),
                 )?;
                 let left_g = pipeline.apply_color_stack_per_eye_16(
-                    &left_tex_16, cfg.eye_w, cfg.eye_h, &color_plan,
+                    &left_tex_16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true),
                 )?;
                 let right_g = pipeline.apply_color_stack_per_eye_16(
-                    &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan,
+                    &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false),
                 )?;
                 let l_final = left_g .as_ref().unwrap_or(&left_tex_16);
                 let r_final = right_g.as_ref().unwrap_or(&right_tex_16);
@@ -1123,10 +1123,10 @@ pub fn export_fisheye(
                 projection, rs_rows.as_deref(),
             )?;
             let left_g = pipeline.apply_color_stack_per_eye_16(
-                &left_tex_16, cfg.eye_w, cfg.eye_h, &color_plan,
+                &left_tex_16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true),
             )?;
             let right_g = pipeline.apply_color_stack_per_eye_16(
-                &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan,
+                &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false),
             )?;
             let l_final = left_g .as_ref().unwrap_or(&left_tex_16);
             let r_final = right_g.as_ref().unwrap_or(&right_tex_16);
@@ -1573,9 +1573,9 @@ fn export_eac_zerocopy_vt(
             // Per-eye color (no-op when the plan is identity), then
             // compose into the P010 encode IOSurface.
             let left_g = pipeline.apply_color_stack_per_eye_16(
-                &left, cfg.eye_w, cfg.eye_h, &color_plan)?;
+                &left, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true))?;
             let right_g = pipeline.apply_color_stack_per_eye_16(
-                &right, cfg.eye_w, cfg.eye_h, &color_plan)?;
+                &right, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false))?;
             let l_final = left_g.as_ref().unwrap_or(&left);
             let r_final = right_g.as_ref().unwrap_or(&right);
             let encode_pb = crate::interop_macos::create_p010_encode_buffer(
@@ -1764,8 +1764,8 @@ fn export_eac_gpu_resident(
             (pipeline.project_cross_texture_to_equirect_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl)?,
              pipeline.project_cross_texture_to_equirect_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr)?)
         };
-        let left_g = pipeline.apply_color_stack_per_eye_16(&left16, cfg.eye_w, cfg.eye_h, &color_plan)?;
-        let right_g = pipeline.apply_color_stack_per_eye_16(&right16, cfg.eye_w, cfg.eye_h, &color_plan)?;
+        let left_g = pipeline.apply_color_stack_per_eye_16(&left16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true))?;
+        let right_g = pipeline.apply_color_stack_per_eye_16(&right16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false))?;
         let l_final = left_g.as_ref().unwrap_or(&left16);
         let r_final = right_g.as_ref().unwrap_or(&right16);
 
@@ -2116,10 +2116,10 @@ fn export_fisheye_osv_zerocopy_p010(
         // so VT sees full 10-bit precision when the user has added a
         // grade.
         let left_g = pipeline.apply_color_stack_per_eye_16(
-            &left_eq, cfg.eye_w, cfg.eye_h, &cfg.color_stack,
+            &left_eq, cfg.eye_w, cfg.eye_h, &cfg.color_stack.for_eye(true),
         )?;
         let right_g = pipeline.apply_color_stack_per_eye_16(
-            &right_eq, cfg.eye_w, cfg.eye_h, &cfg.color_stack,
+            &right_eq, cfg.eye_w, cfg.eye_h, &cfg.color_stack.for_eye(false),
         )?;
         let l_final = left_g .as_ref().unwrap_or(&left_eq);
         let r_final = right_g.as_ref().unwrap_or(&right_eq);
@@ -2445,10 +2445,10 @@ fn export_fisheye_osv_zerocopy_d3d11(
 
             // 16-bit color stack per eye.
             let left_g = pipeline.apply_color_stack_per_eye_16(
-                &left16, cfg.eye_w, cfg.eye_h, &color_plan,
+                &left16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true),
             )?;
             let right_g = pipeline.apply_color_stack_per_eye_16(
-                &right16, cfg.eye_w, cfg.eye_h, &color_plan,
+                &right16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false),
             )?;
             let l_final = left_g.as_ref().unwrap_or(&left16);
             let r_final = right_g.as_ref().unwrap_or(&right16);
@@ -2745,8 +2745,8 @@ fn export_fisheye_osv_gpu_resident(
                     &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31)?,
             )
         };
-        let left_g = pipeline.apply_color_stack_per_eye_16(&left16, cfg.eye_w, cfg.eye_h, &color_plan)?;
-        let right_g = pipeline.apply_color_stack_per_eye_16(&right16, cfg.eye_w, cfg.eye_h, &color_plan)?;
+        let left_g = pipeline.apply_color_stack_per_eye_16(&left16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true))?;
+        let right_g = pipeline.apply_color_stack_per_eye_16(&right16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false))?;
         let l_final = left_g.as_ref().unwrap_or(&left16);
         let r_final = right_g.as_ref().unwrap_or(&right16);
 

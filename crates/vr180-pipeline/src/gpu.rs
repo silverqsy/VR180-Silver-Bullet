@@ -3907,6 +3907,12 @@ pub struct ColorStackPlan {
     pub sharpen:     SharpenParams,
     pub mid_detail:  MidDetailParams,
     pub color_grade: ColorGradeParams,
+    /// "Matching Eyes" inter-eye white-balance trim. Applied OPPOSITELY to the
+    /// two eyes (left `+`, right `−`) via [`ColorStackPlan::for_eye`], on top of
+    /// the global temperature/tint — corrects an inter-lens color discrepancy
+    /// without shifting the overall color. 0 = off.
+    pub eye_match_ct:   f32,
+    pub eye_match_tint: f32,
 }
 
 impl Default for ColorStackPlan {
@@ -3917,6 +3923,8 @@ impl Default for ColorStackPlan {
             sharpen: SharpenParams::default(),
             mid_detail: MidDetailParams::default(),
             color_grade: ColorGradeParams::default(),
+            eye_match_ct: 0.0,
+            eye_match_tint: 0.0,
         }
     }
 }
@@ -3928,6 +3936,23 @@ impl ColorStackPlan {
             || !self.sharpen.is_identity()
             || !self.mid_detail.is_identity()
             || !self.color_grade.is_identity()
+            || self.eye_match_ct != 0.0
+            || self.eye_match_tint != 0.0
+    }
+
+    /// This plan specialized for one eye: the "Matching Eyes" CT/tint trim is
+    /// added in OPPOSITE directions (left `+`, right `−`) on top of the global
+    /// temperature/tint. Cheap when the trim is off — borrows `self` with no
+    /// clone; only clones (incl. any LUT) when a trim is actually set.
+    pub fn for_eye(&self, is_left: bool) -> std::borrow::Cow<'_, ColorStackPlan> {
+        if self.eye_match_ct == 0.0 && self.eye_match_tint == 0.0 {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let sign = if is_left { 1.0 } else { -1.0 };
+        let mut p = self.clone();
+        p.color_grade.temperature += sign * self.eye_match_ct;
+        p.color_grade.tint += sign * self.eye_match_tint;
+        std::borrow::Cow::Owned(p)
     }
 }
 
@@ -6632,12 +6657,16 @@ impl Device {
         // texture, or `None` meaning "no stages ran, use the source
         // texture directly".
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(16);
+        // Per-eye "Matching Eyes" trim: grade each eye with the OPPOSITE CT/tint
+        // offset (left +, right −). `for_eye` borrows the plan when the trim is
+        // off (no clone). The LUT is unchanged by the trim, so the pre-uploaded
+        // `lut_resources` apply to both eyes.
         let left_idx = self.record_color_stack(
-            &mut encoder, left_eq, eye_w, eye_h, plan, &lut_resources, &mut intermediates,
+            &mut encoder, left_eq, eye_w, eye_h, &plan.for_eye(true), &lut_resources, &mut intermediates,
             "stack_l",
         );
         let right_idx = self.record_color_stack(
-            &mut encoder, right_eq, eye_w, eye_h, plan, &lut_resources, &mut intermediates,
+            &mut encoder, right_eq, eye_w, eye_h, &plan.for_eye(false), &lut_resources, &mut intermediates,
             "stack_r",
         );
         let left_final = match left_idx {
