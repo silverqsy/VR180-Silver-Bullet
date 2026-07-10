@@ -149,18 +149,13 @@ impl ThreadedScaler {
     /// context).
     fn run(&mut self, src: &ffmpeg::frame::Video, dst: &mut ffmpeg::frame::Video) -> bool {
         unsafe {
-            let s = src.as_ptr();
-            let d = dst.as_mut_ptr();
-            let ret = ffmpeg::ffi::sws_scale(
-                self.ctx,
-                (*s).data.as_ptr() as *const *const u8,
-                (*s).linesize.as_ptr(),
-                0,
-                (*s).height,
-                (*d).data.as_ptr() as *const *mut u8,
-                (*d).linesize.as_ptr(),
-            );
-            ret > 0
+            // MUST be sws_scale_frame(): the legacy sws_scale() entry point
+            // detects a threads>1 context and silently converts on
+            // slice_ctx[0] — single-threaded, defeating the whole point of
+            // this context. Only sws_scale_frame() dispatches slices across
+            // the thread pool (this is also what the ffmpeg CLI calls).
+            let ret = ffmpeg::ffi::sws_scale_frame(self.ctx, dst.as_mut_ptr(), src.as_ptr());
+            ret >= 0
         }
     }
 }
