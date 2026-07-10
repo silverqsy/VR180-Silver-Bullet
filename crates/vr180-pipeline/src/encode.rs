@@ -1079,6 +1079,100 @@ impl H265Encoder {
         Ok(())
     }
 
+    /// True when the encoder consumes planar `yuv422p10le` — ProRes, both
+    /// CPU `prores_ks` and the Vulkan GPU encoder (whose hwframe pool's
+    /// sw_format is yuv422p10le). Callers can then GPU-compose straight to
+    /// P210 planes and use [`Self::encode_frame_yuv422p10_msb`]: no CPU
+    /// RGB→YUV swscale, and half the readback bytes vs RGBA64.
+    pub fn wants_yuv422p10(&self) -> bool {
+        self.enc_pix_fmt == ffmpeg::format::Pixel::YUV422P10LE
+    }
+
+    /// Encode one frame from GPU-composed **P210-style planes** (10-bit
+    /// MSB-aligned, range/matrix already applied on the GPU):
+    /// `y` = `w*h*2` bytes (R16 luma), `uv` = `(w/2)*h*4` bytes (Rg16
+    /// interleaved Cb,Cr at FULL vertical resolution — 4:2:2). Converts to
+    /// the encoder's planar `yuv422p10le` (LSB-aligned, deinterleaved) with
+    /// a fused `>>6` + split across a few threads — the only remaining CPU
+    /// pixel work on the ProRes feed. The `>>6` is NOT optional: the
+    /// shaders emit P210-style MSB-aligned samples; feeding them unshifted
+    /// as yuv422p10le is the loud 64×-brightness failure.
+    /// Only valid when [`Self::wants_yuv422p10`] is true.
+    pub fn encode_frame_yuv422p10_msb(&mut self, y: &[u8], uv: &[u8]) -> Result<()> {
+        self.ensure_header_written()?;
+        if self.enc_pix_fmt != ffmpeg::format::Pixel::YUV422P10LE {
+            return Err(Error::Ffmpeg(
+                "encode_frame_yuv422p10_msb called on a non-yuv422p10 encoder".into()));
+        }
+        let w = self.w as usize;
+        let h = self.h as usize;
+        let y_row = w * 2;   // 16-bit luma, tightly packed
+        let uv_row = w * 2;  // (w/2) texels × 4 bytes (Cb16,Cr16)
+        if y.len() != y_row * h || uv.len() != uv_row * h {
+            return Err(Error::Ffmpeg(format!(
+                "encode_frame_yuv422p10_msb: bad plane sizes y={} (want {}) uv={} (want {})",
+                y.len(), y_row * h, uv.len(), uv_row * h)));
+        }
+
+        // Row-parallel fill: split the destination plane into contiguous
+        // row-chunks, one scoped thread each (memory-bound; a handful of
+        // threads saturates). `f(row_index, dst_row)` writes one row.
+        fn par_rows(
+            dst: &mut [u8], stride: usize, h: usize,
+            f: impl Fn(usize, &mut [u8]) + Sync,
+        ) {
+            let n = std::thread::available_parallelism()
+                .map(|n| n.get()).unwrap_or(4).min(8).max(1);
+            let rows_per = h.div_ceil(n);
+            std::thread::scope(|s| {
+                for (ci, chunk) in dst.chunks_mut(rows_per * stride).enumerate() {
+                    let f = &f;
+                    s.spawn(move || {
+                        let base = ci * rows_per;
+                        for (i, row) in chunk.chunks_mut(stride).enumerate() {
+                            if base + i < h { f(base + i, row); }
+                        }
+                    });
+                }
+            });
+        }
+
+        let mut frame = ffmpeg::frame::Video::new(
+            ffmpeg::format::Pixel::YUV422P10LE, self.w, self.h);
+        {
+            let stride = frame.stride(0);
+            let dst = frame.data_mut(0);
+            par_rows(dst, stride, h, |r, dst_row| {
+                let src_row = &y[r * y_row..r * y_row + y_row];
+                for (d, s) in dst_row[..y_row].chunks_exact_mut(2)
+                    .zip(src_row.chunks_exact(2))
+                {
+                    let v = u16::from_le_bytes([s[0], s[1]]) >> 6;
+                    d.copy_from_slice(&v.to_le_bytes());
+                }
+            });
+        }
+        for plane in 1..=2usize {
+            let off = (plane - 1) * 2; // Cb at texel bytes 0..2, Cr at 2..4
+            let stride = frame.stride(plane);
+            let dst = frame.data_mut(plane);
+            let half_row = w; // (w/2) samples × 2 bytes
+            par_rows(dst, stride, h, |r, dst_row| {
+                let src_row = &uv[r * uv_row..r * uv_row + uv_row];
+                for (i, d) in dst_row[..half_row].chunks_exact_mut(2).enumerate() {
+                    let s = i * 4 + off;
+                    let v = u16::from_le_bytes([src_row[s], src_row[s + 1]]) >> 6;
+                    d.copy_from_slice(&v.to_le_bytes());
+                }
+            });
+        }
+        frame.set_pts(Some(self.frame_count));
+        self.frame_count += 1;
+        self.send_cpu_frame(&frame)?;
+        self.drain_packets()?;
+        Ok(())
+    }
+
     fn drain_packets(&mut self) -> Result<()> {
         use ffmpeg::util::error::EAGAIN;
         let mut packet = ffmpeg::Packet::empty();

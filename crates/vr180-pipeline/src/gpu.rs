@@ -6154,6 +6154,91 @@ impl Device {
         Ok((y_tex, uv_tex))
     }
 
+    /// 4:2:2 variant of [`Self::compose_sbs_to_p010_textures`]: same
+    /// full-res `R16Unorm` luma plane, but the `Rg16Unorm` interleaved
+    /// chroma plane keeps FULL vertical resolution (`out_w/2 × out_h`,
+    /// P210 layout, 10-bit MSB-aligned) via the `compose_sbs_p210_uv`
+    /// pipeline (one thread per 2×1 pair). This is the ProRes feed: the
+    /// encode thread deinterleaves + LSB-aligns into a `yuv422p10le`
+    /// AVFrame (`encode_frame_yuv422p10_msb`) — no CPU RGB→YUV swscale,
+    /// and the readback drops from 8 to 4 bytes/px.
+    pub fn compose_sbs_to_p210_textures(
+        &self,
+        left_16: &wgpu::Texture,
+        right_16: &wgpu::Texture,
+        eye_w: u32, eye_h: u32,
+        full_range: bool,
+    ) -> Result<(wgpu::Texture, wgpu::Texture)> {
+        let out_w = eye_w * 2;
+        let out_h = eye_h;
+        let y_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("p210_y_tex"),
+            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let uv_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("p210_uv_tex"),
+            size: wgpu::Extent3d { width: out_w / 2, height: out_h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg16Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let l_v = left_16.create_view(&Default::default());
+        let r_v = right_16.create_view(&Default::default());
+        let y_v = y_tex.create_view(&Default::default());
+        let uv_v = uv_tex.create_view(&Default::default());
+        let uni = self.write_uniform("p210_tex_compose_u",
+            &ComposeSbsUniforms { eye_w, _pad0: full_range as u32, _pad1: 0, _pad2: 0 });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("compose_sbs_to_p210_textures_enc"),
+        });
+        {
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("p210_tex_y_bg"),
+                layout: &self.compose_sbs_p010_y.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&l_v) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r_v) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&y_v) },
+                    wgpu::BindGroupEntry { binding: 3, resource: uni.as_entire_binding() },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("p210_tex_y_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compose_sbs_p010_y.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        {
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("p210_tex_uv_bg"),
+                layout: &self.compose_sbs_p210_uv.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&l_v) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r_v) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&uv_v) },
+                    wgpu::BindGroupEntry { binding: 3, resource: uni.as_entire_binding() },
+                ],
+            });
+            let uv_w = out_w / 2;
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("p210_tex_uv_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compose_sbs_p210_uv.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            pass.dispatch_workgroups((uv_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok((y_tex, uv_tex))
+    }
+
     /// Read back a single-mip 2D texture as tightly-packed bytes via a bulk
     /// per-row copy (no per-pixel work). `bytes_per_px` must match the
     /// format (2 = R16Unorm, 4 = Rg16Unorm). Returns `w*h*bytes_per_px`.

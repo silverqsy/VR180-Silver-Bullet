@@ -2363,9 +2363,18 @@ fn export_fisheye_osv_zerocopy_d3d11(
     // instead of their sum.
     use crate::fisheye_decode::SharedFisheyePair;
     // What the main thread hands the encode thread. P010 = the GPU already
-    // did RGB→YUV (NVENC's native input, no swscale); Rgba64 = swscale
-    // fallback (libx265 / prores / 8-bit).
-    enum EncFrame { P010 { y: Vec<u8>, uv: Vec<u8> }, Rgba64(Vec<u8>) }
+    // did RGB→YUV 4:2:0 (NVENC's native input, no swscale); Yuv422 = GPU
+    // RGB→YUV 4:2:2 P210 planes (ProRes — deinterleave + >>6 on the encode
+    // thread, no swscale); Rgba64 = swscale fallback (libx265 / 8-bit).
+    enum EncFrame {
+        P010 { y: Vec<u8>, uv: Vec<u8> },
+        Yuv422 { y: Vec<u8>, uv: Vec<u8> },
+        Rgba64(Vec<u8>),
+    }
+    // Which of those the encoder wants — decided by the encode thread once
+    // the encoder is open, sent back over the format handshake.
+    #[derive(Clone, Copy, PartialEq)]
+    enum ZcFeed { P010, Yuv422P10, Rgba64 }
     // ProRes: warm the process-wide FFmpeg Vulkan device NOW, before the
     // decode/GPU threads load the driver — a cold device create mid-export
     // measured 21–63 s (vs ~0.2 s quiescent). No-op after the first export.
@@ -2380,7 +2389,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     }
     let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<SharedFisheyePair>(3);
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<EncFrame>(2);
-    let (fmt_tx, fmt_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+    let (fmt_tx, fmt_rx) = std::sync::mpsc::sync_channel::<ZcFeed>(1);
 
     // Decode thread — D3D11 only, never touches wgpu. `iter` was already
     // trim-seeked above; just pump pairs until EOF, cancel, or the main
@@ -2413,12 +2422,19 @@ fn export_fisheye_osv_zerocopy_d3d11(
         // Report the encoder's native input so the main thread produces the
         // matching layout. On create-failure we never send → main's recv
         // errs and the pipeline winds down, surfacing the error at the join.
-        let _ = fmt_tx.send(encoder.wants_p010());
+        let _ = fmt_tx.send(if encoder.wants_p010() {
+            ZcFeed::P010
+        } else if encoder.wants_yuv422p10() {
+            ZcFeed::Yuv422P10
+        } else {
+            ZcFeed::Rgba64
+        });
         let mut n: u64 = 0;
         while let Ok(f) = frame_rx.recv() {
             match f {
-                EncFrame::P010 { y, uv } => encoder.encode_frame_p010(&y, &uv)?,
-                EncFrame::Rgba64(b)      => encoder.encode_frame_rgba64(&b)?,
+                EncFrame::P010   { y, uv } => encoder.encode_frame_p010(&y, &uv)?,
+                EncFrame::Yuv422 { y, uv } => encoder.encode_frame_yuv422p10_msb(&y, &uv)?,
+                EncFrame::Rgba64(b)        => encoder.encode_frame_rgba64(&b)?,
             }
             n += 1;
         }
@@ -2426,10 +2442,14 @@ fn export_fisheye_osv_zerocopy_d3d11(
         Ok(n)
     });
     // Block until the encoder is open and reports its input format.
-    let wants_p010 = fmt_rx.recv().unwrap_or(false);
+    let feed = fmt_rx.recv().unwrap_or(ZcFeed::Rgba64);
     tracing::info!(
         "fisheye_export (zero-copy): encode input = {}",
-        if wants_p010 { "P010 (GPU compose → NVENC, no swscale)" } else { "RGBA64 (swscale)" }
+        match feed {
+            ZcFeed::P010 => "P010 (GPU compose → NVENC, no swscale)",
+            ZcFeed::Yuv422P10 => "P210→yuv422p10 (GPU 4:2:2 compose → ProRes, no swscale)",
+            ZcFeed::Rgba64 => "RGBA64 (swscale)",
+        }
     );
 
     // Main thread — GPU work. import → project → color → compose → readback.
@@ -2551,35 +2571,55 @@ fn export_fisheye_osv_zerocopy_d3d11(
             )?;
             let l_final = left_g.as_ref().unwrap_or(&left16);
             let r_final = right_g.as_ref().unwrap_or(&right16);
-            if wants_p010 {
-                // GPU does RGB→YUV + chroma subsample; read back both P010
-                // planes (≈half the RGBA64 bytes) → NVENC consumes directly,
-                // no CPU swscale (the encode-stage bottleneck).
-                // Video-range here (false): the readback path's encoder
-                // (create_with_bit_depth) tags AVCOL_RANGE_MPEG, so the data
-                // must be video-range to match. (The GPU-resident path now
-                // also uses video-range — both export paths agree.)
-                let (y_tex, uv_tex) = pipeline.compose_sbs_to_p010_textures(
-                    l_final, r_final, cfg.eye_w, cfg.eye_h, false,
-                )?;
-                // Time the two readbacks separately (NO extra poll — that
-                // serializes the pipeline). The Y readback's internal poll
-                // drains the GPU, so the UV readback runs GPU-idle = pure copy
-                // cost. That tells us what a GPU-resident encode would save.
-                let ry = std::time::Instant::now();
-                let y = pipeline.read_texture_planar(&y_tex, sbs_w, sbs_h, 2)?;
-                t_gpuexec += ry.elapsed(); // GPU-exec + Y copy
-                let ruv = std::time::Instant::now();
-                let uv = pipeline.read_texture_planar(&uv_tex, sbs_w / 2, sbs_h / 2, 4)?;
-                t_readback += ruv.elapsed(); // pure UV copy (GPU idle)
-                Ok(EncFrame::P010 { y, uv })
-            } else {
-                let sbs_tex_16 = pipeline.compose_sbs_textures_16(
-                    l_final, r_final, cfg.eye_w, cfg.eye_h,
-                )?;
-                Ok(EncFrame::Rgba64(
-                    pipeline.read_texture_rgba64(&sbs_tex_16, sbs_w, sbs_h)?
-                ))
+            match feed {
+                ZcFeed::P010 => {
+                    // GPU does RGB→YUV + chroma subsample; read back both P010
+                    // planes (≈half the RGBA64 bytes) → NVENC consumes directly,
+                    // no CPU swscale (the encode-stage bottleneck).
+                    // Video-range here (false): the readback path's encoder
+                    // (create_with_bit_depth) tags AVCOL_RANGE_MPEG, so the data
+                    // must be video-range to match. (The GPU-resident path now
+                    // also uses video-range — both export paths agree.)
+                    let (y_tex, uv_tex) = pipeline.compose_sbs_to_p010_textures(
+                        l_final, r_final, cfg.eye_w, cfg.eye_h, false,
+                    )?;
+                    // Time the two readbacks separately (NO extra poll — that
+                    // serializes the pipeline). The Y readback's internal poll
+                    // drains the GPU, so the UV readback runs GPU-idle = pure copy
+                    // cost. That tells us what a GPU-resident encode would save.
+                    let ry = std::time::Instant::now();
+                    let y = pipeline.read_texture_planar(&y_tex, sbs_w, sbs_h, 2)?;
+                    t_gpuexec += ry.elapsed(); // GPU-exec + Y copy
+                    let ruv = std::time::Instant::now();
+                    let uv = pipeline.read_texture_planar(&uv_tex, sbs_w / 2, sbs_h / 2, 4)?;
+                    t_readback += ruv.elapsed(); // pure UV copy (GPU idle)
+                    Ok(EncFrame::P010 { y, uv })
+                }
+                ZcFeed::Yuv422P10 => {
+                    // ProRes: GPU does RGB→YUV 4:2:2 (P210 planes, full
+                    // vertical chroma, video-range like everything else);
+                    // the encode thread deinterleaves + LSB-aligns into
+                    // yuv422p10le. vs RGBA64: half the readback bytes and
+                    // no RGB→YUV swscale on the CPU at all.
+                    let (y_tex, uv_tex) = pipeline.compose_sbs_to_p210_textures(
+                        l_final, r_final, cfg.eye_w, cfg.eye_h, false,
+                    )?;
+                    let ry = std::time::Instant::now();
+                    let y = pipeline.read_texture_planar(&y_tex, sbs_w, sbs_h, 2)?;
+                    t_gpuexec += ry.elapsed(); // GPU-exec + Y copy
+                    let ruv = std::time::Instant::now();
+                    let uv = pipeline.read_texture_planar(&uv_tex, sbs_w / 2, sbs_h, 4)?;
+                    t_readback += ruv.elapsed(); // pure UV copy (GPU idle)
+                    Ok(EncFrame::Yuv422 { y, uv })
+                }
+                ZcFeed::Rgba64 => {
+                    let sbs_tex_16 = pipeline.compose_sbs_textures_16(
+                        l_final, r_final, cfg.eye_w, cfg.eye_h,
+                    )?;
+                    Ok(EncFrame::Rgba64(
+                        pipeline.read_texture_rgba64(&sbs_tex_16, sbs_w, sbs_h)?
+                    ))
+                }
             }
         })();
 
