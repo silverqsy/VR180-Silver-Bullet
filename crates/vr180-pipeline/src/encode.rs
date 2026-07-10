@@ -166,6 +166,148 @@ impl Drop for ThreadedScaler {
     }
 }
 
+/// GPU (Vulkan) ProRes encode support — FFmpeg 8.1's `prores_ks_vulkan`
+/// compute-shader encoder (DCT, quantizer search, and VLC bitstream packing
+/// all run in shaders; measured ~40 fps at 7680×3840 HQ on an RTX 4090 vs
+/// ~8 fps for 16-thread CPU `prores_ks`, output fidelity identical).
+///
+/// Holds FFmpeg's own Vulkan device — created via `av_hwdevice_ctx_create`,
+/// fully independent of wgpu's VkDevice, so no shared queues and Lesson #1
+/// is untouched — plus the VULKAN-format frame pool the encoder consumes.
+/// CPU `yuv422p10le` frames are uploaded per frame with
+/// `av_hwframe_transfer_data`; a zero-copy wgpu→FFmpeg-Vulkan image import
+/// is a possible follow-up (same external-memory mechanism as the NVENC
+/// CUDA feed). Set `VR180_NO_PRORES_VULKAN` to force the CPU encoder.
+struct VulkanProResHw {
+    device_ref: *mut ffmpeg::ffi::AVBufferRef,
+    frames_ref: *mut ffmpeg::ffi::AVBufferRef,
+}
+
+// Owned by H265Encoder, which moves onto the export's encode thread; the
+// refs are only ever used from that one thread.
+unsafe impl Send for VulkanProResHw {}
+
+impl VulkanProResHw {
+    /// Process-lifetime FFmpeg Vulkan device shared by every ProRes-Vulkan
+    /// encoder. Device creation is cheap on a quiescent GPU (~0.2 s) but
+    /// measured 21–63 s when the NVIDIA driver is already saturated by a
+    /// concurrent NVDEC + wgpu export — so it's created ONCE and reused;
+    /// every export after the first pays nothing. The static holds one ref
+    /// forever (never freed — same posture as the other process caches).
+    fn cached_device() -> Result<*mut ffmpeg::ffi::AVBufferRef> {
+        use std::sync::OnceLock;
+        static DEV: OnceLock<std::result::Result<usize, String>> = OnceLock::new();
+        let r = DEV.get_or_init(|| {
+            use ffmpeg::ffi::*;
+            unsafe {
+                let mut dev: *mut AVBufferRef = std::ptr::null_mut();
+                let ret = av_hwdevice_ctx_create(
+                    &mut dev,
+                    AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+                    std::ptr::null(), std::ptr::null_mut(), 0,
+                );
+                if ret < 0 || dev.is_null() {
+                    Err(format!("av_hwdevice_ctx_create VULKAN failed: ret={ret}"))
+                } else {
+                    Ok(dev as usize)
+                }
+            }
+        });
+        match r {
+            Ok(p) => Ok(*p as *mut ffmpeg::ffi::AVBufferRef),
+            Err(e) => Err(Error::Ffmpeg(e.clone())),
+        }
+    }
+
+    /// Warm the process-wide Vulkan device + verify the encoder exists —
+    /// call BEFORE spawning decode/GPU work so the (first-time) device
+    /// creation happens on a quiescent driver. Cheap no-op afterwards.
+    pub(crate) fn warm() -> bool {
+        ffmpeg::codec::encoder::find_by_name("prores_ks_vulkan").is_some()
+            && Self::cached_device().is_ok()
+    }
+
+    /// FFmpeg Vulkan device (shared, see [`Self::cached_device`]) + a
+    /// `yuv422p10le` frame pool for `w`×`h`. Any failure (encoder missing
+    /// from the build, no Vulkan driver) returns Err and the caller falls
+    /// back to CPU `prores_ks`.
+    fn init(w: u32, h: u32) -> Result<Self> {
+        use ffmpeg::ffi::*;
+        if ffmpeg::codec::encoder::find_by_name("prores_ks_vulkan").is_none() {
+            return Err(Error::Ffmpeg(
+                "prores_ks_vulkan not in this FFmpeg build".into()));
+        }
+        unsafe {
+            // New ref on the shared device — this instance's Drop unrefs it;
+            // the static's own ref keeps the device alive for the process.
+            let dev = av_buffer_ref(Self::cached_device()?);
+            if dev.is_null() {
+                return Err(Error::Ffmpeg("av_buffer_ref (vulkan device) failed".into()));
+            }
+            let frames = av_hwframe_ctx_alloc(dev);
+            if frames.is_null() {
+                av_buffer_unref(&mut (dev as *mut _));
+                return Err(Error::Ffmpeg("av_hwframe_ctx_alloc (vulkan) failed".into()));
+            }
+            let fctx = (*frames).data as *mut AVHWFramesContext;
+            (*fctx).format    = AVPixelFormat::AV_PIX_FMT_VULKAN;
+            (*fctx).sw_format = AVPixelFormat::AV_PIX_FMT_YUV422P10LE;
+            (*fctx).width  = w as i32;
+            (*fctx).height = h as i32;
+            // Dynamic pool — frames are allocated as the encoder's
+            // async_depth demands (~118 MB each at 8K SBS, 2-3 in flight).
+            (*fctx).initial_pool_size = 0;
+            let ret = av_hwframe_ctx_init(frames);
+            if ret < 0 {
+                av_buffer_unref(&mut (frames as *mut _));
+                av_buffer_unref(&mut (dev as *mut _));
+                return Err(Error::Ffmpeg(format!(
+                    "av_hwframe_ctx_init (vulkan): ret={ret}")));
+            }
+            Ok(Self { device_ref: dev, frames_ref: frames })
+        }
+    }
+
+    /// Upload one CPU frame into a pool frame (host→GPU copy), carrying the
+    /// pts. Returns the VULKAN-format frame ready for `send_frame`.
+    fn upload(&mut self, sw: &ffmpeg::frame::Video) -> Result<ffmpeg::frame::Video> {
+        use ffmpeg::ffi::*;
+        unsafe {
+            let mut hw = ffmpeg::frame::Video::empty();
+            let ret = av_hwframe_get_buffer(self.frames_ref, hw.as_mut_ptr(), 0);
+            if ret < 0 {
+                return Err(Error::Ffmpeg(format!(
+                    "av_hwframe_get_buffer (vulkan): ret={ret}")));
+            }
+            let ret = av_hwframe_transfer_data(hw.as_mut_ptr(), sw.as_ptr(), 0);
+            if ret < 0 {
+                return Err(Error::Ffmpeg(format!(
+                    "av_hwframe_transfer_data (vulkan upload): ret={ret}")));
+            }
+            (*hw.as_mut_ptr()).pts = (*sw.as_ptr()).pts;
+            Ok(hw)
+        }
+    }
+}
+
+impl Drop for VulkanProResHw {
+    fn drop(&mut self) {
+        unsafe {
+            ffmpeg::ffi::av_buffer_unref(&mut self.frames_ref);
+            ffmpeg::ffi::av_buffer_unref(&mut self.device_ref);
+        }
+    }
+}
+
+/// Pre-create the process-wide FFmpeg Vulkan device for the ProRes GPU
+/// encoder while the GPU/driver is still quiescent (creating it mid-export,
+/// under NVDEC + wgpu load, measured 21–63 s vs ~0.2 s idle). Returns
+/// whether the GPU encoder is available; either way the encoder open later
+/// resolves the same cached state. Call before spawning export threads.
+pub(crate) fn warm_prores_vulkan() -> bool {
+    VulkanProResHw::warm()
+}
+
 /// Lazily-created multi-threaded scalers for the CPU feed paths, one per
 /// input format. `*_tried` prevents re-attempting a failed creation on
 /// every frame (a failure falls back to the single-threaded contexts).
@@ -215,6 +357,11 @@ pub struct H265Encoder {
     /// Multi-threaded swscale contexts (preferred over the
     /// single-threaded ones above when available; see [`ThreadedScaler`]).
     mt_scalers: MtScalers,
+    /// Present when the GPU (Vulkan) ProRes encoder is active: the CPU feed
+    /// paths convert to `enc_pix_fmt` (yuv422p10le) as usual, then
+    /// [`Self::send_cpu_frame`] uploads into this pool instead of sending
+    /// the CPU frame directly. `None` for every other backend.
+    vulkan_hw: Option<VulkanProResHw>,
     /// Optional ONE-PASS audio passthrough: the source's audio is muxed
     /// into the SAME output during encode (no `.video.tmp` + re-mux). See
     /// [`H265Encoder::attach_audio_passthrough`]. `None` → video-only
@@ -312,7 +459,28 @@ impl H265Encoder {
         let mut octx = ffmpeg::format::output(&path)
             .map_err(|e| Error::Ffmpeg(format!("output ctx {path:?}: {e}")))?;
 
-        let codec_name = backend.codec_name();
+        let mut codec_name = backend.codec_name();
+        // GPU (Vulkan) ProRes: try FFmpeg 8.1's `prores_ks_vulkan` compute
+        // encoder first — same bitstream, same profiles, ~5× the throughput
+        // of the threaded CPU encoder at 8K. ANY init failure (encoder not
+        // in the build, no Vulkan device) falls back to CPU prores_ks
+        // below, so defaulting to the attempt is strictly safe.
+        let mut vulkan_hw: Option<VulkanProResHw> = None;
+        if backend == EncoderBackend::ProResKs
+            && std::env::var_os("VR180_NO_PRORES_VULKAN").is_none()
+        {
+            match VulkanProResHw::init(w, h) {
+                Ok(hw) => {
+                    codec_name = "prores_ks_vulkan";
+                    vulkan_hw = Some(hw);
+                    tracing::info!(
+                        "ProRes: GPU (Vulkan) encoder prores_ks_vulkan ENGAGED \
+                         ({w}x{h}, hwframe upload feed)");
+                }
+                Err(e) => tracing::info!(
+                    "ProRes: prores_ks_vulkan unavailable ({e}) — CPU prores_ks"),
+            }
+        }
         let codec = ffmpeg::codec::encoder::find_by_name(codec_name)
             .ok_or_else(|| Error::Ffmpeg(format!(
                 "{codec_name} encoder not available in this FFmpeg build"
@@ -357,7 +525,14 @@ impl H265Encoder {
             let raw = enc_ctx.as_mut_ptr();
             (*raw).width = w as i32;
             (*raw).height = h as i32;
-            (*raw).pix_fmt = enc_pix_fmt.into();
+            // The Vulkan encoder's input contract is VULKAN hwframes; the
+            // sw format (yuv422p10le, what the CPU feeds still produce and
+            // what `enc_pix_fmt` stays set to) lives on the frames ctx.
+            (*raw).pix_fmt = if vulkan_hw.is_some() {
+                ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VULKAN
+            } else {
+                enc_pix_fmt.into()
+            };
             (*raw).time_base = time_base.into();
             (*raw).framerate = ffmpeg::Rational(num, den).into();
             (*raw).bit_rate = (bitrate_kbps as i64) * 1000;
@@ -434,10 +609,19 @@ impl H265Encoder {
                         (*raw).profile = prores_profile;
                     }
                     if matches!(backend, EncoderBackend::ProResKs) {
-                        // prores_ks (libavcodec): pin the QuickTime
+                        // prores_ks / prores_ks_vulkan: pin the QuickTime
                         // "Apple" vendor tag so QuickTime / FCP recognize
                         // the file as native ProRes (not "Other").
                         set_opt(raw, "vendor", "apl0")?;
+                        if let Some(hw) = vulkan_hw.as_ref() {
+                            // GPU encoder: the frames ctx carries the input
+                            // contract; async_depth=2 pipelines upload and
+                            // encode (each in-flight frame ≈118 MB @ 8K).
+                            // No thread_count — it has no CPU threading.
+                            (*raw).hw_frames_ctx =
+                                ffmpeg::ffi::av_buffer_ref(hw.frames_ref);
+                            set_opt(raw, "async_depth", "2")?;
+                        } else {
                         // libavcodec defaults to thread_count = 1 through
                         // the API (the ffmpeg CLI sets threads=auto), so
                         // prores_ks was encoding single-threaded. Enable
@@ -453,6 +637,7 @@ impl H265Encoder {
                         (*raw).thread_count = std::thread::available_parallelism()
                             .map(|n| n.get().min(16) as i32)
                             .unwrap_or(0); // 0 = let libavcodec pick
+                        }
                     }
                 }
             }
@@ -492,8 +677,23 @@ impl H265Encoder {
             scaler_rgb48: None,
             scaler_rgba64: None,
             mt_scalers: MtScalers::default(),
+            vulkan_hw,
             audio: None,
         })
+    }
+
+    /// Send a CPU-side frame to the encoder, routing through the Vulkan
+    /// hw-frame upload when the GPU ProRes encoder is active (its input
+    /// contract is VULKAN-format frames, not CPU planes).
+    fn send_cpu_frame(&mut self, sw_frame: &ffmpeg::frame::Video) -> Result<()> {
+        if let Some(hw) = self.vulkan_hw.as_mut() {
+            let hw_frame = hw.upload(sw_frame)?;
+            self.encoder.send_frame(&hw_frame)
+                .map_err(|e| Error::Ffmpeg(format!("send_frame (vulkan hwframe): {e}")))
+        } else {
+            self.encoder.send_frame(sw_frame)
+                .map_err(|e| Error::Ffmpeg(format!("send_frame: {e}")))
+        }
     }
 
     /// Write the moov header if it hasn't been written yet. Called
@@ -670,8 +870,7 @@ impl H265Encoder {
         self.frame_count += 1;
 
         // Send + drain.
-        self.encoder.send_frame(&yuv_frame)
-            .map_err(|e| Error::Ffmpeg(format!("send_frame: {e}")))?;
+        self.send_cpu_frame(&yuv_frame)?;
         self.drain_packets()?;
         Ok(())
     }
@@ -749,8 +948,7 @@ impl H265Encoder {
         yuv_frame.set_pts(Some(self.frame_count));
         self.frame_count += 1;
 
-        self.encoder.send_frame(&yuv_frame)
-            .map_err(|e| Error::Ffmpeg(format!("send_frame: {e}")))?;
+        self.send_cpu_frame(&yuv_frame)?;
         self.drain_packets()?;
         Ok(())
     }
@@ -815,8 +1013,7 @@ impl H265Encoder {
         yuv_frame.set_pts(Some(self.frame_count));
         self.frame_count += 1;
 
-        self.encoder.send_frame(&yuv_frame)
-            .map_err(|e| Error::Ffmpeg(format!("send_frame: {e}")))?;
+        self.send_cpu_frame(&yuv_frame)?;
         self.drain_packets()?;
         Ok(())
     }
@@ -1488,6 +1685,7 @@ impl H265Encoder {
             scaler_rgb48: None,
             scaler_rgba64: None,
             mt_scalers: MtScalers::default(),
+            vulkan_hw: None,
             audio: None,
         })
     }

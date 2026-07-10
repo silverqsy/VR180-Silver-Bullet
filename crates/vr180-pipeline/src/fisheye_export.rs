@@ -659,18 +659,24 @@ pub fn export_fisheye(
     // path's encoder tail). What we save vs the portable path: the per-frame
     // swscale P010LE→RGBA64LE + CPU upload of the 3840² dual stream.
     //
-    // Scope: OSV + HEVC(libx265/nvenc) + either projection + Vulkan + P010.
-    // Anything else (ProRes, non-OSV, DX12, no P010) — or the
-    // `VR180_EXPORT_FORCE_CPU` escape hatch — falls through to the portable
-    // readback path below, untouched. Covers Fisheye too (parity with the
-    // macOS p010 path) so libx265 / 8-bit / GPU-resident-fallback fisheye
-    // exports keep RS + the zero-copy decode instead of dropping to the
-    // portable path.
+    // Scope: OSV + (libx265 | nvenc | prores_ks) + either projection +
+    // Vulkan + P010. ProRes rides this arm too: `wants_p010()` is false for
+    // it, so the encode thread takes the RGBA64 feed (readback → swscale →
+    // prores_ks / prores_ks_vulkan) — pipelined across the decode / GPU /
+    // encode threads instead of the serial portable loop (~4x at 8K, more
+    // with the Vulkan GPU encoder). Anything else (non-OSV, DX12, no P010)
+    // — or the `VR180_EXPORT_FORCE_CPU` escape hatch — falls through to the
+    // portable readback path below, untouched. Covers Fisheye too (parity
+    // with the macOS p010 path) so libx265 / 8-bit / GPU-resident-fallback
+    // fisheye exports keep RS + the zero-copy decode instead of dropping to
+    // the portable path.
     #[cfg(target_os = "windows")]
     {
         let can_try = std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
             && matches!(cfg.source_kind, SourceKind::DjiOsv)
-            && matches!(cfg.encoder, EncoderBackend::Libx265 | EncoderBackend::HevcNvenc)
+            && matches!(cfg.encoder,
+                EncoderBackend::Libx265 | EncoderBackend::HevcNvenc
+                | EncoderBackend::ProResKs)
             && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye)
             && (cfg.bit_depth == 10 || cfg.bit_depth == 8)
             && cfg.segments.len() <= 1 // merged recording → portable segmented loop
@@ -2358,8 +2364,20 @@ fn export_fisheye_osv_zerocopy_d3d11(
     use crate::fisheye_decode::SharedFisheyePair;
     // What the main thread hands the encode thread. P010 = the GPU already
     // did RGB→YUV (NVENC's native input, no swscale); Rgba64 = swscale
-    // fallback (libx265 / 8-bit).
+    // fallback (libx265 / prores / 8-bit).
     enum EncFrame { P010 { y: Vec<u8>, uv: Vec<u8> }, Rgba64(Vec<u8>) }
+    // ProRes: warm the process-wide FFmpeg Vulkan device NOW, before the
+    // decode/GPU threads load the driver — a cold device create mid-export
+    // measured 21–63 s (vs ~0.2 s quiescent). No-op after the first export.
+    if cfg.encoder == EncoderBackend::ProResKs
+        && std::env::var_os("VR180_NO_PRORES_VULKAN").is_none()
+    {
+        let t0 = std::time::Instant::now();
+        let ok = crate::encode::warm_prores_vulkan();
+        tracing::info!(
+            "fisheye_export (zero-copy): prores_ks_vulkan warm = {ok} ({:?})",
+            t0.elapsed());
+    }
     let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<SharedFisheyePair>(3);
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<EncFrame>(2);
     let (fmt_tx, fmt_rx) = std::sync::mpsc::sync_channel::<bool>(1);
