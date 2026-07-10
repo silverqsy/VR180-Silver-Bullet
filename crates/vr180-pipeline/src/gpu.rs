@@ -153,7 +153,10 @@ pub struct Device {
     compose_sbs_p010_y:  P010ComposePipeline,
     compose_sbs_p010_uv: P010ComposePipeline,
     /// 4:2:2 UV variant (full vertical chroma) for the ProRes-VT P210
-    /// encode feed. Shares the Y pipeline with P010.
+    /// encode feed. Shares the Y pipeline with P010. Consumed only by the
+    /// macOS-gated `compose_sbs_to_biplanar`; dead on Windows (for now —
+    /// a future Windows P210-readback ProRes feed would reuse it).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     compose_sbs_p210_uv: P010ComposePipeline,
     bilinear_sampler: wgpu::Sampler,
 
@@ -5849,6 +5852,7 @@ impl Device {
     /// 4:2:2 variant: same Y plane, but the UV pass keeps FULL vertical
     /// chroma resolution — for the ProRes-VT P210 encode feed (`target`
     /// from `create_p210_encode_buffer`, UV plane `(w/2, h)`).
+    #[cfg(target_os = "macos")]
     pub fn compose_sbs_to_p210(
         &self,
         left_16: &wgpu::Texture,
@@ -5859,6 +5863,7 @@ impl Device {
         self.compose_sbs_to_biplanar(left_16, right_16, target, eye_w, eye_h, true)
     }
 
+    #[cfg(target_os = "macos")]
     fn compose_sbs_to_biplanar(
         &self,
         left_16: &wgpu::Texture,
