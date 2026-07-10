@@ -185,10 +185,14 @@ pub struct Settings {
     /// Trim-out time in seconds. `None` = play to clip end.
     pub trim_out_s: Option<f64>,
 
-    // ─── Fisheye-source settings (DJI OSV / SBS / BRAW) ──────────
+    // ─── Per-eye lens settings (fisheye sources + GoPro EAC) ─────
     //
-    // Ignored when the loaded file is GoPro EAC. The fisheye decoder
-    // reads these once on settings_generation bump.
+    // For fisheye sources (OSV / SBS / BRAW) the Override fields drive
+    // the KB dewarp directly. For GoPro EAC (.360) the SAME fields
+    // drive the ".360 Lens calibration" re-dewarp warp (seeded from the
+    // file's GEOC factory model; see `resolve_eac_lens_pair`) — values
+    // never collide across kinds because settings persist per source
+    // kind. Decoders re-read on settings_generation bump.
 
     /// Selected camera preset by name. Empty / "Auto" → pick based on
     /// file extension (`.osv` → DJI Osmo 360, `.braw` → Pyxis 12K).
@@ -200,6 +204,17 @@ pub struct Settings {
     /// the manual fov / cx / cy / k below.
     pub fisheye_override_left: bool,
     pub fisheye_override_right: bool,
+    /// One-time sanitation marker for the ".360 Lens calibration" feature.
+    /// Settings written BEFORE the feature carried DEAD Override fields in
+    /// the "eac" kind bucket (typically stale values inherited from the
+    /// legacy single-settings migration) — left alone they would engage the
+    /// new EAC re-dewarp warp with garbage. Files lacking this field
+    /// deserialize `false` (field-level serde default), which makes the
+    /// loaders clear the EAC Override flags ONCE and set this true; fresh
+    /// settings are born `true` (nothing to sanitize), so a deliberate
+    /// .360 Override set after this build persists normally.
+    #[serde(default)]
+    pub eac_lens_sanitized: bool,
     /// Per-eye manual full FOV in degrees (used only when override is on).
     /// Converted to fx via `image_w / (2 · half_fov)`.
     pub fisheye_fov_deg_left: f32,
@@ -349,6 +364,10 @@ impl Default for Settings {
             fisheye_preset: String::new(),
             fisheye_override_left: false,
             fisheye_override_right: false,
+            // Fresh settings never carry stale pre-feature EAC Override
+            // values — born sanitized. (Old persisted files deserialize
+            // `false` here via the field-level serde default.)
+            eac_lens_sanitized: true,
             fisheye_fov_deg_left: 0.0,
             fisheye_fov_deg_right: 0.0,
             fisheye_k_left: [0.0, 0.0, 0.0, 0.0],
@@ -561,18 +580,38 @@ impl Settings {
     /// independent of the others. Missing → migrate by seeding every kind
     /// from the legacy single `settings.json` so existing tuning carries.
     pub fn load_kind_map() -> std::collections::HashMap<String, Settings> {
-        if let Some(path) = Self::kind_map_config_path() {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(m) = serde_json::from_str::<std::collections::HashMap<String, Settings>>(&text) {
-                    tracing::info!("settings: per-kind map restored from {}", path.display());
-                    return m;
+        let mut map = 'load: {
+            if let Some(path) = Self::kind_map_config_path() {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    if let Ok(m) = serde_json::from_str::<std::collections::HashMap<String, Settings>>(&text) {
+                        tracing::info!("settings: per-kind map restored from {}", path.display());
+                        break 'load m;
+                    }
                 }
             }
+            let legacy = Self::load_persisted();
+            ["osv", "eac", "sbs", "braw"].into_iter()
+                .map(|k| (k.to_string(), legacy.clone()))
+                .collect()
+        };
+        // One-time: settings written before the ".360 Lens calibration"
+        // feature carried DEAD Override fields in the "eac" bucket (stale
+        // values from the legacy migration) — clear them so the new EAC
+        // re-dewarp warp stays a no-op until the user actually enables it.
+        if let Some(eac) = map.get_mut("eac") {
+            if !eac.eac_lens_sanitized {
+                if eac.fisheye_override_left || eac.fisheye_override_right {
+                    tracing::info!(
+                        "settings: clearing stale pre-feature .360 lens Override \
+                         (was L={} R={})",
+                        eac.fisheye_override_left, eac.fisheye_override_right);
+                }
+                eac.fisheye_override_left = false;
+                eac.fisheye_override_right = false;
+                eac.eac_lens_sanitized = true;
+            }
         }
-        let legacy = Self::load_persisted();
-        ["osv", "eac", "sbs", "braw"].into_iter()
-            .map(|k| (k.to_string(), legacy.clone()))
-            .collect()
+        map
     }
 
     /// Persist the per-kind settings map (best-effort).
@@ -1092,8 +1131,20 @@ pub fn start_decoder(
     tracing::info!("decoder: per-eye bundles ready ({} entries) gen={}, eye={}×{}",
         per_eye.len(), cached_gen, eye_w, eye_h);
 
+    // GEOC factory lens calibration (file tail, ~1 MiB read) — powers the
+    // ".360 Lens calibration" Override: published as the detected calib
+    // (panel display + Override seeding, like OSV) and used per frame to
+    // resolve the per-eye re-dewarp warp. Missing GEOC → panel shows the
+    // preset fallback and the Override warp stays disabled.
+    let geoc = vr180_core::geoc::parse_geoc(
+        cfg.segments.first().unwrap_or(&cfg.path)).ok().flatten();
+    match &geoc {
+        Some(g) => seed_eac_detected_calib(&control, g),
+        None => tracing::warn!("decoder (eac): no GEOC found — lens Override unavailable"),
+    }
+
     #[cfg(target_os = "macos")]
-    return run_zero_copy(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, frame_tx, cmd_rx);
+    return run_zero_copy(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, geoc, frame_tx, cmd_rx);
 
     // Windows: try the GPU-resident zero-copy EAC preview (NVDEC→D3D11→Vulkan,
     // GPU cross assembly), matching the macOS zero-copy path. Handles merged
@@ -1116,16 +1167,16 @@ pub fn start_decoder(
                     "decoder: EAC zero-copy (d3d11va→Vulkan, GPU cross) preview ENGAGED ({} segment(s))",
                     cfg.segments.len()
                 );
-                return run_eac_zerocopy(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, ctx, iter, frame_tx, cmd_rx);
+                return run_eac_zerocopy(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, geoc, ctx, iter, frame_tx, cmd_rx);
             }
             None => {
                 tracing::info!("decoder: EAC CPU-assemble preview (zero-copy unavailable)");
-                return run_cpu_assemble(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, frame_tx, cmd_rx);
+                return run_cpu_assemble(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, geoc, frame_tx, cmd_rx);
             }
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    return run_cpu_assemble(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, frame_tx, cmd_rx);
+    return run_cpu_assemble(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, geoc, frame_tx, cmd_rx);
 }
 
 /// Open ONE fisheye segment into a `FisheyePairIter`, at the working
@@ -3235,6 +3286,77 @@ pub(crate) fn resolve_fisheye_calib_pair(
     }
 }
 
+/// Per-eye ".360 Lens calibration" Override → shader re-dewarp params.
+/// The FACTORY model comes from the file's GEOC atom (left eye = Lens B =
+/// BACK, right eye = Lens A = FRNT — same mapping as the RS path); the
+/// USER model from the same per-eye `fisheye_*` Override fields the OSV
+/// panel uses (independent per source kind via the settings-by-kind map).
+/// Override-off eyes / missing GEOC → the disabled sentinel (shader warp
+/// skipped entirely). Must mirror `fisheye_export::resolve_eac_lens_pair`
+/// so preview == export.
+pub(crate) fn resolve_eac_lens_pair(
+    s: &Settings,
+    geoc: Option<&vr180_core::geoc::Geoc>,
+) -> (vr180_pipeline::gpu::EacLensAdjust, vr180_pipeline::gpu::EacLensAdjust) {
+    use vr180_pipeline::gpu::EacLensAdjust;
+    let Some(g) = geoc else {
+        return (EacLensAdjust::DISABLED, EacLensAdjust::DISABLED);
+    };
+    let cal_dim = g.cal_dim as f32;
+    let mk = |cal: Option<&vr180_core::geoc::LensCal>, ov: bool,
+              fov: f32, cxn: f32, cyn: f32, k: [f32; 4]| -> EacLensAdjust {
+        match (cal, ov) {
+            (Some(c), true) => EacLensAdjust::from_geoc_override(
+                c.klns, c.ctrx, c.ctry, cal_dim, fov, cxn, cyn, k),
+            _ => EacLensAdjust::DISABLED,
+        }
+    };
+    (
+        mk(g.back.as_ref(), s.fisheye_override_left, s.fisheye_fov_deg_left,
+           s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left),
+        mk(g.front.as_ref(), s.fisheye_override_right, s.fisheye_fov_deg_right,
+           s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right),
+    )
+}
+
+/// Publish the GEOC factory lens calibration as the `.360` clip's
+/// detected calib, in the SAME per-eye seed units the OSV panel uses
+/// (fov via the equidistant fov↔fx convention with `cal_dim` as the
+/// width — feeding it back through `from_geoc_override` reproduces
+/// c0 exactly, i.e. an identity warp; cx/cy normalized to cal_dim;
+/// dimensionless KB k). Drives the panel's in-file display + the
+/// Override-on seeding + per-clip reseeding, identical to OSV.
+fn seed_eac_detected_calib(control: &DecoderControl, geoc: &vr180_core::geoc::Geoc) {
+    let cal_dim = geoc.cal_dim as f32;
+    if !(cal_dim > 1.0) { return; }
+    let seed = |cal: &vr180_core::geoc::LensCal| -> EyeCalibSeed {
+        let c0 = (cal.klns[0] as f32).max(1e-3);
+        EyeCalibSeed {
+            fov_deg: (cal_dim / c0).to_degrees(),
+            cx_norm: 0.5 + cal.ctrx / cal_dim,
+            cy_norm: 0.5 + cal.ctry / cal_dim,
+            k: [
+                (cal.klns[1] as f32) / c0,
+                (cal.klns[2] as f32) / c0,
+                (cal.klns[3] as f32) / c0,
+                (cal.klns[4] as f32) / c0,
+            ],
+            k5: 0.0,
+            p: [0.0, 0.0],
+        }
+    };
+    // Left eye = BACK lens, right eye = FRNT (post-yaw-mod mapping).
+    if let (Some(back), Some(front)) = (geoc.back.as_ref(), geoc.front.as_ref()) {
+        let calib = DetectedLensCalib { left: seed(back), right: seed(front) };
+        tracing::info!(
+            "decoder (eac): GEOC lens calib published — L: fov={:.2}° cx={:.4} cy={:.4}, R: fov={:.2}° cx={:.4} cy={:.4}",
+            calib.left.fov_deg, calib.left.cx_norm, calib.left.cy_norm,
+            calib.right.fov_deg, calib.right.cx_norm, calib.right.cy_norm,
+        );
+        *control.detected_calib.lock() = Some(calib);
+    }
+}
+
 /// Project an already-assembled native EAC cross into a full-resolution
 /// SBS still for the zoom magnifier, using the SAME stab/RS/view-adjust/
 /// color/compose path as the live preview — just at `detail_eye` output
@@ -3249,6 +3371,7 @@ fn render_zoom_detail(
     abs_frame_idx: u32,
     timestamp_s: f64,
     detail_eye: u32,
+    geoc: Option<&vr180_core::geoc::Geoc>,
     tx: &Sender<DecodedFrame>,
 ) -> anyhow::Result<()> {
     let (_, cross_a, cross_b) = cross;
@@ -3260,12 +3383,13 @@ fn render_zoom_detail(
     let s = control.settings.read();
     let fisheye_out = matches!(s.fisheye_output_mode, FisheyeOutputMode::Fisheye);
     let (rl, rr) = apply_view_adjust(&s, rl, rr);
+    let (lens_l, lens_r) = resolve_eac_lens_pair(&s, geoc);
     let (dl, dr) = if fisheye_out {
-        (pipeline.project_cross_texture_to_fisheye_texture(cross_b, detail_eye, detail_eye, rl, sl)?,
-         pipeline.project_cross_texture_to_fisheye_texture(cross_a, detail_eye, detail_eye, rr, sr)?)
+        (pipeline.project_cross_texture_to_fisheye_texture(cross_b, detail_eye, detail_eye, rl, sl, &lens_l)?,
+         pipeline.project_cross_texture_to_fisheye_texture(cross_a, detail_eye, detail_eye, rr, sr, &lens_r)?)
     } else {
-        (pipeline.project_cross_texture_to_equirect_texture(cross_b, detail_eye, detail_eye, rl, sl)?,
-         pipeline.project_cross_texture_to_equirect_texture(cross_a, detail_eye, detail_eye, rr, sr)?)
+        (pipeline.project_cross_texture_to_equirect_texture(cross_b, detail_eye, detail_eye, rl, sl, &lens_l)?,
+         pipeline.project_cross_texture_to_equirect_texture(cross_a, detail_eye, detail_eye, rr, sr, &lens_r)?)
     };
     let (dsbs, dw, dh) = compose_with_color_and_mode(
         pipeline, &s, &dl, &dr, detail_eye, detail_eye)?;
@@ -3291,6 +3415,7 @@ fn run_zero_copy(
     mut per_eye: Vec<((EquirectRotation, EquirectRsParams), (EquirectRotation, EquirectRsParams))>,
     mut stab_key: StabKey,
     mut cached_gen: u64,
+    geoc: Option<vr180_core::geoc::Geoc>,
     frame_tx: Sender<DecodedFrame>,
     cmd_rx: Receiver<DecoderCommand>,
 ) -> anyhow::Result<()> {
@@ -3515,13 +3640,18 @@ fn run_zero_copy(
             control.settings.read().fisheye_output_mode,
             FisheyeOutputMode::Fisheye);
         let (rl, rr) = apply_view_adjust(&control.settings.read(), rl, rr);
+        // Per-eye ".360 Lens calibration" Override (disabled sentinels when
+        // off). Resolved from live settings each frame so slider drags
+        // re-project immediately (the gen bump re-renders a paused frame).
+        let (lens_l, lens_r) = resolve_eac_lens_pair(
+            &control.settings.read(), geoc.as_ref());
 
         let (left_tex, right_tex) = if fisheye_out {
-            (pipeline.project_cross_texture_to_fisheye_texture(cross_b, eye_w, eye_h, rl, sl)?,
-             pipeline.project_cross_texture_to_fisheye_texture(cross_a, eye_w, eye_h, rr, sr)?)
+            (pipeline.project_cross_texture_to_fisheye_texture(cross_b, eye_w, eye_h, rl, sl, &lens_l)?,
+             pipeline.project_cross_texture_to_fisheye_texture(cross_a, eye_w, eye_h, rr, sr, &lens_r)?)
         } else {
-            (pipeline.project_cross_texture_to_equirect_texture(cross_b, eye_w, eye_h, rl, sl)?,
-             pipeline.project_cross_texture_to_equirect_texture(cross_a, eye_w, eye_h, rr, sr)?)
+            (pipeline.project_cross_texture_to_equirect_texture(cross_b, eye_w, eye_h, rl, sl, &lens_l)?,
+             pipeline.project_cross_texture_to_equirect_texture(cross_a, eye_w, eye_h, rr, sr, &lens_r)?)
         };
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex, eye_w, eye_h,
@@ -3582,7 +3712,8 @@ fn run_zero_copy(
                             if let Err(e) = render_zoom_detail(
                                 &pipeline, &control, &per_eye,
                                 cached_cross.as_ref().unwrap(), abs,
-                                time_offset + frame_idx as f64 * dt, detail_eye, tx)
+                                time_offset + frame_idx as f64 * dt, detail_eye,
+                                geoc.as_ref(), tx)
                             {
                                 tracing::debug!("decoder (zc): zoom detail failed: {e}");
                             }
@@ -3654,6 +3785,7 @@ fn run_eac_zerocopy(
     mut per_eye: Vec<((EquirectRotation, EquirectRsParams), (EquirectRotation, EquirectRsParams))>,
     mut stab_key: StabKey,
     mut cached_gen: u64,
+    geoc: Option<vr180_core::geoc::Geoc>,
     ctx: vr180_pipeline::interop_windows::VulkanImportCtx,
     iter: vr180_pipeline::fisheye_decode::SegmentedD3d11SharedStreamPairIter,
     frame_tx: Sender<DecodedFrame>,
@@ -3789,14 +3921,16 @@ fn run_eac_zerocopy(
         // Left eye = Lens B, right eye = Lens A (same as the CPU + export paths).
         // Honor the Fisheye output mode (normalized fisheye SBS) like the macOS
         // run_zero_copy + the export; default is half-equirect (VR180).
+        let (lens_l, lens_r) = resolve_eac_lens_pair(
+            &control.settings.read(), geoc.as_ref());
         let (left_tex, right_tex) = if matches!(
             control.settings.read().fisheye_output_mode, FisheyeOutputMode::Fisheye
         ) {
-            (pipeline.project_cross_texture_to_fisheye_texture(&cross_b, eye_w, eye_h, rl, sl)?,
-             pipeline.project_cross_texture_to_fisheye_texture(&cross_a, eye_w, eye_h, rr, sr)?)
+            (pipeline.project_cross_texture_to_fisheye_texture(&cross_b, eye_w, eye_h, rl, sl, &lens_l)?,
+             pipeline.project_cross_texture_to_fisheye_texture(&cross_a, eye_w, eye_h, rr, sr, &lens_r)?)
         } else {
-            (pipeline.project_cross_texture_to_equirect_texture(&cross_b, eye_w, eye_h, rl, sl)?,
-             pipeline.project_cross_texture_to_equirect_texture(&cross_a, eye_w, eye_h, rr, sr)?)
+            (pipeline.project_cross_texture_to_equirect_texture(&cross_b, eye_w, eye_h, rl, sl, &lens_l)?,
+             pipeline.project_cross_texture_to_equirect_texture(&cross_a, eye_w, eye_h, rr, sr, &lens_r)?)
         };
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex, eye_w, eye_h,
@@ -3867,6 +4001,7 @@ fn run_cpu_assemble(
     mut per_eye: Vec<((EquirectRotation, EquirectRsParams), (EquirectRotation, EquirectRsParams))>,
     mut stab_key: StabKey,
     mut cached_gen: u64,
+    geoc: Option<vr180_core::geoc::Geoc>,
     frame_tx: Sender<DecodedFrame>,
     cmd_rx: Receiver<DecoderCommand>,
 ) -> anyhow::Result<()> {
@@ -4010,14 +4145,16 @@ fn run_cpu_assemble(
 
         // Honor the Fisheye output mode (parity with the zero-copy preview + the
         // export); default is half-equirect (VR180).
+        let (lens_l, lens_r) = resolve_eac_lens_pair(
+            &control.settings.read(), geoc.as_ref());
         let (left_tex, right_tex) = if matches!(
             control.settings.read().fisheye_output_mode, FisheyeOutputMode::Fisheye
         ) {
-            (pipeline.project_cross_to_fisheye_texture(&cross_b, cross_w_px, eye_w, eye_h, rl, sl)?,
-             pipeline.project_cross_to_fisheye_texture(&cross_a, cross_w_px, eye_w, eye_h, rr, sr)?)
+            (pipeline.project_cross_to_fisheye_texture(&cross_b, cross_w_px, eye_w, eye_h, rl, sl, &lens_l)?,
+             pipeline.project_cross_to_fisheye_texture(&cross_a, cross_w_px, eye_w, eye_h, rr, sr, &lens_r)?)
         } else {
-            (pipeline.project_cross_to_equirect_texture(&cross_b, cross_w_px, eye_w, eye_h, rl, sl)?,
-             pipeline.project_cross_to_equirect_texture(&cross_a, cross_w_px, eye_w, eye_h, rr, sr)?)
+            (pipeline.project_cross_to_equirect_texture(&cross_b, cross_w_px, eye_w, eye_h, rl, sl, &lens_l)?,
+             pipeline.project_cross_to_equirect_texture(&cross_a, cross_w_px, eye_w, eye_h, rr, sr, &lens_r)?)
         };
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex, eye_w, eye_h,

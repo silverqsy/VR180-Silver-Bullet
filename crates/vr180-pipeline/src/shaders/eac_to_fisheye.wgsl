@@ -87,6 +87,60 @@ fn rs_group(g: i32) -> vec3<f32> {
     return vec3<f32>(x, y, z);
 }
 
+// Per-eye lens re-dewarp (".360 Lens calibration" Override) — identical
+// math + uniform layout to eac_to_equirect.wgsl; see the comments there.
+struct LensUniforms {
+    fx_u: f32, cx_u: f32, cy_u: f32, enabled: f32,
+    ku1: f32, ku2: f32, ku3: f32, ku4: f32,
+    fx_n: f32, cx_n: f32, cy_n: f32, _pad0: f32,
+    kn1: f32, kn2: f32, kn3: f32, kn4: f32,
+}
+@group(0) @binding(5) var<uniform> lens: LensUniforms;
+
+fn lens_user_r(theta: f32) -> f32 {
+    let t2 = theta * theta;
+    return lens.fx_u * theta
+        * (1.0 + t2 * (lens.ku1 + t2 * (lens.ku2 + t2 * (lens.ku3 + t2 * lens.ku4))));
+}
+fn lens_nom_r(theta: f32) -> f32 {
+    let t2 = theta * theta;
+    return lens.fx_n * theta
+        * (1.0 + t2 * (lens.kn1 + t2 * (lens.kn2 + t2 * (lens.kn3 + t2 * lens.kn4))));
+}
+fn lens_nom_r_deriv(theta: f32) -> f32 {
+    let t2 = theta * theta;
+    let t4 = t2 * t2;
+    let t6 = t4 * t2;
+    let t8 = t4 * t4;
+    return lens.fx_n * (1.0 + 3.0 * lens.kn1 * t2 + 5.0 * lens.kn2 * t4
+        + 7.0 * lens.kn3 * t6 + 9.0 * lens.kn4 * t8);
+}
+
+fn lens_warp(v: vec3<f32>) -> vec3<f32> {
+    let rxy = sqrt(v.x * v.x + v.y * v.y);
+    if (rxy <= 1e-6) {
+        return v;
+    }
+    let theta_u = atan2(rxy, v.z);
+    let r_u = lens_user_r(theta_u);
+    let px = lens.cx_u + r_u * (v.x / rxy);
+    let py = lens.cy_u - r_u * (v.y / rxy);
+    let qx = px - lens.cx_n;
+    let qy = lens.cy_n - py;
+    let r_n = sqrt(qx * qx + qy * qy);
+    if (r_n <= 1e-6) {
+        return vec3<f32>(0.0, 0.0, 1.0);
+    }
+    var t_n = clamp(r_n / max(lens.fx_n, 1e-3), 0.0, PI);
+    for (var i = 0; i < 3; i = i + 1) {
+        let f = lens_nom_r(t_n) - r_n;
+        let d = max(lens_nom_r_deriv(t_n), 1e-3);
+        t_n = clamp(t_n - f / d, 0.0, PI);
+    }
+    let s = sin(t_n) / r_n;
+    return vec3<f32>(qx * s, qy * s, cos(t_n));
+}
+
 const PI: f32 = 3.14159265359;
 const HALF_PI: f32 = 1.57079632679;
 const TWO_OVER_PI: f32 = 0.63661977236;  // 2/π
@@ -206,6 +260,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         xn = xr + wy * zr - wz * yr;
         yn = yr + wz * xr - wx * zr;
         zn = zr - wy * xr + wx * yr;
+    }
+
+    // Per-eye lens re-dewarp (Override) — camera-frame, after stab+RS so
+    // it models the capture optics, not the view. Pass-through when off.
+    if (lens.enabled > 0.5) {
+        let vw = lens_warp(vec3<f32>(xn, yn, zn));
+        xn = vw.x;
+        yn = vw.y;
+        zn = vw.z;
     }
 
     let ax = abs(xn);

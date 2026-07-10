@@ -85,6 +85,105 @@ impl EncoderBackend {
 /// point (instead of `encode_frame`). The encoder context has
 /// `hw_device_ctx` + `hw_frames_ctx` set so it accepts AVFrames with
 /// `format = AV_PIX_FMT_VIDEOTOOLBOX` and `data[3] = CVPixelBufferRef`.
+/// Multi-threaded swscale context. `sws_getContext()` (what ffmpeg-next's
+/// `scaling::Context::get` wraps) has no threads parameter — libswscale
+/// threading (ffmpeg ≥5.0) is only reachable by building the context via
+/// AVOptions before init, which is what the ffmpeg CLI does. Slice
+/// threading splits the frame into row bands; the per-pixel conversion
+/// math is unchanged, so output matches the single-threaded context.
+/// Used for the CPU export path's RGB→YUV conversions, which are
+/// full-frame (up to 8192×4096 × 6 B/px) and were single-threaded.
+struct ThreadedScaler {
+    ctx: *mut ffmpeg::ffi::SwsContext,
+}
+
+// The context is only ever used from the one export thread that owns the
+// encoder; Send is needed because H265Encoder moves across threads.
+unsafe impl Send for ThreadedScaler {}
+
+impl ThreadedScaler {
+    fn new(
+        src: ffmpeg::format::Pixel,
+        dst: ffmpeg::format::Pixel,
+        w: u32, h: u32,
+    ) -> Option<Self> {
+        unsafe {
+            use ffmpeg::ffi::*;
+            let ctx = sws_alloc_context();
+            if ctx.is_null() {
+                return None;
+            }
+            let obj = ctx as *mut std::ffi::c_void;
+            let set = |name: &str, val: i64| -> bool {
+                let cname = CString::new(name).unwrap();
+                av_opt_set_int(obj, cname.as_ptr(), val, 0) >= 0
+            };
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get().min(16) as i64)
+                .unwrap_or(1);
+            let src_fmt: AVPixelFormat = src.into();
+            let dst_fmt: AVPixelFormat = dst.into();
+            let ok = set("srcw", w as i64)
+                && set("srch", h as i64)
+                && set("src_format", src_fmt as i64)
+                && set("dstw", w as i64)
+                && set("dsth", h as i64)
+                && set("dst_format", dst_fmt as i64)
+                // Same algorithm the single-threaded contexts use — for a
+                // 1:1 format conversion the flags barely matter, but keep
+                // them identical so output is unchanged. (4 = SWS_BICUBIC;
+                // the #define isn't re-exported by ffmpeg-sys-next.)
+                && set("sws_flags", 4)
+                && set("threads", threads);
+            if !ok || sws_init_context(ctx, std::ptr::null_mut(), std::ptr::null_mut()) < 0 {
+                sws_freeContext(ctx);
+                tracing::warn!("threaded swscale init failed — falling back to single-threaded");
+                return None;
+            }
+            tracing::info!("threaded swscale: {threads} threads for {src:?} → {dst:?} @ {w}×{h}");
+            Some(Self { ctx })
+        }
+    }
+
+    /// Returns false on failure (caller falls back to the single-threaded
+    /// context).
+    fn run(&mut self, src: &ffmpeg::frame::Video, dst: &mut ffmpeg::frame::Video) -> bool {
+        unsafe {
+            let s = src.as_ptr();
+            let d = dst.as_mut_ptr();
+            let ret = ffmpeg::ffi::sws_scale(
+                self.ctx,
+                (*s).data.as_ptr() as *const *const u8,
+                (*s).linesize.as_ptr(),
+                0,
+                (*s).height,
+                (*d).data.as_ptr() as *const *mut u8,
+                (*d).linesize.as_ptr(),
+            );
+            ret > 0
+        }
+    }
+}
+
+impl Drop for ThreadedScaler {
+    fn drop(&mut self) {
+        unsafe { ffmpeg::ffi::sws_freeContext(self.ctx); }
+    }
+}
+
+/// Lazily-created multi-threaded scalers for the CPU feed paths, one per
+/// input format. `*_tried` prevents re-attempting a failed creation on
+/// every frame (a failure falls back to the single-threaded contexts).
+#[derive(Default)]
+struct MtScalers {
+    rgb24: Option<ThreadedScaler>,
+    rgb24_tried: bool,
+    rgb48: Option<ThreadedScaler>,
+    rgb48_tried: bool,
+    rgba64: Option<ThreadedScaler>,
+    rgba64_tried: bool,
+}
+
 pub struct H265Encoder {
     octx: ffmpeg::format::context::Output,
     encoder: ffmpeg::codec::encoder::Video,
@@ -118,6 +217,9 @@ pub struct H265Encoder {
     /// does the YUV conversion, so the GPU readback skips the per-pixel
     /// RGBA64→RGB48 repack (a 30M-iteration/frame CPU loop at 8K SBS).
     scaler_rgba64: Option<ffmpeg::software::scaling::Context>,
+    /// Multi-threaded swscale contexts (preferred over the
+    /// single-threaded ones above when available; see [`ThreadedScaler`]).
+    mt_scalers: MtScalers,
     /// Optional ONE-PASS audio passthrough: the source's audio is muxed
     /// into the SAME output during encode (no `.video.tmp` + re-mux). See
     /// [`H265Encoder::attach_audio_passthrough`]. `None` → video-only
@@ -341,6 +443,21 @@ impl H265Encoder {
                         // "Apple" vendor tag so QuickTime / FCP recognize
                         // the file as native ProRes (not "Other").
                         set_opt(raw, "vendor", "apl0")?;
+                        // libavcodec defaults to thread_count = 1 through
+                        // the API (the ffmpeg CLI sets threads=auto), so
+                        // prores_ks was encoding single-threaded. Enable
+                        // frame+slice threading: measured on 7680×3840 HQ,
+                        // frame threading is ~11× vs single-thread (slice-
+                        // only ~5×). Output is bit-identical (ProRes frames
+                        // are independent; slice partitioning doesn't
+                        // depend on thread count). Cap at 16 — frame
+                        // threading holds ~thread_count frames in flight
+                        // (~134 MB each at 8192×4096 yuv422p10).
+                        (*raw).thread_type = (ffmpeg::ffi::FF_THREAD_FRAME
+                            | ffmpeg::ffi::FF_THREAD_SLICE) as i32;
+                        (*raw).thread_count = std::thread::available_parallelism()
+                            .map(|n| n.get().min(16) as i32)
+                            .unwrap_or(0); // 0 = let libavcodec pick
                     }
                 }
             }
@@ -379,6 +496,7 @@ impl H265Encoder {
             enc_pix_fmt,
             scaler_rgb48: None,
             scaler_rgba64: None,
+            mt_scalers: MtScalers::default(),
             audio: None,
         })
     }
@@ -536,12 +654,23 @@ impl H265Encoder {
         }
 
         // Convert to the encoder's pixel format (YUV420P for 8-bit,
-        // YUV420P10LE / P010LE for 10-bit).
+        // YUV420P10LE / P010LE for 10-bit). Prefer the multi-threaded
+        // scaler; any failure falls back to the single-threaded one.
         let mut yuv_frame = ffmpeg::frame::Video::new(
             self.enc_pix_fmt, self.w, self.h
         );
-        self.scaler.run(&rgb_frame, &mut yuv_frame)
-            .map_err(|e| Error::Ffmpeg(format!("scaler run: {e}")))?;
+        if !self.mt_scalers.rgb24_tried {
+            self.mt_scalers.rgb24_tried = true;
+            self.mt_scalers.rgb24 = ThreadedScaler::new(
+                ffmpeg::format::Pixel::RGB24, self.enc_pix_fmt, self.w, self.h);
+        }
+        let mt_ok = self.mt_scalers.rgb24.as_mut()
+            .map(|mt| mt.run(&rgb_frame, &mut yuv_frame))
+            .unwrap_or(false);
+        if !mt_ok {
+            self.scaler.run(&rgb_frame, &mut yuv_frame)
+                .map_err(|e| Error::Ffmpeg(format!("scaler run: {e}")))?;
+        }
         yuv_frame.set_pts(Some(self.frame_count));
         self.frame_count += 1;
 
@@ -567,8 +696,14 @@ impl H265Encoder {
                 "encode_frame_rgb48: expected {want} bytes, got {}", rgb48le.len()
             )));
         }
-        // Lazy second scaler for RGB48LE input.
-        if self.scaler_rgb48.is_none() {
+        // Multi-threaded scaler preferred; the single-threaded context is
+        // only built if the threaded one is unavailable.
+        if !self.mt_scalers.rgb48_tried {
+            self.mt_scalers.rgb48_tried = true;
+            self.mt_scalers.rgb48 = ThreadedScaler::new(
+                ffmpeg::format::Pixel::RGB48LE, self.enc_pix_fmt, self.w, self.h);
+        }
+        if self.mt_scalers.rgb48.is_none() && self.scaler_rgb48.is_none() {
             self.scaler_rgb48 = Some(
                 ffmpeg::software::scaling::Context::get(
                     ffmpeg::format::Pixel::RGB48LE,
@@ -598,8 +733,24 @@ impl H265Encoder {
         let mut yuv_frame = ffmpeg::frame::Video::new(
             self.enc_pix_fmt, self.w, self.h
         );
-        self.scaler_rgb48.as_mut().unwrap().run(&rgb_frame, &mut yuv_frame)
-            .map_err(|e| Error::Ffmpeg(format!("rgb48 scaler run: {e}")))?;
+        let mt_ok = self.mt_scalers.rgb48.as_mut()
+            .map(|mt| mt.run(&rgb_frame, &mut yuv_frame))
+            .unwrap_or(false);
+        if !mt_ok {
+            if self.scaler_rgb48.is_none() {
+                self.scaler_rgb48 = Some(
+                    ffmpeg::software::scaling::Context::get(
+                        ffmpeg::format::Pixel::RGB48LE,
+                        self.w, self.h,
+                        self.enc_pix_fmt,
+                        self.w, self.h,
+                        ffmpeg::software::scaling::Flags::BICUBIC,
+                    ).map_err(|e| Error::Ffmpeg(format!("rgb48→yuv scaler: {e}")))?
+                );
+            }
+            self.scaler_rgb48.as_mut().unwrap().run(&rgb_frame, &mut yuv_frame)
+                .map_err(|e| Error::Ffmpeg(format!("rgb48 scaler run: {e}")))?;
+        }
         yuv_frame.set_pts(Some(self.frame_count));
         self.frame_count += 1;
 
@@ -623,16 +774,11 @@ impl H265Encoder {
                 "encode_frame_rgba64: expected {want} bytes, got {}", rgba64le.len()
             )));
         }
-        if self.scaler_rgba64.is_none() {
-            self.scaler_rgba64 = Some(
-                ffmpeg::software::scaling::Context::get(
-                    ffmpeg::format::Pixel::RGBA64LE,
-                    self.w, self.h,
-                    self.enc_pix_fmt,
-                    self.w, self.h,
-                    ffmpeg::software::scaling::Flags::BICUBIC,
-                ).map_err(|e| Error::Ffmpeg(format!("rgba64→yuv scaler: {e}")))?
-            );
+        // Multi-threaded scaler preferred; single-threaded fallback.
+        if !self.mt_scalers.rgba64_tried {
+            self.mt_scalers.rgba64_tried = true;
+            self.mt_scalers.rgba64 = ThreadedScaler::new(
+                ffmpeg::format::Pixel::RGBA64LE, self.enc_pix_fmt, self.w, self.h);
         }
 
         let mut rgba_frame = ffmpeg::frame::Video::new(
@@ -653,8 +799,24 @@ impl H265Encoder {
         let mut yuv_frame = ffmpeg::frame::Video::new(
             self.enc_pix_fmt, self.w, self.h
         );
-        self.scaler_rgba64.as_mut().unwrap().run(&rgba_frame, &mut yuv_frame)
-            .map_err(|e| Error::Ffmpeg(format!("rgba64 scaler run: {e}")))?;
+        let mt_ok = self.mt_scalers.rgba64.as_mut()
+            .map(|mt| mt.run(&rgba_frame, &mut yuv_frame))
+            .unwrap_or(false);
+        if !mt_ok {
+            if self.scaler_rgba64.is_none() {
+                self.scaler_rgba64 = Some(
+                    ffmpeg::software::scaling::Context::get(
+                        ffmpeg::format::Pixel::RGBA64LE,
+                        self.w, self.h,
+                        self.enc_pix_fmt,
+                        self.w, self.h,
+                        ffmpeg::software::scaling::Flags::BICUBIC,
+                    ).map_err(|e| Error::Ffmpeg(format!("rgba64→yuv scaler: {e}")))?
+                );
+            }
+            self.scaler_rgba64.as_mut().unwrap().run(&rgba_frame, &mut yuv_frame)
+                .map_err(|e| Error::Ffmpeg(format!("rgba64 scaler run: {e}")))?;
+        }
         yuv_frame.set_pts(Some(self.frame_count));
         self.frame_count += 1;
 
@@ -1132,11 +1294,12 @@ impl H265Encoder {
     }
 
     /// ProRes flavour of the zero-copy VT encode: `prores_videotoolbox`
-    /// (Apple's hardware ProRes engine) fed the SAME P010 CVPixelBuffers
-    /// as the HEVC path via `encode_pixel_buffer_p010` — p010le is in the
-    /// encoder's supported sw-format list; VT converts to the profile's
-    /// 4:2:2/4:4:4 internally. `prores_profile` = 0..=5
-    /// (Proxy/LT/Standard/HQ/4444/4444 XQ).
+    /// (Apple's hardware ProRes engine) fed **P210** CVPixelBuffers
+    /// (10-bit 4:2:2, `create_p210_encode_buffer` + `compose_sbs_to_p210`)
+    /// via `encode_pixel_buffer_p010` — TRUE 4:2:2 chroma end-to-end.
+    /// (Previously fed P010, which decimated chroma to 4:2:0 before a
+    /// ≥4:2:2 codec; VT merely up-converted it back.) `prores_profile` =
+    /// 0..=5 (Proxy/LT/Standard/HQ/4444/4444 XQ).
     pub fn create_zero_copy_vt_prores(
         path: &Path,
         w: u32, h: u32,
@@ -1220,7 +1383,12 @@ impl H265Encoder {
             }
             let frames_ctx = (*f).data as *mut AVHWFramesContext;
             (*frames_ctx).format    = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
-            (*frames_ctx).sw_format = if bit_depth == 10 {
+            (*frames_ctx).sw_format = if is_prores {
+                // ProRes is a ≥4:2:2 codec: feed P210 (10-bit 4:2:2) so
+                // the hardware engine gets full vertical chroma.
+                // (`prores_videotoolbox` lists p210le as supported.)
+                AVPixelFormat::AV_PIX_FMT_P210LE
+            } else if bit_depth == 10 {
                 AVPixelFormat::AV_PIX_FMT_P010LE
             } else {
                 AVPixelFormat::AV_PIX_FMT_BGRA
@@ -1324,6 +1492,7 @@ impl H265Encoder {
             enc_pix_fmt: ffmpeg::format::Pixel::YUV420P,
             scaler_rgb48: None,
             scaler_rgba64: None,
+            mt_scalers: MtScalers::default(),
             audio: None,
         })
     }

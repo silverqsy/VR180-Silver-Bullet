@@ -644,8 +644,10 @@ pub struct EncodePixelBufferP010 {
     pub iosurface: RetainedIOSurface,
     /// Y plane wgpu texture: R16Unorm, `(width, height)`.
     pub y_tex: wgpu::Texture,
-    /// UV plane wgpu texture: Rg16Unorm at half resolution
-    /// `(width/2, height/2)` — interleaved U and V.
+    /// UV plane wgpu texture: Rg16Unorm, interleaved U and V.
+    /// P010 (`create_p010_encode_buffer*`): `(width/2, height/2)`.
+    /// P210 (`create_p210_encode_buffer`): `(width/2, height)` — full
+    /// vertical chroma for the ProRes-VT 4:2:2 feed.
     pub uv_tex: wgpu::Texture,
     pub width: u32,
     pub height: u32,
@@ -760,6 +762,98 @@ pub fn create_p010_encode_buffer_fmt(
         metal::MTLPixelFormat::RG16Unorm,
         wgpu::TextureFormat::Rg16Unorm,
         width / 2, height / 2, "p010_uv_plane",
+    )?;
+
+    Ok(EncodePixelBufferP010 {
+        pixel_buffer, iosurface,
+        y_tex: y_plane.texture,
+        uv_tex: uv_plane.texture,
+        width, height,
+    })
+}
+
+// ─── P210 encode buffer (10-bit semi-planar 4:2:2) ─────────────────
+//
+// FourCC `x422` = kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange.
+// Same biplanar layout as P010 but the UV plane keeps FULL vertical
+// resolution (chroma is only halved horizontally). Used to feed the
+// VideoToolbox hardware ProRes encoder true 4:2:2 chroma — ProRes is a
+// ≥4:2:2 codec, and a P010 feed would decimate chroma to 4:2:0 before
+// the encode (VT would merely up-convert it back to nominal 4:2:2).
+const K_CV_PIXEL_FORMAT_TYPE_422_YPCBCR_10_BIPLANAR_VIDEORANGE: u32 =
+    u32::from_be_bytes(*b"x422");
+
+/// Create an IOSurface-backed **P210** CVPixelBuffer (video-range 4:2:2)
+/// and wrap each plane as a wgpu storage texture. Returned in the same
+/// [`EncodePixelBufferP010`] carrier the P010 path uses — the only
+/// difference is the UV plane texture is `(width/2, height)` (full
+/// vertical chroma). `width` must be even.
+pub fn create_p210_encode_buffer(
+    device: &wgpu::Device,
+    width: u32, height: u32,
+) -> Result<EncodePixelBufferP010> {
+    if width % 2 != 0 {
+        return Err(Error::Wgpu(format!(
+            "P210 encode buffer requires an even width, got {width}×{height}"
+        )));
+    }
+    let attrs = unsafe { build_iosurface_attrs() };
+    let mut pb: CVPixelBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        CVPixelBufferCreate(
+            std::ptr::null(),
+            width as usize,
+            height as usize,
+            K_CV_PIXEL_FORMAT_TYPE_422_YPCBCR_10_BIPLANAR_VIDEORANGE,
+            attrs as CFDictionaryRef,
+            &mut pb,
+        )
+    };
+    unsafe { CFRelease(attrs as CFTypeRef); }
+    if ret != 0 || pb.is_null() {
+        return Err(Error::Wgpu(format!(
+            "CVPixelBufferCreate P210 returned {ret} (pb={:?})", pb
+        )));
+    }
+    let pixel_buffer = unsafe { RetainedCVPixelBuffer::from_create_rule(pb) };
+    let raw_io = unsafe { CVPixelBufferGetIOSurface(pixel_buffer.as_raw()) };
+    if raw_io.is_null() {
+        return Err(Error::Wgpu(
+            "P210 CVPixelBuffer has no IOSurface backing".into()
+        ));
+    }
+    let iosurface = unsafe { RetainedIOSurface::retain(raw_io) };
+
+    let plane_count = unsafe { IOSurfaceGetPlaneCount(iosurface.as_raw()) };
+    if plane_count < 2 {
+        return Err(Error::Wgpu(format!(
+            "P210 IOSurface has {plane_count} planes, expected 2"
+        )));
+    }
+    let p0_w = iosurface.plane_width(0) as u32;
+    let p0_h = iosurface.plane_height(0) as u32;
+    let p1_w = iosurface.plane_width(1) as u32;
+    let p1_h = iosurface.plane_height(1) as u32;
+    if p0_w != width || p0_h != height
+        || p1_w != width / 2 || p1_h != height
+    {
+        return Err(Error::Wgpu(format!(
+            "P210 plane geometry mismatch: Y={p0_w}×{p0_h} (expect {width}×{height}), \
+             UV={p1_w}×{p1_h} (expect {}×{height})", width / 2
+        )));
+    }
+
+    let y_plane = wgpu_texture_from_iosurface_plane(
+        device, iosurface.clone(), 0,
+        metal::MTLPixelFormat::R16Unorm,
+        wgpu::TextureFormat::R16Unorm,
+        width, height, "p210_y_plane",
+    )?;
+    let uv_plane = wgpu_texture_from_iosurface_plane(
+        device, iosurface.clone(), 1,
+        metal::MTLPixelFormat::RG16Unorm,
+        wgpu::TextureFormat::Rg16Unorm,
+        width / 2, height, "p210_uv_plane",
     )?;
 
     Ok(EncodePixelBufferP010 {

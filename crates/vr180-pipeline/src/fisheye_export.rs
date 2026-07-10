@@ -1101,13 +1101,21 @@ pub fn export_fisheye(
                 )?;
                 let l_final = left_g .as_ref().unwrap_or(&left_tex_16);
                 let r_final = right_g.as_ref().unwrap_or(&right_tex_16);
-                let encode_pb = crate::interop_macos::create_p010_encode_buffer(
-                    &pipeline.device, sbs_w, sbs_h,
-                )?;
-                pipeline.compose_sbs_to_p010(
-                    l_final, r_final, &encode_pb,
-                    cfg.eye_w, cfg.eye_h,
-                )?;
+                // ProRes gets a P210 (true 4:2:2) surface; HEVC Main10 P010.
+                let encode_pb = if is_prores_vt {
+                    crate::interop_macos::create_p210_encode_buffer(
+                        &pipeline.device, sbs_w, sbs_h)?
+                } else {
+                    crate::interop_macos::create_p010_encode_buffer(
+                        &pipeline.device, sbs_w, sbs_h)?
+                };
+                if is_prores_vt {
+                    pipeline.compose_sbs_to_p210(
+                        l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
+                } else {
+                    pipeline.compose_sbs_to_p010(
+                        l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
+                }
                 encoder.encode_pixel_buffer_p010(&encode_pb)?;
             }
             #[cfg(not(target_os = "macos"))]
@@ -1213,6 +1221,51 @@ pub type EacPerEyeFrame = (
 /// fisheye 8-bit arm). The encoder still honors `cfg.bit_depth` (a 10-bit
 /// codec just gets the 8-bit pixels widened by swscale — no precision lost
 /// vs the source).
+/// Resolve the per-eye ".360 Lens calibration" Override into shader
+/// re-dewarp params for an EAC export. The FACTORY model comes from the
+/// file's GEOC atom (left eye = Lens B = BACK, right eye = Lens A = FRNT
+/// — same mapping as the RS path); the USER model from the
+/// `cfg.fisheye_*` Override fields the GUI populates for every source
+/// kind. Override-off eyes (or a file with no GEOC) get the disabled
+/// sentinel — the shader warp is skipped entirely.
+///
+/// Must mirror the GUI's `resolve_eac_lens_pair` so export == preview.
+fn resolve_eac_lens_pair(cfg: &FisheyeExportConfig) -> (crate::gpu::EacLensAdjust, crate::gpu::EacLensAdjust) {
+    use crate::gpu::EacLensAdjust;
+    if !cfg.fisheye_override_left && !cfg.fisheye_override_right {
+        return (EacLensAdjust::DISABLED, EacLensAdjust::DISABLED);
+    }
+    let src = cfg.segments.first().unwrap_or(&cfg.source_path);
+    let geoc = match vr180_core::geoc::parse_geoc(src) {
+        Ok(Some(g)) => g,
+        _ => {
+            tracing::warn!(
+                "export_eac: lens Override on but no GEOC in {} — Override ignored",
+                src.display());
+            return (EacLensAdjust::DISABLED, EacLensAdjust::DISABLED);
+        }
+    };
+    let cal_dim = geoc.cal_dim as f32;
+    let mk = |cal: Option<&vr180_core::geoc::LensCal>, ov: bool,
+              fov: f32, cxn: f32, cyn: f32, k: [f32; 4]| -> EacLensAdjust {
+        match (cal, ov) {
+            (Some(c), true) => EacLensAdjust::from_geoc_override(
+                c.klns, c.ctrx, c.ctry, cal_dim, fov, cxn, cyn, k),
+            _ => EacLensAdjust::DISABLED,
+        }
+    };
+    let l = mk(geoc.back.as_ref(), cfg.fisheye_override_left,
+        cfg.fisheye_fov_deg_left, cfg.fisheye_cx_norm_left,
+        cfg.fisheye_cy_norm_left, cfg.fisheye_k_left);
+    let r = mk(geoc.front.as_ref(), cfg.fisheye_override_right,
+        cfg.fisheye_fov_deg_right, cfg.fisheye_cx_norm_right,
+        cfg.fisheye_cy_norm_right, cfg.fisheye_k_right);
+    if l.enabled || r.enabled {
+        tracing::info!("export_eac: lens Override engaged (L={}, R={})", l.enabled, r.enabled);
+    }
+    (l, r)
+}
+
 pub fn export_eac(
     pipeline: std::sync::Arc<Device>,
     cfg: FisheyeExportConfig,
@@ -1230,6 +1283,11 @@ pub fn export_eac(
         per_eye.len(),
     );
 
+    // Per-eye ".360 Lens calibration" Override → shader re-dewarp params
+    // (disabled sentinels when Override is off). Resolved once, used by
+    // whichever export route engages below.
+    let (lens_l, lens_r) = resolve_eac_lens_pair(&cfg);
+
     // ── Fast path: zero-copy EAC → VT (macOS) ─────────────────────
     // Same architecture as the OSV zero-copy export: VT-decoded P010
     // IOSurfaces wrapped as wgpu textures → GPU cross assembly → GPU
@@ -1246,7 +1304,7 @@ pub fn export_eac(
         );
         if on_vt {
             return export_eac_zerocopy_vt(
-                pipeline, cfg, per_eye, &mut progress_cb, cancel,
+                pipeline, cfg, per_eye, (lens_l, lens_r), &mut progress_cb, cancel,
             );
         }
     }
@@ -1281,6 +1339,7 @@ pub fn export_eac(
                     tracing::info!("export_eac: GPU-RESIDENT NVENC(CUDA) path ENGAGED");
                     match export_eac_gpu_resident(
                         Arc::clone(&pipeline), cfg.clone(), per_eye.clone(),
+                        (lens_l, lens_r),
                         ctx, iter, &mut progress_cb, Arc::clone(&cancel),
                     ) {
                         Ok(()) => return Ok(()),
@@ -1371,14 +1430,14 @@ pub fn export_eac(
         let (left, right) = if matches!(cfg.projection, FisheyeExportProjection::Fisheye) {
             // Upload the RGB8 crosses once, then fisheye-project both eyes.
             (pipeline.project_cross_to_fisheye_texture(
-                &cross_b, cross_w, cfg.eye_w, cfg.eye_h, rl, sl)?,
+                &cross_b, cross_w, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
              pipeline.project_cross_to_fisheye_texture(
-                &cross_a, cross_w, cfg.eye_w, cfg.eye_h, rr, sr)?)
+                &cross_a, cross_w, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?)
         } else {
             (pipeline.project_cross_to_equirect_texture(
-                &cross_b, cross_w, cfg.eye_w, cfg.eye_h, rl, sl)?,
+                &cross_b, cross_w, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
              pipeline.project_cross_to_equirect_texture(
-                &cross_a, cross_w, cfg.eye_w, cfg.eye_h, rr, sr)?)
+                &cross_a, cross_w, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?)
         };
         let sbs = pipeline.compose_sbs_textures(&left, &right, cfg.eye_w, cfg.eye_h)?;
         let rgb = pipeline.read_texture_rgb8(&sbs, sbs_w, sbs_h)?;
@@ -1440,6 +1499,7 @@ fn export_eac_zerocopy_vt(
     pipeline: std::sync::Arc<Device>,
     cfg: FisheyeExportConfig,
     per_eye: Vec<EacPerEyeFrame>,
+    (lens_l, lens_r): (crate::gpu::EacLensAdjust, crate::gpu::EacLensAdjust),
     progress_cb: &mut dyn FnMut(ExportProgress),
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
@@ -1488,7 +1548,7 @@ fn export_eac_zerocopy_vt(
     };
     tracing::info!(
         "export_eac (zc): VT zero-copy ENGAGED — {} ({}x{}, trim {}..{})",
-        if is_prores_vt { "ProRes-VT P010" } else if ten_bit { "HEVC Main10 P010" } else { "HEVC Main BGRA" },
+        if is_prores_vt { "ProRes-VT P210 (4:2:2)" } else if ten_bit { "HEVC Main10 P010" } else { "HEVC Main BGRA" },
         sbs_w, sbs_h, trim_in_frame,
         trim_out_frame.map(|f| f.to_string()).unwrap_or_else(|| "end".into()),
     );
@@ -1556,32 +1616,43 @@ fn export_eac_zerocopy_vt(
         let fisheye_out = matches!(cfg.projection, FisheyeExportProjection::Fisheye);
         let (left, right) = match (ten_bit, fisheye_out) {
             (true, false) => (
-                pipeline.project_cross_texture_to_equirect_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl)?,
-                pipeline.project_cross_texture_to_equirect_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr)?),
+                pipeline.project_cross_texture_to_equirect_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
+                pipeline.project_cross_texture_to_equirect_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?),
             (false, false) => (
-                pipeline.project_cross_texture_to_equirect_texture(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl)?,
-                pipeline.project_cross_texture_to_equirect_texture(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr)?),
+                pipeline.project_cross_texture_to_equirect_texture(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
+                pipeline.project_cross_texture_to_equirect_texture(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?),
             (true, true) => (
-                pipeline.project_cross_texture_to_fisheye_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl)?,
-                pipeline.project_cross_texture_to_fisheye_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr)?),
+                pipeline.project_cross_texture_to_fisheye_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
+                pipeline.project_cross_texture_to_fisheye_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?),
             (false, true) => (
-                pipeline.project_cross_texture_to_fisheye_texture(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl)?,
-                pipeline.project_cross_texture_to_fisheye_texture(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr)?),
+                pipeline.project_cross_texture_to_fisheye_texture(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
+                pipeline.project_cross_texture_to_fisheye_texture(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?),
         };
 
         if ten_bit {
             // Per-eye color (no-op when the plan is identity), then
-            // compose into the P010 encode IOSurface.
+            // compose into the encode IOSurface — P210 (true 4:2:2) for
+            // ProRes, P010 for HEVC Main10.
             let left_g = pipeline.apply_color_stack_per_eye_16(
                 &left, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true))?;
             let right_g = pipeline.apply_color_stack_per_eye_16(
                 &right, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false))?;
             let l_final = left_g.as_ref().unwrap_or(&left);
             let r_final = right_g.as_ref().unwrap_or(&right);
-            let encode_pb = crate::interop_macos::create_p010_encode_buffer(
-                &pipeline.device, sbs_w, sbs_h)?;
-            pipeline.compose_sbs_to_p010(
-                l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
+            let encode_pb = if is_prores_vt {
+                crate::interop_macos::create_p210_encode_buffer(
+                    &pipeline.device, sbs_w, sbs_h)?
+            } else {
+                crate::interop_macos::create_p010_encode_buffer(
+                    &pipeline.device, sbs_w, sbs_h)?
+            };
+            if is_prores_vt {
+                pipeline.compose_sbs_to_p210(
+                    l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
+            } else {
+                pipeline.compose_sbs_to_p010(
+                    l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
+            }
             encoder.encode_pixel_buffer_p010(&encode_pb)?;
         } else {
             // Color stack fused into the BGRA compose.
@@ -1640,6 +1711,7 @@ fn export_eac_gpu_resident(
     pipeline: Arc<Device>,
     cfg: FisheyeExportConfig,
     per_eye: Vec<EacPerEyeFrame>,
+    (lens_l, lens_r): (crate::gpu::EacLensAdjust, crate::gpu::EacLensAdjust),
     ctx: crate::interop_windows::VulkanImportCtx,
     iter: crate::fisheye_decode::SegmentedD3d11SharedStreamPairIter,
     progress_cb: &mut impl FnMut(ExportProgress),
@@ -1758,11 +1830,11 @@ fn export_eac_gpu_resident(
         let cross_b = pipeline.rgba16_to_eac_cross(&s0_tex, &s4_tex, Lens::B, dims)?;
 
         let (left16, right16) = if fisheye_out {
-            (pipeline.project_cross_texture_to_fisheye_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl)?,
-             pipeline.project_cross_texture_to_fisheye_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr)?)
+            (pipeline.project_cross_texture_to_fisheye_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
+             pipeline.project_cross_texture_to_fisheye_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?)
         } else {
-            (pipeline.project_cross_texture_to_equirect_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl)?,
-             pipeline.project_cross_texture_to_equirect_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr)?)
+            (pipeline.project_cross_texture_to_equirect_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
+             pipeline.project_cross_texture_to_equirect_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?)
         };
         let left_g = pipeline.apply_color_stack_per_eye_16(&left16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true))?;
         let right_g = pipeline.apply_color_stack_per_eye_16(&right16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false))?;
@@ -1995,7 +2067,7 @@ fn export_fisheye_osv_zerocopy_p010(
     tracing::info!(
         "fisheye_export (zero-copy): P010 IOSurface decode → {} encode, \
          no CPU bounce on the decode side; per-row RS = {}",
-        if is_prores { "P010 IOSurface → ProRes-VT (HW)" }
+        if is_prores { "P210 IOSurface (4:2:2) → ProRes-VT (HW)" }
         else if cfg.bit_depth == 10 { "P010 IOSurface (Main10)" }
         else { "BGRA IOSurface (Main, 8-bit)" },
         if rs_enabled { format!("on (readout {:.1}ms)", readout_s * 1000.0) }
@@ -2125,16 +2197,25 @@ fn export_fisheye_osv_zerocopy_p010(
         let r_final = right_g.as_ref().unwrap_or(&right_eq);
 
         // Compose the (already-graded, 16-bit) eyes into the encode
-        // IOSurface and hand off to VT. 10-bit → P010 (YCbCr planes);
-        // 8-bit → BGRA, composed with an IDENTITY plan (no re-grade — the
-        // 16→8 downconvert happens in the compose), then Main encode.
+        // IOSurface and hand off to VT. ProRes → P210 (true 4:2:2);
+        // 10-bit HEVC → P010; 8-bit → BGRA, composed with an IDENTITY
+        // plan (no re-grade — the 16→8 downconvert happens in the
+        // compose), then Main encode.
         if ten_bit {
-            let encode_pb = crate::interop_macos::create_p010_encode_buffer(
-                &pipeline.device, sbs_w, sbs_h,
-            )?;
-            pipeline.compose_sbs_to_p010(
-                l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h,
-            )?;
+            let encode_pb = if is_prores {
+                crate::interop_macos::create_p210_encode_buffer(
+                    &pipeline.device, sbs_w, sbs_h)?
+            } else {
+                crate::interop_macos::create_p010_encode_buffer(
+                    &pipeline.device, sbs_w, sbs_h)?
+            };
+            if is_prores {
+                pipeline.compose_sbs_to_p210(
+                    l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
+            } else {
+                pipeline.compose_sbs_to_p010(
+                    l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
+            }
             encoder.encode_pixel_buffer_p010(&encode_pb)?;
         } else {
             let encode_pb = crate::interop_macos::create_bgra_encode_buffer(

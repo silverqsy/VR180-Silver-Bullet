@@ -218,19 +218,21 @@ pub struct App {
 enum ExportCodec { H265, ProRes }
 
 /// Output resolution target for the export. `Native` renders at the
-/// source's per-eye dimensions (OSV: 3840² per eye → 7680×3840 SBS).
-/// `R8k` renders the PROJECTION at 4096² per eye → 8192×4096 SBS —
-/// the projection kernel samples the native-res source directly into
-/// the 4096 grid (one resample, end-to-end at output res; sharpen /
-/// color / encode all run at 4096), NOT a finished-frame upscale.
+/// source's per-eye dimensions — labeled by the OSV case (3840² per eye
+/// → 7680×3840 SBS); a `.360` source actually renders its cross-native
+/// 3936² → 7872×3936. `R8k` (the default) renders the PROJECTION at
+/// 4096² per eye → 8192×4096 SBS — the projection kernel samples the
+/// native-res source directly into the 4096 grid (one resample,
+/// end-to-end at output res; sharpen / color / encode all run at 4096),
+/// NOT a finished-frame upscale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportResolution { Native, R8k }
 
 impl ExportResolution {
     fn label(self) -> &'static str {
         match self {
-            ExportResolution::Native => "Native (source)",
-            ExportResolution::R8k    => "8192 × 4096 (8K)",
+            ExportResolution::Native => "7680 × 3840",
+            ExportResolution::R8k    => "8192 × 4096",
         }
     }
 }
@@ -297,7 +299,7 @@ impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             codec: ExportCodec::H265,
-            resolution: ExportResolution::Native,
+            resolution: ExportResolution::R8k,
             h265_bitrate_mbps: 200,
             h265_bit_depth: 10,
             h265_hardware: true,
@@ -684,6 +686,11 @@ struct ClipInfo {
     /// "max recommended" hint based on the working resolution.
     fisheye_eye_w: u32,
     fisheye_eye_h: u32,
+    /// GoPro `.360` GEOC calibration dimension (square sensor cal space,
+    /// 4216 for GoPro Max). `None` for non-EAC sources or when the file
+    /// has no GEOC. The ".360 Lens calibration" panel displays cx/cy in
+    /// this pixel space (matching CTRX/CTRY units).
+    eac_cal_dim: Option<u32>,
 }
 
 /// An async clip load in flight (see `App::load_pending`). The worker
@@ -719,6 +726,7 @@ struct LoadedMeta {
     detected_rs_mode: crate::decoder::RsMode,
     fisheye_eye_w: u32,
     fisheye_eye_h: u32,
+    eac_cal_dim: Option<u32>,
 }
 
 impl App {
@@ -1369,6 +1377,9 @@ impl App {
         let Some(path) = self.batch.get(idx).map(|b| b.path.clone()) else { return; };
         self.sync_active_clip_settings();
         self.settings = self.batch[idx].settings.clone();
+        tracing::info!("RESEED-DBG select_clip {idx}: restored cx_l={:.4} cy_l={:.4} fov_l={:.2} ov_l={}",
+            self.settings.fisheye_cx_norm_left, self.settings.fisheye_cy_norm_left,
+            self.settings.fisheye_fov_deg_left, self.settings.fisheye_override_left);
         self.active_clip = Some(idx);
         // The restored settings may carry hand-tuned Override values for
         // THIS clip — don't let the auto-reseed overwrite them when the
@@ -2260,12 +2271,23 @@ impl App {
         // per-frame quats in the background (see `load_dji_imu_progressive`), so
         // the load worker stays fast and the giant metadata read never blocks.
 
+        // GoPro `.360`: GEOC cal dimension for the ".360 Lens calibration"
+        // panel's cx/cy pixel space (cheap 1 MiB file-tail read, off the UI
+        // thread here). The decoder re-parses GEOC itself for the warp.
+        let eac_cal_dim = if source_kind == vr180_pipeline::SourceKind::GoProEac {
+            vr180_core::geoc::parse_geoc(segments.first().unwrap_or(&path))
+                .ok().flatten().map(|g| g.cal_dim)
+        } else {
+            None
+        };
+
         Ok(LoadedMeta {
             token, path, preserve_clip_settings, source_kind,
             width: probe.width, height: probe.height, fps: probe.fps,
             duration_sec, frame_count, segments,
             cori_count, grav_count, srot_ms,
             detected_rs_mode, fisheye_eye_w, fisheye_eye_h,
+            eac_cal_dim,
         })
     }
 
@@ -2275,6 +2297,23 @@ impl App {
     /// and its audio open don't block.
     fn finish_load(&mut self, meta: LoadedMeta) {
         let source_kind = meta.source_kind;
+        // One-time stale-Override guard for `.360` (see the field docs on
+        // `Settings::eac_lens_sanitized`): settings lineages from before the
+        // ".360 Lens calibration" feature may carry dead Override values —
+        // clear them so the lens warp stays a no-op until deliberately
+        // enabled. The kind-map loader sanitizes the stored template; this
+        // catches any other path by which old settings go live for an EAC
+        // clip (e.g. the legacy single settings.json at startup).
+        if source_kind == vr180_pipeline::SourceKind::GoProEac
+            && !self.settings.eac_lens_sanitized
+        {
+            if self.settings.fisheye_override_left || self.settings.fisheye_override_right {
+                tracing::info!("finish_load: clearing stale pre-feature .360 lens Override");
+            }
+            self.settings.fisheye_override_left = false;
+            self.settings.fisheye_override_right = false;
+            self.settings.eac_lens_sanitized = true;
+        }
         // Per-camera default preset — only when none is set yet, so a
         // remembered/explicit choice is preserved.
         if source_kind != vr180_pipeline::SourceKind::GoProEac
@@ -2336,6 +2375,7 @@ impl App {
             srot_ms: meta.srot_ms,
             source_kind,
             fisheye_eye_w: meta.fisheye_eye_w, fisheye_eye_h: meta.fisheye_eye_h,
+            eac_cal_dim: meta.eac_cal_dim,
         });
         self.loaded_path = Some(meta.path);
 
@@ -2682,6 +2722,10 @@ impl App {
         }
         self.fisheye_last_seeded = detected;
         let Some(d) = detected else { return; }; // cleared mid-load → wait for next
+        tracing::info!("RESEED-DBG: detected changed; suppress={} ov_l={} cx_l {:.4}->{:.4} fov_l {:.2}->{:.2}",
+            self.suppress_reseed_once, self.settings.fisheye_override_left,
+            self.settings.fisheye_cx_norm_left, d.left.cx_norm,
+            self.settings.fisheye_fov_deg_left, d.left.fov_deg);
         // Clip-list restore in flight: the settings carry hand-tuned
         // per-clip Override values — keep them instead of re-seeding
         // from the file. One-shot (the next clip change reseeds again).
@@ -3275,6 +3319,16 @@ impl eframe::App for App {
                     )
                     .default_open(true)
                     .show(ui, |ui| { self.draw_view_adjust_panel(ui); });
+
+                    // Per-eye lens Override (FOV / center / KB) — the .360
+                    // re-dewarp analog of the OSV Fisheye-lens panel, seeded
+                    // from the file's GEOC factory calibration.
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new(tr("Lens calibration")).strong()
+                    )
+                    .default_open(false)
+                    .show(ui, |ui| { self.draw_eac_lens_panel(ui); });
 
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new(
@@ -4197,6 +4251,68 @@ impl App {
             // mirrors the eye positions). Toggling reloads the clip.
             ui.checkbox(&mut s.camera_upside_down, tr("Upside-down mount (180°)"));
         }
+    }
+
+    /// ".360 Lens calibration" panel — the GoPro-EAC analog of the OSV
+    /// Fisheye-lens panel. Reuses `draw_eye_lens` (same Override fields,
+    /// independent per source kind), seeded from the file's GEOC factory
+    /// calibration (published by the decoder as `detected_calib`). The
+    /// values drive a re-dewarp warp in the EAC projection: with Override
+    /// off (or seeded values untouched) the output is unchanged; moving
+    /// FOV / cx / cy / k re-maps the geometry as if the firmware had
+    /// dewarped with those lens parameters. cx/cy are edited in the GEOC
+    /// cal-pixel space (4216² on the GoPro Max — CTRX/CTRY units).
+    fn draw_eac_lens_panel(&mut self, ui: &mut egui::Ui) {
+        let cal_dim = self.clip.as_ref()
+            .and_then(|c| c.eac_cal_dim)
+            .unwrap_or(4216) as f32;
+        let detected = self.control.as_ref()
+            .and_then(|c| *c.detected_calib.lock());
+        let zoom = self.preview_zoom;
+        if detected.is_none() {
+            ui.label(RichText::new(tr(
+                "No GEOC factory calibration found in this file — \
+                 lens Override unavailable."
+            )).small().color(Color32::GRAY));
+            return;
+        }
+        let s = &mut self.settings;
+
+        ui.add_space(4.0);
+        draw_eye_lens(
+            ui, "L", "Left eye", cal_dim, cal_dim, zoom,
+            detected.map(|d| d.left),
+            &mut s.fisheye_override_left,
+            &mut s.fisheye_fov_deg_left,
+            &mut s.fisheye_cx_norm_left,
+            &mut s.fisheye_cy_norm_left,
+            &mut s.fisheye_k_left,
+            &mut s.fisheye_k5_left, &mut s.fisheye_p_left,
+            false, // not OSV: no k5 / tangential controls
+            180.0, [0.0; 4],
+        );
+        ui.separator();
+        draw_eye_lens(
+            ui, "R", "Right eye", cal_dim, cal_dim, zoom,
+            detected.map(|d| d.right),
+            &mut s.fisheye_override_right,
+            &mut s.fisheye_fov_deg_right,
+            &mut s.fisheye_cx_norm_right,
+            &mut s.fisheye_cy_norm_right,
+            &mut s.fisheye_k_right,
+            &mut s.fisheye_k5_right, &mut s.fisheye_p_right,
+            false,
+            180.0, [0.0; 4],
+        );
+
+        ui.add_space(6.0);
+        ui.label(RichText::new(tr(
+            "With Override off, each eye uses the camera's factory (GEOC) \
+             calibration as-is. Turn Override on to re-map an eye's FOV, \
+             center and distortion — for units whose lenses don't quite \
+             match the factory model. Values are in the sensor calibration \
+             space (cx/cy in cal pixels)."
+        )).small().color(Color32::GRAY));
     }
 
     /// Per-eye lens calibration panel (camera preset + per-eye FOV /

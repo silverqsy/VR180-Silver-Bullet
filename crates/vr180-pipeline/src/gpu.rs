@@ -152,6 +152,9 @@ pub struct Device {
     compose_preview: ComposeSbsPipeline,
     compose_sbs_p010_y:  P010ComposePipeline,
     compose_sbs_p010_uv: P010ComposePipeline,
+    /// 4:2:2 UV variant (full vertical chroma) for the ProRes-VT P210
+    /// encode feed. Shares the Y pipeline with P010.
+    compose_sbs_p210_uv: P010ComposePipeline,
     bilinear_sampler: wgpu::Sampler,
 
     /// Per-slot recycling for `project_fisheye_to_equirect_rs_texture`.
@@ -412,6 +415,9 @@ impl Device {
         let compose_sbs_p010_uv = P010ComposePipeline::create(
             &device, "p010_uv", COMPOSE_SBS_P010_UV_WGSL,
             wgpu::TextureFormat::Rg16Unorm);
+        let compose_sbs_p210_uv = P010ComposePipeline::create(
+            &device, "p210_uv", COMPOSE_SBS_P210_UV_WGSL,
+            wgpu::TextureFormat::Rg16Unorm);
         let bilinear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("bilinear"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -442,7 +448,7 @@ impl Device {
             gaussian_blur_16, sharpen_combine_16,
             mid_detail_combine_16, downsample_4x_16,
             compose_sbs, compose_preview,
-            compose_sbs_p010_y, compose_sbs_p010_uv,
+            compose_sbs_p010_y, compose_sbs_p010_uv, compose_sbs_p210_uv,
             bilinear_sampler,
             proj_fisheye_rs_cache: Mutex::new(HashMap::new()),
             proj_fisheye_cache: Mutex::new(HashMap::new()),
@@ -609,6 +615,10 @@ impl Device {
             &EquirectUniforms::from_mat3(rotation.0));
         let rs_uniform = self.write_uniform("equirect_RS",
             &RsUniforms::from_params(rs));
+        // Legacy CPU-in/CPU-out path (probe-eac debug CLI) — no lens
+        // Override support; always bind the disabled sentinel.
+        let lens_uniform = self.write_uniform("equirect_LENS",
+            &EacLensUniforms::from_params(&EacLensAdjust::DISABLED));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("eac_to_equirect_bg"),
             layout: &self.eac_to_equirect.bind_group_layout,
@@ -618,6 +628,7 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&output_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: rs_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: lens_uniform.as_entire_binding() },
             ],
         });
         let pipeline = &self.eac_to_equirect.pipeline;
@@ -944,6 +955,20 @@ impl EacToEquirectPipeline {
                         has_dynamic_offset: false,
                         min_binding_size: std::num::NonZeroU64::new(
                             std::mem::size_of::<RsUniforms>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+                // Per-eye lens re-dewarp uniforms (16 × f32; ".360 Lens
+                // calibration" Override — enabled=0 is a pass-through).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<EacLensUniforms>() as u64
                         ),
                     },
                     count: None,
@@ -1818,6 +1843,101 @@ impl EquirectRsParams {
     };
 }
 
+/// Per-eye lens re-dewarp adjustment for EAC (.360) sources — the ".360
+/// Lens calibration" Override. The camera firmware dewarps the raw fisheye
+/// into the EAC cross with its factory model (GEOC KLNS + CTRX/CTRY, in
+/// `cal_dim`-pixel space). When the user overrides the lens, the EAC
+/// shaders re-map each sampled ray: forward through the USER model, then
+/// invert the FACTORY model (Newton) — "where did the firmware store the
+/// ray this pixel would have come from, if the true lens is the user's?".
+/// User == factory (the seeded values) → identity warp; `enabled = false`
+/// skips the shader block entirely (bit-identical to pre-feature output).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct EacLensAdjust {
+    pub enabled: bool,
+    /// USER model: focal (cal px), principal point (cal px), KB k1–k4
+    /// (dimensionless; `r = fx·θ·(1 + k1θ² + k2θ⁴ + k3θ⁶ + k4θ⁸)`).
+    pub fx_u: f32,
+    pub cx_u: f32,
+    pub cy_u: f32,
+    pub k_u: [f32; 4],
+    /// FACTORY model (GEOC), same layout/space.
+    pub fx_n: f32,
+    pub cx_n: f32,
+    pub cy_n: f32,
+    pub k_n: [f32; 4],
+}
+
+impl EacLensAdjust {
+    /// No adjustment — the shader skips the warp entirely.
+    pub const DISABLED: Self = Self {
+        enabled: false,
+        fx_u: 1.0, cx_u: 0.0, cy_u: 0.0, k_u: [0.0; 4],
+        fx_n: 1.0, cx_n: 0.0, cy_n: 0.0, k_n: [0.0; 4],
+    };
+
+    /// Build from the GEOC factory calibration (`klns` c0..c4 in cal-space
+    /// pixels with fx folded into c0; `ctrx`/`ctry` = center offsets from
+    /// the cal-space center; `cal_dim` = square cal dimension, 4216 for
+    /// GoPro Max) + the user's Override values in the app's conventions:
+    /// equidistant fov↔fx with `cal_dim` as the image width, cx/cy
+    /// normalized to [0,1] of `cal_dim`, dimensionless KB k1–k4 (all-zero
+    /// → factory k). Seeding the user values from the factory model (the
+    /// panel's detected seed) therefore yields an identity warp.
+    pub fn from_geoc_override(
+        klns: [f64; 5], ctrx: f32, ctry: f32, cal_dim: f32,
+        fov_deg: f32, cx_norm: f32, cy_norm: f32, k: [f32; 4],
+    ) -> Self {
+        let c0 = klns[0] as f32;
+        if !(c0 > 1e-3) || !(cal_dim > 1.0) {
+            return Self::DISABLED; // degenerate GEOC — refuse to warp
+        }
+        let k_n = [
+            (klns[1] as f32) / c0,
+            (klns[2] as f32) / c0,
+            (klns[3] as f32) / c0,
+            (klns[4] as f32) / c0,
+        ];
+        let half = fov_deg.max(1.0).to_radians() * 0.5;
+        let fx_u = cal_dim / (2.0 * half);
+        let k_u = if k.iter().any(|c| c.abs() > 1e-9) { k } else { k_n };
+        Self {
+            enabled: true,
+            fx_u,
+            cx_u: cx_norm * cal_dim,
+            cy_u: cy_norm * cal_dim,
+            k_u,
+            fx_n: c0,
+            cx_n: cal_dim * 0.5 + ctrx,
+            cy_n: cal_dim * 0.5 + ctry,
+            k_n,
+        }
+    }
+}
+
+/// std140 layout matching the WGSL `LensUniforms` in
+/// `eac_to_equirect.wgsl` / `eac_to_fisheye.wgsl` (16 × f32 = 64 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct EacLensUniforms {
+    fx_u: f32, cx_u: f32, cy_u: f32, enabled: f32,
+    ku1: f32, ku2: f32, ku3: f32, ku4: f32,
+    fx_n: f32, cx_n: f32, cy_n: f32, _pad0: f32,
+    kn1: f32, kn2: f32, kn3: f32, kn4: f32,
+}
+
+impl EacLensUniforms {
+    fn from_params(l: &EacLensAdjust) -> Self {
+        Self {
+            fx_u: l.fx_u, cx_u: l.cx_u, cy_u: l.cy_u,
+            enabled: if l.enabled { 1.0 } else { 0.0 },
+            ku1: l.k_u[0], ku2: l.k_u[1], ku3: l.k_u[2], ku4: l.k_u[3],
+            fx_n: l.fx_n, cx_n: l.cx_n, cy_n: l.cy_n, _pad0: 0.0,
+            kn1: l.k_n[0], kn2: l.k_n[1], kn3: l.k_n[2], kn4: l.k_n[3],
+        }
+    }
+}
+
 // ── Fisheye → half-equirect uniforms ───────────────────────────────
 
 /// std140 layout for the fisheye→equirect shader's calibration uniform.
@@ -1985,6 +2105,7 @@ const DOWNSAMPLE_4X_WGSL: &str = include_str!("shaders/downsample_4x.wgsl");
 const COMPOSE_SBS_BGRA_WGSL: &str = include_str!("shaders/compose_sbs_bgra.wgsl");
 const COMPOSE_SBS_P010_Y_WGSL:  &str = include_str!("shaders/compose_sbs_p010_y.wgsl");
 const COMPOSE_SBS_P010_UV_WGSL: &str = include_str!("shaders/compose_sbs_p010_uv.wgsl");
+const COMPOSE_SBS_P210_UV_WGSL: &str = include_str!("shaders/compose_sbs_p210_uv.wgsl");
 const COMPOSE_PREVIEW_WGSL: &str = include_str!("shaders/compose_preview.wgsl");
 
 #[repr(C)]
@@ -3299,6 +3420,10 @@ impl Device {
             &EquirectUniforms::from_mat3(rotation.0));
         let rs_uniform = self.write_uniform("equirect_RS_zc",
             &RsUniforms::from_params(rs));
+        // Readback variant (no live callers) — no lens Override support;
+        // bind the disabled sentinel to satisfy the layout.
+        let lens_uniform = self.write_uniform("equirect_LENS_zc",
+            &EacLensUniforms::from_params(&EacLensAdjust::DISABLED));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("eac_to_equirect_zc_bg"),
             layout: &self.eac_to_equirect.bind_group_layout,
@@ -3308,6 +3433,7 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&output_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: rs_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: lens_uniform.as_entire_binding() },
             ],
         });
 
@@ -3969,6 +4095,7 @@ impl Device {
         out_w: u32, out_h: u32,
         rotation: EquirectRotation,
         rs: EquirectRsParams,
+        lens: &EacLensAdjust,
     ) -> Result<wgpu::Texture> {
         let output_tex = make_rw_texture(&self.device, "equirect_tex_out", out_w, out_h,
             wgpu::TextureUsages::TEXTURE_BINDING
@@ -3977,7 +4104,7 @@ impl Device {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("project_tex_enc"),
         });
-        self.record_equirect_project(&mut encoder, cross_tex, &output_tex, out_w, out_h, rotation, rs);
+        self.record_equirect_project(&mut encoder, cross_tex, &output_tex, out_w, out_h, rotation, rs, lens);
         self.queue.submit(Some(encoder.finish()));
         Ok(output_tex)
     }
@@ -3989,6 +4116,7 @@ impl Device {
         out_w: u32, out_h: u32,
         rotation: EquirectRotation,
         rs: EquirectRsParams,
+        lens: &EacLensAdjust,
     ) -> Result<wgpu::Texture> {
         let output_tex = make_rw_texture(&self.device, "eac_fisheye_out", out_w, out_h,
             wgpu::TextureUsages::TEXTURE_BINDING
@@ -3999,7 +4127,7 @@ impl Device {
         });
         self.record_equirect_project_with(
             &mut encoder, &self.eac_to_fisheye,
-            cross_tex, &output_tex, out_w, out_h, rotation, rs);
+            cross_tex, &output_tex, out_w, out_h, rotation, rs, lens);
         self.queue.submit(Some(encoder.finish()));
         Ok(output_tex)
     }
@@ -4011,6 +4139,7 @@ impl Device {
         out_w: u32, out_h: u32,
         rotation: EquirectRotation,
         rs: EquirectRsParams,
+        lens: &EacLensAdjust,
     ) -> Result<wgpu::Texture> {
         let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("eac_fisheye_out_16"),
@@ -4028,7 +4157,7 @@ impl Device {
         });
         self.record_equirect_project_with(
             &mut encoder, &self.eac_to_fisheye_16,
-            cross_tex, &output_tex, out_w, out_h, rotation, rs);
+            cross_tex, &output_tex, out_w, out_h, rotation, rs, lens);
         self.queue.submit(Some(encoder.finish()));
         Ok(output_tex)
     }
@@ -4042,6 +4171,7 @@ impl Device {
         out_w: u32, out_h: u32,
         rotation: EquirectRotation,
         rs: EquirectRsParams,
+        lens: &EacLensAdjust,
     ) -> Result<wgpu::Texture> {
         let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("equirect_tex_out_16"),
@@ -4059,7 +4189,7 @@ impl Device {
         });
         self.record_equirect_project_with(
             &mut encoder, &self.eac_to_equirect_16,
-            cross_tex, &output_tex, out_w, out_h, rotation, rs);
+            cross_tex, &output_tex, out_w, out_h, rotation, rs, lens);
         self.queue.submit(Some(encoder.finish()));
         Ok(output_tex)
     }
@@ -4074,13 +4204,14 @@ impl Device {
         out_w: u32, out_h: u32,
         rotation: EquirectRotation,
         rs: EquirectRsParams,
+        lens: &EacLensAdjust,
     ) -> Result<wgpu::Texture> {
         let cross_rgba = rgb_to_rgba(cross_rgb, cross_w as usize, cross_w as usize);
         let cross_tex = make_rw_texture(&self.device, "cross_for_project",
             cross_w, cross_w,
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         self.upload_rgba(&cross_tex, &cross_rgba, cross_w, cross_w);
-        self.project_cross_texture_to_equirect_texture(&cross_tex, out_w, out_h, rotation, rs)
+        self.project_cross_texture_to_equirect_texture(&cross_tex, out_w, out_h, rotation, rs, lens)
     }
 
     /// CPU-input EAC cross → equidistant-fisheye output (fisheye-output
@@ -4092,13 +4223,14 @@ impl Device {
         out_w: u32, out_h: u32,
         rotation: EquirectRotation,
         rs: EquirectRsParams,
+        lens: &EacLensAdjust,
     ) -> Result<wgpu::Texture> {
         let cross_rgba = rgb_to_rgba(cross_rgb, cross_w as usize, cross_w as usize);
         let cross_tex = make_rw_texture(&self.device, "cross_for_project",
             cross_w, cross_w,
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         self.upload_rgba(&cross_tex, &cross_rgba, cross_w, cross_w);
-        self.project_cross_texture_to_fisheye_texture(&cross_tex, out_w, out_h, rotation, rs)
+        self.project_cross_texture_to_fisheye_texture(&cross_tex, out_w, out_h, rotation, rs, lens)
     }
 
     /// Apply the full Phase 0.7.5 color stack to one equirect texture,
@@ -4261,9 +4393,10 @@ impl Device {
         out_w: u32, out_h: u32,
         rotation: EquirectRotation,
         rs: EquirectRsParams,
+        lens: &EacLensAdjust,
     ) {
         self.record_equirect_project_with(
-            encoder, &self.eac_to_equirect, cross_tex, dst, out_w, out_h, rotation, rs)
+            encoder, &self.eac_to_equirect, cross_tex, dst, out_w, out_h, rotation, rs, lens)
     }
 
     fn record_equirect_project_with(
@@ -4275,6 +4408,7 @@ impl Device {
         out_w: u32, out_h: u32,
         rotation: EquirectRotation,
         rs: EquirectRsParams,
+        lens: &EacLensAdjust,
     ) {
         let cross_v = cross_tex.create_view(&Default::default());
         let dst_v = dst.create_view(&Default::default());
@@ -4282,6 +4416,8 @@ impl Device {
             &EquirectUniforms::from_mat3(rotation.0));
         let rs_uniform = self.write_uniform("equirect_RS_record",
             &RsUniforms::from_params(rs));
+        let lens_uniform = self.write_uniform("equirect_LENS_record",
+            &EacLensUniforms::from_params(lens));
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("equirect_project_bg"),
             layout: &pl.bind_group_layout,
@@ -4291,6 +4427,7 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_v) },
                 wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: rs_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: lens_uniform.as_entire_binding() },
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -5705,6 +5842,31 @@ impl Device {
         target: &crate::interop_macos::EncodePixelBufferP010,
         eye_w: u32, eye_h: u32,
     ) -> Result<()> {
+        // 4:2:0 — UV plane at (w/2, h/2).
+        self.compose_sbs_to_biplanar(left_16, right_16, target, eye_w, eye_h, false)
+    }
+
+    /// 4:2:2 variant: same Y plane, but the UV pass keeps FULL vertical
+    /// chroma resolution — for the ProRes-VT P210 encode feed (`target`
+    /// from `create_p210_encode_buffer`, UV plane `(w/2, h)`).
+    pub fn compose_sbs_to_p210(
+        &self,
+        left_16: &wgpu::Texture,
+        right_16: &wgpu::Texture,
+        target: &crate::interop_macos::EncodePixelBufferP010,
+        eye_w: u32, eye_h: u32,
+    ) -> Result<()> {
+        self.compose_sbs_to_biplanar(left_16, right_16, target, eye_w, eye_h, true)
+    }
+
+    fn compose_sbs_to_biplanar(
+        &self,
+        left_16: &wgpu::Texture,
+        right_16: &wgpu::Texture,
+        target: &crate::interop_macos::EncodePixelBufferP010,
+        eye_w: u32, eye_h: u32,
+        p210: bool,
+    ) -> Result<()> {
         let l_v = left_16.create_view(&Default::default());
         let r_v = right_16.create_view(&Default::default());
         let y_v = target.y_tex.create_view(&Default::default());
@@ -5737,11 +5899,14 @@ impl Device {
             pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
-        // UV plane pass (half SBS res — one thread per 2×2 source block).
+        // UV plane pass. P010: half res both axes (one thread per 2×2
+        // block). P210: half res horizontally only (one thread per 2×1
+        // pair — full vertical chroma for ProRes 4:2:2).
         {
+            let uv_pl = if p210 { &self.compose_sbs_p210_uv } else { &self.compose_sbs_p010_uv };
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("p010_uv_bg"),
-                layout: &self.compose_sbs_p010_uv.bind_group_layout,
+                layout: &uv_pl.bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&l_v) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r_v) },
@@ -5750,11 +5915,11 @@ impl Device {
                 ],
             });
             let uv_w = out_w / 2;
-            let uv_h = out_h / 2;
+            let uv_h = if p210 { out_h } else { out_h / 2 };
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("p010_uv_pass"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.compose_sbs_p010_uv.pipeline);
+            pass.set_pipeline(&uv_pl.pipeline);
             pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((uv_w + 7) / 8, (uv_h + 7) / 8, 1);
         }
