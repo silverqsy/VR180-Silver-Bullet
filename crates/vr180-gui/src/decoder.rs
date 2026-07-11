@@ -1257,10 +1257,12 @@ fn run_fisheye(
             );
             // Working res for the D3D11-side P010→RGBA16 downscale: ~1280
             // (matches the proven CPU working res), never below the preview eye.
-            // The iter clamps it to native.
+            // The iter clamps it to native. Merged recordings chain through
+            // the segmented iterator (previously the zero-copy preview opened
+            // only cfg.path — segment 0 — and froze past the first seam).
             let work = eye_w.max(eye_h).max(1280);
-            let iter = vr180_pipeline::fisheye_decode::D3d11SharedDualStreamIter::new(
-                &cfg.path, swap, work, work,
+            let iter = vr180_pipeline::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
+                &cfg.segments, swap, work, work,
             );
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
@@ -2156,7 +2158,7 @@ fn run_fisheye_zerocopy(
     eye_w: u32,
     eye_h: u32,
     ctx: vr180_pipeline::interop_windows::VulkanImportCtx,
-    iter: vr180_pipeline::fisheye_decode::D3d11SharedDualStreamIter,
+    iter: vr180_pipeline::fisheye_decode::SegmentedD3d11SharedDualStreamIter,
     frame_tx: Sender<DecodedFrame>,
     cmd_rx: Receiver<DecoderCommand>,
 ) -> anyhow::Result<()> {
@@ -2231,10 +2233,10 @@ fn run_fisheye_zerocopy(
         calib_left.fx, calib_left.cx, calib_left.cy, calib_right.fx, calib_right.cx, calib_right.cy
     );
 
-    let total_frames = vr180_pipeline::decode::probe_video(&cfg.path)
-        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
-        .unwrap_or(0)
-        .max(1);
+    // Whole-chain frame count (matches the CPU worker) — probing cfg.path
+    // alone covered only segment 0 of a merged recording, truncating the
+    // stab table to identity past the first seam.
+    let total_frames = segments_total_frames(&cfg.segments).max(1);
     let compute_stab = |osv: Option<&vr180_fisheye::DjiOsvImu>,
                         control: &DecoderControl| -> Option<Vec<EquirectRotation>> {
         let osv = osv?;

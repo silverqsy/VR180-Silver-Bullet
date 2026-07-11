@@ -509,10 +509,24 @@ fn fisheye_export_opener(
 fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
     if !matches!(cfg.source_kind, SourceKind::DjiOsv) { return None; }
     if let Some(arc) = &cfg.preloaded_imu {
-        // Reuse only if it covers what this export needs (full quats if stabilizing).
-        if !cfg.stabilize || !arc.frame_quats.is_empty() {
+        // Reuse only if it covers what this export needs: full quats when
+        // stabilizing, and for a merged chain, quats spanning ALL segments
+        // (the GUI's IMU cache is keyed by path only, so a lone-segment
+        // parse could otherwise be reused for a chain export → identity
+        // stab past the first seam). 90% tolerance absorbs probe rounding.
+        let covers_chain = cfg.segments.len() <= 1 || {
+            let total: f64 = cfg.segments.iter()
+                .map(|s| crate::decode::probe_video(s)
+                    .map(|p| p.duration_sec).unwrap_or(0.0))
+                .sum();
+            (arc.frame_quats.len() as f64) >= total * cfg.fps as f64 * 0.9
+        };
+        if !cfg.stabilize || (!arc.frame_quats.is_empty() && covers_chain) {
             return Some((**arc).clone());
         }
+        tracing::info!(
+            "resolve_export_imu: preloaded IMU doesn't cover the chain \
+             ({} quats) — re-reading segments", arc.frame_quats.len());
     }
     if !cfg.stabilize {
         let calib_src = cfg.segments.first().unwrap_or(&cfg.source_path);
@@ -616,7 +630,6 @@ pub fn export_fisheye(
             && matches!(cfg.encoder, EncoderBackend::HevcNvenc)
             && cfg.bit_depth == 10
             && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye)
-            && cfg.segments.len() <= 1 // merged recording → portable segmented loop
             && crate::interop_windows::is_vulkan_backend(&pipeline.device)
             && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010)
             && cfg.denoise_strength <= 0.0; // denoise needs CPU frames → portable path
@@ -625,8 +638,12 @@ pub fn export_fisheye(
             let ctx = crate::interop_windows::VulkanImportCtx::from_wgpu(
                 &pipeline.adapter, &pipeline.device,
             );
-            let iter = crate::fisheye_decode::D3d11SharedDualStreamIter::new(
-                &cfg.source_path, swap, u32::MAX, u32::MAX,
+            // Merged (auto-merge) recordings ride the same arm via the
+            // segment-chaining iterator — they used to be gated off onto
+            // the portable loop (~2 fps vs ~35 fps, the "hardware accel is
+            // slow" report).
+            let iter = crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
+                &cfg.segments, swap, u32::MAX, u32::MAX,
             );
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
@@ -679,7 +696,6 @@ pub fn export_fisheye(
                 | EncoderBackend::ProResKs)
             && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye)
             && (cfg.bit_depth == 10 || cfg.bit_depth == 8)
-            && cfg.segments.len() <= 1 // merged recording → portable segmented loop
             && crate::interop_windows::is_vulkan_backend(&pipeline.device)
             && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010)
             && cfg.denoise_strength <= 0.0; // denoise needs CPU frames → portable path
@@ -691,8 +707,9 @@ pub fn export_fisheye(
             );
             // u32::MAX work dims → the iter clamps to native, so the D3D11
             // P010→RGBA16 convert is 1:1 (full-res export, no quality loss).
-            let iter = crate::fisheye_decode::D3d11SharedDualStreamIter::new(
-                &cfg.source_path, swap, u32::MAX, u32::MAX,
+            // Merged recordings chain through the segmented iterator.
+            let iter = crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
+                &cfg.segments, swap, u32::MAX, u32::MAX,
             );
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
@@ -2288,7 +2305,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     pipeline: Arc<Device>,
     cfg: FisheyeExportConfig,
     ctx: crate::interop_windows::VulkanImportCtx,
-    mut iter: crate::fisheye_decode::D3d11SharedDualStreamIter,
+    mut iter: crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter,
     progress_cb: &mut impl FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -2304,10 +2321,21 @@ fn export_fisheye_osv_zerocopy_d3d11(
     let (calib_left, calib_right) =
         resolve_calib_pair(&cfg, src_w, src_h, dji_osv_imu.as_ref());
 
-    let total_clip_frames = crate::decode::probe_video(&cfg.source_path)
-        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
-        .unwrap_or(0)
-        .max(1);
+    // WHOLE-CHAIN frame count — a merged recording's stab table must cover
+    // every segment (probing source_path alone = segment 0 only, which
+    // truncated stab to identity past the first seam).
+    let total_clip_frames = if cfg.segments.len() > 1 {
+        cfg.segments.iter()
+            .map(|s| crate::decode::probe_video(s)
+                .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+                .unwrap_or(0))
+            .sum::<usize>()
+    } else {
+        crate::decode::probe_video(&cfg.source_path)
+            .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+            .unwrap_or(0)
+    }
+    .max(1);
     let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
         dji_osv_imu.as_ref().and_then(|osv| {
             let max_corr = if cfg.dji_max_corr_deg > 0.0 {
@@ -2673,8 +2701,13 @@ fn export_fisheye_osv_zerocopy_d3d11(
         Err(_) => return Err(Error::Ffmpeg("zc export: encode thread panicked".into())),
     }
 
-    finalize_with_audio(&cfg.source_path, &video_tmp, &cfg.output_path,
-        t_in, frame_idx as f64 * dt)?;
+    // Multi-segment: the audio source is an ffconcat playlist so a merged
+    // recording keeps its FULL audio (source_path alone = segment 0 only).
+    let (audio_src, audio_tmp) = eac_audio_source(&cfg);
+    let mux = finalize_with_audio(&audio_src, &video_tmp, &cfg.output_path,
+        t_in, frame_idx as f64 * dt);
+    if let Some(p) = &audio_tmp { std::fs::remove_file(p).ok(); }
+    mux?;
     finalize_metadata(
         &cfg.output_path,
         cfg.inject_youtube_vr180,
@@ -2708,7 +2741,7 @@ fn export_fisheye_osv_gpu_resident(
     pipeline: Arc<Device>,
     cfg: FisheyeExportConfig,
     ctx: crate::interop_windows::VulkanImportCtx,
-    mut iter: crate::fisheye_decode::D3d11SharedDualStreamIter,
+    mut iter: crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter,
     progress_cb: &mut impl FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -2731,10 +2764,21 @@ fn export_fisheye_osv_gpu_resident(
     let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = resolve_export_imu(&cfg);
     let (calib_left, calib_right) = resolve_calib_pair(&cfg, src_w, src_h, dji_osv_imu.as_ref());
 
-    let total_clip_frames = crate::decode::probe_video(&cfg.source_path)
-        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
-        .unwrap_or(0)
-        .max(1);
+    // WHOLE-CHAIN frame count — a merged recording's stab table must cover
+    // every segment (probing source_path alone = segment 0 only, which
+    // truncated stab to identity past the first seam).
+    let total_clip_frames = if cfg.segments.len() > 1 {
+        cfg.segments.iter()
+            .map(|s| crate::decode::probe_video(s)
+                .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+                .unwrap_or(0))
+            .sum::<usize>()
+    } else {
+        crate::decode::probe_video(&cfg.source_path)
+            .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+            .unwrap_or(0)
+    }
+    .max(1);
     let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
         dji_osv_imu.as_ref().and_then(|osv| {
             let max_corr = if cfg.dji_max_corr_deg > 0.0 { cfg.dji_max_corr_deg } else { f32::INFINITY };
@@ -2969,8 +3013,12 @@ fn export_fisheye_osv_gpu_resident(
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(Error::Ffmpeg("gpu-resident encode thread panicked".into())),
     }
-    finalize_with_audio(&cfg.source_path, &video_tmp, &cfg.output_path,
-        t_in, frame_idx as f64 * dt)?;
+    // Multi-segment: ffconcat playlist keeps a merged recording's FULL audio.
+    let (audio_src, audio_tmp) = eac_audio_source(&cfg);
+    let mux = finalize_with_audio(&audio_src, &video_tmp, &cfg.output_path,
+        t_in, frame_idx as f64 * dt);
+    if let Some(p) = &audio_tmp { std::fs::remove_file(p).ok(); }
+    mux?;
     finalize_metadata(&cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm)?;
     tracing::info!(
         "fisheye_export (GPU-resident): done, {} frames in {:.2?} ({:.1} fps)",

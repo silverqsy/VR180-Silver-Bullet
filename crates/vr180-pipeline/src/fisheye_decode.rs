@@ -1661,6 +1661,122 @@ impl SegmentedD3d11SharedStreamPairIter {
     }
 }
 
+/// Segment-chaining wrapper around [`D3d11SharedDualStreamIter`] — the OSV
+/// analog of [`SegmentedD3d11SharedStreamPairIter`]. A merged (auto-merge)
+/// DJI recording's `.osv` parts play as ONE continuous zero-copy stream:
+/// yielded pts are rebased onto the global clip timeline (so stab-by-pts,
+/// trim and the per-frame IMU index — `parse_multi` concatenates quats
+/// across segments — stay aligned across seams), EOF rolls over to the next
+/// segment transparently, and seek maps a global time to the owning
+/// segment. One entry behaves exactly like the plain iterator. Before this,
+/// merged recordings were gated OFF the Windows GPU-resident/zero-copy
+/// export arms (2 fps portable loop vs ~35 fps) and the zero-copy preview
+/// froze past segment 0.
+#[cfg(target_os = "windows")]
+pub struct SegmentedD3d11SharedDualStreamIter {
+    segments: Vec<std::path::PathBuf>,
+    seg_start_s: Vec<f64>,
+    total_dur_s: f64,
+    cur_idx: usize,
+    cur: D3d11SharedDualStreamIter,
+    // Re-open parameters for the next segment (same convert/downscale).
+    swap_eyes: bool,
+    work_w: u32,
+    work_h: u32,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for SegmentedD3d11SharedDualStreamIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentedD3d11SharedDualStreamIter")
+            .field("segments", &self.segments.len())
+            .field("cur_idx", &self.cur_idx)
+            .field("total_dur_s", &self.total_dur_s)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl SegmentedD3d11SharedDualStreamIter {
+    pub fn new(
+        segments: &[std::path::PathBuf],
+        swap_eyes: bool,
+        work_w: u32,
+        work_h: u32,
+    ) -> Result<Self> {
+        assert!(!segments.is_empty(), "segments must be non-empty");
+        let mut seg_start_s = Vec::with_capacity(segments.len());
+        let mut acc = 0.0_f64;
+        for seg in segments {
+            seg_start_s.push(acc);
+            acc += crate::decode::probe_video(seg).map(|p| p.duration_sec).unwrap_or(0.0);
+        }
+        let cur = D3d11SharedDualStreamIter::new(&segments[0], swap_eyes, work_w, work_h)?;
+        tracing::info!(
+            "SegmentedD3d11SharedDualStreamIter: {} segment(s), {:.1}s total",
+            segments.len(), acc,
+        );
+        Ok(Self {
+            segments: segments.to_vec(),
+            seg_start_s, total_dur_s: acc, cur_idx: 0, cur,
+            swap_eyes, work_w, work_h,
+        })
+    }
+
+    pub fn eye_dims(&self) -> (u32, u32) { self.cur.eye_dims() }
+    pub fn native_dims(&self) -> (u32, u32) { self.cur.native_dims() }
+    pub fn total_duration_s(&self) -> f64 { self.total_dur_s }
+
+    fn open_segment(&self, idx: usize) -> Result<D3d11SharedDualStreamIter> {
+        D3d11SharedDualStreamIter::new(
+            &self.segments[idx], self.swap_eyes, self.work_w, self.work_h)
+    }
+
+    /// PRECISE seek to a GLOBAL clip time: map to the owning segment + local
+    /// time, (re)open that segment, and precise-seek within it.
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        // If every per-segment probe failed (total 0), don't clamp the
+        // target to 0 — pass it through like the plain iterator would.
+        let t = if self.total_dur_s > 0.0 {
+            target_s.clamp(0.0, self.total_dur_s)
+        } else {
+            target_s.max(0.0)
+        };
+        let idx = self.seg_start_s.iter().rposition(|&s| s <= t).unwrap_or(0);
+        if idx != self.cur_idx {
+            self.cur = self.open_segment(idx)?;
+            self.cur_idx = idx;
+        }
+        self.cur.seek(t - self.seg_start_s[idx])
+    }
+
+    pub fn next_pair(&mut self) -> Result<Option<SharedFisheyePair>> {
+        loop {
+            if let Some(mut p) = self.cur.next_pair()? {
+                // Segment-local → global clip time.
+                p.pts_s += self.seg_start_s[self.cur_idx];
+                return Ok(Some(p));
+            }
+            if self.cur_idx + 1 >= self.segments.len() {
+                return Ok(None);
+            }
+            self.cur_idx += 1;
+            let expect = self.cur.native_dims();
+            self.cur = self.open_segment(self.cur_idx)?;
+            // Downstream textures/calib are sized off segment 0 — a chain
+            // with mismatched native dims would render garbage. Real DJI
+            // chains never differ; warn loudly if one somehow does (same
+            // stance as the macOS zero-copy iter's reopen).
+            if self.cur.native_dims() != expect {
+                tracing::warn!(
+                    "segmented OSV: segment {} native dims {:?} != {:?} — \
+                     output may be wrong",
+                    self.cur_idx, self.cur.native_dims(), expect);
+            }
+        }
+    }
+}
+
 // ── Zero-copy dual-stream (macOS only) ─────────────────────────────
 //
 // Mirrors the GoPro `ZeroCopyStreamPairIter` in decode.rs, but for the
