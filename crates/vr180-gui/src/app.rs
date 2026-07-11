@@ -564,6 +564,7 @@ fn tr(en: &'static str) -> &'static str {
         "Downloading…" => "下载中…",
         "Installing — the app will restart…" => "正在安装 — 应用即将重启…",
         "Check failed:" => "检查失败：",
+        "No update feed published yet." => "尚未发布更新源。",
         "Update failed:" => "更新失败：",
         // Fisheye output / stab / lens
         "Format" => "格式",
@@ -1385,7 +1386,13 @@ impl App {
                 E::CheckFailed(e) => {
                     tracing::warn!("updater: check failed: {e}");
                     if self.update_manual_check {
-                        self.update_status = Some(format!("{} {e}", tr("Check failed:")));
+                        // Missing feed = informational, not an error (no
+                        // release has shipped a latest.json yet).
+                        self.update_status = Some(if e == "no update feed published yet" {
+                            tr("No update feed published yet.").to_string()
+                        } else {
+                            format!("{} {e}", tr("Check failed:"))
+                        });
                         self.show_update_popover = true;
                     }
                 }
@@ -3437,8 +3444,44 @@ impl eframe::App for App {
             .exact_height(40.0)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new("▶ VR180 Silver Bullet 2.0")
-                        .strong().color(Color32::from_rgb(90, 166, 255)));
+                    // Brand + version, top-left — THE version display (shown
+                    // nowhere else; the window title carries no version).
+                    // Clickable: opens the update popover / checks for
+                    // updates. Gains an orange "⬆ vNEW" badge when a newer
+                    // version is known.
+                    let brand = format!(
+                        "▶ VR180 Silver Bullet  v{}", env!("CARGO_PKG_VERSION"));
+                    let brand_resp = ui.add(
+                        egui::Button::new(
+                            RichText::new(brand)
+                                .strong()
+                                .color(Color32::from_rgb(90, 166, 255)),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text(tr("Check for updates"));
+                    if let Some(info) = &self.update_available {
+                        ui.add_space(-4.0);
+                        if ui.add(
+                            egui::Button::new(
+                                RichText::new(format!("⬆ v{} {}", info.version, tr("update")))
+                                    .small()
+                                    .color(Color32::from_rgb(255, 190, 60)),
+                            )
+                            .frame(false),
+                        ).clicked() {
+                            self.show_update_popover = true;
+                        }
+                    }
+                    if brand_resp.clicked() {
+                        self.show_update_popover = true;
+                        if self.update_available.is_none() && !self.update_installing {
+                            self.update_manual_check = true;
+                            self.update_status = None;
+                            self.update_last_check = std::time::Instant::now();
+                            crate::updater::spawn_check(self.updater_tx.clone());
+                        }
+                    }
                     ui.separator();
                     if ui.button(tr("Load video…")).clicked() {
                         self.pick_and_load_file();
@@ -3498,42 +3541,8 @@ impl eframe::App for App {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Version label — always shows the INSTALLED
-                        // version (the window title no longer carries it);
-                        // clickable (opens the update popover / re-checks).
-                        // Gains a highlighted "⬆ vNEW" badge when a newer
-                        // version is known.
-                        let (ver_text, ver_color) = match &self.update_available {
-                            Some(info) => (
-                                format!(
-                                    "v{} ⬆ v{} {}",
-                                    env!("CARGO_PKG_VERSION"), info.version, tr("update")
-                                ),
-                                Color32::from_rgb(255, 190, 60),
-                            ),
-                            None => (
-                                format!("v{}", env!("CARGO_PKG_VERSION")),
-                                // Link-blue: signals "clickable" (check for
-                                // updates / release notes live here).
-                                Color32::from_rgb(110, 160, 255),
-                            ),
-                        };
-                        let ver_resp = ui.add(
-                            egui::Button::new(
-                                RichText::new(ver_text).small().color(ver_color),
-                            )
-                            .frame(false),
-                        )
-                        .on_hover_text(tr("Check for updates"));
-                        if ver_resp.clicked() {
-                            self.show_update_popover = true;
-                            if self.update_available.is_none() && !self.update_installing {
-                                self.update_manual_check = true;
-                                self.update_status = None;
-                                self.update_last_check = std::time::Instant::now();
-                                crate::updater::spawn_check(self.updater_tx.clone());
-                            }
-                        }
+                        // (Version lives ONLY in the top-left brand label,
+                        // which is the clickable updater entry point.)
 
                         // Export progress badge in the right corner —
                         // only when a job is in flight.

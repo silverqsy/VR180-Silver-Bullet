@@ -121,7 +121,17 @@ pub fn check(current_version: &str) -> Result<CheckOutcome, String> {
     let resp = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(20))
         .call()
-        .map_err(|e| format!("update check: {e}"))?;
+        .map_err(|e| match e {
+            // The stable /latest/download/ URL 404s when the NEWEST
+            // release carries no latest.json asset — expected until the
+            // first updater-era release ships. Keep the raw URL noise in
+            // the log; show the user something human.
+            ureq::Error::Status(404, _) => {
+                tracing::info!("updater: feed 404 — newest release has no latest.json");
+                "no update feed published yet".to_string()
+            }
+            e => format!("update check: {e}"),
+        })?;
     let manifest: Manifest = resp
         .into_json()
         .map_err(|e| format!("update manifest parse: {e}"))?;
