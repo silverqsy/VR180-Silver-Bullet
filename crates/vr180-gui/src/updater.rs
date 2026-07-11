@@ -101,9 +101,21 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 
 // ─── Check ───────────────────────────────────────────────────────────
 
-/// Fetch the feed and return a newer-version entry for this platform,
-/// or `None` when up to date (or the manifest lacks this platform).
-pub fn check(current_version: &str) -> Result<Option<UpdateInfo>, String> {
+/// What a feed check found.
+#[derive(Debug, Clone)]
+pub enum CheckOutcome {
+    /// A newer version is available for this platform.
+    UpdateAvailable(UpdateInfo),
+    /// Already on the newest release. `current_notes` carries the feed's
+    /// release notes when the feed version matches the RUNNING version
+    /// exactly — i.e. "what's new in the version you're on" — and is
+    /// empty otherwise (older feed, dev build ahead of the feed).
+    UpToDate { current_notes: String },
+}
+
+/// Fetch the feed and compare against the running version. See
+/// [`CheckOutcome`] for the two results.
+pub fn check(current_version: &str) -> Result<CheckOutcome, String> {
     let url = feed_url();
     tracing::info!("updater: checking {url}");
     let resp = ureq::get(&url)
@@ -118,17 +130,22 @@ pub fn check(current_version: &str) -> Result<Option<UpdateInfo>, String> {
             "updater: up to date (feed {} vs current {current_version})",
             manifest.version
         );
-        return Ok(None);
+        let current_notes = if parse_ver(&manifest.version) == parse_ver(current_version) {
+            manifest.notes
+        } else {
+            String::new()
+        };
+        return Ok(CheckOutcome::UpToDate { current_notes });
     }
     let Some(entry) = manifest.platforms.get(PLATFORM_KEY) else {
         tracing::warn!(
             "updater: {} available but no '{PLATFORM_KEY}' platform entry",
             manifest.version
         );
-        return Ok(None);
+        return Ok(CheckOutcome::UpToDate { current_notes: String::new() });
     };
     tracing::info!("updater: {} available for {PLATFORM_KEY}", manifest.version);
-    Ok(Some(UpdateInfo {
+    Ok(CheckOutcome::UpdateAvailable(UpdateInfo {
         version: manifest.version,
         notes: manifest.notes,
         entry: entry.clone(),
@@ -411,8 +428,8 @@ pub fn save_prefs(p: &UpdaterPrefs) {
 /// Events from the updater worker thread to the UI.
 #[derive(Debug, Clone)]
 pub enum UpdateEvent {
-    /// Check finished: newer version (Some) or up to date (None).
-    Checked(Option<UpdateInfo>),
+    /// Check finished — see [`CheckOutcome`].
+    Checked(CheckOutcome),
     /// Check failed (offline etc.) — shown only for manual checks.
     CheckFailed(String),
     /// Download progress in bytes (`total` may be 0 if unknown).
@@ -434,7 +451,7 @@ pub fn spawn_check(tx: crossbeam_channel::Sender<UpdateEvent>) {
     let current = env!("CARGO_PKG_VERSION").to_string();
     std::thread::spawn(move || {
         let ev = match check(&current) {
-            Ok(info) => UpdateEvent::Checked(info),
+            Ok(outcome) => UpdateEvent::Checked(outcome),
             Err(e) => UpdateEvent::CheckFailed(e),
         };
         let _ = tx.send(ev);

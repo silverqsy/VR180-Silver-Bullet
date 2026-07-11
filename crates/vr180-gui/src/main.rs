@@ -76,8 +76,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Title carries no version — the toolbar's clickable version label is
+    // the single source of truth (it also opens the updater popover).
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("VR180 Silver Bullet 2.0")
+        .with_title("VR180 Silver Bullet")
         .with_inner_size([1480.0, 920.0])
         .with_min_inner_size([1100.0, 720.0])
         .with_drag_and_drop(true);

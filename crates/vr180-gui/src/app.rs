@@ -136,6 +136,10 @@ pub struct App {
     /// `UpdateEvent::ReadyToInstall`, consumed in `on_exit` (the app
     /// closes itself gracefully, then the installer runs + relaunches).
     pending_update_install: Option<crate::updater::StagedUpdate>,
+    /// Release notes for the RUNNING version, from the feed (available
+    /// once a check finds us up to date). Shown in the update popover as
+    /// "What's new in this version".
+    current_version_notes: Option<String>,
 
     /// Audio playback for the preview. `Some` when the clip's source
     /// has an audio track. Tied to the same play / pause / seek
@@ -547,6 +551,20 @@ fn tr(en: &'static str) -> &'static str {
         "Stereo offset (right = +, left = −)" => "立体偏移（右 = +，左 = −）",
         "Tip: select a field and press ↑ / ↓ to step its value precisely." => "提示：选中字段后按 ↑ / ↓ 键可精细微调数值。",
         "Reset to 0" => "重置为 0",
+        // Auto-update UI
+        "Software update" => "软件更新",
+        "Installed:" => "已安装：",
+        "New version:" => "新版本：",
+        "Install & Restart" => "安装并重启",
+        "Skip this version" => "跳过此版本",
+        "Check for updates" => "检查更新",
+        "You're on the latest version." => "已是最新版本。",
+        "What's new in" => "更新内容",
+        "update" => "更新",
+        "Downloading…" => "下载中…",
+        "Installing — the app will restart…" => "正在安装 — 应用即将重启…",
+        "Check failed:" => "检查失败：",
+        "Update failed:" => "更新失败：",
         // Fisheye output / stab / lens
         "Format" => "格式",
         "Swap L↔R eyes" => "交换左右眼",
@@ -863,6 +881,7 @@ impl App {
             update_last_check: std::time::Instant::now(),
             updater_prefs: crate::updater::load_prefs(),
             pending_update_install: None,
+            current_version_notes: None,
             audio_player: None,
             export_opts: ExportOptions::default(),
             batch: Vec::new(),
@@ -1333,7 +1352,7 @@ impl App {
         while let Ok(ev) = self.updater_rx.try_recv() {
             use crate::updater::UpdateEvent as E;
             match ev {
-                E::Checked(Some(info)) => {
+                E::Checked(crate::updater::CheckOutcome::UpdateAvailable(info)) => {
                     let skipped = self.updater_prefs.skip_version.as_deref()
                         == Some(info.version.as_str());
                     let prompted = self.update_prompted_version.as_deref()
@@ -1350,8 +1369,13 @@ impl App {
                     self.update_available = Some(info);
                     self.update_status = None;
                 }
-                E::Checked(None) => {
+                E::Checked(crate::updater::CheckOutcome::UpToDate { current_notes }) => {
                     self.update_available = None;
+                    // "What's new in the version you're on" — shown in the
+                    // popover's release-notes section.
+                    if !current_notes.is_empty() {
+                        self.current_version_notes = Some(current_notes);
+                    }
                     if self.update_manual_check {
                         self.update_status =
                             Some(tr("You're on the latest version.").to_string());
@@ -1481,13 +1505,29 @@ impl App {
                         });
                     }
                 }
+                // Up to date: show what changed in the version we're on
+                // (the feed's notes for the running release).
+                if self.update_available.is_none() {
+                    if let Some(notes) = self.current_version_notes.clone() {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(format!(
+                            "{} v{}", tr("What's new in"), env!("CARGO_PKG_VERSION")
+                        )).strong());
+                        ui.add_space(2.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(160.0)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(notes).small());
+                            });
+                    }
+                }
                 if let Some(status) = &self.update_status {
                     ui.add_space(4.0);
                     ui.label(RichText::new(status.clone()).small().color(Color32::GRAY));
                 }
                 if !self.update_installing {
                     ui.add_space(4.0);
-                    if ui.small_button(tr("Check again")).clicked() {
+                    if ui.small_button(tr("Check for updates")).clicked() {
                         self.update_manual_check = true;
                         self.update_status = None;
                         self.update_last_check = std::time::Instant::now();
@@ -3458,17 +3498,24 @@ impl eframe::App for App {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Version label — clickable (opens the update
-                        // popover / re-checks). Turns into a highlighted
-                        // "⬆ update" badge when a newer version is known.
+                        // Version label — always shows the INSTALLED
+                        // version (the window title no longer carries it);
+                        // clickable (opens the update popover / re-checks).
+                        // Gains a highlighted "⬆ vNEW" badge when a newer
+                        // version is known.
                         let (ver_text, ver_color) = match &self.update_available {
                             Some(info) => (
-                                format!("v{} ⬆ {}", info.version, tr("update")),
+                                format!(
+                                    "v{} ⬆ v{} {}",
+                                    env!("CARGO_PKG_VERSION"), info.version, tr("update")
+                                ),
                                 Color32::from_rgb(255, 190, 60),
                             ),
                             None => (
                                 format!("v{}", env!("CARGO_PKG_VERSION")),
-                                Color32::GRAY,
+                                // Link-blue: signals "clickable" (check for
+                                // updates / release notes live here).
+                                Color32::from_rgb(110, 160, 255),
                             ),
                         };
                         let ver_resp = ui.add(
