@@ -26,7 +26,9 @@
 //! Testing: set `VR180_UPDATE_URL` to override the feed (e.g. a local
 //! `python3 -m http.server` serving a hand-built latest.json).
 
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::path::Path;
+use std::path::PathBuf;
 
 /// Stable feed URL — `releases/latest/download/<asset>` always redirects
 /// to the newest release, so each release just ships a fresh latest.json.
@@ -417,6 +419,12 @@ pub enum UpdateEvent {
     Progress { got: u64, total: u64 },
     /// Downloaded, verified and staged — about to install.
     Installing,
+    /// Windows: verified installer staged — the UI must close the app
+    /// gracefully and spawn it from `App::on_exit`. (`process::exit(0)`
+    /// from this worker thread wedges on Windows DLL teardown with live
+    /// D3D11/WASAPI threads — found in the 2.1.0 E2E test: the installer
+    /// launched but the app stayed open until closed by hand.)
+    ReadyToInstall(StagedUpdate),
     /// Download / verify / install failed.
     Failed(String),
 }
@@ -451,8 +459,30 @@ pub fn spawn_install(info: UpdateInfo, tx: crossbeam_channel::Sender<UpdateEvent
         // Give the UI a beat to paint the "installing" state before the
         // process is replaced.
         std::thread::sleep(std::time::Duration::from_millis(300));
+        // Windows: DON'T install-and-exit from this worker — hand the
+        // staged payload to the UI, which closes the window and spawns
+        // the installer during app teardown (see UpdateEvent::ReadyToInstall).
+        #[cfg(target_os = "windows")]
+        {
+            let _ = tx.send(UpdateEvent::ReadyToInstall(staged));
+        }
+        #[cfg(not(target_os = "windows"))]
         if let Err(e) = install_and_relaunch(&staged) {
             let _ = tx.send(UpdateEvent::Failed(e));
         }
     });
+}
+
+/// Windows: spawn the staged silent installer WITHOUT exiting — called
+/// from `App::on_exit` once the event loop has unwound (settings saved,
+/// GPU/decode/audio threads torn down). The installer waits out any
+/// stragglers via `CloseApplications`, replaces the files, and relaunches
+/// the app through the `[Run] Check: WizardSilent` entry in windows.iss.
+#[cfg(target_os = "windows")]
+pub fn spawn_installer(staged: &StagedUpdate) -> Result<(), String> {
+    std::process::Command::new(&staged.payload)
+        .args(["/SILENT", "/NORESTART"])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("launch installer: {e}"))
 }

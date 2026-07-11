@@ -132,6 +132,10 @@ pub struct App {
     update_prompted_version: Option<String>,
     update_last_check: std::time::Instant,
     updater_prefs: crate::updater::UpdaterPrefs,
+    /// Windows: verified installer waiting for app teardown — set by
+    /// `UpdateEvent::ReadyToInstall`, consumed in `on_exit` (the app
+    /// closes itself gracefully, then the installer runs + relaunches).
+    pending_update_install: Option<crate::updater::StagedUpdate>,
 
     /// Audio playback for the preview. `Some` when the clip's source
     /// has an audio track. Tied to the same play / pause / seek
@@ -858,6 +862,7 @@ impl App {
             update_prompted_version: None,
             update_last_check: std::time::Instant::now(),
             updater_prefs: crate::updater::load_prefs(),
+            pending_update_install: None,
             audio_player: None,
             export_opts: ExportOptions::default(),
             batch: Vec::new(),
@@ -1324,7 +1329,7 @@ impl App {
     /// Drain updater events + drive the periodic re-check. Mirrors the
     /// reference UX: auto-prompt once per discovered version, never
     /// during an export; manual checks surface "up to date"/errors.
-    fn poll_updater(&mut self) {
+    fn poll_updater(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.updater_rx.try_recv() {
             use crate::updater::UpdateEvent as E;
             match ev {
@@ -1367,6 +1372,17 @@ impl App {
                     self.update_progress = None;
                     // The process is about to be replaced; nothing to do —
                     // the popover shows "restarting…" until then.
+                }
+                E::ReadyToInstall(staged) => {
+                    // Windows: close gracefully; `on_exit` spawns the
+                    // installer once the event loop has unwound (settings
+                    // saved, GPU/decode/audio threads torn down). A
+                    // process::exit from the worker thread wedged on DLL
+                    // teardown — the app stayed open behind the installer.
+                    tracing::info!(
+                        "updater: v{} staged — closing to install", staged.version);
+                    self.pending_update_install = Some(staged);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 E::Failed(e) => {
                     tracing::error!("updater: {e}");
@@ -3264,6 +3280,21 @@ impl eframe::App for App {
     // it) and leave `ui` empty.
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
+    /// Auto-update hand-off (Windows): the event loop has unwound — the
+    /// window is gone, settings flushed, decode/audio threads down. Spawn
+    /// the verified silent installer now; it replaces our files and
+    /// relaunches the app (windows.iss `[Run] Check: WizardSilent`).
+    fn on_exit(&mut self) {
+        #[cfg(target_os = "windows")]
+        if let Some(staged) = self.pending_update_install.take() {
+            match crate::updater::spawn_installer(&staged) {
+                Ok(()) => tracing::info!(
+                    "updater: installer spawned on exit (v{})", staged.version),
+                Err(e) => tracing::error!("updater: {e}"),
+            }
+        }
+    }
+
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Mirror the chosen language into the process global that `tr` reads.
@@ -3297,7 +3328,7 @@ impl eframe::App for App {
         // Drain export-job progress + check for completion.
         self.poll_export_job();
         // Auto-update: drain events + periodic re-check + popover.
-        self.poll_updater();
+        self.poll_updater(ctx);
         self.draw_update_popover(ctx);
         if self.update_installing {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
