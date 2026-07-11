@@ -53,3 +53,6 @@ Thumbs.db
 # Release bundling output (signed .app / .zip / .dmg) — produced locally by
 # the macOS release process; ship via GitHub Releases, never the repo.
 /dist/
+
+# Release staging (updater manifests + signed artifacts — never commit)
+release-staging/
