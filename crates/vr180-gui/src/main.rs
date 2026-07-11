@@ -16,6 +16,7 @@
 mod app;
 mod audio_player;
 mod decoder;
+mod updater;
 
 use tracing_subscriber::EnvFilter;
 

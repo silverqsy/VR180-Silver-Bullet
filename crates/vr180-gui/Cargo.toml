@@ -1,6 +1,6 @@
 [package]
 name = "vr180-gui"
-version = "2.0.0"
+version = "2.1.0"
 description = "VR180 Silver Bullet 2.0 — egui+wgpu native GUI"
 edition = "2021"
 publish = false
@@ -32,6 +32,13 @@ image = { version = "0.25", default-features = false, features = ["ico"] }
 # Threading + sync.
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
+
+# Auto-update: blocking HTTPS on a plain std::thread (no async runtime —
+# matches the app's thread+channel architecture; reqwest would drag in
+# tokio) + minisign verification of downloaded artifacts against the
+# pubkey baked into updater.rs.
+ureq = { version = "2", features = ["json"] }
+minisign-verify = "0.2"
 
 # Audio output (cross-platform OS device). The audio-decoder thread
 # pushes resampled f32 samples into a parking_lot Mutex<VecDeque>;

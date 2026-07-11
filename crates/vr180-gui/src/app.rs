@@ -111,6 +111,28 @@ pub struct App {
     /// Export button.
     export_job: Option<ExportJob>,
 
+    // ─── Auto-update (see updater.rs; export-job channel pattern) ──
+    updater_tx: crossbeam_channel::Sender<crate::updater::UpdateEvent>,
+    updater_rx: crossbeam_channel::Receiver<crate::updater::UpdateEvent>,
+    /// Newer version advertised by the feed for this platform.
+    update_available: Option<crate::updater::UpdateInfo>,
+    /// Download progress `(got, total)` while installing.
+    update_progress: Option<(u64, u64)>,
+    /// True from "Install & Restart" until the process is replaced
+    /// (or a Failed event lands).
+    update_installing: bool,
+    /// Error/status line shown in the popover (check failures for
+    /// MANUAL checks, install failures, or "up to date").
+    update_status: Option<String>,
+    show_update_popover: bool,
+    /// The in-flight check was user-initiated → surface its result
+    /// even when it's "up to date" / an error.
+    update_manual_check: bool,
+    /// Auto-open the popover once per discovered version per session.
+    update_prompted_version: Option<String>,
+    update_last_check: std::time::Instant,
+    updater_prefs: crate::updater::UpdaterPrefs,
+
     /// Audio playback for the preview. `Some` when the clip's source
     /// has an audio track. Tied to the same play / pause / seek
     /// commands as the video decoder.
@@ -797,6 +819,12 @@ impl App {
         // symptom; the old sRGB view was right only under egui-wgpu 0.28).
         let _ = wgpu_state.target_format; // logged above; view choice is fixed
         let preview_view_format = wgpu::TextureFormat::Rgba8Unorm;
+
+        // Auto-update: silent check on launch (errors swallowed — the
+        // user can always check manually via the version label).
+        let (updater_tx, updater_rx) = crossbeam_channel::unbounded();
+        crate::updater::spawn_check(updater_tx.clone());
+
         Self {
             pipeline,
             egui_renderer: wgpu_state.renderer.clone(),
@@ -819,6 +847,17 @@ impl App {
             kind_settings: Settings::load_kind_map(),
             last_pushed_settings: defaults,
             export_job: None,
+            updater_tx,
+            updater_rx,
+            update_available: None,
+            update_progress: None,
+            update_installing: false,
+            update_status: None,
+            show_update_popover: false,
+            update_manual_check: false,
+            update_prompted_version: None,
+            update_last_check: std::time::Instant::now(),
+            updater_prefs: crate::updater::load_prefs(),
             audio_player: None,
             export_opts: ExportOptions::default(),
             batch: Vec::new(),
@@ -1282,6 +1321,171 @@ impl App {
     /// promote `export_job` to None when it has. When a batch is
     /// running, completion records the item's outcome and immediately
     /// starts the next queued item.
+    /// Drain updater events + drive the periodic re-check. Mirrors the
+    /// reference UX: auto-prompt once per discovered version, never
+    /// during an export; manual checks surface "up to date"/errors.
+    fn poll_updater(&mut self) {
+        while let Ok(ev) = self.updater_rx.try_recv() {
+            use crate::updater::UpdateEvent as E;
+            match ev {
+                E::Checked(Some(info)) => {
+                    let skipped = self.updater_prefs.skip_version.as_deref()
+                        == Some(info.version.as_str());
+                    let prompted = self.update_prompted_version.as_deref()
+                        == Some(info.version.as_str());
+                    // Auto-open once per version per session; skipped
+                    // versions only open on a manual check. Never
+                    // interrupt a running export.
+                    if self.update_manual_check
+                        || (!skipped && !prompted && self.export_job.is_none())
+                    {
+                        self.show_update_popover = true;
+                        self.update_prompted_version = Some(info.version.clone());
+                    }
+                    self.update_available = Some(info);
+                    self.update_status = None;
+                }
+                E::Checked(None) => {
+                    self.update_available = None;
+                    if self.update_manual_check {
+                        self.update_status =
+                            Some(tr("You're on the latest version.").to_string());
+                        self.show_update_popover = true;
+                    }
+                }
+                E::CheckFailed(e) => {
+                    tracing::warn!("updater: check failed: {e}");
+                    if self.update_manual_check {
+                        self.update_status = Some(format!("{} {e}", tr("Check failed:")));
+                        self.show_update_popover = true;
+                    }
+                }
+                E::Progress { got, total } => {
+                    self.update_progress = Some((got, total));
+                }
+                E::Installing => {
+                    self.update_progress = None;
+                    // The process is about to be replaced; nothing to do —
+                    // the popover shows "restarting…" until then.
+                }
+                E::Failed(e) => {
+                    tracing::error!("updater: {e}");
+                    self.update_installing = false;
+                    self.update_progress = None;
+                    self.update_status = Some(format!("{} {e}", tr("Update failed:")));
+                    self.show_update_popover = true;
+                }
+            }
+        }
+        // Periodic re-check every 4 h (reference cadence), skipped while
+        // anything update-related is busy or shown.
+        const RECHECK: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
+        if self.update_last_check.elapsed() >= RECHECK
+            && !self.update_installing
+            && !self.show_update_popover
+        {
+            self.update_last_check = std::time::Instant::now();
+            self.update_manual_check = false;
+            crate::updater::spawn_check(self.updater_tx.clone());
+        }
+    }
+
+    /// The update popover — bottom-anchored non-modal window (the app's
+    /// accepted popover idiom; no new floating tool windows).
+    fn draw_update_popover(&mut self, ctx: &egui::Context) {
+        if !self.show_update_popover {
+            return;
+        }
+        let mut open = self.show_update_popover;
+        egui::Window::new(tr("Software update"))
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -150.0])
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(format!("{} v{}", tr("Installed:"), env!("CARGO_PKG_VERSION")));
+                if let Some(info) = self.update_available.clone() {
+                    ui.label(
+                        RichText::new(format!("{} v{}", tr("New version:"), info.version))
+                            .strong(),
+                    );
+                    if !info.notes.is_empty() {
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(160.0)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(info.notes.clone()).small());
+                            });
+                    }
+                    ui.add_space(6.0);
+                    if self.update_installing {
+                        match self.update_progress {
+                            Some((got, total)) if total > 0 => {
+                                let frac = got as f32 / total as f32;
+                                ui.add(egui::ProgressBar::new(frac).desired_width(380.0).text(
+                                    format!(
+                                        "{} {:.1} / {:.1} MB",
+                                        tr("Downloading…"),
+                                        got as f64 / 1e6,
+                                        total as f64 / 1e6
+                                    ),
+                                ));
+                            }
+                            Some((got, _)) => {
+                                ui.label(format!(
+                                    "{} {:.1} MB",
+                                    tr("Downloading…"),
+                                    got as f64 / 1e6
+                                ));
+                            }
+                            None => {
+                                ui.label(tr("Installing — the app will restart…"));
+                            }
+                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(RichText::new(tr("Install & Restart")).strong())
+                                .clicked()
+                            {
+                                self.update_installing = true;
+                                self.update_status = None;
+                                self.update_progress = Some((0, 0));
+                                crate::updater::spawn_install(
+                                    info.clone(),
+                                    self.updater_tx.clone(),
+                                );
+                            }
+                            if ui.button(tr("Skip this version")).clicked() {
+                                self.updater_prefs.skip_version = Some(info.version.clone());
+                                crate::updater::save_prefs(&self.updater_prefs);
+                                self.show_update_popover = false;
+                            }
+                        });
+                    }
+                }
+                if let Some(status) = &self.update_status {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(status.clone()).small().color(Color32::GRAY));
+                }
+                if !self.update_installing {
+                    ui.add_space(4.0);
+                    if ui.small_button(tr("Check again")).clicked() {
+                        self.update_manual_check = true;
+                        self.update_status = None;
+                        self.update_last_check = std::time::Instant::now();
+                        crate::updater::spawn_check(self.updater_tx.clone());
+                    }
+                }
+            });
+        // Don't let the X close the window mid-install (the process is
+        // about to restart anyway; closing would just hide the state).
+        if !self.update_installing {
+            self.show_update_popover = open;
+        }
+    }
+
     fn poll_export_job(&mut self) {
         let Some(job) = self.export_job.as_mut() else { return; };
         // Drain the channel.
@@ -3092,6 +3296,12 @@ impl eframe::App for App {
         }
         // Drain export-job progress + check for completion.
         self.poll_export_job();
+        // Auto-update: drain events + periodic re-check + popover.
+        self.poll_updater();
+        self.draw_update_popover(ctx);
+        if self.update_installing {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         // Drive the full-res still for the zoom magnifier.
         self.poll_full_res(ctx);
         // Import merge/individual prompt (shown when a multi-file recording
@@ -3217,8 +3427,35 @@ impl eframe::App for App {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(env!("CARGO_PKG_VERSION"))
-                            .small().color(Color32::GRAY));
+                        // Version label — clickable (opens the update
+                        // popover / re-checks). Turns into a highlighted
+                        // "⬆ update" badge when a newer version is known.
+                        let (ver_text, ver_color) = match &self.update_available {
+                            Some(info) => (
+                                format!("v{} ⬆ {}", info.version, tr("update")),
+                                Color32::from_rgb(255, 190, 60),
+                            ),
+                            None => (
+                                format!("v{}", env!("CARGO_PKG_VERSION")),
+                                Color32::GRAY,
+                            ),
+                        };
+                        let ver_resp = ui.add(
+                            egui::Button::new(
+                                RichText::new(ver_text).small().color(ver_color),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text(tr("Check for updates"));
+                        if ver_resp.clicked() {
+                            self.show_update_popover = true;
+                            if self.update_available.is_none() && !self.update_installing {
+                                self.update_manual_check = true;
+                                self.update_status = None;
+                                self.update_last_check = std::time::Instant::now();
+                                crate::updater::spawn_check(self.updater_tx.clone());
+                            }
+                        }
 
                         // Export progress badge in the right corner —
                         // only when a job is in flight.

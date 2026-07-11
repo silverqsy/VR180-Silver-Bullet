@@ -10,7 +10,7 @@
 ; The app's settings (%APPDATA%\VR180SilverBullet2.0) are user data and are
 ; deliberately NOT removed on uninstall.
 
-#define AppVer "2.0.0"
+#define AppVer "2.1.0"
 #define BundleDir "..\dist\VR180-Silver-Bullet-" + AppVer + "-windows-x64"
 
 [Setup]
@@ -36,6 +36,12 @@ UninstallDisplayName=VR180 Silver Bullet 2.0
 SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\vr180-gui.exe
 LicenseFile=
+; Auto-update support: the in-app updater spawns this installer with
+; /SILENT /NORESTART and exits immediately. CloseApplications waits out
+; any file still in use via the Restart Manager (belt-and-braces — the
+; app has already quit by the time files copy).
+CloseApplications=yes
+RestartApplications=no
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -51,3 +57,6 @@ Name: "{autodesktop}\VR180 Silver Bullet 2.0"; Filename: "{app}\vr180-gui.exe"; 
 
 [Run]
 Filename: "{app}\vr180-gui.exe"; Description: "{cm:LaunchProgram,VR180 Silver Bullet 2.0}"; Flags: nowait postinstall skipifsilent
+; Silent installs (= in-app auto-update) relaunch the app themselves —
+; the postinstall entry above is skipped when silent by design.
+Filename: "{app}\vr180-gui.exe"; Flags: nowait; Check: WizardSilent

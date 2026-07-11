@@ -3,13 +3,41 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: 2.0 — feature-complete on macOS + Windows
+## ⚡ Status: 2.1.0 in progress — auto-update landed (macOS-verified)
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
 NVENC path and the macOS feature batch below were verified on both platforms
 (DX12/Vulkan + NVENC on an RTX 4090; Metal on Apple Silicon). See
 [CHANGELOG.md](CHANGELOG.md) for the user-facing 2.0 summary.
+
+**2.1.0 (version bumped, unreleased): seamless auto-update** — see
+[docs/AUTO-UPDATE.md](docs/AUTO-UPDATE.md) for the full design + release
+recipe. `crates/vr180-gui/src/updater.rs`: minisign-verified updates from
+GitHub Releases (`latest.json` at the stable `releases/latest/download/`
+URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
+(E2E-verified with real signing), silent Inno install on Windows.
+
+**Windows session TODO to catch up (2.1.0):**
+1. Pull; `cargo build --release -p vr180-gui` (new deps: ureq,
+   minisign-verify — pure Rust, no system libs).
+2. Copy the updater signing key from the mac box to
+   `C:\Users\<user>\.vr180-updater\vr180-updater.key` (private channel;
+   NEVER commit) and install the `minisign` CLI (scoop or release binary).
+3. Rebuild the installer with the updated `installer/windows.iss`
+   (AppVer 2.1.0 + the new silent-relaunch `[Run]` entry +
+   `CloseApplications`).
+4. VERIFY the Windows update path (built here, not yet run on Windows):
+   serve a `latest.json` locally (`VR180_UPDATE_URL` override), click
+   Install & Restart → the app must exit, the installer run silently
+   (per-user, no UAC), and the app relaunch. Watch for: the spawned
+   `-setup.exe` inheriting a lock on itself (it runs from the staging dir
+   under `%APPDATA%\VR180SilverBullet2.0\updates\` — fine), and the
+   `[Run] Check: WizardSilent` entry actually firing.
+5. At release: `node scripts/make-latest-json.mjs --version 2.1.0
+   --notes-file <notes>` on BOTH machines (mac first, copy its
+   `release-staging/latest.json` over so the entries merge), then upload
+   both artifacts + `latest.json` to the `v2.1.0` release.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
