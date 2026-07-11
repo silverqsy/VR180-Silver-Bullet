@@ -303,7 +303,7 @@ impl Default for ExportOptions {
             h265_bitrate_mbps: 200,
             h265_bit_depth: 10,
             h265_hardware: true,
-            prores_profile: ProResProfile::Hq,
+            prores_profile: ProResProfile::Standard,
             // APMP is the headline target (Vision Pro). They're
             // mutually exclusive; the dialog enforces it.
             inject_apmp: true,
