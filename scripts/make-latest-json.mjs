@@ -84,6 +84,18 @@ const signature = Buffer.from(fs.readFileSync(sigPath, "utf8"), "utf8").toString
 // ── Build / merge the manifest ──
 fs.mkdirSync(outDir, { recursive: true });
 const manifestPath = path.join(outDir, "latest.json");
+
+// RESPIN SAFETY: the other platform's entry may exist only in the
+// RELEASE's latest.json (uploaded from the other machine). Sync it down
+// before merging so a regenerate + --clobber upload can't drop it.
+// Best-effort — a missing release/tag/gh just means a fresh manifest.
+try {
+  execFileSync("gh", [
+    "release", "download", `v${version}`,
+    "--pattern", "latest.json", "--clobber", "--dir", outDir,
+  ], { stdio: "pipe" });
+  console.log(`✓ synced existing latest.json from release v${version}`);
+} catch { /* no release yet / no gh — start fresh */ }
 let manifest = { version, notes, pub_date: pubDate, platforms: {} };
 if (fs.existsSync(manifestPath)) {
   try {

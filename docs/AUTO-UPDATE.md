@@ -99,3 +99,17 @@ vehicles; the app zip and setup.exe are the **update** vehicles.
   a password, the wrong key file is being used.
 - Dev builds (`cargo run`) refuse to install updates ("not running from
   an installed .app") — test the swap from a real installed copy.
+- **RESPIN HAZARD — sync `latest.json` down before regenerating it.**
+  `make-latest-json.mjs` merges into the LOCAL
+  `release-staging/latest.json`; if the other platform's machine has
+  uploaded since (its entry lives only in the RELEASE's copy),
+  regenerating from a stale local file and `--clobber`-uploading DROPS
+  that platform from the live feed. Before any respin:
+  `gh release download v<ver> --pattern latest.json --clobber
+  --dir release-staging` — then run the script. (Recovery, if it
+  happens: download the other platform's artifact, `minisign -S` it
+  with the shared key, merge the entry back by hand.)
+- The stable `releases/latest/download/latest.json` URL serves through
+  GitHub's CDN — after a re-upload, clients can see the previous copy
+  for a few minutes. Verify with the direct
+  `releases/download/v<ver>/latest.json` URL.
