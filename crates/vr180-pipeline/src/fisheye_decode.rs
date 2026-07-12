@@ -1313,6 +1313,103 @@ impl VtSharedDualStreamIter {
     }
 }
 
+/// Chains a merged OSV recording's segments through the VideoToolbox
+/// zero-copy preview iterator — the macOS preview analog of the export's
+/// segmented [`ZeroCopyDualStreamFisheyeIter`] (and of Windows'
+/// `SegmentedD3d11SharedDualStreamIter`). Yielded `pts_s` is rebased onto
+/// the GLOBAL clip timeline so stabilization-by-pts and the timeline stay
+/// aligned across seams. Segment boundaries MUST come from the VIDEO
+/// track's duration (`probe_video_duration_via_moov`) — the movie
+/// duration's audio overhang shifts every post-seam frame onto the next
+/// stab quat.
+#[cfg(target_os = "macos")]
+pub struct SegmentedVtSharedDualStreamIter {
+    seg_paths: Vec<std::path::PathBuf>,
+    /// Cumulative clip-time start of each segment (seconds).
+    seg_start_s: Vec<f64>,
+    total_dur_s: f64,
+    cur_idx: usize,
+    cur: VtSharedDualStreamIter,
+    swap_eyes: bool,
+    native: (u32, u32),
+}
+
+#[cfg(target_os = "macos")]
+impl SegmentedVtSharedDualStreamIter {
+    pub fn new(segments: &[std::path::PathBuf], swap_eyes: bool) -> Result<Self> {
+        assert!(!segments.is_empty(), "segments must be non-empty");
+        let mut seg_start_s = Vec::with_capacity(segments.len());
+        let mut acc = 0.0_f64;
+        for seg in segments {
+            seg_start_s.push(acc);
+            acc += crate::decode::probe_video_duration_via_moov(seg).ok()
+                .or_else(|| crate::decode::probe_video(seg).ok().map(|p| p.duration_sec))
+                .unwrap_or(0.0);
+        }
+        let cur = VtSharedDualStreamIter::new(&segments[0], swap_eyes)?;
+        let native = cur.eye_dims();
+        tracing::info!(
+            "SegmentedVtSharedDualStreamIter: {} segment(s), {:.1}s total, native {}x{}",
+            segments.len(), acc, native.0, native.1,
+        );
+        Ok(Self {
+            seg_paths: segments.to_vec(),
+            seg_start_s,
+            total_dur_s: acc,
+            cur_idx: 0,
+            cur,
+            swap_eyes,
+            native,
+        })
+    }
+
+    pub fn eye_dims(&self) -> (u32, u32) { self.native }
+
+    fn open_segment(&mut self, idx: usize) -> Result<()> {
+        let next = VtSharedDualStreamIter::new(&self.seg_paths[idx], self.swap_eyes)?;
+        // Same stance as the export iter: refuse a mid-chain resolution
+        // change rather than feeding the projector mismatched planes.
+        let nd = next.eye_dims();
+        if nd != self.native {
+            return Err(crate::Error::Ffmpeg(format!(
+                "segment {} native dims {}x{} != chain {}x{}",
+                idx, nd.0, nd.1, self.native.0, self.native.1
+            )));
+        }
+        self.cur = next;
+        self.cur_idx = idx;
+        Ok(())
+    }
+
+    /// Next pair with pts rebased local → global. Rolls into the next
+    /// segment at EOF.
+    pub fn next_pair(&mut self, device: &wgpu::Device)
+        -> Result<Option<VtSharedFisheyePair>>
+    {
+        loop {
+            if let Some(mut p) = self.cur.next_pair(device)? {
+                p.pts_s += self.seg_start_s[self.cur_idx];
+                return Ok(Some(p));
+            }
+            if self.cur_idx + 1 >= self.seg_paths.len() {
+                return Ok(None);
+            }
+            let idx = self.cur_idx + 1;
+            self.open_segment(idx)?;
+        }
+    }
+
+    /// Global seek: map to (segment, local time), reopen if needed.
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let t = target_s.clamp(0.0, self.total_dur_s);
+        let idx = self.seg_start_s.iter().rposition(|&s| s <= t).unwrap_or(0);
+        if idx != self.cur_idx {
+            self.open_segment(idx)?;
+        }
+        self.cur.seek(t - self.seg_start_s[idx])
+    }
+}
+
 /// One GPU-resident EAC stream pair — the two GoPro `.360` HEVC streams
 /// (s0, s4), each decoded P010 by `d3d11va`/NVDEC and converted to a
 /// single-plane Rgba16Unorm D3D11 texture shared out as an NT handle. The
@@ -1616,7 +1713,13 @@ impl SegmentedD3d11SharedStreamPairIter {
         let mut acc = 0.0_f64;
         for seg in segments {
             seg_start_s.push(acc);
-            acc += crate::decode::probe_video(seg).map(|p| p.duration_sec).unwrap_or(0.0);
+            // VIDEO-track duration (not mvhd/ffmpeg movie duration): the
+            // seam boundary feeds the pts rebase AND the stab quat index —
+            // an audio overhang here lags stabilization by a frame past
+            // every seam. Frame-exact by construction.
+            acc += crate::decode::probe_video_duration_via_moov(seg).ok()
+                .or_else(|| crate::decode::probe_video(seg).ok().map(|p| p.duration_sec))
+                .unwrap_or(0.0);
         }
         let cur = D3d11SharedStreamPairIter::new(&segments[0])?;
         tracing::info!(
@@ -1709,7 +1812,13 @@ impl SegmentedD3d11SharedDualStreamIter {
         let mut acc = 0.0_f64;
         for seg in segments {
             seg_start_s.push(acc);
-            acc += crate::decode::probe_video(seg).map(|p| p.duration_sec).unwrap_or(0.0);
+            // VIDEO-track duration (not mvhd/ffmpeg movie duration): the
+            // seam boundary feeds the pts rebase AND the stab quat index —
+            // an audio overhang here lags stabilization by a frame past
+            // every seam. Frame-exact by construction.
+            acc += crate::decode::probe_video_duration_via_moov(seg).ok()
+                .or_else(|| crate::decode::probe_video(seg).ok().map(|p| p.duration_sec))
+                .unwrap_or(0.0);
         }
         let cur = D3d11SharedDualStreamIter::new(&segments[0], swap_eyes, work_w, work_h)?;
         tracing::info!(

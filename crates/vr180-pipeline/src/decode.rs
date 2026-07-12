@@ -806,6 +806,94 @@ pub fn probe_duration_via_moov(path: &Path) -> Result<f64> {
     Ok(duration as f64 / timescale as f64)
 }
 
+/// Duration of the VIDEO track (the trak whose `hdlr` subtype is `vide`),
+/// read from that track's own `mdhd` — the frame-exact duration for
+/// segment-chain pts rebasing and stabilization indexing.
+///
+/// [`probe_duration_via_moov`] reads `mvhd` = the MOVIE duration = the
+/// LONGEST track, which on DJI OSV is the audio and overhangs the video
+/// by a fraction of a frame (measured: +0.534 frames at 50 fps). Used as
+/// a chain's segment boundary that overhang shifts every post-seam frame
+/// onto the NEXT quat index — a one-frame stabilization lag past each
+/// seam — and skews trim grids by a frame. mvhd stays the right answer
+/// for DISPLAY duration; this is the right answer for MATH.
+pub fn probe_video_duration_via_moov(path: &Path) -> Result<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let fsize = f.metadata()?.len();
+    // Locate `moov` reading box headers only (seek past the huge mdat).
+    let mut moov_off: Option<u64> = None;
+    let mut moov_sz: u64 = 0;
+    let mut pos: u64 = 0;
+    while pos + 8 <= fsize {
+        let mut hdr = [0u8; 16];
+        f.seek(SeekFrom::Start(pos))?;
+        f.read_exact(&mut hdr[..8])?;
+        let sz32 = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+        let btag = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        let sz: u64 = if sz32 == 1 {
+            f.read_exact(&mut hdr[8..16])?;
+            u64::from_be_bytes(hdr[8..16].try_into().unwrap())
+        } else if sz32 == 0 { fsize - pos } else { sz32 as u64 };
+        if sz < 8 { break; }
+        if &btag == b"moov" { moov_off = Some(pos); moov_sz = sz; break; }
+        pos = pos.checked_add(sz).ok_or_else(|| Error::Ffmpeg("mp4: box overflow".into()))?;
+    }
+    let moov_off = moov_off.ok_or_else(|| Error::Ffmpeg("mp4: no moov".into()))?;
+    if moov_sz < 8 || moov_off + moov_sz > fsize {
+        return Err(Error::Ffmpeg("mp4: bad moov size".into()));
+    }
+    let mut moov = vec![0u8; moov_sz as usize];
+    f.seek(SeekFrom::Start(moov_off))?;
+    f.read_exact(&mut moov)?;
+    let (mv0, mvsz) = find_atom(&moov, 0, moov.len(), b"moov")
+        .ok_or_else(|| Error::Ffmpeg("mp4: moov header".into()))?;
+
+    // Walk every trak; pick the LONGEST video track (an OSV carries a
+    // tiny MJPEG thumbnail trak that is also `vide` — the real eyes'
+    // track is the long one, mirroring probe_video's max-area rule).
+    let mut best: Option<f64> = None;
+    let mut tpos = mv0 + 8;
+    let tend = mv0 + mvsz;
+    while let Some((t0, tsz)) = find_atom(&moov, tpos, tend, b"trak") {
+        if let Some((md0, mdsz)) = find_atom(&moov, t0 + 8, t0 + tsz, b"mdia") {
+            // hdlr: size(4) tag(4) ver/flags(4) pre_defined(4) handler(4).
+            let is_video = find_atom(&moov, md0 + 8, md0 + mdsz, b"hdlr")
+                .and_then(|(h0, hsz)| if hsz >= 20 { moov.get(h0 + 16..h0 + 20) } else { None })
+                .map(|h| h == b"vide")
+                .unwrap_or(false);
+            if is_video {
+                if let Some((mh0, _)) = find_atom(&moov, md0 + 8, md0 + mdsz, b"mdhd") {
+                    // mdhd content at mh0+8: version(1)+flags(3), then
+                    // v0: creation(4) modification(4) timescale(4) duration(4)
+                    // v1: creation(8) modification(8) timescale(4) duration(8)
+                    let c = mh0 + 8;
+                    let ver = moov.get(c).copied().unwrap_or(0);
+                    let be32 = |o: usize| moov.get(o..o + 4)
+                        .map(|s| u32::from_be_bytes(s.try_into().unwrap()));
+                    let be64 = |o: usize| moov.get(o..o + 8)
+                        .map(|s| u64::from_be_bytes(s.try_into().unwrap()));
+                    let (ts, dur) = if ver == 1 {
+                        (be32(c + 20).map(|v| v as u64), be64(c + 24))
+                    } else {
+                        (be32(c + 12).map(|v| v as u64), be32(c + 16).map(|v| v as u64))
+                    };
+                    if let (Some(ts), Some(dur)) = (ts, dur) {
+                        if ts > 0 {
+                            let d = dur as f64 / ts as f64;
+                            if best.map(|b| d > b).unwrap_or(true) {
+                                best = Some(d);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        tpos = t0 + tsz;
+    }
+    best.ok_or_else(|| Error::Ffmpeg("mp4: no video trak mdhd".into()))
+}
+
 pub fn probe_video(path: &Path) -> Result<VideoProbe> {
     init();
     let ictx = ffmpeg_next::format::input(path)
@@ -1391,7 +1479,13 @@ impl SegmentedZeroCopyPairIter {
         let mut acc = 0.0_f64;
         for seg in segments {
             seg_start_s.push(acc);
-            acc += probe_video(seg).map(|p| p.duration_sec).unwrap_or(0.0);
+            // VIDEO-track duration (frame-exact): these seam boundaries
+            // feed seek→(segment,local) mapping and the frame-indexed
+            // stab/RS tables — the movie duration's audio overhang shifts
+            // post-seam frames off their CORI/quat index by one.
+            acc += probe_video_duration_via_moov(seg).ok()
+                .or_else(|| probe_video(seg).ok().map(|p| p.duration_sec))
+                .unwrap_or(0.0);
         }
         let cur = ZeroCopyStreamPairIter::new(&segments[0], frame_limit)?;
         Ok(Self {
@@ -2126,7 +2220,13 @@ impl SegmentedStreamPairIter {
         let mut acc = 0.0_f64;
         for seg in segments {
             seg_start_s.push(acc);
-            acc += probe_video(seg).map(|p| p.duration_sec).unwrap_or(0.0);
+            // VIDEO-track duration (frame-exact): these seam boundaries
+            // feed seek→(segment,local) mapping and the frame-indexed
+            // stab/RS tables — the movie duration's audio overhang shifts
+            // post-seam frames off their CORI/quat index by one.
+            acc += probe_video_duration_via_moov(seg).ok()
+                .or_else(|| probe_video(seg).ok().map(|p| p.duration_sec))
+                .unwrap_or(0.0);
         }
         let cur = StreamPairIter::new(&segments[0], hw, frame_limit)?;
         Ok(Self {

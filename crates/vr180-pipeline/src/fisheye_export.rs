@@ -506,6 +506,17 @@ fn fisheye_export_opener(
 ///   3. otherwise read the full IMU (single file, or parse_multi over segments
 ///      so quats index by absolute frame across a merged recording).
 /// Returns `None` for non-OSV or on failure (caller falls back to preset calib).
+/// Frame count of one chain segment, from the VIDEO track's own duration
+/// (frame-exact; the movie/ffmpeg duration can overhang by the audio
+/// track's extra fraction of a frame, which mis-sizes stab tables and
+/// shifts quat indices past seams). Falls back to ffmpeg's probe.
+fn chain_segment_frames(path: &std::path::Path, fps: f32) -> usize {
+    crate::decode::probe_video_duration_via_moov(path).ok()
+        .or_else(|| crate::decode::probe_video(path).ok().map(|p| p.duration_sec))
+        .map(|d| (d * fps as f64).round() as usize)
+        .unwrap_or(0)
+}
+
 fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
     if !matches!(cfg.source_kind, SourceKind::DjiOsv) { return None; }
     if let Some(arc) = &cfg.preloaded_imu {
@@ -740,8 +751,13 @@ pub fn export_fisheye(
         // Merged recording: chain the segments into one continuous timeline
         // (the IMU is aggregated the same way below, so stab indexes by
         // absolute frame across the whole export).
+        // VIDEO-track duration: these boundaries feed the pts rebase and
+        // the stab quat index — the movie duration's audio overhang lags
+        // stab by a frame past each seam.
         let durations: Vec<f64> = cfg.segments.iter()
-            .map(|p| crate::decode::probe_video(p).map(|pr| pr.duration_sec).unwrap_or(0.0))
+            .map(|p| crate::decode::probe_video_duration_via_moov(p).ok()
+                .or_else(|| crate::decode::probe_video(p).ok().map(|pr| pr.duration_sec))
+                .unwrap_or(0.0))
             .collect();
         tracing::info!(
             "fisheye_export: {} segments, {:.1}s total — SegmentedFisheyeIter",
@@ -798,8 +814,7 @@ pub fn export_fisheye(
     // ── Stab rotations (one per source frame) ────────────────────
     let total_clip_frames = if cfg.segments.len() > 1 {
         cfg.segments.iter()
-            .filter_map(|p| crate::decode::probe_video(p).ok())
-            .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+            .map(|p| chain_segment_frames(p, cfg.fps))
             .sum::<usize>().max(1)
     } else {
         crate::decode::probe_video(&cfg.source_path)
@@ -1950,9 +1965,15 @@ fn export_fisheye_osv_zerocopy_p010(
 
     // Per-segment durations (for a merged recording): chain the decoder, rebase
     // pts, and total the frame count. Fast moov probe (no find_stream_info).
+    // MUST be the VIDEO-track duration: seam boundaries feed both the pts
+    // rebase and the stab quat index. The movie (mvhd) duration is the
+    // longest track — audio overhangs video by ~half a frame on OSV, which
+    // shifted every post-seam frame onto the NEXT quat (one-frame stab lag
+    // past each seam) and skewed trim grids by a frame.
     let seg_durs: Vec<f64> = if cfg.segments.len() > 1 {
         cfg.segments.iter()
-            .map(|p| crate::decode::probe_duration_via_moov(p).ok()
+            .map(|p| crate::decode::probe_video_duration_via_moov(p).ok()
+                .or_else(|| crate::decode::probe_duration_via_moov(p).ok())
                 .or_else(|| crate::decode::probe_video(p).ok().map(|pr| pr.duration_sec))
                 .unwrap_or(0.0))
             .collect()
@@ -2326,9 +2347,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     // truncated stab to identity past the first seam).
     let total_clip_frames = if cfg.segments.len() > 1 {
         cfg.segments.iter()
-            .map(|s| crate::decode::probe_video(s)
-                .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
-                .unwrap_or(0))
+            .map(|s| chain_segment_frames(s, cfg.fps))
             .sum::<usize>()
     } else {
         crate::decode::probe_video(&cfg.source_path)
@@ -2769,9 +2788,7 @@ fn export_fisheye_osv_gpu_resident(
     // truncated stab to identity past the first seam).
     let total_clip_frames = if cfg.segments.len() > 1 {
         cfg.segments.iter()
-            .map(|s| crate::decode::probe_video(s)
-                .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
-                .unwrap_or(0))
+            .map(|s| chain_segment_frames(s, cfg.fps))
             .sum::<usize>()
     } else {
         crate::decode::probe_video(&cfg.source_path)

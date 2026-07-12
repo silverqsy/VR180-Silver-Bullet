@@ -1932,8 +1932,11 @@ impl App {
         // external drive). The cache still persists on zoom-out (keep_alive),
         // so only the FIRST zoom-in pays the open.
         if self.detail_cache.is_none() && self.preview_zoom > 1.001 {
+            let segments = self.clip.as_ref()
+                .map(|c| c.segments.clone())
+                .unwrap_or_default();
             self.detail_cache = Some(crate::decoder::DetailCache::new(
-                path, kind, fps, self.settings.effective_swap_eyes(), ctx.clone()));
+                path, segments, kind, fps, self.settings.effective_swap_eyes(), ctx.clone()));
             self.full_res_key = 0;
             self.full_res_desired_key = 0;
             self.detail_last_key = 0;
@@ -2510,14 +2513,18 @@ impl App {
         // Duration + frame count span the WHOLE segment chain (GS01…, GS02…).
         // Single-segment: just this file's probe.
         let (duration_sec, frame_count) = if segments.len() > 1 {
-            // Sum each segment's duration via the FAST moov/mvhd probe, run
+            // Sum each segment's duration via the FAST moov probe, run
             // concurrently. ffmpeg's find_stream_info (probe_video) does scattered
             // packet reads (~10 s per cold segment on SMB) — for a 5-chapter clip
             // that blocked the load ~40 s. fps is uniform across the chain.
+            // VIDEO-track duration (frame-exact) — `total_frames` below feeds
+            // frame-indexed stab/RS tables, and the movie (mvhd) duration's
+            // audio overhang would add a spurious frame per segment.
             let fps = probe.fps.max(1e-3) as f64;
             let durs: Vec<f64> = std::thread::scope(|sc| {
                 let hs: Vec<_> = segments.iter().map(|s| sc.spawn(move || {
-                    vr180_pipeline::decode::probe_duration_via_moov(s).ok()
+                    vr180_pipeline::decode::probe_video_duration_via_moov(s).ok()
+                        .or_else(|| vr180_pipeline::decode::probe_duration_via_moov(s).ok())
                         .or_else(|| vr180_pipeline::decode::probe_video(s).ok().map(|p| p.duration_sec))
                         .unwrap_or(0.0)
                 })).collect();

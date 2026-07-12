@@ -708,9 +708,16 @@ pub struct DecoderConfig {
 /// Total decoded-frame count across a segment chain: `Σ round(durᵢ·fps)`.
 /// Single element → the lone clip's frame count.
 pub(crate) fn segments_total_frames(segments: &[PathBuf]) -> usize {
+    // VIDEO-track duration (frame-exact): this sizes per-eye stab/RS
+    // tables indexed by absolute frame — the movie (mvhd) duration's
+    // audio overhang would accumulate a spurious frame per segment.
     segments.iter()
-        .filter_map(|s| vr180_pipeline::decode::probe_video(s).ok())
-        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+        .filter_map(|s| {
+            let fps = vr180_pipeline::decode::probe_video(s).ok()?.fps;
+            let dur = vr180_pipeline::decode::probe_video_duration_via_moov(s).ok()
+                .or_else(|| vr180_pipeline::decode::probe_video(s).ok().map(|p| p.duration_sec))?;
+            Some((dur * fps as f64).round() as usize)
+        })
         .sum()
 }
 
@@ -1292,21 +1299,29 @@ fn run_fisheye(
         }
     }
 
-    // ── macOS zero-copy fast path (DJI OSV, single-segment) ──────────
+    // ── macOS zero-copy fast path (DJI OSV) ──────────────────────────
     // VideoToolbox-decoded P010 IOSurfaces, wrapped zero-copy and resolved →
     // projected on the GPU — eliminates the per-eye HW→host download + libswscale
-    // the CPU `DualStreamFisheyeIter` pays. Single-segment only (merged OSV stays
-    // on the CPU path); any failure falls through to the CPU path below untouched.
+    // the CPU `DualStreamFisheyeIter` pays. Merged recordings chain through
+    // the segmented iterator (they used to be gated onto the CPU path — the
+    // preview flavor of the "merged clips are slow" report); any failure
+    // falls through to the CPU path below untouched.
     #[cfg(target_os = "macos")]
     {
-        if matches!(kind, vr180_pipeline::SourceKind::DjiOsv) && cfg.segments.len() <= 1 {
+        if matches!(kind, vr180_pipeline::SourceKind::DjiOsv) {
             // XOR with DJI's "swap by default" (matches open_fisheye_segment).
             let swap = !control.settings.read().effective_swap_eyes();
-            match vr180_pipeline::fisheye_decode::VtSharedDualStreamIter::new(&cfg.path, swap) {
+            let segs: Vec<std::path::PathBuf> = if cfg.segments.is_empty() {
+                vec![cfg.path.clone()]
+            } else {
+                cfg.segments.clone()
+            };
+            match vr180_pipeline::fisheye_decode::SegmentedVtSharedDualStreamIter::new(&segs, swap) {
                 Ok(iter) => {
                     tracing::info!(
                         "decoder (fisheye): macOS ZERO-COPY VideoToolbox path ENGAGED \
-                         (P010 IOSurface → resolve → project, no host download/swscale)"
+                         ({} segment(s); P010 IOSurface → resolve → project, \
+                         no host download/swscale)", segs.len()
                     );
                     return run_fisheye_vt_zerocopy(
                         pipeline, cfg, control, kind, fps, dt, eye_w, eye_h,
@@ -2676,7 +2691,7 @@ fn run_fisheye_vt_zerocopy(
     dt: f64,
     eye_w: u32,
     eye_h: u32,
-    mut iter: vr180_pipeline::fisheye_decode::VtSharedDualStreamIter,
+    mut iter: vr180_pipeline::fisheye_decode::SegmentedVtSharedDualStreamIter,
     frame_tx: Sender<DecodedFrame>,
     cmd_rx: Receiver<DecoderCommand>,
 ) -> anyhow::Result<()> {
@@ -4408,6 +4423,7 @@ pub(crate) struct DetailCache {
 impl DetailCache {
     pub fn new(
         path: PathBuf,
+        segments: Vec<PathBuf>,
         kind: vr180_pipeline::SourceKind,
         fps: f32,
         swap_eyes: bool,
@@ -4419,9 +4435,9 @@ impl DetailCache {
         let (req_tx, req_rx) = crossbeam_channel::bounded::<f64>(1);
         let (res_tx, res_rx) =
             crossbeam_channel::unbounded::<(i64, vr180_pipeline::fisheye_decode::FisheyePair)>();
-        let path_w = path.clone();
+        let segs_w = if segments.is_empty() { vec![path.clone()] } else { segments };
         let handle = std::thread::spawn(move || {
-            detail_decode_worker(path_w, kind, swap_eyes, fps, req_rx, res_tx, ctx);
+            detail_decode_worker(segs_w, kind, swap_eyes, fps, req_rx, res_tx, ctx);
         });
         Self {
             path, kind, fps,
@@ -4492,7 +4508,7 @@ impl DetailCache {
 /// Metal present. Seeks + decodes-forward to the requested timestamp at
 /// native resolution, posts the pair back, and pokes egui to repaint.
 fn detail_decode_worker(
-    path: PathBuf,
+    segments: Vec<PathBuf>,
     kind: vr180_pipeline::SourceKind,
     swap_eyes: bool,
     fps: f32,
@@ -4500,10 +4516,33 @@ fn detail_decode_worker(
     res_tx: crossbeam_channel::Sender<(i64, vr180_pipeline::fisheye_decode::FisheyePair)>,
     ctx: egui::Context,
 ) {
-    let mut iter = match open_native_iter(&path, kind, swap_eyes) {
-        Ok(it) => it,
-        Err(e) => { tracing::warn!("detail decode: open failed: {e}"); return; }
-    };
+    // Merged recordings chain through the segmented wrapper so the zoom
+    // still stays correct past a seam (the requested timestamp is
+    // clip-global). Single files open their native iter directly.
+    // Segment boundaries use the VIDEO-track duration (frame-exact).
+    let mut iter: Box<dyn vr180_pipeline::fisheye_decode::FisheyePairIter> =
+        if segments.len() > 1 {
+            let durs: Vec<f64> = segments.iter()
+                .map(|p| vr180_pipeline::decode::probe_video_duration_via_moov(p).ok()
+                    .or_else(|| vr180_pipeline::decode::probe_video(p).ok().map(|pr| pr.duration_sec))
+                    .unwrap_or(0.0))
+                .collect();
+            let opener = Box::new(move |p: &std::path::Path| {
+                open_native_iter(p, kind, swap_eyes)
+                    .map_err(|e| vr180_pipeline::Error::Ffmpeg(format!("detail open: {e}")))
+            });
+            match vr180_pipeline::fisheye_decode::SegmentedFisheyeIter::new(
+                &segments, &durs, opener,
+            ) {
+                Ok(it) => Box::new(it),
+                Err(e) => { tracing::warn!("detail decode: segmented open failed: {e}"); return; }
+            }
+        } else {
+            match open_native_iter(&segments[0], kind, swap_eyes) {
+                Ok(it) => it,
+                Err(e) => { tracing::warn!("detail decode: open failed: {e}"); return; }
+            }
+        };
     let dt = 1.0 / (fps.max(1e-3) as f64);
     loop {
         // Block for one request, then drain to the latest (coalesce scrubs).
