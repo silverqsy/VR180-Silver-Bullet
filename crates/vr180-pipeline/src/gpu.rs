@@ -136,6 +136,10 @@ pub struct Device {
     color_grade: PerPixelPipeline,
     /// 16-bit-output color grade (temp / tint / saturation).
     color_grade_16: PerPixelPipeline,
+    /// "BeyondVR Hack" — final-stage per-eye scale-about-center with
+    /// black padding.
+    eye_scale: PerPixelPipeline,
+    eye_scale_16: PerPixelPipeline,
     gaussian_blur: GaussianBlur1dPipeline,
     sharpen_combine: SharpenCombinePipeline,
     mid_detail_combine: MidDetailCombinePipeline,
@@ -402,6 +406,14 @@ impl Device {
             &device, "color_grade_16", COLOR_GRADE_16_WGSL,
             std::mem::size_of::<ColorGradeUniforms>() as u64,
         );
+        let eye_scale = PerPixelPipeline::create(
+            &device, "eye_scale", EYE_SCALE_WGSL,
+            std::mem::size_of::<EyeScaleUniforms>() as u64,
+        );
+        let eye_scale_16 = PerPixelPipeline::create_16bit(
+            &device, "eye_scale_16", EYE_SCALE_16_WGSL,
+            std::mem::size_of::<EyeScaleUniforms>() as u64,
+        );
         let gaussian_blur = GaussianBlur1dPipeline::create(&device);
         let sharpen_combine = SharpenCombinePipeline::create(&device);
         let mid_detail_combine = MidDetailCombinePipeline::create(&device);
@@ -447,6 +459,7 @@ impl Device {
             rgba_to_eac, rgba_to_eac_16,
             cdl, cdl_16,
             color_grade, color_grade_16,
+            eye_scale, eye_scale_16,
             gaussian_blur, sharpen_combine, mid_detail_combine, downsample_4x,
             gaussian_blur_16, sharpen_combine_16,
             mid_detail_combine_16, downsample_4x_16,
@@ -2101,6 +2114,8 @@ const CDL_WGSL: &str = include_str!("shaders/cdl.wgsl");
 const CDL_16_WGSL: &str = include_str!("shaders/cdl_16.wgsl");
 const COLOR_GRADE_WGSL: &str = include_str!("shaders/color_grade.wgsl");
 const COLOR_GRADE_16_WGSL: &str = include_str!("shaders/color_grade_16.wgsl");
+const EYE_SCALE_WGSL: &str = include_str!("shaders/eye_scale.wgsl");
+const EYE_SCALE_16_WGSL: &str = include_str!("shaders/eye_scale_16.wgsl");
 const GAUSSIAN_BLUR_1D_WGSL: &str = include_str!("shaders/gaussian_blur_1d.wgsl");
 const SHARPEN_COMBINE_WGSL: &str = include_str!("shaders/sharpen_combine.wgsl");
 const MID_DETAIL_COMBINE_WGSL: &str = include_str!("shaders/mid_detail_combine.wgsl");
@@ -2297,6 +2312,17 @@ struct ColorGradeUniforms {
     tint:        f32,
     saturation:  f32,
     _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct EyeScaleUniforms {
+    scale: f32,
+    /// Half width: texture width for a per-eye texture, width/2 for a
+    /// full SBS texture (each half then scales about its own center).
+    eye_w: f32,
+    _pad0: f32,
+    _pad1: f32,
 }
 
 /// Color-grade knobs: temperature, tint, saturation. Defaults are
@@ -2806,6 +2832,32 @@ impl Device {
         };
         self.apply_per_pixel(
             &self.color_grade, "color_grade",
+            rgb_in, w, h,
+            bytemuck::bytes_of(&uniforms),
+        )
+    }
+
+    /// "BeyondVR Hack" on an RGB8 SBS readback buffer (8-bit CPU-fallback
+    /// export paths): scale each half about its own half-center, black
+    /// outside. `eye_w` = w/2. Runs AFTER the CPU color roundtrip so the
+    /// padding stays true black.
+    pub fn apply_eye_scale_sbs_rgb8(
+        &self,
+        rgb_in: &[u8],
+        w: u32, h: u32,
+        eye_w: u32,
+        scale: f32,
+    ) -> Result<Vec<u8>> {
+        if scale == 1.0 {
+            return Ok(rgb_in.to_vec());
+        }
+        let uniforms = EyeScaleUniforms {
+            scale,
+            eye_w: eye_w as f32,
+            _pad0: 0.0, _pad1: 0.0,
+        };
+        self.apply_per_pixel(
+            &self.eye_scale, "eye_scale",
             rgb_in, w, h,
             bytemuck::bytes_of(&uniforms),
         )
@@ -4042,6 +4094,10 @@ pub struct ColorStackPlan {
     /// without shifting the overall color. 0 = off.
     pub eye_match_ct:   f32,
     pub eye_match_tint: f32,
+    /// "BeyondVR Hack": scale each eye about its own (half-)center at the
+    /// very END of the stack, padding the revealed border with black.
+    /// 1.0 = off. Export-only — the preview plan never sets it.
+    pub eye_scale: f32,
 }
 
 impl Default for ColorStackPlan {
@@ -4054,6 +4110,7 @@ impl Default for ColorStackPlan {
             color_grade: ColorGradeParams::default(),
             eye_match_ct: 0.0,
             eye_match_tint: 0.0,
+            eye_scale: 1.0,
         }
     }
 }
@@ -4067,6 +4124,7 @@ impl ColorStackPlan {
             || !self.color_grade.is_identity()
             || self.eye_match_ct != 0.0
             || self.eye_match_tint != 0.0
+            || self.eye_scale != 1.0
     }
 
     /// This plan specialized for one eye: the "Matching Eyes" CT/tint trim is
@@ -6450,6 +6508,22 @@ impl Device {
         self.record_per_pixel(encoder, "grade_chain", &self.color_grade, src, dst, &uni, dims);
     }
 
+    /// "BeyondVR Hack" stage on a PER-EYE texture: eye_w = full texture
+    /// width, so the scale is about the texture's own center.
+    fn record_eye_scale(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        scale: f32,
+    ) {
+        let uni = self.write_uniform("eye_scale_chain_u", &EyeScaleUniforms {
+            scale, eye_w: dst.width() as f32, _pad0: 0.0, _pad1: 0.0,
+        });
+        let dims = (dst.width(), dst.height());
+        self.record_per_pixel(encoder, "eye_scale_chain", &self.eye_scale, src, dst, &uni, dims);
+    }
+
     fn record_per_pixel(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -7096,6 +7170,21 @@ impl Device {
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
+        // Stage 6: "BeyondVR Hack" per-eye scale — MUST stay the final
+        // stage so the black padding is written after grading (a LUT or
+        // lift would otherwise tint it).
+        if plan.eye_scale != 1.0 {
+            let next = make_rw_texture(&self.device,
+                &format!("{eye_label}_escale"), w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            let prev = match current_idx {
+                Some(i) => &intermediates[i],
+                None => src,
+            };
+            self.record_eye_scale(encoder, prev, &next, plan.eye_scale);
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
         // Index of the final stage's output texture, or None for
         // "every stage was identity, caller should use src".
         current_idx
@@ -7136,6 +7225,21 @@ impl Device {
         let uni = self.write_uniform("grade16_chain_u", &uniforms);
         let dims = (dst.width(), dst.height());
         self.record_per_pixel(encoder, "grade16_chain", &self.color_grade_16, src, dst, &uni, dims);
+    }
+
+    /// 16-bit "BeyondVR Hack" stage (per-eye texture — see `record_eye_scale`).
+    fn record_eye_scale_16(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        scale: f32,
+    ) {
+        let uni = self.write_uniform("eye_scale16_chain_u", &EyeScaleUniforms {
+            scale, eye_w: dst.width() as f32, _pad0: 0.0, _pad1: 0.0,
+        });
+        let dims = (dst.width(), dst.height());
+        self.record_per_pixel(encoder, "eye_scale16_chain", &self.eye_scale_16, src, dst, &uni, dims);
     }
 
     fn record_lut3d_16(
@@ -7355,6 +7459,18 @@ impl Device {
                 None => src,
             };
             self.record_color_grade_16(&mut encoder, prev, &next, plan.color_grade.saturation_only());
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
+        // 6. "BeyondVR Hack" per-eye scale — MUST stay the final stage so
+        // the black padding is written after grading.
+        if plan.eye_scale != 1.0 {
+            let next = make_16("stack16_escale_out", w, h);
+            let prev = match current_idx {
+                Some(i) => &intermediates[i],
+                None => src,
+            };
+            self.record_eye_scale_16(&mut encoder, prev, &next, plan.eye_scale);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }

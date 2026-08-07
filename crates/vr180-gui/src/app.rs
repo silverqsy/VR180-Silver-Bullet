@@ -323,6 +323,12 @@ struct ExportOptions {
     inject_youtube: bool,
     /// Camera baseline in mm for APMP `cams/blin`. Typical 60..=70.
     apmp_baseline_mm: f32,
+    /// "BeyondVR Hack": at the final output stage, scale each eye of the
+    /// SBS half-equirect frame about its own half-center, padding the
+    /// border with black. No-op for fisheye output and in preview.
+    beyondvr_hack: bool,
+    /// Per-eye scale in percent when the hack is on.
+    beyondvr_scale_pct: f32,
 }
 
 impl Default for ExportOptions {
@@ -339,6 +345,8 @@ impl Default for ExportOptions {
             inject_apmp: true,
             inject_youtube: false,
             apmp_baseline_mm: 65.0,
+            beyondvr_hack: false,
+            beyondvr_scale_pct: 85.0,
         }
     }
 }
@@ -499,6 +507,9 @@ fn tr(en: &'static str) -> &'static str {
         "Software (libx265)" => "软件 (libx265)",
         "Camera baseline" => "相机基线",
         "None (no VR180 metadata)" => "无（不写入 VR180 元数据）",
+        "Eye scale" => "单眼缩放",
+        "Scales each eye about its own center at the final output stage, padding with black. Half-equirect (VR180) output only."
+            => "在最终输出阶段将每只眼睛的画面围绕各自中心缩放，四周填充黑色。仅对半等距柱状（VR180）输出生效。",
         // Source info
         "Stream" => "视频流",
         "FPS" => "帧率",
@@ -1167,7 +1178,14 @@ impl App {
             eye_w = side;
             eye_h = side;
         }
-        let color_stack = settings.build_color_stack();
+        let mut color_stack = settings.build_color_stack();
+        // "BeyondVR Hack" — final-stage per-eye scale. Half-equirect SBS
+        // output only; the preview plan (built separately) never sets it.
+        if opts.beyondvr_hack
+            && projection == vr180_pipeline::fisheye_export::FisheyeExportProjection::HalfEquirect
+        {
+            color_stack.eye_scale = (opts.beyondvr_scale_pct / 100.0).clamp(0.25, 1.0);
+        }
 
         // Bitrate / bit-depth come from the options window. ProRes
         // ignores the bitrate field (the profile picks the rate)
@@ -3090,14 +3108,17 @@ impl App {
             None => tr("next to source").to_string(),
         };
         let has_out_dir = self.batch_out_dir.is_some();
-        let fmt_label = format!("{} · {}{}",
+        let fmt_label = format!("{} · {}{}{}",
             self.export_opts.codec.label(),
             self.export_opts.resolution.label(),
             match self.export_opts.codec {
                 ExportCodec::H265 => format!(" · {} Mbps · {}-bit",
                     self.export_opts.h265_bitrate_mbps, self.export_opts.h265_bit_depth),
                 ExportCodec::ProRes => format!(" · {}", self.export_opts.prores_profile.label()),
-            });
+            },
+            if self.export_opts.beyondvr_hack {
+                format!(" · BeyondVR {:.0}%", self.export_opts.beyondvr_scale_pct)
+            } else { String::new() });
         let summary = self.last_batch_summary.as_ref().map(|s| {
             let col = if s.failed > 0 { Color32::from_rgb(230, 160, 90) }
                       else { Color32::from_rgb(120, 200, 120) };
@@ -3323,6 +3344,28 @@ impl App {
              only one can be active per file. Re-run the export \
              with the other target if you need a second copy."
         )).small().color(Color32::GRAY));
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.checkbox(&mut opts.beyondvr_hack, tr("BeyondVR Hack"));
+        if opts.beyondvr_hack {
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label(tr("Eye scale"));
+                // step_by(1.0): whole percents only — a fractional value
+                // (e.g. 99.7) would DISPLAY as "100 %" yet still engage
+                // the scale stage and leave a thin black outline.
+                ui.add(egui::Slider::new(&mut opts.beyondvr_scale_pct, 50.0..=100.0)
+                    .suffix(" %").fixed_decimals(0).step_by(1.0));
+                opts.beyondvr_scale_pct = opts.beyondvr_scale_pct.round();
+            });
+            ui.label(RichText::new(tr(
+                "Scales each eye about its own center at the final \
+                 output stage, padding with black. Half-equirect \
+                 (VR180) output only."
+            )).small().color(Color32::GRAY));
+        }
     }
 
 }

@@ -340,6 +340,7 @@ impl ExportConfig {
             lut:         None,
             eye_match_ct: 0.0,
             eye_match_tint: 0.0,
+            eye_scale: 1.0,
         }
     }
 

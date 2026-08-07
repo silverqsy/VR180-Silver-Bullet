@@ -438,6 +438,7 @@ fn main() -> anyhow::Result<()> {
                 },
                 eye_match_ct: 0.0,
                 eye_match_tint: 0.0,
+                eye_scale: 1.0,
             };
             let post = PostProcess { apac_audio, apac_bitrate, apmp };
             let stab = StabilizeParams {

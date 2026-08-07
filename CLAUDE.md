@@ -38,6 +38,11 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    --notes-file <notes>` on BOTH machines (mac first, copy its
    `release-staging/latest.json` over so the entries merge), then upload
    both artifacts + `latest.json` to the `v2.1.0` release.
+6. **BeyondVR Hack** (final-stage per-eye output scale, ⚙ Format window)
+   landed after the seam fixes — pull + rebuild + re-upload the Windows
+   artifacts so both platforms carry it (mac 2.1.0 artifacts already
+   respun with it). No Windows-specific code: the stage rides the shared
+   color stack (`ColorStackPlan.eye_scale`), incl. the NVENC/d3d11 arms.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

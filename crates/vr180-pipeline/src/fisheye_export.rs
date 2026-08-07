@@ -1190,11 +1190,16 @@ pub fn export_fisheye(
                 &left_tex, &right_tex, cfg.eye_w, cfg.eye_h,
             )?;
             let sbs_rgb8 = pipeline.read_texture_rgb8(&sbs_tex, sbs_w, sbs_h)?;
-            let graded = if color_any {
+            let mut graded = if color_any {
                 apply_color_stack_rgb8(&*pipeline, &color_plan, sbs_rgb8, sbs_w, sbs_h)?
             } else {
                 sbs_rgb8
             };
+            // "BeyondVR Hack" — last, on the graded SBS (padding stays black).
+            if color_plan.eye_scale != 1.0 {
+                graded = pipeline.apply_eye_scale_sbs_rgb8(
+                    &graded, sbs_w, sbs_h, cfg.eye_w, color_plan.eye_scale)?;
+            }
             encoder.encode_frame(&graded)?;
         }
 
@@ -1479,9 +1484,14 @@ pub fn export_eac(
         };
         let sbs = pipeline.compose_sbs_textures(&left, &right, cfg.eye_w, cfg.eye_h)?;
         let rgb = pipeline.read_texture_rgb8(&sbs, sbs_w, sbs_h)?;
-        let graded = if color_any {
+        let mut graded = if color_any {
             apply_color_stack_rgb8(&pipeline, &color_plan, rgb, sbs_w, sbs_h)?
         } else { rgb };
+        // "BeyondVR Hack" — last, on the graded SBS (padding stays black).
+        if color_plan.eye_scale != 1.0 {
+            graded = pipeline.apply_eye_scale_sbs_rgb8(
+                &graded, sbs_w, sbs_h, cfg.eye_w, color_plan.eye_scale)?;
+        }
         encoder.encode_frame(&graded)?;
 
         frame_idx += 1;
