@@ -1133,6 +1133,18 @@ pub const DJI_IMU_PHASE_DEFAULT_MS: f32 = 8.5;
 /// change between clips) and never persisted, so each clip starts from the
 /// readout-midpoint default rather than a stale per-clip tweak.
 pub fn dji_imu_phase_default_ms_for_fps(fps: f32) -> f32 {
+    // 25 fps (PAL) EXCEPTION — lldb-measured DJI Studio ground truth
+    // (2026-08-14, EisGetMatrixForEisAndHorizontal capture on a real
+    // 25 fps clip): DJI samples the render quat at video_ts + 5.0 ms
+    // (fit err 0.03°), which is ≈5.5 ms on our uniform frame grid (the
+    // HR block ts sits ~0.6 ms before the per-frame video ts). The
+    // readout-midpoint rule below gives 9.15 ms here and measurably
+    // over-delays the stab sample — user-visible jitter on 25 fps pans
+    // (+38% residual). 30/50 fps verified good with the readout rule;
+    // deliberately untouched.
+    if fps < 27.0 {
+        return 5.5;
+    }
     dji_osmo_readout_ms_for_fps(fps) * 0.5
 }
 

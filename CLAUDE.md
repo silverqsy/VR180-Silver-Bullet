@@ -43,6 +43,10 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    artifacts so both platforms carry it (mac 2.1.0 artifacts already
    respun with it). No Windows-specific code: the stage rides the shared
    color stack (`ColorStackPlan.eye_scale`), incl. the NVENC/d3d11 arms.
+7. **25 fps OSV stab fix** (`dji_imu_phase_default_ms_for_fps` → 5.5 ms
+   for fps < 27, lldb-verified against DJI Studio) + restored the IMU
+   phase slider in the stab panel. Pipeline-level, shared code — pull +
+   rebuild; no Windows-specific work.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

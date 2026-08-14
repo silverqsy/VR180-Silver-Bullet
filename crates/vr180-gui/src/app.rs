@@ -4562,10 +4562,14 @@ impl App {
                 ui.add(egui::Slider::new(&mut s.dji_responsiveness, 0.2..=3.0)
                     .fixed_decimals(1)
                     .text(tr("Response")));
-                // IMU sample timing is fixed at SROT/2 (readout midpoint),
-                // re-seeded per clip from its own fps — no manual override, so
-                // the slider is hidden. Still assert the main-thread thread-local
-                // so paused detail-still renders use this clip's phase.
+                // IMU sample timing (ms after frame start). Re-seeded per
+                // clip from its fps (5.5 ms @25 fps — DJI-Studio-measured;
+                // readout/2 otherwise); the slider allows manual A/B around
+                // that default. Also asserts the main-thread thread-local so
+                // paused detail-still renders use this clip's phase.
+                ui.add(egui::Slider::new(&mut s.dji_imu_phase_ms, 0.0..=20.0)
+                    .step_by(0.1).fixed_decimals(1)
+                    .text(tr("IMU phase (ms)")));
                 vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
             }
         });
