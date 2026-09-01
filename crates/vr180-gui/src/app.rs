@@ -160,6 +160,12 @@ pub struct App {
     /// `loaded_path`; `None` when nothing is loaded or the active file
     /// was removed from the list.
     active_clip: Option<usize>,
+    /// In-flight "Auto align" stereo-offset measurement (one-shot worker);
+    /// `Some` while running. Result is the correction to ADD to the
+    /// stereo sliders.
+    align_rx: Option<crossbeam_channel::Receiver<Result<vr180_pipeline::stereo_align::StereoAlignResult, String>>>,
+    /// Last Auto align outcome, shown under the button.
+    align_status: Option<String>,
     /// True while the export queue is draining (one item exports at a time).
     batch_running: bool,
     /// Index of the item the current `export_job` belongs to (only
@@ -508,6 +514,15 @@ fn tr(en: &'static str) -> &'static str {
         "Camera baseline" => "相机基线",
         "None (no VR180 metadata)" => "无（不写入 VR180 元数据）",
         "Eye scale" => "单眼缩放",
+        // Auto align (View adjustment panel)
+        "Auto align" => "自动对齐",
+        "Aligning…" => "对齐中…",
+        "Applied" => "已应用",
+        "residual" => "残差",
+        "skipped (no far content)" => "跳过（无远景内容）",
+        "Auto align failed" => "自动对齐失败",
+        "Measures the vertical disparity between the eyes on a few frames and auto-fills the stereo pitch/roll (and yaw when the scene has far content). Adds to the current values — tweak after, or run again to refine."
+            => "在若干帧上测量双眼间的垂直视差，自动填充立体俯仰/滚转偏移（场景有远景时也包括偏航）。在当前值基础上累加——可再手动微调，或再次运行以进一步收敛。",
         "Scales each eye about its own center at the final output stage, padding with black. Half-equirect (VR180) output only."
             => "在最终输出阶段将每只眼睛的画面围绕各自中心缩放，四周填充黑色。仅对半等距柱状（VR180）输出生效。",
         // Source info
@@ -898,6 +913,8 @@ impl App {
             export_opts: ExportOptions::default(),
             batch: Vec::new(),
             active_clip: None,
+            align_rx: None,
+            align_status: None,
             batch_running: false,
             batch_current: None,
             batch_opts: None,
@@ -1730,6 +1747,14 @@ impl App {
                 // overrides). Non-EAC sources fall back to the default.
                 settings.rs_mode = crate::decoder::detect_rs_mode_for_path(&path, source_kind);
                 settings.rs_readout_ms = crate::decoder::default_rs_readout_ms();
+                // OSMO 360 II ("Osmo OQ002"): streams arrive eye-swapped
+                // relative to the I after the VR180 mod — seed the swap
+                // (the toggle still overrides per clip).
+                if matches!(source_kind, vr180_pipeline::SourceKind::DjiOsv)
+                    && crate::decoder::osv_is_osmo_ii(&path)
+                {
+                    settings.fisheye_swap_eyes = true;
+                }
                 settings.trim_in_s = None;
                 settings.trim_out_s = None;
             }
@@ -3426,6 +3451,7 @@ impl eframe::App for App {
         self.poll_export_job();
         // Auto-update: drain events + periodic re-check + popover.
         self.poll_updater(ctx);
+        self.poll_auto_align(ctx);
         self.draw_update_popover(ctx);
         if self.update_installing {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -4476,6 +4502,16 @@ impl App {
 
     fn draw_view_adjust_panel(&mut self, ui: &mut egui::Ui) {
         let zoom = self.preview_zoom;
+        // Snapshot Auto-align state before the &mut settings borrow below.
+        let align_ok = matches!(
+            self.clip.as_ref().map(|c| c.source_kind),
+            Some(vr180_pipeline::SourceKind::DjiOsv)
+                | Some(vr180_pipeline::SourceKind::SbsFisheye)
+                | Some(vr180_pipeline::SourceKind::BlackmagicRaw)
+                | Some(vr180_pipeline::SourceKind::GoProEac)
+        );
+        let align_running = self.align_rx.is_some();
+        let align_status = self.align_status.clone();
         let s = &mut self.settings;
         ui.label(RichText::new(tr("Global (both eyes)")).small().color(Color32::GRAY));
         // Rotational alignment: extra-fine (0.15×) on top of the zoom
@@ -4497,13 +4533,107 @@ impl App {
         ui.label(RichText::new(tr("Tip: select a field and press ↑ / ↓ to step its value precisely."))
             .small().color(Color32::from_rgb(130, 150, 175)));
         ui.add_space(4.0);
-        if ui.button(tr("Reset to 0")).clicked() {
-            s.pano_yaw_deg = 0.0;
-            s.pano_pitch_deg = 0.0;
-            s.pano_roll_deg = 0.0;
-            s.stereo_yaw_deg = 0.0;
-            s.stereo_pitch_deg = 0.0;
-            s.stereo_roll_deg = 0.0;
+        let mut start_align = false;
+        ui.horizontal(|ui| {
+            if ui.button(tr("Reset to 0")).clicked() {
+                s.pano_yaw_deg = 0.0;
+                s.pano_pitch_deg = 0.0;
+                s.pano_roll_deg = 0.0;
+                s.stereo_yaw_deg = 0.0;
+                s.stereo_pitch_deg = 0.0;
+                s.stereo_roll_deg = 0.0;
+            }
+            // Auto align: measure the inter-eye disparity field on a few
+            // frames and ADD the fitted pitch/roll (and gated yaw)
+            // correction to the stereo sliders. Fisheye-family sources.
+            if align_running {
+                ui.spinner();
+                ui.label(RichText::new(tr("Aligning…")).small());
+            } else if ui.add_enabled(align_ok, egui::Button::new(tr("Auto align")))
+                .on_hover_text(tr(
+                    "Measures the vertical disparity between the eyes on a few \
+                     frames and auto-fills the stereo pitch/roll (and yaw when \
+                     the scene has far content). Adds to the current values — \
+                     tweak after, or run again to refine."))
+                .clicked()
+            {
+                start_align = true;
+            }
+        });
+        if let Some(status) = align_status {
+            ui.label(RichText::new(status).small().color(Color32::from_rgb(130, 170, 130)));
+        }
+        if start_align {
+            self.start_auto_align();
+        }
+    }
+
+    /// Spawn the one-shot Auto align worker for the active clip.
+    fn start_auto_align(&mut self) {
+        let Some(idx) = self.active_clip else { return };
+        let Some(item) = self.batch.get(idx) else { return };
+        let segments = self.clip_segments(&item.path);
+        let item = &self.batch[idx];
+        let mut cfg = Self::build_export_cfg(
+            &item.path,
+            std::path::Path::new("/tmp/vr180-auto-align-unused.mp4"),
+            item.fps,
+            item.source_kind,
+            item.fisheye_eye_w,
+            item.fisheye_eye_h,
+            item.width,
+            item.height,
+            &self.settings,
+            &self.export_opts,
+            segments,
+        );
+        cfg.stabilize = false; // common rotation cancels inter-eye; skip IMU load
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.align_rx = Some(rx);
+        self.align_status = None;
+        let pipeline = self.pipeline.clone();
+        std::thread::spawn(move || {
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let res = vr180_pipeline::stereo_align::measure_stereo_align(pipeline, &cfg, cancel)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Poll the Auto align worker; apply the correction to the stereo
+    /// sliders when it lands.
+    fn poll_auto_align(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.align_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(r)) => {
+                self.settings.stereo_pitch_deg += r.d_stereo_pitch_deg;
+                self.settings.stereo_roll_deg += r.d_stereo_roll_deg;
+                if let Some(y) = r.d_stereo_yaw_deg {
+                    self.settings.stereo_yaw_deg += y;
+                }
+                let yaw_txt = match r.d_stereo_yaw_deg {
+                    Some(y) => format!("{y:+.3}°"),
+                    None => tr("skipped (no far content)").to_string(),
+                };
+                self.align_status = Some(format!(
+                    "{}: pitch {:+.3}°  roll {:+.3}°  yaw {}  ·  {} {:.3}°",
+                    tr("Applied"), r.d_stereo_pitch_deg, r.d_stereo_roll_deg,
+                    yaw_txt, tr("residual"), r.residual_deg));
+                self.align_rx = None;
+                ctx.request_repaint();
+            }
+            Ok(Err(e)) => {
+                self.align_status = Some(format!("{}: {e}", tr("Auto align failed")));
+                self.align_rx = None;
+                ctx.request_repaint();
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.align_status = Some(tr("Auto align failed").to_string());
+                self.align_rx = None;
+            }
         }
     }
 

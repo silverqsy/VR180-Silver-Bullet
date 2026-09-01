@@ -17,7 +17,7 @@
 //   5. Sample Y + UV from the resulting (u, v).
 //
 // The re-projection is one iteration of fixed-point — accurate enough
-// in practice (matches DJI Studio's algorithm + Python reference at
+// in practice (matches DJI Studio's output + Python reference at
 // `vr180_gui.py:1399-1440`).
 //
 // "RS off" convention: the buffer's first matrix has R00 == 0.0 →

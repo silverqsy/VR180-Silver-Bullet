@@ -473,7 +473,7 @@ fn one_pass_audio_eligible(cfg: &FisheyeExportConfig) -> bool {
 /// — native resolution (no cap), bit-depth matched to the output codec.
 /// Shared by the single-file path and the multi-segment
 /// [`SegmentedFisheyeIter`] so a merged recording decodes identically.
-fn fisheye_export_opener(
+pub(crate) fn fisheye_export_opener(
     kind: SourceKind,
     swap_eyes: bool,
     bit_depth: u8,
@@ -1273,7 +1273,7 @@ pub type EacPerEyeFrame = (
 /// sentinel — the shader warp is skipped entirely.
 ///
 /// Must mirror the GUI's `resolve_eac_lens_pair` so export == preview.
-fn resolve_eac_lens_pair(cfg: &FisheyeExportConfig) -> (crate::gpu::EacLensAdjust, crate::gpu::EacLensAdjust) {
+pub(crate) fn resolve_eac_lens_pair(cfg: &FisheyeExportConfig) -> (crate::gpu::EacLensAdjust, crate::gpu::EacLensAdjust) {
     use crate::gpu::EacLensAdjust;
     if !cfg.fisheye_override_left && !cfg.fisheye_override_right {
         return (EacLensAdjust::DISABLED, EacLensAdjust::DISABLED);
@@ -3060,7 +3060,7 @@ fn export_fisheye_osv_gpu_resident(
 /// Per-eye calibration resolver. Same logic as
 /// `vr180-gui::decoder::resolve_fisheye_calib_pair`, lifted here so the
 /// CLI / headless export doesn't pull in the GUI crate.
-fn resolve_calib_pair(
+pub(crate) fn resolve_calib_pair(
     cfg: &FisheyeExportConfig,
     src_w: u32,
     src_h: u32,

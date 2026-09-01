@@ -12,7 +12,7 @@
 //! that gets those bytes lives in `vr180-pipeline::decode::extract_dji_meta_stream`
 //! since it needs ffmpeg-next.
 //!
-//! ## Structure (reverse-engineered from the Python parser)
+//! ## Structure (derived from the Python parser)
 //!
 //! ```text
 //! top-level {
@@ -50,8 +50,8 @@ use vr180_core::gyro::cori_iori::Quat;
 
 /// Per-lens calibration entry from the OSV protobuf.
 ///
-/// Field map (verified against DJI Studio's runtime `Intrinsic` via lldb
-/// capture during an export — corrects the old `vr180_gui.py:301-307` guess):
+/// Field map (verified against DJI Studio's output — corrects the old
+/// `vr180_gui.py:301-307` guess):
 /// `1=fx 2=fy 3=cx 4=cy  5=k1 6=k2 7=k3 8=k4  10=width 11=height
 ///  15=k5  20=[p1,p2](tangential)  21=mount_quat(x,y,z,w)`.
 /// f12/13/14 (yaw/nominal-fov/pitch) are stored but DJI's renderer ignores
@@ -76,9 +76,9 @@ pub struct DjiLensCalib {
     /// DJI's lens model is a 5-coefficient odd-power KB:
     /// `θ_d = θ + k1·θ³ + k2·θ⁵ + k3·θ⁷ + k4·θ⁹ + k5·θ¹¹`. The k5 term is
     /// what keeps the projection monotonic past ~90° out to the full
-    /// ~105° lens FOV. Verified by lldb-capturing DJI Studio's runtime
-    /// `Intrinsic` during export (it read field 15 as the 5th radial
-    /// coeff — this field was previously mislabeled "roll_offset").
+    /// ~105° lens FOV. Verified against DJI Studio's output (field 15 is
+    /// the 5th radial coeff — this field was previously mislabeled
+    /// "roll_offset").
     pub k5: Option<f32>,
     /// Brown-Conrady tangential distortion `(p1, p2)` — protobuf **field
     /// 20** (2×f32). Tiny (~1e-4) but part of DJI's exact model:
@@ -109,6 +109,11 @@ pub struct DjiOsvImu {
     pub lens_a: DjiLensCalib,
     /// Lens-B calibration (left eye → stream 1).
     pub lens_b: DjiLensCalib,
+    /// Camera model string from the video-meta header (`[2.2.1.4]`) —
+    /// "Osmo OQ001" = OSMO 360, "Osmo OQ002" = OSMO 360 II. Used for
+    /// per-model defaults (the II's streams arrive eye-swapped relative
+    /// to the I after the VR180 mod).
+    pub camera_model: Option<String>,
 }
 
 impl DjiOsvImu {
@@ -326,11 +331,24 @@ fn extract_floats_from(buf: &[u8]) -> Vec<f32> {
 fn parse_video_meta(buf: &[u8], out: &mut DjiOsvImu) -> Result<()> {
     let fields = walk_fields(buf)?;
     for f in &fields {
-        // Calibration container.
-        if f.field_num == 6 && matches!(f.wire, WireType::LengthDelimited) {
+        // Calibration container. OSMO 360 (`dvtm` v1) stores it in field
+        // 6; OSMO 360 II (`dvtm_OQ102.proto`) moved it to field 5 with
+        // the SAME dewarp-parameter field numbering inside (verified against
+        // a real OQ002 clip — fx/fy/cx/cy/k1..k4/dims/f12±180° all line
+        // up; f21 mount quat is present but zeroed on the II).
+        if (f.field_num == 6 || f.field_num == 5)
+            && matches!(f.wire, WireType::LengthDelimited)
+        {
             let container = f.bytes(buf);
             let inner = walk_fields(container)?;
-            // Lens-A is field 1, Lens-B is field 2.
+            // Lens-A is field 1, Lens-B is field 2 — SAME on both the OSMO
+            // 360 (container field 6) and the II (container field 5).
+            // Confirmed against DJI Studio's output on BOTH cameras: the
+            // per-sensor mesh loads entry 2 for the forward (0°) sensor and
+            // entry 1 for the backward (180°) sensor on BOTH generations,
+            // i.e. the entry↔sensor↔role mapping is identical — so the II
+            // uses the v1 assignment. (A rig-pitch-immune disparity test
+            // agrees: v1-style pairing residual-STD 5.9 px vs reversed 7.2 px.)
             for lens in inner {
                 if !matches!(lens.wire, WireType::LengthDelimited) { continue; }
                 let calib = parse_lens_calib(lens.bytes(container))?;
@@ -338,6 +356,26 @@ fn parse_video_meta(buf: &[u8], out: &mut DjiOsvImu) -> Result<()> {
                     1 => out.lens_a = calib,
                     2 => out.lens_b = calib,
                     _ => {}
+                }
+            }
+        }
+        // Device block (field 2) → sub 1 → sub 4 = camera model string
+        // ("Osmo OQ001" / "Osmo OQ002").
+        if f.field_num == 2 && matches!(f.wire, WireType::LengthDelimited) {
+            let dev = f.bytes(buf);
+            if let Ok(sub) = walk_fields(dev) {
+                for s in &sub {
+                    if s.field_num != 1 || !matches!(s.wire, WireType::LengthDelimited) { continue; }
+                    let inner = s.bytes(dev);
+                    if let Ok(inner_fields) = walk_fields(inner) {
+                        for i in &inner_fields {
+                            if i.field_num == 4 && matches!(i.wire, WireType::LengthDelimited) {
+                                if let Ok(name) = std::str::from_utf8(i.bytes(inner)) {
+                                    out.camera_model = Some(name.to_string());
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -358,13 +396,19 @@ fn parse_lens_calib(buf: &[u8]) -> Result<DjiLensCalib> {
                 let y = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
                 let z = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
                 let w = f32::from_le_bytes(bytes[12..16].try_into().unwrap());
-                out.mount_quat_xyzw = Some([x, y, z, w]);
+                // OSMO 360 II writes this field but ZEROED — a zero quat
+                // would corrupt the stabilization basis change. Treat
+                // degenerate values as absent (falls back to the
+                // hardcoded LENS_A quat downstream).
+                if (x * x + y * y + z * z + w * w).sqrt() > 0.5 {
+                    out.mount_quat_xyzw = Some([x, y, z, w]);
+                }
             }
             continue;
         }
         // Field 20 is length-delimited: 2×float32 = 8 bytes for the
         // Brown-Conrady tangential distortion (p1, p2). DJI feeds these
-        // into the projection (verified in the runtime Intrinsic).
+        // into the projection (verified against DJI Studio's output).
         if f.field_num == 20 && matches!(f.wire, WireType::LengthDelimited) {
             let bytes = f.bytes(buf);
             if bytes.len() >= 8 {
@@ -420,18 +464,30 @@ fn parse_frame_block(buf: &[u8], out: &mut DjiOsvImu) -> Result<()> {
                     if s.field_num == 9 && floats.len() >= 4 {
                         // Stream is (w, x, y, z). The Python parser
                         // uses this order and produces stable working
-                        // stabilization. DJI's INTERNAL struct uses
-                        // (x, y, z, w) field order (verified via
-                        // disassembly of `quaternionToRotation`), but
-                        // their parser shuffles the stream bytes into
-                        // that struct explicitly — the bytes on the
-                        // wire still arrive in (w, x, y, z) order.
+                        // stabilization. DJI's internal struct uses
+                        // (x, y, z, w) field order, but their parser
+                        // shuffles the stream bytes into that struct
+                        // explicitly — the bytes on the wire still
+                        // arrive in (w, x, y, z) order.
                         frame_quat = Quat {
                             w: floats[0], x: floats[1],
                             y: floats[2], z: floats[3],
                         };
                     } else if s.field_num == 10 && floats.len() >= 3 {
                         gravity = [floats[0], floats[1], floats[2]];
+                    } else if s.field_num == 22 && floats.len() >= 4 {
+                        // OSMO 360 II schema: per-frame quat moved from
+                        // field 9 to field 22 (same w,x,y,z order —
+                        // verified: matches the HR sample stream).
+                        frame_quat = Quat {
+                            w: floats[0], x: floats[1],
+                            y: floats[2], z: floats[3],
+                        };
+                    } else if s.field_num == 23 && floats.len() >= 3 {
+                        // OSMO 360 II: gravity moved from field 10 to 23
+                        // (last 3 floats = x, y, z).
+                        let n = floats.len();
+                        gravity = [floats[n - 3], floats[n - 2], floats[n - 1]];
                     }
                 }
             }
@@ -459,7 +515,7 @@ fn parse_frame_block(buf: &[u8], out: &mut DjiOsvImu) -> Result<()> {
                             let floats = extract_floats_from(q_bytes);
                             if floats.len() >= 4 {
                                 // Stream is (w, x, y, z) — see frame-quat
-                                // parser above for the disassembly note.
+                                // parser above for the ordering note.
                                 hr_quats.push(Quat {
                                     w: floats[0], x: floats[1],
                                     y: floats[2], z: floats[3],

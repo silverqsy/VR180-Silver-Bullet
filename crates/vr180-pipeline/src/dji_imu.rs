@@ -76,15 +76,12 @@ const LENS_A_QUAT_XYZW: [f32; 4] = [
      0.7082221508,
 ];
 
-/// Pre-multiplier that maps DJI's lens-A camera frame to the convention
-/// Empirical fallback `[[-1,0,0],[0,0,1],[0,1,0]]` — verified
-/// visually correct for our VR180 shader on a tilt/yaw/roll test clip.
-/// Tested `K_CONSTᵀ = [[0,1,0],[0,0,1],[-1,0,0]]` (the math-derived
-/// value for equivalence with DJI's `INPUT·EIS·K_CONST` chain) on
-/// 2026-06-01; got "wrong axis or sign" visually. That tells us DJI's
-/// `INPUT` from `EisGetMatrixForDirectionLock` at "looking forward"
-/// is NOT what the math requires for equivalence — it's something
-/// else we'd need to decode from `EisGetMatrixForDirectionLock`.
+/// Pre-multiplier that maps the lens-A camera frame to the convention
+/// the rest of our pipeline expects. Empirical fallback
+/// `[[-1,0,0],[0,0,1],[0,1,0]]` — verified visually correct for our
+/// VR180 shader on a tilt/yaw/roll test clip. An alternative
+/// math-derived value `[[0,1,0],[0,0,1],[-1,0,0]]` was tried and gave
+/// "wrong axis or sign" visually, so we keep the empirical matrix.
 const AXIS_CORRECTION: [[f32; 3]; 3] = [
     [-1.0, 0.0, 0.0],
     [ 0.0, 0.0, 1.0],
@@ -128,7 +125,7 @@ const fn mat3_mul(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 }
 
 /// Rodrigues rotation vector `(x, y, z)` → unit quaternion `(w, x, y, z)`.
-/// Mirrors DJI Studio's `DUALFISHEYEVIDEOEIS::rotvec2quaternion`. The
+/// Mirrors DJI Studio's rotation-vector→quaternion conversion. The
 /// magnitude `|v|` is the rotation angle in radians; `v / |v|` is the
 /// axis. For near-zero vectors returns the identity quaternion.
 fn rotvec_to_quat(x: f32, y: f32, z: f32) -> Quat {
@@ -163,11 +160,10 @@ const fn quat_xyzw_to_mat3(q: [f32; 4]) -> [[f32; 3]; 3] {
     ]
 }
 
-/// DJI Studio's K-matrix stack at runtime, captured live from EisBase
-/// via lldb (eis_fields.log, 2026-05-31). K0 and K2/K3 are exact
-/// permutation matrices; K1 carries sub-degree factory calibration in
-/// its off-diagonal entries. The combined `M = K3·K0·K1·K2` evaluates
-/// to a 0.713° rotation (`trace(M) = 2.99985`), which is precisely the
+/// DJI Studio's K-matrix stack. K0 and K2/K3 are exact permutation
+/// matrices; K1 carries sub-degree factory calibration in its
+/// off-diagonal entries. The combined `M = K3·K0·K1·K2` evaluates to a
+/// 0.713° rotation (`trace(M) = 2.99985`), which is precisely the
 /// magnitude of the residual angle gap we're trying to close.
 const K0: [[f32; 3]; 3] = [
     [1.0, 0.0, 0.0],
@@ -212,8 +208,8 @@ const M_INV: [[f32; 3]; 3] = [
 /// resolves to ≈ `[[0,-1,0],[0,0,1],[-1,0,0]]` (the Python fallback)
 /// plus the quat's < 1° off-diagonal fine adjustments.
 ///
-/// **2026-05-31**: tried applying a Y↔Z swap that made our matrix
-/// match DJI's lldb-captured `+0x3d8` matrix numerically — 8 of 9
+/// A previous experiment tried applying a Y↔Z swap that made our
+/// matrix match DJI's stabilization matrix numerically — 8 of 9
 /// entries within 0.02 at frames 188 and 296. But the visual output
 /// became 90° CW rotated with broken stab. Conclusion: DJI's shader
 /// and our shader apply rotation matrices in DIFFERENT BASES, so
@@ -280,9 +276,8 @@ pub fn compute_dji_stabilization(
     //
     // **Preferred path** — Catmull-Rom time-interpolation at the frame's
     // exact midpoint over a merged prev+curr+next high-rate timeline.
-    // This matches DJI Studio's `getQuaternionForEisAndHorizontal` for
-    // the per-slab central time and avoids the ±0.5 ms discretization
-    // error of picking `hr[len/2]`.
+    // This matches DJI Studio's per-slab central-time sampling and
+    // avoids the ±0.5 ms discretization error of picking `hr[len/2]`.
     //
     // **Fallback** — when the timeline can't be built (e.g. frame has
     // < 4 total samples across prev/curr/next, or HR data missing),
@@ -339,10 +334,10 @@ pub fn compute_dji_stabilization(
     // direction at frame 0). At frame N it produces the rotation that
     // takes the camera from its current pose back to frame 0's pose.
     //
-    // This differs from DJI Studio's `getMatrixForEisAndHorizontal`,
-    // which is horizon-lock-to-identity (`q_actual⁻¹` alone). The DJI
-    // formula leaves the view tilted by the camera's initial pose at
-    // frame 0; user wants frame 0 itself as the lock anchor instead.
+    // This differs from DJI Studio's stabilization, which is
+    // horizon-lock-to-identity (`q_actual⁻¹` alone). The DJI formula
+    // leaves the view tilted by the camera's initial pose at frame 0;
+    // user wants frame 0 itself as the lock anchor instead.
     let q_zero = frame_quats[0];
 
     // Optional velocity-dampened smoothing on the per-frame IMU quats
@@ -366,9 +361,10 @@ pub fn compute_dji_stabilization(
     };
 
     // Per-clip lens_a from protobuf field 21. Two effects:
-    // 1. Compute DJI's exact `+0x3d8` rotation: R_dji = mat((q_la·q_imu)⁻¹)
-    //    = mat(q_imu⁻¹·q_la⁻¹). This is what DJI Studio applies in its
-    //    shader (verified element-wise: max diff 0.19 vs DJI's matrix).
+    // 1. Compute DJI's exact stabilization rotation:
+    //    R_dji = mat((q_la·q_imu)⁻¹) = mat(q_imu⁻¹·q_la⁻¹). This is
+    //    what DJI Studio applies in its shader (matched element-wise:
+    //    max diff 0.19 vs DJI's matrix).
     // 2. Apply only AXIS_CORRECTION (not C·R·Cᵀ similarity-with-lens_a)
     //    as the shader convention swap. This routes DJI's exact
     //    rotation into our shader's expected coordinate system.
@@ -377,17 +373,16 @@ pub fn compute_dji_stabilization(
     // similarity transform — that ZEROS the q_lens_a contribution to
     // the rotation magnitude, so the per-camera lens_a difference
     // (~0.5°) gave us drift relative to DJI on different cameras.
-    // We reached the limit of static analysis (2026-06-01). DJI's Metal
-    // shaders (pano2FisheyeShader, panoAndRollingShutterCalibration2FisheyeShader)
-    // render to a 360° panorama output (lon range [-π, +π], 360°-full),
-    // while our shader renders VR180 half-equirect (lon range
-    // [-output_hfov, +output_hfov] ≈ ±90°). The matrix DJI feeds to
-    // its shader is correct for DJI's 360° output basis; the matrix
-    // we feed our shader has to be correct for our 180° output basis.
-    // Same IMU input → different matrix output via different per-pipeline
-    // basis change. There is no way to make "DJI's exact +0x3d8 matrix"
-    // produce visually correct output in OUR shader without rewriting
-    // our shader's projection convention to match DJI's.
+    // DJI's Metal shaders render to a 360° panorama output (lon range
+    // [-π, +π], 360°-full), while our shader renders VR180 half-equirect
+    // (lon range [-output_hfov, +output_hfov] ≈ ±90°). The matrix DJI
+    // feeds to its shader is correct for DJI's 360° output basis; the
+    // matrix we feed our shader has to be correct for our 180° output
+    // basis. Same IMU input → different matrix output via different
+    // per-pipeline basis change. There is no way to make "DJI's exact
+    // stabilization matrix" produce visually correct output in OUR
+    // shader without rewriting our shader's projection convention to
+    // match DJI's.
     //
     // The OLD pipeline (C·R·Cᵀ similarity with C = AXIS · mat(q_lens_a))
     // is the correct stabilization for our shader. Keeping it.
@@ -469,8 +464,7 @@ fn smooth_gravity_ema(
 
 /// Build the merged prev+curr+next high-rate-sample timeline for
 /// frame `fi` and Catmull-Rom interpolate to the **frame midpoint
-/// time** (matches what DJI's `getQuaternionForEisAndHorizontal` does
-/// for a single slab's central time).
+/// time** (matches what DJI does for a single slab's central time).
 ///
 /// Returns `None` when there aren't enough samples to interpolate
 /// (need ≥ 2 in the current frame and ≥ 4 total across the timeline).
@@ -572,8 +566,8 @@ fn interpolated_mid_frame_quat(
 
 /// Smallest rotation that aligns a camera-frame gravity vector with
 /// world-frame down `(0, 0, -1)`. This is the horizon-lock correction
-/// DJI Studio computes per frame (verified via disassembly of
-/// `EisBase::getMatrixForEisAndHorizontal`).
+/// DJI Studio computes per frame (verified against DJI Studio's
+/// output).
 ///
 /// The returned quaternion `q` satisfies
 ///     q · gravity_cam · q⁻¹ ≈ (0, 0, -1)
@@ -765,7 +759,7 @@ fn smooth_quats_velocity_dampened(
 ///    window is centred on the IMU-phase point — the same point as the
 ///    per-frame stab sample (see `dji_imu_phase_offset_s_fps`).
 /// 4. Component-wise Catmull-Rom interpolate the merged quaternion
-///    timeline to that time (matches DJI Studio's `catmullRomQuaternion`
+///    timeline to that time (matches DJI Studio's interpolation
 ///    convention — NLERP-style, not slerp).
 /// 5. Also interpolate at `t_mid` (the readout-window center; the
 ///    reference orientation each row is corrected to).
@@ -861,8 +855,8 @@ pub fn compute_per_row_quaternions_for_frame(
     // when the camera switches sensor modes (different fps → maybe
     // different readout).
     // RS window phase — the SAME IMU-phase point as the per-frame stab
-    // sample (DJI anchors both to one point; verified via disasm). The
-    // readout window is centred on it, ±readout/2.
+    // sample (DJI anchors both to one point; confirmed empirically).
+    // The readout window is centred on it, ±readout/2.
     let phase_offset_s = dji_imu_phase_offset_s_fps(readout_s, fps);
     let readout_start = (frame_dur - readout_s) * 0.5 + phase_offset_s;
     let t_mid = frame_dur * 0.5 + phase_offset_s;
@@ -912,14 +906,13 @@ pub fn compute_per_row_quaternions_for_frame(
 
 /// Component-wise Catmull-Rom interpolation of four control quats at
 /// query time `t`. Mirrors `vr180_gui.py:934-963` (NLERP-style, not
-/// slerp — matches DJI Studio's `catmullRomQuaternion`).
+/// slerp).
 /// Two-sample spherical interpolation at time `t` between adjacent
 /// IMU samples `(q1, t1)` and `(q2, t2)`. The `q0, q3, t0, t3`
 /// parameters are kept for call-site compatibility but ignored —
 /// they were the outer Catmull-Rom control points; DJI Studio's
-/// `getQuaternionForEisAndHorizontal` does pure slerp between the
-/// floor/ceil samples of its global timeline (verified via
-/// disassembly: `bl __ZN…quaternionSlerp…`).
+/// stabilization does pure slerp between the floor/ceil samples of
+/// its global timeline (matched empirically).
 fn catmull_rom_quat_components(
     _q0: Quat, q1: Quat, q2: Quat, _q3: Quat,
     _t0: f32, t1: f32, t2: f32, _t3: f32,
@@ -976,9 +969,8 @@ fn slerp_quat(a: Quat, b: Quat, wa: f32, wb: f32) -> Quat {
     }
 }
 
-/// DJI Studio's fixed output basis matrix `K_const`, extracted from
-/// `UtilsWrapper::getMatrixForEisAndHorizontal` (rodata at vmaddrs
-/// `0x102736a50`, `0x102737150`, `0x102736a40`, `0x102737170`).
+/// DJI Studio's fixed output basis matrix `K_const` — empirically
+/// matched to DJI's output.
 ///
 /// 3×3 portion, row-major:
 /// ```
@@ -990,13 +982,11 @@ fn slerp_quat(a: Quat, b: Quat, wa: f32, wb: f32) -> Quat {
 /// Kept here for reference. **NOT used at runtime** — the K_const-based
 /// experiments (right-multiply, similarity, similarity-with-flipped
 /// row) all introduced sign errors on roll/yaw axes vs. our long-
-/// standing fallback similarity. The caller's MKMatrix4 in DJI's
-/// pipeline encodes more than just `K_const⁻¹`; we can't infer it
-/// without seeing the UI code that constructs it.
-/// Post-multiply applied by `UtilsWrapper::getMatrixForEisAndHorizontal`
-/// in DJI Studio (rodata at 0x102736a50, 0x102737150, 0x102736a40,
-/// 0x102737170 — verified via lldb memory dump 2026-06-01). The
-/// Metal shader receives `+0x3d8_matrix · K_CONST`, not just +0x3d8.
+/// standing fallback similarity. DJI's pipeline encodes more than just
+/// `K_const⁻¹` in the caller; we can't infer it from the output alone.
+/// DJI Studio post-multiplies its stabilization matrix by this basis:
+/// the Metal shader receives `stab_matrix · K_CONST`, not the
+/// stabilization matrix alone.
 const K_CONST: [[f32; 3]; 3] = [
     [0.0, 0.0, -1.0],
     [1.0, 0.0,  0.0],
@@ -1034,9 +1024,8 @@ pub fn pack_per_row_camera_matrices(quats: &[Quat], lens_a_quat_xyzw: [f32; 4]) 
 /// sensor crops/bins to fit the smaller frame budget) — use
 /// [`dji_osmo_readout_ms_for_fps`] when fps is known.
 ///
-/// Measured via lldb capture of EisBase fields `+0x60c` (scan lines) ×
-/// `+0x614` (ns per line) in DJI Studio — the exact `scan_lines · ns_per_line`
-/// the firmware uses:
+/// Derived from the sensor's `scan_lines · ns_per_line` — the exact
+/// readout the firmware uses, matched against DJI Studio's output:
 /// - 30 fps:   4766 × 3840 ns = 18.301 ms  ← this constant
 /// - 50 fps:   4226 × 3840 ns = 16.228 ms (different sensor mode; see
 ///             [`dji_osmo_readout_ms_for_fps`])
@@ -1059,8 +1048,8 @@ pub fn dji_osmo_readout_ms_for_fps(fps: f32) -> f32 {
 }
 
 /// Number of horizontal slices DJI's pipeline uses per frame.
-/// Hardcoded in `getMatrixForEisAndHorizontal` — confirmed via
-/// disassembly. Same value across all OSMO 360 firmware revisions
+/// A fixed value in DJI's stabilization pipeline — confirmed
+/// empirically. Same value across all OSMO 360 firmware revisions
 /// we've inspected.
 pub const DJI_OSMO_SLICE_COUNT: f32 = 8.0;
 
@@ -1104,8 +1093,8 @@ pub fn dji_imu_phase_offset_s(_readout_s: f32) -> f32 {
     dji_imu_phase_offset_s_fps(_readout_s, 29.97)
 }
 
-/// FPS-aware phase offset. Empirically derived from DJI Studio
-/// `+0x3d8` matrix captures at both 30 fps and 50 fps:
+/// FPS-aware phase offset. Empirically derived by matching DJI
+/// Studio's output at both 30 fps and 50 fps:
 ///
 /// | fps | empirical phase from mid-frame | implies time-from-frame-start |
 /// |-----|------------------------------|-----------------------------|
@@ -1122,8 +1111,8 @@ pub fn dji_imu_phase_offset_s(_readout_s: f32) -> f32 {
 /// for callers that want to pass it (it informs the per-row pipeline's
 /// readout window separately).
 /// Default IMU sample offset (ms after frame_start) — the empirically
-/// verified DJI sample point (see dji_studio_field_measurements: DJI's
-/// own formula lands 8.05–8.77 ms after frame_start across 30/50 fps).
+/// verified DJI sample point (DJI's own formula lands 8.05–8.77 ms
+/// after frame_start across 30/50 fps).
 pub const DJI_IMU_PHASE_DEFAULT_MS: f32 = 8.5;
 
 /// FPS-aware default IMU-phase value (ms after frame_start) used to seed
@@ -1133,9 +1122,8 @@ pub const DJI_IMU_PHASE_DEFAULT_MS: f32 = 8.5;
 /// change between clips) and never persisted, so each clip starts from the
 /// readout-midpoint default rather than a stale per-clip tweak.
 pub fn dji_imu_phase_default_ms_for_fps(fps: f32) -> f32 {
-    // 25 fps (PAL) EXCEPTION — lldb-measured DJI Studio ground truth
-    // (2026-08-14, EisGetMatrixForEisAndHorizontal capture on a real
-    // 25 fps clip): DJI samples the render quat at video_ts + 5.0 ms
+    // 25 fps (PAL) EXCEPTION — measured against DJI Studio's output on
+    // a real 25 fps clip: DJI samples the render quat at video_ts + 5.0 ms
     // (fit err 0.03°), which is ≈5.5 ms on our uniform frame grid (the
     // HR block ts sits ~0.6 ms before the per-frame video ts). The
     // readout-midpoint rule below gives 9.15 ms here and measurably

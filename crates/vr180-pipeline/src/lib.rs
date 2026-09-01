@@ -15,6 +15,7 @@ pub mod dji_imu;
 pub mod encode;
 pub mod fisheye_decode;
 pub mod fisheye_export;
+pub mod stereo_align;
 pub mod gpu;
 pub mod helpers;
 pub mod imu;

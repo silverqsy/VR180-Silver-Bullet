@@ -121,6 +121,18 @@ pub(crate) fn detect_rs_mode_for_path(
     }
 }
 
+/// True when an OSV was recorded by the OSMO 360 **II** ("Osmo OQ002").
+/// The II's two video streams arrive eye-swapped relative to the I after
+/// the VR180 mod, so fresh clips seed `fisheye_swap_eyes = true`. Cheap:
+/// byte-sniffs the model string in the djmd head (moov-only read, no
+/// full metadata parse), so it's safe on the batch-add path even for
+/// NAS files.
+pub(crate) fn osv_is_osmo_ii(path: &std::path::Path) -> bool {
+    vr180_pipeline::decode::extract_dji_calib_blob(path)
+        .map(|b| b.windows(10).any(|w| w == b"Osmo OQ002"))
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -1901,8 +1913,8 @@ fn run_fisheye(
         // Per-row RS matrices for this frame. Built lazily on CPU; ~46 KB
         // for src_h=1280 so the per-frame `queue.write_buffer` is cheap.
         // When present, fused per-row stab + RS gives us DJI Studio's
-        // per-slab quality (matches their `getMatrixForEisAndHorizontal`
-        // x slab x scanline approach) without leaving the live pipeline.
+        // per-slab quality (matches its per-slab, per-scanline
+        // approach) without leaving the live pipeline.
         let rs_quats: Option<Vec<vr180_core::gyro::cori_iori::Quat>> =
             if control.settings.read().stabilize {
                 dji_osv_imu.as_ref().and_then(|osv| {

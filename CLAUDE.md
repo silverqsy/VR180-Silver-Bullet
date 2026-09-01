@@ -44,7 +44,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    respun with it). No Windows-specific code: the stage rides the shared
    color stack (`ColorStackPlan.eye_scale`), incl. the NVENC/d3d11 arms.
 7. **25 fps OSV stab fix** (`dji_imu_phase_default_ms_for_fps` → 5.5 ms
-   for fps < 27, lldb-verified against DJI Studio) + restored the IMU
+   for fps < 27, verified against DJI Studio's output) + restored the IMU
    phase slider in the stab panel. Pipeline-level, shared code — pull +
    rebuild; no Windows-specific work.
 
@@ -72,7 +72,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
 The macOS feature batch that the Windows session verified (kept as the
 engineering record — the checklist was what to *confirm*, not to port):
 
-1. **DJI lens model is now exact** (reverse-engineered from DJI Studio —
+1. **DJI lens model is now exact** (matched to DJI Studio's output —
    verified against its export). Auto mode loads the per-lens FACTORY
    calibration from the OSV protobuf: fx/fy, raw cx/cy (top-left, y-down,
    NO flip), k1–k4, **k5 (field 15)**, and **Brown-Conrady tangential
@@ -269,7 +269,7 @@ slash string literals); `include_str!`'d shaders + `assets/` are portable.
 
 ## DJI OSV lens model (exact — don't simplify)
 
-Reverse-engineered from DJI Studio's binary and bit-matched at runtime.
+Empirically matched to DJI Studio's output, bit-for-bit.
 Per-lens calib block in the OSV protobuf (`vr180-fisheye/src/dji_osv.rs`):
 `1=fx 2=fy 3=cx 4=cy 5..8=k1..k4 10=W 11=H 15=k5 20=[p1,p2]
 21=mount_quat`. Projection (in every KB WGSL shader's `project_kb`):

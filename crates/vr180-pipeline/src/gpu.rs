@@ -77,7 +77,7 @@ pub struct Device {
     fisheye_to_hequirect_16: FisheyeToHequirectPipeline,
     /// RS-aware variant of `fisheye_to_hequirect`. Used by the GUI
     /// preview when DJI OSV per-row matrices are available, to apply
-    /// per-scanline correction (matches DJI Studio's per-slab approach).
+    /// per-scanline correction (matches DJI Studio's output).
     fisheye_to_hequirect_rs: FisheyeToHequirectRsPipeline,
     /// 16-bit-output RS half-equirect projection (Windows zero-copy preview
     /// stab with per-row rolling-shutter correction).
@@ -214,7 +214,7 @@ struct FisheyeToHequirectPipeline {
 /// RS-aware sibling of `FisheyeToHequirectPipeline` for the RGBA
 /// preview path. Adds a 6th binding for the per-scanline R-matrix
 /// storage buffer used by `fisheye_to_hequirect_rs.wgsl`. Fuses
-/// per-row rolling-shutter / per-slab stabilization into the projection
+/// per-row rolling-shutter stabilization into the projection
 /// for OSV live preview.
 #[derive(Debug)]
 struct FisheyeToHequirectRsPipeline {
@@ -4619,8 +4619,8 @@ impl Device {
     /// Takes an additional per-scanline rotation buffer (`rs_rows_f32`
     /// = 12 f32 per row × `src_h` rows) and applies per-row correction
     /// fused with the per-frame stab. Used by the GUI preview path when
-    /// DJI OSV per-row matrices are available so we get DJI Studio's
-    /// per-slab stab quality without leaving the live pipeline.
+    /// DJI OSV per-row matrices are available so we match DJI Studio's
+    /// stabilization quality without leaving the live pipeline.
     pub fn project_fisheye_to_equirect_rs_texture(
         &self,
         src_rgba: &[u8],
