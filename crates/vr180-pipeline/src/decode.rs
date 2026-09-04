@@ -1832,6 +1832,24 @@ pub(crate) fn download_hw_frame(
 
 // ─── D3D11VA hwaccel plumbing (Windows only) ───────────────────────────
 
+/// Vendor ID of the GPU selected by the host's renderer. FFmpeg otherwise
+/// creates D3D11VA on Windows' default display adapter, which is commonly the
+/// integrated GPU on hybrid laptops even when rendering uses the dGPU.
+#[cfg(target_os = "windows")]
+static D3D11VA_VENDOR_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Keep FFmpeg's independent D3D11VA decode device on the same GPU vendor as
+/// the renderer. A value of zero restores FFmpeg's default-adapter behavior.
+#[cfg(target_os = "windows")]
+pub fn set_d3d11va_vendor_id(vendor_id: u32) {
+    D3D11VA_VENDOR_ID.store(vendor_id, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(
+        vendor = format_args!("{vendor_id:#06x}"),
+        "D3D11VA decode adapter pinned to renderer vendor"
+    );
+}
+
 /// Wire D3D11VA hardware decode onto a codec context (Windows). Mirror
 /// of [`try_enable_videotoolbox_decode`]: creates an FFmpeg-owned D3D11
 /// device, installs it as `hw_device_ctx`, and points `get_format` at
@@ -1850,17 +1868,38 @@ pub(crate) fn try_enable_d3d11va_decode(
 ) -> bool {
     use ffmpeg_next::ffi::*;
     let mut hw_device: *mut AVBufferRef = std::ptr::null_mut();
+
+    // `vendor_id` is an FFmpeg-supported D3D11VA device option. Unlike a
+    // numeric DXGI adapter index it remains stable when Windows reorders
+    // adapters or a dock/eGPU is connected.
+    let vendor_id = D3D11VA_VENDOR_ID.load(std::sync::atomic::Ordering::Relaxed);
+    let vendor_value = (vendor_id != 0)
+        .then(|| std::ffi::CString::new(format!("{vendor_id:#06x}")).unwrap());
+    let vendor_key = std::ffi::CString::new("vendor_id").unwrap();
+    let mut options: *mut AVDictionary = std::ptr::null_mut();
+    if let Some(value) = vendor_value.as_ref() {
+        let set_ret =
+            unsafe { av_dict_set(&mut options, vendor_key.as_ptr(), value.as_ptr(), 0) };
+        if set_ret < 0 {
+            tracing::warn!(
+                "could not set D3D11VA vendor_id={vendor_id:#06x} (ret={set_ret}); using default adapter"
+            );
+        }
+    }
     let ret = unsafe {
         av_hwdevice_ctx_create(
             &mut hw_device,
             AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
-            std::ptr::null(),     // device name — picks the default adapter
-            std::ptr::null_mut(), // options
+            std::ptr::null(), // select by vendor_id option, or default if unset
+            options,
             0,
         )
     };
+    unsafe { av_dict_free(&mut options) };
     if ret < 0 || hw_device.is_null() {
-        tracing::debug!("av_hwdevice_ctx_create D3D11VA returned {ret}");
+        tracing::debug!(
+            "av_hwdevice_ctx_create D3D11VA vendor={vendor_id:#06x} returned {ret}"
+        );
         return false;
     }
     unsafe {

@@ -20,6 +20,56 @@ mod updater;
 
 use tracing_subscriber::EnvFilter;
 
+/// Pick a surface-compatible GPU deterministically. `HighPerformance` is only
+/// a hint to Windows/wgpu and can still resolve to the integrated adapter on a
+/// hybrid laptop. Prefer a real discrete adapter, with Vulkan ahead of DX12
+/// because the Windows zero-copy D3D11VA interop path imports into Vulkan.
+fn select_gpu_adapter(
+    adapters: &[wgpu::Adapter],
+    surface: Option<&wgpu::Surface<'_>>,
+) -> Result<wgpu::Adapter, String> {
+    let device_rank = |kind: wgpu::DeviceType| match kind {
+        wgpu::DeviceType::DiscreteGpu => 4,
+        wgpu::DeviceType::IntegratedGpu => 3,
+        wgpu::DeviceType::VirtualGpu => 2,
+        wgpu::DeviceType::Cpu => 1,
+        wgpu::DeviceType::Other => 0,
+    };
+    let backend_rank = |backend: wgpu::Backend| match backend {
+        wgpu::Backend::Vulkan => 3,
+        wgpu::Backend::Dx12 => 2,
+        wgpu::Backend::Metal => 2,
+        _ => 1,
+    };
+
+    let adapter = adapters
+        .iter()
+        .filter(|adapter| surface.map_or(true, |s| adapter.is_surface_supported(s)))
+        .max_by_key(|adapter| {
+            let info = adapter.get_info();
+            (device_rank(info.device_type), backend_rank(info.backend))
+        })
+        .cloned()
+        .ok_or_else(|| "no wgpu adapter can present to this window".to_owned())?;
+
+    let info = adapter.get_info();
+    tracing::info!(
+        backend = ?info.backend,
+        device_type = ?info.device_type,
+        vendor = format_args!("{:#06x}", info.vendor),
+        name = %info.name,
+        "explicit GPU adapter selected"
+    );
+
+    // FFmpeg creates its own D3D11 device for hardware video decode. Point it
+    // at the same physical vendor so it does not silently fall back to the
+    // Intel iGPU while wgpu is rendering on the dedicated GPU.
+    #[cfg(target_os = "windows")]
+    vr180_pipeline::decode::set_d3d11va_vendor_id(info.vendor);
+
+    Ok(adapter)
+}
+
 /// Decode the bundled `.ico` into an egui window icon (its largest frame) for
 /// the live window — title bar + taskbar while the app is running. The .exe's
 /// *file* icon (Explorer, the installer's shortcut) is a separate build-time
@@ -100,13 +150,17 @@ fn main() -> anyhow::Result<()> {
         // Rg16Unorm without re-creating the device.
         // egui-wgpu 0.34 moved device-creation knobs into `wgpu_setup`.
         // `WgpuSetupCreateNew` has no `Default`, so start from the default
-        // config and override only the device descriptor — we request
+        // config and override adapter selection + the device descriptor. We
+        // explicitly prefer a discrete Vulkan adapter (Windows' generic high-
+        // performance hint can still select an iGPU), and request
         // TEXTURE_FORMAT_16BIT_NORM (needed for the R16/Rg16 16-bit color
         // stack). Backend left default (Vulkan on Windows); forcing DX12
         // caused DXGI_ERROR_DEVICE_REMOVED with D3D11VA decode + wgpu-D3D12.
         wgpu_options: {
             let mut cfg = egui_wgpu::WgpuConfiguration::default();
             if let egui_wgpu::WgpuSetup::CreateNew(create) = &mut cfg.wgpu_setup {
+                create.native_adapter_selector =
+                    Some(std::sync::Arc::new(select_gpu_adapter));
                 create.device_descriptor = std::sync::Arc::new(|adapter: &wgpu::Adapter| {
                     // TEXTURE_FORMAT_16BIT_NORM: R16/Rg16 color stack.
                     // TEXTURE_FORMAT_P010 / _NV12: zero-copy import of
