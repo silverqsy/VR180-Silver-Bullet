@@ -1832,24 +1832,6 @@ pub(crate) fn download_hw_frame(
 
 // ─── D3D11VA hwaccel plumbing (Windows only) ───────────────────────────
 
-/// Vendor ID of the GPU selected by the host's renderer. FFmpeg otherwise
-/// creates D3D11VA on Windows' default display adapter, which is commonly the
-/// integrated GPU on hybrid laptops even when rendering uses the dGPU.
-#[cfg(target_os = "windows")]
-static D3D11VA_VENDOR_ID: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
-
-/// Keep FFmpeg's independent D3D11VA decode device on the same GPU vendor as
-/// the renderer. A value of zero restores FFmpeg's default-adapter behavior.
-#[cfg(target_os = "windows")]
-pub fn set_d3d11va_vendor_id(vendor_id: u32) {
-    D3D11VA_VENDOR_ID.store(vendor_id, std::sync::atomic::Ordering::Relaxed);
-    tracing::info!(
-        vendor = format_args!("{vendor_id:#06x}"),
-        "D3D11VA decode adapter pinned to renderer vendor"
-    );
-}
-
 /// Wire D3D11VA hardware decode onto a codec context (Windows). Mirror
 /// of [`try_enable_videotoolbox_decode`]: creates an FFmpeg-owned D3D11
 /// device, installs it as `hw_device_ctx`, and points `get_format` at
@@ -1869,37 +1851,17 @@ pub(crate) fn try_enable_d3d11va_decode(
     use ffmpeg_next::ffi::*;
     let mut hw_device: *mut AVBufferRef = std::ptr::null_mut();
 
-    // `vendor_id` is an FFmpeg-supported D3D11VA device option. Unlike a
-    // numeric DXGI adapter index it remains stable when Windows reorders
-    // adapters or a dock/eGPU is connected.
-    let vendor_id = D3D11VA_VENDOR_ID.load(std::sync::atomic::Ordering::Relaxed);
-    let vendor_value = (vendor_id != 0)
-        .then(|| std::ffi::CString::new(format!("{vendor_id:#06x}")).unwrap());
-    let vendor_key = std::ffi::CString::new("vendor_id").unwrap();
-    let mut options: *mut AVDictionary = std::ptr::null_mut();
-    if let Some(value) = vendor_value.as_ref() {
-        let set_ret =
-            unsafe { av_dict_set(&mut options, vendor_key.as_ptr(), value.as_ptr(), 0) };
-        if set_ret < 0 {
-            tracing::warn!(
-                "could not set D3D11VA vendor_id={vendor_id:#06x} (ret={set_ret}); using default adapter"
-            );
-        }
-    }
     let ret = unsafe {
         av_hwdevice_ctx_create(
             &mut hw_device,
             AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
-            std::ptr::null(), // select by vendor_id option, or default if unset
-            options,
+            std::ptr::null(),
+            std::ptr::null_mut(),
             0,
         )
     };
-    unsafe { av_dict_free(&mut options) };
     if ret < 0 || hw_device.is_null() {
-        tracing::debug!(
-            "av_hwdevice_ctx_create D3D11VA vendor={vendor_id:#06x} returned {ret}"
-        );
+        tracing::debug!("av_hwdevice_ctx_create D3D11VA returned {ret}");
         return false;
     }
     unsafe {
@@ -1908,6 +1870,92 @@ pub(crate) fn try_enable_d3d11va_decode(
         (*raw).get_format = Some(d3d11va_get_format);
     }
     true
+}
+
+/// Attach hardware decode to the exact Vulkan adapter used by the consumer.
+/// A missing LUID or a different actual D3D11 device rejects zero-copy so the
+/// caller can use the portable decode/download/upload path.
+#[cfg(target_os = "windows")]
+pub(crate) fn enable_d3d11va_decode_on_adapter(
+    dec_ctx: &mut ffmpeg_next::codec::context::Context,
+    luid: Option<[u8; 8]>,
+) -> Result<()> {
+    use ffmpeg_next::ffi::*;
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1};
+
+    let wanted = luid.ok_or_else(|| Error::Ffmpeg(
+        "zero-copy requires a valid Vulkan adapter LUID".into()
+    ))?;
+    let matches = |actual: windows::Win32::Foundation::LUID| {
+        actual.LowPart.to_le_bytes() == wanted[..4]
+            && actual.HighPart.to_le_bytes() == wanted[4..]
+    };
+    // Resolve the current DXGI index for FFmpeg, then verify its actual device
+    // below. The verification also catches a topology change between the two
+    // enumerations (FFmpeg can fall back to the default adapter in that case).
+    let index = unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()
+            .map_err(|e| Error::Ffmpeg(format!("DXGI factory: {e}")))?;
+        let mut index = 0;
+        loop {
+            let adapter = factory.EnumAdapters(index)
+                .map_err(|e| Error::Ffmpeg(format!("DXGI adapter LUID {wanted:02x?} not found: {e}")))?;
+            let desc = adapter.GetDesc()
+                .map_err(|e| Error::Ffmpeg(format!("DXGI adapter description: {e}")))?;
+            if matches(desc.AdapterLuid) { break index; }
+            index += 1;
+        }
+    };
+    let name = std::ffi::CString::new(index.to_string()).unwrap();
+    let mut hw_device = std::ptr::null_mut();
+    // SAFETY: FFmpeg owns the returned reference. On any failure below we
+    // release it; on success ownership transfers to AVCodecContext.
+    unsafe {
+        let ret = av_hwdevice_ctx_create(
+            &mut hw_device, AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+            name.as_ptr(), std::ptr::null_mut(), 0,
+        );
+        if ret < 0 || hw_device.is_null() {
+            av_buffer_unref(&mut hw_device);
+            return Err(Error::Ffmpeg(format!("D3D11VA adapter {index}: {ret}")));
+        }
+        let verified = (|| -> Result<()> {
+            let ctx = (*hw_device).data as *const AVHWDeviceContext;
+            if ctx.is_null() || (*ctx).hwctx.is_null() {
+                return Err(Error::Ffmpeg("missing D3D11VA device context".into()));
+            }
+            // Public FFmpeg AVD3D11VADeviceContext starts with ID3D11Device*.
+            // ffmpeg-sys does not bind that platform-specific header. Borrow
+            // the first member only; the owning AVBufferRef stays live here.
+            let raw = *((*ctx).hwctx as *const *mut std::ffi::c_void);
+            let device = ID3D11Device::from_raw_borrowed(&raw)
+                .ok_or_else(|| Error::Ffmpeg("missing D3D11 device".into()))?;
+            let dxgi: IDXGIDevice = device.cast()
+                .map_err(|e| Error::Ffmpeg(format!("D3D11 DXGI device: {e}")))?;
+            let desc = dxgi.GetAdapter().and_then(|a| a.GetDesc())
+                .map_err(|e| Error::Ffmpeg(format!("D3D11 adapter description: {e}")))?;
+            if !matches(desc.AdapterLuid) {
+                return Err(Error::Ffmpeg("D3D11/Vulkan adapter LUID mismatch; refusing zero-copy".into()));
+            }
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            tracing::info!(
+                adapter = %String::from_utf16_lossy(&desc.Description[..end]),
+                luid = ?wanted,
+                "D3D11VA actual adapter verified against Vulkan"
+            );
+            Ok(())
+        })();
+        if let Err(e) = verified {
+            av_buffer_unref(&mut hw_device);
+            return Err(e);
+        }
+        let raw = dec_ctx.as_mut_ptr();
+        (*raw).hw_device_ctx = hw_device;
+        (*raw).get_format = Some(d3d11va_get_format);
+    }
+    Ok(())
 }
 
 /// FFmpeg `get_format` callback: prefer `AV_PIX_FMT_D3D11` from the

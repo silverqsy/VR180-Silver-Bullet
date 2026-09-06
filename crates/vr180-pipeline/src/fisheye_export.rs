@@ -655,6 +655,7 @@ pub fn export_fisheye(
             // slow" report).
             let iter = crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
                 &cfg.segments, swap, u32::MAX, u32::MAX,
+                ctx.as_ref().and_then(crate::interop_windows::vulkan_device_luid),
             );
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
@@ -721,6 +722,7 @@ pub fn export_fisheye(
             // Merged recordings chain through the segmented iterator.
             let iter = crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
                 &cfg.segments, swap, u32::MAX, u32::MAX,
+                ctx.as_ref().and_then(crate::interop_windows::vulkan_device_luid),
             );
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
@@ -1376,7 +1378,9 @@ pub fn export_eac(
             );
             // Segmented iterator chains a merged recording's GS01…/GS02…/… on
             // the fast path (globalized pts → stab index stays continuous).
-            let iter = crate::fisheye_decode::SegmentedD3d11SharedStreamPairIter::new(&cfg.segments);
+            let iter = crate::fisheye_decode::SegmentedD3d11SharedStreamPairIter::new(
+                &cfg.segments, ctx.as_ref().and_then(crate::interop_windows::vulkan_device_luid),
+            );
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
                     tracing::info!("export_eac: GPU-RESIDENT NVENC(CUDA) path ENGAGED");

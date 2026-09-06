@@ -1163,7 +1163,9 @@ pub fn start_decoder(
         let zc = vr180_pipeline::interop_windows::VulkanImportCtx::from_wgpu(
             &pipeline.adapter, &pipeline.device,
         ).and_then(|ctx| {
-            match vr180_pipeline::fisheye_decode::SegmentedD3d11SharedStreamPairIter::new(&cfg.segments) {
+            match vr180_pipeline::fisheye_decode::SegmentedD3d11SharedStreamPairIter::new(
+                &cfg.segments, vr180_pipeline::interop_windows::vulkan_device_luid(&ctx),
+            ) {
                 Ok(iter) => Some((ctx, iter)),
                 Err(e) => { tracing::warn!("decoder: EAC zero-copy iter unavailable ({e})"); None }
             }
@@ -1270,6 +1272,7 @@ fn run_fisheye(
             let work = eye_w.max(eye_h).max(1280);
             let iter = vr180_pipeline::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
                 &cfg.segments, swap, work, work,
+                ctx.as_ref().and_then(vr180_pipeline::interop_windows::vulkan_device_luid),
             );
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
