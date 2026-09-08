@@ -27,7 +27,9 @@ struct FisheyeCalibUniforms {
     k1: f32, k2: f32, k3: f32, k4: f32,
     theta_trans: f32, theta_max: f32, r_max: f32, k5: f32,
     src_w: f32, src_h: f32, output_hfov_rad: f32, _pad2: f32,
-    p1: f32, p2: f32, _pad3: f32, _pad4: f32,
+    p1: f32, p2: f32, xi: f32, _pad4: f32,        // xi > 0 selects the unified camera model
+    ta: f32, tb: f32, tc: f32, te: f32,            // UCM tangential: (r²+2x²)(ta + tc r²) + 2xy(tb + te r²)
+    s1: f32, s2: f32, s3: f32, s4: f32,            // UCM thin prism: x += s1 r² + s2 r⁴, y += s3 r² + s4 r⁴
 }
 @group(0) @binding(4) var<uniform> cal: FisheyeCalibUniforms;
 
@@ -86,14 +88,41 @@ fn project_kb(xn: f32, yn: f32, zn: f32) -> vec2<f32> {
     }
     // Brown-Conrady tangential distortion (p1,p2) — DJI applies this to the
     // normalized point AFTER the radial KB. p1=p2=0 → identical to before.
-    let theta_d = r_px / cal.fx;          // r_px = fx · θ_d
-    let u0 = theta_d * cos_phi;
-    let v0 = theta_d * sin_phi;
-    let r2 = u0 * u0 + v0 * v0;            // = θ_d²
-    let ut = u0 + 2.0 * cal.p1 * u0 * v0 + cal.p2 * (r2 + 2.0 * u0 * u0);
-    let vt = v0 + cal.p1 * (r2 + 2.0 * v0 * v0) + 2.0 * cal.p2 * u0 * v0;
-    let src_x = cal.cx + cal.fx * ut;
-    let src_y = cal.cy - cal.fy * vt;
+    var src_x: f32;
+    var src_y: f32;
+    if (cal.xi > 0.0) {
+        // Unified camera model (Insta360 factory calibration): the ray is
+        // projected onto the plane n = sinθ / (ξ + cosθ); then an even radial
+        // polynomial in n² (k1..k5), tangential terms whose strength grows
+        // with r² (ta,tb ; tc,te) and thin-prism terms (s1..s4) are applied
+        // in image (y-down) coordinates. Matches Insta360 Studio's output.
+        let ct = cos(theta);
+        let st = sin(theta);
+        let n = st / (cal.xi + ct);
+        let x = n * cos_phi;
+        let y = -n * sin_phi;                  // image y points down
+        let r2 = n * n;
+        let dd = 1.0 + r2 * (cal.k1 + r2 * (cal.k2 + r2 * (cal.k3 + r2 * (cal.k4 + r2 * cal.k5))));
+        let xy2 = 2.0 * x * y;
+        let xd = x * dd + (r2 + 2.0 * x * x) * (cal.ta + cal.tc * r2) + xy2 * (cal.tb + cal.te * r2)
+               + cal.s1 * r2 + cal.s2 * r2 * r2;
+        let yd = y * dd + (r2 + 2.0 * y * y) * (cal.tb + cal.te * r2) + xy2 * (cal.ta + cal.tc * r2)
+               + cal.s3 * r2 + cal.s4 * r2 * r2;
+        src_x = cal.cx + cal.fx * xd;
+        src_y = cal.cy + cal.fy * yd;
+    } else {
+        // Kannala-Brandt radial (+ rim extension), then Brown-Conrady
+        // tangential distortion (p1,p2) on the normalized point — DJI applies
+        // this AFTER the radial KB. p1=p2=0 → pure KB.
+        let theta_d = r_px / cal.fx;          // r_px = fx · θ_d
+        let u0 = theta_d * cos_phi;
+        let v0 = theta_d * sin_phi;
+        let r2 = u0 * u0 + v0 * v0;            // = θ_d²
+        let ut = u0 + 2.0 * cal.p1 * u0 * v0 + cal.p2 * (r2 + 2.0 * u0 * u0);
+        let vt = v0 + cal.p1 * (r2 + 2.0 * v0 * v0) + 2.0 * cal.p2 * u0 * v0;
+        src_x = cal.cx + cal.fx * ut;
+        src_y = cal.cy - cal.fy * vt;
+    }
     return vec2<f32>(src_x, src_y);
 }
 

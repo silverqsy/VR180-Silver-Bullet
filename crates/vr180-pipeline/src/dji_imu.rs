@@ -386,7 +386,9 @@ pub fn compute_dji_stabilization(
     //
     // The OLD pipeline (C·R·Cᵀ similarity with C = AXIS · mat(q_lens_a))
     // is the correct stabilization for our shader. Keeping it.
-    let lens_a_quat = osv.lens_a.mount_quat_xyzw.unwrap_or(LENS_A_QUAT_XYZW);
+    // Basis: DJI → AXIS·mat(q_lens_a); raw-gyro sources (Insta360) carry
+    // their measured mount matrix in `imu_to_cam`.
+    let basis = imu_basis(osv);
 
     let mut per_frame = Vec::with_capacity(n_frames);
     for (q_actual, q_smoothed) in frame_quats.iter().zip(smoothed_quats.iter()) {
@@ -410,7 +412,7 @@ pub fn compute_dji_stabilization(
             clamp_correction(q_corr, max_corr_deg)
         };
         let r_eis = q_corr.to_mat3_row_major();
-        let r_final = apply_c_imu_to_cam_with_lens_a(&r_eis, lens_a_quat);
+        let r_final = apply_basis(&r_eis, &basis);
         per_frame.push(EquirectRotation(r_final));
     }
 
@@ -1004,19 +1006,151 @@ const K_CONST: [[f32; 3]; 3] = [
 /// `array<RsRowR>` with three `vec4<f32>` rows per element; the
 /// fourth lane of each is unused padding.
 pub fn pack_per_row_camera_matrices(quats: &[Quat], lens_a_quat_xyzw: [f32; 4]) -> Vec<f32> {
-    // Per-row quats are RELATIVE (q_row⁻¹ · q_mid). The basis change
-    // applies the same way as per-frame stab (C·R·Cᵀ with C = AXIS ·
-    // mat(q_lens_a)) so the per-row correction lands in the same camera
-    // frame as the per-frame stab.
+    pack_per_row_camera_matrices_basis(quats, &c_imu_to_cam_with_lens_a(lens_a_quat_xyzw))
+}
+
+/// [`pack_per_row_camera_matrices`] with the basis taken from the clip's
+/// IMU block — DJI's lens-A mount or a raw-gyro source's measured mount
+/// (see [`imu_basis`]). Use this at every RS pack site so the per-row
+/// correction lands in the same camera frame as the per-frame stab.
+pub fn pack_per_row_camera_matrices_for(quats: &[Quat], osv: &DjiOsvImu) -> Vec<f32> {
+    pack_per_row_camera_matrices_basis(quats, &imu_basis(osv))
+}
+
+/// Pack per-row RELATIVE quats (`q_row⁻¹ · q_mid`) through the basis
+/// change `C·R·Cᵀ` into the shader's 12-float-per-row layout.
+pub fn pack_per_row_camera_matrices_basis(quats: &[Quat], basis: &[[f32; 3]; 3]) -> Vec<f32> {
     let mut out = Vec::with_capacity(quats.len() * 12);
     for q in quats {
         let r_eis = q.to_mat3_row_major();
-        let r_final = apply_c_imu_to_cam_with_lens_a(&r_eis, lens_a_quat_xyzw);
+        let r_final = apply_basis(&r_eis, basis);
         out.push(r_final[0]); out.push(r_final[1]); out.push(r_final[2]); out.push(0.0);
         out.push(r_final[3]); out.push(r_final[4]); out.push(r_final[5]); out.push(0.0);
         out.push(r_final[6]); out.push(r_final[7]); out.push(r_final[8]); out.push(0.0);
     }
     out
+}
+
+/// IMU→camera basis for a clip: the explicit per-file matrix when the
+/// source supplies one (Insta360 — measured mount), else DJI's
+/// `AXIS_CORRECTION · mat(q_lens_a)` from the factory mount quaternion
+/// (hardcoded fallback when the file lacks field 21).
+pub fn imu_basis(osv: &DjiOsvImu) -> [[f32; 3]; 3] {
+    if let Some(c) = osv.imu_to_cam {
+        return c;
+    }
+    c_imu_to_cam_with_lens_a(osv.lens_a.mount_quat_xyzw.unwrap_or(LENS_A_QUAT_XYZW))
+}
+
+/// `R_cam = C · R_imu · Cᵀ` for an arbitrary basis `C` (row-major in/out).
+fn apply_basis(r_imu_row_major: &[f32; 9], c: &[[f32; 3]; 3]) -> [f32; 9] {
+    let r: [[f32; 3]; 3] = [
+        [r_imu_row_major[0], r_imu_row_major[1], r_imu_row_major[2]],
+        [r_imu_row_major[3], r_imu_row_major[4], r_imu_row_major[5]],
+        [r_imu_row_major[6], r_imu_row_major[7], r_imu_row_major[8]],
+    ];
+    let mut tmp = [[0.0_f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            for k in 0..3 {
+                tmp[i][j] += c[i][k] * r[k][j];
+            }
+        }
+    }
+    let mut out = [[0.0_f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            for k in 0..3 {
+                out[i][j] += tmp[i][k] * c[j][k]; // Cᵀ[k][j] = C[j][k]
+            }
+        }
+    }
+    [
+        out[0][0], out[0][1], out[0][2],
+        out[1][0], out[1][1], out[1][2],
+        out[2][0], out[2][1], out[2][2],
+    ]
+}
+
+/// Sensor readout (rolling-shutter) time for a source kind, ms. DJI: the
+/// fps-dependent OSMO table; Insta360 X6: the measured constant (0 = per-row
+/// RS disabled until measured); anything else falls back to the DJI table.
+pub fn readout_ms_for(kind: crate::SourceKind, fps: f32, imu: Option<&vr180_fisheye::DjiOsvImu>) -> f32 {
+    // A readout the file itself states (Insta360 `rolling_shutter_time`)
+    // beats the per-source default.
+    if let Some(r) = imu.and_then(|i| i.readout_ms).filter(|r| r.is_finite() && *r > 0.0) {
+        return r;
+    }
+    match kind {
+        crate::SourceKind::Insta360Insv => crate::insv_imu::INSV_X6_READOUT_MS,
+        _ => dji_osmo_readout_ms_for_fps(fps),
+    }
+}
+
+/// Stabilization rotation of each eye for one frame. When the source's two
+/// lenses expose on their own timelines (`DjiOsvImu::lens_b_timeline`), the
+/// eye showing lens B is re-oriented by the rotation the camera made between
+/// lens A's and lens B's content times: with `δ = q_a⁻¹ q_b` (sensor frame),
+/// `q_corr_b = δ⁻¹ q_corr_a`, so `rot_b = (C δ⁻¹ Cᵀ) · rot_a`. `swapped` is
+/// the user eye swap (left shows lens A when set). Sources without a lens-B
+/// timeline get `rot` on both eyes.
+pub fn per_eye_rotations(
+    rot: EquirectRotation,
+    osv: Option<&DjiOsvImu>,
+    idx: usize,
+    swapped: bool,
+) -> (EquirectRotation, EquirectRotation) {
+    let rot_b = lens_b_rotation(rot, osv, idx).unwrap_or(rot);
+    if swapped { (rot, rot_b) } else { (rot_b, rot) }
+}
+
+fn lens_b_rotation(rot: EquirectRotation, osv: Option<&DjiOsvImu>, idx: usize) -> Option<EquirectRotation> {
+    let o = osv?;
+    let b = o.lens_b_timeline.as_deref()?;
+    let (qa, qb) = (o.frame_quats.get(idx)?, b.frame_quats.get(idx)?);
+    let delta_inv = qa.conjugate().mul(*qb).normalize().conjugate();
+    let m = apply_basis(&delta_inv.to_mat3_row_major(), &imu_basis(o));
+    Some(EquirectRotation(crate::panomap::mat3_mul_row_major(&m, &rot.0)))
+}
+
+/// Packed per-row rolling-shutter matrices for each eye (left, right): the
+/// eye showing lens B samples lens B's own timeline when the source has one
+/// (its readout window is centred on that sensor's mid-exposure), the other
+/// eye the main timeline. `None` when a frame has no usable high-rate data.
+pub fn per_eye_rs_rows(
+    osv: &DjiOsvImu,
+    idx: usize,
+    readout_s: f32,
+    src_h: u32,
+    fps: f32,
+    swapped: bool,
+) -> (Option<Vec<f32>>, Option<Vec<f32>>) {
+    let a = compute_per_row_quaternions_for_frame(osv, idx, readout_s, src_h, fps)
+        .map(|q| pack_per_row_camera_matrices_for(&q, osv));
+    let b = lens_b_rs_rows(osv, idx, readout_s, src_h, fps).or_else(|| a.clone());
+    if swapped { (a, b) } else { (b, a) }
+}
+
+/// Packed per-row RS matrices from lens B's own timeline; `None` when the
+/// source has none (callers then reuse lens A's rows for both eyes).
+pub fn lens_b_rs_rows(osv: &DjiOsvImu, idx: usize, readout_s: f32, src_h: u32, fps: f32) -> Option<Vec<f32>> {
+    let ob = osv.lens_b_timeline.as_deref()?;
+    compute_per_row_quaternions_for_frame(ob, idx, readout_s, src_h, fps)
+        .map(|q| pack_per_row_camera_matrices_for(&q, ob))
+}
+
+/// Per-clip default for the "IMU phase" slider (ms after frame start).
+/// DJI: [`dji_imu_phase_default_ms_for_fps`]. Insta360: mid-frame — the
+/// synthetic high-rate block is built centred on each frame's measured
+/// content time, so mid-frame samples it exactly and the slider becomes a
+/// ± sync trim.
+pub fn imu_phase_default_ms_for(kind: crate::SourceKind, fps: f32) -> f32 {
+    match kind {
+        crate::SourceKind::Insta360Insv => {
+            if fps > 0.0 { 500.0 / fps } else { 16.7 }
+        }
+        _ => dji_imu_phase_default_ms_for_fps(fps),
+    }
 }
 
 /// Default sensor readout time for the DJI Osmo OQ001 (OSMO 360) at
@@ -1227,36 +1361,87 @@ fn apply_c_imu_to_cam_with_lens_a(
     r_imu_row_major: &[f32; 9],
     lens_a_quat_xyzw: [f32; 4],
 ) -> [f32; 9] {
-    // Unpack r_imu into 3×3.
-    let r: [[f32; 3]; 3] = [
-        [r_imu_row_major[0], r_imu_row_major[1], r_imu_row_major[2]],
-        [r_imu_row_major[3], r_imu_row_major[4], r_imu_row_major[5]],
-        [r_imu_row_major[6], r_imu_row_major[7], r_imu_row_major[8]],
-    ];
-    let c = c_imu_to_cam_with_lens_a(lens_a_quat_xyzw);
-    // First product: tmp = C · R.
-    let mut tmp = [[0.0_f32; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            for k in 0..3 {
-                tmp[i][j] += c[i][k] * r[k][j];
+    apply_basis(r_imu_row_major, &c_imu_to_cam_with_lens_a(lens_a_quat_xyzw))
+}
+
+#[cfg(test)]
+mod lens_b_tests {
+    use super::*;
+    use vr180_core::gyro::cori_iori::Quat;
+
+    fn axis_angle(axis: [f32; 3], ang: f32) -> Quat {
+        let h = ang * 0.5;
+        let s = h.sin();
+        Quat { w: h.cos(), x: axis[0] * s, y: axis[1] * s, z: axis[2] * s }.normalize()
+    }
+
+    /// A synthetic camera turning about a tilted axis: lens B's timeline is
+    /// the same motion sampled 4 ms later. The per-eye rotation derived from
+    /// the two frame quats must match running the stabilizer on lens B's
+    /// timeline directly.
+    #[test]
+    fn per_eye_rotation_matches_full_lens_b_stabilization() {
+        let fps = 50.0f32;
+        let n = 40usize;
+        let axis = { let v = [0.3f32, 0.9, -0.2]; let l = (v[0]*v[0]+v[1]*v[1]+v[2]*v[2]).sqrt(); [v[0]/l, v[1]/l, v[2]/l] };
+        let q_at = |t: f32| axis_angle(axis, 1.2 * t + 0.3 * (7.0 * t).sin());
+        let timeline = |offset: f32| -> DjiOsvImu {
+            let mut o = DjiOsvImu::default();
+            o.imu_to_cam = Some(crate::insv_imu::insv_x6_imu_to_cam());
+            for i in 0..n {
+                let tc = i as f32 / fps + offset;
+                o.frame_quats.push(q_at(tc));
+                let start = tc - 0.5 / fps;
+                o.high_rate_quats.push((0..16).map(|k| q_at(start + (k as f32) / (16.0 * fps))).collect());
+                o.gravity.push([0.0, -1.0, 0.0]);
+            }
+            o
+        };
+        let mut a = timeline(0.0);
+        let b = timeline(0.004);
+        set_dji_imu_phase_after_start_ms(500.0 / fps);
+        // Reference: lens B's orientation corrected to the SAME anchor as
+        // lens A (frame 0 of lens A) — both eyes must lock to one world
+        // reference, so an independent run on lens B (anchored to its own
+        // frame 0) is NOT the reference.
+        let basis_ref = imu_basis(&a);
+        let q_anchor = a.frame_quats[0];
+        let expected_b: Vec<[f32; 9]> = b.frame_quats.iter()
+            .map(|qb| apply_basis(&qb.conjugate().mul(q_anchor).normalize().to_mat3_row_major(), &basis_ref))
+            .collect();
+        a.lens_b_timeline = Some(Box::new(b));
+        let stab_a = compute_dji_stabilization(&a, n, f32::INFINITY, 0.0, fps, 1.0).unwrap();
+        let stab_b = DjiStabResult { per_frame: expected_b.into_iter().map(EquirectRotation).collect(), frames_with_hr_quat: n };
+        // Report every composition order so a convention slip is diagnosable.
+        let basis = imu_basis(&a);
+        let mut worst_all = [0f32; 4];
+        let mut worst = 0f32;
+        for i in 0..n {
+            let (left, right) = per_eye_rotations(stab_a.per_frame[i], Some(&a), i, false);
+            assert_eq!(right.0, stab_a.per_frame[i].0, "right eye = lens A");
+            for k in 0..9 {
+                worst = worst.max((left.0[k] - stab_b.per_frame[i].0[k]).abs());
+            }
+            let qa = a.frame_quats[i]; let qb = a.lens_b_timeline.as_ref().unwrap().frame_quats[i];
+            let delta = qa.conjugate().mul(qb).normalize();
+            let md = apply_basis(&delta.to_mat3_row_major(), &basis);
+            let mdi = apply_basis(&delta.conjugate().to_mat3_row_major(), &basis);
+            let r = stab_a.per_frame[i].0;
+            let cands = [
+                crate::panomap::mat3_mul_row_major(&mdi, &r),
+                crate::panomap::mat3_mul_row_major(&r, &mdi),
+                crate::panomap::mat3_mul_row_major(&md, &r),
+                crate::panomap::mat3_mul_row_major(&r, &md),
+            ];
+            for (c, cand) in cands.iter().enumerate() {
+                for k in 0..9 { worst_all[c] = worst_all[c].max((cand[k] - stab_b.per_frame[i].0[k]).abs()); }
             }
         }
+        assert!(worst < 2e-4, "lens-B eye rotation differs from the full run by {worst}; candidates [Mδ⁻¹·R, R·Mδ⁻¹, Mδ·R, R·Mδ] = {worst_all:?}");
+        let (l2, r2) = per_eye_rotations(stab_a.per_frame[3], Some(&a), 3, true);
+        assert_eq!(r2.0, per_eye_rotations(stab_a.per_frame[3], Some(&a), 3, false).0 .0, "swap moves lens B to the right eye");
+        assert_eq!(l2.0, stab_a.per_frame[3].0);
     }
-    // Second product: out = tmp · Cᵀ.
-    let mut out = [[0.0_f32; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            for k in 0..3 {
-                out[i][j] += tmp[i][k] * c[j][k]; // Cᵀ[k][j] = C[j][k]
-            }
-        }
-    }
-    [
-        out[0][0], out[0][1], out[0][2],
-        out[1][0], out[1][1], out[1][2],
-        out[2][0], out[2][1], out[2][2],
-    ]
 }
 
 #[cfg(test)]
@@ -1276,6 +1461,7 @@ mod tests {
             high_rate_quats: vec![vec![q; 16]; n_frames],
             lens_a: Default::default(),
             lens_b: Default::default(),
+            ..Default::default()
         };
         let stab = compute_dji_stabilization(&osv, n_frames, 10.0, 0.0, 30.0, 1.0)
             .expect("stab");
@@ -1442,6 +1628,7 @@ mod tests {
             high_rate_quats: vec![vec![q; 16]; 60],
             lens_a: Default::default(),
             lens_b: Default::default(),
+            ..Default::default()
         };
         let row_quats = compute_per_row_quaternions_for_frame(
             &osv, 30, 0.019, 1080, 29.97,

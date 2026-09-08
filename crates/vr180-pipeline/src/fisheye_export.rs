@@ -481,8 +481,8 @@ pub(crate) fn fisheye_export_opener(
     let bd = if bit_depth >= 10 { 16u8 } else { 8u8 };
     Box::new(move |p: &std::path::Path| -> Result<Box<dyn FisheyePairIter>> {
         Ok(match kind {
-            SourceKind::DjiOsv => Box::new(DualStreamFisheyeIter::new_with_options(
-                p, crate::decode::HwDecode::Auto, 0, !swap_eyes, 0, bd)?),
+            SourceKind::DjiOsv | SourceKind::Insta360Insv => Box::new(DualStreamFisheyeIter::new_with_options(
+                p, crate::decode::HwDecode::Auto, 0, kind.dual_stream_iter_swap(swap_eyes), 0, bd)?),
             SourceKind::SbsFisheye => Box::new(
                 SbsFisheyeIter::new(p, crate::decode::HwDecode::Auto, 0)?),
             SourceKind::BlackmagicRaw => {
@@ -518,7 +518,10 @@ fn chain_segment_frames(path: &std::path::Path, fps: f32) -> usize {
 }
 
 fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
-    if !matches!(cfg.source_kind, SourceKind::DjiOsv) { return None; }
+    if cfg.source_kind == SourceKind::Insta360Insv {
+        return resolve_export_insv_imu(cfg);
+    }
+    if cfg.source_kind != SourceKind::DjiOsv { return None; }
     if let Some(arc) = &cfg.preloaded_imu {
         // Reuse only if it covers what this export needs: full quats when
         // stabilizing, and for a merged chain, quats spanning ALL segments
@@ -565,6 +568,32 @@ fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsv
     }
 }
 
+/// Insta360: the trailer is small and sits at the file end, so there is no
+/// progressive / calib-only split to manage — reuse the GUI's cached IMU when
+/// it has what we need, else read the trailer and fuse the raw gyro here.
+fn resolve_export_insv_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
+    if let Some(arc) = &cfg.preloaded_imu {
+        if !cfg.stabilize || !arc.frame_quats.is_empty() {
+            return Some((**arc).clone());
+        }
+    }
+    let path = cfg.segments.first().unwrap_or(&cfg.source_path);
+    let meta = match vr180_fisheye::insta360::read_insta360_meta(path) {
+        Ok(m) => m,
+        Err(e) => { tracing::warn!("insv trailer: {e}"); return None; }
+    };
+    let probe = crate::decode::probe_video(path).ok();
+    let (w, h) = probe.as_ref().map(|p| (p.width, p.height)).unwrap_or((3840, 3840));
+    let n_frames = probe.as_ref()
+        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+        .unwrap_or(0);
+    Some(if cfg.stabilize {
+        crate::insv_imu::build_insv_imu(&meta, cfg.fps, n_frames, w, h)
+    } else {
+        crate::insv_imu::insv_calib_only(&meta, w, h)
+    })
+}
+
 pub fn export_fisheye(
     pipeline: Arc<Device>,
     cfg: FisheyeExportConfig,
@@ -604,7 +633,7 @@ pub fn export_fisheye(
         // Handles a merged recording too: the zero-copy iterator chains its
         // segments internally (new_segmented), so denoise + stab stay on the
         // fast GPU path across seams instead of dropping to the portable loop.
-        let can_zero_copy_decode = matches!(cfg.source_kind, SourceKind::DjiOsv)
+        let can_zero_copy_decode = cfg.source_kind.is_dual_stream()
             && on_macos_vt
             && (cfg.bit_depth == 10 || cfg.bit_depth == 8);
         // NB: denoise (cfg.denoise_strength > 0) STAYS on this fast path — the
@@ -637,7 +666,7 @@ pub fn export_fisheye(
     {
         let try_gpu_resident = std::env::var_os("VR180_NO_GPU_RESIDENT").is_none()
             && std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
-            && matches!(cfg.source_kind, SourceKind::DjiOsv)
+            && cfg.source_kind.is_dual_stream()
             && matches!(cfg.encoder, EncoderBackend::HevcNvenc)
             && cfg.bit_depth == 10
             && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye)
@@ -645,7 +674,7 @@ pub fn export_fisheye(
             && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010)
             && cfg.denoise_strength <= 0.0; // denoise needs CPU frames → portable path
         if try_gpu_resident {
-            let swap = !cfg.fisheye_swap_eyes;
+            let swap = cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes);
             let ctx = crate::interop_windows::VulkanImportCtx::from_wgpu(
                 &pipeline.adapter, &pipeline.device,
             );
@@ -701,7 +730,7 @@ pub fn export_fisheye(
     #[cfg(target_os = "windows")]
     {
         let can_try = std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
-            && matches!(cfg.source_kind, SourceKind::DjiOsv)
+            && cfg.source_kind.is_dual_stream()
             && matches!(cfg.encoder,
                 EncoderBackend::Libx265 | EncoderBackend::HevcNvenc
                 | EncoderBackend::ProResKs)
@@ -712,7 +741,7 @@ pub fn export_fisheye(
             && cfg.denoise_strength <= 0.0; // denoise needs CPU frames → portable path
         if can_try {
             // OSV swap-by-default ⊕ user override (matches preview + CPU path).
-            let swap = !cfg.fisheye_swap_eyes;
+            let swap = cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes);
             let ctx = crate::interop_windows::VulkanImportCtx::from_wgpu(
                 &pipeline.adapter, &pipeline.device,
             );
@@ -823,7 +852,7 @@ pub fn export_fisheye(
     };
     let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
         match cfg.source_kind {
-            SourceKind::DjiOsv => {
+            SourceKind::DjiOsv | SourceKind::Insta360Insv => {
                 dji_osv_imu.as_ref().and_then(|osv| {
                     // Slider=0 → legacy camera-lock (∞ cap, no
                     // smoothing). User-set values activate the cap /
@@ -978,9 +1007,9 @@ pub fn export_fisheye(
     // ride, so without this those exports kept jello under stabilization
     // while every zero-copy path was RS-corrected.
     let rs_enabled = cfg.stabilize
-        && matches!(cfg.source_kind, SourceKind::DjiOsv)
+        && cfg.source_kind.has_frame_imu()
         && dji_osv_imu.is_some();
-    let readout_s = crate::dji_imu::dji_osmo_readout_ms_for_fps(cfg.fps) / 1000.0;
+    let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
     if rs_enabled {
         tracing::info!(
             "fisheye_export: per-row RS on (readout {:.1} ms)",
@@ -1024,30 +1053,26 @@ pub fn export_fisheye(
         // offset) AFTER stab. `is_identity()` short-circuit means
         // default-zero export is byte-identical to the pre-pano-map
         // pipeline.
+        let (rot_l0, rot_r0) = crate::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes);
         let (rot_left, rot_right) = if cfg.view_adjust.is_identity() {
-            (rot, rot)
+            (rot_l0, rot_r0)
         } else {
             let (v_l, v_r) = cfg.view_adjust.per_eye_matrices();
             (
-                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot.0, &v_l)),
-                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot.0, &v_r)),
+                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
+                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
             )
         };
 
         // Per-row RS matrices for this frame — identical CPU build to the
         // zero-copy paths. None (= legacy projection, byte-identical) when
         // not stabilizing or non-OSV.
-        let rs_rows: Option<Vec<f32>> = if rs_enabled {
-            dji_osv_imu.as_ref().and_then(|osv| {
-                let lens_a = osv.lens_a.mount_quat_xyzw
-                    .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
-                crate::dji_imu::compute_per_row_quaternions_for_frame(
-                    osv, stab_idx, readout_s, src_h, cfg.fps,
-                )
-                .map(|q| crate::dji_imu::pack_per_row_camera_matrices(&q, lens_a))
-            })
+        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if rs_enabled {
+            dji_osv_imu.as_ref().map(|osv| crate::dji_imu::per_eye_rs_rows(
+                osv, stab_idx, readout_s, src_h, cfg.fps, cfg.fisheye_swap_eyes,
+            )).unwrap_or((None, None))
         } else {
-            None
+            (None, None)
         };
 
         // 8-bit per-eye projection, built lazily — ONLY the arms that
@@ -1057,19 +1082,19 @@ pub fn export_fisheye(
         // away there (two wasted full-res projections per frame). The
         // (projection, rs) four-way matches every zero-copy path, so the
         // portable path now keeps per-row RS too.
-        let project_8 = |rs: Option<&[f32]>| -> Result<(wgpu::Texture, wgpu::Texture)> {
-            Ok(match (projection, rs) {
-                (FisheyeExportProjection::HalfEquirect, Some(rs_buf)) => (
+        let project_8 = |rs: (Option<&[f32]>, Option<&[f32]>)| -> Result<(wgpu::Texture, wgpu::Texture)> {
+            Ok(match (projection, rs.0, rs.1) {
+                (FisheyeExportProjection::HalfEquirect, Some(rs_l), Some(rs_r)) => (
                     pipeline.project_fisheye_to_equirect_rs_texture(
                         &pair.left, src_w, src_h, cfg.eye_w, cfg.eye_h,
-                        rot_left, calib_left, rs_buf, 10,
+                        rot_left, calib_left, rs_l, 10,
                     )?,
                     pipeline.project_fisheye_to_equirect_rs_texture(
                         &pair.right, src_w, src_h, cfg.eye_w, cfg.eye_h,
-                        rot_right, calib_right, rs_buf, 11,
+                        rot_right, calib_right, rs_r, 11,
                     )?,
                 ),
-                (FisheyeExportProjection::HalfEquirect, None) => (
+                (FisheyeExportProjection::HalfEquirect, _, _) => (
                     pipeline.project_fisheye_to_equirect_texture(
                         &pair.left, src_w, src_h, cfg.eye_w, cfg.eye_h,
                         rot_left, calib_left, 10,
@@ -1079,17 +1104,17 @@ pub fn export_fisheye(
                         rot_right, calib_right, 11,
                     )?,
                 ),
-                (FisheyeExportProjection::Fisheye, Some(rs_buf)) => (
+                (FisheyeExportProjection::Fisheye, Some(rs_l), Some(rs_r)) => (
                     pipeline.project_fisheye_to_fisheye_rs_texture(
                         &pair.left, src_w, src_h, cfg.eye_w, cfg.eye_h,
-                        rot_left, calib_left, rs_buf,
+                        rot_left, calib_left, rs_l,
                     )?,
                     pipeline.project_fisheye_to_fisheye_rs_texture(
                         &pair.right, src_w, src_h, cfg.eye_w, cfg.eye_h,
-                        rot_right, calib_right, rs_buf,
+                        rot_right, calib_right, rs_r,
                     )?,
                 ),
-                (FisheyeExportProjection::Fisheye, None) => (
+                (FisheyeExportProjection::Fisheye, _, _) => (
                     pipeline.project_fisheye_to_fisheye_texture(
                         &pair.left, src_w, src_h, cfg.eye_w, cfg.eye_h,
                         rot_left, calib_left,
@@ -1108,7 +1133,7 @@ pub fn export_fisheye(
             // stack runs fused with the SBS compose into the IOSurface.
             #[cfg(target_os = "macos")]
             {
-                let (left_tex, right_tex) = project_8(rs_rows.as_deref())?;
+                let (left_tex, right_tex) = project_8((rs_rows_l.as_deref(), rs_rows_r.as_deref()))?;
                 let encode_pb = crate::interop_macos::create_bgra_encode_buffer(
                     &pipeline.device, sbs_w, sbs_h,
                 )?;
@@ -1129,7 +1154,7 @@ pub fn export_fisheye(
                     &pipeline, &pair, src_w, src_h,
                     cfg.eye_w, cfg.eye_h,
                     rot_left, rot_right, calib_left, calib_right,
-                    projection, rs_rows.as_deref(),
+                    projection, (rs_rows_l.as_deref(), rs_rows_r.as_deref()),
                 )?;
                 let left_g = pipeline.apply_color_stack_per_eye_16(
                     &left_tex_16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true),
@@ -1166,7 +1191,7 @@ pub fn export_fisheye(
                 &*pipeline, &pair, src_w, src_h,
                 cfg.eye_w, cfg.eye_h,
                 rot_left, rot_right, calib_left, calib_right,
-                projection, rs_rows.as_deref(),
+                projection, (rs_rows_l.as_deref(), rs_rows_r.as_deref()),
             )?;
             let left_g = pipeline.apply_color_stack_per_eye_16(
                 &left_tex_16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true),
@@ -1185,7 +1210,7 @@ pub fn export_fisheye(
             // 8-bit non-zero-copy fallback. Color stack happens via the
             // legacy CPU roundtrip on the SBS readback below (acceptable
             // since this path is already CPU-bound).
-            let (left_tex, right_tex) = project_8(rs_rows.as_deref())?;
+            let (left_tex, right_tex) = project_8((rs_rows_l.as_deref(), rs_rows_r.as_deref()))?;
             let sbs_tex = pipeline.compose_sbs_textures(
                 &left_tex, &right_tex, cfg.eye_w, cfg.eye_h,
             )?;
@@ -1990,14 +2015,14 @@ fn export_fisheye_osv_zerocopy_p010(
     } else { Vec::new() };
 
     // Open zero-copy decoder. OSV swap convention mirrors DualStreamFisheyeIter:
-    // !cfg.fisheye_swap_eyes means swap on by default (Lens A == stream 0 ==
+    // Dual-stream default swap ⊕ user toggle (DJI: Lens A == stream 0 ==
     // right eye). A merged recording chains its segments into one stream.
     let raw = if cfg.segments.len() > 1 {
         ZeroCopyDualStreamFisheyeIter::new_segmented(
-            &cfg.segments, &seg_durs, 0, !cfg.fisheye_swap_eyes,
+            &cfg.segments, &seg_durs, 0, cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes),
         )?
     } else {
-        ZeroCopyDualStreamFisheyeIter::new(&cfg.source_path, 0, !cfg.fisheye_swap_eyes)?
+        ZeroCopyDualStreamFisheyeIter::new(&cfg.source_path, 0, cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes))?
     };
     // Temporal NR, if requested, wraps the decoder and denoises the P010
     // IOSurfaces on the GPU (no CPU readback) — the whole reason this path
@@ -2117,7 +2142,7 @@ fn export_fisheye_osv_zerocopy_p010(
     // FPS-aware readout: OSMO 360 sensor at 50fps uses 16.23 ms vs
     // 18.3 ms at 30fps. Wrong readout → wrong phase offset → "loose"
     // stab at fast motion.
-    let readout_s = crate::dji_imu::dji_osmo_readout_ms_for_fps(cfg.fps) / 1000.0;
+    let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
     tracing::info!(
         "fisheye_export (zero-copy): P010 IOSurface decode → {} encode, \
          no CPU bounce on the decode side; per-row RS = {}",
@@ -2160,30 +2185,26 @@ fn export_fisheye_osv_zerocopy_p010(
         // <200 KB at 3840 rows so the per-frame `queue.write_buffer`
         // is negligible vs the 138 MB+ that the zero-copy path saved
         // on the decode side.
-        let rs_rows_f32: Option<Vec<f32>> = if rs_enabled {
-            dji_osv_imu.as_ref().and_then(|osv| {
-                let lens_a = osv.lens_a.mount_quat_xyzw
-                    .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
-                crate::dji_imu::compute_per_row_quaternions_for_frame(
-                    osv, stab_idx, readout_s, src_h, cfg.fps,
-                )
-                .map(|q| crate::dji_imu::pack_per_row_camera_matrices(&q, lens_a))
-            })
+        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if rs_enabled {
+            dji_osv_imu.as_ref().map(|osv| crate::dji_imu::per_eye_rs_rows(
+                osv, stab_idx, readout_s, src_h, cfg.fps, cfg.fisheye_swap_eyes,
+            )).unwrap_or((None, None))
         } else {
-            None
+            (None, None)
         };
 
         // Compose per-eye view adjustment AFTER stab. is_identity()
         // short-circuit means default-zero export is byte-identical.
+        let (rot_l0, rot_r0) = crate::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes);
         let (rot_left, rot_right) = if cfg.view_adjust.is_identity() {
-            (rot, rot)
+            (rot_l0, rot_r0)
         } else {
             let (v_l, v_r) = cfg.view_adjust.per_eye_matrices();
             (
                 crate::gpu::EquirectRotation(
-                    crate::panomap::mat3_mul_row_major(&rot.0, &v_l)),
+                    crate::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
                 crate::gpu::EquirectRotation(
-                    crate::panomap::mat3_mul_row_major(&rot.0, &v_r)),
+                    crate::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
             )
         };
 
@@ -2191,19 +2212,19 @@ fn export_fisheye_osv_zerocopy_p010(
         // shutter correction is wired for BOTH projections — the RS warp
         // operates on the source-frame direction, independent of whether
         // the output is half-equirect or fisheye.
-        let (left_eq, right_eq) = match (cfg.projection, rs_rows_f32.as_deref()) {
-            (FisheyeExportProjection::HalfEquirect, Some(rs_buf)) => {
+        let (left_eq, right_eq) = match (cfg.projection, rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
+            (FisheyeExportProjection::HalfEquirect, Some(rs_l), Some(rs_r)) => {
                 let l = pipeline.project_fisheye_p010_to_equirect_rs_texture_16(
                     &pair.left_y.texture, &pair.left_uv.texture,
-                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_buf,
+                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l,
                 )?;
                 let r = pipeline.project_fisheye_p010_to_equirect_rs_texture_16(
                     &pair.right_y.texture, &pair.right_uv.texture,
-                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_buf,
+                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r,
                 )?;
                 (l, r)
             }
-            (FisheyeExportProjection::HalfEquirect, None) => {
+            (FisheyeExportProjection::HalfEquirect, _, _) => {
                 let l = pipeline.project_fisheye_p010_to_equirect_texture_16(
                     &pair.left_y.texture, &pair.left_uv.texture,
                     src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left,
@@ -2214,18 +2235,18 @@ fn export_fisheye_osv_zerocopy_p010(
                 )?;
                 (l, r)
             }
-            (FisheyeExportProjection::Fisheye, Some(rs_buf)) => {
+            (FisheyeExportProjection::Fisheye, Some(rs_l), Some(rs_r)) => {
                 let l = pipeline.project_fisheye_p010_to_fisheye_rs_texture_16(
                     &pair.left_y.texture, &pair.left_uv.texture,
-                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_buf,
+                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l,
                 )?;
                 let r = pipeline.project_fisheye_p010_to_fisheye_rs_texture_16(
                     &pair.right_y.texture, &pair.right_uv.texture,
-                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_buf,
+                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r,
                 )?;
                 (l, r)
             }
-            (FisheyeExportProjection::Fisheye, None) => {
+            (FisheyeExportProjection::Fisheye, _, _) => {
                 let l = pipeline.project_fisheye_p010_to_fisheye_texture_16(
                     &pair.left_y.texture, &pair.left_uv.texture,
                     src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left,
@@ -2398,10 +2419,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
 
     let dt = 1.0 / cfg.fps as f64;
     let color_plan = cfg.color_stack.clone();
-    let readout_s = crate::dji_imu::dji_osmo_readout_ms_for_fps(cfg.fps) / 1000.0;
-    let lens_a_mount = dji_osv_imu.as_ref()
-        .and_then(|o| o.lens_a.mount_quat_xyzw)
-        .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
+    let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
 
     // ── 3-stage pipeline ───────────────────────────────────────────
     // The serial path summed decode + GPU + encode per frame; at native
@@ -2552,25 +2570,24 @@ fn export_fisheye_osv_zerocopy_d3d11(
             .as_ref()
             .and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(EquirectRotation::IDENTITY);
+        let (rot_l0, rot_r0) = crate::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes);
         let (rot_left, rot_right) = if cfg.view_adjust.is_identity() {
-            (rot, rot)
+            (rot_l0, rot_r0)
         } else {
             let (v_l, v_r) = cfg.view_adjust.per_eye_matrices();
             (
-                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot.0, &v_l)),
-                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot.0, &v_r)),
+                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
+                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
             )
         };
 
         // Per-row rolling-shutter matrices (only when stabilizing). Same
         // lens_a mount quat for both eyes — matches the preview.
-        let rs_rows: Option<Vec<f32>> = if cfg.stabilize {
-            dji_osv_imu.as_ref().and_then(|osv| {
-                crate::dji_imu::compute_per_row_quaternions_for_frame(
-                    osv, stab_idx, readout_s, src_h, cfg.fps,
-                )
-            }).map(|q| crate::dji_imu::pack_per_row_camera_matrices(&q, lens_a_mount))
-        } else { None };
+        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if cfg.stabilize {
+            dji_osv_imu.as_ref().map(|osv| crate::dji_imu::per_eye_rs_rows(
+                osv, stab_idx, readout_s, src_h, cfg.fps, cfg.fisheye_swap_eyes,
+            )).unwrap_or((None, None))
+        } else { (None, None) };
 
         // All GPU work for this frame, errors captured so we can shut the
         // pipeline down cleanly rather than unwinding past the join.
@@ -2584,16 +2601,16 @@ fn export_fisheye_osv_zerocopy_d3d11(
             // (projection, rs) split as the GPU-resident + macOS p010
             // paths). Slots 30/31 keep the export's cached output
             // textures distinct from preview 0/1.
-            let (left16, right16) = match (cfg.projection, rs_rows.as_deref()) {
-                (FisheyeExportProjection::HalfEquirect, Some(rs)) => (
+            let (left16, right16) = match (cfg.projection, rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
+                (FisheyeExportProjection::HalfEquirect, Some(rs_l), Some(rs_r)) => (
                     pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs, 30,
+                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 30,
                     )?,
                     pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs, 31,
+                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 31,
                     )?,
                 ),
-                (FisheyeExportProjection::HalfEquirect, None) => (
+                (FisheyeExportProjection::HalfEquirect, _, _) => (
                     pipeline.project_fisheye_rgba16_texture_to_equirect_16(
                         &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30,
                     )?,
@@ -2601,15 +2618,15 @@ fn export_fisheye_osv_zerocopy_d3d11(
                         &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31,
                     )?,
                 ),
-                (FisheyeExportProjection::Fisheye, Some(rs)) => (
+                (FisheyeExportProjection::Fisheye, Some(rs_l), Some(rs_r)) => (
                     pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs, 30,
+                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 30,
                     )?,
                     pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs, 31,
+                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 31,
                     )?,
                 ),
-                (FisheyeExportProjection::Fisheye, None) => (
+                (FisheyeExportProjection::Fisheye, _, _) => (
                     pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
                         &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30,
                     )?,
@@ -2858,10 +2875,7 @@ fn export_fisheye_osv_gpu_resident(
 
     let dt = 1.0 / cfg.fps as f64;
     let color_plan = cfg.color_stack.clone();
-    let readout_s = crate::dji_imu::dji_osmo_readout_ms_for_fps(cfg.fps) / 1000.0;
-    let lens_a_mount = dji_osv_imu.as_ref()
-        .and_then(|o| o.lens_a.mount_quat_xyzw)
-        .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
+    let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
 
     // Decode sub-thread (D3D11/NVDEC only — never touches CUDA/wgpu), so the
     // ~10 ms decode overlaps the GPU compose + NVENC encode on this thread.
@@ -2901,22 +2915,21 @@ fn export_fisheye_osv_gpu_resident(
         } else { frame_idx as usize };
         let rot = stab_rotations.as_ref().and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(EquirectRotation::IDENTITY);
+        let (rot_l0, rot_r0) = crate::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes);
         let (rot_left, rot_right) = if cfg.view_adjust.is_identity() {
-            (rot, rot)
+            (rot_l0, rot_r0)
         } else {
             let (v_l, v_r) = cfg.view_adjust.per_eye_matrices();
             (
-                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot.0, &v_l)),
-                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot.0, &v_r)),
+                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
+                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
             )
         };
-        let rs_rows: Option<Vec<f32>> = if cfg.stabilize {
-            dji_osv_imu.as_ref().and_then(|osv| {
-                crate::dji_imu::compute_per_row_quaternions_for_frame(
-                    osv, stab_idx, readout_s, src_h, cfg.fps,
-                )
-            }).map(|q| crate::dji_imu::pack_per_row_camera_matrices(&q, lens_a_mount))
-        } else { None };
+        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if cfg.stabilize {
+            dji_osv_imu.as_ref().map(|osv| crate::dji_imu::per_eye_rs_rows(
+                osv, stab_idx, readout_s, src_h, cfg.fps, cfg.fisheye_swap_eyes,
+            )).unwrap_or((None, None))
+        } else { (None, None) };
 
         // Import + project + color (same as the readback path).
         let l_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.left) };
@@ -2925,12 +2938,12 @@ fn export_fisheye_osv_gpu_resident(
             // Normalized fisheye SBS output (slots 32/33 so the cache doesn't
             // collide with the equirect slots). RS-corrected when stabilizing —
             // same (projection, rs) split as the macOS p010 export path.
-            if let Some(rs) = rs_rows.as_deref() {
+            if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                 (
                     pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs, 32)?,
+                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 32)?,
                     pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs, 33)?,
+                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 33)?,
                 )
             } else {
                 (
@@ -2940,12 +2953,12 @@ fn export_fisheye_osv_gpu_resident(
                         &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 33)?,
                 )
             }
-        } else if let Some(rs) = rs_rows.as_deref() {
+        } else if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
             (
                 pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                    &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs, 30)?,
+                    &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 30)?,
                 pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                    &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs, 31)?,
+                    &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 31)?,
             )
         } else {
             (
@@ -3075,6 +3088,7 @@ pub(crate) fn resolve_calib_pair(
     }.unwrap_or_else(|| {
         let auto_name = match cfg.source_kind {
             SourceKind::DjiOsv        => "DJI Osmo 360",
+            SourceKind::Insta360Insv  => "Insta360 X6",
             SourceKind::BlackmagicRaw => "Blackmagic Pyxis 12K",
             _                         => "Custom",
         };
@@ -3098,7 +3112,7 @@ pub(crate) fn resolve_calib_pair(
     // For OSV, prefer the per-lens protobuf calibration. After the DJI
     // iter's default swap: left = Lens B, right = Lens A.
     let (calib_l, calib_r) = match (cfg.source_kind, osv) {
-        (SourceKind::DjiOsv, Some(imu)) => {
+        (SourceKind::DjiOsv | SourceKind::Insta360Insv, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
             let eye = |lens: &vr180_fisheye::DjiLensCalib,
@@ -3106,6 +3120,19 @@ pub(crate) fn resolve_calib_pair(
                        km_p: [f32; 2]|
                 -> FisheyeCalib
             {
+                // Auto + an exact factory model (Insta360): use it as is —
+                // the KB fields only seed the override UI. Override drops
+                // to KB (the manual fields describe a KB lens).
+                if !ov {
+                    if let Some(o) = lens.omni {
+                        let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
+                        let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
+                        return FisheyeCalib::new_omni(
+                            o.fx * scale_x, o.fy * scale_y, cx, cy, o.xi,
+                            o.radial, o.tangential, o.prism, src_w as f32, src_h as f32,
+                        );
+                    }
+                }
                 let (fx, fy, cx, cy, k, k5) = if ov {
                     let fx = fx_from_fov(fov);
                     let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
@@ -3212,26 +3239,26 @@ fn build_eye_eq_16(
     calib_left: FisheyeCalib,
     calib_right: FisheyeCalib,
     projection: FisheyeExportProjection,
-    rs: Option<&[f32]>,
+    rs: (Option<&[f32]>, Option<&[f32]>),
 ) -> Result<(wgpu::Texture, wgpu::Texture)> {
-    if let Some(rs_buf) = rs {
+    if let (Some(rs_l), Some(rs_r)) = rs {
         let l_tex = upload_eye_rgba16(pipeline, &pair.left, pair.bit_depth, src_w, src_h);
         let r_tex = upload_eye_rgba16(pipeline, &pair.right, pair.bit_depth, src_w, src_h);
         return Ok(match projection {
             FisheyeExportProjection::HalfEquirect => (
                 pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                    &l_tex, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_buf, 30,
+                    &l_tex, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_l, 30,
                 )?,
                 pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                    &r_tex, src_w, src_h, eye_w, eye_h, rot_right, calib_right, rs_buf, 31,
+                    &r_tex, src_w, src_h, eye_w, eye_h, rot_right, calib_right, rs_r, 31,
                 )?,
             ),
             FisheyeExportProjection::Fisheye => (
                 pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                    &l_tex, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_buf, 30,
+                    &l_tex, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_l, 30,
                 )?,
                 pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                    &r_tex, src_w, src_h, eye_w, eye_h, rot_right, calib_right, rs_buf, 31,
+                    &r_tex, src_w, src_h, eye_w, eye_h, rot_right, calib_right, rs_r, 31,
                 )?,
             ),
         });

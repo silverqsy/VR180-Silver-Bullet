@@ -19,6 +19,7 @@ pub mod stereo_align;
 pub mod gpu;
 pub mod helpers;
 pub mod imu;
+pub mod insv_imu;
 pub mod panomap;
 pub mod render;
 pub mod source_kind;

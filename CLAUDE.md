@@ -47,6 +47,32 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    for fps < 27, verified against DJI Studio's output) + restored the IMU
    phase slider in the stab panel. Pipeline-level, shared code — pull +
    rebuild; no Windows-specific work.
+8. **Insta360 X6 `.insv` support** (`SourceKind::Insta360Insv`): trailer
+   parser (`vr180-fisheye/src/insta360.rs`), raw-gyro → VQF → the shared
+   DJI-style stab stream (`vr180-pipeline/src/insv_imu.rs`), measured X6
+   lens preset, stream 0 = back lens = LEFT eye by default
+   (`SourceKind::dual_stream_iter_swap`). The dual-stream iterators now
+   stage packets per stream (`DualPacketPump` in `fisheye_decode.rs`) —
+   the X6 interleaves its two video streams in 1 s chunks, which the old
+   feed-as-you-read loops turned into dropped packets + mis-paired eyes.
+   Lens calibration is read per file (the trailer's factory string, a
+   UCM + radial-polynomial model, converted to KB-5 in stream coords —
+   `insv_imu::stream_lens_calib`); the "Insta360 X6" preset is only a fallback. The
+   lens is rendered through the shaders' unified-camera-model branch
+   (`cal.xi > 0` in every `fisheye_*.wgsl`; uniform grew to 7 vec4s) with
+   the principal point from the file's `window_crop_info` and the tracks
+   in reverse lens order (stream 0 = calibration entry 2); readout and
+   gyro offset come from the file (`rolling_shutter_time`, `gyro_timestamp`).
+   Verify the UCM branch compiles/renders on D3D11/DX12 (naga → HLSL).
+   Stabilization: the orientation stream is a direct gyro integration
+   (`insv_imu::integrate_orientation`, VQF only supplies the bias) and the two
+   eyes are timed from their own sensor's exposure record (`lens_b_timeline`,
+   `dji_imu::per_eye_rotations` / `per_eye_rs_rows`) — the GPU-resident NVENC
+   export path got that per-eye plumbing edited blind; check it renders.
+   Windows TODO: verify the `D3d11SharedDualStreamIter` arm (edited blind
+   on macOS — same pump, same shape as the VT iterator) on an `.insv` AND
+   an `.osv`: frame count == trim length, no "Could not find ref with POC"
+   spam, eyes in sync. The X6 gets no built-in LUT yet.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

@@ -1957,7 +1957,7 @@ impl EacLensUniforms {
 // ── Fisheye → half-equirect uniforms ───────────────────────────────
 
 /// std140 layout for the fisheye→equirect shader's calibration uniform.
-/// 16 scalars (4 × vec4 = 64 bytes). Matches the WGSL
+/// 28 scalars (7 × vec4 = 112 bytes). Matches the WGSL
 /// `FisheyeCalibUniforms` struct field-by-field. See
 /// `fisheye_to_hequirect.wgsl` for the per-pixel use of each value.
 #[repr(C)]
@@ -1970,7 +1970,13 @@ struct FisheyeCalibUniforms {
     // only have a 4-coeff model → the new term vanishes (back-compat).
     theta_trans: f32, theta_max: f32, r_max: f32, k5: f32,
     src_w: f32, src_h: f32, output_hfov_rad: f32, _pad2: f32,
-    p1: f32, p2: f32, _pad3: f32, _pad4: f32,
+    // xi > 0 switches the shader to the unified camera model (Insta360):
+    // k1..k5 then form the even radial polynomial on the UCM plane and the
+    // two rows below carry its tangential (ta,tb,tc,te) and thin-prism
+    // (s1..s4) terms. 0 → Kannala-Brandt + Brown-Conrady (p1,p2) as before.
+    p1: f32, p2: f32, xi: f32, _pad4: f32,
+    ta: f32, tb: f32, tc: f32, te: f32,
+    s1: f32, s2: f32, s3: f32, s4: f32,
 }
 
 /// Public per-eye Kannala-Brandt fisheye calibration. Caller builds
@@ -2001,6 +2007,17 @@ pub struct FisheyeCalib {
     /// `v += p1·(r²+2v²) + 2·p2·u·v`. 0 → no tangential (vanishes).
     pub p1: f32,
     pub p2: f32,
+    /// Unified-camera-model `ξ`. `> 0` selects the UCM projection in the
+    /// shaders (Insta360 factory calibration): the ray is projected onto the
+    /// plane `n = sinθ/(ξ+cosθ)`, `k[0..4]`/`k5` become the even radial
+    /// polynomial `1 + k1 n² + … + k5 n¹⁰` on that plane, and `tangential` /
+    /// `prism` are applied in image (y-down) coordinates. `0` → KB.
+    pub xi: f32,
+    /// UCM tangential terms `[A, B, C, E]`:
+    /// `x += (r²+2x²)(A + C r²) + 2xy(B + E r²)`, `y += (r²+2y²)(B + E r²) + 2xy(A + C r²)`.
+    pub tangential: [f32; 4],
+    /// UCM thin-prism terms `[s1, s2, s3, s4]`: `x += s1 r² + s2 r⁴`, `y += s3 r² + s4 r⁴`.
+    pub prism: [f32; 4],
     /// KB → cubic-Hermite extension boundary (radians).
     pub theta_trans: f32,
     /// Cubic extension upper bound (radians).
@@ -2031,6 +2048,7 @@ impl FisheyeCalib {
     ) -> Self {
         Self {
             fx, fy, cx, cy, k, k5: 0.0, p1: 0.0, p2: 0.0,
+            xi: 0.0, tangential: [0.0; 4], prism: [0.0; 4],
             theta_trans: 80.0_f32.to_radians(),
             theta_max:   110.0_f32.to_radians(),
             r_max, src_w, src_h,
@@ -2065,7 +2083,53 @@ impl FisheyeCalib {
         let theta_trans = theta_max + 0.1;
         Self {
             fx, fy, cx, cy, k, k5: 0.0, p1: 0.0, p2: 0.0,
+            xi: 0.0, tangential: [0.0; 4], prism: [0.0; 4],
             theta_trans,
+            theta_max,
+            r_max: max_r,
+            src_w, src_h,
+            output_hfov_rad: std::f32::consts::FRAC_PI_2,
+        }
+    }
+
+    /// Unified-camera-model constructor (Insta360 factory calibration,
+    /// already expressed in the working frame's pixels): `xi`, `radial` =
+    /// `[k1..k5]` on the UCM plane, `tangential` = `[A, B, C, E]`, `prism` =
+    /// `[s1, s2, s3, s4]`. Full-FOV projection with no rim extension; the
+    /// θ clamp is set where the radial curve reaches the farthest frame edge
+    /// (like [`new_pure_kb`](Self::new_pure_kb)), capped at 108° — the UCM
+    /// radius is monotonic out to ~114° for this lens, so the clamp only
+    /// decides which rim pixel out-of-circle rays replicate.
+    pub fn new_omni(
+        fx: f32, fy: f32, cx: f32, cy: f32, xi: f32,
+        radial: [f32; 5], tangential: [f32; 4], prism: [f32; 4],
+        src_w: f32, src_h: f32,
+    ) -> Self {
+        let max_r = cx.max(cy).max(src_w - cx).max(src_h - cy).max(1.0);
+        let radius = |theta: f32| -> f32 {
+            let n = theta.sin() / (xi + theta.cos());
+            let n2 = n * n;
+            let d = 1.0 + n2 * (radial[0] + n2 * (radial[1] + n2 * (radial[2] + n2 * (radial[3] + n2 * radial[4]))));
+            fx.max(1e-3) * n * d
+        };
+        let cap = 108.0_f32.to_radians();
+        let theta_max = if radius(cap) <= max_r {
+            cap
+        } else {
+            let (mut lo, mut hi) = (0.0_f32, cap);
+            for _ in 0..48 {
+                let mid = 0.5 * (lo + hi);
+                if radius(mid) < max_r { lo = mid } else { hi = mid }
+            }
+            0.5 * (lo + hi)
+        };
+        Self {
+            fx, fy, cx, cy,
+            k: [radial[0], radial[1], radial[2], radial[3]],
+            k5: radial[4],
+            p1: 0.0, p2: 0.0,
+            xi, tangential, prism,
+            theta_trans: theta_max + 0.1,
             theta_max,
             r_max: max_r,
             src_w, src_h,
@@ -2095,7 +2159,9 @@ impl FisheyeCalibUniforms {
             src_w: c.src_w, src_h: c.src_h,
             output_hfov_rad: c.output_hfov_rad,
             _pad2: 0.0,
-            p1: c.p1, p2: c.p2, _pad3: 0.0, _pad4: 0.0,
+            p1: c.p1, p2: c.p2, xi: c.xi, _pad4: 0.0,
+            ta: c.tangential[0], tb: c.tangential[1], tc: c.tangential[2], te: c.tangential[3],
+            s1: c.prism[0], s2: c.prism[1], s3: c.prism[2], s4: c.prism[3],
         }
     }
 }

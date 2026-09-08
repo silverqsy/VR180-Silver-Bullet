@@ -26,6 +26,10 @@ pub enum SourceKind {
     /// DJI Osmo `.osv`. MP4 container with two HEVC video streams,
     /// each one a full fisheye eye.
     DjiOsv,
+    /// Insta360 `.insv` (X-series, e.g. X6). Same dual-stream fisheye
+    /// MP4 layout as the OSV, plus a proprietary trailer carrying the raw
+    /// ~1 kHz IMU and per-frame exposure stamps (no metadata track).
+    Insta360Insv,
     /// Single-stream side-by-side fisheye `.mp4` / `.mov` (Insta360,
     /// Vuze XR, QooCam, Canon RF dual-fisheye, generic dual-camera
     /// rigs muxed to one stream).
@@ -46,7 +50,33 @@ impl SourceKind {
 
     /// True if this source uses the fisheye (KB) pipeline.
     pub fn is_fisheye(self) -> bool {
-        matches!(self, Self::DjiOsv | Self::SbsFisheye | Self::BlackmagicRaw)
+        matches!(self, Self::DjiOsv | Self::Insta360Insv | Self::SbsFisheye | Self::BlackmagicRaw)
+    }
+
+    /// Two equal-size video streams in one MP4, one full fisheye eye each
+    /// (DJI OSV, Insta360 INSV). Routes through `DualStreamFisheyeIter`
+    /// and the zero-copy dual-stream decoders.
+    pub fn is_dual_stream(self) -> bool {
+        matches!(self, Self::DjiOsv | Self::Insta360Insv)
+    }
+
+    /// `swap_eyes` flag to hand the dual-stream iterators for a given user
+    /// toggle. DJI streams arrive stream 0 = RIGHT eye after the VR180 mod,
+    /// so the iterator swaps by default (`!user`); the Insta360 X6 arrives
+    /// stream 0 = back lens = LEFT eye, stream 1 = screen-side lens = RIGHT
+    /// eye, so the user toggle passes straight through.
+    pub fn dual_stream_iter_swap(self, user_swap: bool) -> bool {
+        match self {
+            Self::DjiOsv => !user_swap,
+            _ => user_swap,
+        }
+    }
+
+    /// The source carries an IMU we turn into per-frame orientations —
+    /// the DJI-style stabilization controls (smooth / max-corr / IMU
+    /// phase) apply. DJI reads camera quats; Insta360 fuses its raw gyro.
+    pub fn has_frame_imu(self) -> bool {
+        matches!(self, Self::DjiOsv | Self::Insta360Insv)
     }
 
     /// True if we can preview AND export this source to VR180 SBS —
@@ -61,6 +91,7 @@ impl SourceKind {
         match self {
             Self::GoProEac      => "GoPro EAC (.360)",
             Self::DjiOsv        => "DJI Osmo OSV (dual-stream fisheye)",
+            Self::Insta360Insv  => "Insta360 INSV (dual-stream fisheye)",
             Self::SbsFisheye    => "Side-by-side fisheye",
             Self::BlackmagicRaw => "Blackmagic RAW",
             Self::Unknown       => "Unknown",
@@ -83,11 +114,17 @@ pub fn detect(path: &Path) -> Result<SourceKind> {
     match ext.as_deref() {
         Some("360")  => return Ok(SourceKind::GoProEac),
         Some("osv")  => return Ok(SourceKind::DjiOsv),
+        Some("insv") => return Ok(SourceKind::Insta360Insv),
         Some("braw") => return Ok(SourceKind::BlackmagicRaw),
         Some("mp4") | Some("mov") | Some("m4v") | Some("mkv") => {
             // Ambiguous: could be GoPro `.mp4` (with `gpmd` stream), DJI
-            // OSV-as-`.mp4` (two video streams), or plain SBS fisheye.
-            return Ok(probe_container_layout(path));
+            // OSV-as-`.mp4` (two video streams), a renamed Insta360 `.insv`
+            // (two video streams + trailer), or plain SBS fisheye.
+            let kind = probe_container_layout(path);
+            if kind == SourceKind::DjiOsv && vr180_fisheye::insta360::has_insv_trailer(path) {
+                return Ok(SourceKind::Insta360Insv);
+            }
+            return Ok(kind);
         }
         _ => {}
     }
@@ -160,6 +197,7 @@ mod tests {
         let cases = [
             ("clip.360", SourceKind::GoProEac),
             ("video.OSV", SourceKind::DjiOsv),
+            ("VID_20260815_193658_00_030.insv", SourceKind::Insta360Insv),
             ("pyxis.BRAW", SourceKind::BlackmagicRaw),
             ("readme.txt", SourceKind::Unknown),
         ];

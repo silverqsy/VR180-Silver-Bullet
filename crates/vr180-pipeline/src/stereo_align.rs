@@ -143,6 +143,13 @@ pub fn measure_stereo_align(
         let osv = if cfg.source_kind == crate::SourceKind::DjiOsv {
             crate::decode::extract_dji_calib_blob(&cfg.source_path).ok()
                 .and_then(|b| vr180_fisheye::DjiOsvImu::parse(&b).ok())
+        } else if cfg.source_kind == crate::SourceKind::Insta360Insv {
+            // Calib-only synthetic IMU at the native stream size (the resolver
+            // rescales it to the decoded working size).
+            let (w, h) = crate::decode::probe_video(&cfg.source_path)
+                .map(|p| (p.width, p.height)).unwrap_or((3840, 3840));
+            vr180_fisheye::insta360::read_insta360_identity(&cfg.source_path).ok()
+                .map(|m| crate::insv_imu::insv_calib_only(&m, w, h))
         } else {
             None
         };

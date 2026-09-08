@@ -867,6 +867,9 @@ fn load_or_publish_dji_imu(
     src_w: u32,
     src_h: u32,
 ) -> Option<vr180_fisheye::DjiOsvImu> {
+    if matches!(kind, vr180_pipeline::SourceKind::Insta360Insv) {
+        return load_insv_imu(cfg, control, src_w, src_h);
+    }
     if !matches!(kind, vr180_pipeline::SourceKind::DjiOsv) {
         return None;
     }
@@ -937,6 +940,44 @@ fn seed_detected_calib(
     *control.detected_calib.lock() = Some(DetectedLensCalib { left: seed(sl), right: seed(sr) });
 }
 
+/// Insta360 `.insv`: read the trailer (identity + raw gyro + frame stamps),
+/// fuse the gyro (VQF 6D) into the shared per-frame orientation stream, cache
+/// it under the clip path (the export + zoom-still read it from there) and
+/// seed the Override UI. Returns `None` (preset calib, no stab) on a bad
+/// trailer.
+fn load_insv_imu(
+    cfg: &DecoderConfig,
+    control: &DecoderControl,
+    src_w: u32,
+    src_h: u32,
+) -> Option<vr180_fisheye::DjiOsvImu> {
+    if let Some(arc) = cached_dji_imu(&cfg.path).filter(|a| !a.frame_quats.is_empty()) {
+        tracing::info!("decoder (fisheye/insv): reusing cached IMU for {}", cfg.path.display());
+        seed_detected_calib(control, &arc, src_w, src_h);
+        return Some((*arc).clone());
+    }
+    let meta = match vr180_fisheye::insta360::read_insta360_meta(&cfg.path) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("insv trailer failed: {e} — using preset calib, no stabilization");
+            return None;
+        }
+    };
+    let probe = vr180_pipeline::decode::probe_video(&cfg.path).ok();
+    let fps = probe.as_ref().map(|p| p.fps).filter(|f| *f > 0.0).unwrap_or(30.0);
+    let (w, h) = probe.as_ref().map(|p| (p.width, p.height)).unwrap_or((src_w, src_h));
+    let total = segments_total_frames(&cfg.segments).max(1);
+    let imu = vr180_pipeline::insv_imu::build_insv_imu(&meta, fps, total, w, h);
+    tracing::info!(
+        "decoder (fisheye/insv): {} fw {} — {} imu samples @ {:.0} Hz, {} frame stamps, {} frame quats",
+        meta.model, meta.firmware, meta.imu.len(), meta.imu_rate_hz(), meta.frames.len(),
+        imu.frame_quats.len()
+    );
+    cache_dji_imu(&cfg.path, std::sync::Arc::new(imu.clone()));
+    seed_detected_calib(control, &imu, src_w, src_h);
+    Some(imu)
+}
+
 /// Progressive DJI OSV IMU load: get the lens calibration FAST (first metadata
 /// sample → the preview dewarps in ~1 s) and stream the heavy per-frame
 /// quaternions (needed for stabilization) in the BACKGROUND, so a huge clip's
@@ -954,6 +995,13 @@ fn load_dji_imu_progressive(
     src_h: u32,
 ) -> Option<vr180_fisheye::DjiOsvImu> {
     use std::sync::atomic::Ordering;
+    if matches!(kind, vr180_pipeline::SourceKind::Insta360Insv) {
+        // The whole trailer (calib + gyro + stamps) is ~1 MB at the file end
+        // and VQF runs in well under a second — no progressive split needed.
+        let imu = load_insv_imu(cfg, control, src_w, src_h);
+        control.imu_ready.store(true, Ordering::SeqCst);
+        return imu;
+    }
     if !matches!(kind, vr180_pipeline::SourceKind::DjiOsv) {
         control.imu_ready.store(true, Ordering::SeqCst);
         return None;
@@ -1232,11 +1280,12 @@ fn open_fisheye_segment(
     use vr180_pipeline::decode::HwDecode;
     use vr180_pipeline::Error;
     Ok(match kind {
-        vr180_pipeline::SourceKind::DjiOsv => {
+        vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv => {
             let cap = max_decode_side_for_fps(fps);
-            // XOR with DJI's "swap by default" (stream 0 = right eye).
+            // Per-kind default swap ⊕ user toggle (DJI: stream 0 = right eye;
+            // Insta360 X6: stream 0 = back lens = left eye).
             Box::new(DualStreamFisheyeIter::new_with_options(
-                path, HwDecode::Auto, 0, !swap_eyes, cap, 8)?)
+                path, HwDecode::Auto, 0, kind.dual_stream_iter_swap(swap_eyes), cap, 8)?)
         }
         vr180_pipeline::SourceKind::SbsFisheye =>
             Box::new(SbsFisheyeIter::new(path, HwDecode::Auto, 0)?),
@@ -1285,9 +1334,9 @@ fn run_fisheye(
             .features()
             .contains(wgpu::Features::TEXTURE_FORMAT_P010);
         let on_vulkan = vr180_pipeline::interop_windows::is_vulkan_backend(&pipeline.device);
-        if matches!(kind, vr180_pipeline::SourceKind::DjiOsv) && on_vulkan && has_p010 {
+        if kind.is_dual_stream() && on_vulkan && has_p010 {
             // XOR with DJI's "swap by default" (matches the CPU worker).
-            let swap = !control.settings.read().effective_swap_eyes();
+            let swap = kind.dual_stream_iter_swap(control.settings.read().effective_swap_eyes());
             let ctx = vr180_pipeline::interop_windows::VulkanImportCtx::from_wgpu(
                 &pipeline.adapter, &pipeline.device,
             );
@@ -1323,7 +1372,7 @@ fn run_fisheye(
             tracing::info!(
                 "decoder (fisheye): zero-copy preconditions not met \
                  (dji_osv={}, vulkan={}, p010={}) — CPU path",
-                matches!(kind, vr180_pipeline::SourceKind::DjiOsv), on_vulkan, has_p010
+                kind.is_dual_stream(), on_vulkan, has_p010
             );
         }
     }
@@ -1337,9 +1386,9 @@ fn run_fisheye(
     // falls through to the CPU path below untouched.
     #[cfg(target_os = "macos")]
     {
-        if matches!(kind, vr180_pipeline::SourceKind::DjiOsv) {
-            // XOR with DJI's "swap by default" (matches open_fisheye_segment).
-            let swap = !control.settings.read().effective_swap_eyes();
+        if kind.is_dual_stream() {
+            // Per-kind default swap ⊕ user toggle (matches open_fisheye_segment).
+            let swap = kind.dual_stream_iter_swap(control.settings.read().effective_swap_eyes());
             let segs: Vec<std::path::PathBuf> = if cfg.segments.is_empty() {
                 vec![cfg.path.clone()]
             } else {
@@ -1544,7 +1593,7 @@ fn run_fisheye(
                     Err(e) => { tracing::warn!("braw gyro extract failed: {e}"); None }
                 }
             }
-            vr180_pipeline::SourceKind::DjiOsv => {
+            vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv => {
                 if let Some(osv) = dji_osv_imu {
                     // Base mode is camera-lock (smooth_ms = 0 →
                     // q_corr = q_actual.conjugate(), no cap → no
@@ -1932,17 +1981,14 @@ fn run_fisheye(
         // When present, fused per-row stab + RS gives us DJI Studio's
         // per-slab quality (matches its per-slab, per-scanline
         // approach) without leaving the live pipeline.
+        // FPS-aware readout: OSMO 360 sensor mode at 50fps gives 16.23 ms vs
+        // 18.3 ms at 30fps; Insta360 states it in the file.
+        let readout_s = vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0;
         let rs_quats: Option<Vec<vr180_core::gyro::cori_iori::Quat>> =
             if control.settings.read().stabilize {
                 dji_osv_imu.as_ref().and_then(|osv| {
                     vr180_pipeline::dji_imu::compute_per_row_quaternions_for_frame(
-                        osv,
-                        stab_idx,
-                        // FPS-aware readout: OSMO 360 sensor mode at 50fps
-                        // gives 16.23 ms vs 18.3 ms at 30fps.
-                        vr180_pipeline::dji_imu::dji_osmo_readout_ms_for_fps(fps) / 1000.0,
-                        src_h,
-                        fps,
+                        osv, stab_idx, readout_s, src_h, fps,
                     )
                 })
             } else {
@@ -1950,14 +1996,21 @@ fn run_fisheye(
             };
         let phase_rs_quats = phase_t0.elapsed();
         let phase_t1 = std::time::Instant::now();
-        // Per-clip lens_a (factory mount) feeds into the per-row
-        // basis change. Same fallback as compute_dji_stabilization.
-        let lens_a_for_pack: [f32; 4] = dji_osv_imu
-            .as_ref()
-            .and_then(|osv| osv.lens_a.mount_quat_xyzw)
-            .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
-        let rs_rows_f32: Option<Vec<f32>> = rs_quats.as_ref()
-            .map(|q| vr180_pipeline::dji_imu::pack_per_row_camera_matrices(q, lens_a_for_pack));
+        // Basis change per clip (DJI lens_a mount / Insta360 measured mount)
+        // — same as compute_dji_stabilization.
+        // Per eye: the eye showing lens B samples lens B's own timeline when
+        // the camera's sensors expose independently (Insta360).
+        let swapped_eyes = control.settings.read().effective_swap_eyes();
+        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) =
+            match (rs_quats.as_ref(), dji_osv_imu.as_ref()) {
+                (Some(q), Some(osv)) => {
+                    let a = Some(vr180_pipeline::dji_imu::pack_per_row_camera_matrices_for(q, osv));
+                    let b = vr180_pipeline::dji_imu::lens_b_rs_rows(osv, stab_idx, readout_s, src_h, fps)
+                        .or_else(|| a.clone());
+                    if swapped_eyes { (a, b) } else { (b, a) }
+                }
+                _ => (None, None),
+            };
         let phase_pack = phase_t1.elapsed();
 
         // Diagnostic: per-axis decomposition of the stab rotation so we
@@ -2016,15 +2069,17 @@ fn run_fisheye(
                 upside_down: s.camera_upside_down,
             }
         };
+        let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(
+            rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes);
         let (rot_left, rot_right) = if view_adjust.is_identity() {
-            (rot, rot)
+            (rot_l0, rot_r0)
         } else {
             let (v_l, v_r) = view_adjust.per_eye_matrices();
             (
                 vr180_pipeline::gpu::EquirectRotation(
-                    vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &v_l)),
+                    vr180_pipeline::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
                 vr180_pipeline::gpu::EquirectRotation(
-                    vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &v_r)),
+                    vr180_pipeline::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
             )
         };
         // Decide projection target: half-equirect VR180 (default) or
@@ -2037,12 +2092,12 @@ fn run_fisheye(
             drop(s);
             match mode {
                 FisheyeOutputMode::HalfEquirect => {
-                    if let Some(rs_buf) = rs_rows_f32.as_deref() {
+                    if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_to_equirect_rs_texture(
-                            &pair.left, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_buf, 0,
+                            &pair.left, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_l, 0,
                         )?;
                         let r = pipeline.project_fisheye_to_equirect_rs_texture(
-                            &pair.right, src_w, src_h, eye_w, eye_h, rot_right, calib_right, rs_buf, 1,
+                            &pair.right, src_w, src_h, eye_w, eye_h, rot_right, calib_right, rs_r, 1,
                         )?;
                         (l, r)
                     } else {
@@ -2060,16 +2115,16 @@ fn run_fisheye(
                     // both axes so the result is a circle in a square
                     // frame regardless of the half-equirect aspect.
                     let side = eye_w.min(eye_h);
-                    if let Some(rs_buf) = rs_rows_f32.as_deref() {
+                    if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         // Per-row rolling-shutter correction, same as the
                         // half-equirect path — the RS warp operates on the
                         // source-frame direction independent of the output
                         // projection.
                         let l = pipeline.project_fisheye_to_fisheye_rs_texture(
-                            &pair.left, src_w, src_h, side, side, rot_left, calib_left, rs_buf,
+                            &pair.left, src_w, src_h, side, side, rot_left, calib_left, rs_l,
                         )?;
                         let r = pipeline.project_fisheye_to_fisheye_rs_texture(
-                            &pair.right, src_w, src_h, side, side, rot_right, calib_right, rs_buf,
+                            &pair.right, src_w, src_h, side, side, rot_right, calib_right, rs_r,
                         )?;
                         (l, r)
                     } else {
@@ -2549,24 +2604,17 @@ fn run_fisheye_zerocopy(
         // `src_h` is the working-res fisheye height the projection samples; the
         // same per-row quats apply to both eyes (one IMU). Without this the OSV
         // rolling-shutter jello is uncorrected (the "broken" stab).
-        let rs_rows_f32: Option<Vec<f32>> = if control.settings.read().stabilize {
-            dji_osv_imu.as_ref().and_then(|osv| {
-                vr180_pipeline::dji_imu::compute_per_row_quaternions_for_frame(
-                    osv,
-                    stab_idx,
-                    vr180_pipeline::dji_imu::dji_osmo_readout_ms_for_fps(fps) / 1000.0,
-                    src_h,
-                    fps,
-                )
-            }).map(|q| {
-                let lens_a = dji_osv_imu.as_ref()
-                    .and_then(|osv| osv.lens_a.mount_quat_xyzw)
-                    .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
-                vr180_pipeline::dji_imu::pack_per_row_camera_matrices(&q, lens_a)
-            })
+        let swapped_eyes = control.settings.read().effective_swap_eyes();
+        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if control.settings.read().stabilize {
+            dji_osv_imu.map(|osv| vr180_pipeline::dji_imu::per_eye_rs_rows(
+                osv, stab_idx,
+                vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu) / 1000.0,
+                src_h, fps, swapped_eyes,
+            )).unwrap_or((None, None))
         } else {
-            None
+            (None, None)
         };
+        let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(rot, dji_osv_imu, stab_idx, swapped_eyes);
 
         let view_adjust = {
             let s = control.settings.read();
@@ -2577,12 +2625,12 @@ fn run_fisheye_zerocopy(
             }
         };
         let (rot_left, rot_right) = if view_adjust.is_identity() {
-            (rot, rot)
+            (rot_l0, rot_r0)
         } else {
             let (v_l, v_r) = view_adjust.per_eye_matrices();
             (
-                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &v_l)),
-                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &v_r)),
+                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
+                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
             )
         };
 
@@ -2605,12 +2653,12 @@ fn run_fisheye_zerocopy(
                 // as half-equirect (parity with the macOS p010 + CPU-worker
                 // fisheye paths, which have always applied RS here).
                 FisheyeOutputMode::Fisheye => {
-                    if let Some(rs) = rs_rows_f32.as_deref() {
+                    if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                            &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs, 0,
+                            &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs_l, 0,
                         )?;
                         let r = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                            &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs, 1,
+                            &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs_r, 1,
                         )?;
                         (l, r)
                     } else {
@@ -2627,12 +2675,12 @@ fn run_fisheye_zerocopy(
                 // per-row rolling shutter is corrected (kills the jello); same
                 // per-row quats for both eyes.
                 FisheyeOutputMode::HalfEquirect => {
-                    if let Some(rs) = rs_rows_f32.as_deref() {
+                    if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                            &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs, 0,
+                            &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs_l, 0,
                         )?;
                         let r = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                            &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs, 1,
+                            &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs_r, 1,
                         )?;
                         (l, r)
                     } else {
@@ -2993,22 +3041,17 @@ fn run_fisheye_vt_zerocopy(
 
         // Per-row rolling-shutter correction (OSV; gated on stabilize, like the
         // CPU/paused-still path). `src_h` is the working-res fisheye height.
-        let rs_rows_f32: Option<Vec<f32>> = if control.settings.read().stabilize {
-            dji_osv_imu.as_ref().and_then(|osv| {
-                vr180_pipeline::dji_imu::compute_per_row_quaternions_for_frame(
-                    osv, stab_idx,
-                    vr180_pipeline::dji_imu::dji_osmo_readout_ms_for_fps(fps) / 1000.0,
-                    src_h, fps,
-                )
-            }).map(|q| {
-                let lens_a = dji_osv_imu.as_ref()
-                    .and_then(|osv| osv.lens_a.mount_quat_xyzw)
-                    .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
-                vr180_pipeline::dji_imu::pack_per_row_camera_matrices(&q, lens_a)
-            })
+        let swapped_eyes = control.settings.read().effective_swap_eyes();
+        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if control.settings.read().stabilize {
+            dji_osv_imu.as_ref().map(|osv| vr180_pipeline::dji_imu::per_eye_rs_rows(
+                osv, stab_idx,
+                vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0,
+                src_h, fps, swapped_eyes,
+            )).unwrap_or((None, None))
         } else {
-            None
+            (None, None)
         };
+        let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes);
 
         let view_adjust = {
             let s = control.settings.read();
@@ -3019,12 +3062,12 @@ fn run_fisheye_vt_zerocopy(
             }
         };
         let (rot_left, rot_right) = if view_adjust.is_identity() {
-            (rot, rot)
+            (rot_l0, rot_r0)
         } else {
             let (v_l, v_r) = view_adjust.per_eye_matrices();
             (
-                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &v_l)),
-                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &v_r)),
+                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
+                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
             )
         };
 
@@ -3036,11 +3079,11 @@ fn run_fisheye_vt_zerocopy(
             };
             match mode {
                 FisheyeOutputMode::Fisheye => {
-                    if let Some(rs) = rs_rows_f32.as_deref() {
+                    if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                            &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs, 0)?;
+                            &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs_l, 0)?;
                         let r = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs, 1)?;
+                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs_r, 1)?;
                         (l, r)
                     } else {
                         let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
@@ -3051,11 +3094,11 @@ fn run_fisheye_vt_zerocopy(
                     }
                 }
                 FisheyeOutputMode::HalfEquirect => {
-                    if let Some(rs) = rs_rows_f32.as_deref() {
+                    if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                            &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs, 0)?;
+                            &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs_l, 0)?;
                         let r = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs, 1)?;
+                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs_r, 1)?;
                         (l, r)
                     } else {
                         let l = pipeline.project_fisheye_rgba16_texture_to_equirect_16(
@@ -3195,6 +3238,7 @@ pub(crate) fn resolve_fisheye_calib_pair(
     .unwrap_or_else(|| {
         let auto_name = match kind {
             vr180_pipeline::SourceKind::DjiOsv         => "DJI Osmo 360",
+            vr180_pipeline::SourceKind::Insta360Insv   => "Insta360 X6",
             vr180_pipeline::SourceKind::BlackmagicRaw  => "Blackmagic Pyxis 12K",
             _                                          => "Custom",
         };
@@ -3220,7 +3264,7 @@ pub(crate) fn resolve_fisheye_calib_pair(
     // For OSV: per-lens protobuf fx/fy/cx/cy + pure-KB projection. After
     // the DJI iter's default swap: left = Lens B, right = Lens A.
     let (calib_l, calib_r) = match (kind, osv) {
-        (vr180_pipeline::SourceKind::DjiOsv, Some(imu)) => {
+        (vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
             let eye = |lens: &vr180_fisheye::DjiLensCalib,
@@ -3228,6 +3272,20 @@ pub(crate) fn resolve_fisheye_calib_pair(
                        km_p: [f32; 2]|
                 -> vr180_pipeline::gpu::FisheyeCalib
             {
+                // Auto + an exact factory model (Insta360): use it as is —
+                // the KB fields only seed the override UI. Override drops
+                // to KB (the manual fields describe a KB lens). Must match
+                // the export resolver exactly so preview == export.
+                if !ov {
+                    if let Some(o) = lens.omni {
+                        let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
+                        let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
+                        return vr180_pipeline::gpu::FisheyeCalib::new_omni(
+                            o.fx * scale_x, o.fy * scale_y, cx, cy, o.xi,
+                            o.radial, o.tangential, o.prism, src_w as f32, src_h as f32,
+                        );
+                    }
+                }
                 let (fx, fy, cx, cy, k, k5) = if ov {
                     // Manual: fx from FOV, absolute cx/cy from normalized,
                     // manual k1–k4 (preset if all-zero) + manual k5 (km5).
@@ -4511,7 +4569,7 @@ impl DetailCache {
         // IMU read from the cache the decoder thread populated (None until
         // it finishes parsing — the still renders un-stabilized until then,
         // which only matters if you zoom during the initial cold load).
-        let imu = if matches!(self.kind, vr180_pipeline::SourceKind::DjiOsv) {
+        let imu = if self.kind.has_frame_imu() {
             cached_dji_imu(&self.path)
         } else { None };
 
@@ -4604,8 +4662,8 @@ fn open_native_iter(
     use vr180_pipeline::fisheye_decode::{SbsFisheyeIter, DualStreamFisheyeIter, BrawFisheyeIter};
     use vr180_pipeline::decode::HwDecode;
     Ok(match kind {
-        vr180_pipeline::SourceKind::DjiOsv => {
-            let swap = !swap_eyes;
+        vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv => {
+            let swap = kind.dual_stream_iter_swap(swap_eyes);
             Box::new(DualStreamFisheyeIter::new_with_options(path, HwDecode::Auto, 0, swap, 0, 8)?)
         }
         vr180_pipeline::SourceKind::SbsFisheye =>
@@ -4643,7 +4701,7 @@ fn compute_stab_for(
     let total = vr180_pipeline::decode::probe_video(path)
         .map(|p| (p.duration_sec * p.fps as f64).round() as usize).unwrap_or(0).max(1);
     match kind {
-        vr180_pipeline::SourceKind::DjiOsv => imu.and_then(|osv| {
+        vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv => imu.and_then(|osv| {
             let max_corr = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
             vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
             vr180_pipeline::dji_imu::compute_dji_stabilization(
@@ -4701,38 +4759,36 @@ fn render_still_from_pair(
         stereo_yaw_deg: s.stereo_yaw_deg, stereo_pitch_deg: s.stereo_pitch_deg, stereo_roll_deg: s.stereo_roll_deg,
         upside_down: s.camera_upside_down,
     };
-    let (rot_left, rot_right) = if view_adjust.is_identity() { (rot, rot) } else {
+    let swapped_eyes = s.effective_swap_eyes();
+    let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(rot, imu, stab_idx, swapped_eyes);
+    let (rot_left, rot_right) = if view_adjust.is_identity() { (rot_l0, rot_r0) } else {
         let (vl, vr) = view_adjust.per_eye_matrices();
-        (EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &vl)),
-         EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot.0, &vr)))
+        (EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_l0.0, &vl)),
+         EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_r0.0, &vr)))
     };
 
-    let rs_rows: Option<Vec<f32>> = if s.stabilize && stab_rotations.is_some() {
-        imu.and_then(|osv| {
-            let lens_a = osv.lens_a.mount_quat_xyzw
-                .unwrap_or([-0.0060261087, 0.0048986990, -0.7059469223, 0.7082221508]);
-            vr180_pipeline::dji_imu::compute_per_row_quaternions_for_frame(
-                osv, stab_idx,
-                vr180_pipeline::dji_imu::dji_osmo_readout_ms_for_fps(fps) / 1000.0,
-                src_h, fps,
-            ).map(|q| vr180_pipeline::dji_imu::pack_per_row_camera_matrices(&q, lens_a))
-        })
-    } else { None };
+    let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if s.stabilize && stab_rotations.is_some() {
+        imu.map(|osv| vr180_pipeline::dji_imu::per_eye_rs_rows(
+            osv, stab_idx,
+            vr180_pipeline::dji_imu::readout_ms_for(kind, fps, imu) / 1000.0,
+            src_h, fps, swapped_eyes,
+        )).unwrap_or((None, None))
+    } else { (None, None) };
 
     let (left_tex, right_tex) = match s.fisheye_output_mode {
         FisheyeOutputMode::HalfEquirect => {
-            if let Some(buf) = rs_rows.as_deref() {
-                (pipeline.project_fisheye_to_equirect_rs_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, buf, 20)?,
-                 pipeline.project_fisheye_to_equirect_rs_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, buf, 21)?)
+            if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
+                (pipeline.project_fisheye_to_equirect_rs_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, rs_l, 20)?,
+                 pipeline.project_fisheye_to_equirect_rs_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, rs_r, 21)?)
             } else {
                 (pipeline.project_fisheye_to_equirect_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, 20)?,
                  pipeline.project_fisheye_to_equirect_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, 21)?)
             }
         }
         FisheyeOutputMode::Fisheye => {
-            if let Some(buf) = rs_rows.as_deref() {
-                (pipeline.project_fisheye_to_fisheye_rs_texture(&pair.left, src_w, src_h, oside, oside, rot_left, calib_left, buf)?,
-                 pipeline.project_fisheye_to_fisheye_rs_texture(&pair.right, src_w, src_h, oside, oside, rot_right, calib_right, buf)?)
+            if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
+                (pipeline.project_fisheye_to_fisheye_rs_texture(&pair.left, src_w, src_h, oside, oside, rot_left, calib_left, rs_l)?,
+                 pipeline.project_fisheye_to_fisheye_rs_texture(&pair.right, src_w, src_h, oside, oside, rot_right, calib_right, rs_r)?)
             } else {
                 (pipeline.project_fisheye_to_fisheye_texture(&pair.left, src_w, src_h, oside, oside, rot_left, calib_left)?,
                  pipeline.project_fisheye_to_fisheye_texture(&pair.right, src_w, src_h, oside, oside, rot_right, calib_right)?)

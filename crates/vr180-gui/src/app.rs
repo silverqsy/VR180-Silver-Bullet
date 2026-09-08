@@ -596,6 +596,7 @@ fn tr(en: &'static str) -> &'static str {
         "IMU phase (ms)" => "IMU 相位 (ms)",
         "Stabilization (VQF 6D, BRAW)" => "防抖 (VQF 6D, BRAW)",
         "Stabilization (DJI camera quats)" => "防抖（DJI 相机四元数）",
+        "Stabilization (Insta360 gyro)" => "防抖（Insta360 陀螺仪）",
         "No gyro stabilization available for this source yet." => "此素材暂无陀螺仪防抖。",
         "Camera" => "相机",
         "(Auto)" => "（自动）",
@@ -1634,6 +1635,7 @@ impl App {
         use vr180_pipeline::SourceKind as K;
         match kind {
             K::DjiOsv         => "osv",
+            K::Insta360Insv   => "insv",
             K::GoProEac       => "eac",
             K::SbsFisheye     => "sbs",
             K::BlackmagicRaw  => "braw",
@@ -1717,7 +1719,8 @@ impl App {
             };
             let (fisheye_eye_w, fisheye_eye_h) = match source_kind {
                 vr180_pipeline::SourceKind::SbsFisheye => (probe.width / 2, probe.height),
-                vr180_pipeline::SourceKind::DjiOsv     => (probe.width, probe.height),
+                vr180_pipeline::SourceKind::DjiOsv
+                | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
                 vr180_pipeline::SourceKind::BlackmagicRaw => {
                     if let Ok(info) = vr180_braw::BrawInfo::probe(&path) {
                         if info.is_dual_track() { (info.width / 2, info.height) }
@@ -1738,7 +1741,7 @@ impl App {
             };
             if !is_loaded_clip {
                 settings.dji_imu_phase_ms =
-                    vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(probe.fps);
+                    vr180_pipeline::dji_imu::imu_phase_default_ms_for(source_kind, probe.fps);
                 // RS mode + readout are per-clip — auto-detect firmware vs
                 // no-firmware RS from the GoPro CORI stream (the toggle still
                 // overrides). Non-EAC sources fall back to the default.
@@ -2539,7 +2542,8 @@ impl App {
         // Fisheye family: compute one-eye dimensions for FOV slider hints.
         let (fisheye_eye_w, fisheye_eye_h) = match source_kind {
             vr180_pipeline::SourceKind::SbsFisheye => (probe.width / 2, probe.height),
-            vr180_pipeline::SourceKind::DjiOsv     => (probe.width, probe.height),
+            vr180_pipeline::SourceKind::DjiOsv
+            | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
             vr180_pipeline::SourceKind::BlackmagicRaw => {
                 // braw_helper --info may not be installed; fall back to probe.
                 if let Ok(info) = vr180_braw::BrawInfo::probe(&path) {
@@ -2645,6 +2649,7 @@ impl App {
         {
             let auto = match source_kind {
                 vr180_pipeline::SourceKind::DjiOsv        => "DJI Osmo 360",
+                vr180_pipeline::SourceKind::Insta360Insv  => "Insta360 X6",
                 vr180_pipeline::SourceKind::BlackmagicRaw => "Blackmagic Pyxis 12K",
                 _                                         => "Custom",
             };
@@ -2681,7 +2686,7 @@ impl App {
         // them and gen isn't bumped on frame 0.
         if !meta.preserve_clip_settings {
             self.settings.dji_imu_phase_ms =
-                vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(meta.fps);
+                vr180_pipeline::dji_imu::imu_phase_default_ms_for(source_kind, meta.fps);
             self.settings.rs_mode = meta.detected_rs_mode;
             self.settings.rs_readout_ms = crate::decoder::default_rs_readout_ms();
         }
@@ -4181,6 +4186,7 @@ impl App {
                   "mp4", "MP4", "mov", "MOV"],
             )
             .add_filter("DJI Osmo 360 (.osv)", &["osv", "OSV"])
+            .add_filter("Insta360 (.insv)", &["insv", "INSV"])
             .add_filter("Blackmagic RAW (.braw)", &["braw", "BRAW"])
             .add_filter("Side-by-side fisheye (.mp4 / .mov)",
                 &["mp4", "MP4", "mov", "MOV"])
@@ -4513,6 +4519,7 @@ impl App {
         let align_ok = matches!(
             self.clip.as_ref().map(|c| c.source_kind),
             Some(vr180_pipeline::SourceKind::DjiOsv)
+                | Some(vr180_pipeline::SourceKind::Insta360Insv)
                 | Some(vr180_pipeline::SourceKind::SbsFisheye)
                 | Some(vr180_pipeline::SourceKind::BlackmagicRaw)
                 | Some(vr180_pipeline::SourceKind::GoProEac)
@@ -4644,6 +4651,9 @@ impl App {
         let kind = self.clip.as_ref().map(|c| c.source_kind);
         let is_braw = matches!(kind, Some(vr180_pipeline::SourceKind::BlackmagicRaw));
         let is_osv  = matches!(kind, Some(vr180_pipeline::SourceKind::DjiOsv));
+        // Insta360: raw gyro fused at load (VQF) — same stab controls as OSV,
+        // no background quat load to gate on.
+        let is_insv = matches!(kind, Some(vr180_pipeline::SourceKind::Insta360Insv));
         // DJI OSV loads the lens calib first (instant preview) and streams the
         // per-frame quaternions — needed for stabilization — in the background.
         // While they load, gray the controls; the decoder auto-applies stab the
@@ -4665,7 +4675,7 @@ impl App {
         } else { 0 };
         let s = &mut self.settings;
 
-        if !(is_braw || is_osv) {
+        if !(is_braw || is_osv || is_insv) {
             ui.label(RichText::new(
                 tr("No gyro stabilization available for this source yet.")
             ).small().color(Color32::GRAY));
@@ -4673,6 +4683,8 @@ impl App {
         }
         let stab_label = if is_braw {
             tr("Stabilization (VQF 6D, BRAW)")
+        } else if is_insv {
+            tr("Stabilization (Insta360 gyro)")
         } else {
             tr("Stabilization (DJI camera quats)")
         };
@@ -4681,7 +4693,7 @@ impl App {
         ui.checkbox(&mut s.stabilize, stab_label);
         // Stab sliders need the loaded quats — enabled only once ready.
         ui.add_enabled_ui(s.stabilize && quats_ready, |ui| {
-            if is_osv {
+            if is_osv || is_insv {
                 // smooth_ms = 0 → sharp camera-lock (legacy).
                 // smooth_ms > 0 → soft-stab (GoPro-style).
                 ui.add(egui::Slider::new(&mut s.dji_smooth_ms, 0.0..=3000.0)
@@ -4698,7 +4710,9 @@ impl App {
                 // readout/2 otherwise); the slider allows manual A/B around
                 // that default. Also asserts the main-thread thread-local so
                 // paused detail-still renders use this clip's phase.
-                ui.add(egui::Slider::new(&mut s.dji_imu_phase_ms, 0.0..=20.0)
+                // Insta360 seeds mid-frame (up to 20.8 ms at 24 fps) → wider range.
+                let phase_max = if is_insv { 40.0 } else { 20.0 };
+                ui.add(egui::Slider::new(&mut s.dji_imu_phase_ms, 0.0..=phase_max)
                     .step_by(0.1).fixed_decimals(1)
                     .text(tr("IMU phase (ms)")));
                 vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
@@ -4728,7 +4742,7 @@ impl App {
     fn draw_fisheye_output_panel(&mut self, ui: &mut egui::Ui) {
         let is_osv = matches!(
             self.clip.as_ref().map(|c| c.source_kind),
-            Some(vr180_pipeline::SourceKind::DjiOsv)
+            Some(vr180_pipeline::SourceKind::DjiOsv) | Some(vr180_pipeline::SourceKind::Insta360Insv)
         );
         let s = &mut self.settings;
 
@@ -4843,7 +4857,7 @@ impl App {
         // k5 (5th radial coeff) only applies to DJI OSV's 5-coefficient
         // model — gate the override slider on the loaded clip being OSV.
         let is_osv = self.clip.as_ref()
-            .map(|c| c.source_kind == vr180_pipeline::SourceKind::DjiOsv)
+            .map(|c| c.source_kind.has_frame_imu())
             .unwrap_or(false);
         let s = &mut self.settings;
 

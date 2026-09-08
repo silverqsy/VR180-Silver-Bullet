@@ -54,6 +54,34 @@ pub fn run(
     mag: Option<&[[f32; 3]]>,
     gyr_ts: f32,
 ) -> VqfRun {
+    run_with(gyro, acc, mag, gyr_ts, &VqfOptions::default())
+}
+
+/// Tuning for [`run_with`]. The defaults reproduce [`run`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VqfOptions {
+    /// Accelerometer (inclination) correction time constant in seconds;
+    /// `None` keeps VQF's default (3 s). Note VQF averages the earth-frame
+    /// accelerometer for the first `tau` seconds before its Butterworth
+    /// filter takes over, so a very long constant keeps a running mean (and
+    /// its low-frequency motion content) in the output for that long.
+    pub tau_acc_s: Option<f32>,
+    /// Disable VQF's online bias estimation (rest + motion) and integrate
+    /// with a fixed bias instead. Pair with `initial_bias_rad_s`.
+    pub fixed_bias: bool,
+    /// Gyro bias (rad/s, sensor frame) to start from — e.g. the estimate
+    /// of a previous full-clip pass.
+    pub initial_bias_rad_s: Option<[f32; 3]>,
+}
+
+/// [`run`] with explicit tuning.
+pub fn run_with(
+    gyro: &[[f32; 3]],
+    acc: &[[f32; 3]],
+    mag: Option<&[[f32; 3]]>,
+    gyr_ts: f32,
+    opts: &VqfOptions,
+) -> VqfRun {
     assert_eq!(gyro.len(), acc.len(), "gyro and acc length mismatch");
     if let Some(m) = mag {
         assert_eq!(m.len(), gyro.len(), "mag length must match gyro");
@@ -65,9 +93,19 @@ pub fn run(
         params.mag_dist_rejection_enabled = false;
         params.tau_mag = 5.0;
     }
+    if let Some(tau) = opts.tau_acc_s {
+        params.tau_acc = tau;
+    }
+    if opts.fixed_bias {
+        params.motion_bias_est_enabled = false;
+        params.rest_bias_est_enabled = false;
+    }
 
     // acc_ts / mag_ts == gyr_ts because the caller resampled both to gyro rate.
     let mut filter = vqf_rs::VQF::new(gyr_ts, None, None, Some(params));
+    if let Some(b) = opts.initial_bias_rad_s {
+        filter.set_bias_estimate(b, None);
+    }
 
     let mut quats = Vec::with_capacity(gyro.len());
     for i in 0..gyro.len() {

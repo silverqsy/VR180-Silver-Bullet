@@ -92,6 +92,32 @@ pub struct DjiLensCalib {
     /// (This quat — NOT fields 12/13/14 — is the orientation DJI's
     /// renderer actually uses; f12/13/14 are unused metadata.)
     pub mount_quat_xyzw: Option<[f32; 4]>,
+    /// Exact unified-camera-model description of the same lens, when the
+    /// source provides one (Insta360 factory calibration). `fx`/`cx`/`cy`/`k`
+    /// above then hold a Kannala-Brandt fit of its radial curve for the
+    /// override UI and CPU consumers; the renderers prefer this model.
+    pub omni: Option<OmniLensModel>,
+}
+
+/// Unified camera model (Mei/Geyer `ξ` + even radial polynomial + tangential
+/// + thin prism), in the same pixel frame as the owning [`DjiLensCalib`]'s
+/// `cx`/`cy`. Projection of a camera-frame ray `(X, Y, Z)` (x right, y DOWN,
+/// z optical): `(x, y) = (X, Y) / (ξ·|d| + Z)`, `r² = x²+y²`,
+/// `D = 1 + k1 r² + k2 r⁴ + k3 r⁶ + k4 r⁸ + k5 r¹⁰`,
+/// `x' = x·D + (r²+2x²)(A + C r²) + 2xy(B + E r²) + s1 r² + s2 r⁴`,
+/// `y' = y·D + (r²+2y²)(B + E r²) + 2xy(A + C r²) + s3 r² + s4 r⁴`,
+/// `u = cx + fx·x'`, `v = cy + fy·y'`. Matched to Insta360 Studio's output.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct OmniLensModel {
+    pub xi: f32,
+    pub fx: f32,
+    pub fy: f32,
+    /// `[k1, k2, k3, k4, k5]`.
+    pub radial: [f32; 5],
+    /// `[A, B, C, E]`.
+    pub tangential: [f32; 4],
+    /// `[s1, s2, s3, s4]` — x gets `s1 r² + s2 r⁴`, y gets `s3 r² + s4 r⁴`.
+    pub prism: [f32; 4],
 }
 
 /// Extracted IMU + calibration block from a DJI OSV file.
@@ -114,6 +140,22 @@ pub struct DjiOsvImu {
     /// per-model defaults (the II's streams arrive eye-swapped relative
     /// to the I after the VR180 mod).
     pub camera_model: Option<String>,
+    /// Explicit IMU→camera basis (rows = camera x/y/z axes expressed in IMU
+    /// coordinates). `None` for DJI files — the basis is then derived from
+    /// the lens-A mount quaternion. Set by sources that synthesize this
+    /// structure from a raw gyro (Insta360 `.insv`), whose sensor mount is
+    /// measured rather than read from the file.
+    pub imu_to_cam: Option<[[f32; 3]; 3]>,
+    /// Sensor readout (rolling-shutter sweep) time in ms when the file states
+    /// it (Insta360 `rolling_shutter_time`). `None` → the per-source default.
+    pub readout_ms: Option<f32>,
+    /// The same motion stream resampled at lens B's own per-frame content
+    /// times (`frame_quats` / `high_rate_quats` / `gravity` only), for
+    /// cameras whose two sensors expose independently (Insta360: the
+    /// second sensor's exposure record). `None` when both lenses share the
+    /// frame timing (DJI). Consumers stabilize the eye that shows lens B
+    /// from this timeline and everything else from `self`.
+    pub lens_b_timeline: Option<Box<DjiOsvImu>>,
 }
 
 impl DjiOsvImu {

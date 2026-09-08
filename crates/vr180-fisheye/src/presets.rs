@@ -80,7 +80,7 @@ pub fn for_extension(ext: &str) -> Option<&'static CameraPreset> {
 
 // ---- Catalog ------------------------------------------------------
 
-static PRESETS: [CameraPreset; 8] = [
+static PRESETS: [CameraPreset; 9] = [
     // ============================================================
     // DJI Osmo 360
     // ============================================================
@@ -262,6 +262,32 @@ static PRESETS: [CameraPreset; 8] = [
         default_fov_deg: 180.0,
         file_hints: &[],
         input_layout: InputLayout::SideBySide,
+    },
+
+    // ============================================================
+    // Insta360 X6 (dual-stream .insv, VR180-modded)
+    // ============================================================
+    // FALLBACK only — `.insv` files carry a per-lens factory calibration
+    // (UCM ξ + radial polynomial, decoded against the camera's own stitched
+    // previews) that the pipeline converts per file; see
+    // vr180-pipeline::insv_imu::stream_lens_calib. These constants are that
+    // conversion for a typical unit: 3840² stream = 2×2-binned sensor,
+    // principal point at the frame centre, rim ≈ 102° → ≈204° FOV.
+    CameraPreset {
+        name: "Insta360 X6",
+        lens: Some("2× Insta360 ~204° fisheye"),
+        calib: FisheyeCalibration {
+            fx: 1044.389,
+            fy: 1044.389,
+            cx: 1920.0,
+            cy: 1920.0,
+            k: [0.087926, -0.023232, 0.001227, -0.000388],
+            calib_w: 3840,
+            calib_h: 3840,
+        },
+        default_fov_deg: 204.5,
+        file_hints: &["insv"],
+        input_layout: InputLayout::DualStream,
     },
 ];
 
