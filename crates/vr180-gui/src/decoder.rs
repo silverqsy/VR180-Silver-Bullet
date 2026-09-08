@@ -71,6 +71,12 @@ pub(crate) fn default_rs_readout_ms() -> f32 { 15.224 }
 /// "off" to mirror the `CoriSource::Auto` routing; callers that want a
 /// no-signal fallback guard on `cori.len()` first (see [`detect_rs_mode`]).
 pub(crate) fn cori_indicates_no_firmware(cori: &[vr180_core::gyro::Quat]) -> bool {
+    // NOTE: this head test is only meaningful on the FIRST chapter of a
+    // recording — CORI integrates continuously across chapter splits, so
+    // a later chapter's cori[0] is wherever the camera pointed at the
+    // cut. Callers must feed chapter-1 CORI (see `first_chapter_of`).
+    // (IORI is NOT a substitute: the camera can record a real CORI with
+    // IORI off, and that mode still has firmware RS baked in.)
     let head = &cori[..cori.len().min(10)];
     let cori_is_zero = head.iter().all(|q|
         q.w.abs() < 0.01 && q.x.abs() < 0.01
@@ -115,10 +121,21 @@ pub(crate) fn detect_rs_mode_for_path(
     if kind != vr180_pipeline::SourceKind::GoProEac {
         return default_rs_mode();
     }
-    match extract_gpmf_cached(path) {
+    match extract_gpmf_cached(&first_chapter_of(path)) {
         Ok(gpmf) => detect_rs_mode(&vr180_core::gyro::parse_cori(&gpmf)),
         Err(_) => default_rs_mode(),
     }
+}
+
+/// Resolve any chapter of a GoPro recording (`GS02xxxx.360`, …) to the
+/// FIRST chapter present on disk, via the same sibling scan merged import
+/// uses. The firmware-RS auto-detect must run on chapter-1 CORI (an
+/// individually-imported later chapter otherwise mis-seeds as firmware).
+/// Non-GoPro / standalone files resolve to themselves.
+pub(crate) fn first_chapter_of(path: &std::path::Path) -> std::path::PathBuf {
+    vr180_core::segments::detect_segments(path)
+        .into_iter().next()
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 /// True when an OSV was recorded by the OSMO 360 **II** ("Osmo OQ002").
@@ -4917,7 +4934,19 @@ pub(crate) fn build_per_eye_frames_multi(
             // real regression — it sent no-firmware GS010192 to drifty CORI
             // instead of VQF, which (with the MNOR-frame fix) now matches the
             // Python app to ~0.1°.
-            CoriSource::Auto => cori_indicates_no_firmware(&cori),
+            CoriSource::Auto => {
+                // Single-chapter import of a later chapter: judge on
+                // chapter-1 CORI (a merged chain already starts there).
+                let c1 = first_chapter_of(input);
+                if !is_multi && c1 != std::path::PathBuf::from(input) {
+                    match extract_gpmf_cached(&c1) {
+                        Ok(g) => cori_indicates_no_firmware(&parse_cori(&g)),
+                        Err(_) => cori_indicates_no_firmware(&cori),
+                    }
+                } else {
+                    cori_indicates_no_firmware(&cori)
+                }
+            }
         };
         if want_vqf {
             cori = if is_multi {

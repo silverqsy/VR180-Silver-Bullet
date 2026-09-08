@@ -7,9 +7,9 @@
 //!
 //! - vertical disparity `dy(λ) = pitch + roll·λ` — always solvable: no
 //!   scene geometry produces vertical disparity, so it is pure error.
-//! - horizontal disparity `dx = yaw + depth(patch)` — yaw is only
-//!   solvable from far content (depth → 0 at infinity), so it is gated
-//!   on a tight far-cluster and returned as `Option`.
+//! - horizontal disparity `dx = yaw + depth(patch)` — yaw comes from the
+//!   far end of the distribution (depth → 0 at infinity); ungated, the
+//!   user tweaks the slider if a close-range scene biases it.
 //!
 //! Because the render includes the CURRENT ViewAdjust, the result is the
 //! correction to ADD to the stereo offset sliders (which apply ± per eye,
@@ -28,7 +28,7 @@ use crate::{Error, Result};
 pub struct StereoAlignResult {
     pub d_stereo_pitch_deg: f32,
     pub d_stereo_roll_deg: f32,
-    /// `None` when the scene had no trustworthy far content.
+    /// Practically always `Some` (None only with <4 usable patches).
     pub d_stereo_yaw_deg: Option<f32>,
     /// RMS vertical disparity after the fit, in degrees — doubles as a
     /// per-eye INTRINSIC health metric: with good per-lens calibration
@@ -239,38 +239,29 @@ pub fn measure_stereo_align(
     })
 }
 
-/// Far content sits at zero disparity; near content spreads to ONE side
-/// of the dx distribution. The far end is whichever tail is more tightly
-/// clustered. Gated: the cluster must be tight and populated, else None.
+/// Yaw from the far end of the horizontal-disparity distribution. Far
+/// content sits at zero depth disparity while near content spreads to ONE
+/// side, so the far end is whichever tail is more tightly clustered; the
+/// estimate is the median of that cluster (ungated — the user tweaks the
+/// slider if a close-range scene biases it).
 fn solve_yaw(sorted_dx: &[f32]) -> Option<f32> {
-    if sorted_dx.len() < 16 {
+    let n = sorted_dx.len();
+    if n < 4 {
         return None;
     }
-    let n = sorted_dx.len();
     let px = std::f32::consts::PI / EYE as f32; // 1 measurement pixel, rad
     let q = |f: f32| sorted_dx[((n - 1) as f32 * f) as usize];
-    // The far end is whichever tail is more tightly clustered (depth
-    // disparity spreads near content toward one side only; far content
-    // piles up at its zero).
     let lo_spread = (q(0.15) - q(0.02)).abs();
     let hi_spread = (q(0.98) - q(0.85)).abs();
     let far_anchor = if lo_spread < hi_spread { q(0.06) } else { q(0.94) };
-    // Cluster = members within ~2.2 px of the anchor (NCC subpixel noise
-    // is ~0.3 px; depth between ~10 m and infinity spans under 1 px).
     let members: Vec<f32> = sorted_dx.iter().copied()
         .filter(|d| (d - far_anchor).abs() < 2.2 * px)
         .collect();
-    if members.len() < (n / 5).max(10) {
-        return None;
+    if members.len() >= 3 {
+        Some(members[members.len() / 2])
+    } else {
+        Some(far_anchor)
     }
-    // The cluster itself must be dense (a smeared mid-depth tail is not
-    // "far"): inner-quartile spread under ~1.3 px.
-    let m = members.len();
-    let iqr = (members[m * 3 / 4] - members[m / 4]).abs();
-    if iqr > 1.3 * px {
-        return None;
-    }
-    Some(members[m / 2])
 }
 
 fn to_gray(rgb: &[u8]) -> Vec<f32> {

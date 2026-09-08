@@ -517,12 +517,9 @@ fn tr(en: &'static str) -> &'static str {
         // Auto align (View adjustment panel)
         "Auto align" => "自动对齐",
         "Aligning…" => "对齐中…",
-        "Applied" => "已应用",
-        "residual" => "残差",
-        "skipped (no far content)" => "跳过（无远景内容）",
         "Auto align failed" => "自动对齐失败",
-        "Measures the vertical disparity between the eyes on a few frames and auto-fills the stereo pitch/roll (and yaw when the scene has far content). Adds to the current values — tweak after, or run again to refine."
-            => "在若干帧上测量双眼间的垂直视差，自动填充立体俯仰/滚转偏移（场景有远景时也包括偏航）。在当前值基础上累加——可再手动微调，或再次运行以进一步收敛。",
+        "Measures the disparity between the eyes on a few frames and auto-fills the stereo pitch/roll/yaw. Adds to the current values — tweak after, or run again to refine."
+            => "在若干帧上测量双眼间的视差，自动填充立体俯仰/滚转/偏航偏移。在当前值基础上累加——可再手动微调，或再次运行以进一步收敛。",
         "Scales each eye about its own center at the final output stage, padding with black. Half-equirect (VR180) output only."
             => "在最终输出阶段将每只眼睛的画面围绕各自中心缩放，四周填充黑色。仅对半等距柱状（VR180）输出生效。",
         // Source info
@@ -2520,7 +2517,17 @@ impl App {
                                 vr180_core::geoc::lookup_srot_s(&path, None)
                                     .ok().flatten().map(|s| s * 1000.0)
                             });
-                        let rs_mode = crate::decoder::detect_rs_mode(&cori);
+                        // Auto-detect on CHAPTER-1 CORI: an individually
+                        // loaded later chapter's own CORI starts mid-flight.
+                        let c1 = crate::decoder::first_chapter_of(&path);
+                        let rs_mode = if c1 != path {
+                            crate::decoder::extract_gpmf_cached(&c1)
+                                .map(|g| crate::decoder::detect_rs_mode(
+                                    &vr180_core::gyro::parse_cori(&g)))
+                                .unwrap_or_else(|_| crate::decoder::detect_rs_mode(&cori))
+                        } else {
+                            crate::decoder::detect_rs_mode(&cori)
+                        };
                         (cori.len(), raw.grav.len(), srot, rs_mode)
                     }
                     Err(_) => (0, 0, None, crate::decoder::default_rs_mode()),
@@ -4551,10 +4558,9 @@ impl App {
                 ui.label(RichText::new(tr("Aligning…")).small());
             } else if ui.add_enabled(align_ok, egui::Button::new(tr("Auto align")))
                 .on_hover_text(tr(
-                    "Measures the vertical disparity between the eyes on a few \
-                     frames and auto-fills the stereo pitch/roll (and yaw when \
-                     the scene has far content). Adds to the current values — \
-                     tweak after, or run again to refine."))
+                    "Measures the disparity between the eyes on a few frames \
+                     and auto-fills the stereo pitch/roll/yaw. Adds to the \
+                     current values — tweak after, or run again to refine."))
                 .clicked()
             {
                 start_align = true;
@@ -4611,14 +4617,9 @@ impl App {
                 if let Some(y) = r.d_stereo_yaw_deg {
                     self.settings.stereo_yaw_deg += y;
                 }
-                let yaw_txt = match r.d_stereo_yaw_deg {
-                    Some(y) => format!("{y:+.3}°"),
-                    None => tr("skipped (no far content)").to_string(),
-                };
-                self.align_status = Some(format!(
-                    "{}: pitch {:+.3}°  roll {:+.3}°  yaw {}  ·  {} {:.3}°",
-                    tr("Applied"), r.d_stereo_pitch_deg, r.d_stereo_roll_deg,
-                    yaw_txt, tr("residual"), r.residual_deg));
+                // No summary text: the user sees the three stereo sliders
+                // move. (Failures below still surface a message.)
+                self.align_status = None;
                 self.align_rx = None;
                 ctx.request_repaint();
             }
