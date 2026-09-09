@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: 2.1.0 in progress — auto-update landed (macOS-verified)
+## ⚡ Status: 2.5.0 (version bumped, unreleased) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -11,7 +11,10 @@ NVENC path and the macOS feature batch below were verified on both platforms
 (DX12/Vulkan + NVENC on an RTX 4090; Metal on Apple Silicon). See
 [CHANGELOG.md](CHANGELOG.md) for the user-facing 2.0 summary.
 
-**2.1.0 (version bumped, unreleased): seamless auto-update** — see
+**2.5.0 bumps from 2.1.0** (auto-update, released) with the reframed output
+mode, stabilization timing derived from the file (no IMU phase slider),
+Insta360 X6 support, OSMO 360 II support and Auto align — see items 7–9
+below and [CHANGELOG.md](CHANGELOG.md). **2.1.0: seamless auto-update** — see
 [docs/AUTO-UPDATE.md](docs/AUTO-UPDATE.md) for the full design + release
 recipe. `crates/vr180-gui/src/updater.rs`: minisign-verified updates from
 GitHub Releases (`latest.json` at the stable `releases/latest/download/`
@@ -25,7 +28,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    `C:\Users\<user>\.vr180-updater\vr180-updater.key` (private channel;
    NEVER commit) and install the `minisign` CLI (scoop or release binary).
 3. Rebuild the installer with the updated `installer/windows.iss`
-   (AppVer 2.1.0 + the new silent-relaunch `[Run]` entry +
+   (AppVer 2.5.0 + the new silent-relaunch `[Run]` entry +
    `CloseApplications`).
 4. VERIFY the Windows update path (built here, not yet run on Windows):
    serve a `latest.json` locally (`VR180_UPDATE_URL` override), click
@@ -34,10 +37,10 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    `-setup.exe` inheriting a lock on itself (it runs from the staging dir
    under `%APPDATA%\VR180SilverBullet2.0\updates\` — fine), and the
    `[Run] Check: WizardSilent` entry actually firing.
-5. At release: `node scripts/make-latest-json.mjs --version 2.1.0
+5. At release: `node scripts/make-latest-json.mjs --version 2.5.0
    --notes-file <notes>` on BOTH machines (mac first, copy its
    `release-staging/latest.json` over so the entries merge), then upload
-   both artifacts + `latest.json` to the `v2.1.0` release.
+   both artifacts + `latest.json` to the `v2.5.0` release.
 6. **BeyondVR Hack** (final-stage per-eye output scale, ⚙ Format window)
    landed after the seam fixes — pull + rebuild + re-upload the Windows
    artifacts so both platforms carry it (mac 2.1.0 artifacts already
@@ -87,6 +90,32 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    on macOS — same pump, same shape as the VT iterator) on an `.insv` AND
    an `.osv`: frame count == trim length, no "Could not find ref with POC"
    spam, eyes in sync. The X6 gets no built-in LUT yet.
+9. **Reframed output mode** (`FisheyeOutputMode::Reframe`, 2026-09-09):
+   a pinhole-style side-by-side viewport of each eye instead of the VR180
+   half-equirect — per-clip zoom (horizontal FOV), pan/tilt/roll, a
+   "defish" blend (k-projection `r = k·tan(θ/k)`: 0 = rectilinear,
+   1 = fisheye look) and a 1:1 or 16:9 per-eye aspect. Implemented as a
+   second ray generator (`output_ray`, `proj_mode` uniform) inside the
+   existing equirect kernels — the four `fisheye_*_to_hequirect*` shaders
+   (DJI / Insta360 / BRAW) and `eac_to_equirect.wgsl` (GoPro) — driven by
+   `FisheyeCalib::with_reframe` / `EacLensAdjust::with_reframe`
+   (`gpu::reframe_k`, `reframe_edge_x`, `reframe_ray` are the CPU twins,
+   unit-tested). The pan reuses the view adjust's global angles
+   (`Settings::output_view_adjust`, tilt-up = negative pitch); stab, stereo
+   offsets, per-row RS and the lens override all still apply. Export
+   (`FisheyeExportProjection::Reframe { hfov_deg, defish, spatial }`)
+   writes the exact viewport at a per-eye size (1080/1440/2160 lines ×
+   aspect → 2:1 or 32:9 SBS) and never tags VR180 metadata (no spatial-
+   video side output: Vision Pro viewers watch the VR180 export instead).
+   Preview follows the aspect
+   via `preview_out_dims`; in this mode dragging the preview pans the view,
+   scroll / pinch zooms the FOV and double-click recenters (the alignment
+   magnifier is inert), and the BeyondVR eye-scale hack is hidden and not
+   applied. Preview sharpness: the zero-copy worker projects the reframed
+   view from the NATIVE frame (not the 1280 working res), its output is ≥
+   1920 px per eye, and a paused frame always shows the native still
+   (`wants_full_res_still`). The Windows D3D11 preview path took the same
+   edit blind — verify there.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

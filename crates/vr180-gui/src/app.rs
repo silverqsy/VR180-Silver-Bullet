@@ -273,6 +273,26 @@ impl ExportResolution {
     }
 }
 
+/// Per-eye size of a reframed export (the side-by-side frame is twice as
+/// wide): 1080 / 1440 / 2160 lines; the width follows the view's aspect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReframeSize { P1080, P1440, P2160 }
+
+impl ReframeSize {
+    fn height(self) -> u32 {
+        match self { Self::P1080 => 1080, Self::P1440 => 1440, Self::P2160 => 2160 }
+    }
+    fn eye_dims(self, aspect: crate::decoder::ReframeAspect) -> (u32, u32) {
+        let h = self.height();
+        let w = (((h as f32 * aspect.ratio()).round() as u32) + 1) & !1;
+        (w, h)
+    }
+    fn label(self, aspect: crate::decoder::ReframeAspect) -> String {
+        let (w, h) = self.eye_dims(aspect);
+        format!("{} × {}  ({w} × {h} per eye)", 2 * w, h)
+    }
+}
+
 impl ExportCodec {
     fn label(self) -> &'static str {
         match self {
@@ -327,6 +347,8 @@ struct ExportOptions {
     /// MUTUALLY EXCLUSIVE with `inject_apmp` (they overwrite the same
     /// atoms in the visual sample entry) — the GUI enforces it.
     inject_youtube: bool,
+    /// Reframed exports: per-eye size (the aspect comes from the clip).
+    reframe_size: ReframeSize,
     /// Camera baseline in mm for APMP `cams/blin`. Typical 60..=70.
     apmp_baseline_mm: f32,
     /// "BeyondVR Hack": at the final output stage, scale each eye of the
@@ -351,6 +373,7 @@ impl Default for ExportOptions {
             inject_apmp: true,
             inject_youtube: false,
             apmp_baseline_mm: 65.0,
+            reframe_size: ReframeSize::P1080,
             beyondvr_hack: false,
             beyondvr_scale_pct: 85.0,
         }
@@ -533,6 +556,23 @@ fn tr(en: &'static str) -> &'static str {
         "Enable stabilization" => "启用防抖",
         "CORI source" => "CORI 来源",
         "Smooth (ms)" => "平滑 (ms)",
+        // Reframed view
+        "Reframed view" => "重新取景视图",
+        "Aspect" => "画幅比例",
+        "Zoom — horizontal FOV (°)" => "变焦 — 水平视场角 (°)",
+        "Defish (0 = rectilinear, 1 = fisheye)" => "去鱼眼（0 = 直线透视，1 = 鱼眼）",
+        "Pan (°)" => "平移 (°)",
+        "Tilt (°)" => "俯仰 (°)",
+        "Field of view" => "视场角",
+        "Reset view" => "重置视图",
+        "FOV" => "视场角",
+        "pan" => "平移",
+        "tilt" => "俯仰",
+        "drag = pan, scroll / pinch = zoom, dbl-click = recenter" => "拖动 = 平移，滚轮 / 捏合 = 缩放，双击 = 回中",
+        "Per-eye size" => "单眼尺寸",
+        "Reframed output is not VR180 — no projection metadata is written." => "重新取景输出不是 VR180 —— 不写入投影元数据。",
+        "Reframed mode aims the view with the Reframed view pan; these angles apply to VR180 output only."
+            => "重新取景模式下由“重新取景视图”的平移控制朝向；这些角度仅作用于 VR180 输出。",
         "Max corr (°)" => "最大校正 (°)",
         "Response" => "响应",
         "direct" => "直接",
@@ -1179,6 +1219,17 @@ impl App {
                 vr180_pipeline::fisheye_export::FisheyeExportProjection::HalfEquirect,
             crate::decoder::FisheyeOutputMode::Fisheye =>
                 vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye,
+            crate::decoder::FisheyeOutputMode::Reframe => {
+                // The exact viewport at the chosen per-eye size and aspect
+                // (overrides the VR180 resolution targets above).
+                let (w, h) = opts.reframe_size.eye_dims(settings.reframe_aspect);
+                eye_w = w;
+                eye_h = h;
+                vr180_pipeline::fisheye_export::FisheyeExportProjection::Reframe {
+                    hfov_deg: settings.reframe_hfov_deg,
+                    defish: settings.reframe_defish,
+                }
+            }
         };
         // Fisheye output is a CIRCLE in a SQUARE frame — force eye_h = eye_w
         // so SBS becomes (2*side × side). For OSV (3840×3840) this is a
@@ -1245,15 +1296,7 @@ impl App {
             dji_smooth_ms: settings.dji_smooth_ms,
             dji_responsiveness: settings.dji_responsiveness,
             denoise_strength: settings.denoise_strength,
-            view_adjust: vr180_pipeline::panomap::ViewAdjust {
-                pano_yaw_deg: settings.pano_yaw_deg,
-                pano_pitch_deg: settings.pano_pitch_deg,
-                pano_roll_deg: settings.pano_roll_deg,
-                stereo_yaw_deg: settings.stereo_yaw_deg,
-                stereo_pitch_deg: settings.stereo_pitch_deg,
-                stereo_roll_deg: settings.stereo_roll_deg,
-                upside_down: settings.camera_upside_down,
-            },
+            view_adjust: settings.output_view_adjust(),
             fisheye_preset: settings.fisheye_preset.clone(),
             fisheye_override_left: settings.fisheye_override_left,
             fisheye_override_right: settings.fisheye_override_right,
@@ -1957,7 +2000,7 @@ impl App {
         // file, contending with the preview worker (a slow first frame off an
         // external drive). The cache still persists on zoom-out (keep_alive),
         // so only the FIRST zoom-in pays the open.
-        if self.detail_cache.is_none() && self.preview_zoom > 1.001 {
+        if self.detail_cache.is_none() && self.wants_full_res_still() {
             let segments = self.clip.as_ref()
                 .map(|c| c.segments.clone())
                 .unwrap_or_default();
@@ -1972,7 +2015,7 @@ impl App {
         // cache + the last rendered still (the 1× view uses the live
         // preview), so returning here makes zoom-in instant when nothing
         // changed — and a cheap re-projection (no decode) if settings moved.
-        if self.preview_zoom <= 1.001 {
+        if !self.wants_full_res_still() {
             return;
         }
 
@@ -2096,7 +2139,7 @@ impl App {
     /// truth, so the still is pixel-identical to the preview at native res.
     fn poll_full_res_eac(&mut self, ctx: &egui::Context) {
         use std::sync::atomic::Ordering;
-        let want = self.decoder_alive && !self.playing && self.preview_zoom > 1.001;
+        let want = self.decoder_alive && !self.playing && self.wants_full_res_still();
         if let Some(c) = &self.control {
             c.want_detail.store(want, Ordering::SeqCst);
         }
@@ -3058,6 +3101,15 @@ impl App {
         }
     }
 
+    /// Whether a paused frame should be shown as the native-resolution still:
+    /// when the alignment magnifier is zoomed in, and always in the reframed
+    /// mode (its viewport shows a small part of the lens, so the live
+    /// working-res preview is soft and the magnifier is inert there).
+    fn wants_full_res_still(&self) -> bool {
+        self.preview_zoom > 1.001
+            || matches!(self.settings.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Reframe)
+    }
+
     /// Diff `self.settings` against `last_pushed_settings`; if changed,
     /// push to the shared control and bump the generation counter so
     /// the decoder rebuilds per-eye bundles on its next iteration.
@@ -3124,15 +3176,19 @@ impl App {
             None => tr("next to source").to_string(),
         };
         let has_out_dir = self.batch_out_dir.is_some();
+        let res_label = match self.settings.reframe_aspect_if_active() {
+            Some(aspect) => self.export_opts.reframe_size.label(aspect),
+            None => self.export_opts.resolution.label().to_string(),
+        };
         let fmt_label = format!("{} · {}{}{}",
             self.export_opts.codec.label(),
-            self.export_opts.resolution.label(),
+            res_label,
             match self.export_opts.codec {
                 ExportCodec::H265 => format!(" · {} Mbps · {}-bit",
                     self.export_opts.h265_bitrate_mbps, self.export_opts.h265_bit_depth),
                 ExportCodec::ProRes => format!(" · {}", self.export_opts.prores_profile.label()),
             },
-            if self.export_opts.beyondvr_hack {
+            if self.export_opts.beyondvr_hack && self.settings.reframe_aspect_if_active().is_none() {
                 format!(" · BeyondVR {:.0}%", self.export_opts.beyondvr_scale_pct)
             } else { String::new() });
         let summary = self.last_batch_summary.as_ref().map(|s| {
@@ -3250,7 +3306,8 @@ impl App {
                 .open(&mut open)
                 .show(ctx, |ui| {
                     ui.set_min_width(360.0);
-                    Self::export_options_ui(ui, &mut self.export_opts, "export");
+                    Self::export_options_ui(ui, &mut self.export_opts, "export",
+                        self.settings.reframe_aspect_if_active());
                 });
             self.show_export_settings = open;
         }
@@ -3259,17 +3316,35 @@ impl App {
     /// The export-output controls (resolution / codec / codec-specific /
     /// VR180 metadata) shown in the export bar's Format dropdown. `id_prefix`
     /// keeps the ComboBox ids distinct.
-    fn export_options_ui(ui: &mut egui::Ui, opts: &mut ExportOptions, id_prefix: &str) {
-        ui.label(RichText::new(tr("Resolution")).strong());
-        egui::ComboBox::from_id_source(format!("{id_prefix}_resolution"))
-            .selected_text(opts.resolution.label())
-            .width(220.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut opts.resolution,
-                    ExportResolution::Native, ExportResolution::Native.label());
-                ui.selectable_value(&mut opts.resolution,
-                    ExportResolution::R8k, ExportResolution::R8k.label());
-            });
+    fn export_options_ui(
+        ui: &mut egui::Ui, opts: &mut ExportOptions, id_prefix: &str,
+        reframe: Option<crate::decoder::ReframeAspect>,
+    ) {
+        if let Some(aspect) = reframe {
+            // Reframed view: the exact viewport at a per-eye size.
+            ui.label(RichText::new(tr("Per-eye size")).strong());
+            egui::ComboBox::from_id_source(format!("{id_prefix}_reframe_size"))
+                .selected_text(opts.reframe_size.label(aspect))
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    for sz in [ReframeSize::P1080, ReframeSize::P1440, ReframeSize::P2160] {
+                        ui.selectable_value(&mut opts.reframe_size, sz, sz.label(aspect));
+                    }
+                });
+            ui.label(RichText::new(tr("Reframed output is not VR180 — no projection metadata is written."))
+                .small().color(Color32::GRAY));
+        } else {
+            ui.label(RichText::new(tr("Resolution")).strong());
+            egui::ComboBox::from_id_source(format!("{id_prefix}_resolution"))
+                .selected_text(opts.resolution.label())
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut opts.resolution,
+                        ExportResolution::Native, ExportResolution::Native.label());
+                    ui.selectable_value(&mut opts.resolution,
+                        ExportResolution::R8k, ExportResolution::R8k.label());
+                });
+        }
         ui.add_space(8.0);
 
         ui.label(RichText::new(tr("Codec")).strong());
@@ -3326,6 +3401,7 @@ impl App {
             }
         }
 
+        if reframe.is_none() {
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(4.0);
@@ -3360,7 +3436,13 @@ impl App {
              only one can be active per file. Re-run the export \
              with the other target if you need a second copy."
         )).small().color(Color32::GRAY));
+        }
 
+        // The BeyondVR eye-scale hack is a half-equirect (VR180) fix-up —
+        // a reframed view neither shows nor applies it.
+        if reframe.is_some() {
+            return;
+        }
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(4.0);
@@ -3873,7 +3955,7 @@ impl eframe::App for App {
             // falls back to the live preview while the new still decodes.
             let cur_ts = self.current_display.as_ref()
                 .map(|d| d.timestamp_s).unwrap_or(0.0);
-            let use_full_res = self.preview_zoom > 1.001 && !self.playing
+            let use_full_res = self.wants_full_res_still() && !self.playing
                 && self.full_res_display.as_ref()
                     .map(|d| (d.timestamp_s - cur_ts).abs() < 0.02).unwrap_or(false);
             let disp = if use_full_res {
@@ -3901,9 +3983,52 @@ impl eframe::App for App {
 
                 let zoom = &mut self.preview_zoom;
                 let center = &mut self.preview_center;
+                let reframe = matches!(self.settings.fisheye_output_mode,
+                    crate::decoder::FisheyeOutputMode::Reframe);
+
+                if reframe {
+                    // Reframed view: the gestures aim the viewport itself —
+                    // drag pans, scroll / pinch zooms (the FOV), double-click
+                    // recenters. The alignment magnifier stays at fit.
+                    *zoom = 1.0;
+                    *center = egui::vec2(0.5, 0.5);
+                    let s = &mut self.settings;
+                    if resp.hovered() {
+                        let zd = ui.input(|i| i.zoom_delta());
+                        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                        let factor = if (zd - 1.0).abs() > 1e-4 { zd } else { 1.0 + scroll * 0.002 };
+                        if (factor - 1.0).abs() > 1e-6 {
+                            s.reframe_hfov_deg = (s.reframe_hfov_deg / factor).clamp(30.0, 150.0);
+                        }
+                    }
+                    if resp.dragged() {
+                        let d = resp.drag_delta();
+                        // Displayed width of ONE eye: the SBS preview shows two
+                        // side by side, the other modes one eye full-width.
+                        let eye_disp_w = if s.preview_mode == crate::decoder::PreviewMode::Sbs {
+                            w * 0.5
+                        } else {
+                            w
+                        };
+                        // Angular size of one displayed pixel at the view centre
+                        // (dθ/dr = 1 there for every k), so the content follows
+                        // the cursor.
+                        let k = vr180_pipeline::gpu::reframe_k(s.reframe_defish);
+                        let edge_x = vr180_pipeline::gpu::reframe_edge_x(s.reframe_hfov_deg, k);
+                        let deg_per_px = (2.0 * edge_x / eye_disp_w.max(1.0)).to_degrees();
+                        let mut yaw = s.reframe_yaw_deg - d.x * deg_per_px;
+                        if yaw > 180.0 { yaw -= 360.0; } else if yaw < -180.0 { yaw += 360.0; }
+                        s.reframe_yaw_deg = yaw;
+                        s.reframe_pitch_deg = (s.reframe_pitch_deg + d.y * deg_per_px).clamp(-90.0, 90.0);
+                    }
+                    if resp.double_clicked() {
+                        s.reframe_yaw_deg = 0.0;
+                        s.reframe_pitch_deg = 0.0;
+                    }
+                }
 
                 // Scroll → zoom toward the cursor.
-                if resp.hovered() {
+                if resp.hovered() && !reframe {
                     let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                     if scroll.abs() > 0.01 {
                         let old_z = *zoom;
@@ -3923,13 +4048,13 @@ impl eframe::App for App {
                     }
                 }
                 // Drag → pan (only meaningful when zoomed in).
-                if resp.dragged() && *zoom > 1.0 {
+                if resp.dragged() && *zoom > 1.0 && !reframe {
                     let d = resp.drag_delta();
                     center.x -= d.x / (w * *zoom);
                     center.y -= d.y / (h * *zoom);
                 }
                 // Double-click → reset to fit.
-                if resp.double_clicked() {
+                if resp.double_clicked() && !reframe {
                     *zoom = 1.0;
                     *center = egui::vec2(0.5, 0.5);
                 }
@@ -3953,8 +4078,16 @@ impl eframe::App for App {
                 painter.text(
                     img_rect.left_top() + egui::vec2(8.0, 8.0),
                     egui::Align2::LEFT_TOP,
-                    format!("{:.0}%  (scroll = zoom, drag = pan, dbl-click = reset)",
-                        *zoom * 100.0),
+                    if reframe {
+                        let s = &self.settings;
+                        format!("{} {:.1}°  ·  {} {:+.1}°  ·  {} {:+.1}°   ({})",
+                            tr("FOV"), s.reframe_hfov_deg, tr("pan"), s.reframe_yaw_deg,
+                            tr("tilt"), s.reframe_pitch_deg,
+                            tr("drag = pan, scroll / pinch = zoom, dbl-click = recenter"))
+                    } else {
+                        format!("{:.0}%  (scroll = zoom, drag = pan, dbl-click = reset)",
+                            *zoom * 100.0)
+                    },
                     egui::FontId::proportional(12.0),
                     Color32::from_rgba_unmultiplied(255, 255, 255, 180),
                 );
@@ -4507,6 +4640,11 @@ impl App {
         let align_status = self.align_status.clone();
         let s = &mut self.settings;
         ui.label(RichText::new(tr("Global (both eyes)")).small().color(Color32::GRAY));
+        if matches!(s.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Reframe) {
+            ui.label(RichText::new(tr(
+                "Reframed mode aims the view with the Reframed view pan; these angles apply to VR180 output only."
+            )).small().color(Color32::from_rgb(130, 150, 175)));
+        }
         // Rotational alignment: extra-fine (0.15×) on top of the zoom
         // scaling, since these need sub-degree precision.
         let rot_fine = 0.15;
@@ -4724,8 +4862,44 @@ impl App {
                         M::HalfEquirect, M::HalfEquirect.as_str());
                     ui.selectable_value(&mut s.fisheye_output_mode,
                         M::Fisheye, M::Fisheye.as_str());
+                    ui.selectable_value(&mut s.fisheye_output_mode,
+                        M::Reframe, M::Reframe.as_str());
                 });
         });
+
+        if matches!(s.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Reframe) {
+            use crate::decoder::ReframeAspect;
+            ui.add_space(4.0);
+            ui.label(RichText::new(tr("Reframed view")).small().color(Color32::GRAY));
+            ui.horizontal(|ui| {
+                ui.label(tr("Aspect"));
+                ui.selectable_value(&mut s.reframe_aspect, ReframeAspect::Square, ReframeAspect::Square.as_str());
+                ui.selectable_value(&mut s.reframe_aspect, ReframeAspect::Wide, ReframeAspect::Wide.as_str());
+            });
+            ui.add(egui::Slider::new(&mut s.reframe_hfov_deg, 30.0..=150.0)
+                .fixed_decimals(1).text(tr("Zoom — horizontal FOV (°)")));
+            ui.add(egui::Slider::new(&mut s.reframe_defish, 0.0..=1.0)
+                .fixed_decimals(2).text(tr("Defish (0 = rectilinear, 1 = fisheye)")));
+            ui.add(egui::Slider::new(&mut s.reframe_yaw_deg, -180.0..=180.0)
+                .fixed_decimals(1).text(tr("Pan (°)")));
+            ui.add(egui::Slider::new(&mut s.reframe_pitch_deg, -90.0..=90.0)
+                .fixed_decimals(1).text(tr("Tilt (°)")));
+            ui.add(egui::Slider::new(&mut s.reframe_roll_deg, -45.0..=45.0)
+                .fixed_decimals(1).text(tr("Roll (°)")));
+            let vfov = vr180_pipeline::gpu::reframe_vfov_deg(
+                s.reframe_hfov_deg, s.reframe_defish, s.reframe_aspect.ratio());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{}: {:.1}° × {:.1}°", tr("Field of view"),
+                    s.reframe_hfov_deg, vfov)).small().color(Color32::GRAY));
+                if ui.small_button(tr("Reset view")).clicked() {
+                    s.reframe_yaw_deg = 0.0;
+                    s.reframe_pitch_deg = 0.0;
+                    s.reframe_roll_deg = 0.0;
+                    s.reframe_hfov_deg = 90.0;
+                    s.reframe_defish = 0.0;
+                }
+            });
+        }
 
         // Show the actual output FOV for the current source — the GoPro
         // Max `.360` captures 185°, the DJI/OSV lens 195°.

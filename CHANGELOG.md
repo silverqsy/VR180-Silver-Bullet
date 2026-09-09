@@ -1,5 +1,38 @@
 # Changelog
 
+## 2.5.0
+
+### Reframed output mode (new)
+- **Format → "Reframed (rectilinear)"**: a pinhole-style side-by-side view
+  of each eye instead of the VR180 half-equirect — zoom (horizontal FOV),
+  pan / tilt / roll, a **Defish** blend from rectilinear to a fisheye look,
+  and a 1:1 or 16:9 per-eye frame. Stabilization, stereo offsets, per-row
+  rolling-shutter correction and the lens override all still apply.
+  Available for DJI OSMO, Insta360 X6, Blackmagic and GoPro sources.
+- Drag the preview to pan, scroll or pinch to zoom, double-click to
+  recenter. The preview renders from the native frame and a paused frame
+  shows the native-resolution still.
+- Export writes the exact viewport at 1080 / 1440 / 2160 lines per eye —
+  2:1 square or **32:9 side-by-side** (3840×1080 … 7680×2160) for AR
+  glasses — with no VR180 metadata. The BeyondVR hack does not apply.
+
+### Stabilization
+- **Timing is derived from the file, no more IMU phase slider.** Each
+  frame's pose is sampled at the centre row's mid-exposure using the
+  file's sensor readout, exposure record and timestamps, so dark and
+  bright clips and every frame rate are timed right automatically
+  (verified on 25 / 30 / 50 fps DJI clips, consistent with DJI Studio's
+  output).
+- **Insta360 X6 (`.insv`)**: factory lens model, gyro stabilization
+  matched to Insta360 Studio's output, per-sensor exposure timing.
+- **OSMO 360 II** support and **Auto align** stereo alignment; GoPro
+  chapter-safe firmware-RS detection.
+
+### Since 2.0.0
+- Seamless auto-update (2.1.0), `.360` lens calibration override, ProRes
+  4:2:2 with GPU compose, 8K export default, Matching Eyes white-balance
+  trim, BeyondVR Hack (VR180 output only), frame-exact multi-segment seams.
+
 ## 2.0.0
 
 The `2.0` clean-room rewrite of VR180 Silver Bullet — a native Rust + wgpu

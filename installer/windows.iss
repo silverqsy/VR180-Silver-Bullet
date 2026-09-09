@@ -10,7 +10,7 @@
 ; The app's settings (%APPDATA%\VR180SilverBullet2.0) are user data and are
 ; deliberately NOT removed on uninstall.
 
-#define AppVer "2.1.0"
+#define AppVer "2.5.0"
 #define BundleDir "..\dist\VR180-Silver-Bullet-" + AppVer + "-windows-x64"
 
 [Setup]

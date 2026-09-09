@@ -65,6 +65,7 @@ struct FisheyeCalibUniforms {
     p1: f32, p2: f32, xi: f32, _pad4: f32,        // xi > 0 selects the unified camera model
     ta: f32, tb: f32, tc: f32, te: f32,            // UCM tangential: (r²+2x²)(ta + tc r²) + 2xy(tb + te r²)
     s1: f32, s2: f32, s3: f32, s4: f32,            // UCM thin prism: x += s1 r² + s2 r⁴, y += s3 r² + s4 r⁴
+    proj_mode: f32, defish_k: f32, edge_x: f32, edge_y: f32,  // vec4 #7: reframed-view output (proj_mode 1 → k-projection; 0 → half-equirect)
 }
 @group(0) @binding(4) var<uniform> cal: FisheyeCalibUniforms;
 
@@ -120,6 +121,31 @@ fn kb_radius(theta: f32) -> f32 {
     return kb_cubic_extension(theta);
 }
 
+// Output pixel → unit ray in the output frame (Z forward, Y up, X right).
+//   proj_mode 0: half-equirect — lon/lat from `output_hfov_rad`.
+//   proj_mode 1: reframed view — a k-projection `r = k·tan(θ/k)` on a plane
+//                of half-extents (edge_x, edge_y): k = 1 rectilinear,
+//                k = 2 stereographic, large k → the equidistant fisheye
+//                look (the defish control). CPU twin: `gpu::reframe_ray`.
+fn output_ray(u: f32, v: f32) -> vec3<f32> {
+    if (cal.proj_mode > 0.5) {
+        let x = (2.0 * u - 1.0) * cal.edge_x;
+        let y = (1.0 - 2.0 * v) * cal.edge_y;
+        let r = sqrt(x * x + y * y);
+        if (r < 1e-6) {
+            return vec3<f32>(0.0, 0.0, 1.0);
+        }
+        let k = max(cal.defish_k, 1.0);
+        let theta = k * atan(r / k);
+        let s = sin(theta) / r;
+        return vec3<f32>(x * s, y * s, cos(theta));
+    }
+    let lon = (u - 0.5) * 2.0 * cal.output_hfov_rad;
+    let lat = (0.5 - v) * PI;
+    let cos_lat = cos(lat);
+    return vec3<f32>(cos_lat * sin(lon), sin(lat), cos_lat * cos(lon));
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let out_dim = textureDimensions(out_tex);
@@ -134,16 +160,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // that a strict 180° would crop out.
     let u = (f32(gid.x) + 0.5) / f32(out_dim.x);
     let v = (f32(gid.y) + 0.5) / f32(out_dim.y);
-    let lon = (u - 0.5) * 2.0 * cal.output_hfov_rad;
-    let lat = (0.5 - v) * PI;
-
-    // Unit ray in output frame. Z is the optical axis (forward).
-    let cos_lat = cos(lat);
-    let dir = vec3<f32>(
-        cos_lat * sin(lon),
-        sin(lat),
-        cos_lat * cos(lon),
-    );
+    let dir = output_ray(u, v);
 
     // Apply stabilization rotation R.
     let xn = equ.r00 * dir.x + equ.r01 * dir.y + equ.r02 * dir.z;

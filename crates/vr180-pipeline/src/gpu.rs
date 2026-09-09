@@ -1882,6 +1882,13 @@ pub struct EacLensAdjust {
     pub cx_n: f32,
     pub cy_n: f32,
     pub k_n: [f32; 4],
+    /// Output ray generator of the equirect kernel: 0 = half-equirect,
+    /// 1 = reframed view (see [`EacLensAdjust::with_reframe`]) — the same
+    /// k-projection the fisheye family uses (`FisheyeCalib::with_reframe`).
+    pub proj_mode: f32,
+    pub defish_k: f32,
+    pub edge_x: f32,
+    pub edge_y: f32,
 }
 
 impl EacLensAdjust {
@@ -1890,7 +1897,21 @@ impl EacLensAdjust {
         enabled: false,
         fx_u: 1.0, cx_u: 0.0, cy_u: 0.0, k_u: [0.0; 4],
         fx_n: 1.0, cx_n: 0.0, cy_n: 0.0, k_n: [0.0; 4],
+        proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
     };
+
+    /// Reframed-view output for the EAC kernel — same parameters as
+    /// [`FisheyeCalib::with_reframe`]. Independent of the lens re-dewarp
+    /// (`enabled`), which stays whatever it was.
+    pub fn with_reframe(mut self, hfov_deg: f32, defish: f32, aspect_w_over_h: f32) -> Self {
+        let k = reframe_k(defish);
+        let ex = reframe_edge_x(hfov_deg, k);
+        self.proj_mode = 1.0;
+        self.defish_k = k;
+        self.edge_x = ex;
+        self.edge_y = ex / aspect_w_over_h.max(0.05);
+        self
+    }
 
     /// Build from the GEOC factory calibration (`klns` c0..c4 in cal-space
     /// pixels with fx folded into c0; `ctrx`/`ctry` = center offsets from
@@ -1927,12 +1948,14 @@ impl EacLensAdjust {
             cx_n: cal_dim * 0.5 + ctrx,
             cy_n: cal_dim * 0.5 + ctry,
             k_n,
+            proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
         }
     }
 }
 
 /// std140 layout matching the WGSL `LensUniforms` in
-/// `eac_to_equirect.wgsl` / `eac_to_fisheye.wgsl` (16 × f32 = 64 bytes).
+/// `eac_to_equirect.wgsl` (20 × f32 = 80 bytes; `eac_to_fisheye.wgsl`
+/// declares only the first 16 and ignores the trailing vec4).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct EacLensUniforms {
@@ -1940,6 +1963,8 @@ struct EacLensUniforms {
     ku1: f32, ku2: f32, ku3: f32, ku4: f32,
     fx_n: f32, cx_n: f32, cy_n: f32, _pad0: f32,
     kn1: f32, kn2: f32, kn3: f32, kn4: f32,
+    // vec4 #4 — reframed-view output (proj_mode 1), see `EacLensAdjust`.
+    proj_mode: f32, defish_k: f32, edge_x: f32, edge_y: f32,
 }
 
 impl EacLensUniforms {
@@ -1950,6 +1975,7 @@ impl EacLensUniforms {
             ku1: l.k_u[0], ku2: l.k_u[1], ku3: l.k_u[2], ku4: l.k_u[3],
             fx_n: l.fx_n, cx_n: l.cx_n, cy_n: l.cy_n, _pad0: 0.0,
             kn1: l.k_n[0], kn2: l.k_n[1], kn3: l.k_n[2], kn4: l.k_n[3],
+            proj_mode: l.proj_mode, defish_k: l.defish_k, edge_x: l.edge_x, edge_y: l.edge_y,
         }
     }
 }
@@ -1977,6 +2003,10 @@ struct FisheyeCalibUniforms {
     p1: f32, p2: f32, xi: f32, _pad4: f32,
     ta: f32, tb: f32, tc: f32, te: f32,
     s1: f32, s2: f32, s3: f32, s4: f32,
+    // vec4 #7 — reframed-view output (proj_mode 1): k of the k-projection
+    // and the projection-plane half-extents at the frame edges. proj_mode
+    // 0 → the half-equirect ray generator as before.
+    proj_mode: f32, defish_k: f32, edge_x: f32, edge_y: f32,
 }
 
 /// Public per-eye Kannala-Brandt fisheye calibration. Caller builds
@@ -2036,6 +2066,55 @@ pub struct FisheyeCalib {
     /// Defaults to π/2 for backward compat; OSV builds set this to
     /// lens-FOV/2 so the export captures every pixel the lens saw.
     pub output_hfov_rad: f32,
+    /// Output ray generator: 0 = half-equirect (`output_hfov_rad`),
+    /// 1 = reframed view (see [`FisheyeCalib::with_reframe`]).
+    pub proj_mode: f32,
+    /// Reframed view: `k` of the k-projection `r = k·tan(θ/k)` — 1 =
+    /// rectilinear, 2 = stereographic, large = equidistant fisheye look.
+    pub defish_k: f32,
+    /// Reframed view: normalized projection-plane half-extents at the
+    /// horizontal / vertical frame edges.
+    pub edge_x: f32,
+    pub edge_y: f32,
+}
+
+/// Defish amount (0..=1) → `k` of the k-projection `r = k·tan(θ/k)`:
+/// 0 → 1 (rectilinear), 0.5 → 2 (stereographic), 0.99 → 100 (≈ equidistant
+/// fisheye). The mapping spreads the visible change evenly over the slider.
+pub fn reframe_k(defish: f32) -> f32 {
+    1.0 / (1.0 - defish.clamp(0.0, 0.99))
+}
+
+/// Projection-plane half-extent at the horizontal frame edge of a reframed
+/// viewport with `hfov_deg` horizontal field of view under k-projection `k`.
+pub fn reframe_edge_x(hfov_deg: f32, k: f32) -> f32 {
+    let half = hfov_deg.clamp(5.0, 175.0).to_radians() * 0.5;
+    let k = k.max(1.0);
+    k * (half / k).tan()
+}
+
+/// Vertical field of view (degrees) of a reframed viewport of aspect
+/// `aspect_w_over_h` (square pixels: the vertical extent follows the aspect).
+pub fn reframe_vfov_deg(hfov_deg: f32, defish: f32, aspect_w_over_h: f32) -> f32 {
+    let k = reframe_k(defish);
+    let ey = reframe_edge_x(hfov_deg, k) / aspect_w_over_h.max(0.05);
+    2.0 * k * (ey / k).atan().to_degrees()
+}
+
+/// CPU reference of the shaders' reframed ray generator: output-pixel
+/// normalized coordinates `(u, v)` (0..1, `v` down the frame) → unit ray
+/// (x right, y up, z forward). Tests pin the shaders to this.
+pub fn reframe_ray(u: f32, v: f32, k: f32, edge_x: f32, edge_y: f32) -> [f32; 3] {
+    let x = (2.0 * u - 1.0) * edge_x;
+    let y = (1.0 - 2.0 * v) * edge_y;
+    let r = (x * x + y * y).sqrt();
+    if r < 1e-6 {
+        return [0.0, 0.0, 1.0];
+    }
+    let k = k.max(1.0);
+    let theta = k * (r / k).atan();
+    let s = theta.sin() / r;
+    [x * s, y * s, theta.cos()]
 }
 
 impl FisheyeCalib {
@@ -2053,6 +2132,7 @@ impl FisheyeCalib {
             theta_max:   110.0_f32.to_radians(),
             r_max, src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
+            proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
         }
     }
 
@@ -2089,6 +2169,7 @@ impl FisheyeCalib {
             r_max: max_r,
             src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
+            proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
         }
     }
 
@@ -2134,6 +2215,7 @@ impl FisheyeCalib {
             r_max: max_r,
             src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
+            proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
         }
     }
 
@@ -2143,6 +2225,23 @@ impl FisheyeCalib {
     /// Returns `self` so it can chain after `new_pure_kb`.
     pub fn with_output_hfov(mut self, hfov_rad: f32) -> Self {
         self.output_hfov_rad = hfov_rad;
+        self
+    }
+
+    /// Reframed-view output: a pinhole-style viewport of `hfov_deg`
+    /// horizontal field of view and aspect `aspect_w_over_h`, blended
+    /// towards a fisheye look by `defish` (0 = rectilinear … 1 = fisheye,
+    /// see [`reframe_k`]). Pixels are square, so the vertical extent
+    /// follows the aspect. The viewport's direction is whatever rotation
+    /// the caller composes into the per-frame `EquirectRotation` (the view
+    /// adjust's global angles).
+    pub fn with_reframe(mut self, hfov_deg: f32, defish: f32, aspect_w_over_h: f32) -> Self {
+        let k = reframe_k(defish);
+        let ex = reframe_edge_x(hfov_deg, k);
+        self.proj_mode = 1.0;
+        self.defish_k = k;
+        self.edge_x = ex;
+        self.edge_y = ex / aspect_w_over_h.max(0.05);
         self
     }
 }
@@ -2162,6 +2261,7 @@ impl FisheyeCalibUniforms {
             p1: c.p1, p2: c.p2, xi: c.xi, _pad4: 0.0,
             ta: c.tangential[0], tb: c.tangential[1], tc: c.tangential[2], te: c.tangential[3],
             s1: c.prism[0], s2: c.prism[1], s3: c.prism[2], s4: c.prism[3],
+            proj_mode: c.proj_mode, defish_k: c.defish_k, edge_x: c.edge_x, edge_y: c.edge_y,
         }
     }
 }
@@ -7994,5 +8094,68 @@ mod eac_assembly_regression {
         let (r, _g, b) = px(&buf, cw, tw + cn + tw / 2, tw + cw / 4);
         assert!(r as i32 > b as i32 + 30,
             "Lens B RIGHT should be reddish (from s0); got R={r} B={b}");
+    }
+}
+
+#[cfg(test)]
+mod reframe_tests {
+    use super::*;
+
+    fn angle_from_axis(r: [f32; 3]) -> f32 {
+        let n = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
+        (r[2] / n).clamp(-1.0, 1.0).acos()
+    }
+
+    #[test]
+    fn horizontal_edge_sits_at_half_hfov_for_every_k() {
+        for &hfov in &[40.0f32, 90.0, 120.0, 150.0] {
+            for &k in &[1.0f32, 2.0, 10.0, 100.0] {
+                let ex = reframe_edge_x(hfov, k);
+                let r = reframe_ray(1.0, 0.5, k, ex, ex);
+                let a = angle_from_axis(r).to_degrees();
+                assert!((a - hfov * 0.5).abs() < 1e-3, "hfov {hfov} k {k}: edge at {a}°");
+                assert!(r[0] > 0.0 && r[1].abs() < 1e-6, "edge ray points right on the centre row");
+            }
+        }
+    }
+
+    #[test]
+    fn k_one_is_a_pinhole() {
+        let ex = reframe_edge_x(90.0, 1.0);
+        assert!((ex - 1.0).abs() < 1e-6);
+        let r = reframe_ray(0.75, 0.25, 1.0, ex, 0.5625);
+        // x/z and y/z equal the plane coordinates for a pinhole.
+        assert!((r[0] / r[2] - 0.5).abs() < 1e-5);
+        assert!((r[1] / r[2] - 0.28125).abs() < 1e-5);
+    }
+
+    #[test]
+    fn defish_mapping_and_vertical_fov() {
+        assert!((reframe_k(0.0) - 1.0).abs() < 1e-6);
+        assert!((reframe_k(0.5) - 2.0).abs() < 1e-6);
+        assert!(reframe_k(1.0) >= 99.0);
+        // 90° × 16:9 rectilinear → 58.7° vertical.
+        assert!((reframe_vfov_deg(90.0, 0.0, 16.0 / 9.0) - 58.716).abs() < 0.05);
+        // Square, rectilinear: vertical = horizontal.
+        assert!((reframe_vfov_deg(70.0, 0.0, 1.0) - 70.0).abs() < 1e-3);
+        // At a fixed horizontal FOV, defishing compresses the periphery, so
+        // the vertical FOV of a fixed-aspect frame shrinks (120° 16:9:
+        // 88.5° rectilinear → 68.2° at k = 5).
+        assert!(reframe_vfov_deg(120.0, 0.8, 16.0 / 9.0) < reframe_vfov_deg(120.0, 0.0, 16.0 / 9.0));
+        assert!((reframe_vfov_deg(120.0, 0.0, 16.0 / 9.0) - 88.53).abs() < 0.1);
+    }
+
+    #[test]
+    fn calib_builder_fills_the_uniform() {
+        let c = FisheyeCalib::new(1000.0, 1000.0, 960.0, 960.0, [0.0; 4], 1920.0, 1920.0, 900.0)
+            .with_reframe(90.0, 0.5, 16.0 / 9.0);
+        let u = FisheyeCalibUniforms::from_public(c);
+        assert_eq!(u.proj_mode, 1.0);
+        assert!((u.defish_k - 2.0).abs() < 1e-6);
+        assert!((u.edge_x - 2.0 * (45.0f32.to_radians() / 2.0).tan()).abs() < 1e-5);
+        assert!((u.edge_y - u.edge_x * 9.0 / 16.0).abs() < 1e-5);
+        assert_eq!(std::mem::size_of::<FisheyeCalibUniforms>(), 32 * 4);
+        let plain = FisheyeCalibUniforms::from_public(FisheyeCalib::new(1000.0, 1000.0, 960.0, 960.0, [0.0; 4], 1920.0, 1920.0, 900.0));
+        assert_eq!(plain.proj_mode, 0.0);
     }
 }

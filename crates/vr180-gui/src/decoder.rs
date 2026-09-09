@@ -269,6 +269,20 @@ pub struct Settings {
     /// and writes the raw fisheye eyes as SBS — useful for VFX or
     /// re-grade pipelines.
     pub fisheye_output_mode: FisheyeOutputMode,
+    /// Reframed view (`FisheyeOutputMode::Reframe`): horizontal field of
+    /// view of the viewport in degrees (the zoom).
+    pub reframe_hfov_deg: f32,
+    /// Reframed view: 0 = rectilinear … 1 = fisheye look
+    /// (`vr180_pipeline::gpu::reframe_k`).
+    pub reframe_defish: f32,
+    /// Reframed view: where the viewport points, degrees — pan right,
+    /// tilt up, roll. Replaces the pano-map angles in that mode (see
+    /// [`Settings::output_view_adjust`]).
+    pub reframe_yaw_deg: f32,
+    pub reframe_pitch_deg: f32,
+    pub reframe_roll_deg: f32,
+    /// Reframed view: per-eye frame aspect (1:1 or 16:9).
+    pub reframe_aspect: ReframeAspect,
     /// Export audio track choice for `.360` (stereo / ambisonic / APAC).
     pub audio_format: AudioFormat,
 
@@ -395,6 +409,12 @@ impl Default for Settings {
             fisheye_swap_eyes: false,
             camera_upside_down: false,
             fisheye_output_mode: FisheyeOutputMode::HalfEquirect,
+            reframe_hfov_deg: 90.0,
+            reframe_defish: 0.0,
+            reframe_yaw_deg: 0.0,
+            reframe_pitch_deg: 0.0,
+            reframe_roll_deg: 0.0,
+            reframe_aspect: ReframeAspect::Wide,
             audio_format: AudioFormat::Stereo,
             lift: 0.0,
             gamma: 1.0,
@@ -483,6 +503,35 @@ impl Settings {
     /// a swap on top of whatever the user chose).
     pub fn effective_swap_eyes(&self) -> bool {
         self.fisheye_swap_eyes ^ self.camera_upside_down
+    }
+
+    /// The view adjustment the projection composes after stabilization.
+    /// In the reframed output mode the global angles are the viewport's
+    /// pan (yaw right / tilt up / roll) instead of the pano-map sliders;
+    /// the per-eye stereo offsets and the upside-down flip apply in every
+    /// mode. `ViewAdjust`'s pitch tilts the view DOWN for positive values
+    /// (`R_x` convention), so the "tilt up" slider is negated here.
+    pub fn output_view_adjust(&self) -> vr180_pipeline::panomap::ViewAdjust {
+        let (yaw, pitch, roll) = if self.fisheye_output_mode == FisheyeOutputMode::Reframe {
+            (self.reframe_yaw_deg, -self.reframe_pitch_deg, self.reframe_roll_deg)
+        } else {
+            (self.pano_yaw_deg, self.pano_pitch_deg, self.pano_roll_deg)
+        };
+        vr180_pipeline::panomap::ViewAdjust {
+            pano_yaw_deg: yaw,
+            pano_pitch_deg: pitch,
+            pano_roll_deg: roll,
+            stereo_yaw_deg: self.stereo_yaw_deg,
+            stereo_pitch_deg: self.stereo_pitch_deg,
+            stereo_roll_deg: self.stereo_roll_deg,
+            upside_down: self.camera_upside_down,
+        }
+    }
+
+    /// `Some(aspect)` when the reframed output mode is active — what the
+    /// export options need to size the frame.
+    pub fn reframe_aspect_if_active(&self) -> Option<ReframeAspect> {
+        (self.fisheye_output_mode == FisheyeOutputMode::Reframe).then_some(self.reframe_aspect)
     }
 
     /// Build a `ColorStackPlan` from the slider state. Returns
@@ -648,6 +697,11 @@ pub enum FisheyeOutputMode {
     /// stereo offset, per-row RS all apply; the source lens's own
     /// distortion is removed.
     Fisheye,
+    /// Reframed view: a pinhole-style viewport of each eye (zoom, pan,
+    /// defish, 1:1 or 16:9) with stab, stereo offset and per-row RS
+    /// applied — the SBS is the exact viewport (square or 32:9). Not
+    /// VR180; exports optionally add an Apple spatial video.
+    Reframe,
 }
 
 impl FisheyeOutputMode {
@@ -655,6 +709,46 @@ impl FisheyeOutputMode {
         match self {
             Self::HalfEquirect => "Half-equirect (VR180)",
             Self::Fisheye      => "Fisheye SBS (equidist.)",
+            Self::Reframe      => "Reframed (rectilinear)",
+        }
+    }
+}
+
+/// Per-eye frame aspect of the reframed view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReframeAspect {
+    /// 1:1 per eye → a 2:1 side-by-side frame.
+    Square,
+    /// 16:9 per eye → a 32:9 side-by-side frame (AR-glasses SBS).
+    Wide,
+}
+
+impl ReframeAspect {
+    pub fn ratio(self) -> f32 {
+        match self { Self::Square => 1.0, Self::Wide => 16.0 / 9.0 }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Square => "1:1", Self::Wide => "16:9" }
+    }
+}
+
+/// Minimum per-eye width of a reframed live preview (see `preview_out_dims`).
+pub(crate) const REFRAME_PREVIEW_MIN_W: u32 = 1920;
+
+/// Per-eye preview dimensions for an output mode, from the worker's
+/// square working size: half-equirect keeps it, the fisheye disk is
+/// square, a reframed view keeps the width and follows its aspect.
+pub(crate) fn preview_out_dims(mode: FisheyeOutputMode, aspect: ReframeAspect, eye_w: u32, eye_h: u32) -> (u32, u32) {
+    match mode {
+        FisheyeOutputMode::HalfEquirect => (eye_w, eye_h),
+        FisheyeOutputMode::Fisheye => { let side = eye_w.min(eye_h); (side, side) }
+        FisheyeOutputMode::Reframe => {
+            // A viewport of a few tens of degrees needs more output pixels
+            // than the 180° working frame to look sharp on screen: never
+            // narrower than `REFRAME_PREVIEW_MIN_W` (the still keeps native).
+            let w = eye_w.max(eye_h).max(REFRAME_PREVIEW_MIN_W);
+            let h = (((w as f32 / aspect.ratio()).round() as u32) + 1) & !1;
+            (w, h.max(2))
         }
     }
 }
@@ -2041,15 +2135,7 @@ fn run_fisheye(
         // the no-pano-map pipeline.
         let view_adjust = {
             let s = control.settings.read();
-            vr180_pipeline::panomap::ViewAdjust {
-                pano_yaw_deg: s.pano_yaw_deg,
-                pano_pitch_deg: s.pano_pitch_deg,
-                pano_roll_deg: s.pano_roll_deg,
-                stereo_yaw_deg: s.stereo_yaw_deg,
-                stereo_pitch_deg: s.stereo_pitch_deg,
-                stereo_roll_deg: s.stereo_roll_deg,
-                upside_down: s.camera_upside_down,
-            }
+            s.output_view_adjust()
         };
         let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(
             rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes);
@@ -2071,9 +2157,12 @@ fn run_fisheye(
         let (left_tex, right_tex) = {
             let s = control.settings.read();
             let mode = s.fisheye_output_mode;
+            let aspect = s.reframe_aspect;
             drop(s);
             match mode {
-                FisheyeOutputMode::HalfEquirect => {
+                FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => {
+                    // A reframed view keeps the working width and takes its aspect.
+                    let (eye_w, eye_h) = preview_out_dims(mode, aspect, eye_w, eye_h);
                     if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_to_equirect_rs_texture(
                             &pair.left, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_l, 0,
@@ -2599,11 +2688,7 @@ fn run_fisheye_zerocopy(
 
         let view_adjust = {
             let s = control.settings.read();
-            vr180_pipeline::panomap::ViewAdjust {
-                pano_yaw_deg: s.pano_yaw_deg, pano_pitch_deg: s.pano_pitch_deg, pano_roll_deg: s.pano_roll_deg,
-                stereo_yaw_deg: s.stereo_yaw_deg, stereo_pitch_deg: s.stereo_pitch_deg, stereo_roll_deg: s.stereo_roll_deg,
-                upside_down: s.camera_upside_down,
-            }
+            s.output_view_adjust()
         };
         let (rot_left, rot_right) = if view_adjust.is_identity() {
             (rot_l0, rot_r0)
@@ -2618,12 +2703,11 @@ fn run_fisheye_zerocopy(
         let (left_tex, right_tex) = {
             let s = control.settings.read();
             let mode = s.fisheye_output_mode;
+            let aspect = s.reframe_aspect;
             drop(s);
-            let (ow, oh) = match mode {
-                FisheyeOutputMode::HalfEquirect => (eye_w, eye_h),
-                // Fisheye output is a CIRCLE in a SQUARE frame (per eye).
-                FisheyeOutputMode::Fisheye => { let side = eye_w.min(eye_h); (side, side) }
-            };
+            // Fisheye output is a CIRCLE in a SQUARE frame (per eye); a
+            // reframed view keeps the working width and takes its aspect.
+            let (ow, oh) = preview_out_dims(mode, aspect, eye_w, eye_h);
             // The imported textures are already RGBA16 at the working res (the
             // D3D11 side did P010→RGBA16 + downscale), so project single-tap
             // straight from them — no luma moiré, no chroma colour-fringing.
@@ -2655,7 +2739,7 @@ fn run_fisheye_zerocopy(
                 // Half-equirect VR180: when OSV stab is on use the RS variant so
                 // per-row rolling shutter is corrected (kills the jello); same
                 // per-row quats for both eyes.
-                FisheyeOutputMode::HalfEquirect => {
+                FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => {
                     if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
                             &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs_l, 0,
@@ -2783,6 +2867,10 @@ fn run_fisheye_vt_zerocopy(
     let (mut calib_left, mut calib_right) = resolve_fisheye_calib_pair(
         &control.settings.read(), kind, src_w, src_h, dji_osv_imu.as_ref(),
     );
+    // The dims the calib was resolved for — the reframed mode projects from
+    // the NATIVE frame (full-resolution playback), the others from the
+    // working res; the calib follows whichever is in use.
+    let mut calib_dims = (src_w, src_h);
     tracing::info!(
         "decoder (fisheye/vt-zc): initial calib L fx={:.1} cx={:.1} cy={:.1} | R fx={:.1} cx={:.1} cy={:.1}",
         calib_left.fx, calib_left.cx, calib_left.cy, calib_right.fx, calib_right.cx, calib_right.cy
@@ -2962,12 +3050,20 @@ fn run_fisheye_vt_zerocopy(
             paused_offset += pause_start.elapsed();
         }
 
-        // Settings changed → re-resolve per-eye calib.
+        // Reframed mode: resolve + project from the native frame (the viewport
+        // shows a small part of the lens, so the 1280-cap working res would be
+        // visibly soft); the other modes keep the working res.
+        let reframe_native = matches!(
+            control.settings.read().fisheye_output_mode, FisheyeOutputMode::Reframe);
+        let (src_w, src_h) = if reframe_native { (native_w, native_h) } else { (work_w, work_h) };
+
+        // Settings changed (or the source dims did) → re-resolve per-eye calib.
         let current_gen = control.settings_generation.load(Ordering::SeqCst);
-        if current_gen != cached_gen {
+        if current_gen != cached_gen || calib_dims != (src_w, src_h) {
             let snap = control.settings.read();
             let (l, r) = resolve_fisheye_calib_pair(&snap, kind, src_w, src_h, dji_osv_imu.as_ref());
             calib_left = l; calib_right = r; drop(snap); cached_gen = current_gen;
+            calib_dims = (src_w, src_h);
         }
 
         // Wall-clock pacing.
@@ -3005,9 +3101,9 @@ fn run_fisheye_vt_zerocopy(
         // ── Resolve P010 planes → working-res RGBA16 (GPU, zero host hop) ──
         let phase_t0 = std::time::Instant::now();
         let l_tex = pipeline.resolve_p010_planes_to_rgba16(
-            &pair.left_y.texture, &pair.left_uv.texture, native_w, native_h, work_w, work_h)?;
+            &pair.left_y.texture, &pair.left_uv.texture, native_w, native_h, src_w, src_h)?;
         let r_tex = pipeline.resolve_p010_planes_to_rgba16(
-            &pair.right_y.texture, &pair.right_uv.texture, native_w, native_h, work_w, work_h)?;
+            &pair.right_y.texture, &pair.right_uv.texture, native_w, native_h, src_w, src_h)?;
 
         // Frame-level stab rotation.
         let stab_idx = if pair.pts_s.is_finite() && pair.pts_s >= 0.0 {
@@ -3035,11 +3131,7 @@ fn run_fisheye_vt_zerocopy(
 
         let view_adjust = {
             let s = control.settings.read();
-            vr180_pipeline::panomap::ViewAdjust {
-                pano_yaw_deg: s.pano_yaw_deg, pano_pitch_deg: s.pano_pitch_deg, pano_roll_deg: s.pano_roll_deg,
-                stereo_yaw_deg: s.stereo_yaw_deg, stereo_pitch_deg: s.stereo_pitch_deg, stereo_roll_deg: s.stereo_roll_deg,
-                upside_down: s.camera_upside_down,
-            }
+            s.output_view_adjust()
         };
         let (rot_left, rot_right) = if view_adjust.is_identity() {
             (rot_l0, rot_r0)
@@ -3052,11 +3144,11 @@ fn run_fisheye_vt_zerocopy(
         };
 
         let (left_tex, right_tex) = {
-            let mode = control.settings.read().fisheye_output_mode;
-            let (ow, oh) = match mode {
-                FisheyeOutputMode::HalfEquirect => (eye_w, eye_h),
-                FisheyeOutputMode::Fisheye => { let side = eye_w.min(eye_h); (side, side) }
+            let (mode, aspect) = {
+                let s = control.settings.read();
+                (s.fisheye_output_mode, s.reframe_aspect)
             };
+            let (ow, oh) = preview_out_dims(mode, aspect, eye_w, eye_h);
             match mode {
                 FisheyeOutputMode::Fisheye => {
                     if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
@@ -3073,7 +3165,7 @@ fn run_fisheye_vt_zerocopy(
                         (l, r)
                     }
                 }
-                FisheyeOutputMode::HalfEquirect => {
+                FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => {
                     if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
                             &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs_l, 0)?;
@@ -3365,6 +3457,14 @@ pub(crate) fn resolve_fisheye_calib_pair(
     if matches!(s.fisheye_output_mode, FisheyeOutputMode::Fisheye) {
         let hfov = (vr180_pipeline::fisheye_export::FISHEYE_OUT_FULL_FOV_DEG * 0.5).to_radians();
         (calib_l.with_output_hfov(hfov), calib_r.with_output_hfov(hfov))
+    } else if matches!(s.fisheye_output_mode, FisheyeOutputMode::Reframe) {
+        // Reframed view — same parameters the export uses (aspect from the
+        // per-eye frame choice; the preview frame honours it).
+        let a = s.reframe_aspect.ratio();
+        (
+            calib_l.with_reframe(s.reframe_hfov_deg, s.reframe_defish, a),
+            calib_r.with_reframe(s.reframe_hfov_deg, s.reframe_defish, a),
+        )
     } else {
         (calib_l, calib_r)
     }
@@ -3383,24 +3483,36 @@ pub(crate) fn resolve_eac_lens_pair(
     geoc: Option<&vr180_core::geoc::Geoc>,
 ) -> (vr180_pipeline::gpu::EacLensAdjust, vr180_pipeline::gpu::EacLensAdjust) {
     use vr180_pipeline::gpu::EacLensAdjust;
-    let Some(g) = geoc else {
-        return (EacLensAdjust::DISABLED, EacLensAdjust::DISABLED);
-    };
-    let cal_dim = g.cal_dim as f32;
-    let mk = |cal: Option<&vr180_core::geoc::LensCal>, ov: bool,
-              fov: f32, cxn: f32, cyn: f32, k: [f32; 4]| -> EacLensAdjust {
-        match (cal, ov) {
-            (Some(c), true) => EacLensAdjust::from_geoc_override(
-                c.klns, c.ctrx, c.ctry, cal_dim, fov, cxn, cyn, k),
-            _ => EacLensAdjust::DISABLED,
+    let (l, r) = match geoc {
+        None => (EacLensAdjust::DISABLED, EacLensAdjust::DISABLED),
+        Some(g) => {
+            let cal_dim = g.cal_dim as f32;
+            let mk = |cal: Option<&vr180_core::geoc::LensCal>, ov: bool,
+                      fov: f32, cxn: f32, cyn: f32, k: [f32; 4]| -> EacLensAdjust {
+                match (cal, ov) {
+                    (Some(c), true) => EacLensAdjust::from_geoc_override(
+                        c.klns, c.ctrx, c.ctry, cal_dim, fov, cxn, cyn, k),
+                    _ => EacLensAdjust::DISABLED,
+                }
+            };
+            (
+                mk(g.back.as_ref(), s.fisheye_override_left, s.fisheye_fov_deg_left,
+                   s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left),
+                mk(g.front.as_ref(), s.fisheye_override_right, s.fisheye_fov_deg_right,
+                   s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right),
+            )
         }
     };
-    (
-        mk(g.back.as_ref(), s.fisheye_override_left, s.fisheye_fov_deg_left,
-           s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left),
-        mk(g.front.as_ref(), s.fisheye_override_right, s.fisheye_fov_deg_right,
-           s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right),
-    )
+    // Reframed view: the equirect kernel's ray generator takes the viewport.
+    if s.fisheye_output_mode == FisheyeOutputMode::Reframe {
+        let a = s.reframe_aspect.ratio();
+        (
+            l.with_reframe(s.reframe_hfov_deg, s.reframe_defish, a),
+            r.with_reframe(s.reframe_hfov_deg, s.reframe_defish, a),
+        )
+    } else {
+        (l, r)
+    }
 }
 
 /// Publish the GEOC factory lens calibration as the `.360` clip's
@@ -3472,11 +3584,13 @@ fn render_zoom_detail(
         (pipeline.project_cross_texture_to_fisheye_texture(cross_b, detail_eye, detail_eye, rl, sl, &lens_l)?,
          pipeline.project_cross_texture_to_fisheye_texture(cross_a, detail_eye, detail_eye, rr, sr, &lens_r)?)
     } else {
-        (pipeline.project_cross_texture_to_equirect_texture(cross_b, detail_eye, detail_eye, rl, sl, &lens_l)?,
-         pipeline.project_cross_texture_to_equirect_texture(cross_a, detail_eye, detail_eye, rr, sr, &lens_r)?)
+        // A reframed view keeps the width and takes its aspect.
+        let (dw, dh) = preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, detail_eye, detail_eye);
+        (pipeline.project_cross_texture_to_equirect_texture(cross_b, dw, dh, rl, sl, &lens_l)?,
+         pipeline.project_cross_texture_to_equirect_texture(cross_a, dw, dh, rr, sr, &lens_r)?)
     };
     let (dsbs, dw, dh) = compose_with_color_and_mode(
-        pipeline, &s, &dl, &dr, detail_eye, detail_eye)?;
+        pipeline, &s, &dl, &dr, dl.width(), dl.height())?;
     let _ = tx.try_send(DecodedFrame {
         texture: Arc::new(dsbs), width: dw, height: dh,
         frame_idx: abs_frame_idx, timestamp_s,
@@ -3734,11 +3848,16 @@ fn run_zero_copy(
             (pipeline.project_cross_texture_to_fisheye_texture(cross_b, eye_w, eye_h, rl, sl, &lens_l)?,
              pipeline.project_cross_texture_to_fisheye_texture(cross_a, eye_w, eye_h, rr, sr, &lens_r)?)
         } else {
-            (pipeline.project_cross_texture_to_equirect_texture(cross_b, eye_w, eye_h, rl, sl, &lens_l)?,
-             pipeline.project_cross_texture_to_equirect_texture(cross_a, eye_w, eye_h, rr, sr, &lens_r)?)
+            // A reframed view keeps the width and takes its aspect.
+            let (ow, oh) = {
+                let s = control.settings.read();
+                preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, eye_w, eye_h)
+            };
+            (pipeline.project_cross_texture_to_equirect_texture(cross_b, ow, oh, rl, sl, &lens_l)?,
+             pipeline.project_cross_texture_to_equirect_texture(cross_a, ow, oh, rr, sr, &lens_r)?)
         };
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
-            &pipeline, &control.settings.read(), &left_tex, &right_tex, eye_w, eye_h,
+            &pipeline, &control.settings.read(), &left_tex, &right_tex, left_tex.width(), left_tex.height(),
         )?;
 
         let out = DecodedFrame {
@@ -4013,11 +4132,15 @@ fn run_eac_zerocopy(
             (pipeline.project_cross_texture_to_fisheye_texture(&cross_b, eye_w, eye_h, rl, sl, &lens_l)?,
              pipeline.project_cross_texture_to_fisheye_texture(&cross_a, eye_w, eye_h, rr, sr, &lens_r)?)
         } else {
-            (pipeline.project_cross_texture_to_equirect_texture(&cross_b, eye_w, eye_h, rl, sl, &lens_l)?,
-             pipeline.project_cross_texture_to_equirect_texture(&cross_a, eye_w, eye_h, rr, sr, &lens_r)?)
+            let (ow, oh) = {
+                let s = control.settings.read();
+                preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, eye_w, eye_h)
+            };
+            (pipeline.project_cross_texture_to_equirect_texture(&cross_b, ow, oh, rl, sl, &lens_l)?,
+             pipeline.project_cross_texture_to_equirect_texture(&cross_a, ow, oh, rr, sr, &lens_r)?)
         };
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
-            &pipeline, &control.settings.read(), &left_tex, &right_tex, eye_w, eye_h,
+            &pipeline, &control.settings.read(), &left_tex, &right_tex, left_tex.width(), left_tex.height(),
         )?;
 
         let out = DecodedFrame {
@@ -4237,11 +4360,15 @@ fn run_cpu_assemble(
             (pipeline.project_cross_to_fisheye_texture(&cross_b, cross_w_px, eye_w, eye_h, rl, sl, &lens_l)?,
              pipeline.project_cross_to_fisheye_texture(&cross_a, cross_w_px, eye_w, eye_h, rr, sr, &lens_r)?)
         } else {
-            (pipeline.project_cross_to_equirect_texture(&cross_b, cross_w_px, eye_w, eye_h, rl, sl, &lens_l)?,
-             pipeline.project_cross_to_equirect_texture(&cross_a, cross_w_px, eye_w, eye_h, rr, sr, &lens_r)?)
+            let (ow, oh) = {
+                let s = control.settings.read();
+                preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, eye_w, eye_h)
+            };
+            (pipeline.project_cross_to_equirect_texture(&cross_b, cross_w_px, ow, oh, rl, sl, &lens_l)?,
+             pipeline.project_cross_to_equirect_texture(&cross_a, cross_w_px, ow, oh, rr, sr, &lens_r)?)
         };
         let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
-            &pipeline, &control.settings.read(), &left_tex, &right_tex, eye_w, eye_h,
+            &pipeline, &control.settings.read(), &left_tex, &right_tex, left_tex.width(), left_tex.height(),
         )?;
 
         let out = DecodedFrame {
@@ -4317,15 +4444,7 @@ fn apply_view_adjust(
     rl: EquirectRotation,
     rr: EquirectRotation,
 ) -> (EquirectRotation, EquirectRotation) {
-    let va = vr180_pipeline::panomap::ViewAdjust {
-        pano_yaw_deg: s.pano_yaw_deg,
-        pano_pitch_deg: s.pano_pitch_deg,
-        pano_roll_deg: s.pano_roll_deg,
-        stereo_yaw_deg: s.stereo_yaw_deg,
-        stereo_pitch_deg: s.stereo_pitch_deg,
-        stereo_roll_deg: s.stereo_roll_deg,
-        upside_down: s.camera_upside_down,
-    };
+    let va = s.output_view_adjust();
     if va.is_identity() {
         return (rl, rr);
     }
@@ -4732,11 +4851,7 @@ fn render_still_from_pair(
         .and_then(|v| v.get(stab_idx).copied())
         .unwrap_or(EquirectRotation::IDENTITY);
 
-    let view_adjust = vr180_pipeline::panomap::ViewAdjust {
-        pano_yaw_deg: s.pano_yaw_deg, pano_pitch_deg: s.pano_pitch_deg, pano_roll_deg: s.pano_roll_deg,
-        stereo_yaw_deg: s.stereo_yaw_deg, stereo_pitch_deg: s.stereo_pitch_deg, stereo_roll_deg: s.stereo_roll_deg,
-        upside_down: s.camera_upside_down,
-    };
+    let view_adjust = s.output_view_adjust();
     let swapped_eyes = s.effective_swap_eyes();
     let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(rot, imu, stab_idx, swapped_eyes);
     let (rot_left, rot_right) = if view_adjust.is_identity() { (rot_l0, rot_r0) } else {
@@ -4754,7 +4869,9 @@ fn render_still_from_pair(
     } else { (None, None) };
 
     let (left_tex, right_tex) = match s.fisheye_output_mode {
-        FisheyeOutputMode::HalfEquirect => {
+        FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => {
+            // A reframed view keeps the working width and takes its aspect.
+            let (oeq_w, oeq_h) = preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, oeq_w, oeq_h);
             if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                 (pipeline.project_fisheye_to_equirect_rs_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, rs_l, 20)?,
                  pipeline.project_fisheye_to_equirect_rs_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, rs_r, 21)?)

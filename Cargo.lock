@@ -4005,7 +4005,7 @@ checksum = "e6bee49d5fd327532ec2dae66b261f858a8055ba45c24677ce8cacf9206a192a"
 
 [[package]]
 name = "vr180-braw"
-version = "2.1.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -4016,7 +4016,7 @@ dependencies = [
 
 [[package]]
 name = "vr180-core"
-version = "2.1.0"
+version = "2.5.0"
 dependencies = [
  "nalgebra",
  "serde",
@@ -4028,7 +4028,7 @@ dependencies = [
 
 [[package]]
 name = "vr180-fisheye"
-version = "2.1.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "nalgebra",
@@ -4041,7 +4041,7 @@ dependencies = [
 
 [[package]]
 name = "vr180-gui"
-version = "2.1.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4070,7 +4070,7 @@ dependencies = [
 
 [[package]]
 name = "vr180-pipeline"
-version = "2.1.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "ash",
@@ -4099,7 +4099,7 @@ dependencies = [
 
 [[package]]
 name = "vr180-render"
-version = "2.1.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "clap",

@@ -23,7 +23,7 @@ use crate::{Error, Result};
 /// pass-through. The fisheye option skips the equirect projection and
 /// just composes the source left/right fisheye eyes into one SBS frame,
 /// useful for VFX / re-grade pipelines that want unwarped source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FisheyeExportProjection {
     /// Standard VR180 — un-warp each fisheye eye through the KB calib
     /// to a half-equirect, then compose SBS.
@@ -34,6 +34,26 @@ pub enum FisheyeExportProjection {
     /// own distortion removed. Output is a square per-eye disk → SBS is
     /// (2·side × side).
     Fisheye,
+    /// Reframed view — a pinhole-style viewport of each eye (`hfov_deg`
+    /// horizontal FOV, aspect = `eye_w / eye_h`, aimed by the view adjust's
+    /// global angles) blended towards a fisheye look by `defish`
+    /// (0 = rectilinear … 1 = fisheye). The SBS is the exact viewport,
+    /// `2·eye_w × eye_h`. Not VR180: never tagged with projection metadata.
+    Reframe { hfov_deg: f32, defish: f32 },
+}
+
+impl FisheyeExportProjection {
+    /// `(hfov_deg, defish)` of a reframed view; `None` otherwise.
+    pub fn reframe(&self) -> Option<(f32, f32)> {
+        match *self {
+            Self::Reframe { hfov_deg, defish } => Some((hfov_deg, defish)),
+            _ => None,
+        }
+    }
+
+    pub fn is_reframe(&self) -> bool {
+        matches!(self, Self::Reframe { .. })
+    }
 }
 
 impl Default for FisheyeExportProjection {
@@ -596,6 +616,20 @@ fn resolve_export_insv_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::D
 
 pub fn export_fisheye(
     pipeline: Arc<Device>,
+    mut cfg: FisheyeExportConfig,
+    progress_cb: impl FnMut(ExportProgress),
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    // A reframed view is not VR180 — never tag it as one.
+    if cfg.projection.is_reframe() {
+        cfg.inject_apmp = false;
+        cfg.inject_youtube_vr180 = false;
+    }
+    export_fisheye_inner(pipeline, cfg, progress_cb, cancel)
+}
+
+fn export_fisheye_inner(
+    pipeline: Arc<Device>,
     cfg: FisheyeExportConfig,
     mut progress_cb: impl FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
@@ -669,7 +703,7 @@ pub fn export_fisheye(
             && cfg.source_kind.is_dual_stream()
             && matches!(cfg.encoder, EncoderBackend::HevcNvenc)
             && cfg.bit_depth == 10
-            && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye)
+            && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye | FisheyeExportProjection::Reframe { .. })
             && crate::interop_windows::is_vulkan_backend(&pipeline.device)
             && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010)
             && cfg.denoise_strength <= 0.0; // denoise needs CPU frames → portable path
@@ -734,7 +768,7 @@ pub fn export_fisheye(
             && matches!(cfg.encoder,
                 EncoderBackend::Libx265 | EncoderBackend::HevcNvenc
                 | EncoderBackend::ProResKs)
-            && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye)
+            && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye | FisheyeExportProjection::Reframe { .. })
             && (cfg.bit_depth == 10 || cfg.bit_depth == 8)
             && crate::interop_windows::is_vulkan_backend(&pipeline.device)
             && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010)
@@ -1084,7 +1118,7 @@ pub fn export_fisheye(
         // portable path now keeps per-row RS too.
         let project_8 = |rs: (Option<&[f32]>, Option<&[f32]>)| -> Result<(wgpu::Texture, wgpu::Texture)> {
             Ok(match (projection, rs.0, rs.1) {
-                (FisheyeExportProjection::HalfEquirect, Some(rs_l), Some(rs_r)) => (
+                (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, Some(rs_l), Some(rs_r)) => (
                     pipeline.project_fisheye_to_equirect_rs_texture(
                         &pair.left, src_w, src_h, cfg.eye_w, cfg.eye_h,
                         rot_left, calib_left, rs_l, 10,
@@ -1094,7 +1128,7 @@ pub fn export_fisheye(
                         rot_right, calib_right, rs_r, 11,
                     )?,
                 ),
-                (FisheyeExportProjection::HalfEquirect, _, _) => (
+                (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, _, _) => (
                     pipeline.project_fisheye_to_equirect_texture(
                         &pair.left, src_w, src_h, cfg.eye_w, cfg.eye_h,
                         rot_left, calib_left, 10,
@@ -1299,6 +1333,18 @@ pub type EacPerEyeFrame = (
 ///
 /// Must mirror the GUI's `resolve_eac_lens_pair` so export == preview.
 pub(crate) fn resolve_eac_lens_pair(cfg: &FisheyeExportConfig) -> (crate::gpu::EacLensAdjust, crate::gpu::EacLensAdjust) {
+    let (l, r) = resolve_eac_lens_override(cfg);
+    // Reframed view: the equirect kernel's ray generator takes the viewport
+    // (aspect = the eye frame's).
+    if let Some((hfov_deg, defish)) = cfg.projection.reframe() {
+        let aspect = cfg.eye_w as f32 / cfg.eye_h.max(1) as f32;
+        (l.with_reframe(hfov_deg, defish, aspect), r.with_reframe(hfov_deg, defish, aspect))
+    } else {
+        (l, r)
+    }
+}
+
+fn resolve_eac_lens_override(cfg: &FisheyeExportConfig) -> (crate::gpu::EacLensAdjust, crate::gpu::EacLensAdjust) {
     use crate::gpu::EacLensAdjust;
     if !cfg.fisheye_override_left && !cfg.fisheye_override_right {
         return (EacLensAdjust::DISABLED, EacLensAdjust::DISABLED);
@@ -1334,7 +1380,25 @@ pub(crate) fn resolve_eac_lens_pair(cfg: &FisheyeExportConfig) -> (crate::gpu::E
     (l, r)
 }
 
+/// GoPro `.360` export entry point — the same reframed-view handling as
+/// [`export_fisheye`]: a reframed view is not VR180.
 pub fn export_eac(
+    pipeline: std::sync::Arc<Device>,
+    cfg: FisheyeExportConfig,
+    per_eye: Vec<EacPerEyeFrame>,
+    progress_cb: impl FnMut(ExportProgress),
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let mut cfg = cfg;
+    // A reframed view is not VR180 — never tag it as one.
+    if cfg.projection.is_reframe() {
+        cfg.inject_apmp = false;
+        cfg.inject_youtube_vr180 = false;
+    }
+    export_eac_inner(pipeline, cfg, per_eye, progress_cb, cancel)
+}
+
+fn export_eac_inner(
     pipeline: std::sync::Arc<Device>,
     cfg: FisheyeExportConfig,
     per_eye: Vec<EacPerEyeFrame>,
@@ -1391,7 +1455,7 @@ pub fn export_eac(
             && std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
             && matches!(cfg.encoder, EncoderBackend::HevcNvenc)
             && cfg.bit_depth == 10
-            && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye)
+            && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye | FisheyeExportProjection::Reframe { .. })
             && crate::interop_windows::is_vulkan_backend(&pipeline.device)
             && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010)
             && cfg.denoise_strength <= 0.0; // denoise is macOS-only anyway
@@ -2213,7 +2277,7 @@ fn export_fisheye_osv_zerocopy_p010(
         // operates on the source-frame direction, independent of whether
         // the output is half-equirect or fisheye.
         let (left_eq, right_eq) = match (cfg.projection, rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-            (FisheyeExportProjection::HalfEquirect, Some(rs_l), Some(rs_r)) => {
+            (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, Some(rs_l), Some(rs_r)) => {
                 let l = pipeline.project_fisheye_p010_to_equirect_rs_texture_16(
                     &pair.left_y.texture, &pair.left_uv.texture,
                     src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l,
@@ -2224,7 +2288,7 @@ fn export_fisheye_osv_zerocopy_p010(
                 )?;
                 (l, r)
             }
-            (FisheyeExportProjection::HalfEquirect, _, _) => {
+            (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, _, _) => {
                 let l = pipeline.project_fisheye_p010_to_equirect_texture_16(
                     &pair.left_y.texture, &pair.left_uv.texture,
                     src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left,
@@ -2602,7 +2666,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
             // paths). Slots 30/31 keep the export's cached output
             // textures distinct from preview 0/1.
             let (left16, right16) = match (cfg.projection, rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                (FisheyeExportProjection::HalfEquirect, Some(rs_l), Some(rs_r)) => (
+                (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, Some(rs_l), Some(rs_r)) => (
                     pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
                         &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 30,
                     )?,
@@ -2610,7 +2674,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
                         &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 31,
                     )?,
                 ),
-                (FisheyeExportProjection::HalfEquirect, _, _) => (
+                (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, _, _) => (
                     pipeline.project_fisheye_rgba16_texture_to_equirect_16(
                         &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30,
                     )?,
@@ -3207,6 +3271,13 @@ pub(crate) fn resolve_calib_pair(
     if cfg.projection == FisheyeExportProjection::Fisheye {
         let hfov = (FISHEYE_OUT_FULL_FOV_DEG * 0.5).to_radians();
         (calib_l.with_output_hfov(hfov), calib_r.with_output_hfov(hfov))
+    } else if let Some((hfov_deg, defish)) = cfg.projection.reframe() {
+        // Reframed view: the viewport's aspect is the eye frame's.
+        let aspect = cfg.eye_w as f32 / cfg.eye_h.max(1) as f32;
+        (
+            calib_l.with_reframe(hfov_deg, defish, aspect),
+            calib_r.with_reframe(hfov_deg, defish, aspect),
+        )
     } else {
         (calib_l, calib_r)
     }
@@ -3245,7 +3316,7 @@ fn build_eye_eq_16(
         let l_tex = upload_eye_rgba16(pipeline, &pair.left, pair.bit_depth, src_w, src_h);
         let r_tex = upload_eye_rgba16(pipeline, &pair.right, pair.bit_depth, src_w, src_h);
         return Ok(match projection {
-            FisheyeExportProjection::HalfEquirect => (
+            FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. } => (
                 pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
                     &l_tex, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_l, 30,
                 )?,
@@ -3264,7 +3335,7 @@ fn build_eye_eq_16(
         });
     }
     match projection {
-        FisheyeExportProjection::HalfEquirect => {
+        FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. } => {
             let l = pipeline.project_fisheye_to_equirect_texture_16(
                 &pair.left, src_w, src_h, eye_w, eye_h, rot_left, calib_left,
             )?;

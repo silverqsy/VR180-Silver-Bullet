@@ -102,8 +102,34 @@ struct LensUniforms {
     ku1: f32, ku2: f32, ku3: f32, ku4: f32,
     fx_n: f32, cx_n: f32, cy_n: f32, _pad0: f32,
     kn1: f32, kn2: f32, kn3: f32, kn4: f32,
+    proj_mode: f32, defish_k: f32, edge_x: f32, edge_y: f32,  // vec4 #4: reframed-view output (proj_mode 1 → k-projection; 0 → half-equirect)
 }
 @group(0) @binding(5) var<uniform> lens: LensUniforms;
+
+// Output pixel → unit ray in the output frame (Z forward, Y up, X right).
+//   proj_mode 0: the 180° half-equirect (VR180).
+//   proj_mode 1: reframed view — a k-projection `r = k·tan(θ/k)` on a plane
+//                of half-extents (edge_x, edge_y): k = 1 rectilinear,
+//                k = 2 stereographic, large k → the equidistant fisheye
+//                look (the defish control). CPU twin: `gpu::reframe_ray`.
+fn output_ray(u: f32, v: f32) -> vec3<f32> {
+    if (lens.proj_mode > 0.5) {
+        let x = (2.0 * u - 1.0) * lens.edge_x;
+        let y = (1.0 - 2.0 * v) * lens.edge_y;
+        let r = sqrt(x * x + y * y);
+        if (r < 1e-6) {
+            return vec3<f32>(0.0, 0.0, 1.0);
+        }
+        let k = max(lens.defish_k, 1.0);
+        let theta = k * atan(r / k);
+        let s = sin(theta) / r;
+        return vec3<f32>(x * s, y * s, cos(theta));
+    }
+    let lon = (u - 0.5) * PI;
+    let lat = (0.5 - v) * PI;
+    let cos_lat = cos(lat);
+    return vec3<f32>(cos_lat * sin(lon), sin(lat), cos_lat * cos(lon));
+}
 
 fn lens_user_r(theta: f32) -> f32 {
     let t2 = theta * theta;
@@ -183,19 +209,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Per-pixel normalized coords + (lon, lat).
     let u = (f32(gid.x) + 0.5) / f32(out_dim.x);
     let v = (f32(gid.y) + 0.5) / f32(out_dim.y);
-    let lon = (u - 0.5) * PI;
-    let lat = (0.5 - v) * PI;
-
-    // Unit direction in equirect (output) frame, then rotated into
-    // camera (input) frame by the per-frame R uniform. When
-    // stabilization is off R = identity and these two frames are the
-    // same.
-    let cos_lat = cos(lat);
-    let dir_world = vec3<f32>(
-        cos_lat * sin(lon),
-        sin(lat),
-        cos_lat * cos(lon),
-    );
+    let dir_world = output_ray(u, v);
     // R · dir — manual row-vector dot products. 12-scalar uniform
     // layout (see EquirectUniforms above); each row is 3 floats +
     // 1 pad.
@@ -209,6 +223,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var xn: f32 = xr;
     var yn: f32 = yr;
     var zn: f32 = zr;
+    // Direction the sensor-row estimate below is taken from: the legacy
+    // half-equirect keeps the pre-rotation basis (parity with the reference
+    // pipeline); a reframed view can be aimed anywhere, so it uses the
+    // rotated (camera-frame) direction, which is the physical one.
+    let rs_dir = select(dir_world, vec3<f32>(xr, yr, zr), lens.proj_mode > 0.5);
     if (rs.srot_s > 0.0) {
         // Polar angle from optical axis (+Z) — computed from the
         // PRE-rotation output direction (`dir_world`), matching the
@@ -216,9 +235,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // time from the identity (unrotated) direction grid ("R is
         // always a small rotation" approximation). Keeping the same
         // basis keeps the two apps' RS per-pixel timing identical.
-        let cos_theta = clamp(dir_world.z, -1.0, 1.0);
+        let cos_theta = clamp(rs_dir.z, -1.0, 1.0);
         let theta = acos(cos_theta);
-        let sin_theta = sqrt(max(0.0, 1.0 - dir_world.z * dir_world.z));
+        let sin_theta = sqrt(max(0.0, 1.0 - rs_dir.z * rs_dir.z));
         // KLNS polynomial: r = c0·θ + c1·θ³ + c2·θ⁵ + c3·θ⁷ + c4·θ⁹.
         // Horner form for stability.
         let theta2 = theta * theta;
@@ -232,9 +251,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let center_y = rs.cal_dim * 0.5 + rs.ctry;
         var sensor_y: f32;
         if (sin_theta > 1e-6) {
-            sensor_y = center_y - r_klns * dir_world.y / sin_theta;
+            sensor_y = center_y - r_klns * rs_dir.y / sin_theta;
         } else {
-            sensor_y = center_y - rs.klns_c0 * dir_world.y;
+            sensor_y = center_y - rs.klns_c0 * rs_dir.y;
         }
         // Normalized time offset ∈ [-0.5, +0.5] → seconds.
         let t_norm = sensor_y / rs.cal_dim - 0.5;
