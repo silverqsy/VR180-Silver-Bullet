@@ -593,7 +593,6 @@ fn tr(en: &'static str) -> &'static str {
         "Format" => "格式",
         "Swap L↔R eyes" => "交换左右眼",
         "Upside-down mount (180°)" => "倒装 (180°)",
-        "IMU phase (ms)" => "IMU 相位 (ms)",
         "Stabilization (VQF 6D, BRAW)" => "防抖 (VQF 6D, BRAW)",
         "Stabilization (DJI camera quats)" => "防抖（DJI 相机四元数）",
         "Stabilization (Insta360 gyro)" => "防抖（Insta360 陀螺仪）",
@@ -626,8 +625,8 @@ fn tr(en: &'static str) -> &'static str {
         // Long help tooltips / notes
         "APMP and Spatial V2 conflict in the same atoms, so only one can be active per file. Re-run the export with the other target if you need a second copy."
             => "APMP 与 Spatial V2 占用相同的 atom，因此每个文件只能启用其一。如需第二份副本，请改用另一种目标重新导出。",
-        "Copy the active clip's settings to every clip OF THE SAME TYPE (OSV→OSV, .360→.360, …) — other camera types keep their own settings. Per-clip trim & IMU phase are kept."
-            => "将当前片段的设置复制到所有相同类型的片段（OSV→OSV、.360→.360 ……）— 其他相机类型保留各自的设置。各片段的裁剪与 IMU 相位保持不变。",
+        "Copy the active clip's settings to every clip OF THE SAME TYPE (OSV→OSV, .360→.360, …) — other camera types keep their own settings. Per-clip trim & RS mode are kept."
+            => "将当前片段的设置复制到所有相同类型的片段（OSV→OSV、.360→.360 ……）— 其他相机类型保留各自的设置。各片段的裁剪与卷帘快门模式保持不变。",
         "Velocity response curve: <1 follows motion early, 1 linear, >1 holds longer then catches up (cinematic lag)."
             => "速度响应曲线：<1 提前跟随运动，1 为线性，>1 保持更久后再追上（电影感延迟）。",
         "Settings apply live during playback — the decoder rebuilds per-eye bundles on the next iteration (small stutter ~300 ms on long clips)."
@@ -852,9 +851,6 @@ impl App {
         // Restore the user's last-used settings from disk (defaults on first
         // run). Persisted across launches so every knob is remembered.
         let defaults = Settings::load_persisted();
-        // Apply the persisted IMU-phase tuning value to the pipeline global
-        // so it's in effect before the first stab / rolling-shutter compute.
-        vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(defaults.dji_imu_phase_ms);
         // egui-wgpu 0.34's fragment shader (both the linear- and
         // gamma-framebuffer variants) explicitly "expect normal textures that
         // are NOT sRGB-aware": it samples them as gamma/raw bytes, and on an
@@ -1283,10 +1279,7 @@ impl App {
     }
 
     /// Spawn the export worker thread for a prepared config and install
-    /// it as the (single) running `export_job`. `imu_phase_ms` is the
-    /// per-clip IMU sample point — written into the pipeline global
-    /// before the worker starts (jobs are strictly sequential, so a
-    /// per-job global is safe).
+    /// it as the (single) running `export_job`.
     /// `eac_stab`: for a GoPro `.360` (EAC) export, the `(Settings,
     /// n_frames)` needed to compute the per-eye stabilization (the
     /// preview's `build_per_eye_frames`); `None` for fisheye sources,
@@ -1294,7 +1287,6 @@ impl App {
     fn spawn_export_job(
         &mut self,
         cfg: vr180_pipeline::fisheye_export::FisheyeExportConfig,
-        imu_phase_ms: f32,
         eac_stab: Option<(crate::decoder::Settings, usize)>,
     ) {
         let output_path = cfg.output_path.clone();
@@ -1335,10 +1327,6 @@ impl App {
         let pipeline = self.pipeline.clone();
         let progress_tx2 = progress_tx.clone();
         let handle = std::thread::spawn(move || {
-            // The IMU-phase store is THREAD-LOCAL — assert this clip's
-            // value on the worker itself (stab + per-frame RS read it
-            // here, immune to whatever the preview threads set).
-            vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(imu_phase_ms);
             if let Some((settings, n_frames)) = eac_stab {
                 // GoPro EAC: compute the same per-eye stab the preview uses,
                 // then run the EAC export. build_per_eye_frames_multi is
@@ -1740,8 +1728,6 @@ impl App {
                 self.kind_template(source_kind)
             };
             if !is_loaded_clip {
-                settings.dji_imu_phase_ms =
-                    vr180_pipeline::dji_imu::imu_phase_default_ms_for(source_kind, probe.fps);
                 // RS mode + readout are per-clip — auto-detect firmware vs
                 // no-firmware RS from the GoPro CORI stream (the toggle still
                 // overrides). Non-EAC sources fall back to the default.
@@ -1785,18 +1771,16 @@ impl App {
     }
 
     /// Overwrite an item's settings snapshot with the CURRENT settings,
-    /// preserving its per-clip fields (trim + IMU phase) — "apply my
+    /// preserving its per-clip fields (trim + RS mode) — "apply my
     /// grade/stab/output choices", not "copy clip A's trim everywhere".
     fn apply_current_settings_to_item(&mut self, idx: usize) {
         let Some(item) = self.batch.get_mut(idx) else { return; };
         if item.status == BatchStatus::Running { return; }
         let keep_trim = (item.settings.trim_in_s, item.settings.trim_out_s);
-        let keep_phase = item.settings.dji_imu_phase_ms;
         let keep_rs = (item.settings.rs_mode, item.settings.rs_readout_ms);
         item.settings = self.settings.clone();
         item.settings.trim_in_s = keep_trim.0;
         item.settings.trim_out_s = keep_trim.1;
-        item.settings.dji_imu_phase_ms = keep_phase;
         // RS mode + readout are per-clip — keep this item's own, don't copy mine.
         item.settings.rs_mode = keep_rs.0;
         item.settings.rs_readout_ms = keep_rs.1;
@@ -1875,7 +1859,7 @@ impl App {
         let output = self.batch_output_for(&self.batch[idx], &opts);
         let item_path = self.batch[idx].path.clone();
         let segments = self.clip_segments(&item_path);
-        let (cfg, imu_phase, eac_stab) = {
+        let (cfg, eac_stab) = {
             let item = &self.batch[idx];
             // Total across the merged recording (== single-file count when
             // `segments` is one file) so EAC stab spans the whole timeline.
@@ -1891,14 +1875,13 @@ impl App {
                     &item.settings, &opts,
                     segments,
                 ),
-                item.settings.dji_imu_phase_ms,
                 eac_stab,
             )
         };
         self.batch[idx].status = BatchStatus::Running;
         self.batch_current = Some(idx);
         tracing::info!("batch: item {}/{} → {}", idx + 1, self.batch.len(), output.display());
-        self.spawn_export_job(cfg, imu_phase, eac_stab);
+        self.spawn_export_job(cfg, eac_stab);
     }
 
     /// Cancel the running item but keep the batch going (poll marks it
@@ -2420,7 +2403,7 @@ impl App {
     }
 
     /// `preserve_clip_settings = true` keeps the per-clip fields (trim +
-    /// IMU phase) currently in `self.settings` instead of resetting them
+    /// RS mode) currently in `self.settings` instead of resetting them
     /// — used when re-activating a clip whose own settings were just
     /// restored from the clip list (and for same-clip reloads like the
     /// eye-orientation toggle).
@@ -2679,18 +2662,14 @@ impl App {
                 _ => {}
             }
         }
-        // Refresh the (non-persisted) IMU-phase to SROT/2 for THIS clip's fps,
-        // and seed the per-clip RS mode from the auto-detect — fresh loads
-        // only, so a prior clip's tweak never carries over. The UI toggles
-        // still override. Set before the snapshot so the decoder spawns with
-        // them and gen isn't bumped on frame 0.
+        // Seed the per-clip RS mode from the auto-detect — fresh loads only,
+        // so a prior clip's tweak never carries over. The UI toggles still
+        // override. Set before the snapshot so the decoder spawns with them
+        // and gen isn't bumped on frame 0.
         if !meta.preserve_clip_settings {
-            self.settings.dji_imu_phase_ms =
-                vr180_pipeline::dji_imu::imu_phase_default_ms_for(source_kind, meta.fps);
             self.settings.rs_mode = meta.detected_rs_mode;
             self.settings.rs_readout_ms = crate::decoder::default_rs_readout_ms();
         }
-        vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(self.settings.dji_imu_phase_ms);
         self.last_pushed_settings = self.settings.clone();
 
         let dims = vr180_core::eac::Dims::new(meta.width, meta.height);
@@ -3455,7 +3434,7 @@ impl eframe::App for App {
             if let Some(p) = self.loaded_path.clone() {
                 tracing::info!("eye orientation changed (swap={}, upside_down={}) — reloading clip",
                     eye_orient.0, eye_orient.1);
-                // Same clip — keep its trim + IMU phase across the reload.
+                // Same clip — keep its trim + RS mode across the reload.
                 self.load_file_inner(p, true);
             }
         }
@@ -4115,7 +4094,7 @@ impl App {
                 if ui.small_button(tr("Apply settings to all"))
                     .on_hover_text(tr("Copy the active clip's settings to every clip OF THE SAME TYPE \
                                     (OSV→OSV, .360→.360, …) — other camera types keep their own \
-                                    settings. Per-clip trim & IMU phase are kept."))
+                                    settings. Per-clip trim & RS mode are kept."))
                     .clicked()
                 {
                     do_apply_all = true;
@@ -4705,17 +4684,6 @@ impl App {
                 ui.add(egui::Slider::new(&mut s.dji_responsiveness, 0.2..=3.0)
                     .fixed_decimals(1)
                     .text(tr("Response")));
-                // IMU sample timing (ms after frame start). Re-seeded per
-                // clip from its fps (5.5 ms @25 fps — DJI-Studio-measured;
-                // readout/2 otherwise); the slider allows manual A/B around
-                // that default. Also asserts the main-thread thread-local so
-                // paused detail-still renders use this clip's phase.
-                // Insta360 seeds mid-frame (up to 20.8 ms at 24 fps) → wider range.
-                let phase_max = if is_insv { 40.0 } else { 20.0 };
-                ui.add(egui::Slider::new(&mut s.dji_imu_phase_ms, 0.0..=phase_max)
-                    .step_by(0.1).fixed_decimals(1)
-                    .text(tr("IMU phase (ms)")));
-                vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
             }
         });
         if show_loading {

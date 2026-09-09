@@ -430,6 +430,8 @@ pub fn build_insv_imu(
     stream_h: u32,
 ) -> DjiOsvImu {
     let mut out = insv_calib_only(meta, stream_w, stream_h);
+    // The synthetic blocks below are centred on each frame's content time.
+    out.sample_anchor = vr180_fisheye::SampleAnchor::BlockMid;
     let n_imu = meta.imu.len();
     if n_imu < 16 || meta.frames.is_empty() || fps <= 0.0 {
         tracing::warn!(
@@ -518,6 +520,7 @@ pub fn build_insv_imu(
             camera_model: out.camera_model.clone(),
             imu_to_cam: out.imu_to_cam,
             readout_ms: out.readout_ms,
+            sample_anchor: vr180_fisheye::SampleAnchor::BlockMid,
             ..Default::default()
         };
         let t0b = build(&meta.frames_b, &mut b);

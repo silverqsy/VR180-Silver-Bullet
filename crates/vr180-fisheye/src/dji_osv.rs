@@ -120,6 +120,21 @@ pub struct OmniLensModel {
     pub prism: [f32; 4],
 }
 
+/// Where on its high-rate block a frame's stabilization pose is sampled.
+/// Follows from how the block was recorded — never a tuned number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SampleAnchor {
+    /// The block starts at the sensor's frame event (DJI files): the pose is
+    /// the centre row's mid-exposure, `readout/2 + (video_ts − block_ts) −
+    /// shutter/2` after the block's first sample (`exposure_ms`,
+    /// `frame_ts_offset_ms`).
+    #[default]
+    ReadoutMid,
+    /// The block was synthesized centred on the frame's measured content
+    /// time (Insta360): the pose is the block's midpoint.
+    BlockMid,
+}
+
 /// Extracted IMU + calibration block from a DJI OSV file.
 #[derive(Debug, Clone, Default)]
 pub struct DjiOsvImu {
@@ -156,6 +171,24 @@ pub struct DjiOsvImu {
     /// frame timing (DJI). Consumers stabilize the eye that shows lens B
     /// from this timeline and everything else from `self`.
     pub lens_b_timeline: Option<Box<DjiOsvImu>>,
+    /// Per-frame exposure (shutter) time in ms, from the frame's exposure
+    /// record (`[2.4.1]`: a `{numerator, denominator}` fraction of a second —
+    /// `[1, 520]` = 1/520 s on the OSMO 360, `[100000, 79298304]` on the
+    /// 360 II). `NaN` when the file doesn't carry it; empty for synthesized
+    /// sources. Indexed like `frame_quats`.
+    pub exposure_ms: Vec<f32>,
+    /// Per-frame offset (ms) of the video frame's timestamp (`[1.2]`) from
+    /// its IMU block's timestamp (`[3.2.1.1]`, the time of the block's first
+    /// high-rate sample): the sensor's frame event lands ~0.5–0.6 ms after
+    /// the block starts. `NaN` when unavailable. Indexed like `frame_quats`.
+    pub frame_ts_offset_ms: Vec<f32>,
+    /// Sensor scan-line time (ns) from the clip header, when stated —
+    /// `[1.13.1]` on the OSMO 360, `[1.11.1]` on the 360 II. `readout_ms` is
+    /// derived from it (× the frame's rows).
+    pub line_time_ns: Option<f32>,
+    /// How the per-frame pose is placed on `high_rate_quats` — see
+    /// [`SampleAnchor`].
+    pub sample_anchor: SampleAnchor,
 }
 
 impl DjiOsvImu {
@@ -169,6 +202,10 @@ impl DjiOsvImu {
 
         for f in &top {
             match f.field_num {
+                // Clip header — sensor line time.
+                1 if matches!(f.wire, WireType::LengthDelimited) => {
+                    parse_clip_header(f.bytes(blob), &mut out)?;
+                }
                 // video_meta — calibration container.
                 2 if matches!(f.wire, WireType::LengthDelimited) => {
                     parse_video_meta(f.bytes(blob), &mut out)?;
@@ -178,6 +215,21 @@ impl DjiOsvImu {
                     parse_frame_block(f.bytes(blob), &mut out)?;
                 }
                 _ => {}
+            }
+        }
+
+        // Rolling-shutter readout = line time × rows. 4766 ns × 3840 =
+        // 18.301 ms (≤ 30 fps modes) and 4226 ns × 3840 = 16.228 ms (50 fps)
+        // — both matched to DJI Studio's output; the 360 II states 4183 ns
+        // (16.06 ms at 60 fps). Lets the stabilizer time every mode from the
+        // file instead of a per-fps table.
+        if out.readout_ms.is_none() {
+            if let Some(ns) = out.line_time_ns {
+                let rows = out.lens_a.height.filter(|h| *h > 0.0).unwrap_or(3840.0);
+                let readout_ms = ns * rows / 1.0e6;
+                if (8.0..=40.0).contains(&readout_ms) {
+                    out.readout_ms = Some(readout_ms);
+                }
             }
         }
 
@@ -205,10 +257,15 @@ impl DjiOsvImu {
             if i == 0 {
                 out.lens_a = seg.lens_a;
                 out.lens_b = seg.lens_b;
+                out.camera_model = seg.camera_model;
+                out.line_time_ns = seg.line_time_ns;
+                out.readout_ms = seg.readout_ms;
             }
             out.frame_quats.extend(seg.frame_quats);
             out.gravity.extend(seg.gravity);
             out.high_rate_quats.extend(seg.high_rate_quats);
+            out.exposure_ms.extend(seg.exposure_ms);
+            out.frame_ts_offset_ms.extend(seg.frame_ts_offset_ms);
         }
         Ok(out)
     }
@@ -370,6 +427,32 @@ fn extract_floats_from(buf: &[u8]) -> Vec<f32> {
 
 // ── Section-specific parsers ────────────────────────────────────────
 
+/// Clip header (top-level field 1): the sensor's scan-line time in ns —
+/// sub-message 13 on the OSMO 360 (its sub-message 11 holds the frame rate
+/// as a float and fails the varint check), sub-message 11 on the 360 II.
+fn parse_clip_header(buf: &[u8], out: &mut DjiOsvImu) -> Result<()> {
+    let fields = walk_fields(buf)?;
+    for f in &fields {
+        if !(f.field_num == 13 || f.field_num == 11)
+            || !matches!(f.wire, WireType::LengthDelimited)
+        {
+            continue;
+        }
+        let msg = f.bytes(buf);
+        let sub = walk_fields(msg)?;
+        if let Some(v) = sub.iter().find(|s| s.field_num == 1 && matches!(s.wire, WireType::Varint)) {
+            // Field 13 wins when both decode.
+            if f.field_num == 13 || out.line_time_ns.is_none() {
+                let ns = v.varint as f32;
+                if (1000.0..=20000.0).contains(&ns) {
+                    out.line_time_ns = Some(ns);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_video_meta(buf: &[u8], out: &mut DjiOsvImu) -> Result<()> {
     let fields = walk_fields(buf)?;
     for f in &fields {
@@ -492,16 +575,35 @@ fn parse_frame_block(buf: &[u8], out: &mut DjiOsvImu) -> Result<()> {
     let mut frame_quat = Quat::IDENTITY;
     let mut gravity = [0.0_f32, -1.0, 0.0]; // Python fallback at line 455
     let mut hr_quats: Vec<Quat> = Vec::new();
+    let mut video_ts: Option<u64> = None;
+    let mut block_ts: Option<u64> = None;
+    let mut exposure_ms = f32::NAN;
 
     for f in &fields {
         match f.field_num {
-            // Orientation sub-message: per-frame quat + gravity.
+            // Frame header: sub-field 2 = the frame's video timestamp (µs).
+            1 if matches!(f.wire, WireType::LengthDelimited) => {
+                for s in walk_fields(f.bytes(buf))? {
+                    if s.field_num == 2 && matches!(s.wire, WireType::Varint) {
+                        video_ts = Some(s.varint);
+                    }
+                }
+            }
+            // Orientation sub-message: per-frame quat + gravity (+ exposure).
             2 if matches!(f.wire, WireType::LengthDelimited) => {
                 let orient = f.bytes(buf);
                 let sub = walk_fields(orient)?;
                 for s in &sub {
                     if !matches!(s.wire, WireType::LengthDelimited) { continue; }
                     let bytes = s.bytes(orient);
+                    if s.field_num == 4 {
+                        // Exposure record — the shutter time as a fraction
+                        // of a second (see `DjiOsvImu::exposure_ms`).
+                        if let Some(e) = parse_exposure_ms(bytes) {
+                            exposure_ms = e;
+                        }
+                        continue;
+                    }
                     let floats = extract_floats_from(bytes);
                     if s.field_num == 9 && floats.len() >= 4 {
                         // Stream is (w, x, y, z). The Python parser
@@ -551,6 +653,12 @@ fn parse_frame_block(buf: &[u8], out: &mut DjiOsvImu) -> Result<()> {
                         // field 3 holding one quat each.
                         let lens_fields = walk_fields(lens_payload)?;
                         for lf in &lens_fields {
+                            // Sub-field 1 = the block's timestamp (µs, 32-bit
+                            // counter) = the time of the first sample below.
+                            if lf.field_num == 1 && matches!(lf.wire, WireType::Varint) {
+                                block_ts = Some(lf.varint);
+                                continue;
+                            }
                             if lf.field_num != 3
                                 || !matches!(lf.wire, WireType::LengthDelimited) { continue; }
                             let q_bytes = lf.bytes(lens_payload);
@@ -575,10 +683,47 @@ fn parse_frame_block(buf: &[u8], out: &mut DjiOsvImu) -> Result<()> {
     let frame_quat = frame_quat.normalize();
     let hr_quats: Vec<Quat> = hr_quats.into_iter().map(|q| q.normalize()).collect();
 
+    // Video-timestamp − block-timestamp, modulo 2^32 (the block counter is
+    // 32-bit; the video timestamp is 64-bit).
+    let frame_ts_offset_ms = match (video_ts, block_ts) {
+        (Some(v), Some(b)) => (v.wrapping_sub(b) as u32 as i32) as f32 / 1000.0,
+        _ => f32::NAN,
+    };
+
     out.frame_quats.push(frame_quat);
     out.gravity.push(gravity);
     out.high_rate_quats.push(hr_quats);
+    out.exposure_ms.push(exposure_ms);
+    out.frame_ts_offset_ms.push(frame_ts_offset_ms);
     Ok(())
+}
+
+/// Decode a frame's exposure record (`[2.4.1]`): varints `{numerator,
+/// denominator}` (packed, or as repeated fields) of the shutter time in
+/// seconds → milliseconds. `None` when absent or nonsensical.
+fn parse_exposure_ms(record: &[u8]) -> Option<f32> {
+    let inner = walk_fields(record).ok()?;
+    let mut vals: Vec<u64> = Vec::new();
+    for f in &inner {
+        if f.field_num != 1 { continue; }
+        match f.wire {
+            WireType::Varint => vals.push(f.varint),
+            WireType::LengthDelimited => {
+                let b = f.bytes(record);
+                let mut cursor = 0usize;
+                while cursor < b.len() {
+                    match read_varint(b, &mut cursor) {
+                        Ok(v) => vals.push(v),
+                        Err(_) => break,
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if vals.len() < 2 || vals[0] == 0 || vals[1] == 0 { return None; }
+    let ms = vals[0] as f64 / vals[1] as f64 * 1000.0;
+    (ms.is_finite() && ms > 0.0 && ms < 1000.0).then_some(ms as f32)
 }
 
 #[cfg(test)]
@@ -667,6 +812,136 @@ mod tests {
         // After normalize, w should be very close to 0.99 (input was
         // already near-unit, so normalize is ~identity).
         assert!((hr.w - 0.99).abs() < 0.01);
+    }
+
+    #[test]
+    fn frame_exposure_and_timestamp_offset_parse() {
+        fn varint(buf: &mut Vec<u8>, mut v: u64) {
+            loop {
+                let b = (v & 0x7F) as u8;
+                v >>= 7;
+                if v == 0 { buf.push(b); break; } else { buf.push(b | 0x80); }
+            }
+        }
+        fn ld(buf: &mut Vec<u8>, field_num: u32, inner: &[u8]) {
+            varint(buf, ((field_num << 3) | 2) as u64);
+            varint(buf, inner.len() as u64);
+            buf.extend_from_slice(inner);
+        }
+        fn vi(buf: &mut Vec<u8>, field_num: u32, v: u64) {
+            varint(buf, (field_num << 3) as u64);
+            varint(buf, v);
+        }
+        fn f32s(buf: &mut Vec<u8>, vals: &[f32]) {
+            for (i, v) in vals.iter().enumerate() {
+                varint(buf, (((i as u32 + 1) << 3) | 5) as u64);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        // Frame header: [1.2] = 64-bit video timestamp.
+        let mut hdr = Vec::new();
+        vi(&mut hdr, 1, 200);
+        vi(&mut hdr, 2, 5_438_584_595);
+        // Orientation: [2.4.1] = packed {1, 520} (1/520 s), [2.9] = quat.
+        let mut packed = Vec::new();
+        varint(&mut packed, 1);
+        varint(&mut packed, 520);
+        let mut expo = Vec::new();
+        ld(&mut expo, 1, &packed);
+        let mut quat = Vec::new();
+        f32s(&mut quat, &[1.0, 0.0, 0.0, 0.0]);
+        let mut orient = Vec::new();
+        ld(&mut orient, 4, &expo);
+        ld(&mut orient, 9, &quat);
+        // IMU: [3.2.1.1] = 32-bit block timestamp, [3.2.1.3] = samples.
+        let mut lens_payload = Vec::new();
+        vi(&mut lens_payload, 1, 1_143_616_793);
+        vi(&mut lens_payload, 2, 5169);
+        ld(&mut lens_payload, 3, &quat);
+        ld(&mut lens_payload, 3, &quat);
+        let mut lens_arrays = Vec::new();
+        ld(&mut lens_arrays, 1, &lens_payload);
+        let mut imu = Vec::new();
+        ld(&mut imu, 2, &lens_arrays);
+        let mut frame = Vec::new();
+        ld(&mut frame, 1, &hdr);
+        ld(&mut frame, 2, &orient);
+        ld(&mut frame, 3, &imu);
+        let mut blob = Vec::new();
+        ld(&mut blob, 3, &frame);
+        // A second frame without an exposure record → NaN, but still aligned.
+        let mut frame2 = Vec::new();
+        ld(&mut frame2, 2, &{ let mut o = Vec::new(); ld(&mut o, 9, &quat); o });
+        ld(&mut frame2, 3, &imu);
+        ld(&mut blob, 3, &frame2);
+
+        let parsed = DjiOsvImu::parse(&blob).expect("parse");
+        assert_eq!(parsed.frame_quats.len(), 2);
+        assert_eq!(parsed.exposure_ms.len(), 2);
+        assert_eq!(parsed.frame_ts_offset_ms.len(), 2);
+        assert!((parsed.exposure_ms[0] - 1000.0 / 520.0).abs() < 1e-3);
+        // 5_438_584_595 − 1_143_616_793 = 2^32 + 506 → 0.506 ms modulo 2^32.
+        assert!((parsed.frame_ts_offset_ms[0] - 0.506).abs() < 1e-4);
+        assert!(parsed.exposure_ms[1].is_nan());
+        assert!(parsed.frame_ts_offset_ms[1].is_nan());
+        assert_eq!(parsed.high_rate_quats[0].len(), 2);
+        // OSMO 360 II encoding: {100000, 79298304}.
+        let mut packed2 = Vec::new();
+        varint(&mut packed2, 100_000);
+        varint(&mut packed2, 79_298_304);
+        let mut expo2 = Vec::new();
+        ld(&mut expo2, 1, &packed2);
+        assert!((parse_exposure_ms(&expo2).unwrap() - 1.2611).abs() < 1e-3);
+        // Unpacked repeated varints decode the same way.
+        let mut expo3 = Vec::new();
+        vi(&mut expo3, 1, 1);
+        vi(&mut expo3, 1, 120);
+        assert!((parse_exposure_ms(&expo3).unwrap() - 8.3333).abs() < 1e-3);
+    }
+
+    #[test]
+    fn readout_follows_the_header_line_time() {
+        fn varint(buf: &mut Vec<u8>, mut v: u64) {
+            loop {
+                let b = (v & 0x7F) as u8;
+                v >>= 7;
+                if v == 0 { buf.push(b); break; } else { buf.push(b | 0x80); }
+            }
+        }
+        fn ld(buf: &mut Vec<u8>, field_num: u32, inner: &[u8]) {
+            varint(buf, ((field_num << 3) | 2) as u64);
+            varint(buf, inner.len() as u64);
+            buf.extend_from_slice(inner);
+        }
+        fn vi(buf: &mut Vec<u8>, field_num: u32, v: u64) {
+            varint(buf, (field_num << 3) as u64);
+            varint(buf, v);
+        }
+        // OSMO 360: [1.11.1] = fps as f32 (ignored), [1.13.1] = 4766 ns.
+        let mut fps = Vec::new();
+        varint(&mut fps, (1 << 3) | 5);
+        fps.extend_from_slice(&24.9988_f32.to_le_bytes());
+        let mut lt = Vec::new();
+        vi(&mut lt, 1, 4766);
+        let mut hdr = Vec::new();
+        ld(&mut hdr, 11, &fps);
+        ld(&mut hdr, 13, &lt);
+        let mut blob = Vec::new();
+        ld(&mut blob, 1, &hdr);
+        let parsed = DjiOsvImu::parse(&blob).expect("parse");
+        assert_eq!(parsed.line_time_ns, Some(4766.0));
+        assert!((parsed.readout_ms.unwrap() - 18.301).abs() < 1e-3);
+        // 360 II: [1.11.1] = 4183 ns.
+        let mut lt2 = Vec::new();
+        vi(&mut lt2, 1, 4183);
+        let mut hdr2 = Vec::new();
+        ld(&mut hdr2, 11, &lt2);
+        let mut blob2 = Vec::new();
+        ld(&mut blob2, 1, &hdr2);
+        let parsed2 = DjiOsvImu::parse(&blob2).expect("parse");
+        assert!((parsed2.readout_ms.unwrap() - 16.063).abs() < 1e-2);
+        // No header → no readout (callers fall back to the per-mode table).
+        assert!(DjiOsvImu::parse(&[]).expect("parse").readout_ms.is_none());
     }
 
     #[test]

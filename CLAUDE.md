@@ -43,10 +43,24 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    artifacts so both platforms carry it (mac 2.1.0 artifacts already
    respun with it). No Windows-specific code: the stage rides the shared
    color stack (`ColorStackPlan.eye_scale`), incl. the NVENC/d3d11 arms.
-7. **25 fps OSV stab fix** (`dji_imu_phase_default_ms_for_fps` → 5.5 ms
-   for fps < 27, verified against DJI Studio's output) + restored the IMU
-   phase slider in the stab panel. Pipeline-level, shared code — pull +
-   rebuild; no Windows-specific work.
+7. **Stabilization timing is derived from the file — no phase constants,
+   no slider** (`dji_imu::frame_sample_time_s`, 2026-09-09). Each frame's
+   pose is sampled at the centre row's mid-exposure, `readout/2 +
+   (video_ts − block_ts) − shutter/2` after its motion block starts: the
+   readout from the file's line time (`DjiOsvImu::readout_ms`, header
+   `[1.13.1]`, II `[1.11.1]`, × rows; `dji_osmo_readout_ms_for_fps` is only
+   the fallback), the shutter from the per-frame exposure record
+   (`exposure_ms`, `[3.2.4.1]` as a fraction of a second) and the two
+   timestamps (`frame_ts_offset_ms`). Insta360 timelines are synthesized
+   on the measured content time (`SampleAnchor::BlockMid`). Measured on
+   the stabilized output of five clips (1/500 s → ≈9 ms, 1/120 s → ≈5.5 ms,
+   1/40 s → ≈−3 ms) and consistent with DJI Studio's output; the former
+   8.5 ms and 5.5 ms @ 25 fps rules were this formula on particular clips.
+   The "IMU phase" slider and `Settings::dji_imu_phase_ms` are gone — **do
+   not reintroduce tuned phase numbers**; a new camera or mode gets its
+   timing from its metadata. Diagnostics (env): `VR180_IMU_PHASE_OFFSET_MS`,
+   `VR180_DJI_EXPOSURE_COMP=0`, `VR180_DJI_RS_SHIFT_MS`. Pipeline-level,
+   shared code — pull + rebuild; no Windows-specific work.
 8. **Insta360 X6 `.insv` support** (`SourceKind::Insta360Insv`): trailer
    parser (`vr180-fisheye/src/insta360.rs`), raw-gyro → VQF → the shared
    DJI-style stab stream (`vr180-pipeline/src/insv_imu.rs`), measured X6
@@ -395,13 +409,14 @@ experiment was a band-aid for the preview-gamma bug (Lesson #2) and is gone.
    GOP frames on the HW engine but runs the HW→CPU download + swscale only on
    the **target** frame (≈11 s → ≈0.6 s for a deep seek at 8K). Same
    decode-forward in the live worker's seek.
-4. **OSV gyro timing:** measured SROT (sensor readout) is **18.301 ms @
-   30 fps / 16.228 ms @ 50 fps** (`dji_osmo_readout_ms_for_fps`). The
-   per-frame stab IMU sample point defaults to **SROT/2 after
-   frame-start** (9.15 / 8.11 ms) and is exposed as the live "IMU phase
-   (ms)" slider — re-seeded to SROT/2 on every clip load, NOT persisted
-   (`#[serde(skip)]`). The rolling-shutter readout window is centered on
-   the same point (coupled, as DJI does). See `dji_imu.rs`.
+4. **OSV gyro timing:** the sensor readout (SROT) comes from the file's
+   line time (`DjiOsvImu::readout_ms`: 18.301 ms ≤ 30 fps, 16.228 ms @
+   50 fps, 16.06 ms on the 360 II @ 60 fps); `dji_osmo_readout_ms_for_fps`
+   is the fallback for files without one. The per-frame stab pose is
+   sampled at the centre row's mid-exposure (SROT/2 + timestamp gap −
+   shutter/2, all from the file — item 7 under Status) and the
+   rolling-shutter readout window is centred on the same point (coupled,
+   as DJI does). There is no user-facing timing control. See `dji_imu.rs`.
 5. **Settings persistence** lives in a per-OS config dir (macOS App
    Support / Windows `%APPDATA%` / Linux XDG) — `Settings::config_path`.
    It survives both relaunch and loading a new clip (only trim resets).

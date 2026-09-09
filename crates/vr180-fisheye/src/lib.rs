@@ -42,7 +42,7 @@ pub mod presets;
 pub mod projection;
 
 pub use calib::{FisheyeCalibration, GyroflowLensProfile};
-pub use dji_osv::{DjiLensCalib, DjiOsvImu, OmniLensModel};
+pub use dji_osv::{DjiLensCalib, DjiOsvImu, OmniLensModel, SampleAnchor};
 pub use insta360::{Insta360Meta, InsvLensCalib, InsvWindowCrop};
 pub use presets::{CameraPreset, presets};
 

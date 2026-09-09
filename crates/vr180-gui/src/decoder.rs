@@ -42,13 +42,6 @@ use vr180_pipeline::decode::HwDecode;
 #[allow(unused_imports)]
 use vr180_pipeline::decode::iter_stream_pairs;
 
-/// Serde default + pre-file-load seed for the (non-persisted) IMU-phase
-/// slider: SROT/2 at 30 fps (9.15 ms). Refreshed to the actual clip fps in
-/// `App::load_file` once a file is open.
-fn default_dji_imu_phase_ms() -> f32 {
-    vr180_pipeline::dji_imu::dji_imu_phase_default_ms_for_fps(30.0)
-}
-
 /// PER-CLIP GoPro RS defaults. `rs_mode` + `rs_readout_ms` are `#[serde(skip)]`
 /// and re-seeded to these on every clip load (see `app.rs`), so a prior clip's
 /// tweak never carries over — same lifecycle as the IMU phase. (`rs_correct`
@@ -176,15 +169,6 @@ pub struct Settings {
     /// 1 = linear, > 1 = holds longer then catches up (cinematic lag).
     /// Only used when `dji_smooth_ms > 0`.
     pub dji_responsiveness: f32,
-    /// IMU sample offset, ms after frame_start. Defaults to **SROT/2** (the
-    /// readout-window midpoint; 9.15 ms @30 fps, 8.11 ms @50 fps) and is
-    /// **refreshed on every file load** to the new clip's fps. A live
-    /// A/B-test knob for stabilization timing vs DJI Studio; feeds BOTH the
-    /// per-frame stab sample and the rolling-shutter window (coupled, as DJI
-    /// does). NOT persisted (`#[serde(skip)]`) — each session/clip starts at
-    /// the SROT/2 default regardless of prior tweaks.
-    #[serde(skip, default = "default_dji_imu_phase_ms")]
-    pub dji_imu_phase_ms: f32,
     /// Global pano-map adjustment angles (degrees). Shared between
     /// eyes. Applied as `R_view = R_y(yaw) · R_x(pitch) · R_z(roll)`
     /// composed AFTER stabilization. All-zero default = identity =
@@ -377,7 +361,6 @@ impl Default for Settings {
             dji_smooth_ms: 1200.0,
             dji_max_corr_deg: 15.0,
             dji_responsiveness: 1.0,
-            dji_imu_phase_ms: default_dji_imu_phase_ms(),
             pano_yaw_deg: 0.0,
             pano_pitch_deg: 0.0,
             pano_roll_deg: 0.0,
@@ -1609,7 +1592,6 @@ fn run_fisheye(
                     };
                     let smooth_ms = s.dji_smooth_ms;
                     let responsiveness = s.dji_responsiveness;
-                    vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
                     drop(s);
                     match vr180_pipeline::dji_imu::compute_dji_stabilization(
                         osv, total_frames, max_corr_deg, smooth_ms, fps, responsiveness,
@@ -2343,7 +2325,6 @@ fn run_fisheye_zerocopy(
         let max_corr_deg = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
         let smooth_ms = s.dji_smooth_ms;
         let responsiveness = s.dji_responsiveness;
-        vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
         drop(s);
         match vr180_pipeline::dji_imu::compute_dji_stabilization(
             osv, total_frames, max_corr_deg, smooth_ms, fps, responsiveness,
@@ -2817,7 +2798,6 @@ fn run_fisheye_vt_zerocopy(
         let max_corr_deg = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
         let smooth_ms = s.dji_smooth_ms;
         let responsiveness = s.dji_responsiveness;
-        vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
         drop(s);
         match vr180_pipeline::dji_imu::compute_dji_stabilization(
             osv, total_frames, max_corr_deg, smooth_ms, fps, responsiveness,
@@ -4685,7 +4665,6 @@ fn stab_key(s: &Settings) -> u64 {
     let mut h: u64 = if s.stabilize { 1 } else { 0 };
     h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_smooth_ms.to_bits() as u64);
     h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_max_corr_deg.to_bits() as u64);
-    h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_imu_phase_ms.to_bits() as u64);
     h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_responsiveness.to_bits() as u64);
     h
 }
@@ -4703,7 +4682,6 @@ fn compute_stab_for(
     match kind {
         vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv => imu.and_then(|osv| {
             let max_corr = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
-            vr180_pipeline::dji_imu::set_dji_imu_phase_after_start_ms(s.dji_imu_phase_ms);
             vr180_pipeline::dji_imu::compute_dji_stabilization(
                 osv, total, max_corr, s.dji_smooth_ms, fps, s.dji_responsiveness)
                 .ok().map(|st| st.per_frame)
