@@ -64,7 +64,10 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    timing from its metadata. Diagnostics (env): `VR180_IMU_PHASE_OFFSET_MS`,
    `VR180_DJI_EXPOSURE_COMP=0`, `VR180_DJI_RS_SHIFT_MS`. Pipeline-level,
    shared code — pull + rebuild; no Windows-specific work.
-8. **Insta360 X6 `.insv` support** (`SourceKind::Insta360Insv`): trailer
+8. **Insta360 X6 `.insv` support** (`SourceKind::Insta360Insv`; the official
+   X6 10-bit I-Log→Rec.709 LUT v2 is bundled as `BUILTIN_X6_LUT` and
+   auto-applied on load like the DJI/GoPro builtins — every X6 clip seen so
+   far is I-Log, no profile flag found in the metadata): trailer
    parser (`vr180-fisheye/src/insta360.rs`), raw-gyro → VQF → the shared
    DJI-style stab stream (`vr180-pipeline/src/insv_imu.rs`), measured X6
    lens preset, stream 0 = back lens = LEFT eye by default

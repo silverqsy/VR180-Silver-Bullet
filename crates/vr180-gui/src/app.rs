@@ -556,6 +556,8 @@ fn tr(en: &'static str) -> &'static str {
         "Enable stabilization" => "启用防抖",
         "CORI source" => "CORI 来源",
         "Smooth (ms)" => "平滑 (ms)",
+        "Camera lock" => "锁定视角",
+        "Lock the view to the first frame; smoothing and max correction are ignored." => "锁定到首帧视角；平滑与最大校正均忽略。",
         // Reframed view
         "Reframed view" => "重新取景视图",
         "Aspect" => "画幅比例",
@@ -605,6 +607,7 @@ fn tr(en: &'static str) -> &'static str {
         "Clear" => "清除",
         "Use built-in Osmo 360 D-LogM→709" => "使用内置 Osmo 360 D-LogM→709",
         "Use built-in GoPro GP-Log→709" => "使用内置 GoPro GP-Log→709",
+        "Use built-in Insta360 X6 I-Log→709" => "使用内置 Insta360 X6 I-Log→709",
         "Reset detail" => "重置细节",
         // View adjust
         "Global (both eyes)" => "全局（双眼）",
@@ -1292,8 +1295,12 @@ impl App {
             inject_youtube_vr180: opts.inject_youtube,
             apmp_baseline_mm: opts.apmp_baseline_mm,
             stabilize: settings.stabilize,
-            dji_max_corr_deg: settings.dji_max_corr_deg,
-            dji_smooth_ms: settings.dji_smooth_ms,
+            // Camera lock drives the pipeline's frame-0 lock via smooth_ms=0 and
+            // drops the correction cap (0 → ∞ at the export sites): fully locked
+            // no matter what the camera does. Soft-stab passes the window floored
+            // off 0 (the lock sentinel) and the user's cap.
+            dji_max_corr_deg: if settings.dji_camera_lock { 0.0 } else { settings.dji_max_corr_deg },
+            dji_smooth_ms: if settings.dji_camera_lock { 0.0 } else { settings.dji_smooth_ms.max(1.0) },
             dji_responsiveness: settings.dji_responsiveness,
             denoise_strength: settings.denoise_strength,
             view_adjust: settings.output_view_adjust(),
@@ -2445,31 +2452,25 @@ impl App {
         self.load_file_inner(path, false);
     }
 
-    /// `preserve_clip_settings = true` keeps the per-clip fields (trim +
-    /// RS mode) currently in `self.settings` instead of resetting them
-    /// — used when re-activating a clip whose own settings were just
-    /// restored from the clip list (and for same-clip reloads like the
-    /// eye-orientation toggle).
-    fn load_file_inner(&mut self, path: PathBuf, preserve_clip_settings: bool) {
-        // ── Tear down everything tied to the previous clip ──────────
-        // Everything here is UI-thread-only state (egui textures, playback
-        // flags). The actual SOURCE I/O — probe, format detect, GoPro GPMF,
-        // segment scan, per-segment probes — is NOT done here: it runs on a
-        // worker thread (`load_clip_metadata`) and lands in `finish_load`.
-        // Doing it inline used to freeze the whole GUI whenever the source
-        // was cold/slow — most painfully a spun-down SMB/NAS share, where the
-        // first access stalls for seconds while the disks wake (every later
-        // access is instant once cached, which is exactly the "first time
-        // hangs, second time instant" report).
+    /// Return the app to the "no clip loaded" state: stop the decoder,
+    /// free the preview/zoom textures, drop the caches, cancel any load
+    /// still in flight, and clear `clip` + `loaded_path` so the sidebar
+    /// and central panel show the empty state. `load_file_inner` runs
+    /// this before every load; the clip list runs it when the loaded
+    /// clip's entry is removed. Everything here is UI-thread-only state
+    /// (egui textures, playback flags). `preserve_clip_settings` keeps
+    /// the per-clip trim (same-clip reloads); the rest of `Settings` is
+    /// remembered across loads regardless.
+    fn unload_clip(&mut self, preserve_clip_settings: bool) {
         // 1. Stop the decoder thread + drop the IPC channels.
         self.stop_playback();
         // 2. Free the egui-registered preview texture from the old clip, so
-        //    the previous frame doesn't stay painted while the new one loads.
+        //    the previous frame doesn't stay painted.
         if let Some(prev) = self.current_display.take() {
             self.egui_renderer.write().free_texture(&prev.egui_id);
         }
         // 3. Drop the zoom-magnifier caches so they can't serve the PREVIOUS
-        //    clip's still after the swap.
+        //    clip's still later.
         if let Some(prev) = self.full_res_display.take() {
             self.egui_renderer.write().free_texture(&prev.egui_id);
         }
@@ -2477,19 +2478,43 @@ impl App {
         self.full_res_key = 0;
         self.full_res_desired_key = 0;
         self.detail_last_key = 0;
-        // 4. Reset volatile playback state. Everything in `Settings` is now
+        // 4. Reset volatile playback state. Everything in `Settings` is
         //    REMEMBERED across loads, except the clip-specific trim range.
         self.fps_stats = FpsStats::default();
         if !preserve_clip_settings {
             self.settings.trim_in_s = None;
             self.settings.trim_out_s = None;
         }
-        // 5. Drop ClipInfo + path so the sidebar shows the "Loading…" state.
+        // 5. Drop ClipInfo + path: the sidebar shows "No file loaded." (or
+        //    "Loading…" once a new load is queued behind this).
         self.clip = None;
         self.loaded_path = None;
-        // Fresh load → drop any stale "play when ready" intent from a prior
-        // (possibly superseded) load.
+        // Drop any stale "play when ready" intent from a prior load.
         self.play_when_ready = false;
+        // 6. Cancel a load still in flight: bump the token so a late worker
+        //    result reads as superseded, and drop the pending handle (its
+        //    receiver goes with it — the worker's send simply fails).
+        self.load_token = self.load_token.wrapping_add(1);
+        self.load_pending = None;
+    }
+
+    /// `preserve_clip_settings = true` keeps the per-clip fields (trim +
+    /// RS mode) currently in `self.settings` instead of resetting them
+    /// — used when re-activating a clip whose own settings were just
+    /// restored from the clip list (and for same-clip reloads like the
+    /// eye-orientation toggle).
+    fn load_file_inner(&mut self, path: PathBuf, preserve_clip_settings: bool) {
+        // ── Tear down everything tied to the previous clip ──────────
+        // (Shared with the clip list's remove-loaded-clip path.) The actual
+        // SOURCE I/O — probe, format detect, GoPro GPMF, segment scan,
+        // per-segment probes — is NOT done here: it runs on a worker thread
+        // (`load_clip_metadata`) and lands in `finish_load`. Doing it inline
+        // used to freeze the whole GUI whenever the source was cold/slow —
+        // most painfully a spun-down SMB/NAS share, where the first access
+        // stalls for seconds while the disks wake (every later access is
+        // instant once cached, which is exactly the "first time hangs,
+        // second time instant" report).
+        self.unload_clip(preserve_clip_settings);
 
         // Resolve the segment list on the UI thread when it's a cheap
         // import-time choice (a HashMap lookup); otherwise leave it to the
@@ -2682,18 +2707,21 @@ impl App {
             self.settings.fisheye_preset = auto.to_string();
         }
         // Autoload the embedded log→Rec.709 LUT matching the source — DJI
-        // D-Log M for OSV, GoPro GP-Log for `.360` — only when no LUT is set
-        // (preserve a remembered/cleared choice); swap the OTHER source's
-        // builtin on a clip switch since the log curves are camera-specific.
+        // D-Log M for OSV, GoPro GP-Log for `.360`, Insta360 I-Log for
+        // `.insv` — only when no LUT is set (preserve a remembered/cleared
+        // choice); swap the OTHER source's builtin on a clip switch since the
+        // log curves are camera-specific.
         {
-            use crate::decoder::{BUILTIN_OSMO_LUT_PATH, BUILTIN_GPLOG_LUT_PATH};
+            use crate::decoder::{BUILTIN_OSMO_LUT_PATH, BUILTIN_GPLOG_LUT_PATH, BUILTIN_X6_LUT_PATH};
             let wanted = match source_kind {
-                vr180_pipeline::SourceKind::DjiOsv   => Some(BUILTIN_OSMO_LUT_PATH),
-                vr180_pipeline::SourceKind::GoProEac => Some(BUILTIN_GPLOG_LUT_PATH),
+                vr180_pipeline::SourceKind::DjiOsv        => Some(BUILTIN_OSMO_LUT_PATH),
+                vr180_pipeline::SourceKind::GoProEac      => Some(BUILTIN_GPLOG_LUT_PATH),
+                vr180_pipeline::SourceKind::Insta360Insv  => Some(BUILTIN_X6_LUT_PATH),
                 _ => None,
             };
             let cur_is_builtin = self.settings.lut_path == BUILTIN_OSMO_LUT_PATH
-                || self.settings.lut_path == BUILTIN_GPLOG_LUT_PATH;
+                || self.settings.lut_path == BUILTIN_GPLOG_LUT_PATH
+                || self.settings.lut_path == BUILTIN_X6_LUT_PATH;
             match wanted {
                 Some(w) if self.settings.lut_path.is_empty() || cur_is_builtin => {
                     if self.settings.lut_path != w {
@@ -4271,11 +4299,16 @@ impl App {
     }
 
     /// Remove a clip from the list, keeping `active_clip` /
-    /// `batch_current` indices coherent. The preview keeps playing the
-    /// file even if its list entry goes away (it just loses selection).
+    /// `batch_current` indices coherent. If the removed entry is the
+    /// clip currently loaded (or still loading), the preview is unloaded
+    /// with it: the neighbouring entry becomes active when one remains,
+    /// otherwise the app returns to the empty "no clip loaded" state.
     fn remove_clip(&mut self, idx: usize) {
         if idx >= self.batch.len() { return; }
         if self.batch[idx].status == BatchStatus::Running { return; }
+        let removed_path = self.batch[idx].path.clone();
+        let was_loaded = self.loaded_path.as_deref() == Some(removed_path.as_path())
+            || self.load_pending.as_ref().map_or(false, |p| p.path == removed_path);
         self.batch.remove(idx);
         self.active_clip = match self.active_clip {
             Some(a) if a == idx => None,
@@ -4287,6 +4320,16 @@ impl App {
             // c == idx impossible (Running rows can't be removed).
             other => other,
         };
+        if was_loaded {
+            self.unload_clip(false);
+            self.active_clip = None;
+            if !self.batch.is_empty() {
+                // Keep something on screen: activate the entry that slid
+                // into the removed slot (or the new last one).
+                let next = idx.min(self.batch.len() - 1);
+                self.select_clip(next);
+            }
+        }
     }
 
     /// The shared open-dialog filter for every "add video" entry point.
@@ -4384,12 +4427,24 @@ impl App {
                         ui.selectable_value(&mut s.cori_source, C::Auto, tr("auto"));
                     });
             });
-            ui.add(egui::Slider::new(&mut s.smooth_ms, 0.0..=3000.0).text(tr("Smooth (ms)")));
-            ui.add(egui::Slider::new(&mut s.max_corr_deg, 0.0..=45.0).text(tr("Max corr (°)")));
-            ui.add(egui::Slider::new(&mut s.gyro_responsiveness, 0.2..=3.0)
-                .text(tr("Response")))
-                .on_hover_text(tr("Velocity response curve: <1 follows motion early, \
-                    1 linear, >1 holds longer then catches up (cinematic lag)."));
+            // Camera lock owns the sharp frame-0 lock (full counter-rotation,
+            // no cap); Smooth / Max corr / Response are the soft-stab controls
+            // and gray out under it (mirrors the OSV/INSV panel).
+            ui.checkbox(&mut s.camera_lock, tr("Camera lock"))
+                .on_hover_text(tr("Lock the view to the first frame; smoothing and max correction are ignored."));
+            let cam_lock = s.camera_lock;
+            ui.add_enabled_ui(!cam_lock, |ui| {
+                ui.add(egui::Slider::new(&mut s.smooth_ms, 0.0..=3000.0).text(tr("Smooth (ms)")));
+            });
+            ui.add_enabled_ui(!cam_lock, |ui| {
+                ui.add(egui::Slider::new(&mut s.max_corr_deg, 0.0..=45.0).text(tr("Max corr (°)")));
+            });
+            ui.add_enabled_ui(!cam_lock, |ui| {
+                ui.add(egui::Slider::new(&mut s.gyro_responsiveness, 0.2..=3.0)
+                    .text(tr("Response")))
+                    .on_hover_text(tr("Velocity response curve: <1 follows motion early, \
+                        1 linear, >1 holds longer then catches up (cinematic lag)."));
+            });
         });
         ui.add_space(6.0);
         ui.label(RichText::new(tr(
@@ -4534,6 +4589,8 @@ impl App {
                 crate::decoder::BUILTIN_OSMO_LUT_NAME.to_string()
             } else if s.lut_path == crate::decoder::BUILTIN_GPLOG_LUT_PATH {
                 crate::decoder::BUILTIN_GPLOG_LUT_NAME.to_string()
+            } else if s.lut_path == crate::decoder::BUILTIN_X6_LUT_PATH {
+                crate::decoder::BUILTIN_X6_LUT_NAME.to_string()
             } else {
                 std::path::Path::new(&s.lut_path)
                     .file_name().and_then(|f| f.to_str()).unwrap_or("(invalid)")
@@ -4570,6 +4627,14 @@ impl App {
             {
                 if ui.button(tr("Use built-in GoPro GP-Log→709")).clicked() {
                     s.lut_path = crate::decoder::BUILTIN_GPLOG_LUT_PATH.to_string();
+                    s.lut_intensity = 1.0;
+                }
+            }
+            Some(vr180_pipeline::SourceKind::Insta360Insv)
+                if s.lut_path != crate::decoder::BUILTIN_X6_LUT_PATH =>
+            {
+                if ui.button(tr("Use built-in Insta360 X6 I-Log→709")).clicked() {
+                    s.lut_path = crate::decoder::BUILTIN_X6_LUT_PATH.to_string();
                     s.lut_intensity = 1.0;
                 }
             }
@@ -4811,17 +4876,28 @@ impl App {
         // Stab sliders need the loaded quats — enabled only once ready.
         ui.add_enabled_ui(s.stabilize && quats_ready, |ui| {
             if is_osv || is_insv {
-                // smooth_ms = 0 → sharp camera-lock (legacy).
-                // smooth_ms > 0 → soft-stab (GoPro-style).
-                ui.add(egui::Slider::new(&mut s.dji_smooth_ms, 0.0..=3000.0)
-                    .text(tr("Smooth (ms)")));
-                ui.add(egui::Slider::new(&mut s.dji_max_corr_deg, 0.0..=45.0)
-                    .text(tr("Max corr (°)")));
+                // Camera lock owns the sharp frame-0 lock; the smoothing
+                // sliders are the soft-stab controls and gray out under it.
+                ui.checkbox(&mut s.dji_camera_lock, tr("Camera lock"))
+                    .on_hover_text(tr("Lock the view to the first frame; smoothing and max correction are ignored."));
+                let cam_lock = s.dji_camera_lock;
+                ui.add_enabled_ui(!cam_lock, |ui| {
+                    ui.add(egui::Slider::new(&mut s.dji_smooth_ms, 0.0..=3000.0)
+                        .text(tr("Smooth (ms)")));
+                });
+                // Under camera lock the cap is ignored (fully locked no matter
+                // what the camera does), so Max corr grays out with the rest.
+                ui.add_enabled_ui(!cam_lock, |ui| {
+                    ui.add(egui::Slider::new(&mut s.dji_max_corr_deg, 0.0..=45.0)
+                        .text(tr("Max corr (°)")));
+                });
                 // Velocity→smoothing response curve (Python "Response").
                 // <1 follows motion early; >1 holds longer, then catches up.
-                ui.add(egui::Slider::new(&mut s.dji_responsiveness, 0.2..=3.0)
-                    .fixed_decimals(1)
-                    .text(tr("Response")));
+                ui.add_enabled_ui(!cam_lock, |ui| {
+                    ui.add(egui::Slider::new(&mut s.dji_responsiveness, 0.2..=3.0)
+                        .fixed_decimals(1)
+                        .text(tr("Response")));
+                });
             }
         });
         if show_loading {

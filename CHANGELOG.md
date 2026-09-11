@@ -24,9 +24,22 @@
   (verified on 25 / 30 / 50 fps DJI clips, consistent with DJI Studio's
   output).
 - **Insta360 X6 (`.insv`)**: factory lens model, gyro stabilization
-  matched to Insta360 Studio's output, per-sensor exposure timing.
+  matched to Insta360 Studio's output, per-sensor exposure timing, and
+  Insta360's official X6 I-Log→Rec.709 LUT (v2, 65-point) bundled and
+  auto-applied like the DJI and GoPro ones.
 - **OSMO 360 II** support and **Auto align** stereo alignment; GoPro
   chapter-safe firmware-RS detection.
+- **Camera lock** is now an explicit toggle in every stabilization panel
+  (the GoPro `.360` panel gains one; OSV/INSV already had it). It locks the
+  view to the first frame and ignores the smoothing *and* max-correction
+  controls — fully locked no matter what the camera does. The old
+  "Smooth = 0 means lock" convention is gone; Smooth is now a pure
+  smoothing amount and grays out (with Max corr / Response) under the lock.
+
+### App / UX
+- Removing the currently loaded clip from the clip list now unloads it:
+  the app activates the next remaining clip, or returns to the empty
+  "no clip loaded" state when the list is emptied.
 
 ### Since 2.0.0
 - Seamless auto-update (2.1.0), `.360` lens calibration override, ProRes

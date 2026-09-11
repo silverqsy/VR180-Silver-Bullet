@@ -155,10 +155,16 @@ pub struct Settings {
     /// 1 = linear, > 1 = holds longer then catches up. Mirrors the
     /// OSV panel's Response slider.
     pub gyro_responsiveness: f32,
-    /// DJI OSV stabilization smoothing window. `0.0` = sharp
-    /// per-frame camera-lock (legacy default — bit-identical to the
-    /// pre-slider build). > 0 lowpasses the per-frame correction
-    /// quats over that window for a softer lock.
+    /// GoPro/`.360` camera-lock. `true` locks the view to the first
+    /// frame (sharp; counteracts the full camera rotation with
+    /// `max_corr` forced to 0; `smooth_ms`/`gyro_responsiveness`
+    /// ignored). `false` = soft-stab. Replaces the old
+    /// "`smooth_ms == 0` = camera-lock" convention (mirrors
+    /// `dji_camera_lock`).
+    pub camera_lock: bool,
+    /// DJI OSV/INSV soft-stab smoothing window (ms). Lowpasses the
+    /// per-frame correction quats over this window for a softer lock;
+    /// larger = smoother/laggier. Ignored when `dji_camera_lock` is on.
     pub dji_smooth_ms: f32,
     /// DJI OSV stabilization soft-cap on correction angle. `0.0` =
     /// no cap (legacy default — unlimited correction). > 0 caps the
@@ -167,8 +173,13 @@ pub struct Settings {
     /// Soft-stab velocity→smoothing response curve (Python "Response"
     /// slider, 0.2–3.0). < 1 = follows motion early (anticipatory),
     /// 1 = linear, > 1 = holds longer then catches up (cinematic lag).
-    /// Only used when `dji_smooth_ms > 0`.
+    /// Only used when soft-stab is active (`dji_camera_lock` off).
     pub dji_responsiveness: f32,
+    /// DJI/OSV/INSV camera-lock. `true` locks the view to the first
+    /// frame (sharp; `dji_smooth_ms` and `dji_responsiveness` ignored,
+    /// `dji_max_corr_deg` ignored too — fully locked). `false` = soft-stab. Replaces
+    /// the old "`dji_smooth_ms == 0` = camera-lock" convention.
+    pub dji_camera_lock: bool,
     /// Global pano-map adjustment angles (degrees). Shared between
     /// eyes. Applied as `R_view = R_y(yaw) · R_x(pitch) · R_z(roll)`
     /// composed AFTER stabilization. All-zero default = identity =
@@ -369,12 +380,14 @@ impl Default for Settings {
             smooth_ms: 1000.0,
             max_corr_deg: 15.0,
             gyro_responsiveness: 1.0,
+            camera_lock: false,
             sharpen_amount: 0.0,
             sharpen_radius: 1.5,
             denoise_strength: 0.0,
             dji_smooth_ms: 1200.0,
             dji_max_corr_deg: 15.0,
             dji_responsiveness: 1.0,
+            dji_camera_lock: false,
             pano_yaw_deg: 0.0,
             pano_pitch_deg: 0.0,
             pano_roll_deg: 0.0,
@@ -454,6 +467,18 @@ pub const BUILTIN_GPLOG_LUT_PATH: &str = "<builtin:gopro-gplog-rec709>";
 /// Friendly name shown in the LUT picker for the GoPro builtin.
 pub const BUILTIN_GPLOG_LUT_NAME: &str = "GoPro GP-Log→709 (built-in)";
 
+/// Insta360's official X6 "10-bit I-Log → Rec.709 / BT.1886" LUT
+/// (`X6_I-Log_to_Rec709_BT1886_s65_v2.cube`, version 2.0 of 2026-05-20,
+/// from the X6 I-Log LUT package on insta360.com/download/i-log), embedded
+/// — the 65-point grid Insta360 Studio itself renders with. Auto-applied
+/// to `.insv` clips like the DJI and GoPro builtins are to theirs.
+pub const BUILTIN_X6_LUT: &str =
+    include_str!("../assets/insta360_x6_ilog_to_rec709.cube");
+/// Sentinel `lut_path` value for the embedded Insta360 X6 I-Log LUT.
+pub const BUILTIN_X6_LUT_PATH: &str = "<builtin:insta360-x6-ilog-rec709>";
+/// Friendly name shown in the LUT picker for the Insta360 builtin.
+pub const BUILTIN_X6_LUT_NAME: &str = "Insta360 X6 I-Log→709 v2 (built-in)";
+
 thread_local! {
     /// Per-thread cache of the most-recently-loaded parsed LUT, keyed by
     /// `lut_path`. `build_color_stack` is called once per preview frame,
@@ -479,6 +504,11 @@ pub(crate) fn load_lut_cached(lut_path: &str) -> Option<vr180_core::Cube3DLut> {
             match vr180_core::Cube3DLut::from_str(BUILTIN_GPLOG_LUT) {
                 Ok(l) => Some(l),
                 Err(e) => { tracing::warn!("builtin GP-Log LUT parse failed: {e}"); None }
+            }
+        } else if lut_path == BUILTIN_X6_LUT_PATH {
+            match vr180_core::Cube3DLut::from_str(BUILTIN_X6_LUT) {
+                Ok(l) => Some(l),
+                Err(e) => { tracing::warn!("builtin Insta360 X6 I-Log LUT parse failed: {e}"); None }
             }
         } else {
             let p = std::path::Path::new(lut_path);
@@ -1672,19 +1702,18 @@ fn run_fisheye(
             }
             vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv => {
                 if let Some(osv) = dji_osv_imu {
-                    // Base mode is camera-lock (smooth_ms = 0 →
-                    // q_corr = q_actual.conjugate(), no cap → no
-                    // clamp). The OSV sliders ONLY activate when the
-                    // user moves them off 0 — at slider=0 the values
-                    // passed below are bit-identical to the legacy
-                    // hardcoded `f32::INFINITY` / `0.0`.
+                    // Camera lock (toggle on) → smooth_ms = 0 drives the
+                    // pipeline's sharp frame-0 lock. Soft-stab (toggle off)
+                    // uses the smoothing window, floored off 0 so it never
+                    // trips the lock sentinel. Under camera lock the cap is
+                    // ignored (∞): fully locked no matter what the camera does.
                     let s = control.settings.read();
-                    let max_corr_deg = if s.dji_max_corr_deg > 0.0 {
+                    let max_corr_deg = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock {
                         s.dji_max_corr_deg
                     } else {
                         f32::INFINITY
                     };
-                    let smooth_ms = s.dji_smooth_ms;
+                    let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
                     let responsiveness = s.dji_responsiveness;
                     drop(s);
                     match vr180_pipeline::dji_imu::compute_dji_stabilization(
@@ -2411,8 +2440,8 @@ fn run_fisheye_zerocopy(
                         control: &DecoderControl| -> Option<Vec<EquirectRotation>> {
         let osv = osv?;
         let s = control.settings.read();
-        let max_corr_deg = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
-        let smooth_ms = s.dji_smooth_ms;
+        let max_corr_deg = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock { s.dji_max_corr_deg } else { f32::INFINITY };
+        let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
         let responsiveness = s.dji_responsiveness;
         drop(s);
         match vr180_pipeline::dji_imu::compute_dji_stabilization(
@@ -2883,8 +2912,8 @@ fn run_fisheye_vt_zerocopy(
                         control: &DecoderControl| -> Option<Vec<EquirectRotation>> {
         let osv = osv?;
         let s = control.settings.read();
-        let max_corr_deg = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
-        let smooth_ms = s.dji_smooth_ms;
+        let max_corr_deg = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock { s.dji_max_corr_deg } else { f32::INFINITY };
+        let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
         let responsiveness = s.dji_responsiveness;
         drop(s);
         match vr180_pipeline::dji_imu::compute_dji_stabilization(
@@ -4782,6 +4811,7 @@ fn open_native_iter(
 /// stabilization only when these change (not on every calib/view tweak).
 fn stab_key(s: &Settings) -> u64 {
     let mut h: u64 = if s.stabilize { 1 } else { 0 };
+    h = h.wrapping_mul(0x100000001B3).wrapping_add(if s.dji_camera_lock { 1 } else { 0 });
     h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_smooth_ms.to_bits() as u64);
     h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_max_corr_deg.to_bits() as u64);
     h = h.wrapping_mul(0x100000001B3).wrapping_add(s.dji_responsiveness.to_bits() as u64);
@@ -4800,9 +4830,10 @@ fn compute_stab_for(
         .map(|p| (p.duration_sec * p.fps as f64).round() as usize).unwrap_or(0).max(1);
     match kind {
         vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv => imu.and_then(|osv| {
-            let max_corr = if s.dji_max_corr_deg > 0.0 { s.dji_max_corr_deg } else { f32::INFINITY };
+            let max_corr = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock { s.dji_max_corr_deg } else { f32::INFINITY };
+            let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
             vr180_pipeline::dji_imu::compute_dji_stabilization(
-                osv, total, max_corr, s.dji_smooth_ms, fps, s.dji_responsiveness)
+                osv, total, max_corr, smooth_ms, fps, s.dji_responsiveness)
                 .ok().map(|st| st.per_frame)
         }),
         vr180_pipeline::SourceKind::BlackmagicRaw =>
@@ -4962,7 +4993,7 @@ fn compose_sbs(
 /// (GPMF extract + 255k-sample VQF fusion + smoothing, ~0.3-1 s) when
 /// a settings change didn't touch stabilization — THE fix for sliders
 /// feeling laggy on `.360` vs OSV.
-pub(crate) type StabKey = (bool, CoriSource, u32, u32, u32, bool, RsMode, u32);
+pub(crate) type StabKey = (bool, CoriSource, u32, u32, u32, bool, bool, RsMode, u32);
 
 pub(crate) fn stab_settings_key(s: &Settings) -> StabKey {
     (
@@ -4971,6 +5002,7 @@ pub(crate) fn stab_settings_key(s: &Settings) -> StabKey {
         s.smooth_ms.to_bits(),
         s.max_corr_deg.to_bits(),
         s.gyro_responsiveness.to_bits(),
+        s.camera_lock,
         s.rs_correct,
         s.rs_mode,
         s.rs_readout_ms.to_bits(),
@@ -5130,7 +5162,7 @@ pub(crate) fn build_per_eye_frames_multi(
                     apply_gravity_alignment_inplace(&mut cori, gq.conjugate());
                 }
             }
-            // `smooth_ms = 0` → CAMERA LOCK, Python semantics
+            // Camera lock (the `camera_lock` toggle) → CAMERA LOCK, Python semantics
             // (`vr180_gui.py:4652-4654`): `q_heading = q_raw` — counteract
             // the FULL camera rotation, no clamp. Achieved by an identity
             // smoothed anchor + max_corr = 0. The old code anchored to
@@ -5138,18 +5170,18 @@ pub(crate) fn build_per_eye_frames_multi(
             // clip that rotates 56° the lock corrected at most ~35° — the
             // "camera lock still moves around" bug.
             //
-            // `smooth_ms > 0` → soft-stab (the legacy GoPro path):
+            // Soft-stab (camera_lock off, the legacy GoPro path):
             // anchor is a bidirectional-smoothed orientation, so
             // slow camera motion passes through and jitter is killed.
             // The elastic max-corr clamp applies here only (Python keeps
             // its soft-limit inside the smoother; same formula, same
             // (raw, smoothed) operands — final matrices match to 0.02°).
-            let camera_lock = s.smooth_ms <= 0.0;
+            let camera_lock = s.camera_lock;
             let smoothed = if camera_lock {
                 vec![Quat::IDENTITY; cori.len()]
             } else {
                 bidirectional_smooth(&cori, fps, &SmoothParams {
-                    smooth_ms: s.smooth_ms,
+                    smooth_ms: s.smooth_ms.max(1.0),
                     responsiveness: s.gyro_responsiveness.clamp(0.2, 3.0),
                     ..Default::default()
                 })
