@@ -2705,15 +2705,15 @@ fn run_fisheye_zerocopy(
         // rolling-shutter jello is uncorrected (the "broken" stab).
         let swapped_eyes = control.settings.read().effective_swap_eyes();
         let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if control.settings.read().stabilize {
-            dji_osv_imu.map(|osv| vr180_pipeline::dji_imu::per_eye_rs_rows(
+            dji_osv_imu.as_ref().map(|osv| vr180_pipeline::dji_imu::per_eye_rs_rows(
                 osv, stab_idx,
-                vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu) / 1000.0,
+                vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0,
                 src_h, fps, swapped_eyes,
             )).unwrap_or((None, None))
         } else {
             (None, None)
         };
-        let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(rot, dji_osv_imu, stab_idx, swapped_eyes);
+        let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes);
 
         let view_adjust = {
             let s = control.settings.read();
