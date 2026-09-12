@@ -8,7 +8,7 @@
   pan / tilt / roll, a **Defish** blend from rectilinear to a fisheye look,
   and a 1:1 or 16:9 per-eye frame. Stabilization, stereo offsets, per-row
   rolling-shutter correction and the lens override all still apply.
-  Available for DJI OSMO, Insta360 X6, Blackmagic and GoPro sources.
+  Available for DJI OSMO, Insta360 X6 and GoPro sources.
 - Drag the preview to pan, scroll or pinch to zoom, double-click to
   recenter. The preview renders from the native frame and a paused frame
   shows the native-resolution still.
@@ -40,6 +40,10 @@
 - Removing the currently loaded clip from the clip list now unloads it:
   the app activates the next remaining clip, or returns to the empty
   "no clip loaded" state when the list is emptied.
+- Export progress / ETA fixed: totals now honour each clip's trim (a
+  trimmed export used to stall short of 100% with an inflated ETA), and
+  the rate is measured from the first written frame instead of the run
+  start, so load / encoder start-up no longer counts as encode time.
 
 ### Since 2.0.0
 - Seamless auto-update (2.1.0), `.360` lens calibration override, ProRes

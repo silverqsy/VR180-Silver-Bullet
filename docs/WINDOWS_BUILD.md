@@ -40,7 +40,7 @@ git checkout 2.0
 |---|---|---|
 | **Rust** (1.79+, MSVC) | <https://rustup.rs/> → `rustup default stable` | Compiler. The MSVC toolchain is the default on Windows; install "Desktop development with C++" from the Visual Studio Build Tools when rustup prompts. |
 | **LLVM / libclang** (17+) | `winget install LLVM.LLVM` or the installer at <https://releases.llvm.org/> | `ffmpeg-sys-next` runs `bindgen`, which needs `libclang.dll`. |
-| **FFmpeg dev libs** (7.x) | a *dev* distribution with `.lib`s + headers + DLLs (see Step 2) | `ffmpeg-next = 8.1` links libav in-process. |
+| **FFmpeg dev libs** (**8.1+**) | a *dev* distribution with `.lib`s + headers + DLLs (see Step 2) | `ffmpeg-next = 8.1` links libav in-process. FFmpeg 8 is required: the GPU ProRes encoder `prores_ks_vulkan` only exists there. |
 
 After installing LLVM, point Rust's bindgen at it (PowerShell, current session):
 
@@ -50,7 +50,9 @@ $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
 
 ## Step 2 — FFmpeg dev distribution
 
-Get a **dev** build of FFmpeg 7.x (with `include\`, `lib\`, `bin\`). Good sources:
+Get a **dev** build of FFmpeg **8.1 or newer**, built with Vulkan + shaderc so it
+contains the `prores_ks_vulkan` GPU encoder (with `include\`, `lib\`, `bin\`).
+Good sources (use the *full* variants — they include Vulkan/shaderc):
 
 - <https://www.gyan.dev/ffmpeg/builds/> — the `ffmpeg-release-full-shared` / `dev` variant
 - <https://github.com/ShiftMediaProject/FFmpeg/releases>
@@ -59,7 +61,7 @@ Get a **dev** build of FFmpeg 7.x (with `include\`, `lib\`, `bin\`). Good source
 Extract somewhere stable and point the build at it:
 
 ```pwsh
-$env:FFMPEG_DIR = "C:\path\to\ffmpeg-7.x-dev"
+$env:FFMPEG_DIR = "C:\path\to\ffmpeg-8.x-dev"
 # Expected layout:
 #   %FFMPEG_DIR%\include\libavformat\avformat.h   (+ libavcodec, libavutil, libswscale)
 #   %FFMPEG_DIR%\lib\avformat.lib                 (+ the rest)
@@ -67,8 +69,19 @@ $env:FFMPEG_DIR = "C:\path\to\ffmpeg-7.x-dev"
 ```
 
 The version of FFmpeg must match the `ffmpeg-next = "8.1"` pin's expected
-ABI (FFmpeg 7.x). If you hit `avformat-XX.lib not found` or symbol
-mismatches, the dev build's major version is wrong.
+ABI (FFmpeg 8.x: `avcodec-62.dll`; a 7.x build ships `avcodec-61.dll`). If
+you hit `avformat-XX.lib not found` or symbol mismatches, the dev build's
+major version is wrong.
+
+**Verify the GPU ProRes encoder is present** before bundling — without it
+every ProRes export silently falls back to the CPU encoder:
+
+```pwsh
+& "$env:FFMPEG_DIR\bin\ffmpeg.exe" -hide_banner -encoders | Select-String prores_ks_vulkan
+```
+
+It must print a `prores_ks_vulkan` line. After a test export, `vr180-gui.log`
+(next to the exe) should say `prores_ks_vulkan ENGAGED`, not `unavailable`.
 
 ## Step 3 — Build the GUI
 

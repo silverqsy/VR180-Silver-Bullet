@@ -184,6 +184,10 @@ pub struct App {
     batch_run_indices: Vec<usize>,
     /// When the current run started (for elapsed + the completion summary).
     batch_started_at: Option<std::time::Instant>,
+    /// ETA rate anchor: (time of the run's first written frame, overall
+    /// done-frames at that moment). Rate = frames since / seconds since,
+    /// so load / decoder / encoder start-up never counts as encode time.
+    run_rate_anchor: Option<(std::time::Instant, u64)>,
     /// Last finished run's outcome, shown as a banner until dismissed/replaced.
     last_batch_summary: Option<BatchSummary>,
     /// Whether the export-bar's Format settings popover (a non-modal window)
@@ -959,6 +963,7 @@ impl App {
             batch_skip_flag: false,
             batch_run_indices: Vec::new(),
             batch_started_at: None,
+            run_rate_anchor: None,
             last_batch_summary: None,
             show_export_settings: false,
             lang: Self::load_lang(),
@@ -1048,6 +1053,7 @@ impl App {
         self.batch_opts = Some(self.export_opts);
         self.batch_run_indices = run_indices;
         self.batch_started_at = Some(std::time::Instant::now());
+        self.run_rate_anchor = None;
         self.last_batch_summary = None;
         self.batch_running = true;
         self.batch_skip_flag = false;
@@ -1096,51 +1102,74 @@ impl App {
         }
     }
 
-    /// Overall progress of the current run for the export bar:
-    /// `(done_frames, total_frames, eta_secs, item_position, item_total)`.
-    /// `None` when no run is in flight. ETA uses the run's observed
-    /// frames-per-second so far (so it self-corrects as slower NR clips and
-    /// faster plain clips complete), falling back to the live encode rate
-    /// before the first item finishes.
-    fn overall_run_progress(&self) -> Option<(u64, u64, Option<f64>, usize, usize)> {
+    /// Frames one run item contributes to the totals: its TRIMMED length
+    /// (every entry carries its own trim), or — for the item currently
+    /// exporting — the pipeline's authoritative trim-aware count. Using the
+    /// untrimmed clip length here was why a trimmed export's bar stalled
+    /// short of 100% and its ETA ran long.
+    fn run_item_frames(&self, i: usize, running: bool) -> u64 {
+        if running {
+            if let Some(p) = self.export_job.as_ref().and_then(|j| j.last_progress.as_ref()) {
+                if p.total_frames > 0 { return p.total_frames; }
+            }
+        }
+        self.batch.get(i).map(|b| {
+            let t_in = b.settings.trim_in_s.unwrap_or(0.0).max(0.0);
+            let t_out = b.settings.trim_out_s.unwrap_or(b.duration_sec).min(b.duration_sec);
+            ((t_out - t_in).max(0.0) * b.fps as f64).round().max(1.0) as u64
+        }).unwrap_or(1)
+    }
+
+    /// `(done_frames, total_frames, running_item_pos)` for the current run;
+    /// `None` when no run is in flight.
+    fn run_frame_tally(&self) -> Option<(u64, u64, usize)> {
         if !self.batch_running || self.batch_run_indices.is_empty() {
             return None;
         }
-        let item_frames = |i: usize| -> u64 {
-            self.batch.get(i)
-                .map(|b| (b.duration_sec * b.fps as f64).round().max(1.0) as u64)
-                .unwrap_or(1)
-        };
-        let total_frames: u64 = self.batch_run_indices.iter().map(|&i| item_frames(i)).sum();
-        let mut done_frames: u64 = 0;
-        let mut item_pos = 0usize;
+        let (mut done, mut total, mut item_pos) = (0u64, 0u64, 0usize);
         for (pos, &i) in self.batch_run_indices.iter().enumerate() {
-            match self.batch.get(i).map(|b| &b.status) {
+            let status = self.batch.get(i).map(|b| &b.status);
+            let running = matches!(status, Some(BatchStatus::Running));
+            let frames = self.run_item_frames(i, running);
+            total += frames;
+            match status {
                 Some(BatchStatus::Done | BatchStatus::Failed(_) | BatchStatus::Skipped) => {
-                    done_frames += item_frames(i);
+                    done += frames;
                 }
                 Some(BatchStatus::Running) => {
                     item_pos = pos;
                     if let Some(p) = self.export_job.as_ref().and_then(|j| j.last_progress.as_ref()) {
-                        done_frames += p.frame_idx.min(item_frames(i));
+                        done += p.frame_idx.min(frames);
                     }
                 }
                 _ => {}
             }
         }
+        Some((done, total, item_pos))
+    }
+
+    /// Overall progress of the current run for the export bar:
+    /// `(done_frames, total_frames, eta_secs, item_position, item_total)`.
+    /// `None` when no run is in flight. The ETA rate is measured from the
+    /// run's first written frame (see `run_rate_anchor`) across items, so
+    /// slow-NR and fast plain clips self-correct and start-up time is never
+    /// mistaken for encode time; before that anchor exists it falls back to
+    /// the live encode rate.
+    fn overall_run_progress(&self) -> Option<(u64, u64, Option<f64>, usize, usize)> {
+        let (done_frames, total_frames, item_pos) = self.run_frame_tally()?;
         let remaining = total_frames.saturating_sub(done_frames);
-        let eta = if done_frames > 0 {
-            self.batch_started_at.map(|t| {
-                let spf = t.elapsed().as_secs_f64() / done_frames as f64;
-                remaining as f64 * spf
-            })
-        } else {
+        let anchored = self.run_rate_anchor.and_then(|(t0, d0)| {
+            let secs = t0.elapsed().as_secs_f64();
+            (done_frames > d0 && secs > 0.5)
+                .then(|| remaining as f64 * secs / (done_frames - d0) as f64)
+        });
+        let eta = anchored.or_else(|| {
             self.export_job.as_ref()
                 .and_then(|j| j.last_progress.as_ref())
                 .map(|p| p.fps_avg)
                 .filter(|f| *f > 0.1)
                 .map(|f| remaining as f64 / f as f64)
-        };
+        });
         Some((done_frames, total_frames, eta, item_pos + 1, self.batch_run_indices.len()))
     }
 
@@ -1626,6 +1655,15 @@ impl App {
         while let Ok(p) = job.progress_rx.try_recv() {
             job.last_progress = Some(p);
         }
+        let has_frames = job.last_progress.as_ref().map_or(false, |p| p.frame_idx > 0);
+        // The run's first written frame anchors the ETA rate: everything
+        // before it (IMU load, decoder/encoder init, ProRes Vulkan warm-up)
+        // is start-up, not encode throughput.
+        if has_frames && self.run_rate_anchor.is_none() {
+            let done = self.run_frame_tally().map(|t| t.0).unwrap_or(0);
+            self.run_rate_anchor = Some((std::time::Instant::now(), done));
+        }
+        let Some(job) = self.export_job.as_mut() else { return; };
         // Check completion. JoinHandle::is_finished is stable in 1.61+.
         if job.handle.is_finished() {
             let job = self.export_job.take().unwrap();
