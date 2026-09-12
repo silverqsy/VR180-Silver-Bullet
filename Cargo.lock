@@ -4054,6 +4054,7 @@ dependencies = [
  "image",
  "minisign-verify",
  "parking_lot",
+ "pollster 0.4.0",
  "rfd",
  "serde",
  "serde_json",

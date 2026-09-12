@@ -102,11 +102,36 @@ fn main() -> anyhow::Result<()> {
         // `WgpuSetupCreateNew` has no `Default`, so start from the default
         // config and override only the device descriptor — we request
         // TEXTURE_FORMAT_16BIT_NORM (needed for the R16/Rg16 16-bit color
-        // stack). Backend left default (Vulkan on Windows); forcing DX12
-        // caused DXGI_ERROR_DEVICE_REMOVED with D3D11VA decode + wgpu-D3D12.
+        // stack). (Forcing DX12 caused DXGI_ERROR_DEVICE_REMOVED with
+        // D3D11VA decode + wgpu-D3D12 — the DX12 fallback below is only for
+        // boxes with no Vulkan ICD at all.)
+        //
+        // Windows: PREFER the Vulkan backend explicitly. Every GPU fast
+        // path (D3D11→Vulkan zero-copy import, GPU-resident NVENC, the
+        // 4:2:2 ProRes feed) gates on `is_vulkan_backend`; wgpu's default
+        // PRIMARY selection usually lands on Vulkan but is not guaranteed,
+        // and a silent DX12 pick would disable all of them (CPU-speed
+        // exports with no visible reason). Probe synchronously and only
+        // restrict the instance when a Vulkan adapter actually exists, so
+        // a Vulkan-less machine still starts on DX12.
         wgpu_options: {
             let mut cfg = egui_wgpu::WgpuConfiguration::default();
             if let egui_wgpu::WgpuSetup::CreateNew(create) = &mut cfg.wgpu_setup {
+                #[cfg(target_os = "windows")]
+                if std::env::var_os("WGPU_BACKEND").is_none() { // env override wins
+                    let probe = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                        backends: wgpu::Backends::VULKAN,
+                        ..wgpu::InstanceDescriptor::new_without_display_handle()
+                    });
+                    if pollster::block_on(probe.enumerate_adapters(wgpu::Backends::VULKAN)).is_empty() {
+                        tracing::warn!(
+                            "no Vulkan adapter — falling back to wgpu's default \
+                             backend pick; GPU fast export paths will be disabled"
+                        );
+                    } else {
+                        create.instance_descriptor.backends = wgpu::Backends::VULKAN;
+                    }
+                }
                 create.device_descriptor = std::sync::Arc::new(|adapter: &wgpu::Adapter| {
                     // TEXTURE_FORMAT_16BIT_NORM: R16/Rg16 color stack.
                     // TEXTURE_FORMAT_P010 / _NV12: zero-copy import of

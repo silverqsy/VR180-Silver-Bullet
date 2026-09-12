@@ -474,6 +474,29 @@ impl Device {
     }
 
     async fn new_async() -> Result<Self> {
+        // Windows: prefer Vulkan — the D3D11 zero-copy import and every
+        // GPU-resident export arm gate on `is_vulkan_backend`, and PRIMARY
+        // lets wgpu pick DX12, which silently disables them all. Fall back
+        // to the default selection only when no Vulkan adapter exists.
+        #[cfg(target_os = "windows")]
+        let instance = {
+            let vk = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            if vk.enumerate_adapters(wgpu::Backends::VULKAN).await.is_empty() {
+                tracing::warn!(
+                    "no Vulkan adapter — using wgpu's default backend pick \
+                     (GPU fast export paths will be disabled)");
+                wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::PRIMARY,
+                    ..wgpu::InstanceDescriptor::new_without_display_handle()
+                })
+            } else {
+                vk
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..wgpu::InstanceDescriptor::new_without_display_handle()

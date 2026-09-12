@@ -1,7 +1,7 @@
-[package]
+﻿[package]
 name = "vr180-gui"
 version = "2.5.0"
-description = "VR180 Silver Bullet 2.0 — egui+wgpu native GUI"
+description = "VR180 Silver Bullet 2.0 鈥?egui+wgpu native GUI"
 edition = "2021"
 publish = false
 
@@ -10,16 +10,17 @@ name = "vr180-gui"
 path = "src/main.rs"
 
 [dependencies]
-# eframe 0.34 ships with wgpu 29 — same major as our workspace
+# eframe 0.34 ships with wgpu 29 鈥?same major as our workspace
 # `wgpu = "29"` pin. Matching versions is non-negotiable: sharing
 # `wgpu::Texture` between our pipeline and eframe-wgpu's renderer
 # requires that both sides instantiate the same wgpu type layout.
 # Modernized from 0.28/wgpu 0.20 to unlock GPU-texture interop
-# (create_texture_from_hal) for zero-copy decode — Gyroflow blueprint.
+# (create_texture_from_hal) for zero-copy decode 鈥?Gyroflow blueprint.
 eframe = { version = "0.34", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
 egui = "0.34"
 egui-wgpu = "0.34"
 wgpu = { workspace = true }
+pollster = { workspace = true }
 
 # Native file picker.
 rfd = "0.14"
@@ -33,7 +34,7 @@ image = { version = "0.25", default-features = false, features = ["ico"] }
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 
-# Auto-update: blocking HTTPS on a plain std::thread (no async runtime —
+# Auto-update: blocking HTTPS on a plain std::thread (no async runtime 鈥?
 # matches the app's thread+channel architecture; reqwest would drag in
 # tokio) + minisign verification of downloaded artifacts against the
 # pubkey baked into updater.rs.
@@ -64,6 +65,6 @@ vr180-fisheye = { workspace = true }
 vr180-braw = { workspace = true }
 
 # Embed the app icon into the Windows .exe as a Win32 resource (see build.rs).
-# Windows host only — macOS uses the .icns app bundle and never builds this.
+# Windows host only 鈥?macOS uses the .icns app bundle and never builds this.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
