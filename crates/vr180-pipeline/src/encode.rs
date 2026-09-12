@@ -477,8 +477,14 @@ impl H265Encoder {
                         "ProRes: GPU (Vulkan) encoder prores_ks_vulkan ENGAGED \
                          ({w}x{h}, hwframe upload feed)");
                 }
-                Err(e) => tracing::info!(
-                    "ProRes: prores_ks_vulkan unavailable ({e}) — CPU prores_ks"),
+                Err(e) => {
+                    // Users shouldn't need the log to know why ProRes is
+                    // slow — warn AND surface it in the export bar.
+                    tracing::warn!(
+                        "ProRes: prores_ks_vulkan unavailable ({e}) — CPU prores_ks");
+                    crate::fisheye_export::append_export_path_note(
+                        "ProRes GPU encoder unavailable — CPU ProRes encode");
+                }
             }
         }
         let codec = ffmpeg::codec::encoder::find_by_name(codec_name)

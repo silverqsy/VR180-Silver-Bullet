@@ -205,6 +205,38 @@ pub struct ExportProgress {
     pub fps_avg: f32,
 }
 
+/// Short human-readable reason the running export is NOT on the fastest
+/// path (portable CPU loop, or a CPU encoder fallback) — for the GUI's
+/// export bar, so users don't need the log to know why an export is slow.
+/// Cleared at the start of every export; set by whichever route lands.
+/// One export runs at a time (the batch queue is serial), so a single
+/// process-wide slot is enough.
+static EXPORT_PATH_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn set_export_path_note(note: Option<String>) {
+    if let Some(n) = &note {
+        tracing::warn!("export path note: {n}");
+    }
+    *EXPORT_PATH_NOTE.lock().unwrap() = note;
+}
+
+/// Append `part` to the current note (or start one) — used by a later
+/// stage (e.g. the ProRes encoder falling back to CPU) so it doesn't
+/// erase the reason an earlier stage already recorded.
+pub fn append_export_path_note(part: &str) {
+    let mut slot = EXPORT_PATH_NOTE.lock().unwrap();
+    let combined = match slot.take() {
+        Some(prev) => format!("{prev} · {part}"),
+        None => part.to_string(),
+    };
+    tracing::warn!("export path note: {combined}");
+    *slot = Some(combined);
+}
+
+pub fn export_path_note() -> Option<String> {
+    EXPORT_PATH_NOTE.lock().unwrap().clone()
+}
+
 /// Available bytes on the filesystem holding `dir`, via `df -kP`
 /// (POSIX one-line-per-fs output). Best-effort — `None` on any failure.
 fn fs_avail_bytes(dir: &std::path::Path) -> Option<u64> {
@@ -620,6 +652,7 @@ pub fn export_fisheye(
     progress_cb: impl FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
+    set_export_path_note(None); // fresh export — no slow-path note yet
     // A reframed view is not VR180 — never tag it as one.
     if cfg.projection.is_reframe() {
         cfg.inject_apmp = false;
@@ -801,8 +834,25 @@ fn export_fisheye_inner(
                          d3d11va_iter_ok={}) — falling back to CPU readback path",
                         c.is_some(), i.is_ok()
                     );
+                    set_export_path_note(Some(
+                        "CPU export path — GPU decode init failed".into()));
                 }
             }
+        } else if std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none() {
+            // Landed on the portable serial loop — say WHY (the user-visible
+            // symptom is just "export is slow with the GPU idle").
+            let reason = if !cfg.source_kind.is_dual_stream() {
+                "no GPU fast path for this source type"
+            } else if !crate::interop_windows::is_vulkan_backend(&pipeline.device) {
+                "DX12 backend (Vulkan unavailable)"
+            } else if !pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010) {
+                "GPU lacks P010 support"
+            } else if cfg.denoise_strength > 0.0 {
+                "noise reduction is CPU-only"
+            } else {
+                "encoder/bit-depth not GPU-path capable"
+            };
+            set_export_path_note(Some(format!("CPU export path — {reason}")));
         }
     }
 
@@ -1390,6 +1440,7 @@ pub fn export_eac(
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let mut cfg = cfg;
+    set_export_path_note(None); // fresh export — no slow-path note yet
     // A reframed view is not VR180 — never tag it as one.
     if cfg.projection.is_reframe() {
         cfg.inject_apmp = false;
@@ -1441,20 +1492,28 @@ fn export_eac_inner(
         }
     }
 
-    // ── Fast path: GPU-resident EAC → CUDA → NVENC (Windows, default) ────
+    // ── Fast path: GPU-resident EAC decode/project (Windows, default) ────
     // The GoPro `.360` analog of the OSV GPU-resident path: NVDEC decodes
     // both EAC HEVC streams, D3D11 converts each P010→RGBA16, wgpu assembles
-    // the two lens crosses + projects + colors + composes P010, and the frame
-    // is fed to NVENC over CUDA — no CPU readback, no swscale, no CPU
-    // `assemble_lens_*`. Same gate shape + safe fallback as the OSV path:
-    // NVENC + 10-bit + either projection + single-segment + Vulkan + P010 +
-    // no denoise; ANY failure falls through to the portable path below.
+    // the two lens crosses + projects + colors + composes — no CPU readback
+    // of source frames, no swscale, no CPU `assemble_lens_*`. Encode tail by
+    // backend (same split as the OSV arms): NVENC gets the composed P010 over
+    // CUDA (fully GPU-resident); ProRes gets a GPU 4:2:2 (P210) compose read
+    // back and fed to `prores_ks_vulkan` (CPU `prores_ks` fallback); libx265
+    // rides the RGBA64 readback feed. Gate: 10-bit for NVENC (its P010
+    // frame), any supported depth otherwise + either projection + Vulkan +
+    // P010 + no denoise; ANY failure falls through to the portable path.
     #[cfg(target_os = "windows")]
     {
+        let encoder_ok = match cfg.encoder {
+            EncoderBackend::HevcNvenc => cfg.bit_depth == 10,
+            EncoderBackend::ProResKs => true,
+            EncoderBackend::Libx265 => matches!(cfg.bit_depth, 8 | 10),
+            _ => false,
+        };
         let try_gpu_resident = std::env::var_os("VR180_NO_GPU_RESIDENT").is_none()
             && std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
-            && matches!(cfg.encoder, EncoderBackend::HevcNvenc)
-            && cfg.bit_depth == 10
+            && encoder_ok
             && matches!(cfg.projection, FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Fisheye | FisheyeExportProjection::Reframe { .. })
             && crate::interop_windows::is_vulkan_backend(&pipeline.device)
             && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010)
@@ -1468,24 +1527,51 @@ fn export_eac_inner(
             let iter = crate::fisheye_decode::SegmentedD3d11SharedStreamPairIter::new(&cfg.segments);
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
-                    tracing::info!("export_eac: GPU-RESIDENT NVENC(CUDA) path ENGAGED");
+                    if matches!(cfg.encoder, EncoderBackend::HevcNvenc) {
+                        tracing::info!("export_eac: GPU-RESIDENT NVENC(CUDA) path ENGAGED");
+                    } else {
+                        tracing::info!(
+                            "export_eac: GPU-RESIDENT decode/project path ENGAGED \
+                             ({:?} encode tail via readback feed)", cfg.encoder);
+                    }
                     match export_eac_gpu_resident(
                         Arc::clone(&pipeline), cfg.clone(), per_eye.clone(),
                         (lens_l, lens_r),
                         ctx, iter, &mut progress_cb, Arc::clone(&cancel),
                     ) {
                         Ok(()) => return Ok(()),
-                        Err(e) => tracing::warn!(
-                            "export_eac: GPU-resident path failed ({e}) — \
-                             falling back to the portable path"
-                        ),
+                        Err(e) => {
+                            tracing::warn!(
+                                "export_eac: GPU-resident path failed ({e}) — \
+                                 falling back to the portable path");
+                            set_export_path_note(Some(
+                                "CPU export path — GPU path failed mid-init".into()));
+                        }
                     }
                 }
-                (c, i) => tracing::warn!(
-                    "export_eac: GPU-resident unavailable (vulkan_ctx={}, iter_ok={}) — \
-                     falling through to portable path", c.is_some(), i.is_ok()
-                ),
+                (c, i) => {
+                    tracing::warn!(
+                        "export_eac: GPU-resident unavailable (vulkan_ctx={}, iter_ok={}) — \
+                         falling through to portable path", c.is_some(), i.is_ok());
+                    set_export_path_note(Some(
+                        "CPU export path — GPU decode init failed".into()));
+                }
             }
+        } else if std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
+            && std::env::var_os("VR180_NO_GPU_RESIDENT").is_none()
+        {
+            // Say WHY the fast arm was skipped (the user-visible symptom is
+            // just "export is slow with the GPU idle").
+            let reason = if !crate::interop_windows::is_vulkan_backend(&pipeline.device) {
+                "DX12 backend (Vulkan unavailable)"
+            } else if !pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010) {
+                "GPU lacks P010 support"
+            } else if !encoder_ok {
+                "encoder/bit-depth not GPU-path capable"
+            } else {
+                "noise reduction is CPU-only"
+            };
+            set_export_path_note(Some(format!("CPU export path — {reason}")));
         }
     }
 
@@ -1858,10 +1944,18 @@ fn export_eac_gpu_resident(
     use crate::gpu::Lens;
     use crate::fisheye_decode::SharedEacPair;
 
+    // NVENC keeps the fully GPU-resident CUDA handoff; ProRes / libx265
+    // take the readback encode tail (same split as the OSV arms) — the
+    // decode/assemble/project/color front end is identical either way.
+    let nvenc_tail = matches!(cfg.encoder, EncoderBackend::HevcNvenc);
+
     // Bind the device-0 primary CUDA context to THIS thread; ffmpeg's CUDA
-    // hwdevice + our external-memory imports both share it.
-    let _cuda = cudarc::driver::CudaDevice::new(0)
-        .map_err(|e| Error::Ffmpeg(format!("cuda primary ctx: {e:?}")))?;
+    // hwdevice + our external-memory imports both share it. NVENC tail only —
+    // the readback tail never touches CUDA.
+    let _cuda = if nvenc_tail {
+        Some(cudarc::driver::CudaDevice::new(0)
+            .map_err(|e| Error::Ffmpeg(format!("cuda primary ctx: {e:?}")))?)
+    } else { None };
 
     let dims = iter.dims();
     let (nw, nh) = iter.native_dims();
@@ -1869,8 +1963,10 @@ fn export_eac_gpu_resident(
     let sbs_h = cfg.eye_h;
     let fisheye_out = matches!(cfg.projection, FisheyeExportProjection::Fisheye);
     tracing::info!(
-        "export_eac (GPU-resident): EAC native {}x{} (cross_w={}) → {}x{} SBS → NVENC(CUDA), proj={:?}",
-        nw, nh, dims.cross_w(), sbs_w, sbs_h, cfg.projection
+        "export_eac (GPU-resident): EAC native {}x{} (cross_w={}) → {}x{} SBS → {}, proj={:?}",
+        nw, nh, dims.cross_w(), sbs_w, sbs_h,
+        if nvenc_tail { "NVENC(CUDA)".to_string() } else { format!("{:?} (readback feed)", cfg.encoder) },
+        cfg.projection
     );
 
     let dt = 1.0 / cfg.fps as f64;
@@ -1887,30 +1983,116 @@ fn export_eac_gpu_resident(
     if t_in > 0.001 { iter.seek(t_in)?; }
 
     let video_tmp = video_only_temp_path(&cfg.output_path);
-    // Ring of shared P010 frames — main composes frame N+k while the encode
-    // thread feeds NVENC frame N. (Identical pacing to the OSV path.)
-    const RING: usize = 4;
-    let ring: Vec<SharedP010Frame> = (0..RING)
-        .map(|_| SharedP010Frame::new(&ctx, &pipeline.device, sbs_w, sbs_h))
-        .collect::<Result<Vec<_>>>()?;
-    tracing::info!("export_eac (GPU-resident): {RING}-slot shared P010 ring ready");
 
+    // ── Encode tail, by backend (mirrors the OSV arms) ────────────────
+    // NVENC: ring of CUDA-shared P010 frames — main composes frame N+k
+    // while the encode thread feeds NVENC frame N.
+    // ProRes / libx265: the encode thread owns an `H265Encoder` and reports
+    // its native input over a format handshake; the main thread composes
+    // P010 / P210 / RGBA64 on the GPU and reads the planes back. ProRes
+    // itself encodes on FFmpeg's Vulkan device when `prores_ks_vulkan` is
+    // available (CPU `prores_ks` fallback inside the encoder open).
     struct EncMsg { y_ptr: u64, y_pitch: usize, uv_ptr: u64, uv_pitch: usize }
-    let (enc_tx, enc_rx) = std::sync::mpsc::sync_channel::<EncMsg>(RING - 2);
-    let (efps, ebr, etmp) = (cfg.fps, cfg.bitrate_kbps, video_tmp.clone());
-    let encode_handle = std::thread::spawn(move || -> Result<u64> {
-        let _cuda = cudarc::driver::CudaDevice::new(0)
-            .map_err(|e| Error::Ffmpeg(format!("encode-thread cuda ctx: {e:?}")))?;
-        let mut encoder = CudaNvencEncoder::new(&etmp, sbs_w, sbs_h, efps, ebr)?;
-        let mut n: u64 = 0;
-        while let Ok(m) = enc_rx.recv() {
-            unsafe { encoder.encode_cuda_planes(m.y_ptr, m.y_pitch, m.uv_ptr, m.uv_pitch)?; }
-            n += 1;
+    enum EncFrame {
+        P010 { y: Vec<u8>, uv: Vec<u8> },
+        Yuv422 { y: Vec<u8>, uv: Vec<u8> },
+        Rgba64(Vec<u8>),
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum ZcFeed { P010, Yuv422P10, Rgba64 }
+    enum Tail {
+        Nvenc {
+            ring: Vec<SharedP010Frame>,
+            enc_tx: std::sync::mpsc::SyncSender<EncMsg>,
+            handle: std::thread::JoinHandle<Result<u64>>,
+        },
+        Readback {
+            feed: ZcFeed,
+            frame_tx: std::sync::mpsc::SyncSender<EncFrame>,
+            handle: std::thread::JoinHandle<Result<u64>>,
+        },
+    }
+    const RING: usize = 4;
+    let tail = if nvenc_tail {
+        let ring: Vec<SharedP010Frame> = (0..RING)
+            .map(|_| SharedP010Frame::new(&ctx, &pipeline.device, sbs_w, sbs_h))
+            .collect::<Result<Vec<_>>>()?;
+        tracing::info!("export_eac (GPU-resident): {RING}-slot shared P010 ring ready");
+        let (enc_tx, enc_rx) = std::sync::mpsc::sync_channel::<EncMsg>(RING - 2);
+        let (efps, ebr, etmp) = (cfg.fps, cfg.bitrate_kbps, video_tmp.clone());
+        let handle = std::thread::spawn(move || -> Result<u64> {
+            let _cuda = cudarc::driver::CudaDevice::new(0)
+                .map_err(|e| Error::Ffmpeg(format!("encode-thread cuda ctx: {e:?}")))?;
+            let mut encoder = CudaNvencEncoder::new(&etmp, sbs_w, sbs_h, efps, ebr)?;
+            let mut n: u64 = 0;
+            while let Ok(m) = enc_rx.recv() {
+                unsafe { encoder.encode_cuda_planes(m.y_ptr, m.y_pitch, m.uv_ptr, m.uv_pitch)?; }
+                n += 1;
+            }
+            encoder.finish()?;
+            Ok(n)
+        });
+        tracing::info!("export_eac (GPU-resident): NVENC(CUDA) encode thread up");
+        Tail::Nvenc { ring, enc_tx, handle }
+    } else {
+        // ProRes: warm the process-wide FFmpeg Vulkan device NOW, before the
+        // decode/GPU threads load the driver — a cold device create
+        // mid-export measured 21–63 s (vs ~0.2 s quiescent). No-op after the
+        // first export.
+        if cfg.encoder == EncoderBackend::ProResKs
+            && std::env::var_os("VR180_NO_PRORES_VULKAN").is_none()
+        {
+            let t0 = std::time::Instant::now();
+            let ok = crate::encode::warm_prores_vulkan();
+            tracing::info!(
+                "export_eac (GPU-resident): prores_ks_vulkan warm = {ok} ({:?})",
+                t0.elapsed());
         }
-        encoder.finish()?;
-        Ok(n)
-    });
-    tracing::info!("export_eac (GPU-resident): NVENC(CUDA) encode thread up");
+        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<EncFrame>(2);
+        let (fmt_tx, fmt_rx) = std::sync::mpsc::sync_channel::<ZcFeed>(1);
+        let enc_video_tmp = video_tmp.clone();
+        let (enc_backend, enc_fps, enc_bitrate, enc_bd, enc_prores) =
+            (cfg.encoder, cfg.fps, cfg.bitrate_kbps, cfg.bit_depth, cfg.prores_profile);
+        let handle = std::thread::spawn(move || -> Result<u64> {
+            let mut encoder = open_h265_encoder(
+                &enc_video_tmp, sbs_w, sbs_h, enc_fps, enc_bitrate,
+                enc_backend, enc_bd, enc_prores,
+            )?;
+            // Report the encoder's native input so the main thread produces
+            // the matching layout. On create-failure we never send → main's
+            // recv errs and the pipeline winds down; the error surfaces at
+            // the join.
+            let _ = fmt_tx.send(if encoder.wants_p010() {
+                ZcFeed::P010
+            } else if encoder.wants_yuv422p10() {
+                ZcFeed::Yuv422P10
+            } else {
+                ZcFeed::Rgba64
+            });
+            let mut n: u64 = 0;
+            while let Ok(f) = frame_rx.recv() {
+                match f {
+                    EncFrame::P010   { y, uv } => encoder.encode_frame_p010(&y, &uv)?,
+                    EncFrame::Yuv422 { y, uv } => encoder.encode_frame_yuv422p10_msb(&y, &uv)?,
+                    EncFrame::Rgba64(b)        => encoder.encode_frame_rgba64(&b)?,
+                }
+                n += 1;
+            }
+            encoder.finish()?;
+            Ok(n)
+        });
+        // Block until the encoder is open and reports its input format.
+        let feed = fmt_rx.recv().unwrap_or(ZcFeed::Rgba64);
+        tracing::info!(
+            "export_eac (GPU-resident): encode input = {}",
+            match feed {
+                ZcFeed::P010 => "P010 (GPU compose, no swscale)",
+                ZcFeed::Yuv422P10 => "P210→yuv422p10 (GPU 4:2:2 compose → ProRes, no swscale)",
+                ZcFeed::Rgba64 => "RGBA64 (swscale)",
+            }
+        );
+        Tail::Readback { feed, frame_tx, handle }
+    };
 
     let color_plan = cfg.color_stack.clone();
     let view = cfg.view_adjust;
@@ -1978,33 +2160,77 @@ fn export_eac_gpu_resident(
         let l_final = left_g.as_ref().unwrap_or(&left16);
         let r_final = right_g.as_ref().unwrap_or(&right16);
 
-        // Compose video-range Rec.709 P010 plane textures (AVCOL_RANGE_MPEG —
-        // the distribution standard, consistent with the portable path), then
-        // copy into this ring slot's CUDA-shared linear images.
-        let sh = &ring[written as usize % RING];
-        let (y_opt, uv_opt) = pipeline.compose_sbs_to_p010_textures(l_final, r_final, cfg.eye_w, cfg.eye_h, false)?;
-        {
-            let mut enc = pipeline.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("gpu_resident_eac_copy_to_shared"),
-            });
-            let copy = |enc: &mut wgpu::CommandEncoder, src: &wgpu::Texture, dst: &wgpu::Texture, w: u32, h: u32| {
-                enc.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo { texture: src, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                    wgpu::TexelCopyTextureInfo { texture: dst, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                );
-            };
-            copy(&mut enc, &y_opt, sh.y_texture(), sbs_w, sbs_h);
-            copy(&mut enc, &uv_opt, sh.uv_texture(), sbs_w / 2, sbs_h / 2);
-            pipeline.queue.submit(Some(enc.finish()));
-        }
-        let _ = pipeline.device.poll(wgpu::PollType::wait_indefinitely());
+        match &tail {
+            Tail::Nvenc { ring, enc_tx, .. } => {
+                // Compose video-range Rec.709 P010 plane textures
+                // (AVCOL_RANGE_MPEG — the distribution standard, consistent
+                // with the portable path), then copy into this ring slot's
+                // CUDA-shared linear images.
+                let sh = &ring[written as usize % RING];
+                let (y_opt, uv_opt) = pipeline.compose_sbs_to_p010_textures(l_final, r_final, cfg.eye_w, cfg.eye_h, false)?;
+                {
+                    let mut enc = pipeline.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("gpu_resident_eac_copy_to_shared"),
+                    });
+                    let copy = |enc: &mut wgpu::CommandEncoder, src: &wgpu::Texture, dst: &wgpu::Texture, w: u32, h: u32| {
+                        enc.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo { texture: src, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                            wgpu::TexelCopyTextureInfo { texture: dst, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                        );
+                    };
+                    copy(&mut enc, &y_opt, sh.y_texture(), sbs_w, sbs_h);
+                    copy(&mut enc, &uv_opt, sh.uv_texture(), sbs_w / 2, sbs_h / 2);
+                    pipeline.queue.submit(Some(enc.finish()));
+                }
+                let _ = pipeline.device.poll(wgpu::PollType::wait_indefinitely());
 
-        // Hand the (Copy) CUDA plane pointers to the encode thread.
-        let (y_ptr, y_pitch) = sh.y_cuda();
-        let (uv_ptr, uv_pitch) = sh.uv_cuda();
-        if enc_tx.send(EncMsg { y_ptr, y_pitch, uv_ptr, uv_pitch }).is_err() {
-            break; // encode thread died — surfaced at join
+                // Hand the (Copy) CUDA plane pointers to the encode thread.
+                let (y_ptr, y_pitch) = sh.y_cuda();
+                let (uv_ptr, uv_pitch) = sh.uv_cuda();
+                if enc_tx.send(EncMsg { y_ptr, y_pitch, uv_ptr, uv_pitch }).is_err() {
+                    break; // encode thread died — surfaced at join
+                }
+            }
+            Tail::Readback { feed, frame_tx, .. } => {
+                // GPU compose in the encoder's native layout, read the
+                // planes back, hand them to the encode thread (which
+                // overlaps its ProRes/x265 work with the next frame's
+                // decode + GPU stage). Same feeds as the OSV zc arm.
+                let frame = match feed {
+                    ZcFeed::P010 => {
+                        let (y_tex, uv_tex) = pipeline.compose_sbs_to_p010_textures(
+                            l_final, r_final, cfg.eye_w, cfg.eye_h, false,
+                        )?;
+                        let y = pipeline.read_texture_planar(&y_tex, sbs_w, sbs_h, 2)?;
+                        let uv = pipeline.read_texture_planar(&uv_tex, sbs_w / 2, sbs_h / 2, 4)?;
+                        EncFrame::P010 { y, uv }
+                    }
+                    ZcFeed::Yuv422P10 => {
+                        // ProRes: GPU does RGB→YUV 4:2:2 (P210 planes, full
+                        // vertical chroma, video-range); the encode thread
+                        // deinterleaves + LSB-aligns into yuv422p10le. No
+                        // CPU RGB→YUV swscale at all.
+                        let (y_tex, uv_tex) = pipeline.compose_sbs_to_p210_textures(
+                            l_final, r_final, cfg.eye_w, cfg.eye_h, false,
+                        )?;
+                        let y = pipeline.read_texture_planar(&y_tex, sbs_w, sbs_h, 2)?;
+                        let uv = pipeline.read_texture_planar(&uv_tex, sbs_w / 2, sbs_h, 4)?;
+                        EncFrame::Yuv422 { y, uv }
+                    }
+                    ZcFeed::Rgba64 => {
+                        let sbs_tex_16 = pipeline.compose_sbs_textures_16(
+                            l_final, r_final, cfg.eye_w, cfg.eye_h,
+                        )?;
+                        EncFrame::Rgba64(
+                            pipeline.read_texture_rgba64(&sbs_tex_16, sbs_w, sbs_h)?
+                        )
+                    }
+                };
+                if frame_tx.send(frame).is_err() {
+                    break; // encoder failed to open — surfaced at join
+                }
+            }
         }
 
         drop(sp);
@@ -2018,9 +2244,18 @@ fn export_eac_gpu_resident(
 
     drop(pair_rx);
     let _ = decode_handle.join();
-    drop(enc_tx); // end the encode thread's recv loop → flush + finish
-    let enc_result = encode_handle.join();
-    drop(ring);   // free shared frames only AFTER the encoder is done reading
+    let enc_result = match tail {
+        Tail::Nvenc { ring, enc_tx, handle } => {
+            drop(enc_tx); // end the encode thread's recv loop → flush + finish
+            let r = handle.join();
+            drop(ring);   // free shared frames only AFTER the encoder is done reading
+            r
+        }
+        Tail::Readback { frame_tx, handle, .. } => {
+            drop(frame_tx); // end the encode thread's recv loop → flush + finish
+            handle.join()
+        }
+    };
     match enc_result {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(e),

@@ -44,6 +44,14 @@
   trimmed export used to stall short of 100% with an inflated ETA), and
   the rate is measured from the first written frame instead of the run
   start, so load / encoder start-up no longer counts as encode time.
+- **Windows: GoPro `.360` ProRes (and software H.265) exports now run on
+  the GPU fast path** — GPU decode, assembly, projection, color and 4:2:2
+  compose feeding the GPU ProRes encoder (~5× at 8K, was a serial CPU
+  loop with the GPU idle). Merged multi-chapter recordings included.
+- Windows: the app now explicitly prefers the Vulkan GPU backend (all
+  fast export paths require it), and when an export does land on a slow
+  path the export bar says why (e.g. "CPU export path — ProRes GPU
+  encoder unavailable") instead of just being slow.
 
 ### Since 2.0.0
 - Seamless auto-update (2.1.0), `.360` lens calibration override, ProRes

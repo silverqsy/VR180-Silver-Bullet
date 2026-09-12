@@ -3301,6 +3301,13 @@ impl App {
                     } else {
                         ui.label(RichText::new(tr("starting…")).color(Color32::GRAY));
                     }
+                    // Slow-path note from the pipeline (portable CPU loop, or
+                    // a CPU encoder fallback) — users shouldn't need the log
+                    // to know why an export is slow.
+                    if let Some(note) = vr180_pipeline::fisheye_export::export_path_note() {
+                        ui.label(RichText::new(format!("⚠ {note}"))
+                            .small().color(Color32::from_rgb(230, 160, 90)));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button(tr("Stop")).clicked() { do_stop = true; }
                         if ui.button(tr("Skip current")).clicked() { do_skip = true; }

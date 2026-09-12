@@ -119,6 +119,22 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    1920 px per eye, and a paused frame always shows the native still
    (`wants_full_res_still`). The Windows D3D11 preview path took the same
    edit blind — verify there.
+10. **Windows `.360` ProRes/libx265 GPU arm + Vulkan preference + slow-path
+   notes (Windows session, 2026-09-12).** `export_eac_gpu_resident` now
+   takes ProRes and libx265 too: the NVENC gate became per-encoder, and the
+   arm has two encode tails — NVENC keeps the CUDA/P010 ring untouched;
+   ProRes/libx265 get the OSV zc arm's readback tail (format handshake →
+   P210→`prores_ks_vulkan` with `warm_prores_vulkan()` before thread spawn /
+   RGBA64→swscale, encode thread pipelined against decode + GPU). 8K ProRes
+   422: 2.5 → 13.3 fps, arm-vs-portable mean 0.6/255 (the portable EAC loop
+   is 8-bit RGB; the arm feeds 10-bit 4:2:2). Wgpu backend: eframe + the
+   pipeline's own device creation now explicitly prefer Vulkan on Windows
+   (probe first, DX12 fallback kept — a silent DX12 pick disabled every
+   fast arm). Slow-path visibility: landing on the portable loop or a CPU
+   encoder fallback logs at `warn` AND surfaces in the export bar via
+   `fisheye_export::{set,append,}export_path_note`. NOT verifiable on this
+   box: the DX12-fallback branch itself (Vulkan is always present here)
+   and a genuine `prores_ks_vulkan` init failure — both code-reviewed only.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no
@@ -245,7 +261,7 @@ Build/run quick-ref (build `-p vr180-gui`, **not** the workspace):
 ```pwsh
 # Windows
 $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"   # LLVM 17+
-$env:FFMPEG_DIR    = "C:\path\to\ffmpeg-7.x-dev"   # avbuild dev distribution
+$env:FFMPEG_DIR    = "C:\path\to\ffmpeg-8.1-dev"   # 8.1+ REQUIRED (prores_ks_vulkan)
 cargo build --release -p vr180-gui
 $env:PATH = "$env:FFMPEG_DIR\bin;$env:PATH"; .\target\release\vr180-gui.exe
 ```
@@ -405,7 +421,12 @@ Lives in `nvenc_cuda.rs` (`#[cfg(target_os = "windows")]`), dispatched from
 uses a **dedicated** wgpu device (`gpu.rs::new_dedicated_from_adapter`) so it
 can't deadlock eframe's renderer (Lesson #1). Falls back to a P010/RGB48
 readback `hevc_nvenc`/`libx265` path. Both `HalfEquirect` and `Fisheye`
-output modes take the fast path.
+output modes take the fast path. The `.360` arm (`export_eac_gpu_resident`)
+also carries **ProRes and libx265**: same GPU front end, encode tail by
+backend — NVENC via CUDA/P010, ProRes via GPU 4:2:2 readback into
+`prores_ks_vulkan` (FFmpeg 8.1+; CPU `prores_ks` fallback), libx265 via
+RGBA64. Every landing on a slow path warns AND sets
+`fisheye_export::export_path_note` (shown in the export bar).
 
 **Color range:** both the GPU-resident and readback paths compose
 **video-range** YCbCr and tag `AVCOL_RANGE_MPEG` (Rec.709) — the
