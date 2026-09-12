@@ -739,7 +739,7 @@ impl FisheyeOutputMode {
         match self {
             Self::HalfEquirect => "Half-equirect (VR180)",
             Self::Fisheye      => "Fisheye SBS (equidist.)",
-            Self::Reframe      => "Reframed (rectilinear)",
+            Self::Reframe      => "Reframed (Flat 3D)",
         }
     }
 }

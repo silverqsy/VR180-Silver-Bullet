@@ -3,7 +3,7 @@
 ## 2.5.0
 
 ### Reframed output mode (new)
-- **Format → "Reframed (rectilinear)"**: a pinhole-style side-by-side view
+- **Format → "Reframed (Flat 3D)"**: a pinhole-style side-by-side view
   of each eye instead of the VR180 half-equirect — zoom (horizontal FOV),
   pan / tilt / roll, a **Defish** blend from rectilinear to a fisheye look,
   and a 1:1 or 16:9 per-eye frame. Stabilization, stereo offsets, per-row
