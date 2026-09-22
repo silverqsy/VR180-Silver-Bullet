@@ -3875,6 +3875,12 @@ pub(crate) fn resolve_calib_pair(
         }
     };
 
+    // Same line the GUI prints at load (`decoder (fisheye): initial calib`),
+    // so an export's per-eye lens assignment can be checked from the log.
+    tracing::info!(
+        "fisheye_export: resolved calib L fx={:.1}, cx={:.1}, cy={:.1} | R fx={:.1}, cx={:.1}, cy={:.1} (swap={})",
+        calib_l.fx, calib_l.cx, calib_l.cy, calib_r.fx, calib_r.cx, calib_r.cy, cfg.fisheye_swap_eyes
+    );
     // Generic SBS with the fisheye dewarp off: the halves are already
     // half-equirect — bypass the lens model (identity resample for the
     // default output, a correct (lon, lat) lookup for the reframed view).
