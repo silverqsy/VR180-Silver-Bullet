@@ -2894,9 +2894,10 @@ fn export_fisheye_osv_zerocopy_p010(
 
         // Drop decode + compose textures so the IOSurface retains
         // release before the next frame allocates new ones. Must stay AFTER
-        // encode_pixel_buffer*: for the SBS arm the resolve and the split each
-        // queue.submit() inside their own call, so the GPU read of these
-        // planes is already submitted here.
+        // encode_pixel_buffer*. Safe because every GPU read of the frame's
+        // planes has COMPLETED by now, not merely been submitted: both arms'
+        // projections submit inside their own calls, and the compose that
+        // follows polls the device to idle before returning.
         drop(frame);
 
         frame_idx += 1;

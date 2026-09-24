@@ -1625,16 +1625,19 @@ impl VtSharedDualStreamIter {
 /// encoding (depth + range) the kernels expand with.
 /// macOS analogue of the Windows [`SharedSbsFrame`]. Deliberately NOT `Send`
 /// (like [`VtSharedFisheyePair`]) — the IOSurface textures must not cross a
-/// thread. Hold it alive until the resolve reading it has been SUBMITTED.
+/// thread. Hold it alive until every kernel reading it has COMPLETED —
+/// the preview retires frames through a queue; the export drops after a
+/// compose that polls the device to idle.
 #[cfg(target_os = "macos")]
 pub struct VtSharedSbsFrame {
     pub frame_y:  crate::interop_macos::IOSurfacePlaneTexture,
     pub frame_uv: crate::interop_macos::IOSurfacePlaneTexture,
-    /// WHOLE-frame (Y-plane) dims — what the resolve downscales FROM.
+    /// WHOLE-frame (Y-plane) dims of the wrapped planes (both eyes).
     pub frame_w: u32,
     pub frame_h: u32,
-    /// PER-EYE native dims (`frame_w / 2`, `frame_h`) — what
-    /// `split_sbs_texture_16` and the calib resolver want.
+    /// PER-EYE native dims (`frame_w / 2`, `frame_h`) — the eye rect the
+    /// kernels sample (right eye at `src_x0 = eye_w`) and what the calib
+    /// resolver wants.
     pub eye_w: u32,
     pub eye_h: u32,
     /// Presentation timestamp in seconds, `0.0` if unknown.
@@ -1878,7 +1881,8 @@ impl VtSharedSbsIter {
     /// [`VtSharedDualStreamIter::eye_dims`]; the consumer downscales itself.
     pub fn eye_dims(&self) -> (u32, u32) { (self.eye_w, self.eye_h) }
 
-    /// Native WHOLE-frame (Y-plane) dims — what the resolve reads FROM.
+    /// Native WHOLE-frame (Y-plane) dims of the decoded planes; diagnostics
+    /// only — consumers work in per-eye dims (`eye_dims`) plus `src_x0`.
     pub fn frame_dims(&self) -> (u32, u32) { (self.frame_w, self.frame_h) }
 
     /// PRECISE seek — arms the run-in discard, like every zero-copy iterator.
