@@ -738,10 +738,10 @@ fn export_fisheye_inner(
         // segments internally (new_segmented), so denoise + stab stay on the
         // fast GPU path across seams instead of dropping to the portable loop.
         // Generic SBS rides this path too (single VT stream, whole-frame
-        // IOSurface → one resolve → split). NB `cfg.bit_depth` above is the
-        // OUTPUT depth and says NOTHING about the source — the SOURCE refusal
-        // (8-bit NV12 cannot be wrapped as P010) lives in
-        // `VtSharedSbsIter::new`. Denoise is excluded because
+        // IOSurface sampled per eye in place). NB `cfg.bit_depth` above is the
+        // OUTPUT depth and says NOTHING about the source — the SOURCE refusals
+        // (codec, 4:2:0, 8/10-bit) live in `VtSharedSbsIter::new`, which
+        // takes 8-bit NV12 and 10-bit P010 alike. Denoise is excluded because
         // `DenoisingZeroCopyIter::new` takes a `ZeroCopyDualStreamFisheyeIter`
         // by value; multi-segment because `new_segmented` is dual-stream-only
         // and a merged SBS would silently export just segment 0.
@@ -2819,6 +2819,8 @@ fn export_fisheye_osv_zerocopy_p010(
                     let (mut l, mut r) = (calib_left, calib_right);
                     l.src_x0 = 0.0;
                     r.src_x0 = f.eye_w as f32;
+                    l.yuv_range = f.yuv_range;
+                    r.yuv_range = f.yuv_range;
                     (l, r)
                 };
                 let (y, uv) = (&f.frame_y.texture, &f.frame_uv.texture);

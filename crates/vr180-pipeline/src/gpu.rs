@@ -302,6 +302,11 @@ struct ResolveDims {
     _p1: f32,
     _p2: f32,
     _p3: f32,
+    /// Source sample range expansion — see `yuv_range_constants`.
+    y_scale: f32,
+    y_off: f32,
+    c_scale: f32,
+    c_off: f32,
 }
 
 #[derive(Debug)]
@@ -2063,7 +2068,7 @@ impl EacLensUniforms {
 // ── Fisheye → half-equirect uniforms ───────────────────────────────
 
 /// std140 layout for the fisheye→equirect shader's calibration uniform.
-/// 28 scalars (7 × vec4 = 112 bytes). Matches the WGSL
+/// 36 scalars (9 × vec4 = 144 bytes). Matches the WGSL
 /// `FisheyeCalibUniforms` struct field-by-field. See
 /// `fisheye_to_hequirect.wgsl` for the per-pixel use of each value.
 #[repr(C)]
@@ -2091,6 +2096,37 @@ struct FisheyeCalibUniforms {
     // and the projection-plane half-extents at the frame edges. proj_mode
     // 0 → the half-equirect ray generator as before.
     proj_mode: f32, defish_k: f32, edge_x: f32, edge_y: f32,
+    // vec4 #8 — source sample range expansion (y_scale, y_off, c_scale,
+    // c_off) for the P010 kernels: P010-in-16 vs NV12-in-8, limited vs full
+    // range. See `yuv_range_constants`. The RGBA16 kernels declare only the
+    // rows they read; a buffer larger than the WGSL struct is fine.
+    yuv_range: [f32; 4],
+}
+
+/// Range expansion for 10-bit samples stored in the top 10 bits of a
+/// 16-bit-normalised texel (P010 as VideoToolbox delivers it), limited
+/// range: `code10 = t·65535/64`, `(code10 − 64)/876` for luma,
+/// `(code10 − 512)/896` for chroma.
+pub const YUV_RANGE_P010_LIMITED: [f32; 4] = [
+    65535.0 / 56064.0, -64.0 / 876.0, 65535.0 / 57344.0, -512.0 / 896.0,
+];
+
+/// `(y_scale, y_off, c_scale, c_off)` so that `y·y_scale + y_off` and
+/// `c·c_scale + c_off` map a normalised texel to nominal 0..1 luma and
+/// −0.5..0.5 chroma. `bits` is the SOURCE depth as wrapped: 8 = NV12 planes
+/// in `R8Unorm`/`Rg8Unorm`, anything else = P010 planes in
+/// `R16Unorm`/`Rg16Unorm` (10 bits in the top of 16). `full_range` is the
+/// stream's `color_range == JPEG` tag; VideoToolbox hands such buffers back
+/// as `420f`/`xf20` with the codes untouched, so limited-range constants on
+/// them crush blacks and clip whites.
+pub fn yuv_range_constants(bits: u8, full_range: bool) -> [f32; 4] {
+    match (bits, full_range) {
+        (8, false) => [255.0 / 219.0, -16.0 / 219.0, 255.0 / 224.0, -128.0 / 224.0],
+        (8, true)  => [1.0, 0.0, 1.0, -128.0 / 255.0],
+        (_, false) => YUV_RANGE_P010_LIMITED,
+        // full range 10-in-16: code10/1023 = t·65535/65472; chroma centred on 512.
+        (_, true)  => [65535.0 / 65472.0, 0.0, 65535.0 / 65472.0, -512.0 / 1023.0],
+    }
 }
 
 /// Public per-eye Kannala-Brandt fisheye calibration. Caller builds
@@ -2139,6 +2175,13 @@ pub struct FisheyeCalib {
     /// taps to the eye rect before offsetting (see the shader comment);
     /// the RGBA16 kernels are handed per-eye textures and ignore it.
     pub src_x0: f32,
+    /// How the SOURCE samples are encoded, as `(y_scale, y_off, c_scale,
+    /// c_off)` — the linear expansion the P010 kernels apply before the
+    /// BT.709 matrix. Defaults to 10-bit-in-16 limited range (every camera
+    /// file); a generic side-by-side source sets it from its own bit depth
+    /// and range tag via [`yuv_range_constants`]. Ignored by the RGBA16
+    /// kernels, which receive already-converted textures.
+    pub yuv_range: [f32; 4],
     /// KB → cubic-Hermite extension boundary (radians).
     pub theta_trans: f32,
     /// Cubic extension upper bound (radians).
@@ -2230,7 +2273,7 @@ impl FisheyeCalib {
             r_max, src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
-            src_proj: 0.0, src_x0: 0.0,
+            src_proj: 0.0, src_x0: 0.0, yuv_range: YUV_RANGE_P010_LIMITED,
         }
     }
 
@@ -2268,7 +2311,7 @@ impl FisheyeCalib {
             src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
-            src_proj: 0.0, src_x0: 0.0,
+            src_proj: 0.0, src_x0: 0.0, yuv_range: YUV_RANGE_P010_LIMITED,
         }
     }
 
@@ -2315,7 +2358,7 @@ impl FisheyeCalib {
             src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
-            src_proj: 0.0, src_x0: 0.0,
+            src_proj: 0.0, src_x0: 0.0, yuv_range: YUV_RANGE_P010_LIMITED,
         }
     }
 
@@ -2372,6 +2415,7 @@ impl FisheyeCalibUniforms {
             ta: c.tangential[0], tb: c.tangential[1], tc: c.tangential[2], te: c.tangential[3],
             s1: c.prism[0], s2: c.prism[1], s3: c.prism[2], s4: c.prism[3],
             proj_mode: c.proj_mode, defish_k: c.defish_k, edge_x: c.edge_x, edge_y: c.edge_y,
+            yuv_range: c.yuv_range,
         }
     }
 }
@@ -5360,6 +5404,8 @@ impl Device {
             src_w: src_w as f32, src_h: src_h as f32,
             out_w: out_w as f32, out_h: out_h as f32,
             src_x0: 0.0, _p1: 0.0, _p2: 0.0, _p3: 0.0,
+            y_scale: YUV_RANGE_P010_LIMITED[0], y_off: YUV_RANGE_P010_LIMITED[1],
+            c_scale: YUV_RANGE_P010_LIMITED[2], c_off: YUV_RANGE_P010_LIMITED[3],
         });
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("p010_resolve_bg"),
@@ -5407,12 +5453,15 @@ impl Device {
     /// export samples P010 directly and does not resolve at all).
     /// `src_w`/`src_h` describe the rect being resolved and `src_x0` its x
     /// offset in the plane — 0 for a whole frame or a per-eye texture.
+    /// `yuv_range` is the source's sample encoding (`yuv_range_constants`);
+    /// dual-stream callers pass `YUV_RANGE_P010_LIMITED`.
     pub fn resolve_p010_planes_to_rgba16(
         &self,
         y_tex: &wgpu::Texture,
         uv_tex: &wgpu::Texture,
         src_w: u32, src_h: u32,
         src_x0: u32,
+        yuv_range: [f32; 4],
         out_w: u32, out_h: u32,
         slot: u32,
     ) -> Result<wgpu::Texture> {
@@ -5450,6 +5499,7 @@ impl Device {
             src_w: src_w as f32, src_h: src_h as f32,
             out_w: out_w as f32, out_h: out_h as f32,
             src_x0: src_x0 as f32, _p1: 0.0, _p2: 0.0, _p3: 0.0,
+            y_scale: yuv_range[0], y_off: yuv_range[1], c_scale: yuv_range[2], c_off: yuv_range[3],
         });
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("p010_resolve_planes_bg"),
@@ -8376,7 +8426,7 @@ mod reframe_tests {
         assert!((u.defish_k - 2.0).abs() < 1e-6);
         assert!((u.edge_x - 2.0 * (45.0f32.to_radians() / 2.0).tan()).abs() < 1e-5);
         assert!((u.edge_y - u.edge_x * 9.0 / 16.0).abs() < 1e-5);
-        assert_eq!(std::mem::size_of::<FisheyeCalibUniforms>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<FisheyeCalibUniforms>(), 36 * 4);
         let plain = FisheyeCalibUniforms::from_public(FisheyeCalib::new(1000.0, 1000.0, 960.0, 960.0, [0.0; 4], 1920.0, 1920.0, 900.0));
         assert_eq!(plain.proj_mode, 0.0);
     }

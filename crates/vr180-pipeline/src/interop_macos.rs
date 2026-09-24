@@ -99,6 +99,7 @@ extern "C" {
     fn IOSurfaceGetWidthOfPlane(s: IOSurfaceRef, plane: usize) -> usize;
     fn IOSurfaceGetHeightOfPlane(s: IOSurfaceRef, plane: usize) -> usize;
     fn IOSurfaceGetBytesPerRowOfPlane(s: IOSurfaceRef, plane: usize) -> usize;
+    fn IOSurfaceGetBytesPerElementOfPlane(s: IOSurfaceRef, plane: usize) -> usize;
     fn IOSurfaceGetWidth(s: IOSurfaceRef) -> usize;
     fn IOSurfaceGetHeight(s: IOSurfaceRef) -> usize;
     fn IOSurfaceGetBytesPerRow(s: IOSurfaceRef) -> usize;
@@ -135,6 +136,8 @@ impl RetainedIOSurface {
     pub fn plane_width(&self, p: usize) -> usize { unsafe { IOSurfaceGetWidthOfPlane(self.as_raw(), p) } }
     pub fn plane_height(&self, p: usize) -> usize { unsafe { IOSurfaceGetHeightOfPlane(self.as_raw(), p) } }
     pub fn plane_bytes_per_row(&self, p: usize) -> usize { unsafe { IOSurfaceGetBytesPerRowOfPlane(self.as_raw(), p) } }
+    /// Bytes per element of a plane: 1 for an 8-bit (NV12) plane, 2 for P010.
+    pub fn plane_bytes_per_element(&self, p: usize) -> usize { unsafe { IOSurfaceGetBytesPerElementOfPlane(self.as_raw(), p) } }
 }
 
 impl Drop for RetainedIOSurface {
@@ -407,10 +410,15 @@ pub fn wgpu_texture_from_iosurface_plane(
     };
 
     // 4. Hand to wgpu. Descriptor must mirror the hal texture exactly.
-    let usage = wgpu::TextureUsages::COPY_SRC
+    // STORAGE_BINDING only where the format allows it: R16/Rg16 are storage-
+    // capable through TEXTURE_FORMAT_16BIT_NORM, which the Device requests;
+    // R8Unorm/Rg8Unorm (8-bit NV12 planes) are not, and wgpu would reject the
+    // descriptor. Every kernel only ever SAMPLES these planes anyway.
+    let storage = !matches!(wgpu_format, wgpu::TextureFormat::R8Unorm | wgpu::TextureFormat::Rg8Unorm);
+    let mut usage = wgpu::TextureUsages::COPY_SRC
         | wgpu::TextureUsages::COPY_DST
-        | wgpu::TextureUsages::TEXTURE_BINDING
-        | wgpu::TextureUsages::STORAGE_BINDING;
+        | wgpu::TextureUsages::TEXTURE_BINDING;
+    if storage { usage |= wgpu::TextureUsages::STORAGE_BINDING; }
     let wgpu_desc = wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },

@@ -54,6 +54,8 @@ struct FisheyeCalibUniforms {
     ta: f32, tb: f32, tc: f32, te: f32,            // UCM tangential: (r²+2x²)(ta + tc r²) + 2xy(tb + te r²)
     s1: f32, s2: f32, s3: f32, s4: f32,            // UCM thin prism: x += s1 r² + s2 r⁴, y += s3 r² + s4 r⁴
     proj_mode: f32, defish_k: f32, edge_x: f32, edge_y: f32,  // vec4 #7: reframed-view output (proj_mode 1 → k-projection; 0 → half-equirect)
+    // vec4 #8 — source sample range expansion (y_scale, y_off, c_scale, c_off).
+    yuv_range: vec4<f32>,
 }
 @group(0) @binding(5) var<uniform> cal: FisheyeCalibUniforms;
 
@@ -70,9 +72,12 @@ const PI: f32 = 3.14159265359;
 const HALF_PI: f32 = 1.57079632679;
 
 fn yuv_to_rgb_bt709_p010(y: f32, u: f32, v: f32) -> vec3<f32> {
-    let y_l = y * (65535.0 / 56064.0) - (64.0 / 876.0);
-    let u_l = u * (65535.0 / 57344.0) - (512.0 / 896.0);
-    let v_l = v * (65535.0 / 57344.0) - (512.0 / 896.0);
+    // Range expansion comes from the uniform — (y_scale, y_off, c_scale,
+    // c_off) for P010-in-16 or NV12-in-8, limited or full range; see
+    // `yuv_range_constants` in gpu.rs. The BT.709 matrix below is unchanged.
+    let y_l = y * cal.yuv_range.x + cal.yuv_range.y;
+    let u_l = u * cal.yuv_range.z + cal.yuv_range.w;
+    let v_l = v * cal.yuv_range.z + cal.yuv_range.w;
     let r = y_l + 1.5748 * v_l;
     let g = y_l - 0.1873 * u_l - 0.4681 * v_l;
     let b = y_l + 1.8556 * u_l;

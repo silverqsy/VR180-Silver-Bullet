@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### macOS: side-by-side sources — 8-bit joins the zero-copy path, and it uses far less memory
+
+Two changes to the zero-copy path for generic side-by-side `.mp4` / `.mov`
+sources on macOS.
+
+- **8-bit sources now take the fast path.** Until now only 10-bit HEVC/H.264
+  qualified; an 8-bit clip fell back to the CPU decoder. VideoToolbox hands
+  8-bit frames back as NV12; those planes are now wrapped as 8-bit textures
+  and the kernels expand the range from a per-source constant instead of a
+  hard-coded 10-bit one. On an 8192×4096 8-bit clip a 120-frame export went
+  from **21.95 s to 3.73 s** and peak memory from **3.14 GB to 1.03 GB**.
+  Colour checked against the BT.709 formula applied to the raw codes: the
+  new path lands within 0.28/255 on flat areas (the CPU path it replaces
+  was 0.78/255 dark); the preview within 0.01/255. The range tag is
+  honoured too — a full-range (`pc`) source no longer gets limited-range
+  constants — on both 8- and 10-bit.
+- **No more whole-frame intermediate.** The side-by-side path used to
+  convert the entire frame to RGBA16 and then copy out two per-eye halves
+  before projecting: at 8K that is a 268 MB texture plus two 134 MB halves
+  per frame, and two full-frame passes. The projection kernels now sample
+  each eye straight from the decoded planes, the same way the DJI and X6
+  paths always have, and the preview resolves each eye from its own half.
+  Peak memory for the 10-bit 8K export: **2.20 GB → 1.65 GB**. The DJI and
+  X6 paths are bit-identical to before. A side effect worth knowing: the old
+  path put the left eye's last column exactly on the chroma boundary with the
+  right eye and blended it in — one column of wrong colour along the seam,
+  in both preview and export. Sampling per eye fixes that.
+
+Accepted: 8- and 10-bit H.264/HEVC in 4:2:0. ProRes and 4:2:2 profiles still
+use the CPU path.
+
 ### Insta360 X6: eye order and stabilization direction fixed for real post-mod footage
 
 The X6 path was wired before any modded camera existed, on an assumption about

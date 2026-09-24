@@ -1617,11 +1617,12 @@ impl VtSharedDualStreamIter {
 /// One VideoToolbox zero-copy frame from a GENERIC side-by-side source
 /// (plain `.mp4`/`.mov`, `SourceKind::SbsFisheye`): the WHOLE
 /// `2·eye_w × eye_h` frame's Y + UV planes wrapped as wgpu textures that
-/// ALIAS the decoded P010 IOSurface. The consumer resolves the whole frame
-/// ONCE with `Device::resolve_p010_planes_to_rgba16` and halves it with
-/// `Device::split_sbs_texture_16` — never by giving the fisheye shaders an
-/// x-offset, which normalise by `cal.src_w/src_h` and rely on ClampToEdge,
-/// so an out-of-frame tap lands in the OTHER EYE instead of clamping.
+/// ALIAS the decoded IOSurface — P010 planes as `R16Unorm`/`Rg16Unorm`, or
+/// NV12 planes as `R8Unorm`/`Rg8Unorm` for an 8-bit source. Consumers sample
+/// each eye IN PLACE: the P010 kernels take the eye's x offset
+/// (`FisheyeCalib::src_x0`) and clamp their taps to the eye rect, and the
+/// preview's resolve does the same per eye. `yuv_range` carries the sample
+/// encoding (depth + range) the kernels expand with.
 /// macOS analogue of the Windows [`SharedSbsFrame`]. Deliberately NOT `Send`
 /// (like [`VtSharedFisheyePair`]) — the IOSurface textures must not cross a
 /// thread. Hold it alive until the resolve reading it has been SUBMITTED.
@@ -1638,6 +1639,9 @@ pub struct VtSharedSbsFrame {
     pub eye_h: u32,
     /// Presentation timestamp in seconds, `0.0` if unknown.
     pub pts_s: f64,
+    /// Sample range expansion for these planes — `yuv_range_constants(depth,
+    /// full_range)` of the source. Consumers copy it into the calib / resolve.
+    pub yuv_range: [f32; 4],
 }
 
 #[cfg(target_os = "macos")]
@@ -1687,6 +1691,10 @@ pub struct VtSharedSbsIter {
     /// keyframe→target run-in so the first frame returned is the exact
     /// requested one (same contract as every other zero-copy iterator).
     skip_until_s: Option<f64>,
+    /// Source luma depth: 8 → VT yields NV12 (wrapped R8/Rg8), 10 → P010.
+    bit_depth: u8,
+    /// `yuv_range_constants(bit_depth, color_range == JPEG)`.
+    yuv_range: [f32; 4],
 }
 
 #[cfg(target_os = "macos")]
@@ -1730,6 +1738,19 @@ fn codecpar_luma_depth(par: &ffmpeg_next::codec::Parameters) -> i32 {
     }
 }
 
+/// True when the stream's pixel format is 4:2:0 (chroma subsampled by two on
+/// both axes) — the only layout the two-plane wrap and the half-res UV
+/// sampling in the kernels are built for. Unknown format → false.
+#[cfg(target_os = "macos")]
+fn codecpar_is_420(par: &ffmpeg_next::codec::Parameters) -> bool {
+    // SAFETY: read-only; `av_pix_fmt_desc_get` returns null for unknown formats.
+    unsafe {
+        let desc = ffmpeg_next::ffi::av_pix_fmt_desc_get(
+            std::mem::transmute::<i32, ffmpeg_next::ffi::AVPixelFormat>((*par.as_ptr()).format));
+        !desc.is_null() && (*desc).log2_chroma_w == 1 && (*desc).log2_chroma_h == 1
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl VtSharedSbsIter {
     /// Open a generic SBS file and force VideoToolbox decode.
@@ -1740,15 +1761,15 @@ impl VtSharedSbsIter {
     ///  * the codec is not H.264/HEVC. VT returns `p210le` (4:2:2) for ProRes
     ///    422 and `ayuv64le` for 4444, which breaks the half-res-UV
     ///    assumption baked into `p010_resolve_rgba16.wgsl`'s `uv_uv`;
-    ///  * the source is not >= 10-bit. THIS IS THE LOAD-BEARING CHECK.
-    ///    `wrap_p010_planes` hard-codes R16Unorm/Rg16Unorm and
-    ///    `IOSurfaceNv12Descriptor::new` validates ONLY `plane_count() == 2`,
-    ///    which an 8-bit NV12 surface ALSO satisfies — it would be wrapped
-    ///    silently and render garbage rather than erroring, and there is no
-    ///    runtime check anywhere downstream. See `codecpar_luma_depth` for
-    ///    why this cannot just read `bits_per_raw_sample`; a depth of 0
-    ///    (both sources unknown) is a REFUSAL for the same reason —
-    ///    guessing 10 reintroduces exactly the case this check prevents;
+    ///  * the source is not 8- or 10-bit 4:2:0. The plane wrap picks
+    ///    R8/Rg8 vs R16/Rg16 from the depth and the kernels expand the range
+    ///    from `yuv_range`, so both depths work; a 4:2:2 profile would come
+    ///    out of VT as P210 (full-height chroma), which the half-height UV
+    ///    geometry would render as garbage. See `codecpar_luma_depth` for
+    ///    why the depth cannot just read `bits_per_raw_sample`; a depth of 0
+    ///    (both sources unknown) is a REFUSAL because guessing is exactly
+    ///    what produces silent garbage. `wrap_planes` re-checks the actual
+    ///    surface (bytes per element, chroma plane height) on every frame;
     ///  * the frame width is odd, or a dimension is zero (not splittable);
     ///  * VideoToolbox will not attach, or `VR180_NO_HW_DECODE` is set.
     ///
@@ -1792,11 +1813,20 @@ impl VtSharedSbsIter {
                  — falling back to the CPU iterator", par.id())));
         }
         let depth = codecpar_luma_depth(&par);
-        if depth < 10 {
+        if depth != 8 && depth != 10 {
             return Err(Error::Ffmpeg(format!(
-                "VT zero-copy SBS path is P010-only; source luma depth is \
-                 {depth} (0 = unknown) — falling back to the CPU iterator")));
+                "VT zero-copy SBS path takes 8- or 10-bit 4:2:0; source luma \
+                 depth is {depth} (0 = unknown) — falling back to the CPU iterator")));
         }
+        if !codecpar_is_420(&par) {
+            return Err(Error::Ffmpeg(
+                "VT zero-copy SBS path takes 4:2:0 only (a 4:2:2 profile decodes to \
+                 P210, full-height chroma) — falling back to the CPU iterator".into()));
+        }
+        // SAFETY: read-only access to a POD field of AVCodecParameters.
+        let full_range = unsafe { (*par.as_ptr()).color_range }
+            == ffmpeg_next::ffi::AVColorRange::AVCOL_RANGE_JPEG;
+        let yuv_range = crate::gpu::yuv_range_constants(depth as u8, full_range);
 
         let time_base = video.time_base();
         let time_base_s = time_base.numerator() as f64 / time_base.denominator().max(1) as f64;
@@ -1824,7 +1854,9 @@ impl VtSharedSbsIter {
         let (eye_w, eye_h) = (fw / 2, fh);
         tracing::info!(
             "VtSharedSbsIter: {fw}x{fh} SBS (native {eye_w}x{eye_h} per eye), \
-             {depth}-bit, VideoToolbox P010 IOSurface zero-copy");
+             {depth}-bit {} range, VideoToolbox {} IOSurface zero-copy",
+            if full_range { "full" } else { "limited" },
+            if depth == 8 { "NV12" } else { "P010" });
         Ok(Self {
             ictx, video_idx, decoder,
             frame_w: fw, frame_h: fh,
@@ -1832,6 +1864,8 @@ impl VtSharedSbsIter {
             time_base_s, dt_s,
             frames_yielded: 0,
             skip_until_s: None,
+            bit_depth: depth as u8,
+            yuv_range,
         })
     }
 
@@ -1858,7 +1892,12 @@ impl VtSharedSbsIter {
     /// UV: `Rg16Unorm`) plane textures aliasing the surface — the same recipe
     /// as [`VtSharedDualStreamIter::wrap_p010_planes`], applied to the WHOLE
     /// SBS frame instead of one eye.
-    fn wrap_p010_planes(
+    /// Wrap the decoded frame's two planes. Formats follow `bit_depth`; the
+    /// surface is re-checked because `IOSurfaceNv12Descriptor::new` only
+    /// validates `plane_count() == 2`, which NV12, P010 AND P210 all satisfy —
+    /// a mismatch here would otherwise render garbage, never error.
+    fn wrap_planes(
+        &self,
         device: &wgpu::Device,
         frame: &ffmpeg_next::frame::Video,
     ) -> Result<(crate::interop_macos::IOSurfacePlaneTexture,
@@ -1869,16 +1908,26 @@ impl VtSharedSbsIter {
         };
         let surf = extract_iosurface_from_vt_frame(frame)?;
         let desc = IOSurfaceNv12Descriptor::new(surf)?;
+        let (bpe, mfy, wfy, mfuv, wfuv) = if self.bit_depth == 8 {
+            (1usize, metal::MTLPixelFormat::R8Unorm, wgpu::TextureFormat::R8Unorm,
+             metal::MTLPixelFormat::RG8Unorm, wgpu::TextureFormat::Rg8Unorm)
+        } else {
+            (2usize, metal::MTLPixelFormat::R16Unorm, wgpu::TextureFormat::R16Unorm,
+             metal::MTLPixelFormat::RG16Unorm, wgpu::TextureFormat::Rg16Unorm)
+        };
+        let (got_bpe, uv_h) = (desc.surface.plane_bytes_per_element(0), desc.surface.plane_height(1) as u32);
+        if got_bpe != bpe || uv_h * 2 != desc.height {
+            return Err(Error::Ffmpeg(format!(
+                "VT surface does not match the {}-bit 4:2:0 layout the wrap expects: \
+                 {got_bpe} bytes/element, chroma plane {uv_h} rows for {} luma rows",
+                self.bit_depth, desc.height)));
+        }
         let y_surf  = unsafe { RetainedIOSurface::retain(desc.surface.as_raw()) };
         let uv_surf = unsafe { RetainedIOSurface::retain(desc.surface.as_raw()) };
         let y = wgpu_texture_from_iosurface_plane(
-            device, y_surf, 0,
-            metal::MTLPixelFormat::R16Unorm, wgpu::TextureFormat::R16Unorm,
-            desc.width, desc.height, "sbs_vt_y")?;
+            device, y_surf, 0, mfy, wfy, desc.width, desc.height, "sbs_vt_y")?;
         let uv = wgpu_texture_from_iosurface_plane(
-            device, uv_surf, 1,
-            metal::MTLPixelFormat::RG16Unorm, wgpu::TextureFormat::Rg16Unorm,
-            desc.width / 2, desc.height / 2, "sbs_vt_uv")?;
+            device, uv_surf, 1, mfuv, wfuv, desc.width / 2, desc.height / 2, "sbs_vt_uv")?;
         drop(desc);
         Ok((y, uv))
     }
@@ -1936,13 +1985,14 @@ impl VtSharedSbsIter {
                     "SBS frame changed size mid-stream: expected {}x{}, got {}x{}",
                     self.frame_w, self.frame_h, decoded.width(), decoded.height())));
             }
-            let (frame_y, frame_uv) = Self::wrap_p010_planes(device, &decoded)?;
+            let (frame_y, frame_uv) = self.wrap_planes(device, &decoded)?;
             self.frames_yielded += 1;
             return Ok(Some(VtSharedSbsFrame {
                 frame_y, frame_uv,
                 frame_w: self.frame_w, frame_h: self.frame_h,
                 eye_w: self.eye_w, eye_h: self.eye_h,
                 pts_s,
+                yuv_range: self.yuv_range,
             }));
         }
     }

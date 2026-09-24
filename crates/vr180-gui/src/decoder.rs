@@ -1534,8 +1534,8 @@ fn run_fisheye(
     #[cfg(target_os = "macos")]
     {
         // Generic SBS (plain .mp4/.mov) rides this path too: ONE stream, the
-        // whole frame's P010 IOSurface wrapped, resolved once, halves split on
-        // the GPU. There is no segmented VT SBS chaining, so a (rare)
+        // whole frame's IOSurface (P010, or NV12 for an 8-bit source) wrapped
+        // and each eye resolved from its own sub-rect. There is no segmented VT SBS chaining, so a (rare)
         // multi-segment SBS stays on the CPU worker — same predicate as the
         // Windows `sbs_ok` above; opening only cfg.path would freeze the
         // preview past the first seam.
@@ -1576,7 +1576,7 @@ fn run_fisheye(
                     );
                 }
                 Err(e) => {
-                    // Includes the 8-bit / non-HEVC refusal. frame_tx and
+                    // Includes the codec / 4:2:2 / depth refusals. frame_tx and
                     // cmd_rx are untouched, so the CPU path below takes over.
                     tracing::info!(
                         "decoder (fisheye): macOS zero-copy unavailable ({e}) — CPU path");
@@ -3226,10 +3226,10 @@ fn run_fisheye_vt_zerocopy(
             VtZcFisheyeFrame::Pair(p) => (
                 pipeline.resolve_p010_planes_to_rgba16(
                     &p.left_y.texture, &p.left_uv.texture,
-                    native_w, native_h, 0, src_w, src_h, 0)?,
+                    native_w, native_h, 0, vr180_pipeline::gpu::YUV_RANGE_P010_LIMITED, src_w, src_h, 0)?,
                 pipeline.resolve_p010_planes_to_rgba16(
                     &p.right_y.texture, &p.right_uv.texture,
-                    native_w, native_h, 0, src_w, src_h, 1)?,
+                    native_w, native_h, 0, vr180_pipeline::gpu::YUV_RANGE_P010_LIMITED, src_w, src_h, 1)?,
             ),
             // Generic SBS: one resolve PER EYE straight from its sub-rect of the
             // whole-frame planes (`src_x0` = 0 / eye_w), into the same slots
@@ -3240,10 +3240,10 @@ fn run_fisheye_vt_zerocopy(
             VtZcFisheyeFrame::Sbs(f) => (
                 pipeline.resolve_p010_planes_to_rgba16(
                     &f.frame_y.texture, &f.frame_uv.texture,
-                    f.eye_w, f.eye_h, 0, src_w, src_h, 0)?,
+                    f.eye_w, f.eye_h, 0, f.yuv_range, src_w, src_h, 0)?,
                 pipeline.resolve_p010_planes_to_rgba16(
                     &f.frame_y.texture, &f.frame_uv.texture,
-                    f.eye_w, f.eye_h, f.eye_w, src_w, src_h, 1)?,
+                    f.eye_w, f.eye_h, f.eye_w, f.yuv_range, src_w, src_h, 1)?,
             ),
         };
 

@@ -27,7 +27,12 @@
 
 // src_w/src_h = the EYE (or whole frame) being resolved; src_x0 = its x
 // offset in the plane (0 unless resolving one eye of a side-by-side frame).
-struct Dims { src_w: f32, src_h: f32, out_w: f32, out_h: f32, src_x0: f32, _p1: f32, _p2: f32, _p3: f32 }
+struct Dims {
+    src_w: f32, src_h: f32, out_w: f32, out_h: f32,
+    src_x0: f32, _p1: f32, _p2: f32, _p3: f32,
+    // source sample range expansion (see `yuv_range_constants` in gpu.rs)
+    y_scale: f32, y_off: f32, c_scale: f32, c_off: f32,
+}
 @group(0) @binding(4) var<uniform> d: Dims;
 
 // Max box taps per axis. 4 covers up to a 4:1 downscale per pass; the
@@ -37,9 +42,12 @@ const MAX_K: i32 = 4;
 // BT.709 limited-range YUV → RGB for P010 (same constants as
 // `fisheye_p010_to_hequirect.wgsl::yuv_to_rgb_bt709_p010`).
 fn yuv_to_rgb_bt709_p010(y: f32, u: f32, v: f32) -> vec3<f32> {
-    let y_l = y * (65535.0 / 56064.0) - (64.0 / 876.0);
-    let u_l = u * (65535.0 / 57344.0) - (512.0 / 896.0);
-    let v_l = v * (65535.0 / 57344.0) - (512.0 / 896.0);
+    // Range expansion comes from the uniform — (y_scale, y_off, c_scale,
+    // c_off) for P010-in-16 or NV12-in-8, limited or full range; see
+    // `yuv_range_constants` in gpu.rs. The BT.709 matrix below is unchanged.
+    let y_l = y * vec4<f32>(d.y_scale, d.y_off, d.c_scale, d.c_off).x + vec4<f32>(d.y_scale, d.y_off, d.c_scale, d.c_off).y;
+    let u_l = u * vec4<f32>(d.y_scale, d.y_off, d.c_scale, d.c_off).z + vec4<f32>(d.y_scale, d.y_off, d.c_scale, d.c_off).w;
+    let v_l = v * vec4<f32>(d.y_scale, d.y_off, d.c_scale, d.c_off).z + vec4<f32>(d.y_scale, d.y_off, d.c_scale, d.c_off).w;
     let r = y_l + 1.5748 * v_l;
     let g = y_l - 0.1873 * u_l - 0.4681 * v_l;
     let b = y_l + 1.8556 * u_l;
