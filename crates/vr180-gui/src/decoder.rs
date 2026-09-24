@@ -3043,9 +3043,9 @@ fn run_fisheye_vt_zerocopy(
     // `retire` defers the drop of replaced frames so the GPU finishes reading
     // their IOSurfaces first.
     // Only the IOSurface-aliasing frame needs manual deferral. The resolved
-    // RGBA16 texture and the SBS split halves are Device-cache-owned wgpu
-    // resources whose lifetime wgpu tracks through the submission — they must
-    // NOT be pushed here.
+    // per-eye RGBA16 textures are Device-cache-owned wgpu resources whose
+    // lifetime wgpu tracks through the submission — they must NOT be pushed
+    // here.
     let mut held: Option<VtZcFisheyeFrame> = None;
     let mut retire: std::collections::VecDeque<VtZcFisheyeFrame> = std::collections::VecDeque::new();
 

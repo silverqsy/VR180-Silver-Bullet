@@ -180,20 +180,15 @@ pub struct Device {
     /// `(w, h, texture)`; reused when dims match.
     rgba16_eq_out_cache: Mutex<HashMap<u32, (u32, u32, wgpu::Texture)>>,
     /// Reusable per-eye halves for [`Device::split_sbs_texture_16`], keyed by
-    /// SLOT and storing `(w, h, left, right)`. Same reasoning as
-    /// `rgba16_eq_out_cache`: the zero-copy SBS preview splits on the DECODER
-    /// thread, and a per-frame `create_texture` there contends with eframe's
-    /// main thread on the shared device. Safe to overwrite each frame — the
-    /// previous frame's projection reads these before this frame's copy
-    /// writes them (GPU-ordered on one queue) and nothing holds them past
-    /// compose.
-    ///
-    /// The SLOT is load-bearing for the same reason it is on
-    /// `p010_resolve_out_cache`: on macOS the export worker SHARES this
-    /// `Device` with eframe (only Windows gets a dedicated one), so exporting
-    /// an SBS clip while its preview is still decoding would put both splits
-    /// at the SAME per-eye dims — a dims-only key handed them the same two
-    /// textures and each torn the other's frame.
+    /// SLOT and storing `(w, h, left, right)`. Used by the WINDOWS side-by-side
+    /// path only (its D3D11 converter yields one whole-frame RGBA16 that is
+    /// split here; the macOS path samples each eye in place and never splits).
+    /// Same reasoning as `rgba16_eq_out_cache`: the split runs on the DECODER
+    /// thread, and a per-frame `create_texture` there contends with the main
+    /// thread. Safe to overwrite each frame — the previous frame's projection
+    /// reads these before this frame's copy writes them (GPU-ordered on one
+    /// queue) and nothing holds them past compose. Keyed by slot so a preview
+    /// and an export at the same per-eye dims can never share the pair.
     sbs_split_cache: Mutex<HashMap<u32, (u32, u32, wgpu::Texture, wgpu::Texture)>>,
     /// Reusable output texture for [`Device::resolve_p010_planes_to_rgba16`],
     /// keyed by SLOT and storing `(w, h, texture)` — same shape as
@@ -203,13 +198,14 @@ pub struct Device {
     /// The SLOT is load-bearing, not a convenience: the dual-stream preview
     /// resolves TWO eyes at IDENTICAL dims every frame, so a dims-only key
     /// would hand the same texture back for both and silently collapse the
-    /// stereo. Slots: 0 = preview dual left, 1 = preview dual right,
-    /// 2 = preview side-by-side whole frame, 32 = export side-by-side whole frame.
+    /// stereo. Slots: 0 = preview left, 1 = preview right — for a dual-stream
+    /// source one plane pair per eye, for a side-by-side source each eye's
+    /// sub-rect of the whole-frame planes. Exports do not resolve.
     ///
-    /// Why cache at all: a whole-frame side-by-side resolve at 8192x4096 is
-    /// 256 MiB of `create_texture` per frame on the render thread, contending
-    /// with eframe on the shared device — exactly what the
-    /// `rgba16_eq_out_cache` comment below exists to avoid.
+    /// Why cache at all: the preview resolves on the DECODER thread every
+    /// frame, and a per-frame `create_texture` there contends with eframe on
+    /// the shared device — exactly what the `rgba16_eq_out_cache` comment
+    /// below exists to avoid.
     p010_resolve_out_cache: Mutex<HashMap<u32, (u32, u32, wgpu::Texture)>>,
     /// Reusable MAP_READ staging buffers for texture readback, keyed by byte
     /// size. Allocating a fresh 88 MB staging buffer every frame (the P010

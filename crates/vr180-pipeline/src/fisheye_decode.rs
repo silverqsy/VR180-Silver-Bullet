@@ -1770,7 +1770,8 @@ impl VtSharedSbsIter {
     ///    (both sources unknown) is a REFUSAL because guessing is exactly
     ///    what produces silent garbage. `wrap_planes` re-checks the actual
     ///    surface (bytes per element, chroma plane height) on every frame;
-    ///  * the frame width is odd, or a dimension is zero (not splittable);
+    ///  * the frame width is not a multiple of 4, or a dimension is zero
+    ///    (an odd eye width splits a chroma pair across the seam);
     ///  * VideoToolbox will not attach, or `VR180_NO_HW_DECODE` is set.
     ///
     /// Deliberately NOT gated on `VR180_SBS_VT`. That gate exists on
@@ -1847,9 +1848,13 @@ impl VtSharedSbsIter {
         let decoder = codec_ctx.decoder().video()
             .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
         let (fw, fh) = (decoder.width(), decoder.height());
-        if fw % 2 != 0 || fw == 0 || fh == 0 {
+        // Width must be a multiple of FOUR, not two: each eye is sampled in
+        // place from the shared 4:2:0 planes, so an odd eye width would put
+        // the seam through the middle of a chroma pair that both eyes then
+        // share — no clamp can make that column right for either eye.
+        if fw % 4 != 0 || fw == 0 || fh == 0 {
             return Err(Error::Ffmpeg(format!(
-                "SBS frame {fw}x{fh} not splittable (width must be even)")));
+                "SBS frame {fw}x{fh} not splittable in place (width must be a multiple of 4)")));
         }
         let (eye_w, eye_h) = (fw / 2, fh);
         tracing::info!(
@@ -1976,10 +1981,10 @@ impl VtSharedSbsIter {
 
             // A mid-stream resolution change would leave the wrapped
             // IOSurface at the NEW size while `frame_w`/`eye_w` still
-            // describe the old one — the resolve would sample outside the
-            // plane and the split would cut at the stale eye width. Error
-            // out exactly like `SbsFisheyeIter::repack_split` rather than
-            // silently re-splitting at the wrong offset.
+            // describe the old one — every eye sub-rect the kernels clamp to
+            // would be stale. Error out exactly like
+            // `SbsFisheyeIter::repack_split` rather than silently sampling
+            // the wrong eye rect.
             if decoded.width() != self.frame_w || decoded.height() != self.frame_h {
                 return Err(Error::Ffmpeg(format!(
                     "SBS frame changed size mid-stream: expected {}x{}, got {}x{}",

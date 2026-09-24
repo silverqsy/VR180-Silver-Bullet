@@ -2797,15 +2797,10 @@ fn export_fisheye_osv_zerocopy_p010(
                 (l, r)
             }
             },
-            // Generic SBS: ONE whole-frame resolve at native (1:1, so the box
-            // filter is a single tap and the projection still does all the
-            // minification, exactly as on the dual path), then two GPU
-            // subregion copies, then the cross-platform rgba16 family. Slot 32
-            // keeps this resolve's cached output distinct from the preview's
-            // 0/1/2; slots 30/31 keep the projections' cached outputs distinct
-            // from preview 0/1 (same convention as the Windows arm).
-            // NO eye swap: the halves are already in L|R frame order, matching
-            // the CPU `SbsFisheyeIter` and the Windows SBS arm.
+            // Generic SBS: the P010 kernels sample each eye straight from the
+            // whole-frame planes (see the arm). NO eye swap: the halves are
+            // already in L|R frame order, matching the CPU `SbsFisheyeIter`
+            // and the Windows SBS arm.
             ZcMacFrame::Sbs(f) => {
                 // Sample the whole-frame P010 planes IN PLACE, one eye per
                 // dispatch: `src_x0` selects the eye's sub-rect and the kernels
