@@ -291,10 +291,17 @@ struct P010ResolvePipeline {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ResolveDims {
+    /// The rect being resolved (an eye, or a whole frame), in source pixels.
     src_w: f32,
     src_h: f32,
     out_w: f32,
     out_h: f32,
+    /// X offset of that rect within the source plane; 0 unless resolving one
+    /// eye of a side-by-side frame. Padded to two vec4s.
+    src_x0: f32,
+    _p1: f32,
+    _p2: f32,
+    _p3: f32,
 }
 
 #[derive(Debug)]
@@ -2068,7 +2075,7 @@ struct FisheyeCalibUniforms {
     // `_pad0` slot so the uniform layout is unchanged. 0 for sources that
     // only have a 4-coeff model → the new term vanishes (back-compat).
     theta_trans: f32, theta_max: f32, r_max: f32, k5: f32,
-    src_w: f32, src_h: f32, output_hfov_rad: f32, _pad2: f32,
+    src_w: f32, src_h: f32, output_hfov_rad: f32, src_x0: f32, // src_x0: eye's x offset in the plane (0 unless side-by-side)
     // xi > 0 switches the shader to the unified camera model (Insta360):
     // k1..k5 then form the even radial polynomial on the UCM plane and the
     // two rows below carry its tangential (ta,tb,tc,te) and thin-prism
@@ -2125,6 +2132,13 @@ pub struct FisheyeCalib {
     pub tangential: [f32; 4],
     /// UCM thin-prism terms `[s1, s2, s3, s4]`: `x += s1 r² + s2 r⁴`, `y += s3 r² + s4 r⁴`.
     pub prism: [f32; 4],
+    /// X offset of this eye's rect within the SOURCE PLANE, in luma pixels.
+    /// Zero for every dual-stream source and for per-eye textures. Non-zero
+    /// only when a generic side-by-side frame is sampled in place: the right
+    /// eye starts at `src_w`. Read by the P010 kernels, which clamp their
+    /// taps to the eye rect before offsetting (see the shader comment);
+    /// the RGBA16 kernels are handed per-eye textures and ignore it.
+    pub src_x0: f32,
     /// KB → cubic-Hermite extension boundary (radians).
     pub theta_trans: f32,
     /// Cubic extension upper bound (radians).
@@ -2216,7 +2230,7 @@ impl FisheyeCalib {
             r_max, src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
-            src_proj: 0.0,
+            src_proj: 0.0, src_x0: 0.0,
         }
     }
 
@@ -2254,7 +2268,7 @@ impl FisheyeCalib {
             src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
-            src_proj: 0.0,
+            src_proj: 0.0, src_x0: 0.0,
         }
     }
 
@@ -2301,7 +2315,7 @@ impl FisheyeCalib {
             src_w, src_h,
             output_hfov_rad: std::f32::consts::FRAC_PI_2,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
-            src_proj: 0.0,
+            src_proj: 0.0, src_x0: 0.0,
         }
     }
 
@@ -2353,7 +2367,7 @@ impl FisheyeCalibUniforms {
             k5: c.k5,
             src_w: c.src_w, src_h: c.src_h,
             output_hfov_rad: c.output_hfov_rad,
-            _pad2: 0.0,
+            src_x0: c.src_x0,
             p1: c.p1, p2: c.p2, xi: c.xi, src_proj: c.src_proj,
             ta: c.tangential[0], tb: c.tangential[1], tc: c.tangential[2], te: c.tangential[3],
             s1: c.prism[0], s2: c.prism[1], s3: c.prism[2], s4: c.prism[3],
@@ -5345,6 +5359,7 @@ impl Device {
         let dims = self.write_uniform("p010_resolve_dims", &ResolveDims {
             src_w: src_w as f32, src_h: src_h as f32,
             out_w: out_w as f32, out_h: out_h as f32,
+            src_x0: 0.0, _p1: 0.0, _p2: 0.0, _p3: 0.0,
         });
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("p010_resolve_bg"),
@@ -5386,13 +5401,18 @@ impl Device {
     /// `slot` picks the cached output texture (see `p010_resolve_out_cache`).
     /// CALLERS MUST USE A DISTINCT SLOT PER CONCURRENT OUTPUT: the dual-stream
     /// preview resolves both eyes at identical dims in one frame, so sharing a
-    /// slot would alias left and right. 0 = preview left, 1 = preview right,
-    /// 2 = preview side-by-side whole frame, 32 = export side-by-side whole frame.
+    /// slot would alias left and right. 0 = preview left, 1 = preview right
+    /// (the side-by-side preview resolves each eye from its `src_x0` sub-rect
+    /// of the whole-frame planes into these same two slots; the side-by-side
+    /// export samples P010 directly and does not resolve at all).
+    /// `src_w`/`src_h` describe the rect being resolved and `src_x0` its x
+    /// offset in the plane — 0 for a whole frame or a per-eye texture.
     pub fn resolve_p010_planes_to_rgba16(
         &self,
         y_tex: &wgpu::Texture,
         uv_tex: &wgpu::Texture,
         src_w: u32, src_h: u32,
+        src_x0: u32,
         out_w: u32, out_h: u32,
         slot: u32,
     ) -> Result<wgpu::Texture> {
@@ -5429,6 +5449,7 @@ impl Device {
         let dims = self.write_uniform("p010_resolve_planes_dims", &ResolveDims {
             src_w: src_w as f32, src_h: src_h as f32,
             out_w: out_w as f32, out_h: out_h as f32,
+            src_x0: src_x0 as f32, _p1: 0.0, _p2: 0.0, _p3: 0.0,
         });
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("p010_resolve_planes_bg"),

@@ -49,7 +49,7 @@ struct FisheyeCalibUniforms {
     fx: f32, fy: f32, cx: f32, cy: f32,
     k1: f32, k2: f32, k3: f32, k4: f32,
     theta_trans: f32, theta_max: f32, r_max: f32, k5: f32,
-    src_w: f32, src_h: f32, output_hfov_rad: f32, _pad2: f32,
+    src_w: f32, src_h: f32, output_hfov_rad: f32, src_x0: f32,
     p1: f32, p2: f32, xi: f32, src_proj: f32,     // xi > 0 selects the unified camera model; src_proj > 0.5 = half-equirect input (no lens model)
     ta: f32, tb: f32, tc: f32, te: f32,            // UCM tangential: (r²+2x²)(ta + tc r²) + 2xy(tb + te r²)
     s1: f32, s2: f32, s3: f32, s4: f32,            // UCM thin prism: x += s1 r² + s2 r⁴, y += s3 r² + s4 r⁴
@@ -248,11 +248,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Sample Y at full res, UV at half res (matches chroma-siting
     // convention from the non-RS P010 shader).
+    // Eye sub-rect: `src_w`/`src_h` are the EYE's dims (the lens model and
+    // the half-equirect mapping normalise by them); the planes may be wider —
+    // a generic side-by-side frame holds both eyes in ONE texture and this
+    // eye starts at `src_x0`. Clamp in TEXEL space to the eye's own rect
+    // BEFORE offsetting: the ClampToEdge sampler only knows the texture's
+    // edge, and an out-of-rect tap — or a chroma tap on the eye's last
+    // column, which sits exactly on the boundary — would otherwise
+    // bilinear-blend the OTHER eye in. Dual-stream sources pass src_x0 = 0
+    // with eye == plane, so the clamp reduces to ClampToEdge: bit-identical.
     let sw = cal.src_w;
     let sh = cal.src_h;
     let stream_xy = src;
-    let y_uv  = (stream_xy + vec2<f32>(0.5)) / vec2<f32>(sw, sh);
-    let uv_uv = (stream_xy * 0.5 + vec2<f32>(0.5)) / vec2<f32>(sw * 0.5, sh * 0.5);
+    let plane_y  = vec2<f32>(textureDimensions(fisheye_y));
+    let plane_uv = vec2<f32>(textureDimensions(fisheye_uv));
+    let y_px  = clamp(stream_xy + vec2<f32>(0.5),
+                      vec2<f32>(0.5), vec2<f32>(sw - 0.5, sh - 0.5))
+              + vec2<f32>(cal.src_x0, 0.0);
+    let uv_px = clamp(stream_xy * 0.5 + vec2<f32>(0.5),
+                      vec2<f32>(0.5), vec2<f32>(sw * 0.5 - 0.5, sh * 0.5 - 0.5))
+              + vec2<f32>(cal.src_x0 * 0.5, 0.0);
+    let y_uv  = y_px / plane_y;
+    let uv_uv = uv_px / plane_uv;
     let y_sample  = textureSampleLevel(fisheye_y,  fisheye_smp, y_uv,  0.0).r;
     let uv_sample = textureSampleLevel(fisheye_uv, fisheye_smp, uv_uv, 0.0).rg;
     let rgb = yuv_to_rgb_bt709_p010(y_sample, uv_sample.r, uv_sample.g);

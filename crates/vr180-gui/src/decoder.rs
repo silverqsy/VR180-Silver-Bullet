@@ -3226,29 +3226,25 @@ fn run_fisheye_vt_zerocopy(
             VtZcFisheyeFrame::Pair(p) => (
                 pipeline.resolve_p010_planes_to_rgba16(
                     &p.left_y.texture, &p.left_uv.texture,
-                    native_w, native_h, src_w, src_h, 0)?,
+                    native_w, native_h, 0, src_w, src_h, 0)?,
                 pipeline.resolve_p010_planes_to_rgba16(
                     &p.right_y.texture, &p.right_uv.texture,
-                    native_w, native_h, src_w, src_h, 1)?,
+                    native_w, native_h, 0, src_w, src_h, 1)?,
             ),
-            // Generic SBS: ONE resolve of the WHOLE frame, then two GPU
-            // subregion copies. `src_w * 2` is load-bearing — the resolve is a
-            // per-axis box downscale by src/out, so a per-eye out width would
-            // squash the image 2x horizontally (a plausible-looking stretch,
-            // never an error). The X and Y ratios stay equal to the per-eye
-            // ratios, which is what keeps the shader's MAX_K = 4 box within
-            // budget. Do NOT instead hand the fisheye shaders an x-offset:
-            // they normalise by cal.src_w/src_h and ClampToEdge, so an
-            // out-of-frame tap lands in the OTHER EYE.
-            VtZcFisheyeFrame::Sbs(f) => {
-                let full = pipeline.resolve_p010_planes_to_rgba16(
+            // Generic SBS: one resolve PER EYE straight from its sub-rect of the
+            // whole-frame planes (`src_x0` = 0 / eye_w), into the same slots
+            // the dual-stream arm uses — no whole-frame texture, no split.
+            // The box prefilter stays: it is what keeps the working-res
+            // preview free of chroma moiré, which is why the preview resolves
+            // instead of sampling native P010 directly the way the export does.
+            VtZcFisheyeFrame::Sbs(f) => (
+                pipeline.resolve_p010_planes_to_rgba16(
                     &f.frame_y.texture, &f.frame_uv.texture,
-                    f.frame_w, f.frame_h, src_w * 2, src_h, 2)?;
-                // Cached halves, slot 2 (the export's SBS split uses 32 — on
-                // macOS it shares this Device). Consume them THIS frame (the
-                // projections below do) and never stash them.
-                pipeline.split_sbs_texture_16(&full, src_w, src_h, 2)?
-            }
+                    f.eye_w, f.eye_h, 0, src_w, src_h, 0)?,
+                pipeline.resolve_p010_planes_to_rgba16(
+                    &f.frame_y.texture, &f.frame_uv.texture,
+                    f.eye_w, f.eye_h, f.eye_w, src_w, src_h, 1)?,
+            ),
         };
 
         // Frame-level stab rotation.

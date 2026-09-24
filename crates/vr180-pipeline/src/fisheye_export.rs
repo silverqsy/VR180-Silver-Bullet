@@ -2807,34 +2807,45 @@ fn export_fisheye_osv_zerocopy_p010(
             // NO eye swap: the halves are already in L|R frame order, matching
             // the CPU `SbsFisheyeIter` and the Windows SBS arm.
             ZcMacFrame::Sbs(f) => {
-                let full = pipeline.resolve_p010_planes_to_rgba16(
-                    &f.frame_y.texture, &f.frame_uv.texture,
-                    f.frame_w, f.frame_h, f.frame_w, f.frame_h, 32)?;
-                let (l_tex, r_tex) = pipeline.split_sbs_texture_16(&full, src_w, src_h, 32)?;
+                // Sample the whole-frame P010 planes IN PLACE, one eye per
+                // dispatch: `src_x0` selects the eye's sub-rect and the kernels
+                // clamp every tap to it (see fisheye_p010_to_hequirect.wgsl),
+                // so nothing bleeds across the seam. No resolve, no split —
+                // at 8K that was a 268 MB whole-frame RGBA16 plus two 134 MB
+                // halves per frame, and two full-frame passes. These are the
+                // same kernels the dual-stream arm above uses, so generic SBS
+                // and OSV/X6 now render through identical code.
+                let (cal_l, cal_r) = {
+                    let (mut l, mut r) = (calib_left, calib_right);
+                    l.src_x0 = 0.0;
+                    r.src_x0 = f.eye_w as f32;
+                    (l, r)
+                };
+                let (y, uv) = (&f.frame_y.texture, &f.frame_uv.texture);
                 match (cfg.projection, rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                     (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, Some(rs_l), Some(rs_r)) => (
-                        pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                            &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 30)?,
-                        pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                            &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 31)?,
+                        pipeline.project_fisheye_p010_to_equirect_rs_texture_16(
+                            y, uv, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, cal_l, rs_l)?,
+                        pipeline.project_fisheye_p010_to_equirect_rs_texture_16(
+                            y, uv, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, cal_r, rs_r)?,
                     ),
                     (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, _, _) => (
-                        pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                            &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30)?,
-                        pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                            &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31)?,
+                        pipeline.project_fisheye_p010_to_equirect_texture_16(
+                            y, uv, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, cal_l)?,
+                        pipeline.project_fisheye_p010_to_equirect_texture_16(
+                            y, uv, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, cal_r)?,
                     ),
                     (FisheyeExportProjection::Fisheye, Some(rs_l), Some(rs_r)) => (
-                        pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                            &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 30)?,
-                        pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                            &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 31)?,
+                        pipeline.project_fisheye_p010_to_fisheye_rs_texture_16(
+                            y, uv, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, cal_l, rs_l)?,
+                        pipeline.project_fisheye_p010_to_fisheye_rs_texture_16(
+                            y, uv, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, cal_r, rs_r)?,
                     ),
                     (FisheyeExportProjection::Fisheye, _, _) => (
-                        pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                            &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30)?,
-                        pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                            &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31)?,
+                        pipeline.project_fisheye_p010_to_fisheye_texture_16(
+                            y, uv, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, cal_l)?,
+                        pipeline.project_fisheye_p010_to_fisheye_texture_16(
+                            y, uv, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, cal_r)?,
                     ),
                 }
             }

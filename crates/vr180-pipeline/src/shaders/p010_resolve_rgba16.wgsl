@@ -25,7 +25,9 @@
 @group(0) @binding(2) var smp: sampler;
 @group(0) @binding(3) var out_tex: texture_storage_2d<rgba16unorm, write>;
 
-struct Dims { src_w: f32, src_h: f32, out_w: f32, out_h: f32 }
+// src_w/src_h = the EYE (or whole frame) being resolved; src_x0 = its x
+// offset in the plane (0 unless resolving one eye of a side-by-side frame).
+struct Dims { src_w: f32, src_h: f32, out_w: f32, out_h: f32, src_x0: f32, _p1: f32, _p2: f32, _p3: f32 }
 @group(0) @binding(4) var<uniform> d: Dims;
 
 // Max box taps per axis. 4 covers up to a 4:1 downscale per pass; the
@@ -66,8 +68,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let sxy = vec2<f32>(cx + ox, cy + oy);
             // Y at full res; UV bilinear from the half-res plane = full-res
             // chroma upsample at this exact source position.
-            let y_uv  = (sxy + vec2<f32>(0.5)) / vec2<f32>(d.src_w, d.src_h);
-            let uv_uv = (sxy * 0.5 + vec2<f32>(0.5)) / vec2<f32>(d.src_w * 0.5, d.src_h * 0.5);
+            // Clamp in texel space to the rect being resolved, then offset —
+            // same reasoning as the projection shaders' eye sub-rect: with a
+            // side-by-side plane, ClampToEdge alone would blend the other eye.
+            let y_px  = clamp(sxy + vec2<f32>(0.5),
+                              vec2<f32>(0.5), vec2<f32>(d.src_w - 0.5, d.src_h - 0.5))
+                      + vec2<f32>(d.src_x0, 0.0);
+            let uv_px = clamp(sxy * 0.5 + vec2<f32>(0.5),
+                              vec2<f32>(0.5), vec2<f32>(d.src_w * 0.5 - 0.5, d.src_h * 0.5 - 0.5))
+                      + vec2<f32>(d.src_x0 * 0.5, 0.0);
+            let y_uv  = y_px / vec2<f32>(textureDimensions(src_y));
+            let uv_uv = uv_px / vec2<f32>(textureDimensions(src_uv));
             let yv  = textureSampleLevel(src_y,  smp, y_uv,  0.0).r;
             let uvv = textureSampleLevel(src_uv, smp, uv_uv, 0.0).rg;
             acc = acc + yuv_to_rgb_bt709_p010(yv, uvv.r, uvv.g);
