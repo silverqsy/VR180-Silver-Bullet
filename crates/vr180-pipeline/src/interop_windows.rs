@@ -112,54 +112,20 @@ impl VulkanImportCtx {
             };
             let ext_mem_win32 =
                 ash::khr::external_memory_win32::Device::new(&instance, &ash_device);
-            let ctx = Self {
+            // No adapter check here any more. The d3d11va decoder is now
+            // created ON the adapter this context reports
+            // (`vulkan_device_luid` → `decode::enable_d3d11va_decode_on_adapter`),
+            // so a hybrid machine gets a MATCHING decoder and keeps the fast
+            // path, instead of the context refusing itself and dropping every
+            // hybrid box to the portable path. The iterators still decline
+            // when the LUID is unavailable or the adapter cannot be resolved.
+            Some(Self {
                 instance,
                 physical_device,
                 device: ash_device,
                 ext_mem_win32,
-            };
-            // Cross-API sharing REQUIRES both APIs on the same physical GPU.
-            // ffmpeg's d3d11va device is created with a NULL device name, i.e.
-            // DXGI adapter 0, while wgpu picks its own adapter — on a hybrid
-            // machine (iGPU + dGPU) those can differ, and then the imported NT
-            // handle is meaningless to Vulkan: `import_d3d11_handle_to_wgpu`
-            // fails at the memory-type / allocate step, which is `.expect()`ed
-            // and takes the thread down. Refuse the context instead. Every
-            // caller already treats `None` as "no zero-copy" and falls through
-            // to the portable path, which downloads frames to the CPU and is
-            // therefore adapter-agnostic — so the user still gets a working
-            // (slower) decode rather than a panic.
-            match (vulkan_device_luid(&ctx), dxgi_default_adapter_luid()) {
-                (Some(vk_luid), Some(dx_luid)) if vk_luid != dx_luid => {
-                    tracing::warn!(
-                        "zero-copy import disabled: wgpu is on a different GPU than the D3D11 decoder (vulkan LUID {vk_luid:02x?} vs DXGI adapter 0 {dx_luid:02x?}) — using the portable decode path"
-                    );
-                    return None;
-                }
-                // Either LUID unavailable: proceed as before rather than
-                // disabling the fast path on a machine we cannot interrogate.
-                _ => {}
-            }
-            Some(ctx)
+            })
         }
-    }
-}
-
-/// LUID of **DXGI adapter 0** — the adapter ffmpeg's `d3d11va` device lands on,
-/// since `av_hwdevice_ctx_create` is called with a NULL device name. Compared
-/// against the wgpu device's LUID in [`VulkanImportCtx::from_wgpu`].
-pub fn dxgi_default_adapter_luid() -> Option<[u8; 8]> {
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
-    unsafe {
-        let factory = CreateDXGIFactory1::<IDXGIFactory1>().ok()?;
-        let adapter = factory.EnumAdapters(0).ok()?;
-        let desc = adapter.GetDesc().ok()?;
-        // Vulkan reports the LUID as 8 raw bytes; DXGI splits it into
-        // (LowPart: u32, HighPart: i32). Same 64 bits, little-endian.
-        let mut luid = [0u8; 8];
-        luid[..4].copy_from_slice(&desc.AdapterLuid.LowPart.to_ne_bytes());
-        luid[4..].copy_from_slice(&desc.AdapterLuid.HighPart.to_ne_bytes());
-        Some(luid)
     }
 }
 

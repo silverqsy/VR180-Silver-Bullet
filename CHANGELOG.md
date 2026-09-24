@@ -27,6 +27,16 @@ instead of removing it ("twice as shaky").
 Pre-mod (stock, 360°) X6 files are not a target of this app, so no behaviour
 was kept for them.
 
+### Fixed: Windows machines with two GPUs
+- On a hybrid Windows machine (an integrated GPU alongside a discrete one,
+  which is most laptops) the hardware decoder could land on a different GPU
+  from the renderer. The zero-copy preview would then hang before the first
+  frame, stuck on "Loading stabilization data…", and a stopgap that shipped
+  briefly dropped every such machine to the slow CPU path instead. The decoder
+  is now created on the same GPU the renderer chose and its identity verified
+  before use, so hybrid machines keep the GPU fast path. Verified on both GPUs
+  of a 4090 + Intel UHD box. Contributed by @Norman3D.
+
 ### macOS: side-by-side sources get the zero-copy GPU path
 
 `.360`, `.osv` and `.insv` clips have decoded straight into GPU memory on

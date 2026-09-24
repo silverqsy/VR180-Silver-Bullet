@@ -1300,7 +1300,7 @@ impl D3d11SharedDualStreamIter {
     /// + downscaled to (clamped to never upscale past native). Returns an error
     /// (so the caller can fall back to the CPU path) if there aren't two video
     /// streams or `d3d11va` can't attach to either stream.
-    pub fn new(path: &Path, swap_eyes: bool, work_w: u32, work_h: u32) -> Result<Self> {
+    pub fn new(path: &Path, swap_eyes: bool, work_w: u32, work_h: u32, adapter_luid: Option<[u8; 8]>) -> Result<Self> {
         ffmpeg_init();
         let ictx = ffmpeg_next::format::input(path)
             .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
@@ -1323,11 +1323,7 @@ impl D3d11SharedDualStreamIter {
             let mut codec_ctx =
                 ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
                     .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
-            if !crate::decode::try_enable_d3d11va_decode_n(&mut codec_ctx, 2) {
-                return Err(Error::Ffmpeg(format!(
-                    "zero-copy OSV path requires d3d11va hwaccel — setup failed on stream {idx}"
-                )));
-            }
+            crate::decode::enable_d3d11va_decode_on_adapter(&mut codec_ctx, adapter_luid, 2)?;
             decoders.push(
                 codec_ctx.decoder().video()
                     .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?,
@@ -2221,15 +2217,20 @@ impl std::fmt::Debug for D3d11SharedSbsIter {
 #[cfg(target_os = "windows")]
 impl D3d11SharedSbsIter {
     /// Native-resolution (no downscale) — what the export wants.
-    pub fn new(path: &Path) -> Result<Self> {
-        Self::new_with_work(path, u32::MAX, u32::MAX)
+    pub fn new(path: &Path, adapter_luid: Option<[u8; 8]>) -> Result<Self> {
+        Self::new_with_work(path, u32::MAX, u32::MAX, adapter_luid)
     }
 
     /// `work_w`/`work_h` are the PER-EYE working dims, clamped to native
     /// (same convention as [`D3d11SharedDualStreamIter::new`]): the D3D11
     /// P010→RGBA16 convert downscales to `2·work_w × work_h` so the live
     /// preview doesn't push full 8K frames through the projection.
-    pub fn new_with_work(path: &Path, work_w: u32, work_h: u32) -> Result<Self> {
+    pub fn new_with_work(
+        path: &Path,
+        work_w: u32,
+        work_h: u32,
+        adapter_luid: Option<[u8; 8]>,
+    ) -> Result<Self> {
         ffmpeg_init();
         let ictx = ffmpeg_next::format::input(path)
             .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
@@ -2272,10 +2273,10 @@ impl D3d11SharedSbsIter {
         let mut codec_ctx =
             ffmpeg_next::codec::context::Context::from_parameters(video.parameters())
                 .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
-        if !crate::decode::try_enable_d3d11va_decode(&mut codec_ctx) {
-            return Err(Error::Ffmpeg(
-                "zero-copy SBS path requires d3d11va hwaccel — setup failed".into()));
-        }
+        // One stream here, so budget one decoder. Same per-adapter attach as
+        // the dual-stream arms: this frame is imported into Vulkan, so the
+        // decoder has to sit on the wgpu adapter.
+        crate::decode::enable_d3d11va_decode_on_adapter(&mut codec_ctx, adapter_luid, 1)?;
         let decoder = codec_ctx.decoder().video()
             .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
         let (fw, fh) = (decoder.width(), decoder.height());
@@ -2476,7 +2477,7 @@ impl D3d11SharedStreamPairIter {
     /// streams. The two video streams (s0, s4) are the first two video
     /// tracks — same selection as `StreamPairIter` / the macOS
     /// `ZeroCopyStreamPairIter`.
-    pub fn new(path: &Path) -> Result<Self> {
+    pub fn new(path: &Path, adapter_luid: Option<[u8; 8]>) -> Result<Self> {
         ffmpeg_init();
         let ictx = ffmpeg_next::format::input(path)
             .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
@@ -2499,11 +2500,7 @@ impl D3d11SharedStreamPairIter {
             let mut codec_ctx =
                 ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
                     .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
-            if !crate::decode::try_enable_d3d11va_decode_n(&mut codec_ctx, 2) {
-                return Err(Error::Ffmpeg(format!(
-                    "zero-copy EAC path requires d3d11va hwaccel — setup failed on stream {idx}"
-                )));
-            }
+            crate::decode::enable_d3d11va_decode_on_adapter(&mut codec_ctx, adapter_luid, 2)?;
             decoders.push(
                 codec_ctx.decoder().video()
                     .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?,
@@ -2672,6 +2669,7 @@ pub struct SegmentedD3d11SharedStreamPairIter {
     total_dur_s: f64,
     cur_idx: usize,
     cur: D3d11SharedStreamPairIter,
+    adapter_luid: Option<[u8; 8]>,
 }
 
 #[cfg(target_os = "windows")]
@@ -2687,7 +2685,7 @@ impl std::fmt::Debug for SegmentedD3d11SharedStreamPairIter {
 
 #[cfg(target_os = "windows")]
 impl SegmentedD3d11SharedStreamPairIter {
-    pub fn new(segments: &[std::path::PathBuf]) -> Result<Self> {
+    pub fn new(segments: &[std::path::PathBuf], adapter_luid: Option<[u8; 8]>) -> Result<Self> {
         assert!(!segments.is_empty(), "segments must be non-empty");
         let mut seg_start_s = Vec::with_capacity(segments.len());
         let mut acc = 0.0_f64;
@@ -2701,12 +2699,13 @@ impl SegmentedD3d11SharedStreamPairIter {
                 .or_else(|| crate::decode::probe_video(seg).ok().map(|p| p.duration_sec))
                 .unwrap_or(0.0);
         }
-        let cur = D3d11SharedStreamPairIter::new(&segments[0])?;
+        let cur = D3d11SharedStreamPairIter::new(&segments[0], adapter_luid)?;
         tracing::info!(
             "SegmentedD3d11SharedStreamPairIter: {} segment(s), {:.1}s total",
             segments.len(), acc,
         );
         Ok(Self {
+            adapter_luid,
             segments: segments.to_vec(),
             seg_start_s, total_dur_s: acc, cur_idx: 0, cur,
         })
@@ -2722,7 +2721,7 @@ impl SegmentedD3d11SharedStreamPairIter {
         let t = target_s.clamp(0.0, self.total_dur_s);
         let idx = self.seg_start_s.iter().rposition(|&s| s <= t).unwrap_or(0);
         if idx != self.cur_idx {
-            self.cur = D3d11SharedStreamPairIter::new(&self.segments[idx])?;
+            self.cur = D3d11SharedStreamPairIter::new(&self.segments[idx], self.adapter_luid)?;
             self.cur_idx = idx;
         }
         self.cur.seek(t - self.seg_start_s[idx])
@@ -2739,7 +2738,7 @@ impl SegmentedD3d11SharedStreamPairIter {
                 return Ok(None);
             }
             self.cur_idx += 1;
-            self.cur = D3d11SharedStreamPairIter::new(&self.segments[self.cur_idx])?;
+            self.cur = D3d11SharedStreamPairIter::new(&self.segments[self.cur_idx], self.adapter_luid)?;
         }
     }
 }
@@ -2766,6 +2765,7 @@ pub struct SegmentedD3d11SharedDualStreamIter {
     swap_eyes: bool,
     work_w: u32,
     work_h: u32,
+    adapter_luid: Option<[u8; 8]>,
 }
 
 #[cfg(target_os = "windows")]
@@ -2786,6 +2786,7 @@ impl SegmentedD3d11SharedDualStreamIter {
         swap_eyes: bool,
         work_w: u32,
         work_h: u32,
+        adapter_luid: Option<[u8; 8]>,
     ) -> Result<Self> {
         assert!(!segments.is_empty(), "segments must be non-empty");
         let mut seg_start_s = Vec::with_capacity(segments.len());
@@ -2800,7 +2801,7 @@ impl SegmentedD3d11SharedDualStreamIter {
                 .or_else(|| crate::decode::probe_video(seg).ok().map(|p| p.duration_sec))
                 .unwrap_or(0.0);
         }
-        let cur = D3d11SharedDualStreamIter::new(&segments[0], swap_eyes, work_w, work_h)?;
+        let cur = D3d11SharedDualStreamIter::new(&segments[0], swap_eyes, work_w, work_h, adapter_luid)?;
         tracing::info!(
             "SegmentedD3d11SharedDualStreamIter: {} segment(s), {:.1}s total",
             segments.len(), acc,
@@ -2808,7 +2809,7 @@ impl SegmentedD3d11SharedDualStreamIter {
         Ok(Self {
             segments: segments.to_vec(),
             seg_start_s, total_dur_s: acc, cur_idx: 0, cur,
-            swap_eyes, work_w, work_h,
+            swap_eyes, work_w, work_h, adapter_luid,
         })
     }
 
@@ -2818,7 +2819,7 @@ impl SegmentedD3d11SharedDualStreamIter {
 
     fn open_segment(&self, idx: usize) -> Result<D3d11SharedDualStreamIter> {
         D3d11SharedDualStreamIter::new(
-            &self.segments[idx], self.swap_eyes, self.work_w, self.work_h)
+            &self.segments[idx], self.swap_eyes, self.work_w, self.work_h, self.adapter_luid)
     }
 
     /// PRECISE seek to a GLOBAL clip time: map to the owning segment + local

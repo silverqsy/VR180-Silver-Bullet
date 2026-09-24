@@ -243,28 +243,36 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    nothing at startup (no spurious chip).
    Regression sweep after all three: OSV/`.360`/SBS × nvenc/prores/portable
    all pass at unchanged fps, software-fallback output is pixel-identical to
-   hardware (0.72/255 mean, encoder noise). SAME DAY: **cross-GPU guard.** The
-   remaining hazard in `import_d3d11_handle_to_wgpu` was never OOM (the import
-   is +0 MiB — it aliases D3D11 memory); it is **adapter mismatch**. ffmpeg's
-   d3d11va device is created with a NULL device name = DXGI adapter 0, while
-   wgpu picks its own adapter, so on a hybrid machine (iGPU + dGPU) the NT
-   handle is meaningless to Vulkan and the import dies on one of six
-   `.expect()`s. `VulkanImportCtx::from_wgpu` now compares
-   `vulkan_device_luid()` against the new `dxgi_default_adapter_luid()` and
-   returns `None` on mismatch — one place, because every zero-copy caller
-   already treats `None` as "no zero-copy" and falls through to the PORTABLE
-   path, which downloads to the CPU and is adapter-agnostic. So a hybrid
-   laptop gets a working (slower) decode instead of a panic, with no new
-   fallback plumbing. (`vulkan_device_luid` previously had no caller outside
-   an example.) PROVEN on this box, which really is hybrid:
-   `examples/luid_check.rs` (gitignored) builds a ctx on every Vulkan adapter
-   — the RTX 4090 (matching DXGI adapter 0) is ACCEPTED, the Intel UHD 770 is
-   REFUSED with the fallback warning. Zero refusals during normal 4090
-   operation; full export matrix unchanged. **Still open (deliberately):** the
-   six `.expect()`s themselves — with the LUID guard in front of them the
-   realistic trigger is gone, and de-panicking them means threading
-   `Option`/`Result` through ~12 call sites in hot loops (they also leak the
-   `VkImage` on the allocate/bind failure paths).
+   hardware (0.72/255 mean, encoder noise). SAME DAY: a **cross-GPU guard**
+   went into `VulkanImportCtx::from_wgpu` (refuse the context when the wgpu
+   adapter's LUID differed from DXGI adapter 0, i.e. detect a hybrid iGPU+dGPU
+   box and drop it to the portable path) — **SUPERSEDED 2026-09-24 by PR #7
+   (Norman3D), which is the better fix: steer the decoder onto the right
+   adapter instead of detecting the mismatch.** The hazard it addressed is
+   real — the zero-copy import is +0 MiB (it aliases D3D11 memory), so the
+   only way `import_d3d11_handle_to_wgpu` dies is an **adapter mismatch**:
+   ffmpeg's `d3d11va` device used a NULL device name = DXGI adapter 0 while
+   wgpu picked its own, and on a hybrid machine the NT handle is then
+   meaningless to Vulkan. Now `decode::enable_d3d11va_decode_on_adapter`
+   resolves the DXGI index for `vulkan_device_luid()`, creates the d3d11va
+   device on THAT adapter (index passed as the device-name string), and
+   verifies the LUID off the real `ID3D11Device` before attaching — so a
+   hybrid laptop KEEPS the fast path. Every zero-copy iterator (dual-stream,
+   EAC pair, generic SBS) takes an `adapter_luid: Option<[u8; 8]>` from the
+   `VulkanImportCtx`; `None` or an unresolvable adapter declines at
+   construction so the portable ladder still works. The function ALSO carries
+   the VRAM pre-flight (`concurrent_streams`) — the PR as submitted bypassed
+   it, which would have silently reintroduced the item-11 first-frame death.
+   `dxgi_default_adapter_luid` is gone with the guard. PROVEN on this box,
+   which really is hybrid, with the PR's own `examples/windows_adapter_smoke`
+   (tracked, unlike the rest of that dir): RTX 4090 AND Intel UHD 770 both
+   PASS 18 eye imports/readbacks + segment seeks + missing/invalid-LUID
+   rejection — the Intel was REFUSED outright under the old guard. 4090
+   exports byte-identical before/after. **Still open (deliberately):** the six
+   `.expect()`s in `import_d3d11_handle_to_wgpu` — with the decoder now on the
+   matching adapter the realistic trigger is gone, and de-panicking them means
+   threading `Option`/`Result` through ~12 call sites in hot loops (they also
+   leak the `VkImage` on the allocate/bind failure paths).
 12. **Matching Eyes gained an EXPOSURE trim (2026-09-15) — CROSS-PLATFORM,
    nothing Windows-specific.** `ColorStackPlan::eye_match_exposure` (stops)
    joins `eye_match_ct`/`eye_match_tint` and is applied in the same one
