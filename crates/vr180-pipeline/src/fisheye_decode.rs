@@ -329,6 +329,8 @@ pub struct SbsFisheyeIter {
     /// measurably SLOWER than threaded software decode. Transferring into
     /// an already-allocated frame of matching format/dims reuses it.
     sw_storage: ffmpeg_next::frame::Video,
+    /// `color_range == JPEG` on the stream; passed to swscale as `src_range`.
+    full_range: bool,
     eye_w: u32,
     eye_h: u32,
     frame_limit: u32,
@@ -460,6 +462,9 @@ impl SbsFisheyeIter {
         // zoom-still worker — got it right, so the same frame would not even
         // match itself across the UI. 10-bit is unaffected (yuv420p10le and
         // p010le are both limited-range as far as swscale is concerned).
+        // SAFETY: read-only access to a POD field of AVCodecParameters.
+        let full_range = unsafe { (*video.parameters().as_ptr()).color_range }
+            == ffmpeg_next::ffi::AVColorRange::AVCOL_RANGE_JPEG;
         #[cfg(target_os = "macos")]
         let vt_range_ok = {
             let par = video.parameters();
@@ -553,6 +558,7 @@ impl SbsFisheyeIter {
         Ok(Self {
             ictx, video_idx, decoder, scaler: None, scaler_def: None,
             sw_storage: ffmpeg_next::frame::Video::empty(),
+            full_range,
             eye_w, eye_h,
             frame_limit, frames_yielded: 0,
             output_bit_depth,
@@ -745,7 +751,7 @@ impl SbsFisheyeIter {
                 // path sat much closer to a 601 reference (mean 0.45) than a
                 // 709 one (mean 1.51) before this line.
                 let s = self.scaler.as_mut().unwrap();
-                set_sws_colorspace_details(s, is_16bit);
+                set_sws_colorspace_details(s, is_16bit, self.full_range);
                 s
             }
         };
@@ -1179,7 +1185,8 @@ impl DualStreamFisheyeIter {
                 // output path otherwise picks Rec.601 for input and
                 // arbitrary range for output.
                 let s = self.scalers[pos].as_mut().unwrap();
-                set_sws_colorspace_details(s, is_16bit);
+                // Camera files are limited range; keeps OSV/X6 bit-identical.
+                set_sws_colorspace_details(s, is_16bit, false);
                 s
             }
         };
@@ -1713,6 +1720,21 @@ impl std::fmt::Debug for VtSharedSbsIter {
 }
 
 #[cfg(target_os = "macos")]
+/// `av_pix_fmt_desc_get` for a raw `AVCodecParameters::format`, null when
+/// the value is outside the enum's range. The bindgen enum is `#[repr(i32)]`,
+/// so building it from an arbitrary `c_int` by transmute would be UB for any
+/// non-discriminant; libavcodec only ever writes valid discriminants or
+/// `AV_PIX_FMT_NONE` (−1), but the check costs nothing and makes the
+/// transmute sound by construction.
+fn pix_fmt_desc(fmt: i32) -> *const ffmpeg_next::ffi::AVPixFmtDescriptor {
+    use ffmpeg_next::ffi::AVPixelFormat;
+    if fmt < AVPixelFormat::AV_PIX_FMT_NONE as i32 || fmt >= AVPixelFormat::AV_PIX_FMT_NB as i32 {
+        return std::ptr::null();
+    }
+    // SAFETY: range-checked above, so the transmute yields a valid discriminant.
+    unsafe { ffmpeg_next::ffi::av_pix_fmt_desc_get(std::mem::transmute::<i32, AVPixelFormat>(fmt)) }
+}
+
 /// Luma bit depth of a stream, from `AVCodecParameters`.
 ///
 /// `bits_per_raw_sample` is the obvious field but is frequently **0** even
@@ -1731,8 +1753,7 @@ fn codecpar_luma_depth(par: &ffmpeg_next::codec::Parameters) -> i32 {
         if p.bits_per_raw_sample > 0 {
             return p.bits_per_raw_sample;
         }
-        let desc = ffmpeg_next::ffi::av_pix_fmt_desc_get(
-            std::mem::transmute::<i32, ffmpeg_next::ffi::AVPixelFormat>(p.format));
+        let desc = pix_fmt_desc(p.format);
         if desc.is_null() {
             return 0;
         }
@@ -1746,10 +1767,9 @@ fn codecpar_luma_depth(par: &ffmpeg_next::codec::Parameters) -> i32 {
 /// sampling in the kernels are built for. Unknown format → false.
 #[cfg(target_os = "macos")]
 fn codecpar_is_420(par: &ffmpeg_next::codec::Parameters) -> bool {
-    // SAFETY: read-only; `av_pix_fmt_desc_get` returns null for unknown formats.
+    // SAFETY: read-only access to a POD field; `pix_fmt_desc` range-checks.
     unsafe {
-        let desc = ffmpeg_next::ffi::av_pix_fmt_desc_get(
-            std::mem::transmute::<i32, ffmpeg_next::ffi::AVPixelFormat>((*par.as_ptr()).format));
+        let desc = pix_fmt_desc((*par.as_ptr()).format);
         !desc.is_null() && (*desc).log2_chroma_w == 1 && (*desc).log2_chroma_h == 1
     }
 }
@@ -1773,8 +1793,11 @@ impl VtSharedSbsIter {
     ///    (both sources unknown) is a REFUSAL because guessing is exactly
     ///    what produces silent garbage. `wrap_planes` re-checks the actual
     ///    surface (bytes per element, chroma plane height) on every frame;
-    ///  * the frame width is not a multiple of 4, or a dimension is zero
-    ///    (an odd eye width splits a chroma pair across the seam);
+    ///  * the frame width is not a multiple of 4, the height is odd, or a
+    ///    dimension is zero (an odd eye width splits a chroma pair across the
+    ///    seam; an odd height gives VT a ⌈h/2⌉-row chroma plane that the
+    ///    per-frame 4:2:0 check in `wrap_planes` would then reject with no
+    ///    CPU fallback left — refusing HERE is what makes it a fallback);
     ///  * VideoToolbox will not attach, or `VR180_NO_HW_DECODE` is set.
     ///
     /// Deliberately NOT gated on `VR180_SBS_VT`. That gate exists on
@@ -1855,9 +1878,9 @@ impl VtSharedSbsIter {
         // place from the shared 4:2:0 planes, so an odd eye width would put
         // the seam through the middle of a chroma pair that both eyes then
         // share — no clamp can make that column right for either eye.
-        if fw % 4 != 0 || fw == 0 || fh == 0 {
+        if fw % 4 != 0 || fh % 2 != 0 || fw == 0 || fh == 0 {
             return Err(Error::Ffmpeg(format!(
-                "SBS frame {fw}x{fh} not splittable in place (width must be a multiple of 4)")));
+                "SBS frame {fw}x{fh} not splittable in place (width must be a multiple of 4, height even)")));
         }
         let (eye_w, eye_h) = (fw / 2, fh);
         tracing::info!(
@@ -1880,6 +1903,8 @@ impl VtSharedSbsIter {
     /// Native PER-EYE dims — same convention as
     /// [`VtSharedDualStreamIter::eye_dims`]; the consumer downscales itself.
     pub fn eye_dims(&self) -> (u32, u32) { (self.eye_w, self.eye_h) }
+    /// Source luma depth the planes are wrapped at: 8 (NV12) or 10 (P010).
+    pub fn bit_depth(&self) -> u8 { self.bit_depth }
 
     /// Native WHOLE-frame (Y-plane) dims of the decoded planes; diagnostics
     /// only — consumers work in per-eye dims (`eye_dims`) plus `src_x0`.
@@ -1897,10 +1922,6 @@ impl VtSharedSbsIter {
         Ok(())
     }
 
-    /// Wrap a VT-decoded P010 frame's IOSurface as (Y: `R16Unorm`,
-    /// UV: `Rg16Unorm`) plane textures aliasing the surface — the same recipe
-    /// as [`VtSharedDualStreamIter::wrap_p010_planes`], applied to the WHOLE
-    /// SBS frame instead of one eye.
     /// Wrap the decoded frame's two planes. Formats follow `bit_depth`; the
     /// surface is re-checked because `IOSurfaceNv12Descriptor::new` only
     /// validates `plane_count() == 2`, which NV12, P010 AND P210 all satisfy —
@@ -2119,6 +2140,10 @@ impl VtZcFisheyeSource {
     /// Native PER-EYE dims for BOTH variants — so the consumer's working-res
     /// derivation, the calib resolver and `preview_out_dims` see exactly what
     /// they see for a dual-stream source today.
+    /// Luma depth of the wrapped planes; dual-stream camera files are P010.
+    pub fn bit_depth(&self) -> u8 {
+        match self { Self::Dual(_) => 10, Self::Sbs(i) => i.bit_depth() }
+    }
     pub fn eye_dims(&self) -> (u32, u32) {
         match self {
             Self::Dual(i) => i.eye_dims(),
@@ -3511,6 +3536,7 @@ impl ZcDecoder {
 fn set_sws_colorspace_details(
     scaler: &mut ffmpeg_next::software::scaling::Context,
     is_16bit: bool,
+    full_range: bool,
 ) {
     use ffmpeg_next::ffi::*;
     unsafe {
@@ -3527,7 +3553,12 @@ fn set_sws_colorspace_details(
         //                          video range (matches OSV's HEVC
         //                          encode); destination is full
         //                          range for RGB output (RGBA64LE).
-        let src_range = 0;          // video range Y/UV in
+        // Source range from the stream's tag (swscale cannot see the
+        // AVFrame's tag through `Context::run`, only what we pass here). Must
+        // match `yuv_range_constants` on the zero-copy path so a full-range
+        // clip renders the same in the preview, the paused still and every
+        // export. Camera files are all limited; generic SBS may be either.
+        let src_range = if full_range { 1 } else { 0 };
         let dst_range = if is_16bit { 1 } else { 1 }; // full range RGB out
         let _ = sws_setColorspaceDetails(
             scaler.as_mut_ptr(),
@@ -3957,7 +3988,7 @@ mod tests {
             ffmpeg_next::software::scaling::Flags::BICUBIC
                 | ffmpeg_next::software::scaling::Flags::FULL_CHR_H_INT,
         ).expect("sws ctx");
-        set_sws_colorspace_details(&mut sws, true);
+        set_sws_colorspace_details(&mut sws, true, false);
         let mut dst = ffmpeg_next::frame::Video::empty();
         sws.run(&src, &mut dst).expect("sws run");
         // Pixel (0, 0) = first 8 bytes (RGBA, 2 bytes per channel LE).

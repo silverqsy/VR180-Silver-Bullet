@@ -1565,10 +1565,11 @@ fn run_fisheye(
                 Ok(iter) => {
                     tracing::info!(
                         "decoder (fisheye): macOS ZERO-COPY VideoToolbox path ENGAGED \
-                         ({}; P010 IOSurface → resolve → project, no host \
+                         ({}; {} IOSurface → resolve → project, no host \
                          download/swscale)",
                         if sbs_ok { "generic SBS, 1 stream".to_string() }
-                        else { format!("{} segment(s)", cfg.segments.len().max(1)) }
+                        else { format!("{} segment(s)", cfg.segments.len().max(1)) },
+                        if iter.bit_depth() == 8 { "NV12" } else { "P010" }
                     );
                     return run_fisheye_vt_zerocopy(
                         pipeline, cfg, control, kind, fps, dt, eye_w, eye_h,

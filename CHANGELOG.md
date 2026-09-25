@@ -17,7 +17,9 @@ sources on macOS.
   new path lands within 0.28/255 on flat areas (the CPU path it replaces
   was 0.78/255 dark); the preview within 0.01/255. The range tag is
   honoured too — a full-range (`pc`) source no longer gets limited-range
-  constants — on both 8- and 10-bit.
+  constants — on both 8- and 10-bit, and on the CPU fallback as well (its
+  scaler now passes the tag to swscale), so the preview, the paused still
+  and every export agree.
 - **No more whole-frame intermediate.** The side-by-side path used to
   convert the entire frame to RGBA16 and then copy out two per-eye halves
   before projecting: at 8K that is a 268 MB texture plus two 134 MB halves

@@ -50,15 +50,9 @@ struct FisheyeCalibUniforms {
 const PI: f32 = 3.14159265359;
 const HALF_PI: f32 = 1.57079632679;
 
-// BT.709 limited-range YUV → RGB for **P010** 10-bit content.
-//
-// P010 stores each 10-bit Y / UV value in the UPPER 10 bits of a u16
-// (low 6 bits zero). When sampled as R16Unorm / Rg16Unorm, wgpu hands
-// us `s ∈ [0, 1]` mapping from u16 [0, 65535]. To recover the 10-bit
-// value: `t10 = s * 65535 / 64`. Then BT.709 limited-range expansion
-// is `(t10 - 64) / 876` for Y and `(t10 - 512) / 896` for UV.
-// Pre-fused into one mul-add per channel; matches
-// `nv12_to_eac_cross.wgsl::yuv_to_rgb_bt709_p010`.
+// BT.709 YUV → RGB. The range expansion — P010 with 10 bits in the top of 16,
+// or NV12 in 8 bits, limited or full range — comes from `cal.yuv_range`
+// (see `yuv_range_constants` in gpu.rs); only the matrix lives here.
 fn yuv_to_rgb_bt709_p010(y: f32, u: f32, v: f32) -> vec3<f32> {
     // Range expansion comes from the uniform — (y_scale, y_off, c_scale,
     // c_off) for P010-in-16 or NV12-in-8, limited or full range; see

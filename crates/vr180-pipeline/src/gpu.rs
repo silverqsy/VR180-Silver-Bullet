@@ -5357,80 +5357,9 @@ impl Device {
         Ok(output_tex)
     }
 
-    /// Resolve an imported P010 frame (Y/UV plane views) to a downscaled
-    /// `Rgba16Unorm` fisheye image: upsample chroma to RGB at full res, then
-    /// box-average down to `out_w × out_h` (see `p010_resolve_rgba16.wgsl`).
-    /// `src_w`/`src_h` are the native P010 dims. This is the Windows
-    /// zero-copy preview prefilter — pair it with
-    /// [`Self::project_fisheye_rgba16_texture_to_equirect_16`] so the
-    /// projection minifies only a little and a single bilinear tap no longer
-    /// aliases (no luma moiré, no chroma colour-fringing).
-    pub fn resolve_p010_to_rgba16(
-        &self,
-        p010_tex: &wgpu::Texture,
-        src_w: u32, src_h: u32,
-        out_w: u32, out_h: u32,
-    ) -> Result<wgpu::Texture> {
-        let out_tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("p010_resolved_rgba16"),
-            size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        // P010 plane views: plane 0 = R16 (Y), plane 1 = Rg16 (CbCr).
-        let y_view = p010_tex.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("p010_resolve_y"),
-            format: Some(wgpu::TextureFormat::R16Unorm),
-            aspect: wgpu::TextureAspect::Plane0,
-            ..Default::default()
-        });
-        let uv_view = p010_tex.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("p010_resolve_uv"),
-            format: Some(wgpu::TextureFormat::Rg16Unorm),
-            aspect: wgpu::TextureAspect::Plane1,
-            ..Default::default()
-        });
-        let dst_view = out_tex.create_view(&Default::default());
-        let dims = self.write_uniform("p010_resolve_dims", &ResolveDims {
-            src_w: src_w as f32, src_h: src_h as f32,
-            out_w: out_w as f32, out_h: out_h as f32,
-            src_x0: 0.0, _p1: 0.0, _p2: 0.0, _p3: 0.0,
-            y_scale: YUV_RANGE_P010_LIMITED[0], y_off: YUV_RANGE_P010_LIMITED[1],
-            c_scale: YUV_RANGE_P010_LIMITED[2], c_off: YUV_RANGE_P010_LIMITED[3],
-        });
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("p010_resolve_bg"),
-            layout: &self.p010_resolve.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.p010_resolve.sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dst_view) },
-                wgpu::BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
-            ],
-        });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("p010_resolve_enc"),
-        });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("p010_resolve_pass"), timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.p010_resolve.pipeline);
-            pass.set_bind_group(0, Some(&bg), &[]);
-            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
-        }
-        self.queue.submit(Some(encoder.finish()));
-        Ok(out_tex)
-    }
-
-    /// macOS variant of [`Self::resolve_p010_to_rgba16`]: the Y and UV planes
-    /// arrive as TWO SEPARATE textures (`R16Unorm` + `Rg16Unorm`, each aliasing
+    /// The Y and UV planes arrive as TWO SEPARATE textures aliasing the decoded
+    /// IOSurface — `R16Unorm` + `Rg16Unorm` for P010, `R8Unorm` + `Rg8Unorm`
+    /// for NV12 (the range expansion comes from `yuv_range`), each aliasing
     /// one plane of a VideoToolbox IOSurface via
     /// `crate::interop_macos::wgpu_texture_from_iosurface_plane`) instead of one
     /// combined P010 texture sampled through plane-aspect views. Same shader and
@@ -5463,7 +5392,7 @@ impl Device {
     ) -> Result<wgpu::Texture> {
         // Reuse a per-slot output across frames. Safe to overwrite for the
         // same reason the projection caches are: the previous frame's reader
-        // (the projection, or the split's copy_texture_to_texture) is
+        // (the projection) is
         // GPU-ordered ahead of this frame's write on the same queue, and
         // nothing holds a resolved texture past compose.
         let out_tex = {
@@ -5476,7 +5405,7 @@ impl Device {
                     mip_level_count: 1, sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba16Unorm,
-                    // COPY_SRC is what lets `split_sbs_texture_16` read this.
+                    // COPY_SRC: readback probes copy out of this; harmless otherwise.
                     usage: wgpu::TextureUsages::TEXTURE_BINDING
                         | wgpu::TextureUsages::STORAGE_BINDING
                         | wgpu::TextureUsages::COPY_SRC,
@@ -5525,7 +5454,7 @@ impl Device {
 
     /// Project an already-on-GPU `Rgba16Unorm` fisheye texture to half-equirect
     /// (16-bit). Same as [`Self::project_fisheye_to_equirect_texture_16`] but
-    /// the source is an existing texture (e.g. from [`Self::resolve_p010_to_rgba16`])
+    /// the source is an existing texture (e.g. from [`Self::resolve_p010_planes_to_rgba16`])
     /// instead of a CPU byte upload — no host hop. `calib` MUST be resolved
     /// against `src_w`/`src_h` (the resolved texture's dims, NOT the native ones).
     pub fn project_fisheye_rgba16_texture_to_equirect_16(

@@ -1,4 +1,4 @@
-// P010 (YCbCr 10-bit limited-range) → RGBA16 resolve + box downscale.
+// P010 / NV12 YCbCr (range from the uniform) → RGBA16 resolve + box downscale.
 //
 // This is the GPU equivalent of the CPU path's "swscale P010 → RGBA, then
 // downscale" step, done in the CORRECT order: upsample chroma to full-res
@@ -14,8 +14,8 @@
 // minification is small enough that one tap no longer aliases).
 //
 // Bindings:
-//   (0) src_y  — R16Unorm  (full-res 10-bit-in-top-10 Y plane)
-//   (1) src_uv — Rg16Unorm (half-res interleaved Cb/Cr)
+//   (0) src_y  — R16Unorm (P010, 10 bits in the top of 16) or R8Unorm (NV12)
+//   (1) src_uv — Rg16Unorm / Rg8Unorm (half-res interleaved Cb/Cr)
 //   (2) smp    — bilinear sampler (ClampToEdge)
 //   (3) out_tex— Rgba16Unorm storage (downscaled fisheye)
 //   (4) dims   — src/out dimensions
@@ -39,15 +39,15 @@ struct Dims {
 // working res is chosen so the real ratio is ≤3:1 (native 3840 → ~1280).
 const MAX_K: i32 = 4;
 
-// BT.709 limited-range YUV → RGB for P010 (same constants as
-// `fisheye_p010_to_hequirect.wgsl::yuv_to_rgb_bt709_p010`).
+// BT.709 YUV → RGB; the range expansion comes from `d` (same lanes as the
+// projection kernels' `cal.yuv_range`).
 fn yuv_to_rgb_bt709_p010(y: f32, u: f32, v: f32) -> vec3<f32> {
     // Range expansion comes from the uniform — (y_scale, y_off, c_scale,
     // c_off) for P010-in-16 or NV12-in-8, limited or full range; see
     // `yuv_range_constants` in gpu.rs. The BT.709 matrix below is unchanged.
-    let y_l = y * vec4<f32>(d.y_scale, d.y_off, d.c_scale, d.c_off).x + vec4<f32>(d.y_scale, d.y_off, d.c_scale, d.c_off).y;
-    let u_l = u * vec4<f32>(d.y_scale, d.y_off, d.c_scale, d.c_off).z + vec4<f32>(d.y_scale, d.y_off, d.c_scale, d.c_off).w;
-    let v_l = v * vec4<f32>(d.y_scale, d.y_off, d.c_scale, d.c_off).z + vec4<f32>(d.y_scale, d.y_off, d.c_scale, d.c_off).w;
+    let y_l = y * d.y_scale + d.y_off;
+    let u_l = u * d.c_scale + d.c_off;
+    let v_l = v * d.c_scale + d.c_off;
     let r = y_l + 1.5748 * v_l;
     let g = y_l - 0.1873 * u_l - 0.4681 * v_l;
     let b = y_l + 1.8556 * u_l;

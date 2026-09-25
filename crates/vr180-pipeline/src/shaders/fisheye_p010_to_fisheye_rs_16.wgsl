@@ -53,6 +53,9 @@ struct RsRowR {
 
 const PI: f32 = 3.14159265359;
 
+// BT.709 YUV → RGB. The range expansion — P010 with 10 bits in the top of 16,
+// or NV12 in 8 bits, limited or full range — comes from `cal.yuv_range`
+// (see `yuv_range_constants` in gpu.rs); only the matrix lives here.
 fn yuv_to_rgb_bt709_p010(y: f32, u: f32, v: f32) -> vec3<f32> {
     // Range expansion comes from the uniform — (y_scale, y_off, c_scale,
     // c_off) for P010-in-16 or NV12-in-8, limited or full range; see
