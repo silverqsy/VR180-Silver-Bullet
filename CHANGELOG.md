@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2.5.1 — 2026-09-25
+
 ### macOS: side-by-side sources — 8-bit joins the zero-copy path, and it uses far less memory
 
 Two changes to the zero-copy path for generic side-by-side `.mp4` / `.mov`

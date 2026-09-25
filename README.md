@@ -11,7 +11,7 @@ One self-contained binary per platform, **macOS (Apple Silicon)** and
 **Windows (NVIDIA)**. No Python, no bundled runtimes, no system `ffmpeg`.
 **Free and open source** under the MIT license.
 
-**[Download the latest release][releases]** (2.5.0). Installed copies from
+**[Download the latest release][releases]** (2.5.1). Installed copies from
 2.1 onward update themselves.
 
 ## Supported cameras
