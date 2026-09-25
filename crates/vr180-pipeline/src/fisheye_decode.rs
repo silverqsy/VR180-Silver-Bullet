@@ -1398,11 +1398,11 @@ impl D3d11SharedDualStreamIter {
         // drop — their pixels live in our converted copies.
         let (work_w, work_h) = (self.work_w, self.work_h);
         let s0 = unsafe {
-            crate::interop_windows::share_eye_converted(&f0, &mut self.converters[0], work_w, work_h)
+            crate::interop_windows::share_eye_converted(&f0, &mut self.converters[0], work_w, work_h, false)
         }
         .ok_or_else(|| Error::Ffmpeg("zero-copy: convert eye0 failed".into()))?;
         let s1 = unsafe {
-            crate::interop_windows::share_eye_converted(&f1, &mut self.converters[1], work_w, work_h)
+            crate::interop_windows::share_eye_converted(&f1, &mut self.converters[1], work_w, work_h, false)
         }
         .ok_or_else(|| Error::Ffmpeg("zero-copy: convert eye1 failed".into()))?;
         // Both eyes' decode+convert were submitted (on their two separate
@@ -1719,7 +1719,6 @@ impl std::fmt::Debug for VtSharedSbsIter {
     }
 }
 
-#[cfg(target_os = "macos")]
 /// `av_pix_fmt_desc_get` for a raw `AVCodecParameters::format`, null when
 /// the value is outside the enum's range. The bindgen enum is `#[repr(i32)]`,
 /// so building it from an arbitrary `c_int` by transmute would be UB for any
@@ -2286,6 +2285,8 @@ pub struct D3d11SharedSbsIter {
     dt_s: f64,
     /// Precise-seek run-in target — see `D3d11SharedStreamPairIter`.
     skip_until_s: Option<f64>,
+    /// Stream `color_range == JPEG`; selects the expansion constants.
+    full_range: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -2347,6 +2348,11 @@ impl D3d11SharedSbsIter {
         // every caller reads a successful constructor as "zero-copy is on" and
         // has no fallback left once frames start, so a format miss has to
         // decline here to reach the portable path.
+        // The stream's range tag, read the same way the CPU `SbsFisheyeIter`
+        // reads it, so a full-range clip expands identically on both paths.
+        // SAFETY: read-only access to a POD field of AVCodecParameters.
+        let full_range = unsafe { (*video.parameters().as_ptr()).color_range }
+            == ffmpeg_next::ffi::AVColorRange::AVCOL_RANGE_JPEG;
         let src_pix_fmt = unsafe { (*video.parameters().as_ptr()).format };
         if !crate::interop_windows::hw_convert_supports_pix_fmt(src_pix_fmt) {
             return Err(Error::Ffmpeg(format!(
@@ -2373,7 +2379,8 @@ impl D3d11SharedSbsIter {
         let eye_h = work_h.clamp(2, native_eye_h);
         tracing::info!(
             "D3d11SharedSbsIter: {fw}x{fh} SBS (native {native_eye_w}x{native_eye_h} \
-             per eye → work {eye_w}x{eye_h}), d3d11va P010→RGBA16");
+             per eye → work {eye_w}x{eye_h}), d3d11va → RGBA16, {} range",
+            if full_range { "full" } else { "limited" });
         Ok(Self {
             ictx, video_idx, decoder,
             native_eye_w, native_eye_h,
@@ -2381,6 +2388,7 @@ impl D3d11SharedSbsIter {
             converter: None,
             time_base_s, dt_s,
             skip_until_s: None,
+            full_range,
         })
     }
 
@@ -2439,7 +2447,8 @@ impl D3d11SharedSbsIter {
 
             let tex = unsafe {
                 crate::interop_windows::share_eye_converted(
-                    &decoded, &mut self.converter, self.eye_w * 2, self.eye_h)
+                    &decoded, &mut self.converter, self.eye_w * 2, self.eye_h,
+                    self.full_range)
             }
             .ok_or_else(|| Error::Ffmpeg("zero-copy SBS: convert failed".into()))?;
             // Fence the decode+convert before handing the texture to the
@@ -2719,11 +2728,11 @@ impl D3d11SharedStreamPairIter {
             // share. After this the source frames can drop.
             let (nw, nh) = (self.dims.stream_w, self.dims.stream_h);
             let s0 = unsafe {
-                crate::interop_windows::share_eye_converted(&f0, &mut self.converters[0], nw, nh)
+                crate::interop_windows::share_eye_converted(&f0, &mut self.converters[0], nw, nh, false)
             }
             .ok_or_else(|| Error::Ffmpeg("zero-copy EAC: convert s0 failed".into()))?;
             let s4 = unsafe {
-                crate::interop_windows::share_eye_converted(&f4, &mut self.converters[1], nw, nh)
+                crate::interop_windows::share_eye_converted(&f4, &mut self.converters[1], nw, nh, false)
             }
             .ok_or_else(|| Error::Ffmpeg("zero-copy EAC: convert s4 failed".into()))?;
             // Both stream converts were submitted on their own d3d11va devices

@@ -426,9 +426,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             float2 uvc = float2(cx + ox, cy + oy) / float2((float)src_w, (float)src_h);
             float y  = Ytex.SampleLevel(smp, uvc, 0);
             float2 c = UVtex.SampleLevel(smp, uvc, 0);
-            float yl = y   * y_scale - y_off;
-            float ul = c.x * c_scale - c_off;
-            float vl = c.y * c_scale - c_off;
+            float yl = y   * y_scale + y_off;
+            float ul = c.x * c_scale + c_off;
+            float vl = c.y * c_scale + c_off;
             acc += float3(
                 saturate(yl + 1.5748 * vl),
                 saturate(yl - 0.1873 * ul - 0.4681 * vl),
@@ -454,42 +454,36 @@ struct ConvDims {
     c_off: f32,
 }
 
-/// Plane SRV formats + BT.709 limited-range expansion constants for a d3d11va
-/// decoder output format. `None` = a format this converter cannot sample.
+/// Plane SRV formats + SOURCE bit depth for a d3d11va decoder output format.
+/// `None` = a format this converter cannot sample.
 ///
-/// The DPB format follows the SOURCE bit depth: 8-bit H.264/HEVC decodes to
+/// The DPB format follows the source bit depth: 8-bit H.264/HEVC decodes to
 /// **NV12**, 10-bit to **P010**. A plane SRV's format must match the plane's
 /// own format, so asking for `R16_UNORM` on NV12 fails `CreateShaderResourceView`
-/// outright (`E_INVALIDARG`) — which is what used to kill 8-bit sources on the
-/// first frame.
+/// outright (`E_INVALIDARG`).
 ///
-/// P010 stores its 10 bits in the HIGH bits of each 16-bit word, so a P010 and
-/// a P016 black both normalize to 4096/65535 — the two share one set of
-/// constants.
+/// The range-expansion constants are NOT baked here any more: `convert`
+/// asks [`crate::gpu::yuv_range_constants`] for them with this depth and the
+/// stream's range tag, so the D3D11 converter and every P010 kernel on the
+/// macOS side read the same four numbers from one function. That is what
+/// keeps a full-range clip rendering the same on the fast path as on the CPU
+/// fallback. (P010 keeps its 10 bits in the HIGH bits of each 16-bit word, so
+/// P010 and P016 share constants — both blacks normalize to 4096/65535.)
 fn hw_plane_layout(
     fmt: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
 ) -> Option<(
     windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
     windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
-    [f32; 4],
+    u8,
 )> {
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_P016, DXGI_FORMAT_R16G16_UNORM,
         DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM,
     };
     match fmt {
-        // 8-bit: Y 16..235, C 16..240 over a 0..255 range.
-        DXGI_FORMAT_NV12 => Some((
-            DXGI_FORMAT_R8_UNORM,
-            DXGI_FORMAT_R8G8_UNORM,
-            [255.0 / 219.0, 16.0 / 219.0, 255.0 / 224.0, 128.0 / 224.0],
-        )),
-        // 10/16-bit: Y 4096..60160, C 4096..61440 over a 0..65535 range.
-        DXGI_FORMAT_P010 | DXGI_FORMAT_P016 => Some((
-            DXGI_FORMAT_R16_UNORM,
-            DXGI_FORMAT_R16G16_UNORM,
-            [65535.0 / 56064.0, 64.0 / 876.0, 65535.0 / 57344.0, 512.0 / 896.0],
-        )),
+        DXGI_FORMAT_NV12 => Some((DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, 8)),
+        DXGI_FORMAT_P010 | DXGI_FORMAT_P016 =>
+            Some((DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM, 10)),
         _ => None,
     }
 }
@@ -603,8 +597,10 @@ impl P010Converter {
     /// Convert a single-slice NV12 **or** P010 texture (must have
     /// `BIND_SHADER_RESOURCE`) to a fresh shareable RGBA16 texture at
     /// `out_w × out_h`, exported as an NT handle ready to import single-plane
-    /// into Vulkan. The plane SRV formats and range constants come from the
-    /// source texture's own format, so either bit depth works.
+    /// into Vulkan. The plane SRV formats and bit depth come from the source
+    /// texture's own format; `full_range` is the stream's `color_range == JPEG`
+    /// tag, and together they select the expansion constants via
+    /// [`crate::gpu::yuv_range_constants`].
     ///
     /// # Safety
     /// `device`/`context` must own `src_yuv`; `src_yuv` must be a live
@@ -618,6 +614,7 @@ impl P010Converter {
         src_h: u32,
         out_w: u32,
         out_h: u32,
+        full_range: bool,
     ) -> windows::core::Result<D3d11SharedTexture> {
         use windows::Win32::Graphics::Direct3D::D3D11_SRV_DIMENSION_TEXTURE2D;
         use windows::Win32::Graphics::Direct3D11::{
@@ -636,12 +633,16 @@ impl P010Converter {
         // CreateShaderResourceView, which would fail with a bare E_INVALIDARG.
         let mut src_desc = D3D11_TEXTURE2D_DESC::default();
         src_yuv.GetDesc(&mut src_desc);
-        let (y_fmt, uv_fmt, range) = hw_plane_layout(src_desc.Format).ok_or_else(|| {
+        let (y_fmt, uv_fmt, bits) = hw_plane_layout(src_desc.Format).ok_or_else(|| {
             windows::core::Error::new(
                 windows::Win32::Foundation::E_INVALIDARG,
                 format!("unsupported d3d11va plane format {:?}", src_desc.Format),
             )
         })?;
+
+        // ONE source of truth for the expansion constants, shared with the
+        // macOS P010 kernels: depth from the texture, range from the stream tag.
+        let range = crate::gpu::yuv_range_constants(bits, full_range);
 
         // Output RGBA16 texture: UAV (compute writes) + SRV (Vulkan import
         // samples) + shareable NT handle.
@@ -865,7 +866,10 @@ unsafe fn copy_slice_to_shader_texture(
 /// working resolution. After this returns the source frame can be dropped.
 ///
 /// Takes either bit depth — NV12 (8-bit source) or P010 (10-bit) — and always
-/// produces RGBA16, so callers are depth-agnostic. Iterators that can be handed
+/// produces RGBA16, so callers are depth-agnostic. `full_range` is the STREAM's
+/// `color_range == JPEG` tag (read once at iterator construction, the same
+/// field the CPU `SbsFisheyeIter` honours); with it the fast path and the CPU
+/// fallback expand a full-range clip identically. Iterators that can be handed
 /// an arbitrary file should still gate on [`hw_convert_supports_pix_fmt`] at
 /// construction: reaching a refusal HERE is mid-stream, where no fallback is
 /// left.
@@ -877,6 +881,7 @@ pub unsafe fn share_eye_converted(
     converter: &mut Option<P010Converter>,
     work_w: u32,
     work_h: u32,
+    full_range: bool,
 ) -> Option<D3d11SharedTexture> {
     let (tex, slice, dev, dctx) = extract_d3d11_from_frame(frame)?;
     if converter.is_none() {
@@ -902,7 +907,7 @@ pub unsafe fn share_eye_converted(
         frame.height().min(desc.Height).max(2) & !1,
     );
     let planar = copy_slice_to_shader_texture(&dev, &dctx, &tex, slice, nw, nh)?;
-    match conv.convert(&dev, &dctx, &planar, nw, nh, work_w, work_h) {
+    match conv.convert(&dev, &dctx, &planar, nw, nh, work_w, work_h, full_range) {
         Ok(shared) => Some(shared),
         Err(e) => {
             tracing::warn!("share_eye_converted: convert failed: {e}");

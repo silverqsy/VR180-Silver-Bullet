@@ -347,6 +347,41 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    vestigial. It is merely over-conservative (it can only decline to a working
    path, and every d3d11va-capable adapter has P010), so it was left alone
    rather than widened on shipped paths.
+14. **Windows SBS converter honours the range tag (2026-09-25)** — the
+   follow-up the mac side asked for with their shared-code change (`FisheyeCalib`
+   gained `src_x0`/`yuv_range`, `FisheyeCalibUniforms` → 9 vec4, `ResolveDims`
+   → 3 rows, `resolve_p010_planes_to_rgba16` +2 args). Those were TRANSPARENT
+   to Windows — no Windows call site constructs `FisheyeCalib` by literal or
+   calls the resolve, and the RGBA16 kernels are fine with the larger uniform:
+   the export matrix was byte-identical before and after the pull. ONE build
+   break, same class as the `VtSharedSbsIter` gate: `pix_fmt_desc` was gated
+   `macos` but is called by the cross-platform `codecpar_luma_depth` (which
+   `SbsFisheyeIter` now uses on every platform). Pure ffmpeg — ungated it.
+   THE CHANGE: `hw_plane_layout` now returns the source bit depth, and
+   `P010Converter::convert` takes `full_range` (the STREAM's
+   `color_range == JPEG`, read once at `D3d11SharedSbsIter` construction — the
+   same field the CPU `SbsFisheyeIter` reads) and pulls all four expansion
+   constants from **`gpu::yuv_range_constants(bits, full_range)`** — one
+   source of truth shared with the macOS P010 kernels, so the two platforms
+   cannot drift again. (Their convention is `t·scale + off` with NEGATIVE
+   offsets; the HLSL's `- off` became `+ off` to match. Limited-range values
+   are numerically identical to what the HLSL had baked in.) VERIFIED:
+   limited clip parity IDENTICAL to baseline (82.6/82.1 per 65535); a
+   `yuvj420p|pc` full-range clip (`ffmpeg -vf scale=out_range=full`,
+   `-color_range pc`) lands at **82.5/82.1** — the same parity, where a
+   still-hardcoded-limited expansion would read in the THOUSANDS (≈16/255
+   black offset + ≈16% gain). Smoke test both GPUs + matrix unchanged.
+   **Dual-stream and EAC pass `full_range = false` explicitly**, preserving
+   shipped, verified output — and here is the finding worth knowing: **GoPro
+   `.360` is tagged `pc` (full range) on BOTH EAC tracks** (`ffprobe`:
+   `0|yuv420p10le|pc 4|yuv420p10le|pc`), while OSV and X6 are `tv`. NEITHER
+   platform honours it: the macOS EAC VT arm has no range plumbing at all,
+   the Windows converter passes `false`, and the Windows portable path is
+   swscale, which treats 10-bit as limited regardless of tag — which is WHY
+   the Windows arm-vs-portable parity is 0.6/255. So `.360` is consistently
+   limited-expanded everywhere. Do NOT “fix” one side alone: whether GoPro's
+   `pc` tag is truthful (a known GoPro quirk) needs a deliberate cross-platform
+   decision with both boxes comparing against a reference.
 
 **Most recent batch (developed on macOS, then merged with the Windows EAC work):**
 - **In-process noise reduction** — `VTTemporalNoiseFilter` via objc2 FFI (no

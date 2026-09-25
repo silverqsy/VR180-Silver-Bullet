@@ -136,6 +136,10 @@ and export.
   either way, so nothing downstream changes, and 10-bit output is unchanged
   bit-for-bit. Anything the converter genuinely cannot sample is now declined
   up front, where falling back to the portable path still works.
+- The same converter now honours the clip's **colour range tag**: a
+  full-range (`pc`-tagged) side-by-side clip renders identically on the GPU
+  fast path and the CPU fallback, using the same four expansion constants
+  the macOS path uses. Previously the fast path always assumed limited range.
 
 ### Matching Eyes: exposure
 - The **Matching Eyes** panel gains an **Eye Exposure (±EV)** slider
