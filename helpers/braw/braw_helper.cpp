@@ -962,10 +962,19 @@ static int do_decode(const char* path, uint64_t start, uint64_t count, int track
         cb.processedImage->GetResourceSizeBytes(&sz);
         cb.processedImage->GetResource(&p);
         const size_t want = (size_t)w * h * bytesPerPixel;
-        if (!p || fw != w || fh != h || sz != want) {
+        // The resource may be LARGER than w·h·bpp (the URSA Cine Immersive's
+        // tracks at a reduced scale: 1360×1200 BGRA comes in a 6,537,216-byte
+        // buffer, 9,216 over — trailing allocation padding; the rows are
+        // packed, see the decoded image). Smaller, or another size, is an error.
+        if (!p || fw != w || fh != h || sz < want) {
             fprintf(stderr, "ERROR: frame %llu is %ux%u, %u bytes; expected %ux%u, %zu bytes\n",
                     (unsigned long long)i, fw, fh, sz, w, h, want);
             return false;
+        }
+        static bool warnedPad = false;
+        if (sz != want && !warnedPad) {
+            fprintf(stderr, "note: processed image resource is %u bytes for %ux%u (%zu packed) — writing the packed size\n", sz, w, h, want);
+            warnedPad = true;
         }
         *data = p; *bytes = want;
         return true;

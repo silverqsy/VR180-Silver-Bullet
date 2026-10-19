@@ -1247,10 +1247,20 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      `BRAW_IMU_TO_CAM`. Gyro latency `BRAW_GYRO_LATENCY_MS` = **+4 ms**
      (`VR180_BRAW_LATENCY_MS` sweep −12…+12 on two C006 windows: shallow
      minima +3…+5 (0.356–0.360 vs 0.380 at 0, 0.58 at −12) and +1…+5
-     (0.134 flat)). Readout stays the file's (rows × 3 µs): the RS-scale
-     sweep is FLAT on this handheld footage (0.354–0.360 for 0…2×) — no
-     fast pans in the window, so it neither confirms nor refutes the line
-     time. Probe knobs: `VR180_BRAW_DECODE_SCALE=half`
+     (0.134 flat)). Checked again on each clip's FASTEST 2 s window
+     (`|ω|` 77 °/s at C006 34 s, 48 °/s at C005 7 s): no-stab 7.9 / 4.7 px,
+     identity 3.8 / 1.9, this basis +4 ms 2.29 / 0.99 (latency −4 / 0 / +8:
+     2.38 / 2.36 / 2.31 and 1.05 / 1.01 / 1.03). Readout stays the file's
+     (rows × 3 µs): the RS-scale sweep is nearly FLAT (C006 0×…2×: 2.35 /
+     2.26 / 2.29 / 2.35 / 2.33; C005: 0.98 / 0.98 / 0.99 / 1.01 / 1.00) —
+     the residual on these windows is the unknown lens model (preset 210°,
+     k = 0), not timing, so the line time is used as written. Also smoke-
+     tested the two-track URSA Cine Immersive (`~/Downloads/A002_07241548_
+     C002.braw`, 2 × 8160×7200 @ 60, 1144 Hz gyro, readout 10.8 ms, 4.17 ms
+     shutter): decodes composed, stabilizes, muxes audio; its reduced-scale
+     track resources are LARGER than w·h·bpp (6,537,216 for 1360×1200×4 —
+     trailing padding, rows packed) so the helper's size check is `≥`.
+     Probe knobs: `VR180_BRAW_DECODE_SCALE=half`
      (export decode at 2/3 for the headless probes), `VR180_PROBE_AUDIO`,
      `VR180_RS_SCALE`.
    - **Lens = manual (user decision: no in-camera calibration)**: the file
