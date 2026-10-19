@@ -30,7 +30,7 @@
 use crate::decode::{init as ffmpeg_init, HwDecode, DecodePath};
 use crate::source_kind::EyeLayout;
 use crate::{Error, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Tell a demuxer's genuine end of stream apart from a READ ERROR. ffmpeg's
 /// `av_read_frame` answers `AVERROR_EOF` for both: a failed read on the
@@ -3785,25 +3785,30 @@ fn extract_packed_rgba_n(frame: &ffmpeg_next::frame::Video, bytes_per_pixel: usi
 
 // ── BRAW (braw_helper subprocess pipe) ──────────────────────────────
 
-/// Blackmagic RAW iterator. Spawns `braw_helper --decode` and reads
-/// BGRA frames off stdout. Multi-track stereo files (URSA Cine
-/// Immersive, Pyxis 12K) emit SBS BGRA directly from the helper, so
-/// the split logic is the same as the SBS-fisheye path.
-///
-/// Mirrors `_decode_braw_thread` at `vr180_gui.py:3633-3663`.
+/// Blackmagic RAW pair source: the SDK helper decodes each frame to BGRA
+/// (8- or 16-bit) at a chosen fraction of the recorded size, and the two
+/// eyes are the two halves of the frame — a VR180 lens on one sensor puts
+/// its circles side by side (PYXIS 12K: 12288×6480 → two 6144×6480 eyes);
+/// a two-track clip (URSA Cine Immersive) is composed side by side by the
+/// helper. `swap_eyes` exchanges the halves. Seeking restarts the helper at
+/// the target frame (`--start`), lazily on the next pull.
 pub struct BrawFisheyeIter {
-    decoder: vr180_braw::BrawDecoder,
+    path: PathBuf,
+    opts: vr180_braw::decoder::DecodeOptions,
+    swap_eyes: bool,
+    decoder: Option<vr180_braw::BrawDecoder>,
     frame_buf: Vec<u8>,
+    /// Eye size at the decode scale.
     eye_w: u32,
     eye_h: u32,
-    /// 1.0 / fps — derived from `BrawInfo::frame_rate` so PTS counts
-    /// can be turned into seconds.
+    /// Output bit depth (8 → RGBA8, 16 → RGBA64LE), as requested.
+    bit_depth: u8,
+    /// 1.0 / fps — frame indices to seconds.
     dt_s: f64,
+    /// Next frame to emit (absolute index in the clip).
     frame_idx: u64,
+    frame_count: u64,
     frame_limit: u32,
-    /// True when the helper composed a side-by-side image (multi-
-    /// track stereo). False = single-camera, no split.
-    sbs_composed: bool,
 }
 
 impl std::fmt::Debug for BrawFisheyeIter {
@@ -3811,49 +3816,71 @@ impl std::fmt::Debug for BrawFisheyeIter {
         f.debug_struct("BrawFisheyeIter")
             .field("eye_w", &self.eye_w)
             .field("eye_h", &self.eye_h)
+            .field("bit_depth", &self.bit_depth)
             .field("dt_s", &self.dt_s)
             .field("frame_idx", &self.frame_idx)
-            .field("sbs_composed", &self.sbs_composed)
+            .field("scale", &self.opts.scale)
             .finish_non_exhaustive()
     }
 }
 
 impl BrawFisheyeIter {
-    /// Open a BRAW file and start decoding. `info` is the result of a
-    /// prior `BrawInfo::probe(path)`; pass it in so callers don't pay
-    /// the probe twice. `opts` are the colour / exposure knobs
-    /// forwarded to braw_helper.
+    /// Open a BRAW file. `info` is a prior `BrawInfo::probe(path)` (so the
+    /// callers don't pay it twice). `bit_depth` 8 or 16 (the output codec's);
+    /// `scale` the SDK decode fraction (preview caps); `look` the colour
+    /// preset (`Film` = the log the clip was shot in, for the app's LUT).
+    pub fn new_with_options(
+        path: &Path,
+        info: &vr180_braw::BrawInfo,
+        bit_depth: u8,
+        scale: vr180_braw::DecodeScale,
+        look: vr180_braw::DecodeLook,
+        swap_eyes: bool,
+        frame_limit: u32,
+    ) -> Result<Self> {
+        let opts = vr180_braw::decoder::DecodeOptions {
+            bit_16: bit_depth >= 10, scale, look, ..Default::default()
+        };
+        let (fw, fh) = info.frame_dims();
+        let d = scale.divisor();
+        let dt_s = if info.frame_rate > 0.0 { 1.0 / info.frame_rate } else { 1.0 / 24.0 };
+        let mut it = Self {
+            path: path.to_path_buf(), opts, swap_eyes, decoder: None, frame_buf: Vec::new(),
+            eye_w: (fw / d) / 2, eye_h: fh / d, bit_depth: if bit_depth >= 10 { 16 } else { 8 },
+            dt_s, frame_idx: 0, frame_count: info.frame_count, frame_limit,
+        };
+        // Start now so an unopenable file fails here, not on the first pull,
+        // and so the eye size comes from the helper's processed dimensions.
+        it.start_at(0)?;
+        Ok(it)
+    }
+
+    /// Compatibility shape of the old constructor: full size, 8-bit, as shot.
     pub fn new(
         path: &Path,
         info: &vr180_braw::BrawInfo,
         opts: &vr180_braw::decoder::DecodeOptions,
         frame_limit: u32,
     ) -> Result<Self> {
-        let decoder = vr180_braw::BrawDecoder::start(path, opts)
-            .map_err(|e| Error::Ffmpeg(format!("braw decode start: {e}")))?;
-        let header = decoder.header().clone();
-        // Multi-track files get composed SBS at the helper level —
-        // header.width is then track0_width + track1_width and
-        // dual_stream is true. Single-track files emit one eye and
-        // we treat them as monocular (left == right).
-        let (eye_w, eye_h, sbs_composed) = if header.dual_stream {
-            (header.width / 2, header.height, true)
-        } else {
-            (header.width, header.height, false)
-        };
-        let dt_s = if info.frame_rate > 0.0 {
-            1.0 / info.frame_rate
-        } else {
-            1.0 / 24.0
-        };
-        Ok(Self {
-            decoder,
-            frame_buf: Vec::new(),
-            eye_w, eye_h, dt_s,
-            frame_idx: 0,
-            frame_limit,
-            sbs_composed,
-        })
+        Self::new_with_options(path, info, if opts.bit_16 { 16 } else { 8 }, opts.scale, opts.look, false, frame_limit)
+    }
+
+    fn start_at(&mut self, frame: u64) -> Result<()> {
+        self.decoder = None;
+        let mut opts = self.opts.clone();
+        opts.start_frame = Some(frame);
+        let dec = vr180_braw::BrawDecoder::start(&self.path, &opts)
+            .map_err(|e| Error::Ffmpeg(format!("braw decode start at {frame}: {e}")))?;
+        let h = dec.header();
+        if h.bit_depth != self.bit_depth as u32 {
+            return Err(Error::Ffmpeg(format!("braw helper decoded {}-bit, {} requested", h.bit_depth, self.bit_depth)));
+        }
+        // The helper reports the processed size; both layouts are L|R.
+        self.eye_w = h.width / 2;
+        self.eye_h = h.height;
+        self.frame_idx = frame;
+        self.decoder = Some(dec);
+        Ok(())
     }
 }
 
@@ -3862,7 +3889,14 @@ impl FisheyePairIter for BrawFisheyeIter {
         if self.frame_limit > 0 && self.frame_idx >= self.frame_limit as u64 {
             return Ok(None);
         }
-        let got = self.decoder
+        if self.frame_count > 0 && self.frame_idx >= self.frame_count {
+            return Ok(None);
+        }
+        if self.decoder.is_none() {
+            let at = self.frame_idx;
+            self.start_at(at)?;
+        }
+        let got = self.decoder.as_mut().unwrap()
             .next_frame(&mut self.frame_buf)
             .map_err(|e| Error::Ffmpeg(format!("braw next_frame: {e}")))?;
         if !got {
@@ -3871,56 +3905,35 @@ impl FisheyePairIter for BrawFisheyeIter {
         let pts_s = self.frame_idx as f64 * self.dt_s;
         self.frame_idx += 1;
 
-        // BRAW is BGRA. Swizzle to RGBA on the fly while splitting.
-        let header = self.decoder.header();
-        let bytes_per_pixel = header.bytes_per_pixel(); // 4 or 8
+        let header = self.decoder.as_ref().unwrap().header();
+        let bpp = header.bytes_per_pixel(); // 4 or 8 (BGRA8 / BGRA16)
         let frame_w = header.width as usize;
         let frame_h = header.height as usize;
-        let mut left = Vec::with_capacity((self.eye_w * self.eye_h * 4) as usize);
-        let mut right = Vec::with_capacity((self.eye_w * self.eye_h * 4) as usize);
-
-        if self.sbs_composed {
-            let eye_w = self.eye_w as usize;
-            for y in 0..frame_h {
-                let row_start = y * frame_w * bytes_per_pixel;
-                bgra_to_rgba8_row(&self.frame_buf[row_start..row_start + eye_w * bytes_per_pixel],
-                                  bytes_per_pixel, &mut left);
-                let right_row = row_start + eye_w * bytes_per_pixel;
-                bgra_to_rgba8_row(&self.frame_buf[right_row..right_row + eye_w * bytes_per_pixel],
-                                  bytes_per_pixel, &mut right);
-            }
-        } else {
-            // Single-eye source: duplicate into both halves. The
-            // downstream pipeline treats one eye as the canonical
-            // input; the other is a no-op for monocular fisheye.
-            for y in 0..frame_h {
-                let row_start = y * frame_w * bytes_per_pixel;
-                bgra_to_rgba8_row(&self.frame_buf[row_start..row_start + frame_w * bytes_per_pixel],
-                                  bytes_per_pixel, &mut left);
-            }
-            right = left.clone();
+        let eye_w = self.eye_w as usize;
+        let mut left = Vec::with_capacity(eye_w * frame_h * bpp);
+        let mut right = Vec::with_capacity(eye_w * frame_h * bpp);
+        for y in 0..frame_h {
+            let row = y * frame_w * bpp;
+            bgra_to_rgba_row(&self.frame_buf[row..row + eye_w * bpp], bpp, &mut left);
+            let r0 = row + eye_w * bpp;
+            bgra_to_rgba_row(&self.frame_buf[r0..r0 + eye_w * bpp], bpp, &mut right);
         }
-
+        if self.swap_eyes { std::mem::swap(&mut left, &mut right); }
         Ok(Some(FisheyePair {
             left, right,
             eye_w: self.eye_w, eye_h: self.eye_h,
-            bit_depth: 8,
+            bit_depth: self.bit_depth,
             pts_s,
         }))
     }
 
-    fn seek(&mut self, _target_s: f64) -> Result<()> {
-        // The braw_helper subprocess can't seek mid-stream. The
-        // caller has to restart by tearing down and re-opening with
-        // a fresh `--start <N>`. Returning Err here would crash the
-        // GUI's seek-while-paused flow; instead, we ignore the seek
-        // silently and let the caller observe the frame index stays
-        // monotonic. The GUI's BRAW handling will need its own
-        // restart logic.
-        tracing::warn!(
-            "BrawFisheyeIter::seek not supported in-process — caller \
-             must restart decoder with new --start"
-        );
+    fn seek(&mut self, target_s: f64) -> Result<()> {
+        let target = (target_s.max(0.0) / self.dt_s).round() as u64;
+        let target = if self.frame_count > 0 { target.min(self.frame_count.saturating_sub(1)) } else { target };
+        if target == self.frame_idx && self.decoder.is_some() { return Ok(()); }
+        // Restart lazily: the next pull spawns the helper at `target`.
+        self.decoder = None;
+        self.frame_idx = target;
         Ok(())
     }
 
@@ -3929,33 +3942,15 @@ impl FisheyePairIter for BrawFisheyeIter {
     }
 }
 
-/// Copy one row of BGRA[8|16] into a u8 RGBA accumulator. For 16-bit
-/// input, the high byte of each channel is taken (linear truncation —
-/// matches what the Python kernel's uint8 fallback does, and the GPU
-/// shader operates in uint8 anyway).
-fn bgra_to_rgba8_row(src: &[u8], bytes_per_pixel: usize, dst: &mut Vec<u8>) {
-    match bytes_per_pixel {
-        4 => {
-            // BGRA8 → RGBA8 swizzle.
-            for px in src.chunks_exact(4) {
-                dst.push(px[2]); // R from B-slot? No — BGRA means B=0, G=1, R=2, A=3.
-                dst.push(px[1]); // G
-                dst.push(px[0]); // B
-                dst.push(px[3]); // A
-            }
-        }
-        8 => {
-            // BGRA16-LE → RGBA8: take the high byte of each channel.
-            for px in src.chunks_exact(8) {
-                dst.push(px[5]); // R high
-                dst.push(px[3]); // G high
-                dst.push(px[1]); // B high
-                dst.push(px[7]); // A high
-            }
-        }
-        _ => {
-            tracing::error!("unexpected BRAW bpp={bytes_per_pixel}");
-        }
+/// Copy one row of BGRA (8- or 16-bit) into an RGBA accumulator of the SAME
+/// depth (RGBA8 / RGBA64LE) — a channel swizzle, nothing lost.
+fn bgra_to_rgba_row(src: &[u8], bpp: usize, dst: &mut Vec<u8>) {
+    match bpp {
+        4 => for px in src.chunks_exact(4) { dst.extend_from_slice(&[px[2], px[1], px[0], px[3]]); },
+        8 => for px in src.chunks_exact(8) {
+            dst.extend_from_slice(&[px[4], px[5], px[2], px[3], px[0], px[1], px[6], px[7]]);
+        },
+        _ => tracing::error!("unexpected BRAW bpp={bpp}"),
     }
 }
 
@@ -4275,23 +4270,21 @@ mod tests {
 
     #[test]
     fn bgra8_to_rgba8_swizzle() {
-        // One BGRA8 pixel: B=10, G=20, R=30, A=255 → after swizzle
-        // should land as R=30, G=20, B=10, A=255 in dst.
+        // One BGRA8 pixel: B=10, G=20, R=30, A=255 → R=30, G=20, B=10, A=255.
         let src = vec![10u8, 20, 30, 255];
         let mut dst = Vec::new();
-        bgra_to_rgba8_row(&src, 4, &mut dst);
+        bgra_to_rgba_row(&src, 4, &mut dst);
         assert_eq!(dst, vec![30, 20, 10, 255]);
     }
 
     #[test]
-    fn bgra16le_to_rgba8_high_byte() {
+    fn bgra16le_to_rgba64le_keeps_both_bytes() {
         // BGRA16 LE: B = 0x0102 = bytes [02, 01], G = 0x0304 = [04, 03],
-        // R = 0x0506 = [06, 05], A = 0x0708 = [08, 07].
-        // High byte: B=01, G=03, R=05, A=07.
-        // Swizzled to RGBA: R, G, B, A = 05, 03, 01, 07.
+        // R = 0x0506 = [06, 05], A = 0x0708 = [08, 07] → RGBA64LE
+        // [06 05, 04 03, 02 01, 08 07]: a swizzle, no truncation.
         let src = vec![0x02, 0x01, 0x04, 0x03, 0x06, 0x05, 0x08, 0x07];
         let mut dst = Vec::new();
-        bgra_to_rgba8_row(&src, 8, &mut dst);
-        assert_eq!(dst, vec![0x05, 0x03, 0x01, 0x07]);
+        bgra_to_rgba_row(&src, 8, &mut dst);
+        assert_eq!(dst, vec![0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x08, 0x07]);
     }
 }

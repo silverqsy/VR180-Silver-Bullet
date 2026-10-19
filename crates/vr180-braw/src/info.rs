@@ -56,10 +56,53 @@ pub struct BrawInfo {
     /// Audio channel count.
     #[serde(default)]
     pub audio_channels: u32,
-    /// Sensor readout time in milliseconds (used for per-row rolling
-    /// shutter correction — currently disabled for BRAW).
+    /// Sensor readout time in milliseconds: `sensor_area_captured` rows ×
+    /// `sensor_line_time` (µs) from the clip metadata (PYXIS 12K: 3 µs ×
+    /// 6480 = 19.44 ms at 12288×6480 / 50 fps, 15.34 ms at ×5112 / 60).
+    /// 0 when the file states no line time.
     #[serde(default)]
     pub readout_ms: f64,
+    /// Sensor scan-line time, µs (`sensor_line_time`); 0 if absent.
+    #[serde(default)]
+    pub sensor_line_time_us: f64,
+    /// `sensor_area_captured` = [w, h] of the sensor window read out (the
+    /// frame); [0, 0] if absent.
+    #[serde(default)]
+    pub sensor_area_captured: [f64; 2],
+    /// `crop_origin` = [x, y] of that window; the PYXIS 12K writes [24, 12]
+    /// for both the 6480- and the 5112-row windows, so it is NOT the
+    /// window's position on the sensor (assume the windows are centred).
+    #[serde(default)]
+    pub crop_origin: [f64; 2],
+    /// `shutter_type`: "Angle" or "Speed".
+    #[serde(default)]
+    pub shutter_type: String,
+    /// The first sampled frame's `shutter_value` text ("7.2°", "1/535").
+    #[serde(default)]
+    pub shutter_text: String,
+    /// Shutter in seconds over five frames sampled across the clip —
+    /// min / max; the camera's auto exposure varies it within a take
+    /// (0.4–3.3 ms on the sample clip). Per-frame values: [`crate::shutters`].
+    #[serde(default)]
+    pub shutter_s_min: f64,
+    #[serde(default)]
+    pub shutter_s_max: f64,
+    /// As-shot colour: `viewing_gamma` ("Blackmagic Design Film"),
+    /// `viewing_gamut` ("Blackmagic Design"), `viewing_bmdgen` (5).
+    #[serde(default)]
+    pub viewing_gamma: String,
+    #[serde(default)]
+    pub viewing_gamut: String,
+    #[serde(default)]
+    pub viewing_bmdgen: f64,
+    /// Title of the clip's embedded post-3D-LUT ("Gen 5 Film to Extended
+    /// Video"); empty if none. Dump it with [`crate::lut::extract_embedded_lut`].
+    #[serde(default)]
+    pub embedded_lut: String,
+    /// The SDK pipeline the helper decodes with ("cpu", "metal", …), when
+    /// the helper reports it.
+    #[serde(default)]
+    pub pipeline: String,
 }
 
 fn default_one() -> u32 { 1 }
@@ -97,5 +140,23 @@ impl BrawInfo {
     /// Immersive, Pyxis 12K dual-body shoot).
     pub fn is_dual_track(&self) -> bool {
         self.video_track_count >= 2
+    }
+
+    /// Readout (rolling-shutter sweep) time in seconds, `None` when the file
+    /// states no line time.
+    pub fn readout_s(&self) -> Option<f64> {
+        (self.readout_ms > 0.0).then_some(self.readout_ms * 1e-3)
+    }
+
+    /// Size of ONE eye as the app sees it: a dual-track clip's track (the
+    /// helper composes the two side by side), a single-track clip's half —
+    /// a VR180 lens on one sensor puts its two circles side by side.
+    pub fn eye_dims(&self) -> (u32, u32) {
+        if self.is_dual_track() { (self.width, self.height) } else { (self.width / 2, self.height) }
+    }
+
+    /// The composed frame the decoder emits (both eyes).
+    pub fn frame_dims(&self) -> (u32, u32) {
+        if self.is_dual_track() { (self.width * 2, self.height) } else { (self.width, self.height) }
     }
 }

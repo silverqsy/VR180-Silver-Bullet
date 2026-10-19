@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: **Unreleased on `main`: X6 automatic per-frame eye-exposure matching (2026-09-27, item 15) + GoPro per-frame exposure timing from SHUT (2026-10-07, item 16) + Kandao QooCam 3 Ultra video/stills/audio (2026-10-14, item 23; Windows arms verified + matrix/gate fixes 2026-10-17, item 24).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
+## ⚡ Status: **Unreleased on `main`: X6 automatic per-frame eye-exposure matching (2026-09-27, item 15) + GoPro per-frame exposure timing from SHUT (2026-10-07, item 16) + Kandao QooCam 3 Ultra video/stills/audio (2026-10-14, item 23; Windows arms verified + matrix/gate fixes 2026-10-17, item 24) + Blackmagic RAW rebuilt on the modern path (2026-10-19, item 25).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -1190,6 +1190,105 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    decoder exits before its first frame (`decoder_retried`, cleared when a
    first frame lands; stills excluded), logging a WARN — the user never
    sees the dead "Click ▶ Play" state for a transient network read.
+
+25. **Blackmagic RAW (PYXIS 12K + VR180 lens) brought up to the X6/QooCam
+   level (2026-10-19).** The early BRAW port (Python-era: VQF nearest-sample
+   hard lock, no RS, mono single-track, 8-bit only, no LUT) was rebuilt on
+   the modern path. Sample material: `/Volumes/Database/Pyxis braw stab
+   footage/A001_04071604_C005.braw` (12288×6480 @ 50, 56 GB) and
+   `…C006.braw` (12288×5112 @ 60, 32 GB), PYXIS 12K fw 10.0, a dual-fisheye
+   lens on the one sensor (two ~6360-px circles side by side), handheld.
+   - **Helper (`helpers/braw/braw_helper.cpp`, SDK 6.0 — the installed SDK's
+     callback interface gained `ReadAudioComplete`, which the old helper
+     lacked)**: `--info` now also reports `readout_ms` (= `sensor_area_captured`
+     rows × `sensor_line_time` µs; the old key `sensor_area_captured_height`
+     never existed and the line time is an INTEGER variant → it read 0),
+     `sensor_line_time_us`, `sensor_area_captured`, `crop_origin`,
+     `shutter_type/text/s_min/s_max` (five frames sampled), `viewing_gamma /
+     gamut / bmdgen`, `embedded_lut`, `pipeline` (cpu), `resolution_scales`;
+     `--decode … --scale full|half|quarter|eighth` (ReadJobHints +
+     `SetResolutionScale`; **the SDK's steps on this clip are 2/3, 1/3, 1/6
+     — 8192 / 4096 / 2048 wide — not 1/2 1/4 1/8: take the size from the
+     decode header**), `--look film|video|extended|rec709`, dual-track header
+     `bit_depth` + 16-bit fix; `--meta [--frame N]` (every clip + frame key);
+     `--shutters [--step N]` (per-frame `shutter_value` "7.2°" / "1/535" →
+     seconds; reading a frame's metadata reads the frame: 106 s cold for all
+     2894 frames of C006 — the app samples every fps/2 frames);
+     `--lut <file> <out.cube>` (the embedded "Gen 5 Film to Extended Video",
+     33³, stored B,G,R → written R,G,B; matches Resolve's shipped cube to
+     5e-7). Decode: 12K 8-bit ~25 fps CPU (16-bit the same), the pipe +
+     CPU swizzle make the export ~5.5 fps at full size.
+   - **File facts**: gyro+accel 1022 Hz, rad/s and m/s², NO timestamps
+     (sample 0 = frame 0 start, rate is the clock); no lens metadata at all
+     (`lens_type` etc. empty, distortion arrays zero); shutter is AUTO and
+     varies within a take (C005 0.4–3.3 ms, C006 1.0–2.6 ms) → per-frame
+     from `--shutters`; `crop_origin` = [24, 12] for BOTH window heights, so
+     it does not place the window on the sensor (assume centred); clip is
+     Blackmagic Design Film Gen 5 / BMD gamut with the display LUT embedded
+     (`post_3dlut_mode` Disabled); audio PCM 24-bit stereo.
+   - **Pipeline**: `probe_video` routes `.braw` to `BrawInfo` (frame = both
+     eyes, fps, frame count — ffprobe pads the size and fails on URSA
+     files); `SourceKind::BlackmagicRaw` now `has_frame_imu` + `is_braw`;
+     `BrawFisheyeIter::new_with_options(path, info, bit_depth, scale, look,
+     swap, limit)` splits the frame into L|R halves (single-track = a VR180
+     lens on one sensor; dual-track = the helper's composition), keeps 16-bit
+     as RGBA64LE, seeks by restarting the helper at `--start`, no swap in the
+     iterator (consumers apply it, like SBS); `braw_imu.rs` rewritten:
+     `build_braw_imu(info, gyro, shutters, fps, n, eye_w, eye_h, circles)` →
+     `DjiOsvImu` via `integrate_orientation_samples` (VQF bias), content time
+     `i/fps + readout/2 − shutter(i)/2 + latency`, `HR_PER_FRAME` blocks,
+     `readout_ms` from the file, `BlockMid`; export/preview/still/auto-align
+     all take the common `compute_dji_stabilization` arm with per-row RS;
+     `resolve_export_braw_imu`, `load_braw_imu` (cached + `seed_detected_calib`).
+     **IMU basis measured** (`VR180_BRAW_BASIS` sweep of all 48 axis-aligned
+     candidates, camera-locked 2 s exports, residual inter-frame motion at
+     512 px): `diag(−1, 1, −1)` ≡ `diag(1, −1, 1)` (the Python app's old C)
+     0.38 px vs 1.53 no-stab, 2.02 identity, every other ≥ 1.16 →
+     `BRAW_IMU_TO_CAM`. Gyro latency `BRAW_GYRO_LATENCY_MS` = **+4 ms**
+     (`VR180_BRAW_LATENCY_MS` sweep −12…+12 on two C006 windows: shallow
+     minima +3…+5 (0.356–0.360 vs 0.380 at 0, 0.58 at −12) and +1…+5
+     (0.134 flat)). Readout stays the file's (rows × 3 µs): the RS-scale
+     sweep is FLAT on this handheld footage (0.354–0.360 for 0…2×) — no
+     fast pans in the window, so it neither confirms nor refutes the line
+     time. Probe knobs: `VR180_BRAW_DECODE_SCALE=half`
+     (export decode at 2/3 for the headless probes), `VR180_PROBE_AUDIO`,
+     `VR180_RS_SCALE`.
+   - **Lens = manual (user decision: no in-camera calibration)**: the file
+     seeds the Override UI from the IMAGE CIRCLES (`circles.rs`:
+     `detect_sbs_circles` on a quarter-size decode of frame 0 — rim level from
+     the eye's corners (log black ≈ 25/255), edge points per row/column, LS
+     circle with outlier rejection; C005 (2910, 3247) r 3183 / (3170, 3187)
+     r 3178 native px, C006 (2942, 2524) r 3202 / (3188, 2469) r 3206 — the
+     two lenses sit ~60 px apart vertically and 160 px outward of the eye
+     centres) + the preset's FOV (`fx = r / (FOV/2)`) and k; the user sets
+     FOV / k / k5 / p by hand (k5/p shown for BRAW, the Camera preset combo
+     offers the Blackmagic presets + Custom, the Gyroflow loader stays).
+     The Override UI's "In-file" line shows the seed. Templates: "braw".
+   - **Colour**: decoded as shot (Film log) in 8-bit (preview) / 16-bit
+     (10-bit + ProRes exports; the old path fed RGBA8 to the 16-bit kernels);
+     the clip's embedded LUT is written to the temp dir as
+     `Gen 5 Film to Extended Video (embedded).cube` by the loader
+     (`LoadedMeta.braw_lut`) and auto-applied like the built-ins (the
+     `" (embedded).cube"` suffix counts as a built-in for the clip-switch
+     rule). `--look` renders exist in the helper for a direct video/709
+     output but are not used.
+   - **Audio**: `finalize_braw_audio` — helper WAV (whole clip) → the export
+     window as stereo AAC (`audio::stereo_to_aac`, new) → mux. FOUND + FIXED
+     on the way: a WAV's channel layout has an EMPTY mask ("2 channels"), and
+     swresample then rejected every frame with "Input changed" — all audio
+     decode sites normalise the layout (`normalized_layout`) and stamp the
+     decoded frames. `one_pass_audio_eligible` = false for BRAW.
+   - **Preview**: decode scale from `max_decode_side_for_fps` through
+     `DecodeScale::for_eye_width` (12K @ 60 → quarter = 2048-px eyes);
+     progressive loader arm = non-progressive like Kandao (gyro + shutters
+     + circles ≈ 0.5 s).
+   - **Not done / open**: URSA Cine Immersive (two tracks) untested here;
+     Windows has no helper (the BRAW path is macOS-only by construction);
+     `--look` not exposed; no per-file calibration store beyond the "braw"
+     template (a 2.4:1 window and a 16:9 one of the same lens share the
+     circle centre offsets, not the normalised cy — re-detect per clip).
+     Examples (gitignored): `rs_probe_export`, `audio_window_probe`, `wav_probe`.
+
 
 20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac
    side's ambisonic work pulled, built clean first try (the new `build.rs`

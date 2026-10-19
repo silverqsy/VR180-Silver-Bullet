@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Blackmagic RAW: rebuilt on the current stabilization path
+
+Blackmagic cameras with a VR180 lens (tested on a PYXIS 12K, 12288×6480
+and 12288×5112 clips with their gyro) now get the same treatment as the
+other cameras. The camera records no lens calibration, so the lens stays a
+manual entry — the app seeds it from the image circles it finds in the
+frame.
+
+- **Decoding.** Single-track clips are split into their two eyes (a
+  dual-fisheye lens on one sensor); two-track clips are composed by the
+  helper as before. 10-bit and ProRes exports decode at 16 bits; the
+  preview decodes at a fraction of the recorded size; seeking works.
+- **Stabilization.** The clip's gyro drives the same stabilizer as the
+  other cameras (camera lock, soft-stab, Response, max correction), with
+  per-scanline rolling-shutter correction timed from the file: the sensor
+  line time and the per-frame shutter (which the camera's auto exposure
+  moves within a take) are read from the clip. The gyro-to-camera
+  orientation was measured on the sample footage.
+- **Lens.** On load the app finds the two image circles and seeds each
+  eye's principal point and focal from them; FOV, distortion (k1–k5, p1/p2)
+  and the centres are then set in the Override panel. Camera presets and
+  the Gyroflow profile loader remain available for this camera.
+- **Colour and audio.** Clips decode in the Film log they were shot in and
+  the camera's own embedded "Gen 5 Film to Extended Video" LUT is applied
+  automatically; the PCM stereo track is encoded to AAC and muxed. A
+  channel-layout quirk that silently dropped WAV audio in the muxer is
+  fixed.
+- Requires the Blackmagic RAW SDK (macOS) for the helper; the helper now
+  builds against SDK 6.0.
+
 ### Kandao QooCam 3 Ultra: video and stills
 
 The QooCam 3 Ultra joins the Osmo 360, the X6 and the Max 2 as a VR180-mod

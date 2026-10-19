@@ -1,215 +1,273 @@
-//! BRAW gyro → per-frame stabilization rotations.
+//! Blackmagic RAW: the clip's gyro / accelerometer stream + metadata → the
+//! stabilizer's [`DjiOsvImu`], the way `kandao_imu` does it for the QooCam.
 //!
-//! Bridges `vr180-braw::BrawGyroData` (raw IMU samples from the
-//! `braw_helper --gyro` subprocess) and `vr180-pipeline::gpu::EquirectRotation`
-//! (the 3×3 rotation matrix the fisheye projection shader consumes).
+//! ## What the file gives and what it does not
 //!
-//! Algorithm matches `vr180_gui.py:1032-1200` (`BrawGyroStabilizer`):
+//! A BRAW clip carries a raw gyro + accelerometer stream (1022 Hz on the
+//! PYXIS 12K; `IBlackmagicRawClipGyroscopeMotion`, rad/s and m/s², no
+//! timestamps — sample 0 is the start of frame 0 and the rate is the
+//! clock), the sensor's line time (`sensor_line_time`, µs; readout =
+//! rows × line time: 19.44 ms for the 12288×6480 window, 15.34 ms for
+//! 12288×5112), and a per-frame shutter (`shutter_value`, "7.2°" or
+//! "1/535" — the camera's auto exposure moves it within a take, 0.4–3.3 ms
+//! on the sample clip, so it is sampled per frame rather than read once).
+//! It carries NO lens calibration (every `lens_*` key is empty on a
+//! third-party dual-fisheye lens): the lens is the user's manual entry in
+//! the Override UI, seeded from the image circles the app finds in a
+//! decoded frame ([`crate::circles`]) and the camera preset's FOV / k.
 //!
-//! 1. Run VQF 6D (no magnetometer — BRAW gyro/accel only) to get a
-//!    per-sample orientation quaternion.
-//! 2. Sample one quat per video frame at `t_mid = (fi + 0.5) · dt`
-//!    by nearest-index lookup.
-//! 3. Reference is `q_ref = quat_at_frame_0`.
-//! 4. Per-frame correction: `q_corr = q⁻¹ ⊗ q_ref` — left-multiply
-//!    the actual inverse. Matches Python `BrawGyroStabilizer` and
-//!    `DjiGyroStabilizer` at `vr180_gui.py:713,1109-1200`. The
-//!    composition order is part of the empirically-calibrated pair
-//!    `[formula × C_IMU_TO_CAM]`; changing one without the other
-//!    breaks stabilization on real footage (verified — the
-//!    theoretically-equivalent formula `q ⊗ q_ref⁻¹` looks correct
-//!    on paper but produces no visible stab on real OSV clips).
-//! 5. Apply IMU→camera basis transform
-//!    `C = diag(+1, -1, +1)` (negate-Y only — matches
-//!    `vr180_gui.py:1006`, empirically verified for Pyxis / URSA Cine
-//!    Immersive).
+//! ## Motion
 //!
-//! Rolling shutter: BRAW disables RS (`vr180_gui.py:3800-3801`). One
-//! rotation per video frame, not per-row.
+//! The raw stream is fused exactly as the X6's and the QooCam's
+//! (`integrate_orientation_samples`: trapezoid gyro integration with a
+//! whole-clip VQF bias estimate, batch gravity alignment, the slow
+//! inclination trim). Per-frame content time = the centre row's
+//! mid-exposure: `i / fps + readout / 2 − shutter(i) / 2 + latency`
+//! ([`BRAW_GYRO_LATENCY_MS`]; `VR180_BRAW_LATENCY_MS` overrides it for the
+//! probe). The IMU → camera basis ([`BRAW_IMU_TO_CAM`], rows = camera
+//! x right / y up / z in IMU coordinates; `VR180_BRAW_BASIS` overrides) is
+//! settled the way the others were: uncapped camera-lock exports of a
+//! clip window under each candidate, the one that leaves the least
+//! residual motion wins.
 
-use crate::Result;
-use crate::gpu::EquirectRotation;
 use vr180_core::gyro::cori_iori::Quat;
+use vr180_fisheye::insta360::InsvImuSample;
+use vr180_fisheye::{DjiLensCalib, DjiOsvImu};
 
-/// Per-frame stabilization rotations + diagnostics.
-#[derive(Debug)]
-pub struct BrawStabResult {
-    /// One rotation per video frame, length == `n_frames` requested.
-    pub per_frame: Vec<EquirectRotation>,
-    /// VQF's final bias estimate in deg/s (printed for diagnostics).
-    pub bias_deg_s: [f32; 3],
-    /// Number of gyro samples consumed (sanity check).
-    pub gyro_sample_count: usize,
+use crate::insv_imu::{integrate_orientation_samples, HR_PER_FRAME, INSV_TAU_ACC_S};
+
+/// IMU→camera basis for a Blackmagic camera with a forward-facing VR180
+/// lens — rows are the camera axes (x right, y up, z) in IMU coordinates,
+/// the X6 / QooCam convention: a 180° turn about y. Measured on the PYXIS
+/// 12K sample (2026-10-19): camera-locked exports of a 2 s handheld window
+/// under all 48 axis-aligned candidates (`VR180_BRAW_BASIS`), residual
+/// inter-frame motion of the output at 512 px — this one 0.38 px against
+/// 1.53 with no stabilization and 2.02 for the identity; every other
+/// candidate ≥ 1.16. `diag(1, −1, 1)` scores identically (a basis and its
+/// negative conjugate the same way), and is the Python app's old
+/// `C_IMU_TO_CAM`; the proper rotation is kept.
+pub const BRAW_IMU_TO_CAM: [[f32; 3]; 3] = [
+    [-1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, -1.0],
+];
+
+/// Gyro delay relative to `i / fps + readout/2 − shutter/2`, ms — the
+/// residual once the sensor's own timing is accounted for. Measured on
+/// the PYXIS 12K sample (camera-locked 2 s exports, residual inter-frame
+/// motion at 512 px, `VR180_BRAW_LATENCY_MS` swept −12…+12): a shallow
+/// minimum at +3…+5 ms on one window (0.356–0.360 vs 0.380 at 0 and 0.58
+/// at −12) and +1…+5 on another (0.134 flat), so +4. The readout itself
+/// (the file's 3 µs line time) could not be checked the same way: the
+/// RS-scale sweep is flat on this handheld footage (0.354–0.360 for
+/// 0×…2×) — no fast pans in it.
+pub const BRAW_GYRO_LATENCY_MS: f32 = 4.0;
+
+/// The camera-preset name the BRAW kind resolves to.
+pub const BRAW_PRESET_NAME: &str = "Blackmagic Pyxis 12K";
+
+/// `VR180_BRAW_BASIS="r00,r01,…,r22"` (row-major) overrides the basis for
+/// headless A/B tests. Rows are normalised but NOT re-orthogonalised, so a
+/// reflected candidate (det −1) is tested as given.
+pub fn braw_imu_to_cam() -> [[f32; 3]; 3] {
+    let m = std::env::var("VR180_BRAW_BASIS").ok()
+        .and_then(|v| {
+            let f: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            (f.len() == 9).then(|| [[f[0], f[1], f[2]], [f[3], f[4], f[5]], [f[6], f[7], f[8]]])
+        })
+        .unwrap_or(BRAW_IMU_TO_CAM);
+    let norm = |v: [f32; 3]| {
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-12);
+        [v[0] / n, v[1] / n, v[2] / n]
+    };
+    [norm(m[0]), norm(m[1]), norm(m[2])]
 }
 
-/// Compute per-frame stabilization rotations from a `BrawGyroData`.
-///
-/// `n_frames` is the number of video frames to produce (typically
-/// equal to `BrawInfo::frame_count`).
-///
-/// Returns `Ok(BrawStabResult)` on success. If the gyro stream is
-/// empty or shorter than what one frame needs, returns `n_frames`
-/// identity rotations — callers get a clean fallback rather than an
-/// error in the middle of the playback hot path.
-pub fn compute_braw_stabilization(
-    gyro_data: &vr180_braw::BrawGyroData,
-    fps: f32,
-    n_frames: usize,
-) -> Result<BrawStabResult> {
-    let n_samples = gyro_data.len();
-    let identity_run = || BrawStabResult {
-        per_frame: vec![EquirectRotation::IDENTITY; n_frames],
-        bias_deg_s: [0.0; 3],
-        gyro_sample_count: n_samples,
+/// Frames between shutter samples: every half second — the camera's auto
+/// exposure ramps slowly, and reading a frame's metadata means reading the
+/// frame (~10 ms each in one helper process).
+pub fn shutter_sample_step(fps: f64) -> u64 {
+    ((fps * 0.5).round() as u64).max(1)
+}
+
+pub fn braw_gyro_latency_ms() -> f32 {
+    std::env::var("VR180_BRAW_LATENCY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(BRAW_GYRO_LATENCY_MS)
+}
+
+/// A detected image circle of one eye, in that eye's pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EyeCircle { pub cx: f32, pub cy: f32, pub r: f32 }
+
+/// The seed lens for one eye: principal point at the detected circle (or
+/// the eye centre), focal from the circle radius and the preset's FOV (an
+/// equidistant lens: `r = f · θ`), the preset's `k`; `k5 = p = 0`. The user
+/// refines all of it in the Override UI — a Blackmagic file has no lens
+/// record of its own.
+pub fn seed_lens_calib(eye_w: u32, eye_h: u32, circle: Option<EyeCircle>) -> DjiLensCalib {
+    let preset = vr180_fisheye::presets::find(BRAW_PRESET_NAME);
+    let fov_deg = preset.map(|p| p.default_fov_deg as f32).unwrap_or(190.0);
+    let k = preset
+        .map(|p| [p.calib.k[0] as f32, p.calib.k[1] as f32, p.calib.k[2] as f32, p.calib.k[3] as f32])
+        .unwrap_or([0.0; 4]);
+    let half_fov = fov_deg.max(1.0).to_radians() * 0.5;
+    let (cx, cy, fx) = match circle {
+        Some(c) if c.r > 1.0 => (c.cx, c.cy, c.r / half_fov),
+        _ => (eye_w as f32 * 0.5, eye_h as f32 * 0.5, (eye_w.min(eye_h) as f32 * 0.5) / half_fov),
     };
-
-    if n_samples < 8 || fps <= 0.0 || n_frames == 0 {
-        tracing::warn!(
-            "braw_imu: gyro={} fps={} n_frames={} — falling back to identity",
-            n_samples, fps, n_frames
-        );
-        return Ok(identity_run());
+    DjiLensCalib {
+        fx: Some(fx), fy: Some(fx), cx: Some(cx), cy: Some(cy),
+        k1: Some(k[0]), k2: Some(k[1]), k3: Some(k[2]), k4: Some(k[3]),
+        k5: Some(0.0), p1: Some(0.0), p2: Some(0.0),
+        width: Some(eye_w as f32), height: Some(eye_h as f32),
+        omni: None,
+        ..Default::default()
     }
+}
 
-    // De-interleave the flat gyro/accel arrays into [[f32;3]; N].
-    let mut gyro_xyz: Vec<[f32; 3]> = Vec::with_capacity(n_samples);
-    let mut acc_xyz:  Vec<[f32; 3]> = Vec::with_capacity(n_samples);
-    for i in 0..n_samples {
-        let go = i * 3;
-        gyro_xyz.push([
-            gyro_data.gyro[go + 0],
-            gyro_data.gyro[go + 1],
-            gyro_data.gyro[go + 2],
-        ]);
-        acc_xyz.push([
-            gyro_data.accel[go + 0],
-            gyro_data.accel[go + 1],
-            gyro_data.accel[go + 2],
-        ]);
+/// `(lens_a, lens_b)` for the stabilizer: `lens_b` = the LEFT eye (the left
+/// half / track 0, the resolvers' default with the swap off), `lens_a` =
+/// the RIGHT. `circles` = `[left, right]` when detected.
+pub fn lens_pair(eye_w: u32, eye_h: u32, circles: Option<[EyeCircle; 2]>) -> (DjiLensCalib, DjiLensCalib) {
+    let (l, r) = match circles { Some([l, r]) => (Some(l), Some(r)), None => (None, None) };
+    (seed_lens_calib(eye_w, eye_h, r), seed_lens_calib(eye_w, eye_h, l))
+}
+
+/// Calibration-only IMU (no quats): enough to dewarp and seed the Override
+/// UI; stabilization stays identity.
+pub fn braw_calib_only(info: &vr180_braw::BrawInfo, eye_w: u32, eye_h: u32, circles: Option<[EyeCircle; 2]>) -> DjiOsvImu {
+    let (lens_a, lens_b) = lens_pair(eye_w, eye_h, circles);
+    DjiOsvImu {
+        lens_a,
+        lens_b,
+        camera_model: Some(if info.camera_model.is_empty() { "Blackmagic RAW".to_string() } else { info.camera_model.clone() }),
+        imu_to_cam: Some(braw_imu_to_cam()),
+        readout_ms: info.readout_s().map(|s| (s * 1e3) as f32),
+        sample_anchor: vr180_fisheye::SampleAnchor::BlockMid,
+        ..Default::default()
     }
+}
 
-    let gyr_ts = gyro_data.sample_period_s() as f32;
-    if !gyr_ts.is_finite() || gyr_ts <= 0.0 {
-        tracing::warn!("braw_imu: invalid gyr_ts {gyr_ts} — falling back to identity");
-        return Ok(identity_run());
+/// The stabilizer's per-frame orientation stream from the clip's gyro.
+/// `n_frames_hint` is the video's frame count (`BrawInfo::frame_count`);
+/// `shutters` the sampled per-frame shutter (a hold lookup; empty → the
+/// `--info` sample, else 0). Returns the calibration-only structure when
+/// the gyro is unusable.
+pub fn build_braw_imu(
+    info: &vr180_braw::BrawInfo,
+    gyro: &vr180_braw::BrawGyroData,
+    shutters: &vr180_braw::BrawShutters,
+    fps: f32,
+    n_frames_hint: usize,
+    eye_w: u32,
+    eye_h: u32,
+    circles: Option<[EyeCircle; 2]>,
+) -> DjiOsvImu {
+    let mut out = braw_calib_only(info, eye_w, eye_h, circles);
+    let n_imu = gyro.len();
+    let rate = gyro.header.gyro_sample_rate;
+    if n_imu < 16 || rate <= 0.0 || fps <= 0.0 {
+        tracing::warn!("braw_imu: no usable motion data (samples={} rate={} fps={}) — calib only", n_imu, rate, fps);
+        return out;
     }
-
-    let t_vqf = std::time::Instant::now();
-    let vqf = vr180_core::gyro::vqf::run(&gyro_xyz, &acc_xyz, None, gyr_ts);
+    let dt = (1.0 / rate) as f32;
+    // The SDK stream: rad/s and m/s², sample k at k / rate from the clip start.
+    const DEG: f32 = 180.0 / std::f32::consts::PI;
+    const G: f32 = 9.80665;
+    let samples: Vec<InsvImuSample> = (0..n_imu).map(|k| InsvImuSample {
+        t_us: (k as f64 * 1e6 / rate).round() as u64,
+        acc_g: [gyro.accel[k * 3] / G, gyro.accel[k * 3 + 1] / G, gyro.accel[k * 3 + 2] / G],
+        gyr_dps: [gyro.gyro[k * 3] * DEG, gyro.gyro[k * 3 + 1] * DEG, gyro.gyro[k * 3 + 2] * DEG],
+    }).collect();
+    let gyr: Vec<[f32; 3]> = (0..n_imu).map(|k| [gyro.gyro[k * 3], gyro.gyro[k * 3 + 1], gyro.gyro[k * 3 + 2]]).collect();
+    let acc: Vec<[f32; 3]> = (0..n_imu).map(|k| [gyro.accel[k * 3], gyro.accel[k * 3 + 1], gyro.accel[k * 3 + 2]]).collect();
+    let t0 = std::time::Instant::now();
+    let pass1 = vr180_core::gyro::vqf::run(&gyr, &acc, None, dt);
+    let quats = integrate_orientation_samples(&samples, pass1.bias_rad_s, INSV_TAU_ACC_S);
     tracing::info!(
-        "braw_imu: VQF 6D ran in {:.1?}, bias = {:?}°/s",
-        t_vqf.elapsed(), vqf.bias_deg_s()
+        "braw_imu: gyro integration over {} samples @ {:.1} Hz in {:.1?}, bias = {:?} °/s",
+        n_imu, rate, t0.elapsed(), pass1.bias_deg_s()
     );
-
-    // Sample one quaternion per video frame at t_mid = (fi + 0.5) * dt.
-    let dt = 1.0_f32 / fps;
-    let mut frame_quats: Vec<Quat> = Vec::with_capacity(n_frames);
-    for fi in 0..n_frames {
-        let t_mid = (fi as f32 + 0.5) * dt;
-        let mut idx = (t_mid / gyr_ts).round() as usize;
-        if idx >= n_samples {
-            idx = n_samples - 1;
-        }
-        frame_quats.push(vqf.quats[idx]);
+    let timeline = crate::insv_imu::QuatTimeline {
+        t_s: samples.iter().map(|s| s.t_us as f64 * 1e-6).collect(),
+        quats: &quats,
+    };
+    let readout_s = info.readout_s().unwrap_or(0.0);
+    let latency_s = braw_gyro_latency_ms() as f64 * 1e-3;
+    let frame_dur = 1.0 / fps as f64;
+    let fallback_shutter = if info.shutter_s_min > 0.0 { 0.5 * (info.shutter_s_min + info.shutter_s_max) } else { 0.0 };
+    let shutter = |i: usize| -> f64 { shutters.at(i as u64).unwrap_or(fallback_shutter) };
+    // Centre row mid-exposure: frame i's first row starts reading out at
+    // i / fps, the centre row readout/2 later, and its exposure ended
+    // shutter/2 before its own readout.
+    let content_time = |i: usize| -> f64 { i as f64 * frame_dur + readout_s * 0.5 - shutter(i) * 0.5 + latency_s };
+    let n_frames = n_frames_hint.max(1);
+    out.frame_quats.reserve(n_frames);
+    out.high_rate_quats.reserve(n_frames);
+    out.gravity.reserve(n_frames);
+    for i in 0..n_frames {
+        let tc = content_time(i);
+        out.frame_quats.push(timeline.at(tc));
+        let start = tc - frame_dur * 0.5;
+        let hr: Vec<Quat> = (0..HR_PER_FRAME)
+            .map(|k| timeline.at(start + frame_dur * (k as f64) / (HR_PER_FRAME as f64)))
+            .collect();
+        out.high_rate_quats.push(hr);
+        out.gravity.push([0.0, -1.0, 0.0]);
     }
-
-    // Reference = first frame's quat.
-    let q_ref = frame_quats[0];
-
-    // Build per-frame correction matrices.
-    // R_imu = q_frame⁻¹ ⊗ q_ref, as a 3×3 matrix.
-    // R_cam = C @ R_imu @ Cᵀ, where C = diag(+1, -1, +1).
-    //
-    // Composition matches Python BrawGyroStabilizer at
-    // vr180_gui.py:1109-1200 (same `Q_inv * Q_ref` order as the OSV
-    // path). The combined `formula × C_IMU_TO_CAM` pair is what's
-    // empirically calibrated — see compute_dji_stabilization comment
-    // for the full discussion of why we don't change the composition
-    // independently of C.
-    let mut per_frame = Vec::with_capacity(n_frames);
-    for &q in &frame_quats {
-        let q_corr = q.conjugate().mul(q_ref).normalize();
-        let r = q_corr.to_mat3_row_major();
-        // Apply C·R·Cᵀ. With C = diag(1,-1,1):
-        //   C·R has rows 0 and 2 unchanged, row 1 negated.
-        //   (C·R)·Cᵀ has columns 0 and 2 unchanged, column 1 negated.
-        // Net result: r[0,1], r[1,0], r[1,2], r[2,1] all negate.
-        let r_cam = [
-             r[0],       -r[1],        r[2],
-            -r[3],        r[4],       -r[5],
-             r[6],       -r[7],        r[8],
-        ];
-        per_frame.push(EquirectRotation(r_cam));
-    }
-
-    Ok(BrawStabResult {
-        per_frame,
-        bias_deg_s: vqf.bias_deg_s(),
-        gyro_sample_count: n_samples,
-    })
+    out.exposure_ms = (0..n_frames).map(|i| (shutter(i) * 1e3) as f32).collect();
+    tracing::info!(
+        "braw_imu: {} frames @ {:.3} fps, readout {:.2} ms, shutter {:.2}…{:.2} ms ({} sampled), latency {:.1} ms, imu span {:.3}..{:.3} s, basis {:?}",
+        n_frames, fps, readout_s * 1e3, info.shutter_s_min * 1e3, info.shutter_s_max * 1e3, shutters.samples.len(),
+        latency_s * 1e3, timeline.t_s[0], timeline.t_s[timeline.t_s.len() - 1], out.imu_to_cam
+    );
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vr180_braw::{BrawGyroData, BrawGyroHeader};
 
-    /// Stationary IMU (gyro=0, accel=gravity) should produce
-    /// near-identity per-frame rotations across all frames.
-    #[test]
-    fn stationary_gyro_produces_near_identity_rotations() {
-        // Fake 800 Hz, 5 seconds → 4000 samples.
-        let n = 4000;
-        let mut gyro = vec![0f32; n * 3];
-        let mut accel = vec![0f32; n * 3];
-        for i in 0..n {
-            accel[i * 3 + 2] = 9.81; // +Z = gravity
-            let _ = gyro[i * 3]; // silence unused-warn
-        }
-        let header = BrawGyroHeader {
-            gyro_sample_count: n as u64,
-            gyro_sample_rate: 800.0,
-            accel_sample_count: n as u64,
-            accel_sample_rate: 800.0,
-            sample_count: n as u64,
-            frame_rate: 24.0,
-        };
-        let data = BrawGyroData { header, gyro, accel };
-        let stab = compute_braw_stabilization(&data, 24.0, 120)
-            .expect("compute_braw_stabilization");
-        assert_eq!(stab.per_frame.len(), 120);
-        // Every frame's rotation should be near identity.
-        for (i, rot) in stab.per_frame.iter().enumerate() {
-            let m = rot.0;
-            // Diagonal close to 1, off-diagonal close to 0. The
-            // very first few frames will be drifty (VQF inclination
-            // correction not converged yet), so skip them.
-            if i < 10 { continue; }
-            let trace = m[0] + m[4] + m[8];
-            assert!(
-                (trace - 3.0).abs() < 0.05,
-                "frame {i} trace = {trace:.6} (expected ~3.0)"
-            );
-        }
+    fn info() -> vr180_braw::BrawInfo {
+        serde_json::from_str(r#"{"width":12288,"height":6480,"frame_count":100,"frame_rate":50.0,"duration":2.0,
+            "camera_model":"Blackmagic PYXIS 12K","gyro_sample_rate":1022.0,"readout_ms":19.44,"sensor_line_time_us":3.0,
+            "shutter_s_min":0.0004,"shutter_s_max":0.0033}"#).unwrap()
     }
 
-    /// Empty gyro returns identity rotations cleanly (no panic).
     #[test]
-    fn empty_gyro_returns_identity() {
-        let header = BrawGyroHeader {
-            gyro_sample_count: 0,
-            gyro_sample_rate: 800.0,
-            accel_sample_count: 0,
-            accel_sample_rate: 800.0,
-            sample_count: 0,
-            frame_rate: 24.0,
-        };
-        let data = BrawGyroData { header, gyro: vec![], accel: vec![] };
-        let stab = compute_braw_stabilization(&data, 24.0, 60)
-            .expect("identity fallback");
-        assert_eq!(stab.per_frame.len(), 60);
-        for rot in &stab.per_frame {
-            assert_eq!(rot.0, EquirectRotation::IDENTITY.0);
-        }
+    fn seed_lens_from_circle_and_preset() {
+        let c = EyeCircle { cx: 2910.0, cy: 3247.0, r: 3183.0 };
+        let l = seed_lens_calib(6144, 6480, Some(c));
+        assert_eq!(l.cx, Some(2910.0));
+        assert_eq!(l.cy, Some(3247.0));
+        let fov = vr180_fisheye::presets::find(BRAW_PRESET_NAME).map(|p| p.default_fov_deg as f32).unwrap_or(190.0);
+        assert!((l.fx.unwrap() - 3183.0 / (fov.to_radians() * 0.5)).abs() < 1e-2);
+        let (a, b) = lens_pair(6144, 6480, Some([c, EyeCircle { cx: 3170.0, cy: 3187.0, r: 3178.0 }]));
+        assert_eq!(b.cx, Some(2910.0));   // lens_b = left
+        assert_eq!(a.cx, Some(3170.0));
+        let n = seed_lens_calib(6144, 6480, None);
+        assert_eq!(n.cx, Some(3072.0));
+    }
+
+    #[test]
+    fn stream_from_gyro_and_shutters() {
+        let rate = 1022.0f64;
+        let n = (rate * 2.5) as usize;
+        let header: vr180_braw::BrawGyroHeader = serde_json::from_str(&format!(
+            r#"{{"gyro_sample_count":{n},"gyro_sample_rate":{rate},"accel_sample_count":{n},"accel_sample_rate":{rate},"sample_count":{n},"frame_rate":50.0}}"#)).unwrap();
+        let mut accel = vec![0f32; n * 3];
+        for k in 0..n { accel[k * 3 + 1] = -9.80665; }
+        let gyro = vr180_braw::BrawGyroData { header, gyro: vec![0f32; n * 3], accel };
+        let sh = vr180_braw::BrawShutters { samples: vec![(0, 0.001), (50, 0.002)] };
+        let imu = build_braw_imu(&info(), &gyro, &sh, 50.0, 100, 6144, 6480, None);
+        assert_eq!(imu.frame_quats.len(), 100);
+        assert_eq!(imu.high_rate_quats[0].len(), HR_PER_FRAME);
+        assert!((imu.readout_ms.unwrap() - 19.44).abs() < 1e-3);
+        assert!((imu.exposure_ms[10] - 1.0).abs() < 1e-4 && (imu.exposure_ms[60] - 2.0).abs() < 1e-4);
+        assert_eq!(imu.sample_anchor, vr180_fisheye::SampleAnchor::BlockMid);
+        let q0 = imu.frame_quats[0]; let q9 = imu.frame_quats[99];
+        assert!((q0.w - q9.w).abs() < 1e-4 && (q0.x - q9.x).abs() < 1e-4);
+        let calib = braw_calib_only(&info(), 6144, 6480, None);
+        assert!(calib.frame_quats.is_empty());
+        assert_eq!(calib.imu_to_cam, Some(BRAW_IMU_TO_CAM));
     }
 }

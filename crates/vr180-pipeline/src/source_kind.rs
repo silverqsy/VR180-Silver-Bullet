@@ -114,7 +114,14 @@ impl SourceKind {
     /// the DJI-style stabilization controls (smooth / max-corr / IMU
     /// phase) apply. DJI reads camera quats; Insta360 fuses its raw gyro.
     pub fn has_frame_imu(self) -> bool {
-        matches!(self, Self::DjiOsv | Self::Insta360Insv | Self::KandaoQoocam)
+        matches!(self, Self::DjiOsv | Self::Insta360Insv | Self::KandaoQoocam | Self::BlackmagicRaw)
+    }
+
+    /// Blackmagic RAW: decoded by the SDK helper, both eyes side by side
+    /// (a VR180 lens on one sensor, or two tracks composed by the helper);
+    /// the lens is the user's manual calibration.
+    pub fn is_braw(self) -> bool {
+        matches!(self, Self::BlackmagicRaw)
     }
 
     /// A single still photo (no timeline, no decoder, no stabilization):

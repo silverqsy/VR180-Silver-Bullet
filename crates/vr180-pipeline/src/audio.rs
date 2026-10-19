@@ -617,6 +617,13 @@ fn ambisonic_layout(channels: i32) -> ffmpeg::ChannelLayout {
     ffmpeg::ChannelLayout::from(raw)
 }
 
+/// A stream's channel layout with an EMPTY mask (a WAV says "2 channels"
+/// and nothing else) made swresample refuse every decoded frame ("Input
+/// changed"): use the default layout for that channel count instead.
+fn normalized_layout(l: ffmpeg::ChannelLayout) -> ffmpeg::ChannelLayout {
+    if l.is_empty() && l.channels() > 0 { ffmpeg::ChannelLayout::default(l.channels() as i32) } else { l }
+}
+
 /// Output of [`transcode_audio_window`].
 enum AudioOut {
     /// Stereo AAC-LC (ffmpeg's native encoder) in an `.m4a`.
@@ -664,7 +671,7 @@ fn transcode_audio_window(
         .decoder().audio()
         .map_err(|e| Error::Ffmpeg(format!("audio decoder: {e}")))?;
     let rate = decoder.rate();
-    let src_layout = decoder.channel_layout();
+    let src_layout = normalized_layout(decoder.channel_layout());
     let in_ch = src_layout.channels().max(1) as usize;
     if mix.is_some() && in_ch != 4 {
         return Err(Error::Ffmpeg(format!("a 4-channel mix needs 4 input channels, stream has {in_ch}")));
@@ -819,7 +826,7 @@ fn transcode_audio_window(
         }
         if decoder.send_packet(&pkt).is_err() { continue; }
         while decoder.receive_frame(&mut decoded).is_ok() {
-            if to_f32.run(&decoded, &mut f32_frame).is_ok() && f32_frame.samples() > 0 {
+            if { decoded.set_channel_layout(src_layout); to_f32.run(&decoded, &mut f32_frame) }.is_ok() && f32_frame.samples() > 0 {
                 push(&f32_frame, &mut pending, &mut drop_left);
             }
         }
@@ -827,7 +834,7 @@ fn transcode_audio_window(
     }
     let _ = decoder.send_eof();
     while decoder.receive_frame(&mut decoded).is_ok() {
-        if to_f32.run(&decoded, &mut f32_frame).is_ok() && f32_frame.samples() > 0 {
+        if { decoded.set_channel_layout(src_layout); to_f32.run(&decoded, &mut f32_frame) }.is_ok() && f32_frame.samples() > 0 {
             push(&f32_frame, &mut pending, &mut drop_left);
         }
     }
@@ -839,6 +846,26 @@ fn transcode_audio_window(
     drain(&mut encoder, &mut octx)?;
     octx.write_trailer().map_err(|e| Error::Ffmpeg(format!("write_trailer: {e}")))?;
     Ok(written)
+}
+
+/// Encode the window `[offset_s, offset_s + dur_s)` of a plain stereo (or
+/// mono) track — a WAV the BRAW helper extracted, say — to a stereo AAC
+/// `.m4a` starting at its own 0, like [`foa_to_stereo_aac`]. Returns the
+/// samples written.
+pub fn stereo_to_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Option<f64>, bit_rate: usize) -> Result<u64> {
+    let (stream_index, channels, _rate) = probe_any_audio(input)?
+        .ok_or_else(|| Error::Ffmpeg(format!("no audio track in {input:?}")))?;
+    if channels != 2 {
+        return Err(Error::Ffmpeg(format!("stereo_to_aac: {channels}-channel track in {input:?}")));
+    }
+    let t0 = std::time::Instant::now();
+    let n = transcode_audio_window(
+        input, stream_index, output_m4a, offset_s, dur_s,
+        None, AudioOut::AacStereo { bit_rate },
+    )?;
+    tracing::info!(m4a = %output_m4a.display(), samples = n, took_ms = t0.elapsed().as_millis() as u64,
+        "audio: encoded a stereo window to AAC");
+    Ok(n)
 }
 
 /// Decode the X6's 4-channel 360° Audio (first-order AmbiX) to a
@@ -1091,7 +1118,7 @@ fn decode_quad_window(input: &Path, stream_index: usize, offset_s: f64, dur_s: O
         .decoder().audio()
         .map_err(|e| Error::Ffmpeg(format!("audio decoder: {e}")))?;
     let rate = decoder.rate();
-    let src_layout = decoder.channel_layout();
+    let src_layout = normalized_layout(decoder.channel_layout());
     let in_ch = src_layout.channels().max(1) as usize;
     if in_ch != 4 {
         return Err(Error::Ffmpeg(format!("the 4-channel pre-pass needs 4 input channels, stream has {in_ch}")));
@@ -1111,7 +1138,7 @@ fn decode_quad_window(input: &Path, stream_index: usize, offset_s: f64, dur_s: O
         if let Some(end) = win_end { if t >= end { break; } }
         if decoder.send_packet(&pkt).is_err() { continue; }
         while decoder.receive_frame(&mut decoded).is_ok() {
-            if to_f32.run(&decoded, &mut f32_frame).is_ok() && f32_frame.samples() > 0 {
+            if { decoded.set_channel_layout(src_layout); to_f32.run(&decoded, &mut f32_frame) }.is_ok() && f32_frame.samples() > 0 {
                 let n = f32_frame.samples();
                 f(bytemuck::cast_slice(&f32_frame.data(0)[..n * in_ch * 4]));
             }

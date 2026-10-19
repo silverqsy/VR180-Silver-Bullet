@@ -32,6 +32,7 @@ pub struct DecodeHeader {
     pub frames: u64,
     #[serde(default)]
     pub dual_stream: bool,
+    #[serde(default = "default_bit_depth")]
     pub bit_depth: u32,
     #[serde(default)]
     pub track0_width: Option<u32>,
@@ -41,6 +42,46 @@ pub struct DecodeHeader {
     pub track1_width: Option<u32>,
     #[serde(default)]
     pub track1_height: Option<u32>,
+}
+
+fn default_bit_depth() -> u32 { 8 }
+
+/// Decode resolution: the SDK decodes a BRAW frame at a fraction of its
+/// size from a fraction of the bit stream (`--scale`). The fraction is the
+/// SDK's choice per clip — on the 12K PYXIS "half" is 8192 wide (2/3),
+/// "quarter" 4096 (1/3), "eighth" 2048 (1/6) — so consumers take the size
+/// from the decode header, never from [`Self::divisor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecodeScale { #[default] Full, Half, Quarter, Eighth }
+
+impl DecodeScale {
+    pub fn arg(self) -> &'static str {
+        match self { Self::Full => "full", Self::Half => "half", Self::Quarter => "quarter", Self::Eighth => "eighth" }
+    }
+    /// NOMINAL divisor on each dimension (the SDK may divide by less).
+    pub fn divisor(self) -> u32 {
+        match self { Self::Full => 1, Self::Half => 2, Self::Quarter => 4, Self::Eighth => 8 }
+    }
+    /// The coarsest scale whose eye is still at least `want` pixels wide by
+    /// the nominal divisor — conservative when the SDK divides by less.
+    pub fn for_eye_width(native_eye_w: u32, want: u32) -> Self {
+        for s in [Self::Eighth, Self::Quarter, Self::Half] {
+            if native_eye_w / s.divisor() >= want { return s; }
+        }
+        Self::Full
+    }
+}
+
+/// The helper's colour presets (`--look`): `Film` = as shot (Blackmagic
+/// Design Film Gen 5 log in the BMD gamut), the others ask the SDK for a
+/// display-referred render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecodeLook { #[default] Film, Video, Extended, Rec709 }
+
+impl DecodeLook {
+    pub fn arg(self) -> &'static str {
+        match self { Self::Film => "film", Self::Video => "video", Self::Extended => "extended", Self::Rec709 => "rec709" }
+    }
 }
 
 impl DecodeHeader {
@@ -84,6 +125,10 @@ pub struct DecodeOptions {
     pub exposure: Option<f32>,
     /// `--iso <int>`.
     pub iso: Option<i32>,
+    /// `--scale`: decode at a fraction of the recorded size.
+    pub scale: DecodeScale,
+    /// `--look`: colour preset.
+    pub look: DecodeLook,
 }
 
 impl DecodeOptions {
@@ -117,6 +162,12 @@ impl DecodeOptions {
         }
         if let Some(v) = self.iso {
             cmd.arg("--iso").arg(v.to_string());
+        }
+        if self.scale != DecodeScale::Full {
+            cmd.arg("--scale").arg(self.scale.arg());
+        }
+        if self.look != DecodeLook::Film {
+            cmd.arg("--look").arg(self.look.arg());
         }
     }
 }

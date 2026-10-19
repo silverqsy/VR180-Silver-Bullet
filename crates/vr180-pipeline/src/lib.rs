@@ -10,6 +10,7 @@
 
 pub mod audio;
 pub mod braw_imu;
+pub mod circles;
 pub mod decode;
 pub mod dji_imu;
 pub mod raw_develop;

@@ -52,9 +52,13 @@ pub mod audio;
 pub mod decoder;
 pub mod gyro;
 pub mod info;
+pub mod lut;
+pub mod shutters;
 
 pub use audio::{extract_audio_to_tempfile, extract_audio_to_wav, BrawAudioHeader, TempWavPath};
-pub use decoder::BrawDecoder;
+pub use decoder::{BrawDecoder, DecodeLook, DecodeScale};
+pub use lut::extract_embedded_lut;
+pub use shutters::BrawShutters;
 pub use gyro::{BrawGyroData, BrawGyroHeader};
 pub use info::BrawInfo;
 

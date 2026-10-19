@@ -24,6 +24,7 @@ One self-contained binary per platform, **macOS (Apple Silicon)** and
 | **[GoPro Max 2 VR180 Mod][gopro]** | `.360` | EAC dual-fisheye, gyro, firmware rolling-shutter auto-detect |
 | **Kandao QooCam 3 Ultra VR180 Mod** | `.mp4` | Factory lens record (the stitcher's own model), 1 kHz gyro, per-frame exposure, HLG |
 | **Kandao QooCam 3 Ultra VR180 Mod** — stills | `.dng` | Factory lens record, shading grids, DNG colour tags → PNG / JPEG / **linear DNG** |
+| **Blackmagic PYXIS 12K / URSA Cine with a VR180 lens** | `.braw` | 1 kHz gyro + per-frame shutter + sensor line time from the file; lens entered by hand, seeded from the image circles; embedded Gen 5 LUT (macOS, Blackmagic RAW SDK) |
 
 Each camera's official log-to-Rec.709 LUT (DJI D-Log M, Insta360 I-Log,
 GoPro GP-Log) is bundled and applied automatically on load; the QooCam's

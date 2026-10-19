@@ -1079,6 +1079,9 @@ fn load_or_publish_dji_imu(
     if matches!(kind, vr180_pipeline::SourceKind::KandaoQoocam) {
         return load_kandao_imu(cfg, control, src_w, src_h);
     }
+    if matches!(kind, vr180_pipeline::SourceKind::BlackmagicRaw) {
+        return load_braw_imu(cfg, control, src_w, src_h);
+    }
     if !matches!(kind, vr180_pipeline::SourceKind::DjiOsv) {
         return None;
     }
@@ -1227,6 +1230,82 @@ fn load_kandao_imu(
     Some(imu)
 }
 
+/// Blackmagic RAW: the helper's gyro + sampled shutter + metadata → the
+/// shared per-frame orientation stream; the lens seed = the image circles
+/// found in a quarter-size decode of the first frame (the file carries no
+/// calibration — the user refines it in the Override UI). Cached under the
+/// clip path like the others.
+fn load_braw_imu(
+    cfg: &DecoderConfig,
+    control: &DecoderControl,
+    src_w: u32,
+    src_h: u32,
+) -> Option<vr180_fisheye::DjiOsvImu> {
+    if let Some(arc) = cached_dji_imu(&cfg.path).filter(|a| !a.frame_quats.is_empty()) {
+        tracing::info!("decoder (fisheye/braw): reusing cached IMU for {}", cfg.path.display());
+        seed_detected_calib(control, &arc, src_w, src_h);
+        return Some((*arc).clone());
+    }
+    let info = match vr180_braw::BrawInfo::probe(&cfg.path) {
+        Ok(i) => i,
+        Err(e) => { tracing::warn!("braw info failed: {e} — preset calib, no stabilization"); return None; }
+    };
+    let (w, h) = info.eye_dims();
+    let fps = if info.frame_rate > 0.0 { info.frame_rate as f32 } else { 30.0 };
+    let t0 = std::time::Instant::now();
+    let circles = detect_braw_circles(&cfg.path, &info);
+    let gyro = match vr180_braw::BrawGyroData::extract(&cfg.path) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!("braw gyro failed: {e} — calib only");
+            let imu = vr180_pipeline::braw_imu::braw_calib_only(&info, w, h, circles);
+            cache_dji_imu(&cfg.path, std::sync::Arc::new(imu.clone()));
+            seed_detected_calib(control, &imu, src_w, src_h);
+            return Some(imu);
+        }
+    };
+    let shutters = vr180_braw::BrawShutters::extract(&cfg.path, vr180_pipeline::braw_imu::shutter_sample_step(info.frame_rate))
+        .unwrap_or_else(|e| { tracing::warn!("braw shutters: {e}"); Default::default() });
+    let total = segments_total_frames(&cfg.segments).max(info.frame_count as usize).max(1);
+    let imu = vr180_pipeline::braw_imu::build_braw_imu(&info, &gyro, &shutters, fps, total, w, h, circles);
+    tracing::info!(
+        "decoder (fisheye/braw): {} fw {} — {}×{} @ {} fps, {} gyro samples @ {:.0} Hz, readout {:.2} ms, {} shutter samples ({:.2}…{:.2} ms), circles {:?}, {} frame quats, in {:.1?}",
+        info.camera_model, info.firmware_version, info.width, info.height, info.frame_rate,
+        gyro.len(), gyro.header.gyro_sample_rate, info.readout_ms, shutters.samples.len(),
+        info.shutter_s_min * 1e3, info.shutter_s_max * 1e3, circles, imu.frame_quats.len(), t0.elapsed()
+    );
+    cache_dji_imu(&cfg.path, std::sync::Arc::new(imu.clone()));
+    seed_detected_calib(control, &imu, src_w, src_h);
+    Some(imu)
+}
+
+/// The two image circles of a BRAW clip's first frame, in native eye pixels
+/// (a quarter-size decode is plenty: ~10 px on a 6144-px eye).
+fn detect_braw_circles(path: &std::path::Path, info: &vr180_braw::BrawInfo) -> Option<[vr180_pipeline::braw_imu::EyeCircle; 2]> {
+    let opts = vr180_braw::decoder::DecodeOptions {
+        scale: vr180_braw::DecodeScale::Quarter, count: Some(1), ..Default::default()
+    };
+    let mut dec = match vr180_braw::BrawDecoder::start(path, &opts) {
+        Ok(d) => d,
+        Err(e) => { tracing::warn!("braw circles: decode start failed: {e}"); return None; }
+    };
+    let mut buf = Vec::new();
+    match dec.next_frame(&mut buf) {
+        Ok(true) => {}
+        other => { tracing::warn!("braw circles: no frame ({other:?})"); return None; }
+    }
+    let h = dec.header().clone();
+    let (fw, _) = info.frame_dims();
+    let scale = fw as f32 / h.width.max(1) as f32;
+    // BGRA in, but the detector only takes max(R, G, B) — order-free.
+    let found = vr180_pipeline::circles::detect_sbs_circles(&buf, h.width, h.height, h.bytes_per_pixel(), scale);
+    match &found {
+        Some([l, r]) => tracing::info!("braw circles: left ({:.0}, {:.0}) r {:.0} | right ({:.0}, {:.0}) r {:.0} (native eye px)", l.cx, l.cy, l.r, r.cx, r.cy, r.r),
+        None => tracing::info!("braw circles: none found — seeding the eye centre"),
+    }
+    found
+}
+
 /// Progressive DJI OSV IMU load: get the lens calibration FAST (first metadata
 /// sample → the preview dewarps in ~1 s) and stream the heavy per-frame
 /// quaternions (needed for stabilization) in the BACKGROUND, so a huge clip's
@@ -1244,14 +1323,16 @@ fn load_dji_imu_progressive(
     src_h: u32,
 ) -> Option<vr180_fisheye::DjiOsvImu> {
     use std::sync::atomic::Ordering;
-    if matches!(kind, vr180_pipeline::SourceKind::Insta360Insv | vr180_pipeline::SourceKind::KandaoQoocam) {
+    if matches!(kind, vr180_pipeline::SourceKind::Insta360Insv | vr180_pipeline::SourceKind::KandaoQoocam
+                      | vr180_pipeline::SourceKind::BlackmagicRaw) {
         // The whole trailer (calib + gyro + stamps) is ~1 MB at the file end
         // and VQF runs in well under a second — no progressive split needed.
-        // Same for the Kandao boxes after `moov`.
-        let imu = if kind == vr180_pipeline::SourceKind::Insta360Insv {
-            load_insv_imu(cfg, control, src_w, src_h)
-        } else {
-            load_kandao_imu(cfg, control, src_w, src_h)
+        // Same for the Kandao boxes after `moov`, and the BRAW helper's gyro
+        // read (plus a few seconds of shutter sampling).
+        let imu = match kind {
+            vr180_pipeline::SourceKind::Insta360Insv => load_insv_imu(cfg, control, src_w, src_h),
+            vr180_pipeline::SourceKind::BlackmagicRaw => load_braw_imu(cfg, control, src_w, src_h),
+            _ => load_kandao_imu(cfg, control, src_w, src_h),
         };
         control.imu_ready.store(true, Ordering::SeqCst);
         return imu;
@@ -1556,11 +1637,18 @@ fn open_fisheye_segment(
         vr180_pipeline::SourceKind::SbsFisheye | vr180_pipeline::SourceKind::KandaoQoocam =>
             Box::new(SbsFisheyeIter::new_with_layout(path, HwDecode::Auto, 0, 8, kind.eye_layout())?),
         vr180_pipeline::SourceKind::BlackmagicRaw => {
+            // The SDK decodes at a fraction of the recorded size from a
+            // fraction of the bit stream — pick the coarsest that still
+            // covers the preview's working eye (a 6144-px 12K eye at 50
+            // fps → half; the cap is `max_decode_side_for_fps`).
             let info = vr180_braw::BrawInfo::probe(path)
                 .map_err(|e| Error::Ffmpeg(format!("braw probe: {e}")))?;
-            let opts = vr180_braw::decoder::DecodeOptions::default();
-            Box::new(BrawFisheyeIter::new(path, &info, &opts, 0)
-                .map_err(|e| Error::Ffmpeg(format!("braw start: {e}")))?)
+            let cap = max_decode_side_for_fps(fps);
+            let scale = vr180_braw::DecodeScale::for_eye_width(info.eye_dims().0, cap);
+            tracing::info!("decoder (fisheye/braw): preview decode scale {:?} (eye {}×{} native, cap {})",
+                scale, info.eye_dims().0, info.eye_dims().1, cap);
+            Box::new(BrawFisheyeIter::new_with_options(
+                path, &info, 8, scale, vr180_braw::DecodeLook::Film, false, 0)?)
         }
         _ => return Err(Error::Ffmpeg(format!("non-fisheye source: {kind:?}"))),
     })
@@ -1890,25 +1978,8 @@ fn run_fisheye(
         // single-file count.
         let total_frames = segments_total_frames(&cfg.segments).max(1);
         match kind {
-            vr180_pipeline::SourceKind::BlackmagicRaw => {
-                match vr180_braw::BrawGyroData::extract(&cfg.path) {
-                    Ok(gyro_data) => match vr180_pipeline::braw_imu::compute_braw_stabilization(
-                        &gyro_data, fps, total_frames
-                    ) {
-                        Ok(stab) => {
-                            tracing::info!(
-                                "decoder (fisheye/braw): stab ready, {} frames, bias={:?}°/s",
-                                stab.per_frame.len(), stab.bias_deg_s
-                            );
-                            Some(stab.per_frame)
-                        }
-                        Err(e) => { tracing::warn!("braw stab failed: {e}"); None }
-                    },
-                    Err(e) => { tracing::warn!("braw gyro extract failed: {e}"); None }
-                }
-            }
             vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv
-            | vr180_pipeline::SourceKind::KandaoQoocam => {
+            | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw => {
                 if let Some(osv) = dji_osv_imu {
                     // Camera lock (toggle on) → smooth_ms = 0 drives the
                     // pipeline's sharp frame-0 lock. Soft-stab (toggle off)
@@ -4067,7 +4138,8 @@ pub(crate) fn resolve_fisheye_calib_pair(
          | vr180_pipeline::SourceKind::Insta360Insv
          | vr180_pipeline::SourceKind::Insta360Dng
          | vr180_pipeline::SourceKind::KandaoQoocam
-         | vr180_pipeline::SourceKind::KandaoDng, Some(imu)) => {
+         | vr180_pipeline::SourceKind::KandaoDng
+         | vr180_pipeline::SourceKind::BlackmagicRaw, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
             let eye = |lens: &vr180_fisheye::DjiLensCalib,
@@ -5597,9 +5669,8 @@ fn open_native_iter(
         vr180_pipeline::SourceKind::BlackmagicRaw => {
             let info = vr180_braw::BrawInfo::probe(path)
                 .map_err(|e| anyhow::anyhow!("braw probe: {e}"))?;
-            let opts = vr180_braw::decoder::DecodeOptions::default();
-            Box::new(BrawFisheyeIter::new(path, &info, &opts, 0)
-                .map_err(|e| anyhow::anyhow!("braw start: {e}"))?)
+            Box::new(BrawFisheyeIter::new_with_options(
+                path, &info, 8, vr180_braw::DecodeScale::Full, vr180_braw::DecodeLook::Film, false, 0)?)
         }
         _ => anyhow::bail!("non-fisheye source"),
     })
@@ -5628,17 +5699,13 @@ fn compute_stab_for(
         .map(|p| (p.duration_sec * p.fps as f64).round() as usize).unwrap_or(0).max(1);
     match kind {
         vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv
-        | vr180_pipeline::SourceKind::KandaoQoocam => imu.and_then(|osv| {
+        | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw => imu.and_then(|osv| {
             let max_corr = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock { s.dji_max_corr_deg } else { f32::INFINITY };
             let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
             vr180_pipeline::dji_imu::compute_dji_stabilization(
                 osv, total, max_corr, smooth_ms, fps, s.dji_responsiveness)
                 .ok().map(|st| st.per_frame)
         }),
-        vr180_pipeline::SourceKind::BlackmagicRaw =>
-            vr180_braw::BrawGyroData::extract(path).ok()
-                .and_then(|g| vr180_pipeline::braw_imu::compute_braw_stabilization(&g, fps, total).ok())
-                .map(|st| st.per_frame),
         _ => None,
     }
 }

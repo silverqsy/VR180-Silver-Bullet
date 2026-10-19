@@ -157,6 +157,11 @@ pub fn measure_stereo_align(
                 .unwrap_or((3840, 3840));
             vr180_fisheye::kandao::read_kandao_meta(&cfg.source_path, false).ok()
                 .map(|m| crate::kandao_imu::kandao_calib_only(&m, w, h))
+        } else if cfg.source_kind == crate::SourceKind::BlackmagicRaw {
+            // Seed geometry only; the user's overrides (the manual lens)
+            // take precedence in the resolver like everywhere else.
+            vr180_braw::BrawInfo::probe(&cfg.source_path).ok()
+                .map(|i| { let (w, h) = i.eye_dims(); crate::braw_imu::braw_calib_only(&i, w, h, None) })
         } else {
             None
         };

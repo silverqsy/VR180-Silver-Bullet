@@ -633,8 +633,45 @@ fn one_pass_audio_eligible(cfg: &FisheyeExportConfig) -> bool {
         // `stereo_audio_source`).
         SourceKind::GoProEac | SourceKind::Insta360Insv | SourceKind::KandaoQoocam =>
             matches!(cfg.audio_track, AudioTrack::Stereo),
+        // Not an ffmpeg container: the helper extracts the PCM to a WAV
+        // and the finalize step encodes the window to AAC and muxes it.
+        SourceKind::BlackmagicRaw => false,
         _ => true,
     }
+}
+
+/// Blackmagic RAW: `braw_helper --audio` → WAV (24-bit PCM, the whole
+/// clip) → the export window as stereo AAC → mux.
+fn finalize_braw_audio(
+    cfg: &FisheyeExportConfig,
+    video_tmp: &std::path::Path,
+    offset_s: f64,
+    dur_s: f64,
+) -> Result<()> {
+    let src = cfg.segments.first().unwrap_or(&cfg.source_path);
+    let wav = video_only_temp_path(&cfg.output_path).with_extension("braw_audio.wav");
+    let out = &cfg.output_path;
+    let r = match vr180_braw::extract_audio_to_wav(src, &wav) {
+        Ok(h) => {
+            tracing::info!("braw audio: {} ch {} Hz {}-bit, {} samples", h.channels, h.sample_rate, h.bit_depth, h.sample_count);
+            let aac = video_only_temp_path(out).with_extension("braw_audio.m4a");
+            let r = match crate::audio::stereo_to_aac(&wav, &aac, offset_s, Some(dur_s), 192_000) {
+                Ok(_) => finalize_with_audio(&aac, video_tmp, out, 0.0, dur_s),
+                Err(e) => {
+                    tracing::warn!("braw audio: AAC encode failed ({e}) — muxing the WAV window");
+                    finalize_with_audio(&wav, video_tmp, out, offset_s, dur_s)
+                }
+            };
+            std::fs::remove_file(&aac).ok();
+            r
+        }
+        Err(e) => {
+            tracing::warn!("braw audio: extraction failed ({e}) — video only");
+            move_file(video_tmp, out)
+        }
+    };
+    std::fs::remove_file(&wav).ok();
+    r
 }
 
 /// The audio source for a STEREO export of the window `[t_in, t_in + dur_s)`:
@@ -695,6 +732,9 @@ fn finalize_fisheye_audio(
     if cfg.source_kind == SourceKind::KandaoQoocam {
         return finalize_kandao_audio(cfg, video_tmp, offset_s, dur_s);
     }
+    if cfg.source_kind == SourceKind::BlackmagicRaw {
+        return finalize_braw_audio(cfg, video_tmp, offset_s, dur_s);
+    }
     // Multi-segment: the audio source is an ffconcat playlist so a merged
     // recording keeps its FULL audio (source_path alone = segment 0 only).
     let (audio_src, audio_tmp) = eac_audio_source(cfg);
@@ -723,12 +763,25 @@ pub(crate) fn fisheye_export_opener(
             // failed with a wgpu validation error).
             SourceKind::SbsFisheye | SourceKind::KandaoQoocam => Box::new(
                 SbsFisheyeIter::new_with_layout(p, crate::decode::HwDecode::Auto, 0, bd, kind.eye_layout())?),
+            // Full size, the output codec's depth, the log the clip was shot
+            // in (the colour stack's LUT does the display transform).
             SourceKind::BlackmagicRaw => {
                 let info = vr180_braw::BrawInfo::probe(p)
                     .map_err(|e| Error::Ffmpeg(format!("braw probe: {e}")))?;
-                let opts = vr180_braw::decoder::DecodeOptions::default();
-                Box::new(BrawFisheyeIter::new(p, &info, &opts, 0)
-                    .map_err(|e| Error::Ffmpeg(format!("braw start: {e}")))?)
+                // `VR180_BRAW_DECODE_SCALE=half|quarter|eighth`: the headless
+                // probes' knob (a 12K decode is the probe's bottleneck); an
+                // export always decodes at full size.
+                let scale = match std::env::var("VR180_BRAW_DECODE_SCALE").ok().as_deref() {
+                    Some("half") => vr180_braw::DecodeScale::Half,
+                    Some("quarter") => vr180_braw::DecodeScale::Quarter,
+                    Some("eighth") => vr180_braw::DecodeScale::Eighth,
+                    _ => vr180_braw::DecodeScale::Full,
+                };
+                // No swap in the iterator: like the SBS iterator, the halves
+                // stay in frame order and the consumers apply the user's swap.
+                let _ = swap_eyes;
+                Box::new(BrawFisheyeIter::new_with_options(
+                    p, &info, bd, scale, vr180_braw::DecodeLook::Film, false, 0)?)
             }
             other => return Err(Error::Ffmpeg(format!(
                 "export_fisheye non-fisheye source: {other:?}"))),
@@ -761,6 +814,9 @@ fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsv
     }
     if cfg.source_kind == SourceKind::KandaoQoocam {
         return resolve_export_kandao_imu(cfg);
+    }
+    if cfg.source_kind == SourceKind::BlackmagicRaw {
+        return resolve_export_braw_imu(cfg);
     }
     if cfg.source_kind != SourceKind::DjiOsv { return None; }
     if let Some(arc) = &cfg.preloaded_imu {
@@ -859,6 +915,36 @@ fn resolve_export_kandao_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye:
         crate::kandao_imu::build_kandao_imu(&meta, cfg.fps, n_frames, w, h)
     } else {
         crate::kandao_imu::kandao_calib_only(&meta, w, h)
+    })
+}
+
+/// Blackmagic RAW: reuse the GUI's cached IMU when it has what we need,
+/// else read the gyro, the sampled shutter and the metadata through the
+/// helper and fuse here. The lens seed is the eye centre + preset (the GUI
+/// has the detected circles; an export from the GUI arrives with the
+/// preloaded IMU and the user's overrides anyway).
+fn resolve_export_braw_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
+    if let Some(arc) = &cfg.preloaded_imu {
+        if !cfg.stabilize || !arc.frame_quats.is_empty() {
+            return Some((**arc).clone());
+        }
+    }
+    let path = cfg.segments.first().unwrap_or(&cfg.source_path);
+    let info = match vr180_braw::BrawInfo::probe(path) {
+        Ok(i) => i,
+        Err(e) => { tracing::warn!("braw info: {e}"); return None; }
+    };
+    let (w, h) = info.eye_dims();
+    Some(if cfg.stabilize {
+        let gyro = match vr180_braw::BrawGyroData::extract(path) {
+            Ok(g) => g,
+            Err(e) => { tracing::warn!("braw gyro: {e} — calib only"); return Some(crate::braw_imu::braw_calib_only(&info, w, h, None)); }
+        };
+        let shutters = vr180_braw::BrawShutters::extract(path, crate::braw_imu::shutter_sample_step(info.frame_rate))
+            .unwrap_or_else(|e| { tracing::warn!("braw shutters: {e}"); Default::default() });
+        crate::braw_imu::build_braw_imu(&info, &gyro, &shutters, cfg.fps, info.frame_count as usize, w, h, None)
+    } else {
+        crate::braw_imu::braw_calib_only(&info, w, h, None)
     })
 }
 
@@ -1206,7 +1292,7 @@ fn export_fisheye_inner(
     };
     let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
         match cfg.source_kind {
-            SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam => {
+            SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam | SourceKind::BlackmagicRaw => {
                 dji_osv_imu.as_ref().and_then(|osv| {
                     // Slider=0 → legacy camera-lock (∞ cap, no
                     // smoothing). User-set values activate the cap /
@@ -1218,15 +1304,6 @@ fn export_fisheye_inner(
                         osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness,
                     ).ok().map(|s| { let mut v = s.per_frame; crate::dji_imu::apply_lock_ref_diag(&mut v, cfg.dji_smooth_ms); v })
                 })
-            }
-            SourceKind::BlackmagicRaw => {
-                vr180_braw::BrawGyroData::extract(&cfg.source_path)
-                    .ok()
-                    .and_then(|gyro_data| {
-                        crate::braw_imu::compute_braw_stabilization(
-                            &gyro_data, cfg.fps, total_clip_frames,
-                        ).ok().map(|s| s.per_frame)
-                    })
             }
             _ => None,
         }
@@ -3992,7 +4069,7 @@ pub(crate) fn resolve_calib_pair(
     // For OSV, prefer the per-lens protobuf calibration. After the DJI
     // iter's default swap: left = Lens B, right = Lens A.
     let (calib_l, calib_r) = match (cfg.source_kind, osv) {
-        (SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam, Some(imu)) => {
+        (SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam | SourceKind::BlackmagicRaw, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
             let eye = |lens: &vr180_fisheye::DjiLensCalib,

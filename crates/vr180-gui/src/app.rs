@@ -1138,6 +1138,9 @@ struct LoadedMeta {
     quad_audio: bool,
     /// The stream is HLG (the QooCam's HDR mode) — auto-apply the HLG LUT.
     hlg: bool,
+    /// Blackmagic RAW: the clip's embedded display LUT written out as a
+    /// `.cube` by the helper (off the UI thread), to auto-apply.
+    braw_lut: Option<String>,
 }
 
 impl App {
@@ -2299,14 +2302,9 @@ impl App {
                 vr180_pipeline::SourceKind::KandaoQoocam => (probe.width, probe.height / 2),
                 vr180_pipeline::SourceKind::DjiOsv
                 | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
-                vr180_pipeline::SourceKind::BlackmagicRaw => {
-                    if let Ok(info) = vr180_braw::BrawInfo::probe(&path) {
-                        if info.is_dual_track() { (info.width / 2, info.height) }
-                        else { (info.width, info.height) }
-                    } else {
-                        (probe.width, probe.height)
-                    }
-                }
+                // The probe is the helper's own (`probe_video` routes `.braw`
+                // to it): the frame holds both eyes side by side.
+                vr180_pipeline::SourceKind::BlackmagicRaw => (probe.width / 2, probe.height),
                 _ => (0, 0),
             };
             let is_loaded_clip = self.loaded_path.as_deref() == Some(path.as_path());
@@ -3171,18 +3169,7 @@ impl App {
             vr180_pipeline::SourceKind::KandaoQoocam => (probe.width, probe.height / 2),
             vr180_pipeline::SourceKind::DjiOsv
             | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
-            vr180_pipeline::SourceKind::BlackmagicRaw => {
-                // braw_helper --info may not be installed; fall back to probe.
-                if let Ok(info) = vr180_braw::BrawInfo::probe(&path) {
-                    if info.is_dual_track() {
-                        (info.width / 2, info.height)
-                    } else {
-                        (info.width, info.height)
-                    }
-                } else {
-                    (probe.width, probe.height)
-                }
-            }
+            vr180_pipeline::SourceKind::BlackmagicRaw => (probe.width / 2, probe.height),
             _ => (0, 0),
         };
 
@@ -3250,13 +3237,23 @@ impl App {
             && vr180_pipeline::audio::probe_foa_aac(&path).ok().flatten().is_some();
         if quad_audio { tracing::info!("load: QooCam 4-channel microphone track detected"); }
         if probe.hlg { tracing::info!("load: HLG (ARIB STD-B67) transfer — HDR clip"); }
+        // Blackmagic RAW: the clip's own display LUT ("Gen 5 Film to
+        // Extended Video"), written out by the helper for the LUT stage.
+        let braw_lut = if source_kind == vr180_pipeline::SourceKind::BlackmagicRaw {
+            vr180_braw::BrawInfo::probe(&path).ok()
+                .filter(|i| !i.embedded_lut.is_empty())
+                .and_then(|i| match vr180_braw::extract_embedded_lut(&path, &i.embedded_lut) {
+                    Ok(p) => { tracing::info!("load: BRAW embedded LUT '{}' → {}", i.embedded_lut, p.display()); Some(p.to_string_lossy().into_owned()) }
+                    Err(e) => { tracing::warn!("load: BRAW embedded LUT: {e}"); None }
+                })
+        } else { None };
         Ok(LoadedMeta {
             token, path, preserve_clip_settings, source_kind,
             width: probe.width, height: probe.height, fps: probe.fps,
             duration_sec, frame_count, segments,
             cori_count, grav_count, srot_ms,
             detected_rs_mode, fisheye_eye_w, fisheye_eye_h,
-            eac_cal_dim, foa_audio, quad_audio, hlg: probe.hlg,
+            eac_cal_dim, foa_audio, quad_audio, hlg: probe.hlg, braw_lut,
         })
     }
 
@@ -3315,10 +3312,17 @@ impl App {
                 vr180_pipeline::SourceKind::KandaoQoocam if meta.hlg => Some(BUILTIN_HLG_LUT_PATH),
                 _ => None,
             };
+            // A BRAW clip is decoded in the log it was shot in (Blackmagic
+            // Design Film Gen 5) and carries Blackmagic's own display
+            // transform ("Gen 5 Film to Extended Video"): the helper writes
+            // it out as a .cube and it is applied like the other cameras'
+            // built-ins. Counts as a built-in for the swap-on-clip-switch rule.
+            let wanted: Option<&str> = meta.braw_lut.as_deref().or(wanted);
             let cur_is_builtin = self.settings.lut_path == BUILTIN_OSMO_LUT_PATH
                 || self.settings.lut_path == BUILTIN_GPLOG_LUT_PATH
                 || self.settings.lut_path == BUILTIN_X6_LUT_PATH
-                || self.settings.lut_path == BUILTIN_HLG_LUT_PATH;
+                || self.settings.lut_path == BUILTIN_HLG_LUT_PATH
+                || self.settings.lut_path.ends_with(" (embedded).cube");
             match wanted {
                 Some(w) if self.settings.lut_path.is_empty() || cur_is_builtin => {
                     if self.settings.lut_path != w {
@@ -6250,7 +6254,7 @@ impl App {
             return;
         }
         let stab_label = if is_braw {
-            tr("Stabilization (VQF 6D, BRAW)")
+            tr("Stabilization (Blackmagic gyro)")
         } else if is_insv {
             tr("Stabilization (Insta360 gyro)")
         } else if is_kandao {
@@ -6263,7 +6267,7 @@ impl App {
         ui.checkbox(&mut s.stabilize, stab_label);
         // Stab sliders need the loaded quats — enabled only once ready.
         ui.add_enabled_ui(s.stabilize && quats_ready, |ui| {
-            if is_osv || is_insv || is_kandao {
+            if is_osv || is_insv || is_kandao || is_braw {
                 // Camera lock owns the sharp frame-0 lock; the smoothing
                 // sliders are the soft-stab controls and gray out under it.
                 ui.checkbox(&mut s.dji_camera_lock, tr("Camera lock"))
@@ -6474,6 +6478,13 @@ impl App {
         let is_osv = self.clip.as_ref()
             .map(|c| c.source_kind.has_frame_imu())
             .unwrap_or(false);
+        // Blackmagic RAW carries a gyro but NO lens calibration: the preset
+        // picker and the Gyroflow loader stay (the lens is entered by hand,
+        // seeded from the detected image circles), and so do k5 / p.
+        let is_braw_lens = self.clip.as_ref()
+            .map(|c| c.source_kind.is_braw())
+            .unwrap_or(false);
+        let hide_preset = is_osv && !is_braw_lens;
         // Generic SBS with the fisheye dewarp off (Source ▸ Input): none of
         // the lens settings apply — say so and gray the panel out.
         let sbs_no_dewarp = matches!(self.clip.as_ref().map(|c| c.source_kind),
@@ -6488,7 +6499,7 @@ impl App {
 
         // ── Camera preset — hidden for OSV: the .osv file carries the full
         //    per-lens calibration, so a camera/profile picker is redundant.
-        if !is_osv {
+        if !hide_preset {
         ui.horizontal(|ui| {
             ui.label(tr("Camera"));
             let current = if s.fisheye_preset.is_empty() {
@@ -6504,7 +6515,8 @@ impl App {
                     // the DJI Osmo 360 and a Custom slot. (Empty preset still
                     // auto-resolves to the Osmo 360 for OSV clips.)
                     for p in presets.iter()
-                        .filter(|p| p.name == "DJI Osmo 360" || p.name == "Custom")
+                        .filter(|p| p.name == "Custom"
+                            || (if is_braw_lens { p.name.starts_with("Blackmagic") } else { p.name == "DJI Osmo 360" }))
                     {
                         let selected = s.fisheye_preset == p.name;
                         if ui.selectable_label(selected, p.name).clicked() {
@@ -6553,7 +6565,7 @@ impl App {
         // ── Load Gyroflow lens profile (applies to BOTH eyes; enables
         //    override on both so the loaded values take effect). Hidden for
         //    OSV — its calibration comes from the file, not a profile. ──
-        if !is_osv {
+        if !hide_preset {
         ui.add_space(6.0);
         if ui.button("Load Gyroflow lens profile (both eyes)…").clicked() {
             load_gyroflow = true;

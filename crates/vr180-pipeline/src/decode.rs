@@ -899,6 +899,21 @@ pub fn probe_video_duration_via_moov(path: &Path) -> Result<f64> {
 }
 
 pub fn probe_video(path: &Path) -> Result<VideoProbe> {
+    // Blackmagic RAW: not an ffmpeg format (ffprobe opens some files with
+    // padded dimensions and fails on others) — the SDK helper's metadata is
+    // the truth for size, rate and frame count, so every caller that sizes
+    // a stab table or an eye by this probe agrees with the decoder.
+    if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("braw")).unwrap_or(false) {
+        let info = vr180_braw::BrawInfo::probe(path)
+            .map_err(|e| Error::Ffmpeg(format!("braw probe {path:?}: {e}")))?;
+        let (w, h) = info.frame_dims();
+        let fps = info.frame_rate as f32;
+        return Ok(VideoProbe {
+            width: w, height: h, fps,
+            duration_sec: if fps > 0.0 { info.frame_count as f64 / fps as f64 } else { info.duration },
+            hlg: false,
+        });
+    }
     init();
     let ictx = ffmpeg_next::format::input(path)
         .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
