@@ -44,6 +44,15 @@ pub struct CameraPreset {
     pub file_hints: &'static [&'static str],
     /// Input layout this preset expects.
     pub input_layout: InputLayout,
+    /// A stereo lens's per-eye principal points, `[left eye, right eye]`,
+    /// each an OFFSET from its eye's centre as a fraction of the FULL
+    /// frame width (both eyes) — so one entry serves every sensor window
+    /// height the camera offers. `None` = the eye centre / the file's
+    /// calibration / the detected image circle.
+    pub stereo_pp: Option<[[f64; 2]; 2]>,
+    /// The physical LEFT eye sits in the RIGHT half of the frame (the lens
+    /// crosses over): fresh clips of this preset seed the eye swap on.
+    pub left_eye_is_right_half: bool,
 }
 
 /// Which decoder path this preset routes to.
@@ -64,6 +73,18 @@ pub enum InputLayout {
     BlackmagicRaw,
 }
 
+/// The dual-fisheye PYXIS preset's FOV in the app's convention — the angle
+/// the EYE WIDTH spans, `fx = eye_w / fov_rad`, with the KB polynomial on
+/// top. The user's figure for this lens is 192.709108254° in their tool's
+/// convention (unknown; at the image-circle edge under the KB model it
+/// would be 188.7° here, across the eye width under KB 196.8°). Measured
+/// instead (2026-10-19, PYXIS 12K C006, camera-locked export of the
+/// fastest 2 s window, residual inter-frame motion at 512 px, the user's
+/// k and principal points): 180° 1.63, 186.2° 1.51, 192.7° 1.37, 198° 1.32,
+/// **202° 1.30**, 205° 1.33, 210° 1.41, 220° 1.50 px — the minimum is here.
+/// The FOV slider overrides it per clip.
+pub const BRAW_DUAL_FISHEYE_FOV_DEG: f64 = 202.0;
+
 /// Built-in preset catalog. Static — no allocation, no I/O.
 pub fn presets() -> &'static [CameraPreset] {
     &PRESETS
@@ -83,7 +104,7 @@ pub fn for_extension(ext: &str) -> Option<&'static CameraPreset> {
 
 // ---- Catalog ------------------------------------------------------
 
-static PRESETS: [CameraPreset; 10] = [
+static PRESETS: [CameraPreset; 11] = [
     // ============================================================
     // DJI Osmo 360
     // ============================================================
@@ -112,6 +133,8 @@ static PRESETS: [CameraPreset; 10] = [
         default_fov_deg: 207.68,
         file_hints: &["osv"],
         input_layout: InputLayout::DualStream,
+        stereo_pp: None,
+        left_eye_is_right_half: false,
     },
 
     // ============================================================
@@ -136,6 +159,8 @@ static PRESETS: [CameraPreset; 10] = [
         default_fov_deg: 210.0,
         file_hints: &["braw"],
         input_layout: InputLayout::BlackmagicRaw,
+        stereo_pp: None,
+        left_eye_is_right_half: false,
     },
 
     // ============================================================
@@ -158,6 +183,8 @@ static PRESETS: [CameraPreset; 10] = [
         default_fov_deg: 210.0,
         file_hints: &["braw"],
         input_layout: InputLayout::BlackmagicRaw,
+        stereo_pp: None,
+        left_eye_is_right_half: false,
     },
 
     // ============================================================
@@ -179,6 +206,8 @@ static PRESETS: [CameraPreset; 10] = [
         default_fov_deg: 200.0,
         file_hints: &["mp4", "mov"],
         input_layout: InputLayout::SideBySide,
+        stereo_pp: None,
+        left_eye_is_right_half: false,
     },
 
     // ============================================================
@@ -200,6 +229,8 @@ static PRESETS: [CameraPreset; 10] = [
         default_fov_deg: 180.0,
         file_hints: &["mp4", "mov"],
         input_layout: InputLayout::SideBySide,
+        stereo_pp: None,
+        left_eye_is_right_half: false,
     },
 
     // ============================================================
@@ -221,6 +252,8 @@ static PRESETS: [CameraPreset; 10] = [
         default_fov_deg: 140.0,
         file_hints: &["mp4", "mov"],
         input_layout: InputLayout::SideBySide,
+        stereo_pp: None,
+        left_eye_is_right_half: false,
     },
 
     // ============================================================
@@ -243,6 +276,8 @@ static PRESETS: [CameraPreset; 10] = [
         default_fov_deg: 190.0,
         file_hints: &["mp4", "mov", "cr3"],
         input_layout: InputLayout::SideBySide,
+        stereo_pp: None,
+        left_eye_is_right_half: false,
     },
 
     // ============================================================
@@ -265,6 +300,8 @@ static PRESETS: [CameraPreset; 10] = [
         default_fov_deg: 180.0,
         file_hints: &[],
         input_layout: InputLayout::SideBySide,
+        stereo_pp: None,
+        left_eye_is_right_half: false,
     },
 
     // ============================================================
@@ -291,6 +328,8 @@ static PRESETS: [CameraPreset; 10] = [
         default_fov_deg: 204.5,
         file_hints: &["insv"],
         input_layout: InputLayout::DualStream,
+        stereo_pp: None,
+        left_eye_is_right_half: false,
     },
 
     // ============================================================
@@ -317,6 +356,43 @@ static PRESETS: [CameraPreset; 10] = [
         default_fov_deg: 212.0,
         file_hints: &[],
         input_layout: InputLayout::Stacked,
+        stereo_pp: None,
+        left_eye_is_right_half: false,
+    },
+
+    // ============================================================
+    // Blackmagic PYXIS 12K with a dual-fisheye VR180 lens (one sensor)
+    // ============================================================
+    // The user's calibration for the lens this camera is commonly used
+    // with (2026-10-19): full FOV 192.709108254°, KB k1..k4 below, per-eye
+    // principal points given normalised to a 12288-wide 2:1 frame with the
+    // 60p 12288×5112 video centred in it, origin top-left, and the LEFT eye
+    // in the RIGHT half: CxL 0.76546, CyL 0.50049, CxR 0.24243, CyR 0.49821.
+    // Stored as offsets from each eye's centre in units of the frame width
+    // (dx = Cx − 0.75 / 0.25, dy = (Cy − 0.5) / 2), so the 50p 12288×6480
+    // window shares them. The app's FOV is the angle the EYE WIDTH spans
+    // (`fx = eye_w / fov`); the value here is the one the stabilization
+    // residual sweep picked for this lens (see CLAUDE.md item 25).
+    CameraPreset {
+        name: "Blackmagic PYXIS 12K VR180 (dual fisheye)",
+        lens: Some("Dual fisheye on one sensor, 192.7°"),
+        calib: FisheyeCalibration {
+            fx: 0.0, // from the FOV at the working size
+            fy: 0.0,
+            cx: 3072.0,
+            cy: 2556.0,
+            k: [-0.002605415285, 0.001226067608, -0.000347504137, 0.000413900418],
+            calib_w: 6144,
+            calib_h: 5112,
+        },
+        default_fov_deg: BRAW_DUAL_FISHEYE_FOV_DEG,
+        file_hints: &["braw"],
+        input_layout: InputLayout::BlackmagicRaw,
+        stereo_pp: Some([
+            [0.76546 - 0.75, (0.50049 - 0.5) / 2.0],   // left eye (right half)
+            [0.24243 - 0.25, (0.49821 - 0.5) / 2.0],   // right eye (left half)
+        ]),
+        left_eye_is_right_half: true,
     },
 ];
 

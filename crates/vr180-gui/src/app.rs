@@ -2340,6 +2340,17 @@ impl App {
                 {
                     settings.fisheye_swap_eyes = true;
                 }
+                // Blackmagic with the dual-fisheye preset: the lens crosses
+                // over (the LEFT eye is the RIGHT half) — seed the swap from
+                // the preset (the toggle still overrides per clip).
+                if matches!(source_kind, vr180_pipeline::SourceKind::BlackmagicRaw) {
+                    let name = if settings.fisheye_preset.is_empty() || settings.fisheye_preset == "Auto" {
+                        vr180_pipeline::braw_imu::BRAW_PRESET_NAME
+                    } else { settings.fisheye_preset.as_str() };
+                    if let Some(p) = vr180_fisheye::presets::find(name) {
+                        settings.fisheye_swap_eyes = p.left_eye_is_right_half;
+                    }
+                }
                 settings.trim_in_s = None;
                 settings.trim_out_s = None;
             }
@@ -3291,6 +3302,22 @@ impl App {
             self.settings.fisheye_override_right = false;
             self.settings.eac_lens_sanitized = true;
         }
+        // Blackmagic templates from before the dual-fisheye preset (2026-10-19)
+        // hold "Custom" or the single-camera "Blackmagic Pyxis 12K" that the
+        // old BRAW path auto-picked — neither a deliberate choice for this
+        // lens. Migrate once to the new auto preset unless an Override is on.
+        if source_kind == vr180_pipeline::SourceKind::BlackmagicRaw
+            && !self.settings.fisheye_override_left && !self.settings.fisheye_override_right
+            && (self.settings.fisheye_preset == "Custom" || self.settings.fisheye_preset == "Blackmagic Pyxis 12K")
+        {
+            tracing::info!("load: BRAW preset '{}' → '{}' (migrated)", self.settings.fisheye_preset, vr180_pipeline::braw_imu::BRAW_PRESET_NAME);
+            self.settings.fisheye_preset.clear();
+            // …and the eye order that preset implies (a clip that was in
+            // the batch before this preset existed never got it seeded).
+            if let Some(p) = vr180_fisheye::presets::find(vr180_pipeline::braw_imu::BRAW_PRESET_NAME) {
+                self.settings.fisheye_swap_eyes = p.left_eye_is_right_half;
+            }
+        }
         // Per-camera default preset — only when none is set yet, so a
         // remembered/explicit choice is preserved.
         if source_kind != vr180_pipeline::SourceKind::GoProEac
@@ -3302,7 +3329,7 @@ impl App {
                 | vr180_pipeline::SourceKind::Insta360Dng => "Insta360 X6",
                 vr180_pipeline::SourceKind::KandaoQoocam
                 | vr180_pipeline::SourceKind::KandaoDng   => vr180_pipeline::kandao_imu::KANDAO_PRESET_NAME,
-                vr180_pipeline::SourceKind::BlackmagicRaw => "Blackmagic Pyxis 12K",
+                vr180_pipeline::SourceKind::BlackmagicRaw => vr180_pipeline::braw_imu::BRAW_PRESET_NAME,
                 _                                         => "Custom",
             };
             self.settings.fisheye_preset = auto.to_string();

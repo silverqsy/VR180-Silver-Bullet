@@ -1147,9 +1147,32 @@ fn seed_detected_calib(
             p: [lens.p1.unwrap_or(0.0), lens.p2.unwrap_or(0.0)],
         }
     };
-    let swapped = control.settings.read().effective_swap_eyes();
+    let settings = control.settings.read().clone();
+    let swapped = settings.effective_swap_eyes();
     let (sl, sr) = if swapped { (&imu.lens_a, &imu.lens_b) } else { (&imu.lens_b, &imu.lens_a) };
-    *control.detected_calib.lock() = Some(DetectedLensCalib { left: seed(sl), right: seed(sr) });
+    let (mut left, mut right) = (seed(sl), seed(sr));
+    // Blackmagic: the Override seed must be what Auto renders — the circle
+    // seed re-scaled to the selected preset's FOV / k, with the preset's
+    // own principal points when it carries them (both resolvers do this).
+    if imu.camera_model.as_deref().map(|m| m.starts_with("Blackmagic")).unwrap_or(false) {
+        let name = if settings.fisheye_preset.is_empty() || settings.fisheye_preset == "Auto" {
+            vr180_pipeline::braw_imu::BRAW_PRESET_NAME.to_string()
+        } else { settings.fisheye_preset.clone() };
+        if let Some(preset) = vr180_fisheye::presets::find(&name) {
+            let (sx, sk) = vr180_pipeline::braw_imu::preset_rescale(preset);
+            for (output, e, lens) in [(0usize, &mut left, sl), (1usize, &mut right, sr)] {
+                let w = lens.width.unwrap_or(src_w as f32).max(1.0);
+                let h = lens.height.unwrap_or(src_h as f32).max(1.0);
+                // fov = w / fx ⇒ fx × sx ⇒ fov / sx
+                e.fov_deg /= sx;
+                if let Some(k) = sk { e.k = k; }
+                if let Some((cx, cy)) = vr180_pipeline::braw_imu::preset_principal_point(preset, output, swapped, w, h) {
+                    e.cx_norm = cx / w; e.cy_norm = cy / h;
+                }
+            }
+        }
+    }
+    *control.detected_calib.lock() = Some(DetectedLensCalib { left, right });
 }
 
 /// Insta360 `.insv`: read the trailer (identity + raw gyro + frame stamps),
@@ -4081,7 +4104,7 @@ pub(crate) fn resolve_fisheye_calib_pair(
             | vr180_pipeline::SourceKind::Insta360Dng  => "Insta360 X6",
             vr180_pipeline::SourceKind::KandaoQoocam
             | vr180_pipeline::SourceKind::KandaoDng    => vr180_pipeline::kandao_imu::KANDAO_PRESET_NAME,
-            vr180_pipeline::SourceKind::BlackmagicRaw  => "Blackmagic Pyxis 12K",
+            vr180_pipeline::SourceKind::BlackmagicRaw  => vr180_pipeline::braw_imu::BRAW_PRESET_NAME,
             _                                          => "Custom",
         };
         presets::find(auto_name).unwrap_or(&presets::presets()[7])
@@ -4117,7 +4140,7 @@ pub(crate) fn resolve_fisheye_calib_pair(
          | vr180_pipeline::SourceKind::BlackmagicRaw, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
-            let eye = |lens: &vr180_fisheye::DjiLensCalib,
+            let eye = |output: usize, lens: &vr180_fisheye::DjiLensCalib,
                        ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4], km5: f32,
                        km_p: [f32; 2]|
                 -> vr180_pipeline::gpu::FisheyeCalib
@@ -4173,10 +4196,12 @@ pub(crate) fn resolve_fisheye_calib_pair(
                     // Blackmagic: the seed is the image circle + the DEFAULT
                     // preset's FOV / k; the Camera combo's choice re-scales the
                     // focal to its FOV and takes its k (same as the export).
-                    let (fx, fy, k) = if kind == vr180_pipeline::SourceKind::BlackmagicRaw {
+                    let (fx, fy, cx, cy, k) = if kind == vr180_pipeline::SourceKind::BlackmagicRaw {
                         let (sx, sk) = vr180_pipeline::braw_imu::preset_rescale(preset);
-                        (fx * sx, fy * sx, sk.unwrap_or(k))
-                    } else { (fx, fy, k) };
+                        let (cx, cy) = vr180_pipeline::braw_imu::preset_principal_point(
+                            preset, output, s.effective_swap_eyes(), src_w as f32, src_h as f32).unwrap_or((cx, cy));
+                        (fx * sx, fy * sx, cx, cy, sk.unwrap_or(k))
+                    } else { (fx, fy, cx, cy, k) };
                     // k5 (protobuf field 15) — DJI's 5th radial KB coeff.
                     // Keeps the projection monotonic past ~90° out to the full
                     // lens FOV. 0 when the file omits it (4-coeff fallback).
@@ -4202,10 +4227,10 @@ pub(crate) fn resolve_fisheye_calib_pair(
                 (&imu.lens_b, &imu.lens_a)
             };
             (
-                eye(lens_l, s.fisheye_override_left, s.fisheye_fov_deg_left,
+                eye(0, lens_l, s.fisheye_override_left, s.fisheye_fov_deg_left,
                     s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left,
                     s.fisheye_k5_left, s.fisheye_p_left),
-                eye(lens_r, s.fisheye_override_right, s.fisheye_fov_deg_right,
+                eye(1, lens_r, s.fisheye_override_right, s.fisheye_fov_deg_right,
                     s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right,
                     s.fisheye_k5_right, s.fisheye_p_right),
             )

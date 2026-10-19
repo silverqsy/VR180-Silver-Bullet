@@ -1274,6 +1274,29 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      FOV / k / k5 / p by hand (k5/p shown for BRAW, the Camera preset combo
      offers the Blackmagic presets + Custom, the Gyroflow loader stays).
      The Override UI's "In-file" line shows the seed. Templates: "braw".
+     **The user's lens calibration (2026-10-19)** is the preset
+     "Blackmagic PYXIS 12K VR180 (dual fisheye)" (`BRAW_PRESET_NAME`, the
+     catalog's LAST entry — Custom stays at index 7): k1..k4 =
+     −0.002605415285, 0.001226067608, −0.000347504137, 0.000413900418; the
+     per-eye principal points were given normalised to a 12288-wide 2:1
+     frame with the 60p 12288×5112 video centred in it, origin top-left,
+     **LEFT eye in the RIGHT half**: CxL 0.76546 CyL 0.50049 / CxR 0.24243
+     CyR 0.49821 → stored as `stereo_pp` offsets from each eye's centre in
+     units of the frame width (L +0.01546, +0.000245; R −0.00757,
+     −0.000895), `left_eye_is_right_half: true` seeds `fisheye_swap_eyes`
+     for fresh BRAW clips; `preset_principal_point(preset, output, swap,
+     w, h)` + `preset_rescale` apply the preset's pp / FOV / k in BOTH
+     resolvers and in `seed_detected_calib` (so Auto == the Override seed).
+     Against our detected circles (C006 right half (3188, 2469), left
+     (2942, 2524)) the user's points sit +74/+90 and +37/+21 px — the C006
+     fit is the truncated-circle one. **FOV convention**: the user's
+     192.709° is not the app's width-based FOV; the residual sweep with
+     their k + pp puts the app's value at **202°** (`BRAW_DUAL_FISHEYE_FOV_DEG`;
+     1.30 px vs 1.37 at 192.7, 1.63 at 180, 1.50 at 220; our circles + their
+     k: 1.28 at 201.4). Templates holding "Custom" / the old
+     "Blackmagic Pyxis 12K" migrate once to the new preset at load
+     (unless an Override is on). The single-camera "Blackmagic Pyxis 12K"
+     preset (210°, mono) remains for one-circle clips.
    - **Colour**: decoded as shot (Film log) in 8-bit (preview) / 16-bit
      (10-bit + ProRes exports; the old path fed RGBA8 to the 16-bit kernels);
      the clip's embedded LUT is written to the temp dir as

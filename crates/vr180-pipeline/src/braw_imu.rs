@@ -63,8 +63,25 @@ pub const BRAW_IMU_TO_CAM: [[f32; 3]; 3] = [
 /// 0×…2×) — no fast pans in it.
 pub const BRAW_GYRO_LATENCY_MS: f32 = 4.0;
 
-/// The camera-preset name the BRAW kind resolves to.
-pub const BRAW_PRESET_NAME: &str = "Blackmagic Pyxis 12K";
+/// The camera-preset name the BRAW kind resolves to: the dual-fisheye
+/// VR180 lens on the PYXIS 12K (the user's calibration). The circle seed's
+/// focal is built with this preset's FOV too.
+pub const BRAW_PRESET_NAME: &str = "Blackmagic PYXIS 12K VR180 (dual fisheye)";
+
+/// The preset's principal point for one OUTPUT eye at the working eye
+/// size, when the preset carries per-eye points (`stereo_pp`): `output`
+/// 0 = left, 1 = right; `swap` = the user's eye swap. The preset's points
+/// belong to the physical eyes; the left output shows the physical left
+/// eye exactly when `swap == preset.left_eye_is_right_half`.
+pub fn preset_principal_point(preset: &vr180_fisheye::presets::CameraPreset, output: usize, swap: bool, src_w: f32, src_h: f32) -> Option<(f32, f32)> {
+    let pp = preset.stereo_pp?;
+    let left_shows_left = swap == preset.left_eye_is_right_half;
+    let physical = if (output == 0) == left_shows_left { 0 } else { 1 };
+    let [dx, dy] = pp[physical];
+    // Offsets are fractions of the FULL frame width = 2 × the eye width.
+    let frame_w = 2.0 * src_w;
+    Some((src_w * 0.5 + dx as f32 * frame_w, src_h * 0.5 + dy as f32 * frame_w))
+}
 
 /// `VR180_BRAW_BASIS="r00,r01,…,r22"` (row-major) overrides the basis for
 /// headless A/B tests. Rows are normalised but NOT re-orthogonalised, so a
@@ -192,20 +209,23 @@ pub fn preset_rescale(preset: &vr180_fisheye::presets::CameraPreset) -> (f32, Op
 }
 
 /// The seed lens for one eye: principal point at the detected circle (or
-/// the eye centre), focal from the circle radius and the preset's FOV (an
-/// equidistant lens: `r = f · θ`), the preset's `k`; `k5 = p = 0`. The user
-/// refines all of it in the Override UI — a Blackmagic file has no lens
-/// record of its own.
+/// the eye centre), focal from the preset's FOV in the app's convention —
+/// the angle the EYE WIDTH spans, `fx = eye_w / fov` exactly as the
+/// Override UI's `fx_from_fov` (so Auto, the Override seed and the
+/// residual sweeps all mean the same number; the circle's radius is not a
+/// focal: it only locates the centre) — and the preset's `k`; `k5 = p =
+/// 0`. The user refines all of it in the Override UI — a Blackmagic file
+/// has no lens record of its own.
 pub fn seed_lens_calib(eye_w: u32, eye_h: u32, circle: Option<EyeCircle>) -> DjiLensCalib {
     let preset = vr180_fisheye::presets::find(BRAW_PRESET_NAME);
     let fov_deg = preset.map(|p| p.default_fov_deg as f32).unwrap_or(190.0);
     let k = preset
         .map(|p| [p.calib.k[0] as f32, p.calib.k[1] as f32, p.calib.k[2] as f32, p.calib.k[3] as f32])
         .unwrap_or([0.0; 4]);
-    let half_fov = fov_deg.max(1.0).to_radians() * 0.5;
-    let (cx, cy, fx) = match circle {
-        Some(c) if c.r > 1.0 => (c.cx, c.cy, c.r / half_fov),
-        _ => (eye_w as f32 * 0.5, eye_h as f32 * 0.5, (eye_w.min(eye_h) as f32 * 0.5) / half_fov),
+    let fx = eye_w as f32 / fov_deg.max(1.0).to_radians();
+    let (cx, cy) = match circle {
+        Some(c) if c.r > 1.0 => (c.cx, c.cy),
+        _ => (eye_w as f32 * 0.5, eye_h as f32 * 0.5),
     };
     DjiLensCalib {
         fx: Some(fx), fy: Some(fx), cx: Some(cx), cy: Some(cy),
@@ -346,7 +366,7 @@ mod tests {
         assert_eq!(l.cx, Some(2910.0));
         assert_eq!(l.cy, Some(3247.0));
         let fov = vr180_fisheye::presets::find(BRAW_PRESET_NAME).map(|p| p.default_fov_deg as f32).unwrap_or(190.0);
-        assert!((l.fx.unwrap() - 3183.0 / (fov.to_radians() * 0.5)).abs() < 1e-2);
+        assert!((l.fx.unwrap() - 6144.0 / fov.to_radians()).abs() < 1e-2);
         let (a, b) = lens_pair(6144, 6480, Some([c, EyeCircle { cx: 3170.0, cy: 3187.0, r: 3178.0 }]));
         assert_eq!(b.cx, Some(2910.0));   // lens_b = left
         assert_eq!(a.cx, Some(3170.0));

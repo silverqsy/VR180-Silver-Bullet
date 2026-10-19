@@ -4055,7 +4055,7 @@ pub(crate) fn resolve_calib_pair(
             | SourceKind::Insta360Dng => "Insta360 X6",
             SourceKind::KandaoQoocam
             | SourceKind::KandaoDng   => crate::kandao_imu::KANDAO_PRESET_NAME,
-            SourceKind::BlackmagicRaw => "Blackmagic Pyxis 12K",
+            SourceKind::BlackmagicRaw => crate::braw_imu::BRAW_PRESET_NAME,
             _                         => "Custom",
         };
         presets::find(auto_name).unwrap_or(&presets::presets()[7])
@@ -4081,7 +4081,7 @@ pub(crate) fn resolve_calib_pair(
         (SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam | SourceKind::BlackmagicRaw, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
-            let eye = |lens: &vr180_fisheye::DjiLensCalib,
+            let eye = |output: usize, lens: &vr180_fisheye::DjiLensCalib,
                        ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4], km5: f32,
                        km_p: [f32; 2]|
                 -> FisheyeCalib
@@ -4120,10 +4120,12 @@ pub(crate) fn resolve_calib_pair(
                     // Blackmagic: the seed is the image circle + the DEFAULT
                     // preset's FOV / k; the Camera combo's choice re-scales the
                     // focal to its FOV and takes its k (same in the GUI resolver).
-                    let (fx, fy, k) = if cfg.source_kind == SourceKind::BlackmagicRaw {
+                    let (fx, fy, cx, cy, k) = if cfg.source_kind == SourceKind::BlackmagicRaw {
                         let (sx, sk) = crate::braw_imu::preset_rescale(preset);
-                        (fx * sx, fy * sx, sk.unwrap_or(k))
-                    } else { (fx, fy, k) };
+                        let (cx, cy) = crate::braw_imu::preset_principal_point(preset, output, cfg.fisheye_swap_eyes, src_w as f32, src_h as f32)
+                            .unwrap_or((cx, cy));
+                        (fx * sx, fy * sx, cx, cy, sk.unwrap_or(k))
+                    } else { (fx, fy, cx, cy, k) };
                     (fx, fy, cx, cy, k, lens.k5.unwrap_or(0.0))
                 };
                 let mut calib =
@@ -4144,10 +4146,10 @@ pub(crate) fn resolve_calib_pair(
                 (&imu.lens_b, &imu.lens_a)
             };
             (
-                eye(lens_l, cfg.fisheye_override_left, cfg.fisheye_fov_deg_left,
+                eye(0, lens_l, cfg.fisheye_override_left, cfg.fisheye_fov_deg_left,
                     cfg.fisheye_cx_norm_left, cfg.fisheye_cy_norm_left, cfg.fisheye_k_left,
                     cfg.fisheye_k5_left, cfg.fisheye_p_left),
-                eye(lens_r, cfg.fisheye_override_right, cfg.fisheye_fov_deg_right,
+                eye(1, lens_r, cfg.fisheye_override_right, cfg.fisheye_fov_deg_right,
                     cfg.fisheye_cx_norm_right, cfg.fisheye_cy_norm_right, cfg.fisheye_k_right,
                     cfg.fisheye_k5_right, cfg.fisheye_p_right),
             )
