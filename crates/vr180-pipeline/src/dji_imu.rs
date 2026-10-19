@@ -1123,6 +1123,9 @@ pub fn readout_ms_for(kind: crate::SourceKind, fps: f32, imu: Option<&vr180_fish
     match kind {
         crate::SourceKind::Insta360Insv => crate::insv_imu::INSV_X6_READOUT_MS,
         crate::SourceKind::KandaoQoocam => crate::kandao_imu::KANDAO_READOUT_MS,
+        // Blackmagic: the file's line time or nothing — never the Osmo
+        // table (0 = per-row RS off, like the X6 before it was measured).
+        crate::SourceKind::BlackmagicRaw => 0.0,
         _ => dji_osmo_readout_ms_for_fps(fps),
     }
 }

@@ -189,6 +189,9 @@ pub struct BrawDecoder {
     /// Thread reading stderr to keep the helper unblocked. Joined on
     /// drop.
     stderr_log: Option<std::thread::JoinHandle<String>>,
+    /// Frames handed out so far — an EOF before the header's `frames`
+    /// count (or with a non-zero exit) is a helper failure, not the end.
+    delivered: u64,
 }
 
 impl std::fmt::Debug for BrawDecoder {
@@ -263,9 +266,20 @@ impl BrawDecoder {
             captured
         });
 
-        let header = header_rx
-            .recv()
-            .map_err(|_| Error::BadOutput("stderr thread died before header".into()))??;
+        let header = match header_rx.recv() {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => {
+                // No header: the helper failed to open the clip — its only
+                // diagnostic is the `ERROR:` line it printed; surface it.
+                let status = child.wait().ok();
+                let captured = stderr_log.join().unwrap_or_default();
+                return Err(Error::HelperFailed {
+                    code: status.and_then(|s| s.code()).unwrap_or(-1),
+                    stderr: if captured.trim().is_empty() { e.to_string() } else { captured.trim().to_string() },
+                });
+            }
+            Err(_) => return Err(Error::BadOutput("stderr thread died before header".into())),
+        };
 
         Ok(BrawDecoder {
             helper_path: helper,
@@ -273,6 +287,7 @@ impl BrawDecoder {
             stdout: BufReader::with_capacity(1 << 20, stdout), // 1 MiB
             header,
             stderr_log: Some(stderr_log),
+            delivered: 0,
         })
     }
 
@@ -295,7 +310,21 @@ impl BrawDecoder {
             match self.stdout.read(&mut buf[total..need])? {
                 0 => {
                     if total == 0 {
-                        return Ok(false); // clean EOF on frame boundary
+                        // EOF on a frame boundary: clean only when the helper
+                        // exited cleanly after the announced count — a decode
+                        // error mid-clip prints an `ERROR:` line and exits 1,
+                        // which must not pass for the end of the clip.
+                        let status = self.child.wait()?;
+                        let short = self.header.frames > 0 && self.delivered < self.header.frames;
+                        if !status.success() || short {
+                            let captured = self.stderr_log.take().and_then(|h| h.join().ok()).unwrap_or_default();
+                            return Err(Error::HelperFailed {
+                                code: status.code().unwrap_or(-1),
+                                stderr: format!("braw_helper ended after {} of {} frames (exit {:?}): {}",
+                                    self.delivered, self.header.frames, status.code(), captured.trim()),
+                            });
+                        }
+                        return Ok(false);
                     } else {
                         return Err(Error::BadOutput(format!(
                             "short frame: got {} of {} bytes",
@@ -306,6 +335,7 @@ impl BrawDecoder {
                 n => total += n,
             }
         }
+        self.delivered += 1;
         Ok(true)
     }
 }

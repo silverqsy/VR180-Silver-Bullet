@@ -98,6 +98,99 @@ pub fn braw_gyro_latency_ms() -> f32 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EyeCircle { pub cx: f32, pub cy: f32, pub r: f32 }
 
+/// How a single-track BRAW frame holds its eyes, and where the image
+/// circles sit — read off a quarter-size decode of the first frame, once
+/// per clip ([`braw_layout`]). A dual-fisheye VR180 lens puts two circles
+/// side by side; a single fisheye (the "single-camera" presets) puts one
+/// in the middle, and that frame is then one eye shown to both.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BrawLayout {
+    /// One circle for the whole frame: the frame is ONE eye (duplicated).
+    pub mono: bool,
+    /// `[left, right]` circles in native eye pixels (`mono`: the one circle
+    /// twice), when found.
+    pub circles: Option<[EyeCircle; 2]>,
+}
+
+impl BrawLayout {
+    /// Size of one eye for this layout.
+    pub fn eye_dims(&self, info: &vr180_braw::BrawInfo) -> (u32, u32) {
+        if self.mono { info.frame_dims() } else { info.eye_dims() }
+    }
+}
+
+/// Detect the layout + circles of a clip's first frame (a quarter-size
+/// decode: ~10 px on a 6144-px eye). Two circles that each fill their half
+/// → side by side; one circle centred on the frame → mono; nothing found →
+/// side by side with no seed (the VR180 default).
+pub fn detect_braw_layout(path: &std::path::Path, info: &vr180_braw::BrawInfo) -> BrawLayout {
+    let opts = vr180_braw::decoder::DecodeOptions {
+        scale: vr180_braw::DecodeScale::Quarter, count: Some(1), ..Default::default()
+    };
+    let mut dec = match vr180_braw::BrawDecoder::start(path, &opts) {
+        Ok(d) => d,
+        Err(e) => { tracing::warn!("braw layout: decode start failed: {e}"); return BrawLayout::default(); }
+    };
+    let mut buf = Vec::new();
+    match dec.next_frame(&mut buf) {
+        Ok(true) => {}
+        other => { tracing::warn!("braw layout: no frame ({other:?})"); return BrawLayout::default(); }
+    }
+    let h = dec.header().clone();
+    let (fw, _) = info.frame_dims();
+    let scale = fw as f32 / h.width.max(1) as f32;
+    let bpp = h.bytes_per_pixel();
+    // BGRA in, but the detector only takes max(R, G, B) — order-free.
+    let sbs = crate::circles::detect_sbs_circles(&buf, h.width, h.height, bpp, scale);
+    // A single centred circle wider than a half (a mono fisheye, or a
+    // two-track clip is never mono) — only for single-track frames.
+    let whole = if info.is_dual_track() { None } else {
+        crate::circles::detect_eye_circle(&buf, h.width, h.height, bpp, 0, h.width)
+            .filter(|c| (c.cx - h.width as f32 * 0.5).abs() < h.width as f32 * 0.06
+                && (c.cy - h.height as f32 * 0.5).abs() < h.height as f32 * 0.1
+                && c.r > h.width as f32 * 0.3)
+            .map(|c| EyeCircle { cx: c.cx * scale, cy: c.cy * scale, r: c.r * scale })
+    };
+    match (sbs, whole) {
+        (Some([l, r]), _) => {
+            tracing::info!("braw layout: side by side — left ({:.0}, {:.0}) r {:.0} | right ({:.0}, {:.0}) r {:.0} (native eye px)", l.cx, l.cy, l.r, r.cx, r.cy, r.r);
+            BrawLayout { mono: false, circles: Some([l, r]) }
+        }
+        (None, Some(c)) => {
+            tracing::info!("braw layout: ONE centred circle ({:.0}, {:.0}) r {:.0} — a single fisheye, the frame is one eye", c.cx, c.cy, c.r);
+            BrawLayout { mono: true, circles: Some([c, c]) }
+        }
+        (None, None) => {
+            tracing::info!("braw layout: no circles found — side by side, seeding the eye centres");
+            BrawLayout::default()
+        }
+    }
+}
+
+/// [`detect_braw_layout`] memoised per clip path for the process: the
+/// loader, the export, the still and auto-align all read one answer.
+pub fn braw_layout(path: &std::path::Path, info: &vr180_braw::BrawInfo) -> BrawLayout {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<std::path::PathBuf, BrawLayout>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(l) = cache.lock().unwrap().get(path) { return *l; }
+    let l = detect_braw_layout(path, info);
+    cache.lock().unwrap().insert(path.to_path_buf(), l);
+    l
+}
+
+/// The focal factor and `k` a selected camera preset applies on top of the
+/// circle seed (which is built with [`BRAW_PRESET_NAME`]'s FOV / k):
+/// `fx × (seed_half_fov / preset_half_fov)` and the preset's `k` when it is
+/// another preset; `(1, None)` for the default (and for presets without a
+/// FOV). Both calibration resolvers apply it identically.
+pub fn preset_rescale(preset: &vr180_fisheye::presets::CameraPreset) -> (f32, Option<[f32; 4]>) {
+    if preset.name == BRAW_PRESET_NAME || preset.default_fov_deg <= 0.0 { return (1.0, None); }
+    let seed_fov = vr180_fisheye::presets::find(BRAW_PRESET_NAME).map(|p| p.default_fov_deg as f32).unwrap_or(190.0);
+    let sx = (seed_fov.max(1.0) * 0.5) / ((preset.default_fov_deg as f32).max(1.0) * 0.5);
+    (sx, Some([preset.calib.k[0] as f32, preset.calib.k[1] as f32, preset.calib.k[2] as f32, preset.calib.k[3] as f32]))
+}
+
 /// The seed lens for one eye: principal point at the detected circle (or
 /// the eye centre), focal from the circle radius and the preset's FOV (an
 /// equidistant lens: `r = f · θ`), the preset's `k`; `k5 = p = 0`. The user
@@ -126,7 +219,8 @@ pub fn seed_lens_calib(eye_w: u32, eye_h: u32, circle: Option<EyeCircle>) -> Dji
 
 /// `(lens_a, lens_b)` for the stabilizer: `lens_b` = the LEFT eye (the left
 /// half / track 0, the resolvers' default with the swap off), `lens_a` =
-/// the RIGHT. `circles` = `[left, right]` when detected.
+/// the RIGHT. `circles` = `[left, right]` when detected (`eye_w × eye_h` =
+/// the layout's eye, the whole frame for a mono clip).
 pub fn lens_pair(eye_w: u32, eye_h: u32, circles: Option<[EyeCircle; 2]>) -> (DjiLensCalib, DjiLensCalib) {
     let (l, r) = match circles { Some([l, r]) => (Some(l), Some(r)), None => (None, None) };
     (seed_lens_calib(eye_w, eye_h, r), seed_lens_calib(eye_w, eye_h, l))
@@ -168,6 +262,18 @@ pub fn build_braw_imu(
     if n_imu < 16 || rate <= 0.0 || fps <= 0.0 {
         tracing::warn!("braw_imu: no usable motion data (samples={} rate={} fps={}) — calib only", n_imu, rate, fps);
         return out;
+    }
+    // The helper pairs gyro and accelerometer samples by INDEX; a clip whose
+    // two sensors run at different rates would put the accelerometer on a
+    // stretched clock inside the fusion — refuse rather than fuse wrongly.
+    let acc_rate = gyro.header.accel_sample_rate;
+    if (acc_rate - rate).abs() > 0.5 || gyro.header.gyro_sample_count != gyro.header.accel_sample_count {
+        tracing::warn!("braw_imu: gyro {rate} Hz × {} / accel {acc_rate} Hz × {} — not index-paired, calib only",
+            gyro.header.gyro_sample_count, gyro.header.accel_sample_count);
+        return out;
+    }
+    if info.readout_s().is_none() {
+        tracing::warn!("braw_imu: the clip states no sensor_line_time — content time at the first row, per-row RS off");
     }
     let dt = (1.0 / rate) as f32;
     // The SDK stream: rad/s and m/s², sample k at k / rate from the clip start.

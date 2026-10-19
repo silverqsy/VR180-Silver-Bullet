@@ -1292,12 +1292,41 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      `DecodeScale::for_eye_width` (12K @ 60 → quarter = 2048-px eyes);
      progressive loader arm = non-progressive like Kandao (gyro + shutters
      + circles ≈ 0.5 s).
-   - **Not done / open**: URSA Cine Immersive (two tracks) untested here;
-     Windows has no helper (the BRAW path is macOS-only by construction);
-     `--look` not exposed; no per-file calibration store beyond the "braw"
-     template (a 2.4:1 window and a 16:9 one of the same lens share the
-     circle centre offsets, not the normalised cy — re-detect per clip).
-     Examples (gitignored): `rs_probe_export`, `audio_window_probe`, `wav_probe`.
+   - **Review pass (5-angle adversarial review of 73b09ab, 29 findings
+     kept, fixed in the follow-up commit)**: the circle seed now lives in
+     the PIPELINE (`braw_imu::braw_layout(path, info)` — a per-process memo
+     of `detect_braw_layout`: the two half circles, or ONE centred circle
+     → `BrawLayout { mono, circles }`), so the GUI loader, a headless
+     export (`resolve_export_braw_imu`, which also keeps a calib-only
+     preloaded carrier's lens over a rebuild) and auto-align (preloaded
+     carrier first) all dewarp with the same lens (the lock residual on the
+     C006 window fell 0.38 → 0.17 px with the circle seed vs the eye
+     centre); a mono clip (one fisheye, the "single-camera" presets) is one
+     full-frame eye shown to both (`BrawFisheyeIter … mono`, app.rs
+     `braw_eye_dims`); `readout_ms_for` has an explicit BRAW arm = 0 (no
+     line time → per-row RS OFF, never the Osmo table; `build_braw_imu`
+     warns); the user's swap goes THROUGH the iterator like the dual-stream
+     kinds (both openers pass `swap_eyes`; the Swap / Upside-down toggles
+     show for BRAW); the Camera combo's preset re-scales the seed's focal
+     to its FOV and supplies its k in BOTH resolvers (`preset_rescale`; the
+     legacy "braw" template's "Custom" = 180° → fx × 1.167); the helper's
+     `--decode` forces `post_3dlut_mode` Disabled (the app owns the LUT
+     stage; `--info` reports the clip's mode), `--gyro` fails instead of
+     spinning on a short read; `BrawDecoder::next_frame` treats EOF before
+     the announced count / a non-zero exit as `HelperFailed` with the
+     helper's stderr, `start` surfaces the `ERROR:` line when no header
+     arrives; the LUT cache writes a `.partial` and validates `LUT_3D_SIZE`
+     n³ rows before reuse; a gyro/accel rate or count mismatch → calib only.
+   - **Not done / open**: the CPU preview decodes BRAW at 8 bits before the
+     LUT (the generic CPU SBS preview does the same; exports are 16-bit) —
+     a 16-bit CPU preview branch is a follow-up; the shutter term's sign
+     (`−shutter/2`) and the +4 ms are indistinguishable at these 1–3 ms
+     shutters — pin them on long-shutter (90–180°) pans when available;
+     `IBlackmagicRawPost3DLUT::WriteCubeFile` could replace the helper's
+     own cube writer; Windows has no helper (the BRAW path is macOS-only by
+     construction); `--look` not exposed; the URSA hood intrudes into its
+     circles (the fit still landed: r ≈ 4050 on 8160-px eyes). Examples
+     (gitignored): `rs_probe_export`, `audio_window_probe`, `wav_probe`.
 
 
 20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac

@@ -3790,12 +3790,15 @@ fn extract_packed_rgba_n(frame: &ffmpeg_next::frame::Video, bytes_per_pixel: usi
 /// eyes are the two halves of the frame — a VR180 lens on one sensor puts
 /// its circles side by side (PYXIS 12K: 12288×6480 → two 6144×6480 eyes);
 /// a two-track clip (URSA Cine Immersive) is composed side by side by the
-/// helper. `swap_eyes` exchanges the halves. Seeking restarts the helper at
-/// the target frame (`--start`), lazily on the next pull.
+/// helper. A `mono` clip (one fisheye circle, `BrawLayout`) is one eye
+/// shown to both. `swap_eyes` exchanges the halves, like the dual-stream
+/// iterators. Seeking restarts the helper at the target frame (`--start`),
+/// lazily on the next pull.
 pub struct BrawFisheyeIter {
     path: PathBuf,
     opts: vr180_braw::decoder::DecodeOptions,
     swap_eyes: bool,
+    mono: bool,
     decoder: Option<vr180_braw::BrawDecoder>,
     frame_buf: Vec<u8>,
     /// Eye size at the decode scale.
@@ -3836,6 +3839,7 @@ impl BrawFisheyeIter {
         scale: vr180_braw::DecodeScale,
         look: vr180_braw::DecodeLook,
         swap_eyes: bool,
+        mono: bool,
         frame_limit: u32,
     ) -> Result<Self> {
         let opts = vr180_braw::decoder::DecodeOptions {
@@ -3845,24 +3849,14 @@ impl BrawFisheyeIter {
         let d = scale.divisor();
         let dt_s = if info.frame_rate > 0.0 { 1.0 / info.frame_rate } else { 1.0 / 24.0 };
         let mut it = Self {
-            path: path.to_path_buf(), opts, swap_eyes, decoder: None, frame_buf: Vec::new(),
-            eye_w: (fw / d) / 2, eye_h: fh / d, bit_depth: if bit_depth >= 10 { 16 } else { 8 },
+            path: path.to_path_buf(), opts, swap_eyes, mono, decoder: None, frame_buf: Vec::new(),
+            eye_w: if mono { fw / d } else { (fw / d) / 2 }, eye_h: fh / d, bit_depth: if bit_depth >= 10 { 16 } else { 8 },
             dt_s, frame_idx: 0, frame_count: info.frame_count, frame_limit,
         };
         // Start now so an unopenable file fails here, not on the first pull,
         // and so the eye size comes from the helper's processed dimensions.
         it.start_at(0)?;
         Ok(it)
-    }
-
-    /// Compatibility shape of the old constructor: full size, 8-bit, as shot.
-    pub fn new(
-        path: &Path,
-        info: &vr180_braw::BrawInfo,
-        opts: &vr180_braw::decoder::DecodeOptions,
-        frame_limit: u32,
-    ) -> Result<Self> {
-        Self::new_with_options(path, info, if opts.bit_16 { 16 } else { 8 }, opts.scale, opts.look, false, frame_limit)
     }
 
     fn start_at(&mut self, frame: u64) -> Result<()> {
@@ -3875,8 +3869,9 @@ impl BrawFisheyeIter {
         if h.bit_depth != self.bit_depth as u32 {
             return Err(Error::Ffmpeg(format!("braw helper decoded {}-bit, {} requested", h.bit_depth, self.bit_depth)));
         }
-        // The helper reports the processed size; both layouts are L|R.
-        self.eye_w = h.width / 2;
+        // The helper reports the processed size: L|R halves, or the whole
+        // frame for a mono clip.
+        self.eye_w = if self.mono { h.width } else { h.width / 2 };
         self.eye_h = h.height;
         self.frame_idx = frame;
         self.decoder = Some(dec);
@@ -3912,13 +3907,21 @@ impl FisheyePairIter for BrawFisheyeIter {
         let eye_w = self.eye_w as usize;
         let mut left = Vec::with_capacity(eye_w * frame_h * bpp);
         let mut right = Vec::with_capacity(eye_w * frame_h * bpp);
-        for y in 0..frame_h {
-            let row = y * frame_w * bpp;
-            bgra_to_rgba_row(&self.frame_buf[row..row + eye_w * bpp], bpp, &mut left);
-            let r0 = row + eye_w * bpp;
-            bgra_to_rgba_row(&self.frame_buf[r0..r0 + eye_w * bpp], bpp, &mut right);
+        if self.mono {
+            for y in 0..frame_h {
+                let row = y * frame_w * bpp;
+                bgra_to_rgba_row(&self.frame_buf[row..row + frame_w * bpp], bpp, &mut left);
+            }
+            right = left.clone();
+        } else {
+            for y in 0..frame_h {
+                let row = y * frame_w * bpp;
+                bgra_to_rgba_row(&self.frame_buf[row..row + eye_w * bpp], bpp, &mut left);
+                let r0 = row + eye_w * bpp;
+                bgra_to_rgba_row(&self.frame_buf[r0..r0 + eye_w * bpp], bpp, &mut right);
+            }
+            if self.swap_eyes { std::mem::swap(&mut left, &mut right); }
         }
-        if self.swap_eyes { std::mem::swap(&mut left, &mut right); }
         Ok(Some(FisheyePair {
             left, right,
             eye_w: self.eye_w, eye_h: self.eye_h,

@@ -20,21 +20,41 @@ pub fn extract_embedded_lut(path: impl AsRef<Path>, title: &str) -> Result<PathB
     let safe: String = title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
     let safe = safe.trim();
     let out = std::env::temp_dir().join(format!("{} (embedded).cube", if safe.is_empty() { "BRAW LUT" } else { safe }));
-    if out.is_file() && std::fs::metadata(&out).map(|m| m.len() > 1000).unwrap_or(false) {
+    if cube_is_complete(&out) {
         return Ok(out);
     }
+    // Write to a per-process partial and rename, so a crash or a second
+    // process never leaves a half-written cube under the shared name.
+    let partial = out.with_extension(format!("{}.partial", std::process::id()));
     let res = Command::new(&helper)
-        .arg("--lut").arg(src).arg(&out)
+        .arg("--lut").arg(src).arg(&partial)
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .output()?;
     if !res.status.success() {
+        std::fs::remove_file(&partial).ok();
         return Err(Error::HelperFailed {
             code: res.status.code().unwrap_or(-1),
             stderr: String::from_utf8_lossy(&res.stderr).into_owned(),
         });
     }
-    if !out.is_file() {
-        return Err(Error::BadOutput("braw_helper --lut wrote no file".into()));
+    if !cube_is_complete(&partial) {
+        std::fs::remove_file(&partial).ok();
+        return Err(Error::BadOutput("braw_helper --lut wrote an incomplete cube".into()));
     }
+    std::fs::rename(&partial, &out)?;
     Ok(out)
+}
+
+/// A `.cube` whose `LUT_3D_SIZE n` is followed by n³ data rows.
+fn cube_is_complete(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else { return false };
+    let mut size = 0usize;
+    let mut rows = 0usize;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') { continue; }
+        if let Some(n) = l.strip_prefix("LUT_3D_SIZE") { size = n.trim().parse().unwrap_or(0); continue; }
+        if l.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '.') { rows += 1; }
+    }
+    size >= 2 && rows == size * size * size
 }

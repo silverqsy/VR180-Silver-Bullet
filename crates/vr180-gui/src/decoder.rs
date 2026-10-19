@@ -1250,10 +1250,11 @@ fn load_braw_imu(
         Ok(i) => i,
         Err(e) => { tracing::warn!("braw info failed: {e} — preset calib, no stabilization"); return None; }
     };
-    let (w, h) = info.eye_dims();
+    let layout = vr180_pipeline::braw_imu::braw_layout(&cfg.path, &info);
+    let (w, h) = layout.eye_dims(&info);
+    let circles = layout.circles;
     let fps = if info.frame_rate > 0.0 { info.frame_rate as f32 } else { 30.0 };
     let t0 = std::time::Instant::now();
-    let circles = detect_braw_circles(&cfg.path, &info);
     let gyro = match vr180_braw::BrawGyroData::extract(&cfg.path) {
         Ok(g) => g,
         Err(e) => {
@@ -1277,33 +1278,6 @@ fn load_braw_imu(
     cache_dji_imu(&cfg.path, std::sync::Arc::new(imu.clone()));
     seed_detected_calib(control, &imu, src_w, src_h);
     Some(imu)
-}
-
-/// The two image circles of a BRAW clip's first frame, in native eye pixels
-/// (a quarter-size decode is plenty: ~10 px on a 6144-px eye).
-fn detect_braw_circles(path: &std::path::Path, info: &vr180_braw::BrawInfo) -> Option<[vr180_pipeline::braw_imu::EyeCircle; 2]> {
-    let opts = vr180_braw::decoder::DecodeOptions {
-        scale: vr180_braw::DecodeScale::Quarter, count: Some(1), ..Default::default()
-    };
-    let mut dec = match vr180_braw::BrawDecoder::start(path, &opts) {
-        Ok(d) => d,
-        Err(e) => { tracing::warn!("braw circles: decode start failed: {e}"); return None; }
-    };
-    let mut buf = Vec::new();
-    match dec.next_frame(&mut buf) {
-        Ok(true) => {}
-        other => { tracing::warn!("braw circles: no frame ({other:?})"); return None; }
-    }
-    let h = dec.header().clone();
-    let (fw, _) = info.frame_dims();
-    let scale = fw as f32 / h.width.max(1) as f32;
-    // BGRA in, but the detector only takes max(R, G, B) — order-free.
-    let found = vr180_pipeline::circles::detect_sbs_circles(&buf, h.width, h.height, h.bytes_per_pixel(), scale);
-    match &found {
-        Some([l, r]) => tracing::info!("braw circles: left ({:.0}, {:.0}) r {:.0} | right ({:.0}, {:.0}) r {:.0} (native eye px)", l.cx, l.cy, l.r, r.cx, r.cy, r.r),
-        None => tracing::info!("braw circles: none found — seeding the eye centre"),
-    }
-    found
 }
 
 /// Progressive DJI OSV IMU load: get the lens calibration FAST (first metadata
@@ -1647,8 +1621,9 @@ fn open_fisheye_segment(
             let scale = vr180_braw::DecodeScale::for_eye_width(info.eye_dims().0, cap);
             tracing::info!("decoder (fisheye/braw): preview decode scale {:?} (eye {}×{} native, cap {})",
                 scale, info.eye_dims().0, info.eye_dims().1, cap);
+            let layout = vr180_pipeline::braw_imu::braw_layout(path, &info);
             Box::new(BrawFisheyeIter::new_with_options(
-                path, &info, 8, scale, vr180_braw::DecodeLook::Film, false, 0)?)
+                path, &info, 8, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, 0)?)
         }
         _ => return Err(Error::Ffmpeg(format!("non-fisheye source: {kind:?}"))),
     })
@@ -4195,6 +4170,13 @@ pub(crate) fn resolve_fisheye_calib_pair(
                         (Some(a), Some(b), Some(c), Some(d)) => [a, b, c, d],
                         _ => preset_k,
                     };
+                    // Blackmagic: the seed is the image circle + the DEFAULT
+                    // preset's FOV / k; the Camera combo's choice re-scales the
+                    // focal to its FOV and takes its k (same as the export).
+                    let (fx, fy, k) = if kind == vr180_pipeline::SourceKind::BlackmagicRaw {
+                        let (sx, sk) = vr180_pipeline::braw_imu::preset_rescale(preset);
+                        (fx * sx, fy * sx, sk.unwrap_or(k))
+                    } else { (fx, fy, k) };
                     // k5 (protobuf field 15) — DJI's 5th radial KB coeff.
                     // Keeps the projection monotonic past ~90° out to the full
                     // lens FOV. 0 when the file omits it (4-coeff fallback).
@@ -5669,8 +5651,10 @@ fn open_native_iter(
         vr180_pipeline::SourceKind::BlackmagicRaw => {
             let info = vr180_braw::BrawInfo::probe(path)
                 .map_err(|e| anyhow::anyhow!("braw probe: {e}"))?;
+            let layout = vr180_pipeline::braw_imu::braw_layout(path, &info);
             Box::new(BrawFisheyeIter::new_with_options(
-                path, &info, 8, vr180_braw::DecodeScale::Full, vr180_braw::DecodeLook::Film, false, 0)?)
+                path, &info, 8, vr180_braw::DecodeScale::Full, vr180_braw::DecodeLook::Film,
+                swap_eyes, layout.mono, 0)?)
         }
         _ => anyhow::bail!("non-fisheye source"),
     })

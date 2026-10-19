@@ -777,11 +777,11 @@ pub(crate) fn fisheye_export_opener(
                     Some("eighth") => vr180_braw::DecodeScale::Eighth,
                     _ => vr180_braw::DecodeScale::Full,
                 };
-                // No swap in the iterator: like the SBS iterator, the halves
-                // stay in frame order and the consumers apply the user's swap.
-                let _ = swap_eyes;
+                // Like the dual-stream kinds: the iterator swaps the halves
+                // and the resolvers swap lens_a/lens_b with the same flag.
+                let layout = crate::braw_imu::braw_layout(p, &info);
                 Box::new(BrawFisheyeIter::new_with_options(
-                    p, &info, bd, scale, vr180_braw::DecodeLook::Film, false, 0)?)
+                    p, &info, bd, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, 0)?)
             }
             other => return Err(Error::Ffmpeg(format!(
                 "export_fisheye non-fisheye source: {other:?}"))),
@@ -920,9 +920,10 @@ fn resolve_export_kandao_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye:
 
 /// Blackmagic RAW: reuse the GUI's cached IMU when it has what we need,
 /// else read the gyro, the sampled shutter and the metadata through the
-/// helper and fuse here. The lens seed is the eye centre + preset (the GUI
-/// has the detected circles; an export from the GUI arrives with the
-/// preloaded IMU and the user's overrides anyway).
+/// helper and fuse here. The lens seed is the same everywhere — the image
+/// circles of the first frame (`braw_layout`, memoised per clip) + the
+/// preset — so a headless export, the GUI preview and auto-align dewarp
+/// alike; a calib-only preloaded IMU keeps its lens over a rebuild.
 fn resolve_export_braw_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
     if let Some(arc) = &cfg.preloaded_imu {
         if !cfg.stabilize || !arc.frame_quats.is_empty() {
@@ -934,18 +935,26 @@ fn resolve_export_braw_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::D
         Ok(i) => i,
         Err(e) => { tracing::warn!("braw info: {e}"); return None; }
     };
-    let (w, h) = info.eye_dims();
-    Some(if cfg.stabilize {
-        let gyro = match vr180_braw::BrawGyroData::extract(path) {
-            Ok(g) => g,
-            Err(e) => { tracing::warn!("braw gyro: {e} — calib only"); return Some(crate::braw_imu::braw_calib_only(&info, w, h, None)); }
-        };
-        let shutters = vr180_braw::BrawShutters::extract(path, crate::braw_imu::shutter_sample_step(info.frame_rate))
-            .unwrap_or_else(|e| { tracing::warn!("braw shutters: {e}"); Default::default() });
-        crate::braw_imu::build_braw_imu(&info, &gyro, &shutters, cfg.fps, info.frame_count as usize, w, h, None)
+    let layout = crate::braw_imu::braw_layout(path, &info);
+    let (w, h) = layout.eye_dims(&info);
+    let mut imu = if cfg.stabilize {
+        match vr180_braw::BrawGyroData::extract(path) {
+            Ok(gyro) => {
+                let shutters = vr180_braw::BrawShutters::extract(path, crate::braw_imu::shutter_sample_step(info.frame_rate))
+                    .unwrap_or_else(|e| { tracing::warn!("braw shutters: {e}"); Default::default() });
+                crate::braw_imu::build_braw_imu(&info, &gyro, &shutters, cfg.fps, info.frame_count as usize, w, h, layout.circles)
+            }
+            Err(e) => { tracing::warn!("braw gyro: {e} — calib only"); crate::braw_imu::braw_calib_only(&info, w, h, layout.circles) }
+        }
     } else {
-        crate::braw_imu::braw_calib_only(&info, w, h, None)
-    })
+        crate::braw_imu::braw_calib_only(&info, w, h, layout.circles)
+    };
+    if let Some(arc) = &cfg.preloaded_imu {
+        // The GUI's carrier knows the lens the user has been looking at.
+        imu.lens_a = arc.lens_a.clone();
+        imu.lens_b = arc.lens_b.clone();
+    }
+    Some(imu)
 }
 
 pub fn export_fisheye(
@@ -4108,6 +4117,13 @@ pub(crate) fn resolve_calib_pair(
                         (Some(a), Some(b), Some(c), Some(d)) => [a, b, c, d],
                         _ => preset_k,
                     };
+                    // Blackmagic: the seed is the image circle + the DEFAULT
+                    // preset's FOV / k; the Camera combo's choice re-scales the
+                    // focal to its FOV and takes its k (same in the GUI resolver).
+                    let (fx, fy, k) = if cfg.source_kind == SourceKind::BlackmagicRaw {
+                        let (sx, sk) = crate::braw_imu::preset_rescale(preset);
+                        (fx * sx, fy * sx, sk.unwrap_or(k))
+                    } else { (fx, fy, k) };
                     (fx, fy, cx, cy, k, lens.k5.unwrap_or(0.0))
                 };
                 let mut calib =

@@ -1111,6 +1111,16 @@ struct LoadPending {
 /// metadata to apply, or a human-readable error string to log.
 type LoadOutcome = std::result::Result<LoadedMeta, String>;
 
+/// One BRAW eye at load: the layout's (memoised per clip; side by side
+/// unless the first frame holds one centred circle), from the probe's
+/// composed frame size.
+fn braw_eye_dims(path: &std::path::Path, frame_w: u32, frame_h: u32) -> (u32, u32) {
+    match vr180_braw::BrawInfo::probe(path) {
+        Ok(info) => vr180_pipeline::braw_imu::braw_layout(path, &info).eye_dims(&info),
+        Err(_) => (frame_w / 2, frame_h),
+    }
+}
+
 /// Everything `finish_load` needs to build the `ClipInfo`, seed per-clip
 /// settings, and spawn the decoder — all gathered off the UI thread.
 struct LoadedMeta {
@@ -2303,8 +2313,9 @@ impl App {
                 vr180_pipeline::SourceKind::DjiOsv
                 | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
                 // The probe is the helper's own (`probe_video` routes `.braw`
-                // to it): the frame holds both eyes side by side.
-                vr180_pipeline::SourceKind::BlackmagicRaw => (probe.width / 2, probe.height),
+                // to it): the frame holds both eyes side by side, unless the
+                // first frame shows one centred circle (`braw_layout`).
+                vr180_pipeline::SourceKind::BlackmagicRaw => braw_eye_dims(&path, probe.width, probe.height),
                 _ => (0, 0),
             };
             let is_loaded_clip = self.loaded_path.as_deref() == Some(path.as_path());
@@ -3169,7 +3180,7 @@ impl App {
             vr180_pipeline::SourceKind::KandaoQoocam => (probe.width, probe.height / 2),
             vr180_pipeline::SourceKind::DjiOsv
             | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
-            vr180_pipeline::SourceKind::BlackmagicRaw => (probe.width / 2, probe.height),
+            vr180_pipeline::SourceKind::BlackmagicRaw => braw_eye_dims(&path, probe.width, probe.height),
             _ => (0, 0),
         };
 
@@ -6323,6 +6334,7 @@ impl App {
                 | Some(vr180_pipeline::SourceKind::Insta360Dng)
                 | Some(vr180_pipeline::SourceKind::KandaoQoocam)
                 | Some(vr180_pipeline::SourceKind::KandaoDng)
+                | Some(vr180_pipeline::SourceKind::BlackmagicRaw)
         );
         let s = &mut self.settings;
 

@@ -158,10 +158,15 @@ pub fn measure_stereo_align(
             vr180_fisheye::kandao::read_kandao_meta(&cfg.source_path, false).ok()
                 .map(|m| crate::kandao_imu::kandao_calib_only(&m, w, h))
         } else if cfg.source_kind == crate::SourceKind::BlackmagicRaw {
-            // Seed geometry only; the user's overrides (the manual lens)
-            // take precedence in the resolver like everywhere else.
-            vr180_braw::BrawInfo::probe(&cfg.source_path).ok()
-                .map(|i| { let (w, h) = i.eye_dims(); crate::braw_imu::braw_calib_only(&i, w, h, None) })
+            // The GUI's carrier (the lens the preview shows) first, else the
+            // same circle seed every other BRAW entry point builds.
+            cfg.preloaded_imu.as_ref().map(|a| (**a).clone()).or_else(|| {
+                vr180_braw::BrawInfo::probe(&cfg.source_path).ok().map(|i| {
+                    let layout = crate::braw_imu::braw_layout(&cfg.source_path, &i);
+                    let (w, h) = layout.eye_dims(&i);
+                    crate::braw_imu::braw_calib_only(&i, w, h, layout.circles)
+                })
+            })
         } else {
             None
         };

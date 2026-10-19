@@ -667,6 +667,7 @@ static int do_info(const char* path) {
     printf("  \"viewing_gamut\": \"%s\",\n", viewingGamut.c_str());
     printf("  \"viewing_bmdgen\": %.0f,\n", viewingGen);
     printf("  \"embedded_lut\": \"%s\",\n", json_escape(lutName).c_str());
+    printf("  \"post_3dlut_mode\": \"%s\",\n", json_escape(get_metadata_string(ctx.clip, "post_3dlut_mode")).c_str());
     printf("  \"pipeline\": \"%s\",\n", pipeline.c_str());
     if (haveScales)
         printf("  \"resolution_scales\": {\"full\": [%u, %u], \"half\": [%u, %u], \"quarter\": [%u, %u], \"eighth\": [%u, %u]}\n",
@@ -897,6 +898,10 @@ static bool decode_one_frame(ClipContext& ctx, DecodeCallback& cb,
 static int do_decode(const char* path, uint64_t start, uint64_t count, int track) {
     ClipContext ctx;
     if (!ctx.open(path)) return 1;
+    // The app applies the clip's LUT itself (it extracts the embedded cube):
+    // never let the SDK bake a post-3D LUT into the decode, whatever the
+    // clip or a sidecar says — unless a --look already chose.
+    if (g_procParams.postLutMode.empty()) g_procParams.postLutMode = "Disabled";
 
     // Apply clip-level processing overrides directly on the clip
     // (SetClipAttribute on the clip modifies defaults for all subsequent decodes)
@@ -1227,6 +1232,11 @@ static int do_gyro(const char* path) {
     accel->GetSampleSize(&accelSampleSize);
 
     uint32_t sampleCount = std::min(gyroCount, accelCount);
+    if (gyroSampleSize != 3 || accelSampleSize != 3) {
+        fprintf(stderr, "ERROR: motion sample size %u / %u floats (expected 3)\n", gyroSampleSize, accelSampleSize);
+        gyro->Release(); accel->Release();
+        return 1;
+    }
 
     // Write header to stderr
     fprintf(stderr, "{\"gyro_sample_count\": %u, \"gyro_sample_rate\": %.2f, "
@@ -1248,10 +1258,18 @@ static int do_gyro(const char* path) {
         uint32_t toRead = std::min(CHUNK, remaining);
         uint32_t gyroRead = 0, accelRead = 0;
 
-        gyro->GetSampleRange(offset, toRead, gyroBuf, &gyroRead);
-        accel->GetSampleRange(offset, toRead, accelBuf, &accelRead);
+        HRESULT rg = gyro->GetSampleRange(offset, toRead, gyroBuf, &gyroRead);
+        HRESULT ra = accel->GetSampleRange(offset, toRead, accelBuf, &accelRead);
 
         uint32_t n = std::min(gyroRead, accelRead);
+        if (rg != S_OK || ra != S_OK || n == 0) {
+            // A short or failed read must not spin forever with stdout open.
+            fprintf(stderr, "ERROR: motion read at sample %llu: gyro %ld (%u), accel %ld (%u) — %u of %u samples written\n",
+                    (unsigned long long)offset, (long)rg, gyroRead, (long)ra, accelRead, (unsigned)(sampleCount - remaining), sampleCount);
+            fflush(stdout);
+            delete[] gyroBuf; delete[] accelBuf; gyro->Release(); accel->Release();
+            return 1;
+        }
         for (uint32_t i = 0; i < n; i++) {
             outBuf[0] = gyroBuf[i * 3 + 0];
             outBuf[1] = gyroBuf[i * 3 + 1];
