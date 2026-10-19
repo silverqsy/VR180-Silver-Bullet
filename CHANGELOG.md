@@ -12,8 +12,13 @@ frame.
 
 - **Decoding.** Single-track clips are split into their two eyes (a
   dual-fisheye lens on one sensor); two-track clips are composed by the
-  helper as before. 10-bit and ProRes exports decode at 16 bits; the
-  preview decodes at a fraction of the recorded size; seeking works.
+  helper as before. Each eye is fitted on a square canvas, the pair making
+  a 2:1 frame, the way the fisheye-centre web tool and VR players treat a
+  non-square eye: a 2.4:1 clip (12288×5112) is padded black top and
+  bottom, a 17:9 clip (12288×6480) is cropped top and bottom, and the lens
+  parameters, the Override panel and the rolling-shutter timing all refer
+  to that canvas. 10-bit and ProRes exports decode at 16 bits; the preview
+  decodes at a fraction of the recorded size; seeking works.
 - **Stabilization.** The clip's gyro drives the same stabilizer as the
   other cameras (camera lock, soft-stab, Response, max correction), with
   per-scanline rolling-shutter correction timed from the file: the sensor

@@ -410,13 +410,16 @@ static PRESETS: [CameraPreset; 11] = [
     // ============================================================
     // The user's calibration for the lens this camera is commonly used
     // with (2026-10-19): full FOV 192.709108254°, KB k1..k4 below, per-eye
-    // principal points given normalised to a 12288-wide 2:1 frame with the
-    // 60p 12288×5112 video centred in it, origin top-left, and the LEFT eye
-    // in the RIGHT half: CxL 0.76546, CyL 0.50049, CxR 0.24243, CyR 0.49821.
+    // principal points given normalised to a 12288-wide 2:1 frame (the
+    // "fisheyecenter" web tool's canvas: the 60p 12288×5112 video padded
+    // black top and bottom to 12288×6144, a 17:9 12288×6480 window cropped
+    // to it — the app's BRAW decoder emits exactly that canvas, so each
+    // eye is a 6144² square), origin top-left, and the LEFT eye in the
+    // RIGHT half: CxL 0.76546, CyL 0.50049, CxR 0.24243, CyR 0.49821.
     // Stored as offsets from each eye's centre in units of the frame width
-    // (dx = Cx − 0.75 / 0.25, dy = (Cy − 0.5) / 2), so the 50p 12288×6480
-    // window shares them. The FOV is in the web tool's convention
-    // (`FovConvention::KbLongerDim`); `app_fov_deg` converts it.
+    // (dx = Cx − 0.75 / 0.25, dy = (Cy − 0.5) / 2); on the square canvas
+    // `cy = Cy × canvas height` exactly. The FOV is in the web tool's
+    // convention (`FovConvention::KbLongerDim`); `app_fov_deg` converts it.
     CameraPreset {
         name: "Blackmagic PYXIS 12K VR180 (dual fisheye)",
         lens: Some("Dual fisheye on one sensor, 192.7°"),
@@ -424,10 +427,10 @@ static PRESETS: [CameraPreset; 11] = [
             fx: 0.0, // from the FOV at the working size
             fy: 0.0,
             cx: 3072.0,
-            cy: 2556.0,
+            cy: 3072.0,
             k: [-0.002605415285, 0.001226067608, -0.000347504137, 0.000413900418],
             calib_w: 6144,
-            calib_h: 5112,
+            calib_h: 6144, // the square canvas eye
         },
         default_fov_deg: BRAW_DUAL_FISHEYE_FOV_DEG,
         file_hints: &["braw"],

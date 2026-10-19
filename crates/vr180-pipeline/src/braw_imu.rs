@@ -130,9 +130,23 @@ pub struct BrawLayout {
 }
 
 impl BrawLayout {
-    /// Size of one eye for this layout.
+    /// Size of one eye for this layout: the square canvas (`BrawInfo::
+    /// eye_dims`) for a stereo pair, the recorded frame for a mono clip.
     pub fn eye_dims(&self, info: &vr180_braw::BrawInfo) -> (u32, u32) {
-        if self.mono { info.frame_dims() } else { info.eye_dims() }
+        if self.mono { info.raw_frame_dims() } else { info.eye_dims() }
+    }
+
+    /// Rows × line time of what one eye's rows span on the CANVAS, ms: the
+    /// recorded rows read out at the file's line time, and the canvas keeps
+    /// that slope (3 µs/row on the PYXIS) across its own row count — 6144
+    /// rows × 3 µs = 18.43 ms whether the window was 5112 (padded) or 6480
+    /// (cropped) rows. The per-row rolling-shutter table spreads this over
+    /// the canvas rows, centred on the centre row like the pose. `None`
+    /// without a line time.
+    pub fn canvas_readout_ms(&self, info: &vr180_braw::BrawInfo) -> Option<f32> {
+        if info.sensor_line_time_us <= 0.0 { return None; }
+        let rows = self.eye_dims(info).1 as f64;
+        Some((rows * info.sensor_line_time_us * 1e-3) as f32)
     }
 }
 
@@ -154,11 +168,15 @@ pub fn detect_braw_layout(path: &std::path::Path, info: &vr180_braw::BrawInfo) -
         other => { tracing::warn!("braw layout: no frame ({other:?})"); return BrawLayout::default(); }
     }
     let h = dec.header().clone();
-    let (fw, _) = info.frame_dims();
+    let (fw, _) = info.raw_frame_dims();
     let scale = fw as f32 / h.width.max(1) as f32;
     let bpp = h.bytes_per_pixel();
-    // BGRA in, but the detector only takes max(R, G, B) — order-free.
-    let sbs = crate::circles::detect_sbs_circles(&buf, h.width, h.height, bpp, scale);
+    // BGRA in, but the detector only takes max(R, G, B) — order-free. The
+    // frame is as recorded; the circles are reported on the CANVAS (the
+    // pad / crop shifts rows by `canvas_pad_rows`, columns stay).
+    let pad = info.canvas_pad_rows() as f32;
+    let sbs = crate::circles::detect_sbs_circles(&buf, h.width, h.height, bpp, scale)
+        .map(|[l, r]| [EyeCircle { cy: l.cy + pad, ..l }, EyeCircle { cy: r.cy + pad, ..r }]);
     // A single centred circle wider than a half (a mono fisheye, or a
     // two-track clip is never mono) — only for single-track frames.
     let whole = if info.is_dual_track() { None } else {
@@ -256,7 +274,10 @@ pub fn braw_calib_only(info: &vr180_braw::BrawInfo, eye_w: u32, eye_h: u32, circ
         lens_b,
         camera_model: Some(if info.camera_model.is_empty() { "Blackmagic RAW".to_string() } else { info.camera_model.clone() }),
         imu_to_cam: Some(braw_imu_to_cam()),
-        readout_ms: info.readout_s().map(|s| (s * 1e3) as f32),
+        // The per-row sweep's span: the eye's CANVAS rows at the file's line
+        // time (see `BrawLayout::canvas_readout_ms`); a mono clip's frame
+        // is the recorded window, where this equals the window readout.
+        readout_ms: BrawLayout { mono: eye_w != info.eye_dims().0 || eye_h != info.eye_dims().1, circles }.canvas_readout_ms(info),
         sample_anchor: vr180_fisheye::SampleAnchor::BlockMid,
         ..Default::default()
     }
@@ -318,6 +339,10 @@ pub fn build_braw_imu(
         t_s: samples.iter().map(|s| s.t_us as f64 * 1e-6).collect(),
         quats: &quats,
     };
+    // The content time anchors the pose on the sensor's CENTRE row of the
+    // recorded window: its readout/2 is the window's rows × line time / 2
+    // (the canvas shares that centre row, so padding / cropping changes
+    // nothing here).
     let readout_s = info.readout_s().unwrap_or(0.0);
     let latency_s = braw_gyro_latency_ms() as f64 * 1e-3;
     let frame_dur = 1.0 / fps as f64;
@@ -385,15 +410,19 @@ mod tests {
         for k in 0..n { accel[k * 3 + 1] = -9.80665; }
         let gyro = vr180_braw::BrawGyroData { header, gyro: vec![0f32; n * 3], accel };
         let sh = vr180_braw::BrawShutters { samples: vec![(0, 0.001), (50, 0.002)] };
-        let imu = build_braw_imu(&info(), &gyro, &sh, 50.0, 100, 6144, 6480, None);
+        let imu = build_braw_imu(&info(), &gyro, &sh, 50.0, 100, 6144, 6144, None);
         assert_eq!(imu.frame_quats.len(), 100);
         assert_eq!(imu.high_rate_quats[0].len(), HR_PER_FRAME);
-        assert!((imu.readout_ms.unwrap() - 19.44).abs() < 1e-3);
+        // The canvas: 6144 rows × 3 µs, not the recorded 6480 × 3 (19.44).
+        assert!((imu.readout_ms.unwrap() - 18.432).abs() < 1e-3);
+        let layout = BrawLayout { mono: false, circles: None };
+        assert_eq!(layout.eye_dims(&info()), (6144, 6144));
+        assert_eq!(info().canvas_pad_rows(), -168);
         assert!((imu.exposure_ms[10] - 1.0).abs() < 1e-4 && (imu.exposure_ms[60] - 2.0).abs() < 1e-4);
         assert_eq!(imu.sample_anchor, vr180_fisheye::SampleAnchor::BlockMid);
         let q0 = imu.frame_quats[0]; let q9 = imu.frame_quats[99];
         assert!((q0.w - q9.w).abs() < 1e-4 && (q0.x - q9.x).abs() < 1e-4);
-        let calib = braw_calib_only(&info(), 6144, 6480, None);
+        let calib = braw_calib_only(&info(), 6144, 6144, None);
         assert!(calib.frame_quats.is_empty());
         assert_eq!(calib.imu_to_cam, Some(BRAW_IMU_TO_CAM));
     }

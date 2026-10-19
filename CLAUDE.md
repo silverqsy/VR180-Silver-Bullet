@@ -1230,10 +1230,25 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      eyes, fps, frame count — ffprobe pads the size and fails on URSA
      files); `SourceKind::BlackmagicRaw` now `has_frame_imu` + `is_braw`;
      `BrawFisheyeIter::new_with_options(path, info, bit_depth, scale, look,
-     swap, limit)` splits the frame into L|R halves (single-track = a VR180
-     lens on one sensor; dual-track = the helper's composition), keeps 16-bit
-     as RGBA64LE, seeks by restarting the helper at `--start`, no swap in the
-     iterator (consumers apply it, like SBS); `braw_imu.rs` rewritten:
+     swap, mono, limit)` splits the frame into L|R halves (single-track = a
+     VR180 lens on one sensor; dual-track = the helper's composition) and
+     **fits each eye on a SQUARE canvas of its own width (the pair = a 2:1
+     frame; user decision 2026-10-19, the web tool's / DeoVR's handling of
+     a non-square eye): a shorter window is padded black top and bottom
+     (12288×5112 → 6144² eyes, 516 rows each side), a taller one is cropped
+     (12288×6480, 17:9 → 6144², 168 rows each side); `canvas_pad_rows`,
+     `BrawInfo::eye_dims / frame_dims` = the canvas, `raw_eye_dims /
+     raw_frame_dims` = as recorded, `canvas_pad_rows()`; the probe, the
+     layout's circles (shifted by the pad), the preset's pp (`cy = Cy ×
+     canvas h` exactly), the Override seed and the per-row RS table all
+     speak the canvas; the canvas and the window share their centre row so
+     the pose's content time (centre row of the RECORDED window) is
+     unchanged, and the per-row sweep spans canvas rows × line time
+     (`BrawLayout::canvas_readout_ms`: 6144 × 3 µs = 18.43 ms for both
+     windows — padded rows carry no image, cropped rows are gone, the slope
+     per row stays the sensor's). A mono clip stays the recorded frame.**
+     Keeps 16-bit as RGBA64LE, seeks by restarting the helper at `--start`;
+     the user's swap goes through the iterator; `braw_imu.rs` rewritten:
      `build_braw_imu(info, gyro, shutters, fps, n, eye_w, eye_h, circles)` →
      `DjiOsvImu` via `integrate_orientation_samples` (VQF bias), content time
      `i/fps + readout/2 − shutter(i)/2 + latency`, `HR_PER_FRAME` blocks,
@@ -1267,10 +1282,11 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      seeds the Override UI from the IMAGE CIRCLES (`circles.rs`:
      `detect_sbs_circles` on a quarter-size decode of frame 0 — rim level from
      the eye's corners (log black ≈ 25/255), edge points per row/column, LS
-     circle with outlier rejection; C005 (2910, 3247) r 3183 / (3170, 3187)
-     r 3178 native px, C006 (2942, 2524) r 3202 / (3188, 2469) r 3206 — the
-     two lenses sit ~60 px apart vertically and 160 px outward of the eye
-     centres) + the preset's FOV (`fx = r / (FOV/2)`) and k; the user sets
+     circle with outlier rejection; C005 (2944, 3044) r 3205 / (3175, 2984)
+     r 3209, C006 (2942, 3040) r 3202 / (3188, 2985) r 3206 — CANVAS px
+     (C005 cropped −168 rows, C006 padded +516; the two lenses sit ~60 px
+     apart vertically and 160 px outward of the eye centres) + the preset's FOV (`fx = eye_w / fov_rad`, the Override UI's
+     convention — the circle only locates the centre) and k; the user sets
      FOV / k / k5 / p by hand (k5/p shown for BRAW, the Camera preset combo
      offers the Blackmagic presets + Custom, the Gyroflow loader stays).
      The Override UI's "In-file" line shows the seed. Templates: "braw".

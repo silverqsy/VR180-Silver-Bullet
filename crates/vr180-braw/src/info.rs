@@ -148,15 +148,41 @@ impl BrawInfo {
         (self.readout_ms > 0.0).then_some(self.readout_ms * 1e-3)
     }
 
-    /// Size of ONE eye as the app sees it: a dual-track clip's track (the
-    /// helper composes the two side by side), a single-track clip's half —
-    /// a VR180 lens on one sensor puts its two circles side by side.
-    pub fn eye_dims(&self) -> (u32, u32) {
+    /// Size of ONE eye as RECORDED: a dual-track clip's track (the helper
+    /// composes the two side by side), a single-track clip's half — a
+    /// VR180 lens on one sensor puts its two circles side by side.
+    pub fn raw_eye_dims(&self) -> (u32, u32) {
         if self.is_dual_track() { (self.width, self.height) } else { (self.width / 2, self.height) }
     }
 
-    /// The composed frame the decoder emits (both eyes).
-    pub fn frame_dims(&self) -> (u32, u32) {
+    /// The composed frame the helper emits (both eyes), as recorded.
+    pub fn raw_frame_dims(&self) -> (u32, u32) {
         if self.is_dual_track() { (self.width * 2, self.height) } else { (self.width, self.height) }
+    }
+
+    /// Size of ONE eye as the app sees it: the recorded eye fitted on a
+    /// SQUARE canvas of its own width (the two eyes side by side make a 2:1
+    /// frame) — a shorter eye (the 12288×5112 PYXIS window: 2.4:1) is
+    /// padded black top and bottom, a taller one (12288×6480, 17:9) is
+    /// cropped top and bottom. Lens parameters, the Override UI and the
+    /// "fisheyecenter" web tool all speak this canvas; [`BrawFisheyeIter`]
+    /// (in the pipeline crate) emits it.
+    pub fn eye_dims(&self) -> (u32, u32) {
+        let (w, _) = self.raw_eye_dims();
+        (w, w)
+    }
+
+    /// The 2:1 canvas frame (both eyes).
+    pub fn frame_dims(&self) -> (u32, u32) {
+        let (w, h) = self.eye_dims();
+        (w * 2, h)
+    }
+
+    /// Rows added above (and below) the recorded eye to reach the canvas —
+    /// negative when the canvas CROPS rows instead.
+    pub fn canvas_pad_rows(&self) -> i32 {
+        let (_, raw_h) = self.raw_eye_dims();
+        let (_, canvas_h) = self.eye_dims();
+        (canvas_h as i32 - raw_h as i32) / 2
     }
 }

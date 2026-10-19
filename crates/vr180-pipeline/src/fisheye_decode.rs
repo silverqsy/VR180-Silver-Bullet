@@ -3788,12 +3788,18 @@ fn extract_packed_rgba_n(frame: &ffmpeg_next::frame::Video, bytes_per_pixel: usi
 /// Blackmagic RAW pair source: the SDK helper decodes each frame to BGRA
 /// (8- or 16-bit) at a chosen fraction of the recorded size, and the two
 /// eyes are the two halves of the frame — a VR180 lens on one sensor puts
-/// its circles side by side (PYXIS 12K: 12288×6480 → two 6144×6480 eyes);
-/// a two-track clip (URSA Cine Immersive) is composed side by side by the
-/// helper. A `mono` clip (one fisheye circle, `BrawLayout`) is one eye
-/// shown to both. `swap_eyes` exchanges the halves, like the dual-stream
-/// iterators. Seeking restarts the helper at the target frame (`--start`),
-/// lazily on the next pull.
+/// its circles side by side; a two-track clip (URSA Cine Immersive) is
+/// composed side by side by the helper. Each eye is then fitted on a
+/// SQUARE canvas of its own width (the pair = a 2:1 frame), the way the
+/// "fisheyecenter" web tool and DeoVR treat a non-square eye: a shorter
+/// eye (PYXIS 12288×5112 → 6144×5112) is padded black top and bottom to
+/// 6144², a taller one (12288×6480 → 6144×6480) is cropped top and bottom
+/// to 6144². Everything downstream — lens parameters, the Override UI, the
+/// per-row rolling-shutter table — speaks that canvas. A `mono` clip (one
+/// fisheye circle, `BrawLayout`) is one eye shown to both, as recorded.
+/// `swap_eyes` exchanges the halves, like the dual-stream iterators.
+/// Seeking restarts the helper at the target frame (`--start`), lazily on
+/// the next pull.
 pub struct BrawFisheyeIter {
     path: PathBuf,
     opts: vr180_braw::decoder::DecodeOptions,
@@ -3845,7 +3851,9 @@ impl BrawFisheyeIter {
         let opts = vr180_braw::decoder::DecodeOptions {
             bit_16: bit_depth >= 10, scale, look, ..Default::default()
         };
-        let (fw, fh) = info.frame_dims();
+        // Nominal until the helper's header arrives: the canvas for a stereo
+        // pair, the recorded frame for a mono clip.
+        let (fw, fh) = if mono { info.raw_frame_dims() } else { info.frame_dims() };
         let d = scale.divisor();
         let dt_s = if info.frame_rate > 0.0 { 1.0 / info.frame_rate } else { 1.0 / 24.0 };
         let mut it = Self {
@@ -3869,10 +3877,10 @@ impl BrawFisheyeIter {
         if h.bit_depth != self.bit_depth as u32 {
             return Err(Error::Ffmpeg(format!("braw helper decoded {}-bit, {} requested", h.bit_depth, self.bit_depth)));
         }
-        // The helper reports the processed size: L|R halves, or the whole
-        // frame for a mono clip.
+        // The helper reports the processed size: L|R halves on the square
+        // canvas, or the whole frame as recorded for a mono clip.
         self.eye_w = if self.mono { h.width } else { h.width / 2 };
-        self.eye_h = h.height;
+        self.eye_h = if self.mono { h.height } else { self.eye_w };
         self.frame_idx = frame;
         self.decoder = Some(dec);
         Ok(())
@@ -3905,8 +3913,9 @@ impl FisheyePairIter for BrawFisheyeIter {
         let frame_w = header.width as usize;
         let frame_h = header.height as usize;
         let eye_w = self.eye_w as usize;
-        let mut left = Vec::with_capacity(eye_w * frame_h * bpp);
-        let mut right = Vec::with_capacity(eye_w * frame_h * bpp);
+        let eye_h = self.eye_h as usize;
+        let mut left = Vec::with_capacity(eye_w * eye_h * bpp);
+        let mut right = Vec::with_capacity(eye_w * eye_h * bpp);
         if self.mono {
             for y in 0..frame_h {
                 let row = y * frame_w * bpp;
@@ -3914,8 +3923,17 @@ impl FisheyePairIter for BrawFisheyeIter {
             }
             right = left.clone();
         } else {
-            for y in 0..frame_h {
-                let row = y * frame_w * bpp;
+            // The square canvas: rows above/below the recorded eye are black
+            // (pad), or recorded rows outside the canvas are dropped (crop).
+            let pad = canvas_pad_rows(frame_h, eye_h);
+            for y_out in 0..eye_h {
+                let y_src = y_out as i64 - pad as i64;
+                if y_src < 0 || y_src >= frame_h as i64 {
+                    push_black_row(eye_w, bpp, &mut left);
+                    push_black_row(eye_w, bpp, &mut right);
+                    continue;
+                }
+                let row = y_src as usize * frame_w * bpp;
                 bgra_to_rgba_row(&self.frame_buf[row..row + eye_w * bpp], bpp, &mut left);
                 let r0 = row + eye_w * bpp;
                 bgra_to_rgba_row(&self.frame_buf[r0..r0 + eye_w * bpp], bpp, &mut right);
@@ -3942,6 +3960,24 @@ impl FisheyePairIter for BrawFisheyeIter {
 
     fn eye_dims(&self) -> (u32, u32) {
         (self.eye_w, self.eye_h)
+    }
+}
+
+/// Rows the square canvas adds above (and below) a recorded eye of
+/// `raw_h` rows — negative when the canvas is shorter and CROPS instead.
+/// The canvas and the eye share their centre row, so the sensor's centre
+/// row (the stabilization pose's time) stays the canvas centre.
+pub fn canvas_pad_rows(raw_h: usize, canvas_h: usize) -> i32 {
+    (canvas_h as i32 - raw_h as i32) / 2
+}
+
+/// One opaque black row of `w` pixels at `bpp` bytes per pixel (RGBA8 /
+/// RGBA64LE), for the canvas padding.
+fn push_black_row(w: usize, bpp: usize, dst: &mut Vec<u8>) {
+    match bpp {
+        4 => for _ in 0..w { dst.extend_from_slice(&[0, 0, 0, 255]); },
+        8 => for _ in 0..w { dst.extend_from_slice(&[0, 0, 0, 0, 0, 0, 255, 255]); },
+        _ => tracing::error!("unexpected BRAW bpp={bpp}"),
     }
 }
 
@@ -4269,6 +4305,21 @@ mod tests {
             }
             break;
         }
+    }
+
+    #[test]
+    fn braw_canvas_pad_and_crop_rows() {
+        // PYXIS 12288×5112 → 6144² eyes: 516 black rows above and below.
+        assert_eq!(canvas_pad_rows(5112, 6144), 516);
+        // 12288×6480 (17:9) → 6144²: 168 rows cropped top and bottom.
+        assert_eq!(canvas_pad_rows(6480, 6144), -168);
+        // URSA 8160×7200 tracks → 8160²: 480 padded.
+        assert_eq!(canvas_pad_rows(7200, 8160), 480);
+        let mut row = Vec::new();
+        push_black_row(2, 4, &mut row);
+        assert_eq!(row, vec![0, 0, 0, 255, 0, 0, 0, 255]);
+        push_black_row(1, 8, &mut row);
+        assert_eq!(&row[8..], &[0, 0, 0, 0, 0, 0, 255, 255]);
     }
 
     #[test]
