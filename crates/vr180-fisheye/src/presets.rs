@@ -53,6 +53,43 @@ pub struct CameraPreset {
     /// The physical LEFT eye sits in the RIGHT half of the frame (the lens
     /// crosses over): fresh clips of this preset seed the eye swap on.
     pub left_eye_is_right_half: bool,
+    /// What `default_fov_deg` means — see [`FovConvention`].
+    pub fov_convention: FovConvention,
+}
+
+/// How a preset's `default_fov_deg` relates to the focal length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FovConvention {
+    /// The app's own: the angle the EYE WIDTH spans under an ideal
+    /// equidistant lens, `fx = eye_w / fov_rad`, the KB polynomial on top
+    /// (the Override slider, `fx_from_fov`).
+    EyeWidth,
+    /// The "fisheyecenter" web tool's (rest.s3for.me/marat/silvers_fix/
+    /// fisheyecenter): the FOV spans the per-eye frame's LONGER dimension
+    /// through the KB model, `f = (max(eye_w, eye_h) / 2) / θd(fov / 2)`
+    /// with `θd = θ·(1 + k1θ² + k2θ⁴ + k3θ⁶ + k4θ⁸)` — a cropped fisheye
+    /// keeps its FOV along the uncropped axis (DeoVR's convention).
+    KbLongerDim,
+}
+
+impl CameraPreset {
+    /// `default_fov_deg` expressed in the app's [`FovConvention::EyeWidth`]
+    /// for an eye of `eye_w × eye_h`, so the resolvers can build `fx = eye_w
+    /// / fov_rad` whatever convention the preset was entered in.
+    pub fn app_fov_deg(&self, eye_w: u32, eye_h: u32) -> f64 {
+        match self.fov_convention {
+            FovConvention::EyeWidth => self.default_fov_deg,
+            FovConvention::KbLongerDim => {
+                let half = self.default_fov_deg.max(1.0).to_radians() * 0.5;
+                let t2 = half * half;
+                let k = self.calib.k;
+                let theta_d = half * (1.0 + t2 * (k[0] + t2 * (k[1] + t2 * (k[2] + t2 * k[3]))));
+                if theta_d <= 1e-9 || eye_w == 0 { return self.default_fov_deg; }
+                let f = (eye_w.max(eye_h) as f64 * 0.5) / theta_d;
+                (eye_w as f64 / f).to_degrees()
+            }
+        }
+    }
 }
 
 /// Which decoder path this preset routes to.
@@ -73,17 +110,15 @@ pub enum InputLayout {
     BlackmagicRaw,
 }
 
-/// The dual-fisheye PYXIS preset's FOV in the app's convention — the angle
-/// the EYE WIDTH spans, `fx = eye_w / fov_rad`, with the KB polynomial on
-/// top. The user's figure for this lens is 192.709108254° in their tool's
-/// convention (unknown; at the image-circle edge under the KB model it
-/// would be 188.7° here, across the eye width under KB 196.8°). Measured
-/// instead (2026-10-19, PYXIS 12K C006, camera-locked export of the
-/// fastest 2 s window, residual inter-frame motion at 512 px, the user's
-/// k and principal points): 180° 1.63, 186.2° 1.51, 192.7° 1.37, 198° 1.32,
-/// **202° 1.30**, 205° 1.33, 210° 1.41, 220° 1.50 px — the minimum is here.
-/// The FOV slider overrides it per clip.
-pub const BRAW_DUAL_FISHEYE_FOV_DEG: f64 = 202.0;
+/// The dual-fisheye PYXIS preset's FOV as the user calibrated it in the
+/// "fisheyecenter" web tool ([`FovConvention::KbLongerDim`]): 192.709108254°
+/// across the eye's longer dimension through the KB model, which for the
+/// 6144-wide eyes is `f = 3072 / θd(96.35°) = 1788.8 px` → **196.8°** in
+/// the app's eye-width convention ([`CameraPreset::app_fov_deg`]). The
+/// camera-locked residual sweep on the sample clip (fastest 2 s window,
+/// their k + principal points) agrees within its shallow floor: 192.7°
+/// 1.37, 195° 1.32, 198° 1.32, 202° 1.30, 205° 1.33, 210° 1.41 px.
+pub const BRAW_DUAL_FISHEYE_FOV_DEG: f64 = 192.709108254;
 
 /// Built-in preset catalog. Static — no allocation, no I/O.
 pub fn presets() -> &'static [CameraPreset] {
@@ -135,6 +170,7 @@ static PRESETS: [CameraPreset; 11] = [
         input_layout: InputLayout::DualStream,
         stereo_pp: None,
         left_eye_is_right_half: false,
+        fov_convention: FovConvention::EyeWidth,
     },
 
     // ============================================================
@@ -161,6 +197,7 @@ static PRESETS: [CameraPreset; 11] = [
         input_layout: InputLayout::BlackmagicRaw,
         stereo_pp: None,
         left_eye_is_right_half: false,
+        fov_convention: FovConvention::EyeWidth,
     },
 
     // ============================================================
@@ -185,6 +222,7 @@ static PRESETS: [CameraPreset; 11] = [
         input_layout: InputLayout::BlackmagicRaw,
         stereo_pp: None,
         left_eye_is_right_half: false,
+        fov_convention: FovConvention::EyeWidth,
     },
 
     // ============================================================
@@ -208,6 +246,7 @@ static PRESETS: [CameraPreset; 11] = [
         input_layout: InputLayout::SideBySide,
         stereo_pp: None,
         left_eye_is_right_half: false,
+        fov_convention: FovConvention::EyeWidth,
     },
 
     // ============================================================
@@ -231,6 +270,7 @@ static PRESETS: [CameraPreset; 11] = [
         input_layout: InputLayout::SideBySide,
         stereo_pp: None,
         left_eye_is_right_half: false,
+        fov_convention: FovConvention::EyeWidth,
     },
 
     // ============================================================
@@ -254,6 +294,7 @@ static PRESETS: [CameraPreset; 11] = [
         input_layout: InputLayout::SideBySide,
         stereo_pp: None,
         left_eye_is_right_half: false,
+        fov_convention: FovConvention::EyeWidth,
     },
 
     // ============================================================
@@ -278,6 +319,7 @@ static PRESETS: [CameraPreset; 11] = [
         input_layout: InputLayout::SideBySide,
         stereo_pp: None,
         left_eye_is_right_half: false,
+        fov_convention: FovConvention::EyeWidth,
     },
 
     // ============================================================
@@ -302,6 +344,7 @@ static PRESETS: [CameraPreset; 11] = [
         input_layout: InputLayout::SideBySide,
         stereo_pp: None,
         left_eye_is_right_half: false,
+        fov_convention: FovConvention::EyeWidth,
     },
 
     // ============================================================
@@ -330,6 +373,7 @@ static PRESETS: [CameraPreset; 11] = [
         input_layout: InputLayout::DualStream,
         stereo_pp: None,
         left_eye_is_right_half: false,
+        fov_convention: FovConvention::EyeWidth,
     },
 
     // ============================================================
@@ -358,6 +402,7 @@ static PRESETS: [CameraPreset; 11] = [
         input_layout: InputLayout::Stacked,
         stereo_pp: None,
         left_eye_is_right_half: false,
+        fov_convention: FovConvention::EyeWidth,
     },
 
     // ============================================================
@@ -370,9 +415,8 @@ static PRESETS: [CameraPreset; 11] = [
     // in the RIGHT half: CxL 0.76546, CyL 0.50049, CxR 0.24243, CyR 0.49821.
     // Stored as offsets from each eye's centre in units of the frame width
     // (dx = Cx − 0.75 / 0.25, dy = (Cy − 0.5) / 2), so the 50p 12288×6480
-    // window shares them. The app's FOV is the angle the EYE WIDTH spans
-    // (`fx = eye_w / fov`); the value here is the one the stabilization
-    // residual sweep picked for this lens (see CLAUDE.md item 25).
+    // window shares them. The FOV is in the web tool's convention
+    // (`FovConvention::KbLongerDim`); `app_fov_deg` converts it.
     CameraPreset {
         name: "Blackmagic PYXIS 12K VR180 (dual fisheye)",
         lens: Some("Dual fisheye on one sensor, 192.7°"),
@@ -393,6 +437,7 @@ static PRESETS: [CameraPreset; 11] = [
             [0.24243 - 0.25, (0.49821 - 0.5) / 2.0],   // right eye (left half)
         ]),
         left_eye_is_right_half: true,
+        fov_convention: FovConvention::KbLongerDim,
     },
 ];
 
@@ -433,5 +478,26 @@ mod tests {
         assert!(find("dji osmo 360").is_some());
         assert!(find("DJI OSMO 360").is_some());
         assert!(find("nonsense").is_none());
+    }
+}
+
+#[cfg(test)]
+mod braw_preset_tests {
+    use super::*;
+
+    #[test]
+    fn pyxis_dual_fisheye_fov_converts_through_the_kb_model() {
+        let p = find("Blackmagic PYXIS 12K VR180 (dual fisheye)").expect("preset");
+        assert_eq!(p.fov_convention, FovConvention::KbLongerDim);
+        // 6144×5112 eyes: f = 3072 / θd(96.35°) = 1788.8 px → 6144 / f rad = 196.8°.
+        let fov = p.app_fov_deg(6144, 5112);
+        assert!((fov - 196.79).abs() < 0.1, "{fov}");
+        // Square eyes (the tool's 2:1 timeline): the same focal, the same answer.
+        assert!((p.app_fov_deg(6144, 6144) - fov).abs() < 1e-9);
+        // The Custom slot must stay at index 7 (callers index it).
+        assert_eq!(presets()[7].name, "Custom");
+        // An eye-width preset passes its value through.
+        let osmo = find("DJI Osmo 360").unwrap();
+        assert_eq!(osmo.app_fov_deg(3840, 3840), osmo.default_fov_deg);
     }
 }

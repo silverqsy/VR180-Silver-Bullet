@@ -4121,7 +4121,7 @@ pub(crate) fn resolve_calib_pair(
                     // preset's FOV / k; the Camera combo's choice re-scales the
                     // focal to its FOV and takes its k (same in the GUI resolver).
                     let (fx, fy, cx, cy, k) = if cfg.source_kind == SourceKind::BlackmagicRaw {
-                        let (sx, sk) = crate::braw_imu::preset_rescale(preset);
+                        let (sx, sk) = crate::braw_imu::preset_rescale(preset, src_w, src_h);
                         let (cx, cy) = crate::braw_imu::preset_principal_point(preset, output, cfg.fisheye_swap_eyes, src_w as f32, src_h as f32)
                             .unwrap_or((cx, cy));
                         (fx * sx, fy * sx, cx, cy, sk.unwrap_or(k))

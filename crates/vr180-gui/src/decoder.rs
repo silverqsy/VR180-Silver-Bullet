@@ -1159,7 +1159,7 @@ fn seed_detected_calib(
             vr180_pipeline::braw_imu::BRAW_PRESET_NAME.to_string()
         } else { settings.fisheye_preset.clone() };
         if let Some(preset) = vr180_fisheye::presets::find(&name) {
-            let (sx, sk) = vr180_pipeline::braw_imu::preset_rescale(preset);
+            let (sx, sk) = vr180_pipeline::braw_imu::preset_rescale(preset, src_w, src_h);
             for (output, e, lens) in [(0usize, &mut left, sl), (1usize, &mut right, sr)] {
                 let w = lens.width.unwrap_or(src_w as f32).max(1.0);
                 let h = lens.height.unwrap_or(src_h as f32).max(1.0);
@@ -4197,7 +4197,7 @@ pub(crate) fn resolve_fisheye_calib_pair(
                     // preset's FOV / k; the Camera combo's choice re-scales the
                     // focal to its FOV and takes its k (same as the export).
                     let (fx, fy, cx, cy, k) = if kind == vr180_pipeline::SourceKind::BlackmagicRaw {
-                        let (sx, sk) = vr180_pipeline::braw_imu::preset_rescale(preset);
+                        let (sx, sk) = vr180_pipeline::braw_imu::preset_rescale(preset, src_w, src_h);
                         let (cx, cy) = vr180_pipeline::braw_imu::preset_principal_point(
                             preset, output, s.effective_swap_eyes(), src_w as f32, src_h as f32).unwrap_or((cx, cy));
                         (fx * sx, fy * sx, cx, cy, sk.unwrap_or(k))

@@ -201,10 +201,11 @@ pub fn braw_layout(path: &std::path::Path, info: &vr180_braw::BrawInfo) -> BrawL
 /// `fx × (seed_half_fov / preset_half_fov)` and the preset's `k` when it is
 /// another preset; `(1, None)` for the default (and for presets without a
 /// FOV). Both calibration resolvers apply it identically.
-pub fn preset_rescale(preset: &vr180_fisheye::presets::CameraPreset) -> (f32, Option<[f32; 4]>) {
+pub fn preset_rescale(preset: &vr180_fisheye::presets::CameraPreset, eye_w: u32, eye_h: u32) -> (f32, Option<[f32; 4]>) {
     if preset.name == BRAW_PRESET_NAME || preset.default_fov_deg <= 0.0 { return (1.0, None); }
-    let seed_fov = vr180_fisheye::presets::find(BRAW_PRESET_NAME).map(|p| p.default_fov_deg as f32).unwrap_or(190.0);
-    let sx = (seed_fov.max(1.0) * 0.5) / ((preset.default_fov_deg as f32).max(1.0) * 0.5);
+    let seed_fov = vr180_fisheye::presets::find(BRAW_PRESET_NAME).map(|p| p.app_fov_deg(eye_w, eye_h) as f32).unwrap_or(190.0);
+    let sel_fov = preset.app_fov_deg(eye_w, eye_h) as f32;
+    let sx = seed_fov.max(1.0) / sel_fov.max(1.0);
     (sx, Some([preset.calib.k[0] as f32, preset.calib.k[1] as f32, preset.calib.k[2] as f32, preset.calib.k[3] as f32]))
 }
 
@@ -218,7 +219,7 @@ pub fn preset_rescale(preset: &vr180_fisheye::presets::CameraPreset) -> (f32, Op
 /// has no lens record of its own.
 pub fn seed_lens_calib(eye_w: u32, eye_h: u32, circle: Option<EyeCircle>) -> DjiLensCalib {
     let preset = vr180_fisheye::presets::find(BRAW_PRESET_NAME);
-    let fov_deg = preset.map(|p| p.default_fov_deg as f32).unwrap_or(190.0);
+    let fov_deg = preset.map(|p| p.app_fov_deg(eye_w, eye_h) as f32).unwrap_or(190.0);
     let k = preset
         .map(|p| [p.calib.k[0] as f32, p.calib.k[1] as f32, p.calib.k[2] as f32, p.calib.k[3] as f32])
         .unwrap_or([0.0; 4]);
@@ -365,7 +366,7 @@ mod tests {
         let l = seed_lens_calib(6144, 6480, Some(c));
         assert_eq!(l.cx, Some(2910.0));
         assert_eq!(l.cy, Some(3247.0));
-        let fov = vr180_fisheye::presets::find(BRAW_PRESET_NAME).map(|p| p.default_fov_deg as f32).unwrap_or(190.0);
+        let fov = vr180_fisheye::presets::find(BRAW_PRESET_NAME).map(|p| p.app_fov_deg(6144, 6480) as f32).unwrap_or(190.0);
         assert!((l.fx.unwrap() - 6144.0 / fov.to_radians()).abs() < 1e-2);
         let (a, b) = lens_pair(6144, 6480, Some([c, EyeCircle { cx: 3170.0, cy: 3187.0, r: 3178.0 }]));
         assert_eq!(b.cx, Some(2910.0));   // lens_b = left

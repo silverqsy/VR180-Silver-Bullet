@@ -1290,10 +1290,18 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      Against our detected circles (C006 right half (3188, 2469), left
      (2942, 2524)) the user's points sit +74/+90 and +37/+21 px — the C006
      fit is the truncated-circle one. **FOV convention**: the user's
-     192.709° is not the app's width-based FOV; the residual sweep with
-     their k + pp puts the app's value at **202°** (`BRAW_DUAL_FISHEYE_FOV_DEG`;
-     1.30 px vs 1.37 at 192.7, 1.63 at 180, 1.50 at 220; our circles + their
-     k: 1.28 at 201.4). Templates holding "Custom" / the old
+     192.709° comes from the "fisheyecenter" web tool
+     (rest.s3for.me/marat/silvers_fix/fisheyecenter/indexn.html): the FOV
+     spans the per-eye frame's LONGER dimension through the KB model,
+     `f = (max(w,h)/2) / θd(fov/2)` (DeoVR's convention for cropped
+     fisheyes). The preset keeps that number with
+     `fov_convention: KbLongerDim`; `CameraPreset::app_fov_deg(eye_w,
+     eye_h)` converts to the app's eye-width convention everywhere a
+     preset FOV becomes a focal (`seed_lens_calib`, `preset_rescale`):
+     f = 3072 / θd(96.35°) = 1788.8 px → **196.8°**. The residual sweep with
+     their k + pp agrees within its shallow floor (192.7° 1.37, 195° 1.32,
+     198° 1.32, 202° 1.30, 205° 1.33, 210° 1.41; our circles + their k
+     1.28 at 201.4, + k = 0 1.17 at 201.4). Templates holding "Custom" / the old
      "Blackmagic Pyxis 12K" migrate once to the new preset at load
      (unless an Override is on). The single-camera "Blackmagic Pyxis 12K"
      preset (210°, mono) remains for one-circle clips.
