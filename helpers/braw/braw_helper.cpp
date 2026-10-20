@@ -3,11 +3,12 @@
  *
  * Modes:
  *   --info  <file.braw>                                          → JSON clip metadata to stdout
- *   --decode <file.braw> [--start N] [--count M] [--track T]     → raw BGRA frames to stdout
+ *   --decode <file.braw> [--start N] [--count M] [--track T]     → raw RGBA frames to stdout (older builds: BGRA)
  *            [--16bit] [--scale full|half|quarter|eighth]          (JSON header on stderr first)
  *            [--look film|video|extended|rec709] [--gamma S] [--gamut S] [--wb K] ...
  *            [--pipeline auto|metal|cpu]  (auto: the first Metal device, else the CPU;
  *             the header reports "pipeline" + "gpu_device"; frames are pipelined 2–3 deep)
+ *            [--step N]  (every Nth frame; "frames" in the header = the emitted count, "format": "rgba")
  *   --gyro  <file.braw>                                          → binary gyro+accel to stdout, JSON header to stderr
  *   --audio <file.braw>                                          → WAV to stdout, JSON header to stderr
  *   --meta  <file.braw> [--frame N]                              → every clip + frame metadata key, one per line
@@ -398,6 +399,9 @@ static BlackmagicRawResolutionScale g_scale = blackmagicRawResolutionScaleFull;
 // when the buffer is CPU-visible (unified memory), else by a copy into CPU
 // memory. `BRAW_HELPER_READBACK=copy` forces the copy (A/B).
 static std::string g_pipelineArg = "auto";
+// --step N: emit every Nth frame from --start (BRAW is intra-only, so the
+// skipped frames cost nothing). The header's "frames" is the emitted count.
+static uint64_t g_step = 1;
 static IBlackmagicRawPipelineDevice* g_gpuDevice = nullptr;     // alive while the codec is
 static IBlackmagicRawResourceManager* g_resourceManager = nullptr;
 static std::string g_activePipeline = "cpu";
@@ -475,9 +479,9 @@ static bool setup_gpu_pipeline(IBlackmagicRawFactory* factory, IBlackmagicRaw* c
     if (g_pipelineArg == "cpu") return true;
     std::string name;
     IBlackmagicRawPipelineDevice* dev = first_metal_device(factory, codec, &name);
-    const BlackmagicRawResourceFormat fmt = g_use16bit ? blackmagicRawResourceFormatBGRAU16 : blackmagicRawResourceFormatBGRAU8;
+    const BlackmagicRawResourceFormat fmt = g_use16bit ? blackmagicRawResourceFormatRGBAU16 : blackmagicRawResourceFormatRGBAU8;
     if (dev && !device_supports_format(dev, fmt)) {
-        fprintf(stderr, "note: Metal device '%s' does not offer the BGRA %d-bit format; decoding on the CPU\n", name.c_str(), g_use16bit ? 16 : 8);
+        fprintf(stderr, "note: Metal device '%s' does not offer the RGBA %d-bit format; decoding on the CPU\n", name.c_str(), g_use16bit ? 16 : 8);
         dev->Release(); dev = nullptr;
     }
     if (!dev) {
@@ -581,7 +585,9 @@ public:
         readJob->GetUserData(&ticket);
         IBlackmagicRawJob* decodeJob = nullptr;
         if (result == S_OK)
-            result = frame->SetResourceFormat(g_use16bit ? blackmagicRawResourceFormatBGRAU16 : blackmagicRawResourceFormatBGRAU8);
+            // RGBA straight from the SDK: the app's texture order, no swizzle
+            // downstream (the header says "format": "rgba").
+            result = frame->SetResourceFormat(g_use16bit ? blackmagicRawResourceFormatRGBAU16 : blackmagicRawResourceFormatRGBAU8);
         if (result == S_OK)
             result = frame->SetResolutionScale(g_scale);
         if (result == S_OK)
@@ -1151,9 +1157,11 @@ static int do_decode(const char* path, uint64_t start, uint64_t count, int track
         }
         return true;
     };
+    const uint64_t step = g_step;
+    const uint64_t emitted = (end - start + step - 1) / step;
     auto header = [&](uint32_t outW, uint32_t outH, bool dual, uint32_t w0, uint32_t h0, uint32_t w1, uint32_t h1) {
-        fprintf(stderr, "{\"width\": %u, \"height\": %u, \"frames\": %llu, \"dual_stream\": %s, \"bit_depth\": %d",
-                outW, outH, (unsigned long long)(end - start), dual ? "true" : "false", bitDepth);
+        fprintf(stderr, "{\"width\": %u, \"height\": %u, \"frames\": %llu, \"dual_stream\": %s, \"bit_depth\": %d, \"format\": \"rgba\", \"step\": %llu",
+                outW, outH, (unsigned long long)emitted, dual ? "true" : "false", bitDepth, (unsigned long long)step);
         if (dual)
             fprintf(stderr, ", \"track0_width\": %u, \"track0_height\": %u, \"track1_width\": %u, \"track1_height\": %u", w0, h0, w1, h1);
         fprintf(stderr, ", \"pipeline\": \"%s\"", g_activePipeline.c_str());
@@ -1182,12 +1190,12 @@ static int do_decode(const char* path, uint64_t start, uint64_t count, int track
         const size_t outRowBytes = (size_t)outW * bytesPerPixel;
         std::vector<uint8_t> outRow(outRowBytes);
         const int ahead = frames_in_flight_for(rowBytes0 * h0 + rowBytes1 * h1);
-        uint64_t next = start + 1;
+        uint64_t next = start + step;
         int inflight = 0;
         auto top_up = [&]() -> bool {
             while (inflight < ahead && next < end) {
                 if (!submit_read(ctx, next * 2 + 0, next, 0) || !submit_read(ctx, next * 2 + 1, next, 1)) return false;
-                next++; inflight++;
+                next += step; inflight++;
             }
             return true;
         };
@@ -1209,7 +1217,7 @@ static int do_decode(const char* path, uint64_t start, uint64_t count, int track
         };
         if (!top_up()) return fail();
         if (!emit(r0, r1, start)) return fail();
-        for (uint64_t i = start + 1; i < end; i++) {
+        for (uint64_t i = start + step; i < end; i += step) {
             FrameResult a = cb.wait(i * 2 + 0);
             FrameResult b = cb.wait(i * 2 + 1);
             inflight--;
@@ -1234,12 +1242,12 @@ static int do_decode(const char* path, uint64_t start, uint64_t count, int track
 
         const size_t frameBytes = (size_t)outW * outH * bytesPerPixel;
         const int ahead = frames_in_flight_for(frameBytes);
-        uint64_t next = start + 1;
+        uint64_t next = start + step;
         int inflight = 0;
         auto top_up = [&]() -> bool {
             while (inflight < ahead && next < end) {
                 if (!submit_read(ctx, next, next, decode_track)) return false;
-                next++; inflight++;
+                next += step; inflight++;
             }
             return true;
         };
@@ -1253,7 +1261,7 @@ static int do_decode(const char* path, uint64_t start, uint64_t count, int track
         // Submit ahead before writing, so the SDK works while we write.
         if (!top_up()) return fail();
         if (!emit(first, start)) return fail();
-        for (uint64_t i = start + 1; i < end; i++) {
+        for (uint64_t i = start + step; i < end; i += step) {
             FrameResult r = cb.wait(i);
             inflight--;
             if (!top_up()) return fail();
@@ -1583,11 +1591,12 @@ int main(int argc, const char* argv[]) {
         std::cerr << "  braw_helper --decode <file.braw> [--start N] [--count M] [--track T] [--16bit]" << std::endl;
         std::cerr << "              [--scale full|half|quarter|eighth] [--look film|video|extended|rec709]" << std::endl;
         std::cerr << "              [--pipeline auto|metal|cpu]  (auto = the first Metal device, else CPU)" << std::endl;
+        std::cerr << "              [--step N]  (every Nth frame from --start; the header's frames = emitted count)" << std::endl;
+        std::cerr << "              (JSON header on stderr, then raw RGBA frames on stdout)" << std::endl;
         std::cerr << "              [--gamma S] [--gamut S] [--wb K] [--tint T] [--exposure EV] [--iso N]" << std::endl;
         std::cerr << "              [--tc-contrast|--tc-saturation|--tc-midpoint|--tc-highlights|--tc-shadows|" << std::endl;
         std::cerr << "               --tc-black-level|--tc-white-level F] [--highlight-recovery 0|1]" << std::endl;
         std::cerr << "              [--analog-gain F] [--gamut-compression 0|1]" << std::endl;
-        std::cerr << "              (JSON header on stderr, then raw BGRA frames on stdout)" << std::endl;
         std::cerr << "  braw_helper --gyro  <file.braw>  (JSON header on stderr, float32 samples on stdout)" << std::endl;
         std::cerr << "  braw_helper --audio <file.braw>  (JSON header on stderr, WAV on stdout)" << std::endl;
         std::cerr << "  braw_helper --meta  <file.braw> [--frame N]   (all clip + frame metadata)" << std::endl;
@@ -1620,6 +1629,7 @@ int main(int argc, const char* argv[]) {
             if (val != "auto" && val != "metal" && val != "cpu") { std::cerr << "ERROR: unknown --pipeline " << val << " (auto|metal|cpu)" << std::endl; return 1; }
             g_pipelineArg = val;
         }
+        else if (arg == "--step") { g_step = std::max<uint64_t>(1, std::stoull(val)); }
         else if (arg == "--wb") g_procParams.whiteBalanceKelvin = std::stoi(val);
         else if (arg == "--tint") g_procParams.whiteBalanceTint = std::stoi(val);
         else if (arg == "--exposure") g_procParams.exposure = std::stof(val);

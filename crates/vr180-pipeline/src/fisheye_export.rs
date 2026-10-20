@@ -781,7 +781,7 @@ pub(crate) fn fisheye_export_opener(
                 // and the resolvers swap lens_a/lens_b with the same flag.
                 let layout = crate::braw_imu::braw_layout(p, &info);
                 Box::new(BrawFisheyeIter::new_with_options(
-                    p, &info, bd, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, 0)?)
+                    p, &info, bd, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, 1, 0)?)
             }
             other => return Err(Error::Ffmpeg(format!(
                 "export_fisheye non-fisheye source: {other:?}"))),

@@ -40,7 +40,13 @@ frame.
   about 1.7× the preview-size throughput of the CPU path with half the CPU
   time, and a third of the CPU time at half and full size, which is what
   keeps playback smooth when the machine is busy. The decode log line and
-  the clip probe report which pipeline is in use.
+  the clip probe report which pipeline is in use. The helper also hands
+  frames over in the app's own pixel order (no per-pixel conversion
+  afterwards), the preview decodes at the SDK's smallest size that still
+  covers the preview (a 12K clip at 50/60 fps: 1024-pixel eyes; the
+  reframed view keeps 2048), and a >30 fps clip is thinned before the
+  decode rather than after it — the camera's files are intra-only, so the
+  skipped frames cost nothing.
 - Requires the Blackmagic RAW SDK (macOS) for the helper; the helper now
   builds against SDK 6.0.
 

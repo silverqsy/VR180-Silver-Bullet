@@ -1,11 +1,11 @@
 //! `braw_helper --decode` streaming wrapper.
 //!
-//! Spawns `braw_helper` and exposes the BGRA-on-stdout byte stream as
+//! Spawns `braw_helper` and exposes the RGBA-on-stdout byte stream as
 //! a frame iterator. JSON header from stderr is parsed eagerly so the
 //! consumer knows the per-frame byte count up front.
 //!
 //! Multi-track files (URSA Cine Immersive stereo, Pyxis 12K stereo)
-//! emit a single side-by-side BGRA buffer per frame when `--track` is
+//! emit a single side-by-side RGBA buffer per frame when `--track` is
 //! omitted. That's the same layout the rest of the pipeline expects
 //! from the SBS-fisheye path, so the downstream code stays uniform.
 
@@ -42,6 +42,14 @@ pub struct DecodeHeader {
     pub track1_width: Option<u32>,
     #[serde(default)]
     pub track1_height: Option<u32>,
+    /// Pixel order of the frames: `Some("rgba")` from the current helper
+    /// (RGBA / RGBA64LE straight from the SDK); absent from older builds,
+    /// which emit BGRA.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// The frame step the helper is emitting with (`--step`); absent = 1.
+    #[serde(default)]
+    pub step: Option<u32>,
     /// The pipeline the helper decodes this stream with ("metal" / "cpu").
     #[serde(default)]
     pub pipeline: Option<String>,
@@ -76,6 +84,22 @@ impl DecodeScale {
         }
         Self::Full
     }
+
+    /// [`Self::for_eye_width`] by the clip's ACTUAL processed sizes
+    /// (`BrawInfo::resolution_scales`: the SDK's steps are 2/3, 1/3, 1/6 on
+    /// the 12K PYXIS, not 1/2, 1/4, 1/8 — so its "eighth" is a 1024-px eye
+    /// that meets a 896-px cap where the nominal rule asks for "quarter" at
+    /// 2048 px, four times the pixels). `dual_track`: each scale's width is
+    /// one eye (a two-track clip), else half of it (two eyes on one
+    /// sensor). Without a table, the nominal rule.
+    pub fn for_eye_width_in(table: Option<&crate::info::ResolutionScales>, dual_track: bool, native_eye_w: u32, want: u32) -> Self {
+        let Some(t) = table else { return Self::for_eye_width(native_eye_w, want) };
+        let eye = |wh: [u32; 2]| if dual_track { wh[0] } else { wh[0] / 2 };
+        for (s, wh) in [(Self::Eighth, t.eighth), (Self::Quarter, t.quarter), (Self::Half, t.half)] {
+            if wh[0] > 0 && eye(wh) >= want { return s; }
+        }
+        Self::Full
+    }
 }
 
 /// The helper's colour presets (`--look`): `Film` = as shot (Blackmagic
@@ -91,7 +115,7 @@ impl DecodeLook {
 }
 
 impl DecodeHeader {
-    /// Bytes per pixel (4 for 8-bit BGRA, 8 for 16-bit).
+    /// Bytes per pixel (4 for 8-bit RGBA, 8 for 16-bit).
     pub fn bytes_per_pixel(&self) -> usize {
         match self.bit_depth {
             16 => 8,
@@ -110,7 +134,7 @@ impl DecodeHeader {
 /// Field names match the CLI flags 1:1, see `braw_helper.cpp:833-858`.
 #[derive(Debug, Clone, Default)]
 pub struct DecodeOptions {
-    /// Output 16-bit BGRA instead of 8-bit (for 10-bit MV-HEVC export).
+    /// Output 16-bit RGBA instead of 8-bit (for 10-bit MV-HEVC export).
     pub bit_16: bool,
     /// Restrict to one video track (0 or 1). When `None`, multi-track
     /// is composed side-by-side.
@@ -138,6 +162,10 @@ pub struct DecodeOptions {
     /// `--pipeline auto|metal|cpu`: where the SDK decodes. `None` leaves
     /// the helper's default (`auto`: the first Metal device, else the CPU).
     pub pipeline: Option<String>,
+    /// `--step N`: emit every Nth frame from the start (a decimated
+    /// preview of an intra-only codec skips the decode entirely). `None`
+    /// or `Some(1)` = every frame.
+    pub step: Option<u32>,
 }
 
 impl DecodeOptions {
@@ -147,6 +175,9 @@ impl DecodeOptions {
         }
         if let Some(p) = &self.pipeline {
             cmd.arg("--pipeline").arg(p);
+        }
+        if let Some(s) = self.step.filter(|s| *s > 1) {
+            cmd.arg("--step").arg(s.to_string());
         }
         if let Some(t) = self.track {
             cmd.arg("--track").arg(t.to_string());

@@ -1607,6 +1607,11 @@ pub fn start_decoder(
     return run_cpu_assemble(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, geoc, frame_tx, cmd_rx);
 }
 
+/// Frames the BRAW preview asks the helper to skip between decodes: the
+/// same >30 fps rule as the post-decode thinning of the other sources,
+/// applied before the decode because BRAW is intra-only.
+pub(crate) fn braw_preview_step(fps: f32) -> u32 { if fps > 30.5 { 2 } else { 1 } }
+
 /// Open ONE fisheye segment into a `FisheyePairIter`, at the working
 /// resolution the live preview uses. Shared by the single-file worker and
 /// the multi-segment [`SegmentedFisheyeIter`] opener so both decode a
@@ -1617,6 +1622,7 @@ fn open_fisheye_segment(
     kind: vr180_pipeline::SourceKind,
     swap_eyes: bool,
     fps: f32,
+    braw_reframe: bool,
 ) -> vr180_pipeline::Result<Box<dyn vr180_pipeline::fisheye_decode::FisheyePairIter>> {
     use vr180_pipeline::fisheye_decode::{
         SbsFisheyeIter, DualStreamFisheyeIter, BrawFisheyeIter, max_decode_side_for_fps,
@@ -1635,20 +1641,30 @@ fn open_fisheye_segment(
             Box::new(SbsFisheyeIter::new_with_layout(path, HwDecode::Auto, 0, 8, kind.eye_layout())?),
         vr180_pipeline::SourceKind::BlackmagicRaw => {
             // The SDK decodes at a fraction of the recorded size from a
-            // fraction of the bit stream — pick the coarsest that still
-            // covers the preview's working eye (a 6144-px 12K eye at 50
-            // fps → half; the cap is `max_decode_side_for_fps`).
+            // fraction of the bit stream — pick the coarsest of ITS steps
+            // (`resolution_scales`: 2/3, 1/3, 1/6 on the 12K) that still
+            // covers the preview's working eye (`max_decode_side_for_fps`:
+            // a 12K eye at 60 fps → "eighth" = 1024 px). A reframed view
+            // shows a few tens of degrees of the lens, so it keeps at least
+            // `REFRAME_PREVIEW_MIN_W` of source — "quarter" = 2048 px on the
+            // 12K (the output mode is read at open; switching it respawns).
             let info = vr180_braw::BrawInfo::probe(path)
                 .map_err(|e| Error::Ffmpeg(format!("braw probe: {e}")))?;
             let cap = max_decode_side_for_fps(fps);
-            let scale = vr180_braw::DecodeScale::for_eye_width(info.eye_dims().0, cap);
-            tracing::info!("decoder (fisheye/braw): preview decode scale {:?} (eye {}×{} native, cap {}), SDK pipeline {}{}",
-                scale, info.eye_dims().0, info.eye_dims().1, cap,
+            let want = if braw_reframe { cap.max(REFRAME_PREVIEW_MIN_W) } else { cap };
+            let scale = vr180_braw::DecodeScale::for_eye_width_in(
+                info.resolution_scales.as_ref(), info.is_dual_track(), info.eye_dims().0, want);
+            // Intra-only: a >30 fps clip is thinned at the SOURCE (every
+            // 2nd frame is never decoded) instead of after decode.
+            let step = braw_preview_step(fps);
+            tracing::info!("decoder (fisheye/braw): preview decode scale {:?} (eye {}×{} native, want {} px{}, SDK sizes {:?}), step {}, SDK pipeline {}{}",
+                scale, info.eye_dims().0, info.eye_dims().1, want, if braw_reframe { " for reframe" } else { "" },
+                info.resolution_scales.as_ref().map(|t| [t.half, t.quarter, t.eighth]), step,
                 if info.pipeline.is_empty() { "?" } else { info.pipeline.as_str() },
                 info.gpu_device.as_deref().map(|d| format!(" ({d})")).unwrap_or_default());
             let layout = vr180_pipeline::braw_imu::braw_layout(path, &info);
             Box::new(BrawFisheyeIter::new_with_options(
-                path, &info, 8, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, 0)?)
+                path, &info, 8, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, step, 0)?)
         }
         _ => return Err(Error::Ffmpeg(format!("non-fisheye source: {kind:?}"))),
     })
@@ -1841,13 +1857,16 @@ fn run_fisheye(
     let (pair_tx, pair_rx) =
         crossbeam_channel::bounded::<(u64, vr180_pipeline::fisheye_decode::FisheyePair)>(8);
     let (iter_cmd_tx, iter_cmd_rx) = crossbeam_channel::bounded::<IterCmd>(8);
-    let (dims_tx, dims_rx) = crossbeam_channel::bounded::<(u32, u32)>(1);
+    let (dims_tx, dims_rx) = crossbeam_channel::bounded::<(u32, u32, u32)>(1);
 
     let path_for_worker = cfg.path.clone();
     let segments_for_worker = cfg.segments.clone();
     let kind_for_worker = kind;
     let initial_swap_eyes = control.settings.read().effective_swap_eyes();
     let initial_trim_in = control.settings.read().trim_in_s;
+    // The BRAW decode size follows the output mode at open (reframe keeps
+    // more source); the UI respawns the decoder when that mode changes.
+    let braw_reframe = matches!(control.settings.read().fisheye_output_mode, FisheyeOutputMode::Reframe);
 
     let _decode_handle = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut iter: Box<dyn FisheyePairIter> = if segments_for_worker.len() > 1 {
@@ -1862,17 +1881,17 @@ fn run_fisheye(
                 "decoder (fisheye): {} segments, {:.1}s total — SegmentedFisheyeIter",
                 segments_for_worker.len(), durations.iter().sum::<f64>());
             let opener = Box::new(move |p: &std::path::Path|
-                open_fisheye_segment(p, kind_for_worker, initial_swap_eyes, fps));
+                open_fisheye_segment(p, kind_for_worker, initial_swap_eyes, fps, braw_reframe));
             Box::new(vr180_pipeline::fisheye_decode::SegmentedFisheyeIter::new(
                 &segments_for_worker, &durations, opener)?)
         } else {
-            open_fisheye_segment(&path_for_worker, kind_for_worker, initial_swap_eyes, fps)?
+            open_fisheye_segment(&path_for_worker, kind_for_worker, initial_swap_eyes, fps, braw_reframe)?
         };
         if let Some(t_in) = initial_trim_in {
             if t_in > 0.001 { let _ = iter.seek(t_in); }
         }
         let (sw, sh) = iter.eye_dims();
-        if dims_tx.send((sw, sh)).is_err() { return Ok(()); }
+        if dims_tx.send((sw, sh, iter.source_decimation())).is_err() { return Ok(()); }
 
         let mut gen: u64 = 0;
         loop {
@@ -1918,11 +1937,11 @@ fn run_fisheye(
         Ok(())
     });
 
-    let (src_w, src_h) = match dims_rx.recv() {
+    let (src_w, src_h, source_step) = match dims_rx.recv() {
         Ok(d) => d,
         Err(_) => anyhow::bail!("decode worker failed to start"),
     };
-    tracing::info!("decoder (fisheye): eye dims = {}×{} (pipelined)", src_w, src_h);
+    tracing::info!("decoder (fisheye): eye dims = {}×{} (pipelined), source step {}", src_w, src_h, source_step);
     // Main thread tracks the latest seek generation. Pairs tagged
     // with an older generation are stale (decoded before the latest
     // seek took effect) and silently discarded.
@@ -2056,13 +2075,16 @@ fn run_fisheye(
     // at 50 fps before slipping; 25 fps preview from a 50 fps source
     // ran 60+ s without a single drop. Trades temporal resolution for
     // stable playback. Export uses full source frames separately.
-    let preview_decimation: u32 = if fps > 30.5 { 2 } else { 1 };
-    let preview_fps = fps / preview_decimation as f32;
+    // A source that already steps (BRAW: the helper decodes every 2nd
+    // frame of a >30 fps clip) is not thinned again here.
+    let source_step = source_step.max(1);
+    let preview_decimation: u32 = if source_step > 1 { 1 } else if fps > 30.5 { 2 } else { 1 };
+    let preview_fps = fps / (source_step * preview_decimation) as f32;
     let preview_dt = 1.0_f64 / preview_fps as f64;
-    if preview_decimation > 1 {
+    if preview_decimation > 1 || source_step > 1 {
         tracing::info!(
-            "decoder (fisheye): fps={:.2} → preview decimation {}× → effective {:.2} fps",
-            fps, preview_decimation, preview_fps,
+            "decoder (fisheye): fps={:.2} → preview decimation {}× (source step {}) → effective {:.2} fps",
+            fps, preview_decimation, source_step, preview_fps,
         );
     }
 
@@ -5681,7 +5703,7 @@ fn open_native_iter(
             let layout = vr180_pipeline::braw_imu::braw_layout(path, &info);
             Box::new(BrawFisheyeIter::new_with_options(
                 path, &info, 8, vr180_braw::DecodeScale::Full, vr180_braw::DecodeLook::Film,
-                swap_eyes, layout.mono, 0)?)
+                swap_eyes, layout.mono, 1, 0)?)
         }
         _ => anyhow::bail!("non-fisheye source"),
     })

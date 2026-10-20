@@ -1253,7 +1253,32 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      3035) r 3189 Metal; `braw_layout` decodes with the same pipeline as the
      frames). Time
      to first frame 50–80 ms vs 20 ms (the first Metal run on a machine ~1 s:
-     shader cache). The SMB NAS caps a cold quarter decode at ~72 fps.
+     shader cache). The SMB NAS caps a cold quarter decode at ~72 fps. **Follow-up (same day,
+     user: "RGBA 输出、eighth 和 --step 一起")**: (1) the helper asks the SDK
+     for RGBAU8 / RGBAU16 (header `"format": "rgba"`; an older build's
+     BGRA is still swizzled when `format` is absent) and `BrawFisheyeIter`
+     copies rows (`copy_row`) with a cached black row for the canvas pad —
+     the per-pixel swizzle is gone; (2) the preview picks the decode scale
+     from the clip's ACTUAL step table (`BrawInfo::resolution_scales` ←
+     `--info`'s `resolution_scales`, `DecodeScale::for_eye_width_in`): a
+     12K clip at 50/60 fps now decodes at the SDK's "eighth" = 1024-px eyes
+     (4× fewer pixels than the nominal rule's "quarter"), EXCEPT in the
+     reframed output mode, which wants ≥ `REFRAME_PREVIEW_MIN_W` (1920) of
+     source → "quarter"; the mode is read when the decoder opens, so
+     `draw_fisheye_output_panel` respawns the decoder (current position +
+     play state) when a BRAW clip crosses into/out of Reframe; (3) `--step
+     N` in the helper (every Nth frame from `--start`; "frames" = emitted
+     count) — the preview of a >30 fps BRAW clip asks for step 2
+     (`braw_preview_step`) instead of decoding every frame and dropping
+     half; `FisheyePairIter::source_decimation()` (default 1; Segmented /
+     Denoising forward it) tells the loop not to thin such a source again,
+     `pts_s` stays the true frame time so the stab index is unchanged.
+     Export and stills keep step 1. Measured through the iterator (cached
+     frames, Metal / CPU): quarter 145 / 119 fps, eighth 437 / 359, half
+     51 / 38, 16-bit quarter 99, full 12K 8-bit 26 (the pipe's ~4–8 GB/s
+     is the ceiling now, not the Rust side); the camera-locked export is
+     byte-identical to the BGRA-path run. A 60p clip's preview now decodes
+     30 fps of 1024-px eyes (or 2048-px in Reframe).
      **Preview perf picture (same day)**: decode wait in the GUI log is ~0
      until the worker falls behind; the CPU helper's speed swung 105 → 15
      fps at the same frames with the laptop at 7 % battery + screen sharing

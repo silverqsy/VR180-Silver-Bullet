@@ -107,6 +107,21 @@ pub struct BrawInfo {
     /// The Metal device's name when `pipeline` is "metal".
     #[serde(default)]
     pub gpu_device: Option<String>,
+    /// The processed frame size at each `--scale`, as the SDK reports it
+    /// for this clip (`null` from the helper when unavailable).
+    #[serde(default)]
+    pub resolution_scales: Option<ResolutionScales>,
+}
+
+/// Processed `[width, height]` of a frame (one track) at each decode
+/// scale — the SDK's own steps, which on the 12K PYXIS are 2/3, 1/3 and
+/// 1/6 rather than 1/2, 1/4, 1/8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct ResolutionScales {
+    pub full: [u32; 2],
+    pub half: [u32; 2],
+    pub quarter: [u32; 2],
+    pub eighth: [u32; 2],
 }
 
 fn default_one() -> u32 { 1 }
@@ -190,3 +205,33 @@ impl BrawInfo {
         (canvas_h as i32 - raw_h as i32) / 2
     }
 }
+
+#[cfg(test)]
+mod info_tests {
+    use super::*;
+
+    #[test]
+    fn parses_pipeline_and_scale_table() {
+        let j = r#"{"width": 12288, "height": 5112, "frame_count": 2894, "frame_rate": 60.0, "duration": 48.2333,
+            "pipeline": "metal", "gpu_device": "Apple M5 Max",
+            "resolution_scales": {"full": [12288, 5112], "half": [8192, 3408], "quarter": [4096, 1704], "eighth": [2048, 852]}}"#;
+        let info: BrawInfo = serde_json::from_str(j).expect("parse");
+        assert_eq!(info.pipeline, "metal");
+        assert_eq!(info.gpu_device.as_deref(), Some("Apple M5 Max"));
+        let t = info.resolution_scales.expect("table");
+        assert_eq!(t.eighth, [2048, 852]);
+        // The SDK's steps, not the nominal ones: "eighth" is a 1024-px eye.
+        assert_eq!(crate::DecodeScale::for_eye_width_in(Some(&t), false, 6144, 896), crate::DecodeScale::Eighth);
+        assert_eq!(crate::DecodeScale::for_eye_width_in(Some(&t), false, 6144, 1920), crate::DecodeScale::Quarter);
+        assert_eq!(crate::DecodeScale::for_eye_width_in(Some(&t), false, 6144, 3000), crate::DecodeScale::Half);
+        assert_eq!(crate::DecodeScale::for_eye_width_in(Some(&t), false, 6144, 5000), crate::DecodeScale::Full);
+        // Nominal rule without a table: 6144/8 = 768 < 896 → quarter.
+        assert_eq!(crate::DecodeScale::for_eye_width_in(None, false, 6144, 896), crate::DecodeScale::Quarter);
+        // A null table and an older helper without the fields.
+        let j2 = r#"{"width": 8160, "height": 7200, "frame_count": 10, "frame_rate": 60.0, "duration": 0.1667, "resolution_scales": null}"#;
+        let info2: BrawInfo = serde_json::from_str(j2).expect("parse");
+        assert!(info2.resolution_scales.is_none());
+        assert!(info2.pipeline.is_empty());
+    }
+}
+

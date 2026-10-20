@@ -6363,6 +6363,7 @@ impl App {
                 | Some(vr180_pipeline::SourceKind::KandaoDng)
                 | Some(vr180_pipeline::SourceKind::BlackmagicRaw)
         );
+        let mode_before = self.settings.fisheye_output_mode;
         let s = &mut self.settings;
 
         ui.horizontal(|ui| {
@@ -6428,6 +6429,23 @@ impl App {
             // 180° output rotation + implicit eye swap (flipping the rig
             // mirrors the eye positions). Toggling reloads the clip.
             ui.checkbox(&mut s.camera_upside_down, tr("Upside-down mount (180°)"));
+        }
+
+        // A BRAW preview decodes at a size chosen for the output mode when
+        // the decoder opens (a reframed view keeps more source): crossing
+        // into or out of the reframed view respawns the decoder, at the
+        // current position and play state.
+        let mode_after = self.settings.fisheye_output_mode;
+        let is_braw = matches!(self.clip.as_ref().map(|c| c.source_kind),
+            Some(vr180_pipeline::SourceKind::BlackmagicRaw));
+        let reframe = |m: crate::decoder::FisheyeOutputMode| matches!(m, crate::decoder::FisheyeOutputMode::Reframe);
+        if is_braw && self.decoder_alive && reframe(mode_before) != reframe(mode_after) {
+            let cur = self.current_display.as_ref().map(|d| d.timestamp_s).unwrap_or(0.0);
+            let was_playing = self.playing;
+            tracing::info!("BRAW output mode {} → {}: respawning the decoder for the matching decode size at {:.2} s",
+                mode_before.as_str(), mode_after.as_str(), cur);
+            self.spawn_decoder(!was_playing);
+            self.seek_to(cur);
         }
     }
 

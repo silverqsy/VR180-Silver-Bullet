@@ -177,7 +177,8 @@ pub fn detect_braw_layout(path: &std::path::Path, info: &vr180_braw::BrawInfo) -
     let (fw, _) = info.raw_frame_dims();
     let scale = fw as f32 / h.width.max(1) as f32;
     let bpp = h.bytes_per_pixel();
-    // BGRA in, but the detector only takes max(R, G, B) — order-free. The
+    // RGBA in (BGRA from an older helper), but the detector only takes
+    // max(R, G, B) — order-free. The
     // frame is as recorded; the circles are reported on the CANVAS (the
     // pad / crop shifts rows by `canvas_pad_rows`, columns stay).
     let pad = info.canvas_pad_rows() as f32;

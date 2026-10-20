@@ -28,7 +28,8 @@
 //! ### `--decode <file> [--start N] [--count M] [--track T] [--16bit]`
 //! - JSON header on **stderr** (one line, includes `dual_stream`,
 //!   `bit_depth`, and per-track sizes if multi-video).
-//! - Raw BGRA pixel data on **stdout**. 4 bytes/pixel at 8-bit, 8
+//! - Raw RGBA pixel data on **stdout** (BGRA from older helper builds;
+//!   the header's `format` tells). 4 bytes/pixel at 8-bit, 8
 //!   bytes/pixel at 16-bit. Multi-track (no `--track`) writes
 //!   side-by-side at `max(h0, h1)` height with zero-padding.
 //!

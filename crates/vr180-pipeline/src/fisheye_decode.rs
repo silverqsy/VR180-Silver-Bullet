@@ -234,6 +234,12 @@ pub trait FisheyePairIter {
     /// Eye dimensions (one fisheye, not the SBS-composed frame).
     fn eye_dims(&self) -> (u32, u32);
 
+    /// Frames the SOURCE skips between the pairs it emits (1 = every
+    /// frame). A BRAW preview asks the helper for every 2nd frame of a
+    /// >30 fps clip; a consumer that thins frames itself must not thin
+    /// such a source again. `pts_s` always carries the true frame time.
+    fn source_decimation(&self) -> u32 { 1 }
+
     /// Decode-forward to the first frame at/after `target_pts_s` (within half
     /// a frame `dt`), returning ONLY that frame. Call after `seek`.
     ///
@@ -341,6 +347,7 @@ impl FisheyePairIter for SegmentedFisheyeIter {
     }
 
     fn eye_dims(&self) -> (u32, u32) { self.cur.eye_dims() }
+    fn source_decimation(&self) -> u32 { self.cur.source_decimation() }
 }
 
 // ── SBS fisheye (single ffmpeg stream, split horizontally) ─────────
@@ -3798,6 +3805,11 @@ fn extract_packed_rgba_n(frame: &ffmpeg_next::frame::Video, bytes_per_pixel: usi
 /// per-row rolling-shutter table — speaks that canvas. A `mono` clip (one
 /// fisheye circle, `BrawLayout`) is one eye shown to both, as recorded.
 /// `swap_eyes` exchanges the halves, like the dual-stream iterators.
+/// `step` > 1 asks the helper for every `step`-th frame (BRAW is intra-
+/// only, so the skipped frames are never decoded; `pts_s` stays the true
+/// frame time and [`FisheyePairIter::source_decimation`] reports it).
+/// The current helper emits RGBA / RGBA64LE straight from the SDK, copied
+/// row by row; an older build's BGRA is swizzled (`format` absent).
 /// Seeking restarts the helper at the target frame (`--start`), lazily on
 /// the next pull.
 pub struct BrawFisheyeIter {
@@ -3818,6 +3830,12 @@ pub struct BrawFisheyeIter {
     frame_idx: u64,
     frame_count: u64,
     frame_limit: u32,
+    /// Frames between emitted pairs (the helper's `--step`).
+    step: u64,
+    /// The helper emits RGBA (current builds) rather than BGRA (older).
+    rgba: bool,
+    /// One opaque black eye row at the decode size, for the canvas pad.
+    black_row: Vec<u8>,
 }
 
 impl std::fmt::Debug for BrawFisheyeIter {
@@ -3846,14 +3864,17 @@ impl BrawFisheyeIter {
         look: vr180_braw::DecodeLook,
         swap_eyes: bool,
         mono: bool,
+        step: u32,
         frame_limit: u32,
     ) -> Result<Self> {
         // `VR180_BRAW_PIPELINE=cpu|metal|auto` forces the helper's decode
         // pipeline for A/B tests; unset = the helper's default (Metal when
         // the SDK offers a device, else the CPU).
+        let step = step.max(1);
         let opts = vr180_braw::decoder::DecodeOptions {
             bit_16: bit_depth >= 10, scale, look,
             pipeline: std::env::var("VR180_BRAW_PIPELINE").ok().filter(|p| !p.is_empty()),
+            step: (step > 1).then_some(step),
             ..Default::default()
         };
         // Nominal until the helper's header arrives: the canvas for a stereo
@@ -3865,6 +3886,7 @@ impl BrawFisheyeIter {
             path: path.to_path_buf(), opts, swap_eyes, mono, decoder: None, frame_buf: Vec::new(),
             eye_w: if mono { fw / d } else { (fw / d) / 2 }, eye_h: fh / d, bit_depth: if bit_depth >= 10 { 16 } else { 8 },
             dt_s, frame_idx: 0, frame_count: info.frame_count, frame_limit,
+            step: step as u64, rgba: false, black_row: Vec::new(),
         };
         // Start now so an unopenable file fails here, not on the first pull,
         // and so the eye size comes from the helper's processed dimensions.
@@ -3886,6 +3908,8 @@ impl BrawFisheyeIter {
         // canvas, or the whole frame as recorded for a mono clip.
         self.eye_w = if self.mono { h.width } else { h.width / 2 };
         self.eye_h = if self.mono { h.height } else { self.eye_w };
+        self.rgba = h.format.as_deref() == Some("rgba");
+        self.black_row = black_row(self.eye_w as usize, h.bytes_per_pixel());
         self.frame_idx = frame;
         self.decoder = Some(dec);
         Ok(())
@@ -3911,7 +3935,7 @@ impl FisheyePairIter for BrawFisheyeIter {
             return Ok(None);
         }
         let pts_s = self.frame_idx as f64 * self.dt_s;
-        self.frame_idx += 1;
+        self.frame_idx += self.step;
 
         let header = self.decoder.as_ref().unwrap().header();
         let bpp = header.bytes_per_pixel(); // 4 or 8 (BGRA8 / BGRA16)
@@ -3919,12 +3943,13 @@ impl FisheyePairIter for BrawFisheyeIter {
         let frame_h = header.height as usize;
         let eye_w = self.eye_w as usize;
         let eye_h = self.eye_h as usize;
+        let rgba = self.rgba;
         let mut left = Vec::with_capacity(eye_w * eye_h * bpp);
         let mut right = Vec::with_capacity(eye_w * eye_h * bpp);
         if self.mono {
             for y in 0..frame_h {
                 let row = y * frame_w * bpp;
-                bgra_to_rgba_row(&self.frame_buf[row..row + frame_w * bpp], bpp, &mut left);
+                copy_row(&self.frame_buf[row..row + frame_w * bpp], bpp, rgba, &mut left);
             }
             right = left.clone();
         } else {
@@ -3934,14 +3959,14 @@ impl FisheyePairIter for BrawFisheyeIter {
             for y_out in 0..eye_h {
                 let y_src = y_out as i64 - pad as i64;
                 if y_src < 0 || y_src >= frame_h as i64 {
-                    push_black_row(eye_w, bpp, &mut left);
-                    push_black_row(eye_w, bpp, &mut right);
+                    left.extend_from_slice(&self.black_row);
+                    right.extend_from_slice(&self.black_row);
                     continue;
                 }
                 let row = y_src as usize * frame_w * bpp;
-                bgra_to_rgba_row(&self.frame_buf[row..row + eye_w * bpp], bpp, &mut left);
+                copy_row(&self.frame_buf[row..row + eye_w * bpp], bpp, rgba, &mut left);
                 let r0 = row + eye_w * bpp;
-                bgra_to_rgba_row(&self.frame_buf[r0..r0 + eye_w * bpp], bpp, &mut right);
+                copy_row(&self.frame_buf[r0..r0 + eye_w * bpp], bpp, rgba, &mut right);
             }
             if self.swap_eyes { std::mem::swap(&mut left, &mut right); }
         }
@@ -3966,6 +3991,8 @@ impl FisheyePairIter for BrawFisheyeIter {
     fn eye_dims(&self) -> (u32, u32) {
         (self.eye_w, self.eye_h)
     }
+
+    fn source_decimation(&self) -> u32 { self.step as u32 }
 }
 
 /// Rows the square canvas adds above (and below) a recorded eye of
@@ -3977,13 +4004,21 @@ pub fn canvas_pad_rows(raw_h: usize, canvas_h: usize) -> i32 {
 }
 
 /// One opaque black row of `w` pixels at `bpp` bytes per pixel (RGBA8 /
-/// RGBA64LE), for the canvas padding.
-fn push_black_row(w: usize, bpp: usize, dst: &mut Vec<u8>) {
-    match bpp {
-        4 => for _ in 0..w { dst.extend_from_slice(&[0, 0, 0, 255]); },
-        8 => for _ in 0..w { dst.extend_from_slice(&[0, 0, 0, 0, 0, 0, 255, 255]); },
-        _ => tracing::error!("unexpected BRAW bpp={bpp}"),
-    }
+/// RGBA64LE), built once per stream for the canvas padding.
+fn black_row(w: usize, bpp: usize) -> Vec<u8> {
+    let px: &[u8] = match bpp {
+        4 => &[0, 0, 0, 255],
+        8 => &[0, 0, 0, 0, 0, 0, 255, 255],
+        _ => { tracing::error!("unexpected BRAW bpp={bpp}"); return vec![0; w * bpp]; }
+    };
+    px.repeat(w)
+}
+
+/// Append one eye row from the helper's frame: a straight copy when the
+/// helper emits RGBA (current builds), a swizzle for an older BGRA build.
+#[inline]
+fn copy_row(src: &[u8], bpp: usize, rgba: bool, dst: &mut Vec<u8>) {
+    if rgba { dst.extend_from_slice(src); } else { bgra_to_rgba_row(src, bpp, dst); }
 }
 
 /// Copy one row of BGRA (8- or 16-bit) into an RGBA accumulator of the SAME
@@ -4138,6 +4173,7 @@ impl FisheyePairIter for DenoisingFisheyeIter {
     fn eye_dims(&self) -> (u32, u32) {
         (self.eye_w, self.eye_h)
     }
+    fn source_decimation(&self) -> u32 { self.inner.source_decimation() }
 }
 
 /// Suppress "unused" warnings on the public symbol — every consumer
@@ -4320,11 +4356,12 @@ mod tests {
         assert_eq!(canvas_pad_rows(6480, 6144), -168);
         // URSA 8160×7200 tracks → 8160²: 480 padded.
         assert_eq!(canvas_pad_rows(7200, 8160), 480);
+        assert_eq!(black_row(2, 4), vec![0, 0, 0, 255, 0, 0, 0, 255]);
+        assert_eq!(black_row(1, 8), vec![0, 0, 0, 0, 0, 0, 255, 255]);
         let mut row = Vec::new();
-        push_black_row(2, 4, &mut row);
-        assert_eq!(row, vec![0, 0, 0, 255, 0, 0, 0, 255]);
-        push_black_row(1, 8, &mut row);
-        assert_eq!(&row[8..], &[0, 0, 0, 0, 0, 0, 255, 255]);
+        copy_row(&[1, 2, 3, 4], 4, true, &mut row);
+        copy_row(&[1, 2, 3, 4], 4, false, &mut row);
+        assert_eq!(row, vec![1, 2, 3, 4, 3, 2, 1, 4]);
     }
 
     #[test]
