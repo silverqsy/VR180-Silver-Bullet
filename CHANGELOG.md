@@ -47,6 +47,13 @@ frame.
   reframed view keeps 2048), and a >30 fps clip is thinned before the
   decode rather than after it — the camera's files are intra-only, so the
   skipped frames cost nothing.
+- **Smoother preview on macOS, all cameras.** The window now redraws when
+  the decoder hands it a frame instead of on a fast timer. The timer was
+  making the UI wait for the display most of the time, which on Metal
+  blocks the decoder's own GPU work for a whole refresh per step — the
+  "render-bound" frame skips during playback. The BRAW audio track now
+  plays (its resampler rejected every frame before), and the zoom still no
+  longer decodes extra full-size frames in the background.
 - Requires the Blackmagic RAW SDK (macOS) for the helper; the helper now
   builds against SDK 6.0.
 

@@ -1279,6 +1279,30 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      is the ceiling now, not the Rust side); the camera-locked export is
      byte-identical to the BGRA-path run. A 60p clip's preview now decodes
      30 fps of 1024-px eyes (or 2048-px in Reframe).
+     **Live test of that build (2026-10-20)** showed the decode wait at
+     0–80 µs but playback STILL render-bound: after ~0.5 s of play every
+     frame's `project` took ≈ 33 ms and `compose` ≈ 17 ms — exact multiples
+     of the 60 Hz refresh. Cause, confirmed in wgpu-core 29 (`present.rs`
+     165: `device.fence.read()` held across `acquire_texture`; `queue.rs`
+     1202: `queue_submit` takes `fence.write()`; wgpu-hal Metal `acquire_
+     texture` blocks in `nextDrawable`): a UI thread that repaints FASTER
+     than the display waits in `get_current_texture` almost permanently
+     while holding the fence read-lock, so every `queue.submit` from the
+     worker stalls until the next vsync — the old 8 ms (125 Hz) repaint
+     timer while playing did exactly that (and it predates BRAW: the OSV
+     path's project/compose spread was the same). Fix: `DecoderControl::
+     ui_ctx` + `wake_ui()` — every preview loop calls it right after a
+     successful `frame_tx.try_send`, so the window repaints once per
+     delivered frame; `App::update`'s timer is now a 100 ms fallback while
+     playing (50 ms paused). Mouse-driven repaints can still collide for a
+     moment; merging the per-frame submits (project L + R + compose → one
+     encoder) is the remaining lever if dragging ever shows it. Two other
+     fixes from the same session: the audio player's resampler rejected
+     every BRAW frame ("Input changed", the PCM track's EMPTY channel-
+     layout mask; pre-existing — `normalized_layout` is now pub and the
+     player stamps its frames), and the zoom-still path's full-size helper
+     no longer decodes and holds the next 12K frames (`BrawFisheyeIter::
+     with_count(1)`; EOF drops the helper so a later seek/pull restarts).
      **Preview perf picture (same day)**: decode wait in the GUI log is ~0
      until the worker falls behind; the CPU helper's speed swung 105 → 15
      fps at the same frames with the laptop at 7 % battery + screen sharing

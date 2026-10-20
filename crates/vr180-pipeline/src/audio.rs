@@ -620,7 +620,12 @@ fn ambisonic_layout(channels: i32) -> ffmpeg::ChannelLayout {
 /// A stream's channel layout with an EMPTY mask (a WAV says "2 channels"
 /// and nothing else) made swresample refuse every decoded frame ("Input
 /// changed"): use the default layout for that channel count instead.
-fn normalized_layout(l: ffmpeg::ChannelLayout) -> ffmpeg::ChannelLayout {
+/// A decoder's layout with an EMPTY mask ("2 channels", as a WAV or the
+/// PCM track of a Blackmagic RAW clip reports) replaced by the default
+/// layout for that channel count — swresample rejects every frame that
+/// carries the empty layout with "Input changed". Frames must be stamped
+/// with the same layout before they go through a resampler.
+pub fn normalized_layout(l: ffmpeg::ChannelLayout) -> ffmpeg::ChannelLayout {
     if l.is_empty() && l.channels() > 0 { ffmpeg::ChannelLayout::default(l.channels() as i32) } else { l }
 }
 

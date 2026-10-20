@@ -3894,6 +3894,18 @@ impl BrawFisheyeIter {
         Ok(it)
     }
 
+    /// Ask the helper for at most `n` frames per start: a still / zoom
+    /// consumer that seeks and takes one frame should not leave the helper
+    /// decoding (and holding) the next frames of a 12K clip in flight. The
+    /// helper ends after `n`; the next pull or seek restarts it at the
+    /// wanted frame.
+    pub fn with_count(mut self, n: u32) -> Self {
+        self.opts.count = Some(n.max(1) as u64);
+        // Restart so the already-running helper honours the limit too.
+        self.decoder = None;
+        self
+    }
+
     fn start_at(&mut self, frame: u64) -> Result<()> {
         self.decoder = None;
         let mut opts = self.opts.clone();
@@ -3932,6 +3944,9 @@ impl FisheyePairIter for BrawFisheyeIter {
             .next_frame(&mut self.frame_buf)
             .map_err(|e| Error::Ffmpeg(format!("braw next_frame: {e}")))?;
         if !got {
+            // The helper is done (end of clip, or its `--count`): a later
+            // pull or seek starts a fresh one at `frame_idx`.
+            self.decoder = None;
             return Ok(None);
         }
         let pts_s = self.frame_idx as f64 * self.dt_s;

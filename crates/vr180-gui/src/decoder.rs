@@ -969,9 +969,27 @@ pub enum DecoderCommand {
 ///   decoder caches the generation it last computed for; if the
 ///   counter has moved, it rebuilds the per-eye bundle on the spot
 ///   (~ few hundred ms for a full-length clip) and keeps going.
+impl DecoderControl {
+    /// Repaint the UI now: called by the worker right after it hands a
+    /// frame over, so the window redraws once per delivered frame instead
+    /// of on a fast timer. The timer matters: on Metal, wgpu holds the
+    /// device fence read-lock while `get_current_texture` waits in
+    /// `nextDrawable` for a free drawable (vsync), and every
+    /// `queue.submit` from a worker needs the write-lock — a UI that
+    /// repaints faster than the display waits there almost always, and
+    /// each of the worker's submits then costs a whole refresh (project =
+    /// two submits ≈ 33 ms, compose ≈ 17 ms, at 60 Hz: the "render-bound"
+    /// skips). Repainting on delivery keeps the UI out of that wait.
+    pub fn wake_ui(&self) {
+        if let Some(c) = &self.ui_ctx { c.request_repaint(); }
+    }
+}
+
 #[derive(Default)]
 pub struct DecoderControl {
     pub paused: AtomicBool,
+    /// The UI's egui context, for [`Self::wake_ui`] (`None` headless).
+    pub ui_ctx: Option<egui::Context>,
     pub settings: RwLock<Settings>,
     pub settings_generation: AtomicU64,
     /// Per-eye in-file calibration the decoder resolved from the source
@@ -2597,7 +2615,7 @@ fn run_fisheye(
             timestamp_s: absolute_frame_idx as f64 * dt,
         };
         match frame_tx.try_send(out) {
-            Ok(()) => {}
+            Ok(()) => control.wake_ui(),
             Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => return Ok(()),
         }
@@ -3172,7 +3190,7 @@ fn run_fisheye_zerocopy(
             timestamp_s: absolute_frame_idx as f64 * dt,
         };
         match frame_tx.try_send(out) {
-            Ok(()) => {}
+            Ok(()) => control.wake_ui(),
             Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => return Ok(()),
         }
@@ -3653,7 +3671,7 @@ fn run_fisheye_vt_zerocopy(
             timestamp_s: absolute_frame_idx as f64 * dt,
         };
         match frame_tx.try_send(out) {
-            Ok(()) => {}
+            Ok(()) => control.wake_ui(),
             Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => return Ok(()),
         }
@@ -4716,6 +4734,7 @@ fn run_zero_copy(
         };
         match frame_tx.try_send(out) {
             Ok(()) => {
+                control.wake_ui();
                 rendered_count += 1;
                 if rendered_count == 1 {
                     tracing::info!("decoder (zc): first frame rendered + sent");
@@ -5014,7 +5033,7 @@ fn run_eac_zerocopy(
             timestamp_s: frame_t_abs,
         };
         match frame_tx.try_send(out) {
-            Ok(()) => {}
+            Ok(()) => control.wake_ui(),
             Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => return Ok(()),
         }
@@ -5268,7 +5287,7 @@ fn run_cpu_assemble(
             timestamp_s: frame_t_abs,
         };
         match frame_tx.try_send(out) {
-            Ok(()) => {}
+            Ok(()) => control.wake_ui(),
             Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => return Ok(()),
         }
@@ -5701,9 +5720,12 @@ fn open_native_iter(
             let info = vr180_braw::BrawInfo::probe(path)
                 .map_err(|e| anyhow::anyhow!("braw probe: {e}"))?;
             let layout = vr180_pipeline::braw_imu::braw_layout(path, &info);
+            // One native frame per request (the detail loop seeks, then
+            // takes the frame at the target): the helper must not decode
+            // and hold the following 12K frames.
             Box::new(BrawFisheyeIter::new_with_options(
                 path, &info, 8, vr180_braw::DecodeScale::Full, vr180_braw::DecodeLook::Film,
-                swap_eyes, layout.mono, 1, 0)?)
+                swap_eyes, layout.mono, 1, 0)?.with_count(1))
         }
         _ => anyhow::bail!("non-fisheye source"),
     })

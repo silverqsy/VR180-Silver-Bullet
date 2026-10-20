@@ -36,6 +36,9 @@ enum DialogResult {
 }
 
 pub struct App {
+    /// The UI context, handed to decoder workers so they can repaint the
+    /// window when a frame lands (`DecoderControl::wake_ui`).
+    egui_ctx: egui::Context,
     /// Shared with the decoder worker. Built on eframe's wgpu device.
     pipeline: Arc<vr180_pipeline::gpu::Device>,
     /// Handle to the egui_wgpu renderer — we use it to register
@@ -1227,6 +1230,7 @@ impl App {
         let (dialog_tx, dialog_rx) = crossbeam_channel::unbounded();
 
         Self {
+            egui_ctx: cc.egui_ctx.clone(),
             pipeline,
             egui_renderer: wgpu_state.renderer.clone(),
             preview_view_format,
@@ -3527,6 +3531,7 @@ impl App {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let control = Arc::new(DecoderControl {
             paused: std::sync::atomic::AtomicBool::new(start_paused),
+            ui_ctx: Some(self.egui_ctx.clone()),
             settings: parking_lot::RwLock::new(self.settings.clone()),
             settings_generation: std::sync::atomic::AtomicU64::new(0),
             detected_calib: parking_lot::Mutex::new(None),
@@ -5094,12 +5099,17 @@ impl eframe::App for App {
         self.persist_settings(ctx);
 
         // Keep the UI awake whenever a decoder is running so the next
-        // frame draws without waiting for a user input event.
-        // - playing: 125 Hz, matches the source frame budget
+        // frame draws without waiting for a user input event. The worker
+        // repaints the window itself when it hands a frame over
+        // (`DecoderControl::wake_ui`), so this is only a fallback — and it
+        // must stay BELOW the display rate: a UI that repaints faster than
+        // vsync waits in `nextDrawable` holding wgpu's fence lock, and
+        // every worker `queue.submit` then stalls for a whole refresh.
+        // - playing: 10 Hz fallback (frames arrive at the preview rate)
         // - paused but alive: 20 Hz, enough to display slider-driven
         //   re-renders the decoder thread pushes into frame_rx.
         if self.decoder_alive {
-            let delay_ms = if self.playing { 8 } else { 50 };
+            let delay_ms = if self.playing { 100 } else { 50 };
             ctx.request_repaint_after(std::time::Duration::from_millis(delay_ms));
         }
     }

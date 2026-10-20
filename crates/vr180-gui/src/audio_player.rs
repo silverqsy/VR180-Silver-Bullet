@@ -259,7 +259,10 @@ fn decoder_worker(
 
     let src_rate = decoder.rate();
     let src_format = decoder.format();
-    let src_ch_layout = decoder.channel_layout();
+    // An empty layout mask (a BRAW clip's PCM track: "2 channels", mask 0)
+    // makes swresample reject every frame with "Input changed" — use the
+    // default layout for the count, and stamp the frames with it below.
+    let src_ch_layout = vr180_pipeline::audio::normalized_layout(decoder.channel_layout());
     tracing::info!(
         "audio_player worker: decoder ready — src {} Hz, fmt {:?}, layout {:?}",
         src_rate, src_format, src_ch_layout
@@ -373,6 +376,7 @@ fn decoder_worker(
         // push samples into the shared buffer.
         let mut frame = ffmpeg::frame::Audio::empty();
         while decoder.receive_frame(&mut frame).is_ok() {
+            if frame.channel_layout().is_empty() { frame.set_channel_layout(src_ch_layout); }
             let mut out_frame = ffmpeg::frame::Audio::empty();
             if let Err(e) = resampler.run(&frame, &mut out_frame) {
                 tracing::warn!("audio_player worker: resample: {e}");
