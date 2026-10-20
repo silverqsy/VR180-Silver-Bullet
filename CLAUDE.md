@@ -1218,6 +1218,55 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      33³, stored B,G,R → written R,G,B; matches Resolve's shipped cube to
      5e-7). Decode: 12K 8-bit ~25 fps CPU (16-bit the same), the pipe +
      CPU swizzle make the export ~5.5 fps at full size.
+     **GPU decode (2026-10-20, user: "用 GPU 解 BRAW")**: `--pipeline
+     auto|metal|cpu` (default `auto` = the first Metal device from
+     `IBlackmagicRawPipelineDeviceIterator` + `IBlackmagicRawConfiguration::
+     SetFromDevice` before OpenClip; pure C++, no ObjC, no extra frameworks;
+     `metal` fails instead of falling back). The processed image is then a
+     MTLBuffer, read back INSIDE ProcessComplete (the only time the SDK
+     guarantees it) through `IBlackmagicRawResourceManager` (from
+     `IBlackmagicRawConfigurationEx::GetResourceManager`): the host pointer
+     when the buffer is CPU-visible (the PYXIS clips: unified memory), else
+     `CopyResource` of the WHOLE resource — a partial copy is E_INVALIDARG
+     (0x80000003), which is how the URSA Cine Immersive's padded 26,116,096-
+     byte track resources first failed; `BRAW_HELPER_READBACK=copy` forces
+     the copy (A/B: identical bytes). The decode loop is now pipelined for
+     both pipelines: read jobs carry a ticket (frame index, or index·2 +
+     track) as user data, up to 3 frames in flight (≤ ~1.5 GB of frames),
+     completions post by ticket (the SDK finishes in any order), buffers
+     recycled; the CPU-pipeline output is byte-identical to the old helper.
+     Header + `--info` gain `"pipeline"` / `"gpu_device"` ("Apple M5 Max");
+     `DecodeOptions.pipeline`, `VR180_BRAW_PIPELINE=cpu|metal` for A/B, the
+     GUI logs it in the "preview decode scale" line. **Measured (M5 Max,
+     frames in the page cache)**: helper alone, quarter (2048-px eyes) 350–
+     375 fps Metal vs 211 CPU (38 vs 81 ms CPU time per frame), half 63 vs
+     62 fps wall but 80 vs 270 ms CPU, full 12K ~62 vs 35 fps; through the
+     Rust iterator (pipe + BGRA→RGBA swizzle + canvas): quarter 136 vs 111
+     fps, eighth 478 vs 362, half 36 vs 32, 16-bit quarter 95 vs 80 — the
+     per-pixel swizzle is now the limiter (next step: ask the SDK for
+     RGBAU8/U16 and memcpy). Metal pixels ≠ CPU pixels: 8-bit mean |Δ| 0.6–
+     0.8 codes, max 13, a −0.54-code bias (Metal darker), no geometric shift
+     (shifting by 1 px triples the difference), larger in the shadows; 16-bit
+     mean 123/65535; a camera-locked export differs by the same hair (C006
+     34–36 s lock residual 1.141 vs 1.136 px), and the rim-circle seed moves
+     a few px with the pipeline (C006 left (2942, 3040) r 3202 CPU → (2947,
+     3035) r 3189 Metal; `braw_layout` decodes with the same pipeline as the
+     frames). Time
+     to first frame 50–80 ms vs 20 ms (the first Metal run on a machine ~1 s:
+     shader cache). The SMB NAS caps a cold quarter decode at ~72 fps.
+     **Preview perf picture (same day)**: decode wait in the GUI log is ~0
+     until the worker falls behind; the CPU helper's speed swung 105 → 15
+     fps at the same frames with the laptop at 7 % battery + screen sharing
+     (3.3× CPU time per frame), which is what the user saw as "卡"; the
+     structural costs are the decode scale (`for_eye_width` uses NOMINAL
+     divisors, so a 60p 12K clip gets quarter = 2048 px where the SDK's real
+     eighth = 1024 px would meet the 896-px cap: 4× the pixels), decimation
+     AFTER decode (BRAW is intra-only: a `--step` would halve the work), the
+     swizzle (8–17 ms/frame at 2048²), per-frame output-texture allocation +
+     32 MB upload on the GPU path (project 7–24 ms + compose 0.3–20 ms per
+     frame at 2048²); the 2:1 canvas pad is < 1 ms/frame and +20 % upload
+     on C006 only. Open: eighth via `resolution_scales`, `--step`, RGBA out,
+     cached output textures.
    - **File facts**: gyro+accel 1022 Hz, rad/s and m/s², NO timestamps
      (sample 0 = frame 0 start, rate is the clock); no lens metadata at all
      (`lens_type` etc. empty, distortion arrays zero); shutter is AUTO and

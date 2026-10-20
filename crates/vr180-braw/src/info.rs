@@ -99,10 +99,14 @@ pub struct BrawInfo {
     /// Video"); empty if none. Dump it with [`crate::lut::extract_embedded_lut`].
     #[serde(default)]
     pub embedded_lut: String,
-    /// The SDK pipeline the helper decodes with ("cpu", "metal", …), when
-    /// the helper reports it.
+    /// The pipeline `--decode` takes by default: "metal" when the SDK
+    /// offers a Metal device on this machine, else "cpu" (empty from an
+    /// older helper).
     #[serde(default)]
     pub pipeline: String,
+    /// The Metal device's name when `pipeline` is "metal".
+    #[serde(default)]
+    pub gpu_device: Option<String>,
 }
 
 fn default_one() -> u32 { 1 }

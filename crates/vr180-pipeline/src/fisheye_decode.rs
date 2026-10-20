@@ -3848,8 +3848,13 @@ impl BrawFisheyeIter {
         mono: bool,
         frame_limit: u32,
     ) -> Result<Self> {
+        // `VR180_BRAW_PIPELINE=cpu|metal|auto` forces the helper's decode
+        // pipeline for A/B tests; unset = the helper's default (Metal when
+        // the SDK offers a device, else the CPU).
         let opts = vr180_braw::decoder::DecodeOptions {
-            bit_16: bit_depth >= 10, scale, look, ..Default::default()
+            bit_16: bit_depth >= 10, scale, look,
+            pipeline: std::env::var("VR180_BRAW_PIPELINE").ok().filter(|p| !p.is_empty()),
+            ..Default::default()
         };
         // Nominal until the helper's header arrives: the canvas for a stereo
         // pair, the recorded frame for a mono clip.

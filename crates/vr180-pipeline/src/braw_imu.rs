@@ -156,7 +156,13 @@ impl BrawLayout {
 /// side by side with no seed (the VR180 default).
 pub fn detect_braw_layout(path: &std::path::Path, info: &vr180_braw::BrawInfo) -> BrawLayout {
     let opts = vr180_braw::decoder::DecodeOptions {
-        scale: vr180_braw::DecodeScale::Quarter, count: Some(1), ..Default::default()
+        scale: vr180_braw::DecodeScale::Quarter, count: Some(1),
+        // Same pipeline as the frames (`VR180_BRAW_PIPELINE` A/B): the Metal
+        // and CPU pipelines differ by a hair in the shadows, which moves the
+        // rim fit by a few px (C006: (2942, 3040) r 3202 CPU vs (2947, 3035)
+        // r 3189 Metal, canvas px).
+        pipeline: std::env::var("VR180_BRAW_PIPELINE").ok().filter(|p| !p.is_empty()),
+        ..Default::default()
     };
     let mut dec = match vr180_braw::BrawDecoder::start(path, &opts) {
         Ok(d) => d,

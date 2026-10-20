@@ -42,6 +42,12 @@ pub struct DecodeHeader {
     pub track1_width: Option<u32>,
     #[serde(default)]
     pub track1_height: Option<u32>,
+    /// The pipeline the helper decodes this stream with ("metal" / "cpu").
+    #[serde(default)]
+    pub pipeline: Option<String>,
+    /// The GPU's name when the pipeline is a GPU one.
+    #[serde(default)]
+    pub gpu_device: Option<String>,
 }
 
 fn default_bit_depth() -> u32 { 8 }
@@ -129,12 +135,18 @@ pub struct DecodeOptions {
     pub scale: DecodeScale,
     /// `--look`: colour preset.
     pub look: DecodeLook,
+    /// `--pipeline auto|metal|cpu`: where the SDK decodes. `None` leaves
+    /// the helper's default (`auto`: the first Metal device, else the CPU).
+    pub pipeline: Option<String>,
 }
 
 impl DecodeOptions {
     fn extend_argv(&self, cmd: &mut Command) {
         if self.bit_16 {
             cmd.arg("--16bit");
+        }
+        if let Some(p) = &self.pipeline {
+            cmd.arg("--pipeline").arg(p);
         }
         if let Some(t) = self.track {
             cmd.arg("--track").arg(t.to_string());
@@ -280,6 +292,12 @@ impl BrawDecoder {
             }
             Err(_) => return Err(Error::BadOutput("stderr thread died before header".into())),
         };
+        tracing::info!(
+            "braw_helper: {}x{} {}-bit, {} frames, pipeline {}{}",
+            header.width, header.height, header.bit_depth, header.frames,
+            header.pipeline.as_deref().unwrap_or("?"),
+            header.gpu_device.as_deref().map(|d| format!(" ({d})")).unwrap_or_default(),
+        );
 
         Ok(BrawDecoder {
             helper_path: helper,

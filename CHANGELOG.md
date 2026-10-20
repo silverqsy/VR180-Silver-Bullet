@@ -34,6 +34,13 @@ frame.
   automatically; the PCM stereo track is encoded to AAC and muxed. A
   channel-layout quirk that silently dropped WAV audio in the muxer is
   fixed.
+- **GPU decoding.** The helper decodes on the Mac's GPU (the SDK's Metal
+  pipeline) when one is available, falling back to the CPU otherwise, and
+  keeps the next frames in flight while the current one is handed over —
+  about 1.7× the preview-size throughput of the CPU path with half the CPU
+  time, and a third of the CPU time at half and full size, which is what
+  keeps playback smooth when the machine is busy. The decode log line and
+  the clip probe report which pipeline is in use.
 - Requires the Blackmagic RAW SDK (macOS) for the helper; the helper now
   builds against SDK 6.0.
 

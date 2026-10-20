@@ -6,6 +6,8 @@
  *   --decode <file.braw> [--start N] [--count M] [--track T]     → raw BGRA frames to stdout
  *            [--16bit] [--scale full|half|quarter|eighth]          (JSON header on stderr first)
  *            [--look film|video|extended|rec709] [--gamma S] [--gamut S] [--wb K] ...
+ *            [--pipeline auto|metal|cpu]  (auto: the first Metal device, else the CPU;
+ *             the header reports "pipeline" + "gpu_device"; frames are pipelined 2–3 deep)
  *   --gyro  <file.braw>                                          → binary gyro+accel to stdout, JSON header to stderr
  *   --audio <file.braw>                                          → WAV to stdout, JSON header to stderr
  *   --meta  <file.braw> [--frame N]                              → every clip + frame metadata key, one per line
@@ -43,6 +45,7 @@
 #include <map>
 #include <mutex>
 #include <algorithm>
+#include <condition_variable>
 
 #include <CoreServices/CoreServices.h>
 
@@ -385,6 +388,21 @@ static bool g_use16bit = false;  // --16bit flag: output BGRA U16 instead of U8
 // need) and on the frame before the decode job is created.
 static BlackmagicRawResolutionScale g_scale = blackmagicRawResolutionScaleFull;
 
+// --pipeline auto|metal|cpu: where the SDK decodes and processes. `auto`
+// (the default) takes the first Metal device the SDK offers and falls back
+// to the CPU when there is none (or the device lacks the BGRA formats);
+// `metal` fails instead of falling back; `cpu` is the old path. With a GPU
+// pipeline the processed image is a MTLBuffer: the pixels are pulled back
+// through the SDK's resource manager inside ProcessComplete — the only
+// time the SDK guarantees the resource is still ours — by its host pointer
+// when the buffer is CPU-visible (unified memory), else by a copy into CPU
+// memory. `BRAW_HELPER_READBACK=copy` forces the copy (A/B).
+static std::string g_pipelineArg = "auto";
+static IBlackmagicRawPipelineDevice* g_gpuDevice = nullptr;     // alive while the codec is
+static IBlackmagicRawResourceManager* g_resourceManager = nullptr;
+static std::string g_activePipeline = "cpu";
+static std::string g_gpuDeviceName;
+
 // Tell a read job how much of the frame will be decoded. Measured on a
 // PYXIS 12K clip over SMB: a metadata-only read job (no decode) pulls the
 // whole ~12–15 MB frame regardless of this hint, so it is only applied to
@@ -407,19 +425,163 @@ static bool parse_scale(const std::string& s, BlackmagicRawResolutionScale* out)
     return true;
 }
 
+// ── GPU pipeline ─────────────────────────────────────────────────────────────
+
+static std::string cfstr(CFStringRef str) {
+    if (!str) return "";
+    char buf[512];
+    if (CFStringGetCString(str, buf, sizeof buf, kCFStringEncodingUTF8)) return buf;
+    return "";
+}
+
+// The first Metal pipeline device the SDK offers (caller owns the
+// reference; `name` receives its name), or null when the SDK has no Metal
+// pipeline on this machine.
+static IBlackmagicRawPipelineDevice* first_metal_device(IBlackmagicRawFactory* factory, IBlackmagicRaw* codec, std::string* name) {
+    IBlackmagicRawConfiguration* cfg = nullptr;
+    if (codec->QueryInterface(IID_IBlackmagicRawConfiguration, (void**)&cfg) != S_OK || !cfg) return nullptr;
+    bool supported = false;
+    HRESULT r = cfg->IsPipelineSupported(blackmagicRawPipelineMetal, &supported);
+    cfg->Release();
+    if (r != S_OK || !supported) return nullptr;
+    IBlackmagicRawPipelineDeviceIterator* it = nullptr;
+    if (factory->CreatePipelineDeviceIterator(blackmagicRawPipelineMetal, blackmagicRawInteropNone, &it) != S_OK || !it) {
+        it = nullptr;
+        if (factory->CreatePipelineDeviceIterator(blackmagicRawPipelineMetal, blackmagicRawInteropOpenGL, &it) != S_OK || !it) return nullptr;
+    }
+    IBlackmagicRawPipelineDevice* dev = nullptr;
+    r = it->CreateDevice(&dev);
+    it->Release();
+    if (r != S_OK || !dev) return nullptr;
+    CFStringRef n = nullptr;
+    if (dev->GetName(&n) == S_OK && n) { *name = cfstr(n); CFRelease(n); }
+    return dev;
+}
+
+static bool device_supports_format(IBlackmagicRawPipelineDevice* dev, BlackmagicRawResourceFormat fmt) {
+    uint32_t n = 0;
+    if (dev->GetSupportedResourceFormats(nullptr, &n) != S_OK || n == 0) return true;  // unknown: assume
+    std::vector<BlackmagicRawResourceFormat> f(n);
+    if (dev->GetSupportedResourceFormats(f.data(), &n) != S_OK) return true;
+    for (uint32_t i = 0; i < n; i++) if (f[i] == fmt) return true;
+    return false;
+}
+
+// Switch a fresh codec to the Metal pipeline per `--pipeline` (before
+// OpenClip). Returns false only when `metal` was demanded and is not
+// available; `auto` falls back to the CPU with a note on stderr.
+static bool setup_gpu_pipeline(IBlackmagicRawFactory* factory, IBlackmagicRaw* codec) {
+    g_activePipeline = "cpu";
+    if (g_pipelineArg == "cpu") return true;
+    std::string name;
+    IBlackmagicRawPipelineDevice* dev = first_metal_device(factory, codec, &name);
+    const BlackmagicRawResourceFormat fmt = g_use16bit ? blackmagicRawResourceFormatBGRAU16 : blackmagicRawResourceFormatBGRAU8;
+    if (dev && !device_supports_format(dev, fmt)) {
+        fprintf(stderr, "note: Metal device '%s' does not offer the BGRA %d-bit format; decoding on the CPU\n", name.c_str(), g_use16bit ? 16 : 8);
+        dev->Release(); dev = nullptr;
+    }
+    if (!dev) {
+        if (g_pipelineArg == "metal") { fprintf(stderr, "ERROR: no Metal pipeline device available\n"); return false; }
+        fprintf(stderr, "note: no Metal pipeline device; decoding on the CPU\n");
+        return true;
+    }
+    IBlackmagicRawConfiguration* cfg = nullptr;
+    if (codec->QueryInterface(IID_IBlackmagicRawConfiguration, (void**)&cfg) != S_OK || !cfg) { dev->Release(); return g_pipelineArg != "metal"; }
+    HRESULT r = cfg->SetFromDevice(dev);
+    cfg->Release();
+    if (r != S_OK) {
+        fprintf(stderr, "%s: SetFromDevice('%s') failed (0x%08x)%s\n", g_pipelineArg == "metal" ? "ERROR" : "note",
+                name.c_str(), (unsigned)r, g_pipelineArg == "metal" ? "" : "; decoding on the CPU");
+        dev->Release();
+        return g_pipelineArg != "metal";
+    }
+    IBlackmagicRawConfigurationEx* ex = nullptr;
+    if (codec->QueryInterface(IID_IBlackmagicRawConfigurationEx, (void**)&ex) == S_OK && ex) {
+        ex->GetResourceManager(&g_resourceManager);
+        ex->Release();
+    }
+    g_gpuDevice = dev;
+    g_gpuDeviceName = name;
+    g_activePipeline = "metal";
+    return true;
+}
+
+// Copy a processed image's pixels into `dst`: exactly `want` bytes, the
+// packed w·h·bpp (the resource may be larger — the URSA Cine Immersive's
+// reduced-scale tracks carry trailing padding). A CPU pipeline hands a
+// host buffer; a GPU pipeline a MTLBuffer, read through the resource
+// manager. Only valid inside ProcessComplete.
+static HRESULT fetch_processed_bytes(IBlackmagicRawProcessedImage* img, size_t want, std::vector<uint8_t>& dst) {
+    void* res = nullptr; uint32_t sz = 0;
+    BlackmagicRawResourceType type = blackmagicRawResourceTypeBufferCPU;
+    if (img->GetResource(&res) != S_OK || !res) return E_FAIL;
+    img->GetResourceSizeBytes(&sz);
+    img->GetResourceType(&type);
+    if (sz < want) {
+        fprintf(stderr, "ERROR: processed image resource is %u bytes; expected at least %zu\n", sz, want);
+        return E_FAIL;
+    }
+    static bool warnedPad = false;
+    if (sz != want && !warnedPad) {
+        fprintf(stderr, "note: processed image resource is %u bytes (%zu packed) — writing the packed size\n", sz, want);
+        warnedPad = true;
+    }
+    dst.resize(want);
+    if (type == blackmagicRawResourceTypeBufferCPU) { memcpy(dst.data(), res, want); return S_OK; }
+    if (!g_resourceManager) { fprintf(stderr, "ERROR: GPU resource without a resource manager\n"); return E_FAIL; }
+    void* context = nullptr; void* queue = nullptr;
+    img->GetResourceContextAndCommandQueue(&context, &queue);
+    static const bool forceCopy = [] { const char* e = getenv("BRAW_HELPER_READBACK"); return e && std::string(e) == "copy"; }();
+    HRESULT hostResult = E_FAIL;
+    if (!forceCopy) {
+        void* host = nullptr;
+        hostResult = g_resourceManager->GetResourceHostPointer(context, queue, res, type, &host);
+        if (hostResult == S_OK && host) {
+            memcpy(dst.data(), host, want);
+            return S_OK;
+        }
+    }
+    // Not CPU-visible: copy the WHOLE resource (a partial copy is rejected)
+    // into CPU memory, then keep the packed part.
+    HRESULT copyResult;
+    if (sz == want) {
+        copyResult = g_resourceManager->CopyResource(context, queue, res, type, dst.data(), blackmagicRawResourceTypeBufferCPU, sz, false);
+    } else {
+        std::vector<uint8_t> whole(sz);
+        copyResult = g_resourceManager->CopyResource(context, queue, res, type, whole.data(), blackmagicRawResourceTypeBufferCPU, sz, false);
+        if (copyResult == S_OK) memcpy(dst.data(), whole.data(), want);
+    }
+    if (copyResult != S_OK)
+        fprintf(stderr, "ERROR: GPU readback failed (host pointer 0x%08x, copy 0x%08x, resource %u bytes)\n",
+                (unsigned)hostResult, (unsigned)copyResult, sz);
+    return copyResult;
+}
+
 // ── Frame decode callback ────────────────────────────────────────────────────
+//
+// Jobs carry a ticket (the frame index, or index·2 + track for a two-track
+// clip) as their user data. Several frames are in flight at once — the SDK
+// decodes the next ones while the main thread writes the current — and
+// they complete in any order, so results are posted by ticket and the
+// writer waits for the one it needs. Frame buffers are recycled.
+
+struct FrameResult {
+    HRESULT status = S_OK;
+    uint32_t w = 0, h = 0;
+    std::vector<uint8_t> bytes;
+};
 
 class DecodeCallback : public IBlackmagicRawCallback {
 public:
-    std::atomic<bool> done{false};
-    std::atomic<HRESULT> status{S_OK};
-    IBlackmagicRawProcessedImage* processedImage = nullptr;
     IBlackmagicRawClipProcessingAttributes* clipOverrides = nullptr;  // set before decode
+    size_t bytesPerPixel = 4;
 
     void ReadComplete(IBlackmagicRawJob* readJob, HRESULT result, IBlackmagicRawFrame* frame) override {
+        void* ticket = nullptr;
+        readJob->GetUserData(&ticket);
         IBlackmagicRawJob* decodeJob = nullptr;
         if (result == S_OK)
-            VERIFY(frame->SetResourceFormat(g_use16bit ? blackmagicRawResourceFormatBGRAU16 : blackmagicRawResourceFormatBGRAU8));
+            result = frame->SetResourceFormat(g_use16bit ? blackmagicRawResourceFormatBGRAU16 : blackmagicRawResourceFormatBGRAU8);
         if (result == S_OK)
             result = frame->SetResolutionScale(g_scale);
         if (result == S_OK)
@@ -427,22 +589,29 @@ public:
         if (result == S_OK)
             result = frame->CreateJobDecodeAndProcessFrame(clipOverrides, nullptr, &decodeJob);
         if (result == S_OK)
+            result = decodeJob->SetUserData(ticket);
+        if (result == S_OK)
             result = decodeJob->Submit();
         if (result != S_OK) {
             if (decodeJob) decodeJob->Release();
-            status.store(result);
-            done.store(true);
+            FrameResult r; r.status = result;
+            post((uint64_t)(uintptr_t)ticket, std::move(r));
         }
         readJob->Release();
     }
 
     void ProcessComplete(IBlackmagicRawJob* job, HRESULT result, IBlackmagicRawProcessedImage* img) override {
-        if (result == S_OK && img) {
-            processedImage = img;
-            processedImage->AddRef();
+        void* ticket = nullptr;
+        job->GetUserData(&ticket);
+        FrameResult r;
+        r.status = (result == S_OK && !img) ? E_FAIL : result;
+        if (r.status == S_OK) {
+            img->GetWidth(&r.w);
+            img->GetHeight(&r.h);
+            r.bytes = take_buffer();
+            r.status = fetch_processed_bytes(img, (size_t)r.w * r.h * bytesPerPixel, r.bytes);
         }
-        status.store(result);
-        done.store(true);
+        post((uint64_t)(uintptr_t)ticket, std::move(r));
         job->Release();
     }
 
@@ -460,10 +629,36 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return 0; }
     ULONG STDMETHODCALLTYPE Release() override { return 0; }
 
-    void reset() {
-        if (processedImage) { processedImage->Release(); processedImage = nullptr; }
-        done.store(false);
-        status.store(S_OK);
+    // Block until the ticket's frame has been posted, and take it.
+    FrameResult wait(uint64_t ticket) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return done_.count(ticket) > 0; });
+        FrameResult r = std::move(done_[ticket]);
+        done_.erase(ticket);
+        return r;
+    }
+    // Hand a written frame's buffer back for the next decode.
+    void recycle(std::vector<uint8_t>&& buf) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (pool_.size() < 8) pool_.push_back(std::move(buf));
+    }
+
+private:
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::map<uint64_t, FrameResult> done_;
+    std::vector<std::vector<uint8_t>> pool_;
+
+    std::vector<uint8_t> take_buffer() {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (pool_.empty()) return {};
+        std::vector<uint8_t> b = std::move(pool_.back());
+        pool_.pop_back();
+        return b;
+    }
+    void post(uint64_t ticket, FrameResult&& r) {
+        { std::lock_guard<std::mutex> lk(mu_); done_[ticket] = std::move(r); }
+        cv_.notify_all();
     }
 };
 
@@ -476,12 +671,15 @@ struct ClipContext {
     IBlackmagicRawClipMultiVideo* multiVideo = nullptr;  // non-null if multi-video
     uint32_t videoTrackCount = 1;
 
-    bool open(const char* path) {
+    // `wantGpu`: configure the decode pipeline per `--pipeline` (only the
+    // modes that decode frames pay for the Metal device).
+    bool open(const char* path, bool wantGpu = false) {
         factory = CreateBlackmagicRawFactoryInstanceFromPath(
             CFStringCreateWithCString(NULL, SDK_LIB_PATH, kCFStringEncodingUTF8));
         if (!factory) { std::cerr << "ERROR: Cannot create BRAW factory. SDK not found." << std::endl; return false; }
 
         if (factory->CreateCodec(&codec) != S_OK) { std::cerr << "ERROR: Cannot create codec." << std::endl; return false; }
+        if (wantGpu && !setup_gpu_pipeline(factory, codec)) return false;
 
         CFStringRef cfPath = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
         HRESULT result = codec->OpenClip(cfPath, &clip);
@@ -499,7 +697,9 @@ struct ClipContext {
     void close() {
         if (multiVideo) { multiVideo->Release(); multiVideo = nullptr; }
         if (clip) { clip->Release(); clip = nullptr; }
+        if (g_resourceManager) { g_resourceManager->Release(); g_resourceManager = nullptr; }
         if (codec) { codec->Release(); codec = nullptr; }
+        if (g_gpuDevice) { g_gpuDevice->Release(); g_gpuDevice = nullptr; }
         if (factory) { factory->Release(); factory = nullptr; }
     }
 
@@ -598,27 +798,12 @@ static int do_info(const char* path) {
     if (firmware == "7.9" && frameRate > 0 && readoutMs > (1000.0 / frameRate))
         readoutMs /= 2.0;
 
-    // The codec's decode pipeline (whatever the SDK picked for this process;
-    // we never call SetPipeline).
-    std::string pipeline = "unknown";
-    {
-        IBlackmagicRawConfiguration* cfg = nullptr;
-        if (ctx.codec->QueryInterface(IID_IBlackmagicRawConfiguration, (void**)&cfg) == S_OK && cfg) {
-            BlackmagicRawPipeline p = (BlackmagicRawPipeline)0;
-            if (cfg->GetPipeline(&p, nullptr, nullptr) == S_OK) {
-                switch (p) {
-                    case blackmagicRawPipelineCPU:    pipeline = "cpu"; break;
-                    case blackmagicRawPipelineMetal:  pipeline = "metal"; break;
-                    case blackmagicRawPipelineCUDA:   pipeline = "cuda"; break;
-                    case blackmagicRawPipelineOpenCL: pipeline = "opencl"; break;
-                    default: {
-                        char fourcc[5] = { (char)(p >> 24), (char)(p >> 16), (char)(p >> 8), (char)p, 0 };
-                        pipeline = fourcc;
-                    }
-                }
-            }
-            cfg->Release();
-        }
+    // The pipeline `--decode` takes by default: the first Metal device when
+    // the SDK offers one, else the CPU.
+    std::string pipeline = "cpu", gpuDevice;
+    if (IBlackmagicRawPipelineDevice* dev = first_metal_device(ctx.factory, ctx.codec, &gpuDevice)) {
+        pipeline = "metal";
+        dev->Release();
     }
 
     // Processed image size at each --scale, as the SDK reports it.
@@ -669,6 +854,8 @@ static int do_info(const char* path) {
     printf("  \"embedded_lut\": \"%s\",\n", json_escape(lutName).c_str());
     printf("  \"post_3dlut_mode\": \"%s\",\n", json_escape(get_metadata_string(ctx.clip, "post_3dlut_mode")).c_str());
     printf("  \"pipeline\": \"%s\",\n", pipeline.c_str());
+    if (pipeline == "metal") printf("  \"gpu_device\": \"%s\",\n", gpuDevice.c_str());
+    else printf("  \"gpu_device\": null,\n");
     if (haveScales)
         printf("  \"resolution_scales\": {\"full\": [%u, %u], \"half\": [%u, %u], \"quarter\": [%u, %u], \"eighth\": [%u, %u]}\n",
                scaleW[0], scaleH[0], scaleW[1], scaleH[1], scaleW[2], scaleH[2], scaleW[3], scaleH[3]);
@@ -852,52 +1039,40 @@ static int do_lut(const char* path, const char* outPath) {
 
 // ── Mode: --decode ───────────────────────────────────────────────────────────
 
-// Decode a single frame from a specific track (or default track)
-// Returns true on success, fills processedImage in cb
-static bool decode_one_frame(ClipContext& ctx, DecodeCallback& cb,
-                              uint64_t frameIndex, int track = -1) {
-    cb.reset();
-
+// Submit a read job for one frame (of one track) under `ticket`.
+static bool submit_read(ClipContext& ctx, uint64_t ticket, uint64_t frameIndex, int track) {
     IBlackmagicRawJob* readJob = nullptr;
-    HRESULT result;
-
-    if (track >= 0 && ctx.multiVideo) {
-        result = ctx.multiVideo->CreateJobReadFrame((uint32_t)track, frameIndex, &readJob);
-    } else {
-        result = ctx.clip->CreateJobReadFrame(frameIndex, &readJob);
-    }
-
-    if (result != S_OK) {
-        std::cerr << "ERROR: CreateJobReadFrame failed at frame " << frameIndex
-                  << " track " << track << std::endl;
+    HRESULT result = (track >= 0 && ctx.multiVideo)
+        ? ctx.multiVideo->CreateJobReadFrame((uint32_t)track, frameIndex, &readJob)
+        : ctx.clip->CreateJobReadFrame(frameIndex, &readJob);
+    if (result != S_OK || !readJob) {
+        fprintf(stderr, "ERROR: CreateJobReadFrame failed at frame %llu track %d\n", (unsigned long long)frameIndex, track);
         return false;
     }
-
     // Reader hint: at reduced scale the SDK can skip reading the detail
     // levels it will not decode (the frame-level SetResolutionScale in
     // ReadComplete is what actually sizes the output).
     set_read_hint(readJob, g_scale);
-
+    readJob->SetUserData((void*)(uintptr_t)ticket);
     result = readJob->Submit();
     if (result != S_OK) {
         readJob->Release();
-        std::cerr << "ERROR: Submit failed at frame " << frameIndex << std::endl;
+        fprintf(stderr, "ERROR: Submit failed at frame %llu\n", (unsigned long long)frameIndex);
         return false;
     }
-
-    ctx.codec->FlushJobs();
-
-    if (!cb.done.load() || cb.status.load() != S_OK || !cb.processedImage) {
-        std::cerr << "ERROR: Decode failed at frame " << frameIndex << std::endl;
-        return false;
-    }
-
     return true;
+}
+
+// Frames kept in flight beyond the one being written: bounded by memory
+// (about 1.5 GB of decoded frames), at most 3.
+static int frames_in_flight_for(size_t frameBytes) {
+    size_t k = frameBytes ? (size_t)(1.5e9 / (double)frameBytes) : 3;
+    return (int)std::max<size_t>(1, std::min<size_t>(3, k));
 }
 
 static int do_decode(const char* path, uint64_t start, uint64_t count, int track) {
     ClipContext ctx;
-    if (!ctx.open(path)) return 1;
+    if (!ctx.open(path, /*wantGpu=*/true)) return 1;
     // The app applies the clip's LUT itself (it extracts the embedded cube):
     // never let the SDK bake a post-3D LUT into the decode, whatever the
     // clip or a sidecar says — unless a --look already chose.
@@ -933,155 +1108,160 @@ static int do_decode(const char* path, uint64_t start, uint64_t count, int track
     // Also create cloned overrides for passing to CreateJobDecodeAndProcessFrame
     IBlackmagicRawClipProcessingAttributes* clipOverrides = create_clip_overrides(ctx.clip);
 
-    uint32_t width = 0, height = 0;
     uint64_t frameCount = 0;
-    ctx.clip->GetWidth(&width);
-    ctx.clip->GetHeight(&height);
     ctx.clip->GetFrameCount(&frameCount);
 
     bool is_dual = ctx.videoTrackCount >= 2 && track < 0;
 
     if (start >= frameCount) {
         std::cerr << "ERROR: start frame " << start << " >= frame count " << frameCount << std::endl;
+        if (clipOverrides) clipOverrides->Release();
         return 1;
     }
 
     uint64_t end = (count == 0) ? frameCount : std::min(start + count, frameCount);
 
-    DecodeCallback cb;
-    cb.clipOverrides = clipOverrides;  // may be nullptr if no overrides
-    ctx.codec->SetCallback(&cb);
-
     const size_t bytesPerPixel = g_use16bit ? 8 : 4;  // BGRA U16 = 8, U8 = 4
     const int bitDepth = g_use16bit ? 16 : 8;
 
+    DecodeCallback cb;
+    cb.clipOverrides = clipOverrides;  // may be nullptr if no overrides
+    cb.bytesPerPixel = bytesPerPixel;
+    ctx.codec->SetCallback(&cb);
+
+    // Every exit drains the SDK's jobs first: callbacks must not outlive `cb`.
+    auto fail = [&]() -> int {
+        ctx.codec->FlushJobs();
+        if (clipOverrides) clipOverrides->Release();
+        return 1;
+    };
     // The frame the SDK hands back must be exactly the tightly packed
-    // w × h × bpp we announced in the header (the consumer reads frames by
-    // that byte count). A frame that differs in size (a mid-clip scale
-    // change) or in buffer size (row padding) is a hard error rather than
-    // a silently garbled stream.
-    auto check_frame = [&](uint64_t i, uint32_t w, uint32_t h, void** data, size_t* bytes) -> bool {
-        uint32_t fw = 0, fh = 0, sz = 0; void* p = nullptr;
-        cb.processedImage->GetWidth(&fw);
-        cb.processedImage->GetHeight(&fh);
-        cb.processedImage->GetResourceSizeBytes(&sz);
-        cb.processedImage->GetResource(&p);
-        const size_t want = (size_t)w * h * bytesPerPixel;
-        // The resource may be LARGER than w·h·bpp (the URSA Cine Immersive's
-        // tracks at a reduced scale: 1360×1200 BGRA comes in a 6,537,216-byte
-        // buffer, 9,216 over — trailing allocation padding; the rows are
-        // packed, see the decoded image). Smaller, or another size, is an error.
-        if (!p || fw != w || fh != h || sz < want) {
-            fprintf(stderr, "ERROR: frame %llu is %ux%u, %u bytes; expected %ux%u, %zu bytes\n",
-                    (unsigned long long)i, fw, fh, sz, w, h, want);
+    // w × h × bpp announced in the header (the consumer reads frames by that
+    // byte count): a mid-clip size change is a hard error, not a garbled
+    // stream.
+    auto check = [&](const FrameResult& r, uint64_t i, uint32_t w, uint32_t h) -> bool {
+        if (r.status != S_OK) {
+            fprintf(stderr, "ERROR: Decode failed at frame %llu (0x%08x)\n", (unsigned long long)i, (unsigned)r.status);
             return false;
         }
-        static bool warnedPad = false;
-        if (sz != want && !warnedPad) {
-            fprintf(stderr, "note: processed image resource is %u bytes for %ux%u (%zu packed) — writing the packed size\n", sz, w, h, want);
-            warnedPad = true;
+        if (r.w != w || r.h != h || r.bytes.size() != (size_t)w * h * bytesPerPixel) {
+            fprintf(stderr, "ERROR: frame %llu is %ux%u (%zu bytes); expected %ux%u\n",
+                    (unsigned long long)i, r.w, r.h, r.bytes.size(), w, h);
+            return false;
         }
-        *data = p; *bytes = want;
         return true;
+    };
+    auto header = [&](uint32_t outW, uint32_t outH, bool dual, uint32_t w0, uint32_t h0, uint32_t w1, uint32_t h1) {
+        fprintf(stderr, "{\"width\": %u, \"height\": %u, \"frames\": %llu, \"dual_stream\": %s, \"bit_depth\": %d",
+                outW, outH, (unsigned long long)(end - start), dual ? "true" : "false", bitDepth);
+        if (dual)
+            fprintf(stderr, ", \"track0_width\": %u, \"track0_height\": %u, \"track1_width\": %u, \"track1_height\": %u", w0, h0, w1, h1);
+        fprintf(stderr, ", \"pipeline\": \"%s\"", g_activePipeline.c_str());
+        if (g_activePipeline == "metal") fprintf(stderr, ", \"gpu_device\": \"%s\"", g_gpuDeviceName.c_str());
+        fprintf(stderr, "}\n");
+        fflush(stderr);
     };
 
     if (is_dual) {
-        // Dual-track: decode both tracks per frame, write side-by-side BGRA
-        // Each track has its own dimensions — decode track 0 and track 1
-
-        // Decode frame 0 of each track to discover per-track dimensions
-        // (main clip width/height may be the combined or single-track size)
-        if (!decode_one_frame(ctx, cb, start, 0)) return 1;
-        uint32_t w0 = 0, h0 = 0;
-        cb.processedImage->GetWidth(&w0);
-        cb.processedImage->GetHeight(&h0);
-        cb.reset();
-
-        if (!decode_one_frame(ctx, cb, start, 1)) return 1;
-        uint32_t w1 = 0, h1 = 0;
-        cb.processedImage->GetWidth(&w1);
-        cb.processedImage->GetHeight(&h1);
-        cb.reset();
-
-        uint32_t outH = std::max(h0, h1);
-        uint32_t outW = w0 + w1;
-
-        fprintf(stderr, "{\"width\": %u, \"height\": %u, \"frames\": %llu, "
-                "\"dual_stream\": true, \"bit_depth\": %d, \"track0_width\": %u, \"track0_height\": %u, "
-                "\"track1_width\": %u, \"track1_height\": %u}\n",
-                outW, outH, (unsigned long long)(end - start), bitDepth, w0, h0, w1, h1);
-        fflush(stderr);
+        // Two tracks per frame, written side by side (track 0 left). Tickets
+        // are index·2 + track; both tracks of a frame are in flight together.
+        if (!submit_read(ctx, start * 2 + 0, start, 0) || !submit_read(ctx, start * 2 + 1, start, 1)) return fail();
+        FrameResult r0 = cb.wait(start * 2 + 0);
+        FrameResult r1 = cb.wait(start * 2 + 1);
+        if (r0.status != S_OK || r1.status != S_OK) {
+            fprintf(stderr, "ERROR: Decode failed at frame %llu\n", (unsigned long long)start);
+            return fail();
+        }
+        const uint32_t w0 = r0.w, h0 = r0.h, w1 = r1.w, h1 = r1.h;
+        const uint32_t outH = std::max(h0, h1);
+        const uint32_t outW = w0 + w1;
+        header(outW, outH, true, w0, h0, w1, h1);
 
         const size_t rowBytes0 = (size_t)w0 * bytesPerPixel;
         const size_t rowBytes1 = (size_t)w1 * bytesPerPixel;
         const size_t outRowBytes = (size_t)outW * bytesPerPixel;
         std::vector<uint8_t> outRow(outRowBytes);
-        std::vector<uint8_t> buf0;
-
-        for (uint64_t i = start; i < end; i++) {
-            // Decode track 0
-            if (!decode_one_frame(ctx, cb, i, 0)) return 1;
-            void* data0 = nullptr; size_t sz0 = 0;
-            if (!check_frame(i, w0, h0, &data0, &sz0)) return 1;
-
-            // Copy track 0 data before reset (SDK may reuse buffer)
-            buf0.assign((uint8_t*)data0, (uint8_t*)data0 + sz0);
-            cb.reset();
-
-            // Decode track 1
-            if (!decode_one_frame(ctx, cb, i, 1)) return 1;
-            void* data1 = nullptr; size_t sz1 = 0;
-            if (!check_frame(i, w1, h1, &data1, &sz1)) return 1;
-
-            // Write side-by-side: track0 left, track1 right, row by row
-            const uint8_t* src0 = buf0.data();
-            const uint8_t* src1 = (const uint8_t*)data1;
+        const int ahead = frames_in_flight_for(rowBytes0 * h0 + rowBytes1 * h1);
+        uint64_t next = start + 1;
+        int inflight = 0;
+        auto top_up = [&]() -> bool {
+            while (inflight < ahead && next < end) {
+                if (!submit_read(ctx, next * 2 + 0, next, 0) || !submit_read(ctx, next * 2 + 1, next, 1)) return false;
+                next++; inflight++;
+            }
+            return true;
+        };
+        auto emit = [&](FrameResult& a, FrameResult& b, uint64_t i) -> bool {
+            if (!check(a, i, w0, h0) || !check(b, i, w1, h1)) return false;
+            const uint8_t* src0 = a.bytes.data();
+            const uint8_t* src1 = b.bytes.data();
             for (uint32_t y = 0; y < outH; y++) {
-                // Track 0 pixels (left half)
-                if (y < h0) {
-                    memcpy(outRow.data(), src0 + y * rowBytes0, rowBytes0);
-                } else {
-                    memset(outRow.data(), 0, rowBytes0);
-                }
-                // Track 1 pixels (right half)
-                if (y < h1) {
-                    memcpy(outRow.data() + rowBytes0, src1 + y * rowBytes1, rowBytes1);
-                } else {
-                    memset(outRow.data() + rowBytes0, 0, rowBytes1);
-                }
+                if (y < h0) memcpy(outRow.data(), src0 + y * rowBytes0, rowBytes0);
+                else memset(outRow.data(), 0, rowBytes0);
+                if (y < h1) memcpy(outRow.data() + rowBytes0, src1 + y * rowBytes1, rowBytes1);
+                else memset(outRow.data() + rowBytes0, 0, rowBytes1);
                 fwrite(outRow.data(), 1, outRowBytes, stdout);
             }
             fflush(stdout);
+            cb.recycle(std::move(a.bytes));
+            cb.recycle(std::move(b.bytes));
+            return true;
+        };
+        if (!top_up()) return fail();
+        if (!emit(r0, r1, start)) return fail();
+        for (uint64_t i = start + 1; i < end; i++) {
+            FrameResult a = cb.wait(i * 2 + 0);
+            FrameResult b = cb.wait(i * 2 + 1);
+            inflight--;
+            if (!top_up()) return fail();
+            if (!emit(a, b, i)) return fail();
         }
     } else {
         // Single-track (or explicit --track N)
         int decode_track = track;  // -1 means use default clip API
-
         // For single-track multi-video, still use the track API
-        if (decode_track < 0 && ctx.videoTrackCount == 1 && ctx.multiVideo) {
-            decode_track = 0;
+        if (decode_track < 0 && ctx.videoTrackCount == 1 && ctx.multiVideo) decode_track = 0;
+
+        // The first frame sizes the header.
+        if (!submit_read(ctx, start, start, decode_track)) return fail();
+        FrameResult first = cb.wait(start);
+        if (first.status != S_OK) {
+            fprintf(stderr, "ERROR: Decode failed at frame %llu (0x%08x)\n", (unsigned long long)start, (unsigned)first.status);
+            return fail();
         }
+        const uint32_t outW = first.w, outH = first.h;
+        header(outW, outH, false, 0, 0, 0, 0);
 
-        // Get actual output dimensions by decoding first frame
-        if (!decode_one_frame(ctx, cb, start, decode_track)) return 1;
-        uint32_t outW = 0, outH = 0;
-        cb.processedImage->GetWidth(&outW);
-        cb.processedImage->GetHeight(&outH);
-
-        fprintf(stderr, "{\"width\": %u, \"height\": %u, \"frames\": %llu, \"dual_stream\": false, \"bit_depth\": %d}\n",
-                outW, outH, (unsigned long long)(end - start), bitDepth);
-        fflush(stderr);
-
-        // Write the first (already decoded) frame, then the rest
-        for (uint64_t i = start; i < end; i++) {
-            if (i != start && !decode_one_frame(ctx, cb, i, decode_track)) return 1;
-            void* data = nullptr; size_t bytes = 0;
-            if (!check_frame(i, outW, outH, &data, &bytes)) return 1;
-            fwrite(data, 1, bytes, stdout);
+        const size_t frameBytes = (size_t)outW * outH * bytesPerPixel;
+        const int ahead = frames_in_flight_for(frameBytes);
+        uint64_t next = start + 1;
+        int inflight = 0;
+        auto top_up = [&]() -> bool {
+            while (inflight < ahead && next < end) {
+                if (!submit_read(ctx, next, next, decode_track)) return false;
+                next++; inflight++;
+            }
+            return true;
+        };
+        auto emit = [&](FrameResult& r, uint64_t i) -> bool {
+            if (!check(r, i, outW, outH)) return false;
+            fwrite(r.bytes.data(), 1, frameBytes, stdout);
             fflush(stdout);
+            cb.recycle(std::move(r.bytes));
+            return true;
+        };
+        // Submit ahead before writing, so the SDK works while we write.
+        if (!top_up()) return fail();
+        if (!emit(first, start)) return fail();
+        for (uint64_t i = start + 1; i < end; i++) {
+            FrameResult r = cb.wait(i);
+            inflight--;
+            if (!top_up()) return fail();
+            if (!emit(r, i)) return fail();
         }
     }
 
+    ctx.codec->FlushJobs();
     if (clipOverrides) clipOverrides->Release();
     return 0;
 }
@@ -1402,6 +1582,7 @@ int main(int argc, const char* argv[]) {
         std::cerr << "  braw_helper --info  <file.braw>" << std::endl;
         std::cerr << "  braw_helper --decode <file.braw> [--start N] [--count M] [--track T] [--16bit]" << std::endl;
         std::cerr << "              [--scale full|half|quarter|eighth] [--look film|video|extended|rec709]" << std::endl;
+        std::cerr << "              [--pipeline auto|metal|cpu]  (auto = the first Metal device, else CPU)" << std::endl;
         std::cerr << "              [--gamma S] [--gamut S] [--wb K] [--tint T] [--exposure EV] [--iso N]" << std::endl;
         std::cerr << "              [--tc-contrast|--tc-saturation|--tc-midpoint|--tc-highlights|--tc-shadows|" << std::endl;
         std::cerr << "               --tc-black-level|--tc-white-level F] [--highlight-recovery 0|1]" << std::endl;
@@ -1434,6 +1615,10 @@ int main(int argc, const char* argv[]) {
         }
         else if (arg == "--scale") {
             if (!parse_scale(val, &g_scale)) { std::cerr << "ERROR: unknown --scale " << val << " (full|half|quarter|eighth)" << std::endl; return 1; }
+        }
+        else if (arg == "--pipeline") {
+            if (val != "auto" && val != "metal" && val != "cpu") { std::cerr << "ERROR: unknown --pipeline " << val << " (auto|metal|cpu)" << std::endl; return 1; }
+            g_pipelineArg = val;
         }
         else if (arg == "--wb") g_procParams.whiteBalanceKelvin = std::stoi(val);
         else if (arg == "--tint") g_procParams.whiteBalanceTint = std::stoi(val);

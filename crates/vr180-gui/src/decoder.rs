@@ -1642,8 +1642,10 @@ fn open_fisheye_segment(
                 .map_err(|e| Error::Ffmpeg(format!("braw probe: {e}")))?;
             let cap = max_decode_side_for_fps(fps);
             let scale = vr180_braw::DecodeScale::for_eye_width(info.eye_dims().0, cap);
-            tracing::info!("decoder (fisheye/braw): preview decode scale {:?} (eye {}×{} native, cap {})",
-                scale, info.eye_dims().0, info.eye_dims().1, cap);
+            tracing::info!("decoder (fisheye/braw): preview decode scale {:?} (eye {}×{} native, cap {}), SDK pipeline {}{}",
+                scale, info.eye_dims().0, info.eye_dims().1, cap,
+                if info.pipeline.is_empty() { "?" } else { info.pipeline.as_str() },
+                info.gpu_device.as_deref().map(|d| format!(" ({d})")).unwrap_or_default());
             let layout = vr180_pipeline::braw_imu::braw_layout(path, &info);
             Box::new(BrawFisheyeIter::new_with_options(
                 path, &info, 8, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, 0)?)
