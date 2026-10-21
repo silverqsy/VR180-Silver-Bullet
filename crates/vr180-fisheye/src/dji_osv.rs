@@ -177,6 +177,12 @@ pub struct DjiOsvImu {
     /// 360 II). `NaN` when the file doesn't carry it; empty for synthesized
     /// sources. Indexed like `frame_quats`.
     pub exposure_ms: Vec<f32>,
+    /// The shutter behind the content times is a clip-level stand-in (a
+    /// Blackmagic live view built from the probe's shutter range before
+    /// the per-frame table was read — `braw_imu::build_braw_imu` with no
+    /// samples): fine for the preview (≤ ±(max−min)/2 ≈ 1.5 ms of content
+    /// time), but an export rebuilds with the real table.
+    pub shutter_timing_approx: bool,
     /// Per-frame offset (ms) of the video frame's timestamp (`[1.2]`) from
     /// its IMU block's timestamp (`[3.2.1.1]`, the time of the block's first
     /// high-rate sample): the sensor's frame event lands ~0.5–0.6 ms after

@@ -926,8 +926,13 @@ fn resolve_export_kandao_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye:
 /// alike; a calib-only preloaded IMU keeps its lens over a rebuild.
 fn resolve_export_braw_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
     if let Some(arc) = &cfg.preloaded_imu {
-        if !cfg.stabilize || !arc.frame_quats.is_empty() {
+        // The live view's carrier is built on the probe's clip-level shutter
+        // (no per-frame table): good enough to watch, not to export with.
+        if !cfg.stabilize || (!arc.frame_quats.is_empty() && !arc.shutter_timing_approx) {
             return Some((**arc).clone());
+        }
+        if cfg.stabilize && arc.shutter_timing_approx {
+            tracing::info!("braw export: the preview's IMU carries the clip-mean shutter — reading the per-frame shutter table");
         }
     }
     let path = cfg.segments.first().unwrap_or(&cfg.source_path);

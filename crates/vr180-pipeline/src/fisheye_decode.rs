@@ -3894,16 +3894,36 @@ impl BrawFisheyeIter {
         Ok(it)
     }
 
-    /// Ask the helper for at most `n` frames per start: a still / zoom
-    /// consumer that seeks and takes one frame should not leave the helper
-    /// decoding (and holding) the next frames of a 12K clip in flight. The
-    /// helper ends after `n`; the next pull or seek restarts it at the
-    /// wanted frame.
-    pub fn with_count(mut self, n: u32) -> Self {
-        self.opts.count = Some(n.max(1) as u64);
-        // Restart so the already-running helper honours the limit too.
-        self.decoder = None;
-        self
+    /// A still / zoom source: one frame per helper run (`--count 1`), and
+    /// the helper only starts at the first pull after a seek — nothing is
+    /// read until a frame is asked for, and the following 12K frames are
+    /// never decoded or held. The eye size before that first pull is the
+    /// clip's own at `scale` (nominal); the helper's header replaces it.
+    pub fn new_single_frame(
+        path: &Path,
+        info: &vr180_braw::BrawInfo,
+        bit_depth: u8,
+        scale: vr180_braw::DecodeScale,
+        look: vr180_braw::DecodeLook,
+        swap_eyes: bool,
+        mono: bool,
+    ) -> Self {
+        let opts = vr180_braw::decoder::DecodeOptions {
+            bit_16: bit_depth >= 10, scale, look,
+            pipeline: std::env::var("VR180_BRAW_PIPELINE").ok().filter(|p| !p.is_empty()),
+            count: Some(1),
+            ..Default::default()
+        };
+        let (fw, fh) = if mono { info.raw_frame_dims() } else { info.frame_dims() };
+        let d = scale.divisor();
+        let dt_s = if info.frame_rate > 0.0 { 1.0 / info.frame_rate } else { 1.0 / 24.0 };
+        let eye_w = if mono { fw / d } else { (fw / d) / 2 };
+        Self {
+            path: path.to_path_buf(), opts, swap_eyes, mono, decoder: None, frame_buf: Vec::new(),
+            eye_w, eye_h: if mono { fh / d } else { eye_w }, bit_depth: if bit_depth >= 10 { 16 } else { 8 },
+            dt_s, frame_idx: 0, frame_count: info.frame_count, frame_limit: 0,
+            step: 1, rgba: false, black_row: Vec::new(),
+        }
     }
 
     fn start_at(&mut self, frame: u64) -> Result<()> {

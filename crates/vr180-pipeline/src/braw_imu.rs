@@ -374,6 +374,9 @@ pub fn build_braw_imu(
         out.gravity.push([0.0, -1.0, 0.0]);
     }
     out.exposure_ms = (0..n_frames).map(|i| (shutter(i) * 1e3) as f32).collect();
+    // No per-frame table (the live view skips the 2 GB scan): the content
+    // times use the probe's clip mean; the export reads the real table.
+    out.shutter_timing_approx = shutters.is_empty();
     tracing::info!(
         "braw_imu: {} frames @ {:.3} fps, readout {:.2} ms, shutter {:.2}…{:.2} ms ({} sampled), latency {:.1} ms, imu span {:.3}..{:.3} s, basis {:?}",
         n_frames, fps, readout_s * 1e3, info.shutter_s_min * 1e3, info.shutter_s_max * 1e3, shutters.samples.len(),

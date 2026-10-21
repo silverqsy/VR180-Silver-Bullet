@@ -127,8 +127,27 @@ pub struct ResolutionScales {
 fn default_one() -> u32 { 1 }
 
 impl BrawInfo {
-    /// Run `braw_helper --info <path>` and parse the result.
+    /// Run `braw_helper --info <path>` and parse the result — memoised per
+    /// process by path + size + mtime: the probe samples five frames for
+    /// the shutter range (~70 MB on a 12K clip, seconds on a slow share),
+    /// and a load, a decoder start, a still and an export each ask again.
     pub fn probe(path: impl AsRef<Path>) -> Result<Self> {
+        type Key = (u64, Option<std::time::SystemTime>);
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (Key, BrawInfo)>>> =
+            std::sync::OnceLock::new();
+        let path = path.as_ref();
+        let key: Key = std::fs::metadata(path).map(|m| (m.len(), m.modified().ok())).unwrap_or((0, None));
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Some((k, info)) = cache.lock().unwrap().get(path) {
+            if *k == key { return Ok(info.clone()); }
+        }
+        let info = Self::probe_uncached(path)?;
+        cache.lock().unwrap().insert(path.to_path_buf(), (key, info.clone()));
+        Ok(info)
+    }
+
+    /// The probe itself (one helper run).
+    pub fn probe_uncached(path: impl AsRef<Path>) -> Result<Self> {
         let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
             expected: "helpers/bin/braw_helper".into(),
         })?;

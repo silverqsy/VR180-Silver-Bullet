@@ -1306,14 +1306,19 @@ fn load_braw_imu(
             return Some(imu);
         }
     };
-    let shutters = vr180_braw::BrawShutters::extract(&cfg.path, vr180_pipeline::braw_imu::shutter_sample_step(info.frame_rate))
-        .unwrap_or_else(|e| { tracing::warn!("braw shutters: {e}"); Default::default() });
+    // The per-frame shutter table (`--shutters`) reads one whole frame per
+    // sample — 160 frames ≈ 2 GB on an 80 s 12K clip — which on a slow share
+    // kept the first frame waiting for minutes. The live view builds its
+    // timing on the probe's clip-level shutter range instead (the content
+    // time moves by at most ±(max−min)/2, ≈ 1.5 ms here); the export reads
+    // the real table (`resolve_export_braw_imu` sees `shutter_timing_approx`).
+    let shutters = vr180_braw::BrawShutters::default();
     let total = segments_total_frames(&cfg.segments).max(info.frame_count as usize).max(1);
     let imu = vr180_pipeline::braw_imu::build_braw_imu(&info, &gyro, &shutters, fps, total, w, h, circles);
     tracing::info!(
-        "decoder (fisheye/braw): {} fw {} — {}×{} @ {} fps, {} gyro samples @ {:.0} Hz, readout {:.2} ms, {} shutter samples ({:.2}…{:.2} ms), circles {:?}, {} frame quats, in {:.1?}",
+        "decoder (fisheye/braw): {} fw {} — {}×{} @ {} fps, {} gyro samples @ {:.0} Hz, readout {:.2} ms, shutter {:.2}…{:.2} ms from the probe (live view: clip mean; the export reads the per-frame table), circles {:?}, {} frame quats, in {:.1?}",
         info.camera_model, info.firmware_version, info.width, info.height, info.frame_rate,
-        gyro.len(), gyro.header.gyro_sample_rate, info.readout_ms, shutters.samples.len(),
+        gyro.len(), gyro.header.gyro_sample_rate, info.readout_ms,
         info.shutter_s_min * 1e3, info.shutter_s_max * 1e3, circles, imu.frame_quats.len(), t0.elapsed()
     );
     cache_dji_imu(&cfg.path, std::sync::Arc::new(imu.clone()));
@@ -5721,11 +5726,11 @@ fn open_native_iter(
                 .map_err(|e| anyhow::anyhow!("braw probe: {e}"))?;
             let layout = vr180_pipeline::braw_imu::braw_layout(path, &info);
             // One native frame per request (the detail loop seeks, then
-            // takes the frame at the target): the helper must not decode
-            // and hold the following 12K frames.
-            Box::new(BrawFisheyeIter::new_with_options(
+            // takes the frame at the target): the helper starts at the first
+            // request and must not decode and hold the following 12K frames.
+            Box::new(BrawFisheyeIter::new_single_frame(
                 path, &info, 8, vr180_braw::DecodeScale::Full, vr180_braw::DecodeLook::Film,
-                swap_eyes, layout.mono, 1, 0)?.with_count(1))
+                swap_eyes, layout.mono))
         }
         _ => anyhow::bail!("non-fisheye source"),
     })
