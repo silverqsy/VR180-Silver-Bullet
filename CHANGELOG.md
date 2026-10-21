@@ -54,6 +54,11 @@ frame.
   "render-bound" frame skips during playback. The BRAW audio track now
   plays (its resampler rejected every frame before), and the zoom still no
   longer decodes extra full-size frames in the background.
+- **BRAW on slow storage.** Play no longer waits for the per-frame shutter
+  scan (one full frame per sample, about 2 GB on a long 12K clip): the
+  live view uses the clip's shutter range from the probe, and the export
+  reads the exact per-frame table. The clip probe is cached, and the zoom
+  still starts its decoder only when a frame is asked for.
 - Requires the Blackmagic RAW SDK (macOS) for the helper; the helper now
   builds against SDK 6.0.
 

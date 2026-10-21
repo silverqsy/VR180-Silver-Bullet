@@ -1302,7 +1302,29 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      layout mask; pre-existing — `normalized_layout` is now pub and the
      player stamps its frames), and the zoom-still path's full-size helper
      no longer decodes and holds the next 12K frames (`BrawFisheyeIter::
-     with_count(1)`; EOF drops the helper so a later seek/pull restarts).
+     new_single_frame`: lazy, `--count 1`; EOF drops the helper so a later
+     seek/pull restarts).
+     **2026-10-21, "卡在 click play"**: the same NAS that read 1 GB/s the
+     day before delivered ~25 MB/s on cold reads (10GBase-T link up; the
+     share itself was slow) — and the BRAW path did far too much I/O before
+     its first frame: `load_braw_imu` ran `--shutters` (one WHOLE frame per
+     sample: 160 frames ≈ 2.2 GB on C005 → ~90 s at 25 MB/s, during which
+     the decoder thread logs nothing after "eye dims" and Play looks dead),
+     `BrawInfo::probe` was spawned ~5× per load/play (each samples five
+     frames ≈ 70 MB), and the zoom-still's constructor started an unlimited
+     full-size helper that decoded 3 × 12K frames before `with_count`
+     restarted it. Fixes: the live view builds its IMU on the probe's
+     clip-level shutter range (`BrawShutters::default()` → `build_braw_imu`
+     falls back to the mean and sets `DjiOsvImu::shutter_timing_approx`;
+     content-time error ≤ ±(max−min)/2 ≈ 1.5 ms), and the export reads the
+     per-frame table when the preloaded carrier is approximate
+     (`resolve_export_braw_imu`); `BrawInfo::probe` is memoised per
+     process by path + size + mtime (`probe_uncached` = the helper run);
+     the still uses `new_single_frame` (no start until the first seek +
+     pull). A 51 s gap with no log line from ANY thread during a C006 load
+     looked like the SMB share stalling, not the app. At 25 MB/s the
+     preview is I/O-bound (~2 fps: the SDK reads whole frames even at
+     reduced scale) — nothing in the app can fix a slow share.
      **Preview perf picture (same day)**: decode wait in the GUI log is ~0
      until the worker falls behind; the CPU helper's speed swung 105 → 15
      fps at the same frames with the laptop at 7 % battery + screen sharing
