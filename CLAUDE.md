@@ -1369,6 +1369,17 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      helper waits for releases), which is fine. Global IOSurfaces are a
      deprecated-but-working route (both ends are our unsandboxed
      binaries); the mach-port hand-off is the fallback if Apple removes it.
+     **In-app (same day, local C006, vsync-off build)**: half-equirect at
+     eighth: render 0.8–5.8 ms per frame; reframe at FULL 12K: decode
+     wait 4–33 µs, project 0.3–0.7 ms, compose 0.3 ms, render 0.8–1.2 ms,
+     no render-bound skips — the per-frame cost quantised to display
+     refreshes is gone too (the `AutoNoVsync` present mode works; the
+     earlier `NativeOptions::vsync` attempt was inert). First build
+     deadlocked at frame 0: the helper topped up its decode queue (waiting
+     for a free slot) BEFORE reporting the finished frame, while the app
+     returns slots only as it moves on to frames it has been told about —
+     report first, then top up, and keep two slots for the app
+     (`ahead = min(3, slots − 2)`, GUI pool 5).
      **Preview perf picture (same day)**: decode wait in the GUI log is ~0
      until the worker falls behind; the CPU helper's speed swung 105 → 15
      fps at the same frames with the laptop at 7 % battery + screen sharing
