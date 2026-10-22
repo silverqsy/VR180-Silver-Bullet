@@ -2807,7 +2807,11 @@ impl App {
             self.replace_display(f);
             self.decoder_starting = false; // first frame in → load done, ungate respawns
             self.decoder_retried = false;  // a later start failure gets its one retry again
-            ctx.request_repaint();
+            // No extra repaint: this drain runs at the top of `update`, so
+            // the frame is painted by this very pass. Requesting another
+            // doubled the repaint rate to the display's, which parked the UI
+            // thread in `nextDrawable` with wgpu's fence lock held and
+            // stalled every decoder submit by a refresh (see `wake_ui`).
         }
         // FPS aggregation.
         let now = std::time::Instant::now();

@@ -122,6 +122,16 @@ fn main() -> anyhow::Result<()> {
         // a Vulkan-less machine still starts on DX12.
         wgpu_options: {
             let mut cfg = egui_wgpu::WgpuConfiguration::default();
+            // No vsync on the UI surface (`NativeOptions::vsync` only reaches
+            // the glow backend; wgpu takes this). On Metal, wgpu holds the
+            // device fence read-lock while `get_current_texture` waits in
+            // `nextDrawable`, and every `queue.submit` from the decoder
+            // thread needs the write-lock — with vsync, a UI repainting at
+            // the display rate parks there and each of the decoder's
+            // per-frame submits stalls for a refresh (project ≈ 33 ms,
+            // compose ≈ 17 ms: the "render-bound" skips). Windowed Metal
+            // layers do not tear: the compositor samples whole drawables.
+            cfg.present_mode = wgpu::PresentMode::AutoNoVsync;
             if let egui_wgpu::WgpuSetup::CreateNew(create) = &mut cfg.wgpu_setup {
                 #[cfg(target_os = "windows")]
                 if std::env::var_os("WGPU_BACKEND").is_none() { // env override wins
