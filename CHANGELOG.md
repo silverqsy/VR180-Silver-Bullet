@@ -71,9 +71,15 @@ frame.
   switches off automatically under a non-Film gamma and back on for Film.
   The SDK applies its tone curve only under the "Blackmagic Design Custom"
   gamma, so moving a tone-curve control switches the gamma to it, as
-  DaVinci Resolve does. The preview re-decodes the frame on screen as a
-  control moves (the zero-copy helper takes the change live), and exports
-  and zoom stills use the same settings.
+  DaVinci Resolve does; the controls start from the curve the current
+  gamma is built from (the SDK's own preset for the camera), so the
+  picture continues from where it was and only the moved control changes.
+  Highlight and shadow rolloff are named as such, with help text: they
+  shape the knee and toe of the curve only (a subtle effect by design);
+  midpoint, contrast and the black / white levels are the level controls.
+  The preview re-decodes the frame on screen as a control moves (the
+  zero-copy helper takes the change live), and exports and zoom stills use
+  the same settings.
 - **Full-resolution export.** The Resolution picker's native entry now
   shows the loaded clip's own size (a 12K BRAW: 12288 × 6144) instead of a
   fixed 7680 × 3840 label. HEVC at that size encodes in hardware; the Mac's

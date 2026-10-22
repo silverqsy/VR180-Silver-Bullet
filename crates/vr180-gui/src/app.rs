@@ -852,8 +852,15 @@ fn tr(en: &'static str) -> &'static str {
         "The clip's Film→video LUT fits the Film gamma only — it is switched off while another gamma is selected above."
             => "素材自带的 Film→视频 LUT 只适用于 Film 伽马——上方选择其他伽马时会自动关闭。",
         "Use the clip's embedded Film→video LUT" => "使用素材内嵌的 Film→视频 LUT",
-        "The SDK applies the tone curve under its \"Blackmagic Design Custom\" gamma only — moving a control switches the gamma to it (and the clip's Film LUT off)."
-            => "SDK 只在 “Blackmagic Design Custom” 伽马下应用色调曲线——拖动任一控件会自动切换到该伽马（并关闭素材的 Film LUT）。",
+        "Shown: the curve this gamma is built from. The SDK applies edits under its \"Blackmagic Design Custom\" gamma only — moving a control switches to it, continuing from this curve (the clip's Film LUT goes off)."
+            => "显示的是当前伽马所基于的曲线。SDK 只在 “Blackmagic Design Custom” 伽马下应用修改——拖动任一控件会切换到该伽马并从这条曲线继续（素材的 Film LUT 随之关闭）。",
+        "Highlight rolloff" => "高光过渡",
+        "Shadow rolloff" => "阴影过渡",
+        "Where the curve's middle sits — the strongest overall brightness control." => "曲线中点的位置——整体亮度最强的控制项。",
+        "Knee shape of the brightest few percent only — lower = softer (highlights compressed), higher = harder. A subtle control by design; for a level change use White level."
+            => "只影响最亮几个百分点的拐点形状——数值越低越柔和（高光被压缩），越高越硬。设计上作用就很轻微；要改电平请用“白电平”。",
+        "Toe shape of the darkest few percent only — lower = softer, which lifts the deepest shadows; higher = harder, which pushes them down. A subtle control by design; for a level change use Black level."
+            => "只影响最暗几个百分点的趾部形状——数值越低越柔和（最深的暗部被抬起），越高越硬（暗部被压下）。设计上作用就很轻微；要改电平请用“黑电平”。",
         "native" => "原始",
         "full" => "全尺寸",
         "Above 8192 × 4096 the Mac's hardware ProRes encoder refuses the frame — the software encoder takes over (several times slower)."
@@ -6951,12 +6958,13 @@ fn draw_braw_color_section(
     fn mark(label: &str, overridden: bool) -> String {
         if overridden { format!("{label} •") } else { label.to_string() }
     }
-    // A float slider over the SDK's range, showing the effective value.
-    fn f32_slider(ui: &mut egui::Ui, field: &mut Option<f32>, r: Ranged<f32>, label: &str, decimals: usize) {
-        let mut v = field.unwrap_or(r.value);
-        if ui.add(egui::Slider::new(&mut v, r.min..=r.max).text(mark(label, field.is_some())).fixed_decimals(decimals)).changed() {
-            *field = Some(v);
-        }
+    // A float slider over the SDK's range, showing the effective value
+    // (`base` = the value in effect without an override).
+    fn f32_slider(ui: &mut egui::Ui, field: &mut Option<f32>, r: Ranged<f32>, base: f32, label: &str, decimals: usize, hover: Option<&str>) {
+        let mut v = field.unwrap_or(base);
+        let resp = ui.add(egui::Slider::new(&mut v, r.min..=r.max).text(mark(label, field.is_some())).fixed_decimals(decimals));
+        if let Some(h) = hover { resp.clone().on_hover_text(h); }
+        if resp.changed() { *field = Some(v); }
     }
     fn flag(ui: &mut egui::Ui, field: &mut Option<bool>, as_shot: u16, label: &str) {
         let mut v = field.unwrap_or(as_shot != 0);
@@ -7017,6 +7025,12 @@ fn draw_braw_color_section(
                 s.lut_path.clear();
             }
         }
+        // Into Custom from the combo: start from the curve the previous
+        // gamma was built from (Custom's own defaults are a flat, bright
+        // curve), so the picture does not jump.
+        if gamma_after == vr180_braw::CUSTOM_GAMMA {
+            seed_tone_curve(&mut s.braw_color, info.tone_baseline(&gamma_before));
+        }
     }
     let p = &mut s.braw_color;
 
@@ -7033,7 +7047,7 @@ fn draw_braw_color_section(
                 }
             });
     });
-    f32_slider(ui, &mut p.exposure, info.exposure, tr("Exposure (stops)"), 2);
+    f32_slider(ui, &mut p.exposure, info.exposure, info.exposure.value, tr("Exposure (stops)"), 2, None);
     {
         // Kelvin on a log scale (2000–50000 K); tint as the camera counts it.
         let r = info.wb_kelvin;
@@ -7057,34 +7071,61 @@ fn draw_braw_color_section(
     ui.add_space(4.0);
     // The SDK applies the tone curve ONLY under its "Blackmagic Design
     // Custom" gamma (measured: under Film / Video / Extended Video / Rec.709
-    // every tone-curve attribute is ignored). Like Resolve's Camera Raw
-    // panel, moving a tone control switches the gamma to Custom.
-    const CUSTOM_GAMMA: &str = "Blackmagic Design Custom";
-    let has_custom = info.gamma_list.iter().any(|g| g == CUSTOM_GAMMA);
-    let on_custom = p.effective_gamma(info) == CUSTOM_GAMMA;
+    // every tone-curve attribute is ignored). The sliders show the curve
+    // the CURRENT gamma is built from (the SDK's preset for it, e.g.
+    // Extended Video = contrast 1.58, saturation 1.4, midpoint 0.409,
+    // shadow rolloff 1.25 on the PYXIS), and — like Resolve's Camera Raw
+    // panel — moving one switches the gamma to Custom seeded with that
+    // preset, so the look continues from where it was and only the moved
+    // control changes.
+    let has_custom = info.gamma_list.iter().any(|g| g == vr180_braw::CUSTOM_GAMMA);
+    let gamma_now = p.effective_gamma(info).to_string();
+    let on_custom = gamma_now == vr180_braw::CUSTOM_GAMMA;
+    let base = info.tone_baseline(&gamma_now);
     ui.label(RichText::new(tr("Tone curve")).strong());
     if has_custom && !on_custom {
         ui.label(RichText::new(tr(
-            "The SDK applies the tone curve under its \"Blackmagic Design Custom\" gamma only — moving a control switches the gamma to it (and the clip's Film LUT off)."
+            "Shown: the curve this gamma is built from. The SDK applies edits under its \"Blackmagic Design Custom\" gamma only — moving a control switches to it, continuing from this curve (the clip's Film LUT goes off)."
         )).small().color(Color32::GRAY));
     }
     let tone_before = (p.saturation, p.contrast, p.midpoint, p.highlights, p.shadows, p.black_level, p.white_level, p.video_black_level);
-    f32_slider(ui, &mut p.saturation, info.saturation, tr("Saturation"), 2);
-    f32_slider(ui, &mut p.contrast, info.contrast, tr("Contrast"), 2);
-    f32_slider(ui, &mut p.midpoint, info.midpoint, tr("Midpoint"), 2);
-    f32_slider(ui, &mut p.highlights, info.highlights, tr("Highlights"), 2);
-    f32_slider(ui, &mut p.shadows, info.shadows, tr("Shadows"), 2);
-    f32_slider(ui, &mut p.black_level, info.black_level, tr("Black level"), 2);
-    f32_slider(ui, &mut p.white_level, info.white_level, tr("White level"), 2);
-    flag(ui, &mut p.video_black_level, info.video_black_level, tr("Video black level"));
+    f32_slider(ui, &mut p.saturation, info.saturation, base.saturation, tr("Saturation"), 2, None);
+    f32_slider(ui, &mut p.contrast, info.contrast, base.contrast, tr("Contrast"), 2, None);
+    f32_slider(ui, &mut p.midpoint, info.midpoint, base.midpoint, tr("Midpoint"), 2,
+        Some(tr("Where the curve's middle sits — the strongest overall brightness control.")));
+    f32_slider(ui, &mut p.highlights, info.highlights, base.highlights, tr("Highlight rolloff"), 2,
+        Some(tr("Knee shape of the brightest few percent only — lower = softer (highlights compressed), higher = harder. A subtle control by design; for a level change use White level.")));
+    f32_slider(ui, &mut p.shadows, info.shadows, base.shadows, tr("Shadow rolloff"), 2,
+        Some(tr("Toe shape of the darkest few percent only — lower = softer, which lifts the deepest shadows; higher = harder, which pushes them down. A subtle control by design; for a level change use Black level.")));
+    f32_slider(ui, &mut p.black_level, info.black_level, base.black_level, tr("Black level"), 2, None);
+    f32_slider(ui, &mut p.white_level, info.white_level, base.white_level, tr("White level"), 2, None);
+    flag(ui, &mut p.video_black_level, base.video_black_level as u16, tr("Video black level"));
     let tone_after = (p.saturation, p.contrast, p.midpoint, p.highlights, p.shadows, p.black_level, p.white_level, p.video_black_level);
     if tone_after != tone_before && has_custom && !on_custom {
-        p.gamma = Some(CUSTOM_GAMMA.to_string());
-        // Custom is display-referred: the Film→video LUT no longer fits.
+        // Keep every untouched control at the gamma's own value (explicitly,
+        // since Custom would otherwise fall back to the clip's flat curve),
+        // then switch. Custom is display-referred: the Film→video LUT no
+        // longer fits.
+        seed_tone_curve(p, base);
+        p.gamma = Some(vr180_braw::CUSTOM_GAMMA.to_string());
         if let Some(lut) = braw_lut {
             if s.lut_path == lut { s.lut_path.clear(); }
         }
     }
+}
+
+/// Make the tone-curve overrides that are still "as shot" explicit at the
+/// values of `base`, so the Custom gamma reproduces the curve the user was
+/// looking at (the moved control keeps its new value).
+fn seed_tone_curve(p: &mut vr180_braw::BrawColorParams, base: vr180_braw::TonePreset) {
+    p.saturation.get_or_insert(base.saturation);
+    p.contrast.get_or_insert(base.contrast);
+    p.midpoint.get_or_insert(base.midpoint);
+    p.highlights.get_or_insert(base.highlights);
+    p.shadows.get_or_insert(base.shadows);
+    p.black_level.get_or_insert(base.black_level);
+    p.white_level.get_or_insert(base.white_level);
+    p.video_black_level.get_or_insert(base.video_black_level);
 }
 
 fn fine_slider(

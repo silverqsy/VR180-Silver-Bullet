@@ -1480,6 +1480,40 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      SH_WORD_SPLIT), so `helper $FLAGS` passed "--exposure 2" as a single
      argument and `size=$SZ:rate` applied the `:r` modifier — use bash for
      such loops.
+     **Tone-curve semantics (same day, user: "shadows 和 highlights 是全部
+     的调整范围么？效果非常轻微，shadow 数值越低暗部越亮")**: the sliders span
+     the SDK's full accepted range (`GetClipAttributeRange`), the small
+     effect is the controls' nature — `ToneCurveHighlights` / `Shadows` are
+     Resolve's "Highlight rolloff" / "Shadow rolloff" (knee / toe SHAPE of
+     the brightest ~1 % / darkest ~5 %), measured under Custom on C006:
+     shadows 0.002 → p5 50→54, shadows 2 → p5 39 (lower = softer toe =
+     deepest shadows lifted — the user's observation is the SDK's
+     semantics), highlights 0 → p99 186→182, no change above 1; the level
+     controls are strong (midpoint 0.2 / 0.8 → mean 23 / 170, black level
+     ±0.2 → mean 69 / 120, white level 0.6 / 1.4 → 45 / 145, contrast
+     0.5 / 1.998 → 110 / 27). Renamed in the panel with hover text. KEY
+     SDK FACT: `IBlackmagicRawToneCurve::GetToneCurve(camera_type, gamma,
+     gen)` (QueryInterface on the codec) returns the tone-curve parameters
+     each gamma is BUILT from — PYXIS 12K Gen 5: Film = contrast 1, sat 1,
+     midpoint 0.383562, hl 1, sh 1, black 0, white 1, videoBlack 0;
+     Extended Video = 1.58, 1.4, 0.409008, 1, 1.25, 0, 1, 0; Custom's
+     defaults = 1, 1, 0.409008, 1, 1, 0, 1, 0 (Gen 4 Extended Video = 1.4,
+     1.25, 0.409, 0.6, 1.8, videoBlack 1; Video / Rec.709 answer
+     E_INVALIDARG; Gen 6 has Film + Custom only). Custom seeded with a
+     gamma's preset REPRODUCES that gamma (Extended Video: 180 of 7 M bytes
+     differ by 1; Film: same mean) — which is why Custom's own defaults
+     looked flat and bright (contrast 1 vs 1.58). The helper's `--info`
+     colour block now carries `tone_presets` (per gamma, `[contrast, sat,
+     midpoint, hl, sh, black, white, videoBlack]`) → `BrawColorInfo::
+     tone_presets` / `tone_baseline(gamma)`; the panel shows the CURRENT
+     gamma's preset as the sliders' baseline and, on the first tone edit or
+     on picking Custom in the combo, makes the untouched controls explicit
+     at that preset (`seed_tone_curve`) before switching — the picture
+     continues from where it was and only the moved control changes.
+     `EvaluateToneCurve` exists (17-point array) but its axis convention
+     did not match the measured direction of the shadows parameter, so no
+     curve preview was built from it. `GetToneCurveForCustomGamma` is
+     mentioned in the header's comment but does not exist in SDK 6.0.
    - **File facts**: gyro+accel 1022 Hz, rad/s and m/s², NO timestamps
      (sample 0 = frame 0 start, rate is the clock); no lens metadata at all
      (`lens_type` etc. empty, distortion arrays zero); shutter is AUTO and

@@ -927,6 +927,46 @@ static int do_info(const char* path) {
             std::string isoList = "[";
             for (size_t i = 0; i < frameColor.isoList.size(); i++) { if (i) isoList += ", "; isoList += std::to_string(frameColor.isoList[i]); }
             isoList += "]";
+            // The tone-curve parameters each gamma is built from, for THIS
+            // camera and the clip's colour science generation
+            // (IBlackmagicRawToneCurve::GetToneCurve: Film, Extended Video
+            // and Custom answer; Video / Rec.709 do not). The SDK applies the
+            // ToneCurve* attributes only under the Custom gamma, and Custom
+            // seeded with a gamma's preset reproduces that gamma (measured:
+            // Extended Video to within 1 code), so the app starts a Custom
+            // edit from these instead of the clip's flat defaults.
+            std::string tonePresets = "{";
+            {
+                IBlackmagicRawToneCurve* tc = nullptr;
+                if (ctx.codec->QueryInterface(IID_IBlackmagicRawToneCurve, (void**)&tc) == S_OK && tc) {
+                    const uint16_t gen = (uint16_t)u16Val(blackmagicRawClipProcessingAttributeColorScienceGen);
+                    CFStringRef camCf = CFStringCreateWithCString(NULL, cameraModel.c_str(), kCFStringEncodingUTF8);
+                    uint32_t n = 0; bool ro = false;
+                    std::vector<Variant> gammas;
+                    if (ca->GetClipAttributeList(blackmagicRawClipProcessingAttributeGamma, nullptr, &n, &ro) == S_OK && n > 0) {
+                        gammas.resize(n);
+                        for (auto& it : gammas) VariantInit(&it);
+                        if (ca->GetClipAttributeList(blackmagicRawClipProcessingAttributeGamma, gammas.data(), &n, &ro) != S_OK) gammas.clear();
+                    }
+                    bool first = true;
+                    for (auto& g : gammas) {
+                        if (g.vt == blackmagicRawVariantTypeString) {
+                            float c = 0, sat = 0, mid = 0, hi = 0, sh = 0, bl = 0, wl = 0; uint16_t vb = 0;
+                            if (tc->GetToneCurve(camCf, g.bstrVal, gen, &c, &sat, &mid, &hi, &sh, &bl, &wl, &vb) == S_OK) {
+                                char b[192];
+                                snprintf(b, sizeof b, "%s\"%s\": [%.6g, %.6g, %.6g, %.6g, %.6g, %.6g, %.6g, %u]", first ? "" : ", ",
+                                         json_escape(cfstr_to_string(g.bstrVal)).c_str(), c, sat, mid, hi, sh, bl, wl, (unsigned)vb);
+                                tonePresets += b;
+                                first = false;
+                            }
+                        }
+                        VariantClear(&g);
+                    }
+                    CFRelease(camCf);
+                    tc->Release();
+                }
+            }
+            tonePresets += "}";
             char fb[256];
             snprintf(fb, sizeof fb, "\"wb_kelvin\": [%u, %u, %u], \"wb_tint\": [%d, %d, %d], \"exposure\": [%.6g, %.6g, %.6g], \"iso\": %u",
                      frameColor.kelvin, frameColor.kelvinMin, frameColor.kelvinMax, frameColor.tint, frameColor.tintMin, frameColor.tintMax,
@@ -947,7 +987,8 @@ static int do_info(const char* path) {
                 + ", \"video_black_level\": " + std::to_string(u16Val(blackmagicRawClipProcessingAttributeToneCurveVideoBlackLevel))
                 + ", \"highlight_recovery\": " + std::to_string(u16Val(blackmagicRawClipProcessingAttributeHighlightRecovery))
                 + ", \"gamut_compression\": " + std::to_string(u16Val(blackmagicRawClipProcessingAttributeGamutCompressionEnable))
-                + ", " + fb + ", \"iso_list\": " + isoList + "}";
+                + ", " + fb + ", \"iso_list\": " + isoList
+                + ", \"tone_presets\": " + tonePresets + "}";
             ca->Release();
         }
     }

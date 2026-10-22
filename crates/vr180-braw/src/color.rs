@@ -17,6 +17,7 @@
 //! 15 ISO steps 125–3200. The ranges did not change with the generation.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::process::Command;
 
 /// A value with the range the SDK accepts for it (`[value, min, max]` in
@@ -31,6 +32,34 @@ pub struct Ranged<T: Copy> {
 
 impl<T: Copy> From<[T; 3]> for Ranged<T> {
     fn from(a: [T; 3]) -> Self { Self { value: a[0], min: a[1], max: a[2] } }
+}
+
+/// The tone-curve parameters a gamma is built from (the SDK's
+/// `IBlackmagicRawToneCurve::GetToneCurve` for the camera and colour
+/// science generation; `[contrast, saturation, midpoint, highlights,
+/// shadows, black_level, white_level, video_black_level]` in the probe).
+/// The SDK applies the `ToneCurve*` attributes only under the "Blackmagic
+/// Design Custom" gamma, and Custom seeded with a gamma's preset reproduces
+/// that gamma (Extended Video to within one code on the PYXIS), so an edit
+/// starts from the current gamma's preset rather than the flat defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(from = "[f32; 8]")]
+pub struct TonePreset {
+    pub contrast: f32,
+    pub saturation: f32,
+    pub midpoint: f32,
+    pub highlights: f32,
+    pub shadows: f32,
+    pub black_level: f32,
+    pub white_level: f32,
+    pub video_black_level: bool,
+}
+
+impl From<[f32; 8]> for TonePreset {
+    fn from(a: [f32; 8]) -> Self {
+        Self { contrast: a[0], saturation: a[1], midpoint: a[2], highlights: a[3], shadows: a[4],
+               black_level: a[5], white_level: a[6], video_black_level: a[7] != 0.0 }
+    }
 }
 
 /// The clip's colour processing as the probe found it: the clip-level
@@ -69,11 +98,33 @@ pub struct BrawColorInfo {
     pub iso: u32,
     #[serde(default)]
     pub iso_list: Vec<u32>,
+    /// Per-gamma tone-curve presets for this camera (see [`TonePreset`]);
+    /// the gammas without one (Video, Rec.709, …) are absent.
+    #[serde(default)]
+    pub tone_presets: HashMap<String, TonePreset>,
 }
+
+/// The gamma under which the SDK applies the tone-curve attributes.
+pub const CUSTOM_GAMMA: &str = "Blackmagic Design Custom";
 
 impl BrawColorInfo {
     /// The values as shot (no override).
     pub fn as_shot(&self) -> BrawColorValues { BrawColorParams::default().resolve(self) }
+
+    /// The tone curve a gamma is built from, when the SDK states one.
+    pub fn tone_preset(&self, gamma: &str) -> Option<TonePreset> { self.tone_presets.get(gamma).copied() }
+
+    /// The tone-curve values in effect under `gamma` before any override:
+    /// the gamma's preset, else the clip's stored values (what the Custom
+    /// gamma uses by default).
+    pub fn tone_baseline(&self, gamma: &str) -> TonePreset {
+        self.tone_preset(gamma).unwrap_or(TonePreset {
+            contrast: self.contrast.value, saturation: self.saturation.value, midpoint: self.midpoint.value,
+            highlights: self.highlights.value, shadows: self.shadows.value,
+            black_level: self.black_level.value, white_level: self.white_level.value,
+            video_black_level: self.video_black_level != 0,
+        })
+    }
 
     /// Whether `gamma` is the camera's Film log — what the clip's embedded
     /// display LUT ("Gen 5 Film to Extended Video") expects as its input.
@@ -254,7 +305,21 @@ mod tests {
             "highlights": [1, 0, 1.998], "shadows": [1, 0.002, 2], "black_level": [0, -1, 1],
             "white_level": [1, 0, 2], "video_black_level": 0, "highlight_recovery": 0, "gamut_compression": 0,
             "wb_kelvin": [5600, 2000, 50000], "wb_tint": [10, -150, 150], "exposure": [0, -5, 5],
-            "iso": 800, "iso_list": [125, 160, 200, 250, 320, 400, 500, 640, 800]}"#).expect("parse")
+            "iso": 800, "iso_list": [125, 160, 200, 250, 320, 400, 500, 640, 800],
+            "tone_presets": {"Blackmagic Design Film": [1, 1, 0.383562, 1, 1, 0, 1, 0],
+                             "Blackmagic Design Extended Video": [1.58, 1.4, 0.409008, 1, 1.25, 0, 1, 0]}}"#).expect("parse")
+    }
+
+    #[test]
+    fn tone_presets_and_baseline() {
+        let i = info();
+        let ev = i.tone_preset("Blackmagic Design Extended Video").expect("preset");
+        assert_eq!((ev.contrast, ev.saturation, ev.shadows, ev.video_black_level), (1.58, 1.4, 1.25, false));
+        assert!(i.tone_preset("Rec.709").is_none());
+        // Without a preset the baseline is the clip's stored (flat) values.
+        let b = i.tone_baseline(CUSTOM_GAMMA);
+        assert_eq!((b.contrast, b.midpoint), (1.0, 0.5));
+        assert_eq!(i.tone_baseline("Blackmagic Design Film").midpoint, 0.383562);
     }
 
     #[test]
