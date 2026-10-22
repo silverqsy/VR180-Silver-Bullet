@@ -65,7 +65,7 @@ pub mod shutters;
 pub mod zc;
 
 pub use audio::{extract_audio_to_tempfile, extract_audio_to_wav, BrawAudioHeader, TempWavPath};
-pub use color::{BrawColorInfo, BrawColorParams, BrawColorValues, Ranged, TonePreset, CUSTOM_GAMMA};
+pub use color::{BrawColorInfo, BrawColorParams, BrawColorValues, GenColor, GenColorView, Ranged, TonePreset, CUSTOM_GAMMA};
 pub use decoder::{BrawDecoder, DecodeLook, DecodeScale};
 pub use lut::extract_embedded_lut;
 pub use shutters::BrawShutters;

@@ -855,6 +855,10 @@ fn tr(en: &'static str) -> &'static str {
         "Shown: the curve this gamma is built from. The SDK applies edits under its \"Blackmagic Design Custom\" gamma only — moving a control switches to it, continuing from this curve (the clip's Film LUT goes off)."
             => "显示的是当前伽马所基于的曲线。SDK 只在 “Blackmagic Design Custom” 伽马下应用修改——拖动任一控件会切换到该伽马并从这条曲线继续（素材的 Film LUT 随之关闭）。",
         "Highlight rolloff" => "高光过渡",
+        "Another colour science than the clip's: its own gamma and gamut lists apply (Gen 6 has no Blackmagic Design gammas — a Film clip decodes to DaVinci Intermediate / DaVinci Wide Gamut)."
+            => "已选择与素材不同的色彩科学：使用该代际自己的伽马/色域列表（Gen 6 没有任何 Blackmagic Design 伽马——Film 素材会按 DaVinci Intermediate / DaVinci Wide Gamut 解码）。",
+        "This colour science has no adjustable (Custom) tone curve — the SDK ignores these controls under it. Pick Gen 5 to use the tone curve."
+            => "该色彩科学没有可调的（Custom）色调曲线——SDK 在其下会忽略这些控件。要使用色调曲线请选择 Gen 5。",
         "Shadow rolloff" => "阴影过渡",
         "Where the curve's middle sits — the strongest overall brightness control." => "曲线中点的位置——整体亮度最强的控制项。",
         "Knee shape of the brightest few percent only — lower = softer (highlights compressed), higher = harder. A subtle control by design; for a level change use White level."
@@ -3456,8 +3460,8 @@ impl App {
             let s = &mut self.settings;
             s.lift = 0.0; s.gamma = 1.0; s.gain = 1.0; s.shadow = 0.0; s.highlight = 0.0;
             s.temperature = 0.0; s.tint = 0.0; s.saturation = 1.0;
-            if let (Some(g), Some(lut)) = (s.braw_color.gamma.as_deref(), meta.braw_lut.as_deref()) {
-                if !vr180_braw::BrawColorInfo::is_film_gamma(g) && s.lut_path == lut { s.lut_path.clear(); }
+            if let (Some(info), Some(lut)) = (meta.braw_color.as_ref(), meta.braw_lut.as_deref()) {
+                if !vr180_braw::BrawColorInfo::is_film_gamma(s.braw_color.effective_gamma(info)) && s.lut_path == lut { s.lut_path.clear(); }
             }
         }
         self.last_pushed_settings = self.settings.clone();
@@ -6980,11 +6984,16 @@ fn draw_braw_color_section(
         "Developed by the Blackmagic RAW SDK from the sensor data — these replace the Tone and White balance controls for this camera. A dot marks a value changed from the clip's."
     )).small().color(Color32::GRAY));
 
-    // Colour science / gamma / gamut.
+    // Colour science / gamma / gamut. The gamma and gamut lists (and the
+    // SDK's defaults) belong to a GENERATION: Gen 6 has no "Blackmagic
+    // Design" gamma or gamut at all (a Film clip becomes DaVinci
+    // Intermediate / DaVinci Wide Gamut), so the combos list what the chosen
+    // generation accepts, and an override it rejects is dropped on switch.
     let gamma_before = p.effective_gamma(info).to_string();
+    let gen_before = p.effective_gen(info);
     ui.horizontal(|ui| {
         ui.label(tr("Color science"));
-        let cur = p.color_science_gen.unwrap_or(info.color_science_gen);
+        let cur = gen_before;
         egui::ComboBox::from_id_source("braw_csgen")
             .selected_text(mark(&format!("Gen {cur}"), p.color_science_gen.is_some()))
             .show_ui(ui, |ui| {
@@ -6993,28 +7002,40 @@ fn draw_braw_color_section(
                 }
             });
     });
+    let gen_now = p.effective_gen(info);
+    if gen_now != gen_before {
+        let view = info.for_gen(gen_now);
+        if p.gamma.as_deref().map_or(false, |g| !view.accepts_gamma(g)) { p.gamma = None; }
+        if p.gamut.as_deref().map_or(false, |g| !view.accepts_gamut(g)) { p.gamut = None; }
+    }
+    let view = info.for_gen(gen_now);
     ui.horizontal(|ui| {
         ui.label(tr("Gamma"));
-        let cur = p.gamma.clone().unwrap_or_else(|| info.gamma.clone());
+        let cur = p.effective_gamma(info).to_string();
         egui::ComboBox::from_id_source("braw_gamma")
             .selected_text(mark(&cur, p.gamma.is_some())).width(220.0)
             .show_ui(ui, |ui| {
-                for g in &info.gamma_list {
+                for g in view.gamma_list {
                     if ui.selectable_label(*g == cur, g).clicked() { p.gamma = Some(g.clone()); }
                 }
             });
     });
     ui.horizontal(|ui| {
         ui.label(tr("Gamut"));
-        let cur = p.gamut.clone().unwrap_or_else(|| info.gamut.clone());
+        let cur = p.effective_gamut(info).to_string();
         egui::ComboBox::from_id_source("braw_gamut")
             .selected_text(mark(&cur, p.gamut.is_some())).width(220.0)
             .show_ui(ui, |ui| {
-                for g in &info.gamut_list {
+                for g in view.gamut_list {
                     if ui.selectable_label(*g == cur, g).clicked() { p.gamut = Some(g.clone()); }
                 }
             });
     });
+    if gen_now != info.color_science_gen {
+        ui.label(RichText::new(tr(
+            "Another colour science than the clip's: its own gamma and gamut lists apply (Gen 6 has no Blackmagic Design gammas — a Film clip decodes to DaVinci Intermediate / DaVinci Wide Gamut)."
+        )).small().color(Color32::GRAY));
+    }
     // The embedded display LUT expects the Film log: follow the gamma.
     let gamma_after = p.effective_gamma(info).to_string();
     if gamma_after != gamma_before {
@@ -7029,7 +7050,8 @@ fn draw_braw_color_section(
         // gamma was built from (Custom's own defaults are a flat, bright
         // curve), so the picture does not jump.
         if gamma_after == vr180_braw::CUSTOM_GAMMA {
-            seed_tone_curve(&mut s.braw_color, info.tone_baseline(&gamma_before));
+            let base = info.tone_baseline(gen_before, &gamma_before);
+            seed_tone_curve(&mut s.braw_color, base);
         }
     }
     let p = &mut s.braw_color;
@@ -7078,16 +7100,24 @@ fn draw_braw_color_section(
     // panel — moving one switches the gamma to Custom seeded with that
     // preset, so the look continues from where it was and only the moved
     // control changes.
-    let has_custom = info.gamma_list.iter().any(|g| g == vr180_braw::CUSTOM_GAMMA);
+    let gen_now = p.effective_gen(info);
+    let has_custom = info.for_gen(gen_now).has_custom_gamma();
     let gamma_now = p.effective_gamma(info).to_string();
     let on_custom = gamma_now == vr180_braw::CUSTOM_GAMMA;
-    let base = info.tone_baseline(&gamma_now);
+    let base = info.tone_baseline(gen_now, &gamma_now);
     ui.label(RichText::new(tr("Tone curve")).strong());
-    if has_custom && !on_custom {
+    if !has_custom {
+        // No Custom gamma in this generation (Gen 6): the SDK ignores every
+        // tone-curve attribute, so the controls would do nothing.
+        ui.label(RichText::new(tr(
+            "This colour science has no adjustable (Custom) tone curve — the SDK ignores these controls under it. Pick Gen 5 to use the tone curve."
+        )).small().color(Color32::GRAY));
+    } else if !on_custom {
         ui.label(RichText::new(tr(
             "Shown: the curve this gamma is built from. The SDK applies edits under its \"Blackmagic Design Custom\" gamma only — moving a control switches to it, continuing from this curve (the clip's Film LUT goes off)."
         )).small().color(Color32::GRAY));
     }
+    ui.add_enabled_ui(has_custom, |ui| {
     let tone_before = (p.saturation, p.contrast, p.midpoint, p.highlights, p.shadows, p.black_level, p.white_level, p.video_black_level);
     f32_slider(ui, &mut p.saturation, info.saturation, base.saturation, tr("Saturation"), 2, None);
     f32_slider(ui, &mut p.contrast, info.contrast, base.contrast, tr("Contrast"), 2, None);
@@ -7112,6 +7142,7 @@ fn draw_braw_color_section(
             if s.lut_path == lut { s.lut_path.clear(); }
         }
     }
+    });
 }
 
 /// Make the tone-curve overrides that are still "as shot" explicit at the

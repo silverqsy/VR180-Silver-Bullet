@@ -1514,6 +1514,39 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      did not match the measured direction of the shadows parameter, so no
      curve preview was built from it. `GetToneCurveForCustomGamma` is
      mentioned in the header's comment but does not exist in SDK 6.0.
+     **Colour science generations (same day, user: "选择 Gen 6 之后 behavior
+     不太正常")**: the gamma / gamut LISTS, the SDK's default gamma / gamut
+     and the tone presets belong to a GENERATION. Measured on C006:
+     `SetClipAttribute(ColorScienceGen, 6)` drops every "Blackmagic Design"
+     gamma (Film, Video, Extended Video, Custom) and the Blackmagic Design
+     gamut — 13 gammas / 15 gamuts remain — and the clip's gamma / gamut
+     become "DaVinci Intermediate" / "DaVinci Wide Gamut" (Gen 6 = the
+     DaVinci-wide-gamut colour science; its decode of the Film clip has
+     mean 48.6 vs Film's 65.8); Gen 4 and 5 share the 17 / 16 lists and
+     the BMD defaults. Any Film / Custom gamma override is REJECTED under
+     Gen 6 (E_INVALIDARG, `set_clip_string_attr` warns), so the old UI kept
+     showing Gen 5's list and "Film", the tone curve could not switch to
+     Custom, and the Gen 5 Film→Extended Video LUT stayed on top of a
+     DaVinci Intermediate decode — the "abnormal behaviour". Fix: `--info`'s
+     colour block now has `gens: {"4": {gamma, gamma_list, gamut,
+     gamut_list, tone_presets}, "5": …, "6": …}`, read on a CLONE of the
+     clip's attributes per generation (`CloneClipProcessingAttributes` +
+     `SetClipAttribute(gen)` — the clone switches its own gamma like the
+     clip would); `BrawColorInfo::for_gen(gen)` (view; the clip-level block
+     stands in for an unknown gen), `BrawColorParams::effective_gen /
+     effective_gamma / effective_gamut` — an override the generation does
+     not accept is NOT pretended, the generation's own default applies;
+     `resolve` → `changed_lines` sends `--csgen 6 --gamma DaVinci
+     Intermediate --gamut DaVinci Wide Gamut` and a fresh helper given only
+     `--csgen 6` lands on the same picture (explicit defaults reproduce each
+     gen's default decode byte for byte: gen 4 / 5 / 6 checked). Panel:
+     combos list the chosen generation's gammas / gamuts, an override the
+     new generation rejects is dropped on switch, a note names the change,
+     the tone-curve section is disabled under a generation without the
+     Custom gamma, `tone_baseline(gen, gamma)`. Verified live
+     (`braw_color_check` step 3b): Gen 6 on the running helper is
+     byte-identical to a fresh `--csgen 6` helper, and the reset back to
+     Gen 5 is byte-identical to the as-shot frame.
    - **File facts**: gyro+accel 1022 Hz, rad/s and m/s², NO timestamps
      (sample 0 = frame 0 start, rate is the clock); no lens metadata at all
      (`lens_type` etc. empty, distortion arrays zero); shutter is AUTO and

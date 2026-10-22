@@ -62,6 +62,50 @@ impl From<[f32; 8]> for TonePreset {
     }
 }
 
+/// What one colour-science generation offers: the SDK's gamma and gamut
+/// after switching a clip to it, the lists it accepts, and its tone-curve
+/// presets. They differ per generation — Gen 6 has none of the "Blackmagic
+/// Design" gammas (Film, Video, Extended Video, Custom) nor the Blackmagic
+/// Design gamut; a Gen 5 Film clip switched to Gen 6 decodes to "DaVinci
+/// Intermediate" / "DaVinci Wide Gamut".
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct GenColor {
+    #[serde(default)]
+    pub gamma: String,
+    #[serde(default)]
+    pub gamma_list: Vec<String>,
+    #[serde(default)]
+    pub gamut: String,
+    #[serde(default)]
+    pub gamut_list: Vec<String>,
+    #[serde(default)]
+    pub tone_presets: HashMap<String, TonePreset>,
+}
+
+/// A generation's offer, borrowed from [`BrawColorInfo`] (the clip-level
+/// fields stand in for a generation the probe did not describe).
+#[derive(Debug, Clone, Copy)]
+pub struct GenColorView<'a> {
+    pub gamma: &'a str,
+    pub gamma_list: &'a [String],
+    pub gamut: &'a str,
+    pub gamut_list: &'a [String],
+    pub tone_presets: &'a HashMap<String, TonePreset>,
+}
+
+impl GenColorView<'_> {
+    /// Whether this generation accepts `gamma` (an empty list — an older
+    /// probe — accepts anything).
+    pub fn accepts_gamma(&self, gamma: &str) -> bool {
+        self.gamma_list.is_empty() || self.gamma_list.iter().any(|g| g == gamma)
+    }
+    pub fn accepts_gamut(&self, gamut: &str) -> bool {
+        self.gamut_list.is_empty() || self.gamut_list.iter().any(|g| g == gamut)
+    }
+    /// Whether the tone curve can be edited here (the Custom gamma exists).
+    pub fn has_custom_gamma(&self) -> bool { self.gamma_list.iter().any(|g| g == CUSTOM_GAMMA) }
+}
+
 /// The clip's colour processing as the probe found it: the clip-level
 /// attributes' current values, ranges and lists, and frame 0's white
 /// balance, exposure and ISO.
@@ -102,6 +146,10 @@ pub struct BrawColorInfo {
     /// the gammas without one (Video, Rec.709, …) are absent.
     #[serde(default)]
     pub tone_presets: HashMap<String, TonePreset>,
+    /// Each colour-science generation's gamma / gamut defaults, lists and
+    /// presets, keyed by generation (see [`GenColor`]).
+    #[serde(default)]
+    pub gens: HashMap<u16, GenColor>,
 }
 
 /// The gamma under which the SDK applies the tone-curve attributes.
@@ -111,14 +159,26 @@ impl BrawColorInfo {
     /// The values as shot (no override).
     pub fn as_shot(&self) -> BrawColorValues { BrawColorParams::default().resolve(self) }
 
-    /// The tone curve a gamma is built from, when the SDK states one.
-    pub fn tone_preset(&self, gamma: &str) -> Option<TonePreset> { self.tone_presets.get(gamma).copied() }
+    /// What generation `gen` offers; the clip's own generation's data
+    /// stands in when the probe has no block for it (an older helper).
+    pub fn for_gen(&self, gen: u16) -> GenColorView<'_> {
+        match self.gens.get(&gen) {
+            Some(g) => GenColorView { gamma: &g.gamma, gamma_list: &g.gamma_list, gamut: &g.gamut, gamut_list: &g.gamut_list, tone_presets: &g.tone_presets },
+            None => GenColorView { gamma: &self.gamma, gamma_list: &self.gamma_list, gamut: &self.gamut, gamut_list: &self.gamut_list, tone_presets: &self.tone_presets },
+        }
+    }
 
-    /// The tone-curve values in effect under `gamma` before any override:
-    /// the gamma's preset, else the clip's stored values (what the Custom
-    /// gamma uses by default).
-    pub fn tone_baseline(&self, gamma: &str) -> TonePreset {
-        self.tone_preset(gamma).unwrap_or(TonePreset {
+    /// The tone curve a gamma is built from under generation `gen`, when
+    /// the SDK states one.
+    pub fn tone_preset(&self, gen: u16, gamma: &str) -> Option<TonePreset> {
+        self.for_gen(gen).tone_presets.get(gamma).copied()
+    }
+
+    /// The tone-curve values in effect under `gamma` (generation `gen`)
+    /// before any override: the gamma's preset, else the clip's stored
+    /// values (what the Custom gamma uses by default).
+    pub fn tone_baseline(&self, gen: u16, gamma: &str) -> TonePreset {
+        self.tone_preset(gen, gamma).unwrap_or(TonePreset {
             contrast: self.contrast.value, saturation: self.saturation.value, midpoint: self.midpoint.value,
             highlights: self.highlights.value, shadows: self.shadows.value,
             black_level: self.black_level.value, white_level: self.white_level.value,
@@ -201,17 +261,38 @@ impl BrawColorParams {
     /// No override set.
     pub fn is_as_shot(&self) -> bool { *self == Self::default() }
 
-    /// The gamma in effect for a clip (the override or the clip's own).
+    /// The colour-science generation in effect (the override or the clip's).
+    pub fn effective_gen(&self, info: &BrawColorInfo) -> u16 {
+        self.color_science_gen.unwrap_or(info.color_science_gen)
+    }
+
+    /// The gamma in effect: the override when the effective generation
+    /// accepts it, else that generation's own gamma (the SDK switches a
+    /// Film clip to "DaVinci Intermediate" under Gen 6, where Film does not
+    /// exist — an override the SDK would reject is not pretended).
     pub fn effective_gamma<'a>(&'a self, info: &'a BrawColorInfo) -> &'a str {
-        self.gamma.as_deref().unwrap_or(&info.gamma)
+        let view = info.for_gen(self.effective_gen(info));
+        match self.gamma.as_deref() {
+            Some(g) if view.accepts_gamma(g) => g,
+            _ => view.gamma,
+        }
+    }
+
+    /// The gamut in effect (same rule as [`Self::effective_gamma`]).
+    pub fn effective_gamut<'a>(&'a self, info: &'a BrawColorInfo) -> &'a str {
+        let view = info.for_gen(self.effective_gen(info));
+        match self.gamut.as_deref() {
+            Some(g) if view.accepts_gamut(g) => g,
+            _ => view.gamut,
+        }
     }
 
     /// The effective values for `info`'s clip.
     pub fn resolve(&self, info: &BrawColorInfo) -> BrawColorValues {
         BrawColorValues {
-            color_science_gen: self.color_science_gen.unwrap_or(info.color_science_gen),
-            gamma: self.gamma.clone().unwrap_or_else(|| info.gamma.clone()),
-            gamut: self.gamut.clone().unwrap_or_else(|| info.gamut.clone()),
+            color_science_gen: self.effective_gen(info),
+            gamma: self.effective_gamma(info).to_string(),
+            gamut: self.effective_gamut(info).to_string(),
             contrast: self.contrast.unwrap_or(info.contrast.value),
             saturation: self.saturation.unwrap_or(info.saturation.value),
             midpoint: self.midpoint.unwrap_or(info.midpoint.value),
@@ -307,19 +388,49 @@ mod tests {
             "wb_kelvin": [5600, 2000, 50000], "wb_tint": [10, -150, 150], "exposure": [0, -5, 5],
             "iso": 800, "iso_list": [125, 160, 200, 250, 320, 400, 500, 640, 800],
             "tone_presets": {"Blackmagic Design Film": [1, 1, 0.383562, 1, 1, 0, 1, 0],
-                             "Blackmagic Design Extended Video": [1.58, 1.4, 0.409008, 1, 1.25, 0, 1, 0]}}"#).expect("parse")
+                             "Blackmagic Design Extended Video": [1.58, 1.4, 0.409008, 1, 1.25, 0, 1, 0]},
+            "gens": {"5": {"gamma": "Blackmagic Design Film", "gamma_list": ["Blackmagic Design Film", "Blackmagic Design Custom", "Rec.709"],
+                           "gamut": "Blackmagic Design", "gamut_list": ["Blackmagic Design", "Rec.709"],
+                           "tone_presets": {"Blackmagic Design Film": [1, 1, 0.383562, 1, 1, 0, 1, 0]}},
+                     "6": {"gamma": "DaVinci Intermediate", "gamma_list": ["Rec.709", "DaVinci Intermediate"],
+                           "gamut": "DaVinci Wide Gamut", "gamut_list": ["Rec.709", "DaVinci Wide Gamut"], "tone_presets": {}}}}"#).expect("parse")
+    }
+
+    #[test]
+    fn generations_change_the_offer() {
+        let i = info();
+        let mut p = BrawColorParams::default();
+        p.gamma = Some("Blackmagic Design Film".into());
+        assert_eq!(p.effective_gamma(&i), "Blackmagic Design Film");
+        assert!(i.for_gen(5).has_custom_gamma());
+        // Gen 6 has no Film: the SDK's own gamma / gamut for that generation take over.
+        p.color_science_gen = Some(6);
+        assert_eq!(p.effective_gamma(&i), "DaVinci Intermediate");
+        assert_eq!(p.effective_gamut(&i), "DaVinci Wide Gamut");
+        assert!(!i.for_gen(6).has_custom_gamma());
+        let v = p.resolve(&i);
+        assert_eq!((v.color_science_gen, v.gamma.as_str()), (6, "DaVinci Intermediate"));
+        // An override both generations accept survives the switch.
+        p.gamma = Some("Rec.709".into());
+        assert_eq!(p.effective_gamma(&i), "Rec.709");
+        // The live diff sends the generation AND the new effective gamma / gamut.
+        let lines = v.changed_lines(&i.as_shot());
+        assert_eq!(lines, vec!["P --csgen 6".to_string(), "P --gamma DaVinci Intermediate".to_string(), "P --gamut DaVinci Wide Gamut".to_string()]);
+        // An unknown generation falls back to the clip-level block.
+        assert_eq!(i.for_gen(9).gamma, "Blackmagic Design Film");
     }
 
     #[test]
     fn tone_presets_and_baseline() {
         let i = info();
-        let ev = i.tone_preset("Blackmagic Design Extended Video").expect("preset");
+        let ev = i.tone_preset(9, "Blackmagic Design Extended Video").expect("preset (clip-level fallback)");
         assert_eq!((ev.contrast, ev.saturation, ev.shadows, ev.video_black_level), (1.58, 1.4, 1.25, false));
-        assert!(i.tone_preset("Rec.709").is_none());
+        assert!(i.tone_preset(5, "Rec.709").is_none());
         // Without a preset the baseline is the clip's stored (flat) values.
-        let b = i.tone_baseline(CUSTOM_GAMMA);
+        let b = i.tone_baseline(5, CUSTOM_GAMMA);
         assert_eq!((b.contrast, b.midpoint), (1.0, 0.5));
-        assert_eq!(i.tone_baseline("Blackmagic Design Film").midpoint, 0.383562);
+        assert_eq!(i.tone_baseline(5, "Blackmagic Design Film").midpoint, 0.383562);
+        assert_eq!(i.tone_baseline(9, "Blackmagic Design Extended Video").contrast, 1.58);
     }
 
     #[test]

@@ -77,6 +77,11 @@ frame.
   Highlight and shadow rolloff are named as such, with help text: they
   shape the knee and toe of the curve only (a subtle effect by design);
   midpoint, contrast and the black / white levels are the level controls.
+  The colour science generation decides what gamma and gamut exist: Gen 6
+  has none of the Blackmagic Design gammas and decodes a Film clip to
+  DaVinci Intermediate / DaVinci Wide Gamut, so the panel lists each
+  generation's own options, drops a choice the new generation rejects, and
+  disables the tone curve where there is no Custom gamma.
   The preview re-decodes the frame on screen as a control moves (the
   zero-copy helper takes the change live), and exports and zoom stills use
   the same settings.
