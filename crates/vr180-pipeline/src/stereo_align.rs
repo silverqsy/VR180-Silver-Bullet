@@ -127,7 +127,7 @@ pub fn measure_stereo_align(
     } else {
         // ── fisheye family: same opener as the portable export, 8-bit ──
         let mut open = crate::fisheye_export::fisheye_export_opener(
-            cfg.source_kind, cfg.fisheye_swap_eyes, 8);
+            cfg.source_kind, cfg.fisheye_swap_eyes, 8, cfg.braw_color.clone());
         let mut decoder: Box<dyn FisheyePairIter> = if cfg.segments.len() > 1 {
             let durations: Vec<f64> = cfg.segments.iter()
                 .map(|p| crate::decode::probe_video_duration_via_moov(p).ok()

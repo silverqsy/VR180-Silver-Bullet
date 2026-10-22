@@ -114,6 +114,11 @@ pub struct BrawInfo {
     /// for this clip (`null` from the helper when unavailable).
     #[serde(default)]
     pub resolution_scales: Option<ResolutionScales>,
+    /// The SDK's colour processing for this clip — current values with
+    /// their ranges and lists ([`crate::BrawColorInfo`]); `None` from an
+    /// older helper, or when frame 0 could not be read.
+    #[serde(default)]
+    pub color: Option<crate::color::BrawColorInfo>,
 }
 
 /// Processed `[width, height]` of a frame (one track) at each decode
@@ -246,6 +251,7 @@ mod info_tests {
         assert_eq!(crate::DecodeScale::for_eye_width_in(Some(&t), false, 6144, 896), crate::DecodeScale::Eighth);
         assert_eq!(crate::DecodeScale::for_eye_width_in(Some(&t), false, 6144, 1920), crate::DecodeScale::Quarter);
         assert_eq!(crate::DecodeScale::for_eye_width_in(Some(&t), false, 6144, 3000), crate::DecodeScale::Half);
+        assert!(info.color.is_none(), "an older helper's probe has no colour block");
         assert_eq!(crate::DecodeScale::for_eye_width_in(Some(&t), false, 6144, 5000), crate::DecodeScale::Full);
         // Nominal rule without a table: 6144/8 = 768 < 896 → quarter.
         assert_eq!(crate::DecodeScale::for_eye_width_in(None, false, 6144, 896), crate::DecodeScale::Quarter);

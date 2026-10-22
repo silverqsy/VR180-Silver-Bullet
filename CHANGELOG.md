@@ -59,6 +59,19 @@ frame.
   pipe: no copy on the CPU at any size, so the reframed view decodes the
   full 12K frame and every zoom level samples native pixels. Measured
   throughput 96 fps at full 12K (26 through the pipe), 328 at quarter.
+- **Blackmagic RAW colour controls.** The Color panel gains a Blackmagic
+  RAW section with the SDK's own development of the sensor data: colour
+  science generation, gamma and gamut (the camera's full lists), ISO,
+  exposure, white balance and tint, highlight recovery, gamut compression,
+  and the tone curve (saturation, contrast, midpoint, highlights, shadows,
+  black and white level, video black level). Every control starts at the
+  clip's own value, a dot marks what was changed, and "Reset to clip"
+  clears the overrides. The app's Tone and White balance stages are hidden
+  for this camera (they duplicate the SDK's); the embedded Film→video LUT
+  switches off automatically under a non-Film gamma and back on for Film.
+  The preview re-decodes the frame on screen as a control moves (the
+  zero-copy helper takes the change live), and exports and zoom stills use
+  the same settings.
 - **BRAW on slow storage.** Play no longer waits for the per-frame shutter
   scan (one full frame per sample, about 2 GB on a long 12K clip): the
   live view uses the clip's shutter range from the probe, and the export

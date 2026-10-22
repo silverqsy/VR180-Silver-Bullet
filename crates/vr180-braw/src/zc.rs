@@ -91,6 +91,18 @@ impl ZcReleaser {
             None => false,
         }
     }
+    /// Change colour options on the live helper: `P <flag> <value>` lines
+    /// ([`crate::BrawColorValues::changed_lines`]). The helper applies them
+    /// once the frames it has in flight are done, so follow with [`seek`]
+    /// (to the frame on screen) to see them. `false` when stdin is gone.
+    ///
+    /// [`seek`]: Self::seek
+    pub fn set_params(&self, lines: &[String]) -> bool {
+        match self.stdin.lock().unwrap().as_mut() {
+            Some(w) => lines.iter().try_for_each(|l| writeln!(w, "{l}")).and_then(|_| w.flush()).is_ok(),
+            None => false,
+        }
+    }
     fn close(&self) {
         *self.stdin.lock().unwrap() = None;
     }

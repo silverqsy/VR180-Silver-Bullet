@@ -143,18 +143,9 @@ pub struct DecodeOptions {
     pub start_frame: Option<u64>,
     /// Number of frames to decode. `None` = to end of clip.
     pub count: Option<u64>,
-    /// `--gamma <BMD_GAMMA_*>` enum name.
-    pub gamma: Option<String>,
-    /// `--gamut <BMD_GAMUT_*>` enum name.
-    pub gamut: Option<String>,
-    /// `--wb <kelvin>` white balance temperature.
-    pub wb: Option<i32>,
-    /// `--tint <int>`.
-    pub tint: Option<i32>,
-    /// `--exposure <ev>` stops above/below.
-    pub exposure: Option<f32>,
-    /// `--iso <int>`.
-    pub iso: Option<i32>,
+    /// The SDK's colour processing overrides (gamma/gamut, white balance,
+    /// exposure/ISO, tone curve, …) as `--decode` flags; as shot by default.
+    pub color: crate::color::BrawColorParams,
     /// `--scale`: decode at a fraction of the recorded size.
     pub scale: DecodeScale,
     /// `--look`: colour preset.
@@ -188,29 +179,14 @@ impl DecodeOptions {
         if let Some(c) = self.count {
             cmd.arg("--count").arg(c.to_string());
         }
-        if let Some(g) = &self.gamma {
-            cmd.arg("--gamma").arg(g);
-        }
-        if let Some(g) = &self.gamut {
-            cmd.arg("--gamut").arg(g);
-        }
-        if let Some(v) = self.wb {
-            cmd.arg("--wb").arg(v.to_string());
-        }
-        if let Some(v) = self.tint {
-            cmd.arg("--tint").arg(v.to_string());
-        }
-        if let Some(v) = self.exposure {
-            cmd.arg("--exposure").arg(format!("{v}"));
-        }
-        if let Some(v) = self.iso {
-            cmd.arg("--iso").arg(v.to_string());
-        }
-        if self.scale != DecodeScale::Full {
-            cmd.arg("--scale").arg(self.scale.arg());
-        }
+        // `--look` goes first: a later flag wins in the helper, so an explicit
+        // gamma/gamut override lands on top of the preset.
         if self.look != DecodeLook::Film {
             cmd.arg("--look").arg(self.look.arg());
+        }
+        self.color.extend_argv(cmd);
+        if self.scale != DecodeScale::Full {
+            cmd.arg("--scale").arg(self.scale.arg());
         }
     }
 }

@@ -23,9 +23,14 @@
 //! `firmware_version`, `video_track_count`, `gyro_sample_count`,
 //! `gyro_sample_rate`, `accel_sample_count`, `accel_sample_rate`,
 //! `audio_sample_count`, `audio_sample_rate`, `audio_bit_depth`,
-//! `audio_channels`, `readout_ms`. See [`BrawInfo`].
+//! `audio_channels`, `readout_ms`, …, and `color` — the SDK's colour
+//! processing (current values, ranges, lists; [`BrawColorInfo`]). See
+//! [`BrawInfo`].
 //!
 //! ### `--decode <file> [--start N] [--count M] [--track T] [--16bit]`
+//! Colour overrides ride along as flags (`--gamma`, `--wb`, `--tc-contrast`,
+//! …; [`BrawColorParams`]); the zero-copy mode also takes them live as
+//! `P <flag> <value>` lines on stdin ([`ZcReleaser::set_params`]).
 //! - JSON header on **stderr** (one line, includes `dual_stream`,
 //!   `bit_depth`, and per-track sizes if multi-video).
 //! - Raw RGBA pixel data on **stdout** (BGRA from older helper builds;
@@ -50,6 +55,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod audio;
+pub mod color;
 pub mod decoder;
 pub mod gyro;
 pub mod info;
@@ -59,6 +65,7 @@ pub mod shutters;
 pub mod zc;
 
 pub use audio::{extract_audio_to_tempfile, extract_audio_to_wav, BrawAudioHeader, TempWavPath};
+pub use color::{BrawColorInfo, BrawColorParams, BrawColorValues, Ranged};
 pub use decoder::{BrawDecoder, DecodeLook, DecodeScale};
 pub use lut::extract_embedded_lut;
 pub use shutters::BrawShutters;

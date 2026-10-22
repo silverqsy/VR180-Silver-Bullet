@@ -170,10 +170,53 @@ public:
     std::map<uint64_t, FrameShutter> results;  // every completed frame, by index
     std::mutex mutex;
     double fps = 0;
+    // --info: frame 0's processing attributes (white balance, exposure, ISO
+    // with their ranges, the ISO list) when `wantColor` is set for the job.
+    struct FrameColor {
+        bool valid = false;
+        uint32_t kelvin = 0, kelvinMin = 0, kelvinMax = 0;
+        int tint = 0, tintMin = 0, tintMax = 0;
+        float exposure = 0, exposureMin = 0, exposureMax = 0;
+        uint32_t iso = 0;
+        std::vector<uint32_t> isoList;
+    };
+    bool wantColor = false;
+    FrameColor color;
+    void read_frame_color(IBlackmagicRawFrame* frame) {
+        IBlackmagicRawFrameProcessingAttributes* fa = nullptr;
+        if (frame->QueryInterface(IID_IBlackmagicRawFrameProcessingAttributes, (void**)&fa) != S_OK || !fa) return;
+        FrameColor c; bool ro = false;
+        Variant v; Variant lo; Variant hi;
+        VariantInit(&v); VariantInit(&lo); VariantInit(&hi);
+        if (fa->GetFrameAttribute(blackmagicRawFrameProcessingAttributeWhiteBalanceKelvin, &v) == S_OK && v.vt == blackmagicRawVariantTypeU32) c.kelvin = v.uintVal;
+        if (fa->GetFrameAttributeRange(blackmagicRawFrameProcessingAttributeWhiteBalanceKelvin, &lo, &hi, &ro) == S_OK && lo.vt == blackmagicRawVariantTypeU32) { c.kelvinMin = lo.uintVal; c.kelvinMax = hi.uintVal; }
+        VariantClear(&v); VariantClear(&lo); VariantClear(&hi);
+        VariantInit(&v); VariantInit(&lo); VariantInit(&hi);
+        if (fa->GetFrameAttribute(blackmagicRawFrameProcessingAttributeWhiteBalanceTint, &v) == S_OK && v.vt == blackmagicRawVariantTypeS16) c.tint = v.iVal;
+        if (fa->GetFrameAttributeRange(blackmagicRawFrameProcessingAttributeWhiteBalanceTint, &lo, &hi, &ro) == S_OK && lo.vt == blackmagicRawVariantTypeS16) { c.tintMin = lo.iVal; c.tintMax = hi.iVal; }
+        VariantClear(&v); VariantClear(&lo); VariantClear(&hi);
+        VariantInit(&v); VariantInit(&lo); VariantInit(&hi);
+        if (fa->GetFrameAttribute(blackmagicRawFrameProcessingAttributeExposure, &v) == S_OK && v.vt == blackmagicRawVariantTypeFloat32) c.exposure = v.fltVal;
+        if (fa->GetFrameAttributeRange(blackmagicRawFrameProcessingAttributeExposure, &lo, &hi, &ro) == S_OK && lo.vt == blackmagicRawVariantTypeFloat32) { c.exposureMin = lo.fltVal; c.exposureMax = hi.fltVal; }
+        VariantClear(&v); VariantClear(&lo); VariantClear(&hi);
+        VariantInit(&v);
+        if (fa->GetFrameAttribute(blackmagicRawFrameProcessingAttributeISO, &v) == S_OK && v.vt == blackmagicRawVariantTypeU32) c.iso = v.uintVal;
+        VariantClear(&v);
+        uint32_t n = 0;
+        if (fa->GetISOList(nullptr, &n, &ro) == S_OK && n > 0) {
+            c.isoList.resize(n);
+            if (fa->GetISOList(c.isoList.data(), &n, &ro) != S_OK) c.isoList.clear();
+        }
+        c.valid = c.kelvin > 0;
+        fa->Release();
+        std::lock_guard<std::mutex> lock(mutex);
+        color = c;
+    }
     void ReadComplete(IBlackmagicRawJob* readJob, HRESULT result, IBlackmagicRawFrame* frame) override {
         FrameShutter fs; uint64_t idx = 0; bool haveIdx = false;
         if (result == S_OK && frame) {
             haveIdx = frame->GetFrameIndex(&idx) == S_OK;
+            if (wantColor) read_frame_color(frame);
             Variant v; VariantInit(&v);
             CFStringRef k = CFStringCreateWithCString(NULL, "shutter_value", kCFStringEncodingUTF8);
             if (frame->GetMetadata(k, &v) == S_OK && v.vt == blackmagicRawVariantTypeString)
@@ -213,11 +256,13 @@ struct BrawProcessingParams {
     float toneCurveMidpoint = -1;
     float toneCurveHighlights = -1;
     float toneCurveShadows = -1;
-    float toneCurveBlackLevel = -1;
+    float toneCurveBlackLevel = -9999; // -9999 = don't override (its range is -1..1)
     float toneCurveWhiteLevel = -1;
     int highlightRecovery = -1;     // 0 or 1, -1 = don't override
     float analogGain = -1;          // -1 = don't override
     int gamutCompression = -1;      // 0 or 1, -1 = don't override
+    int colorScienceGen = -1;       // 4 / 5 / 6, -1 = as shot
+    int toneCurveVideoBlackLevel = -1; // 0 or 1, -1 = don't override
     // Frame-level
     int whiteBalanceKelvin = -1;    // -1 = don't override
     int whiteBalanceTint = -9999;   // -9999 = don't override
@@ -241,6 +286,7 @@ static bool apply_look_preset(const std::string& look) {
 }
 
 static std::string variant_repr(const Variant& v);  // defined with --meta below
+static int apply_color_option(const std::string& arg, const std::string& val);  // defined with main below
 
 static const char* attr_name(BlackmagicRawClipProcessingAttribute attr) {
     switch (attr) {
@@ -296,67 +342,59 @@ static bool set_clip_string_attr(IBlackmagicRawClipProcessingAttributes* attrs, 
     return true;
 }
 
-// Apply clip-level overrides to a cloned clip processing attributes object.
-// Returns the cloned+modified object (caller must Release), or nullptr if no overrides.
-static IBlackmagicRawClipProcessingAttributes* create_clip_overrides(IBlackmagicRawClip* clip) {
-    // Check if we have any clip-level overrides
-    bool hasOverrides = !g_procParams.gamma.empty() || !g_procParams.gamut.empty() ||
-        !g_procParams.postLutMode.empty() ||
-        g_procParams.toneCurveContrast >= 0 || g_procParams.toneCurveSaturation >= 0 ||
-        g_procParams.toneCurveMidpoint >= 0 || g_procParams.toneCurveHighlights >= 0 ||
-        g_procParams.toneCurveShadows >= 0 || g_procParams.toneCurveBlackLevel >= 0 ||
-        g_procParams.toneCurveWhiteLevel >= 0 || g_procParams.highlightRecovery >= 0 ||
-        g_procParams.analogGain >= 0 || g_procParams.gamutCompression >= 0;
-    if (!hasOverrides) return nullptr;
-
-    // Clone the clip's current processing attributes
-    IBlackmagicRawClipProcessingAttributes* attrs = nullptr;
-    if (clip->CloneClipProcessingAttributes(&attrs) != S_OK || !attrs)
-        return nullptr;
-
+// Apply every clip-level override in g_procParams to a clip processing
+// attributes object (the clip's own — the defaults for later decodes — or
+// a clone handed to the decode jobs). Fields at their "don't override"
+// sentinel are left alone, so an as-shot value stays the clip's.
+static void apply_clip_params(IBlackmagicRawClipProcessingAttributes* attrs) {
+    auto setFloat = [&](BlackmagicRawClipProcessingAttribute attr, float val, float unset) {
+        if (val <= unset) return;
+        Variant v; VariantInit(&v); v.vt = blackmagicRawVariantTypeFloat32; v.fltVal = val;
+        attrs->SetClipAttribute(attr, &v);
+    };
+    auto setU16 = [&](BlackmagicRawClipProcessingAttribute attr, int val) {
+        if (val < 0) return;
+        Variant v; VariantInit(&v); v.vt = blackmagicRawVariantTypeU16; v.uiVal = (uint16_t)val;
+        attrs->SetClipAttribute(attr, &v);
+    };
+    // Colour science first: it decides what the gamma / gamut lists hold.
+    setU16(blackmagicRawClipProcessingAttributeColorScienceGen, g_procParams.colorScienceGen);
     set_clip_string_attr(attrs, blackmagicRawClipProcessingAttributeGamma, g_procParams.gamma);
     set_clip_string_attr(attrs, blackmagicRawClipProcessingAttributeGamut, g_procParams.gamut);
     set_clip_string_attr(attrs, blackmagicRawClipProcessingAttributePost3DLUTMode, g_procParams.postLutMode);
-    if (g_procParams.toneCurveContrast >= 0) {
-        Variant v; v.vt = blackmagicRawVariantTypeFloat32; v.fltVal = g_procParams.toneCurveContrast;
-        attrs->SetClipAttribute(blackmagicRawClipProcessingAttributeToneCurveContrast, &v);
-    }
-    if (g_procParams.toneCurveSaturation >= 0) {
-        Variant v; v.vt = blackmagicRawVariantTypeFloat32; v.fltVal = g_procParams.toneCurveSaturation;
-        attrs->SetClipAttribute(blackmagicRawClipProcessingAttributeToneCurveSaturation, &v);
-    }
-    if (g_procParams.toneCurveMidpoint >= 0) {
-        Variant v; v.vt = blackmagicRawVariantTypeFloat32; v.fltVal = g_procParams.toneCurveMidpoint;
-        attrs->SetClipAttribute(blackmagicRawClipProcessingAttributeToneCurveMidpoint, &v);
-    }
-    if (g_procParams.toneCurveHighlights >= 0) {
-        Variant v; v.vt = blackmagicRawVariantTypeFloat32; v.fltVal = g_procParams.toneCurveHighlights;
-        attrs->SetClipAttribute(blackmagicRawClipProcessingAttributeToneCurveHighlights, &v);
-    }
-    if (g_procParams.toneCurveShadows >= 0) {
-        Variant v; v.vt = blackmagicRawVariantTypeFloat32; v.fltVal = g_procParams.toneCurveShadows;
-        attrs->SetClipAttribute(blackmagicRawClipProcessingAttributeToneCurveShadows, &v);
-    }
-    if (g_procParams.toneCurveBlackLevel >= 0) {
-        Variant v; v.vt = blackmagicRawVariantTypeFloat32; v.fltVal = g_procParams.toneCurveBlackLevel;
-        attrs->SetClipAttribute(blackmagicRawClipProcessingAttributeToneCurveBlackLevel, &v);
-    }
-    if (g_procParams.toneCurveWhiteLevel >= 0) {
-        Variant v; v.vt = blackmagicRawVariantTypeFloat32; v.fltVal = g_procParams.toneCurveWhiteLevel;
-        attrs->SetClipAttribute(blackmagicRawClipProcessingAttributeToneCurveWhiteLevel, &v);
-    }
-    if (g_procParams.highlightRecovery >= 0) {
-        Variant v; v.vt = blackmagicRawVariantTypeU16; v.uiVal = (uint16_t)g_procParams.highlightRecovery;
-        attrs->SetClipAttribute(blackmagicRawClipProcessingAttributeHighlightRecovery, &v);
-    }
-    if (g_procParams.analogGain >= 0) {
-        Variant v; v.vt = blackmagicRawVariantTypeFloat32; v.fltVal = g_procParams.analogGain;
-        attrs->SetClipAttribute(blackmagicRawClipProcessingAttributeAnalogGain, &v);
-    }
-    if (g_procParams.gamutCompression >= 0) {
-        Variant v; v.vt = blackmagicRawVariantTypeU16; v.uiVal = (uint16_t)g_procParams.gamutCompression;
-        attrs->SetClipAttribute(blackmagicRawClipProcessingAttributeGamutCompressionEnable, &v);
-    }
+    setFloat(blackmagicRawClipProcessingAttributeToneCurveContrast, g_procParams.toneCurveContrast, -1);
+    setFloat(blackmagicRawClipProcessingAttributeToneCurveSaturation, g_procParams.toneCurveSaturation, -1);
+    setFloat(blackmagicRawClipProcessingAttributeToneCurveMidpoint, g_procParams.toneCurveMidpoint, -1);
+    setFloat(blackmagicRawClipProcessingAttributeToneCurveHighlights, g_procParams.toneCurveHighlights, -1);
+    setFloat(blackmagicRawClipProcessingAttributeToneCurveShadows, g_procParams.toneCurveShadows, -1);
+    setFloat(blackmagicRawClipProcessingAttributeToneCurveBlackLevel, g_procParams.toneCurveBlackLevel, -9000);
+    setFloat(blackmagicRawClipProcessingAttributeToneCurveWhiteLevel, g_procParams.toneCurveWhiteLevel, -1);
+    setU16(blackmagicRawClipProcessingAttributeToneCurveVideoBlackLevel, g_procParams.toneCurveVideoBlackLevel);
+    setU16(blackmagicRawClipProcessingAttributeHighlightRecovery, g_procParams.highlightRecovery);
+    setFloat(blackmagicRawClipProcessingAttributeAnalogGain, g_procParams.analogGain, -1);
+    setU16(blackmagicRawClipProcessingAttributeGamutCompressionEnable, g_procParams.gamutCompression);
+}
+
+// True when any clip-level override is set.
+static bool have_clip_overrides() {
+    return !g_procParams.gamma.empty() || !g_procParams.gamut.empty() ||
+        !g_procParams.postLutMode.empty() || g_procParams.colorScienceGen >= 0 ||
+        g_procParams.toneCurveContrast >= 0 || g_procParams.toneCurveSaturation >= 0 ||
+        g_procParams.toneCurveMidpoint >= 0 || g_procParams.toneCurveHighlights >= 0 ||
+        g_procParams.toneCurveShadows >= 0 || g_procParams.toneCurveBlackLevel > -9000 ||
+        g_procParams.toneCurveWhiteLevel >= 0 || g_procParams.toneCurveVideoBlackLevel >= 0 ||
+        g_procParams.highlightRecovery >= 0 || g_procParams.analogGain >= 0 ||
+        g_procParams.gamutCompression >= 0;
+}
+
+// Apply clip-level overrides to a cloned clip processing attributes object.
+// Returns the cloned+modified object (caller must Release), or nullptr if no overrides.
+static IBlackmagicRawClipProcessingAttributes* create_clip_overrides(IBlackmagicRawClip* clip) {
+    if (!have_clip_overrides()) return nullptr;
+    IBlackmagicRawClipProcessingAttributes* attrs = nullptr;
+    if (clip->CloneClipProcessingAttributes(&attrs) != S_OK || !attrs)
+        return nullptr;
+    apply_clip_params(attrs);
     return attrs;  // caller must Release()
 }
 
@@ -364,6 +402,12 @@ static void apply_frame_overrides(IBlackmagicRawFrame* frame) {
     IBlackmagicRawFrameProcessingAttributes* attrs = nullptr;
     if (frame->QueryInterface(IID_IBlackmagicRawFrameProcessingAttributes, (void**)&attrs) != S_OK || !attrs)
         return;
+    static const bool debug = getenv("BRAW_HELPER_DEBUG") != nullptr;
+    if (debug) {
+        uint64_t idx = 0; frame->GetFrameIndex(&idx);
+        fprintf(stderr, "note: frame %llu overrides: wb %d tint %d exposure %g iso %d\n", (unsigned long long)idx,
+                g_procParams.whiteBalanceKelvin, g_procParams.whiteBalanceTint, (double)g_procParams.exposure, g_procParams.iso);
+    }
 
     if (g_procParams.whiteBalanceKelvin > 0) {
         Variant v; v.vt = blackmagicRawVariantTypeU32; v.uintVal = (uint32_t)g_procParams.whiteBalanceKelvin;
@@ -814,12 +858,14 @@ static int do_info(const char* path) {
     // Shutter, sampled at five frames (cinema cameras hold it within a take;
     // the spread is reported so a varying one shows).
     double shutterMin = 0, shutterMax = 0; std::string shutterText;
+    ShutterCallback::FrameColor frameColor;
     {
         ShutterCallback scb; scb.fps = frameRate;
         ctx.codec->SetCallback(&scb);
         uint64_t idx[5] = {0, frameCount / 4, frameCount / 2, (frameCount * 3) / 4, frameCount ? frameCount - 1 : 0};
         for (int k = 0; k < 5; k++) {
             scb.done.store(false); scb.out = FrameShutter();
+            scb.wantColor = (k == 0);
             IBlackmagicRawJob* job = nullptr;
             if (ctx.clip->CreateJobReadFrame(idx[k], &job) != S_OK || !job) continue;
             if (job->Submit() != S_OK) { job->Release(); continue; }
@@ -830,7 +876,80 @@ static int do_info(const char* path) {
                 if (k == 0) shutterText = scb.out.text;
             }
         }
+        frameColor = scb.color;
         ctx.codec->SetCallback(nullptr);
+    }
+
+    // The SDK's colour-processing attributes: the clip's current values with
+    // their ranges / accepted lists, and frame 0's white balance, exposure
+    // and ISO — what the app's Blackmagic RAW colour section edits (its
+    // sliders show these as-shot values and span these ranges).
+    std::string colorJson = "null";
+    {
+        IBlackmagicRawClipProcessingAttributes* ca = nullptr;
+        if (frameColor.valid && ctx.clip->QueryInterface(IID_IBlackmagicRawClipProcessingAttributes, (void**)&ca) == S_OK && ca) {
+            auto f32Triple = [&](BlackmagicRawClipProcessingAttribute a) -> std::string {   // "[value, min, max]"
+                float val = 0, mn = 0, mx = 0; bool ro = false;
+                Variant v; VariantInit(&v);
+                if (ca->GetClipAttribute(a, &v) == S_OK && v.vt == blackmagicRawVariantTypeFloat32) val = v.fltVal;
+                VariantClear(&v);
+                Variant lo; Variant hi; VariantInit(&lo); VariantInit(&hi);
+                if (ca->GetClipAttributeRange(a, &lo, &hi, &ro) == S_OK && lo.vt == blackmagicRawVariantTypeFloat32) { mn = lo.fltVal; mx = hi.fltVal; }
+                else { mn = val; mx = val; }
+                VariantClear(&lo); VariantClear(&hi);
+                char b[96]; snprintf(b, sizeof b, "[%.6g, %.6g, %.6g]", val, mn, mx); return b;
+            };
+            auto u16Val = [&](BlackmagicRawClipProcessingAttribute a) -> int {
+                Variant v; VariantInit(&v); int r = 0;
+                if (ca->GetClipAttribute(a, &v) == S_OK && v.vt == blackmagicRawVariantTypeU16) r = v.uiVal;
+                VariantClear(&v); return r;
+            };
+            auto strVal = [&](BlackmagicRawClipProcessingAttribute a) -> std::string {
+                Variant v; VariantInit(&v); std::string s;
+                if (ca->GetClipAttribute(a, &v) == S_OK && v.vt == blackmagicRawVariantTypeString) s = cfstr_to_string(v.bstrVal);
+                VariantClear(&v); return s;
+            };
+            auto listJson = [&](BlackmagicRawClipProcessingAttribute a) -> std::string {
+                uint32_t n = 0; bool ro = false;
+                if (ca->GetClipAttributeList(a, nullptr, &n, &ro) != S_OK || n == 0) return "[]";
+                std::vector<Variant> items(n);
+                for (auto& it : items) VariantInit(&it);
+                if (ca->GetClipAttributeList(a, items.data(), &n, &ro) != S_OK) return "[]";
+                std::string out = "[";
+                for (uint32_t i = 0; i < n; i++) {
+                    if (i) out += ", ";
+                    if (items[i].vt == blackmagicRawVariantTypeString) out += "\"" + json_escape(cfstr_to_string(items[i].bstrVal)) + "\"";
+                    else out += variant_repr(items[i]);
+                    VariantClear(&items[i]);
+                }
+                return out + "]";
+            };
+            std::string isoList = "[";
+            for (size_t i = 0; i < frameColor.isoList.size(); i++) { if (i) isoList += ", "; isoList += std::to_string(frameColor.isoList[i]); }
+            isoList += "]";
+            char fb[256];
+            snprintf(fb, sizeof fb, "\"wb_kelvin\": [%u, %u, %u], \"wb_tint\": [%d, %d, %d], \"exposure\": [%.6g, %.6g, %.6g], \"iso\": %u",
+                     frameColor.kelvin, frameColor.kelvinMin, frameColor.kelvinMax, frameColor.tint, frameColor.tintMin, frameColor.tintMax,
+                     frameColor.exposure, frameColor.exposureMin, frameColor.exposureMax, frameColor.iso);
+            colorJson = "{\"color_science_gen\": " + std::to_string(u16Val(blackmagicRawClipProcessingAttributeColorScienceGen))
+                + ", \"color_science_gen_list\": " + listJson(blackmagicRawClipProcessingAttributeColorScienceGen)
+                + ", \"gamma\": \"" + json_escape(strVal(blackmagicRawClipProcessingAttributeGamma)) + "\""
+                + ", \"gamma_list\": " + listJson(blackmagicRawClipProcessingAttributeGamma)
+                + ", \"gamut\": \"" + json_escape(strVal(blackmagicRawClipProcessingAttributeGamut)) + "\""
+                + ", \"gamut_list\": " + listJson(blackmagicRawClipProcessingAttributeGamut)
+                + ", \"contrast\": " + f32Triple(blackmagicRawClipProcessingAttributeToneCurveContrast)
+                + ", \"saturation\": " + f32Triple(blackmagicRawClipProcessingAttributeToneCurveSaturation)
+                + ", \"midpoint\": " + f32Triple(blackmagicRawClipProcessingAttributeToneCurveMidpoint)
+                + ", \"highlights\": " + f32Triple(blackmagicRawClipProcessingAttributeToneCurveHighlights)
+                + ", \"shadows\": " + f32Triple(blackmagicRawClipProcessingAttributeToneCurveShadows)
+                + ", \"black_level\": " + f32Triple(blackmagicRawClipProcessingAttributeToneCurveBlackLevel)
+                + ", \"white_level\": " + f32Triple(blackmagicRawClipProcessingAttributeToneCurveWhiteLevel)
+                + ", \"video_black_level\": " + std::to_string(u16Val(blackmagicRawClipProcessingAttributeToneCurveVideoBlackLevel))
+                + ", \"highlight_recovery\": " + std::to_string(u16Val(blackmagicRawClipProcessingAttributeHighlightRecovery))
+                + ", \"gamut_compression\": " + std::to_string(u16Val(blackmagicRawClipProcessingAttributeGamutCompressionEnable))
+                + ", " + fb + ", \"iso_list\": " + isoList + "}";
+            ca->Release();
+        }
     }
 
     double readoutMs = 0;
@@ -896,6 +1015,7 @@ static int do_info(const char* path) {
     printf("  \"viewing_bmdgen\": %.0f,\n", viewingGen);
     printf("  \"embedded_lut\": \"%s\",\n", json_escape(lutName).c_str());
     printf("  \"post_3dlut_mode\": \"%s\",\n", json_escape(get_metadata_string(ctx.clip, "post_3dlut_mode")).c_str());
+    printf("  \"color\": %s,\n", colorJson.c_str());
     printf("  \"pipeline\": \"%s\",\n", pipeline.c_str());
     printf("  \"zerocopy\": true,\n");
     if (pipeline == "metal") printf("  \"gpu_device\": \"%s\",\n", gpuDevice.c_str());
@@ -1144,6 +1264,11 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
     if (!pool) return fail();
     cb.zc = pool;
     cb.dual = is_dual;
+    // The clip's own processing attributes: a live colour change ("P") goes
+    // here (the defaults for later decodes) and to the cloned overrides the
+    // decode jobs take.
+    IBlackmagicRawClipProcessingAttributes* clipAttrs = nullptr;
+    if (ctx.clip->QueryInterface(IID_IBlackmagicRawClipProcessingAttributes, (void**)&clipAttrs) != S_OK) clipAttrs = nullptr;
 
     const uint64_t emitted = (end - start + step - 1) / step;
     fprintf(stderr, "{\"width\": %u, \"height\": %u, \"frames\": %llu, \"dual_stream\": %s, \"bit_depth\": 8, \"format\": \"rgba\", \"step\": %llu",
@@ -1159,21 +1284,31 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
 
     // stdin: "R <slot>" returns a slot, "S <frame> <gen>" seeks (in-flight
     // frames are discarded, "K <gen>" acknowledges, decoding resumes at
-    // <frame>), EOF = the app is gone. The helper stays alive at the end
+    // <frame>), "P <flag> <value…>" changes a colour option (the --decode
+    // flags: --gamma, --wb, --tc-contrast, …; applied once the frames in
+    // flight are done — the app follows it with an "S" for the frame on
+    // screen), EOF = the app is gone. The helper stays alive at the end
     // of the clip ("E" on stdout) until a seek or EOF.
     std::mutex fm; std::condition_variable fcv;
     std::vector<uint32_t> free_slots;
+    std::vector<std::pair<std::string, std::string>> pending_params;   // (flag, value)
     for (uint32_t s = 0; s < slots; s++) free_slots.push_back(s);
     bool app_gone = false;
     bool seek_pending = false; uint64_t seek_frame = 0; uint32_t seek_gen = 0;
     std::thread reader([&]() {
-        char line[128];
+        char line[1024];
         while (fgets(line, sizeof line, stdin)) {
             unsigned s = 0; unsigned long long f = 0; unsigned g = 0;
             if (sscanf(line, "R %u", &s) == 1 && s < slots) {
                 std::lock_guard<std::mutex> lk(fm); free_slots.push_back(s);
             } else if (sscanf(line, "S %llu %u", &f, &g) == 2) {
                 std::lock_guard<std::mutex> lk(fm); seek_pending = true; seek_frame = f; seek_gen = g;
+            } else if (line[0] == 'P' && line[1] == ' ') {
+                std::string rest(line + 2);
+                while (!rest.empty() && (rest.back() == '\n' || rest.back() == '\r')) rest.pop_back();
+                const size_t sp = rest.find(' ');
+                std::string flag = rest.substr(0, sp), value = sp == std::string::npos ? std::string() : rest.substr(sp + 1);
+                std::lock_guard<std::mutex> lk(fm); pending_params.emplace_back(std::move(flag), std::move(value));
             }
             fcv.notify_all();
         }
@@ -1183,8 +1318,8 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
     // A free slot, or false when a seek or the app's departure interrupts.
     auto take_slot = [&](uint32_t* slot) -> bool {
         std::unique_lock<std::mutex> lk(fm);
-        fcv.wait(lk, [&] { return app_gone || seek_pending || !free_slots.empty(); });
-        if (app_gone || seek_pending || free_slots.empty()) return false;
+        fcv.wait(lk, [&] { return app_gone || seek_pending || !pending_params.empty() || !free_slots.empty(); });
+        if (app_gone || seek_pending || !pending_params.empty() || free_slots.empty()) return false;
         *slot = free_slots.back(); free_slots.pop_back();
         return true;
     };
@@ -1219,20 +1354,36 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
         return cb.wait(frame).status == S_OK;
     };
     for (;;) {
-        bool gone, seeking;
-        { std::lock_guard<std::mutex> lk(fm); gone = app_gone; seeking = seek_pending; }
+        bool gone, seeking, recolor;
+        { std::lock_guard<std::mutex> lk(fm); gone = app_gone; seeking = seek_pending; recolor = !pending_params.empty(); }
         if (gone || rc != 0) break;
-        if (seeking) {
-            // Drop everything decoding for the old position; their slots were
-            // never reported, so they are ours to free.
+        if (seeking || recolor) {
+            // Drop everything decoding for the old position / look; their
+            // slots were never reported, so they are ours to free.
             for (auto& [f, slot] : inflight) { wait_frame(f); give_back(slot); }
             inflight.clear();
-            uint64_t f; uint32_t g;
-            { std::lock_guard<std::mutex> lk(fm); f = seek_frame; g = seek_gen; seek_pending = false; }
-            next = std::min(f, end);
-            eof_reported = false;
-            printf("K %u\n", g);
-            fflush(stdout);
+            if (recolor) {
+                // Nothing is in flight now: the frame-level fields are read by
+                // ReadComplete on the SDK's threads, the clip-level ones go to
+                // the attribute objects the decode jobs take.
+                std::vector<std::pair<std::string, std::string>> params;
+                { std::lock_guard<std::mutex> lk(fm); params.swap(pending_params); }
+                for (auto& [flag, value] : params) {
+                    if (apply_color_option(flag, value) <= 0) fprintf(stderr, "WARNING: ignored P %s %s\n", flag.c_str(), value.c_str());
+                    else fprintf(stderr, "note: colour %s %s\n", flag.c_str(), value.c_str());
+                }
+                if (clipAttrs) apply_clip_params(clipAttrs);
+                if (!clipOverrides) { clipOverrides = create_clip_overrides(ctx.clip); cb.clipOverrides = clipOverrides; }
+                else apply_clip_params(clipOverrides);
+            }
+            if (seeking) {
+                uint64_t f; uint32_t g;
+                { std::lock_guard<std::mutex> lk(fm); f = seek_frame; g = seek_gen; seek_pending = false; }
+                next = std::min(f, end);
+                eof_reported = false;
+                printf("K %u\n", g);
+                fflush(stdout);
+            }
             continue;
         }
         if (inflight.empty()) {
@@ -1240,7 +1391,7 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
                 if (!eof_reported) { printf("E\n"); fflush(stdout); eof_reported = true; }
                 // Idle until a seek or the app leaves.
                 std::unique_lock<std::mutex> lk(fm);
-                fcv.wait(lk, [&] { return app_gone || seek_pending; });
+                fcv.wait(lk, [&] { return app_gone || seek_pending || !pending_params.empty(); });
                 continue;
             }
             top_up();
@@ -1264,6 +1415,7 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
     reader.join();
     cb.zc = nullptr;
     zc_pool_destroy(pool);
+    if (clipAttrs) clipAttrs->Release();
     if (clipOverrides) clipOverrides->Release();
     return rc;
 }
@@ -1281,25 +1433,7 @@ static int do_decode(const char* path, uint64_t start, uint64_t count, int track
     {
         IBlackmagicRawClipProcessingAttributes* attrs = nullptr;
         if (ctx.clip->QueryInterface(IID_IBlackmagicRawClipProcessingAttributes, (void**)&attrs) == S_OK && attrs) {
-            auto setFloat = [&](uint32_t attr, float val) {
-                if (val >= 0) { Variant v; v.vt = blackmagicRawVariantTypeFloat32; v.fltVal = val; attrs->SetClipAttribute((BlackmagicRawClipProcessingAttribute)attr, &v); }
-            };
-            auto setU16 = [&](uint32_t attr, int val) {
-                if (val >= 0) { Variant v; v.vt = blackmagicRawVariantTypeU16; v.uiVal = (uint16_t)val; attrs->SetClipAttribute((BlackmagicRawClipProcessingAttribute)attr, &v); }
-            };
-            set_clip_string_attr(attrs, blackmagicRawClipProcessingAttributeGamma, g_procParams.gamma);
-            set_clip_string_attr(attrs, blackmagicRawClipProcessingAttributeGamut, g_procParams.gamut);
-            set_clip_string_attr(attrs, blackmagicRawClipProcessingAttributePost3DLUTMode, g_procParams.postLutMode);
-            setFloat(0x74636F6E, g_procParams.toneCurveContrast);
-            setFloat(0x74736174, g_procParams.toneCurveSaturation);
-            setFloat(0x746D6964, g_procParams.toneCurveMidpoint);
-            setFloat(0x74686968, g_procParams.toneCurveHighlights);
-            setFloat(0x74736861, g_procParams.toneCurveShadows);
-            setFloat(0x74626C6B, g_procParams.toneCurveBlackLevel);
-            setFloat(0x74776974, g_procParams.toneCurveWhiteLevel);
-            setU16(0x686C7279, g_procParams.highlightRecovery);
-            setFloat(0x6761696E, g_procParams.analogGain);
-            setU16(0x67616365, g_procParams.gamutCompression);
+            apply_clip_params(attrs);
             attrs->Release();
         }
     }
@@ -1782,6 +1916,34 @@ static int do_audio(const char* path) {
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
+// A colour-processing option (`--gamma S`, `--wb K`, …) from the command
+// line or from the zero-copy "P <flag> <value>" command. 1 = applied, 0 =
+// not a colour option, -1 = bad value. Later values win.
+static int apply_color_option(const std::string& arg, const std::string& val) {
+    try {
+        if (arg == "--gamma") g_procParams.gamma = val;
+        else if (arg == "--gamut") g_procParams.gamut = val;
+        else if (arg == "--csgen") g_procParams.colorScienceGen = std::stoi(val);
+        else if (arg == "--wb") g_procParams.whiteBalanceKelvin = std::stoi(val);
+        else if (arg == "--tint") g_procParams.whiteBalanceTint = std::stoi(val);
+        else if (arg == "--exposure") g_procParams.exposure = std::stof(val);
+        else if (arg == "--iso") g_procParams.iso = std::stoi(val);
+        else if (arg == "--tc-contrast") g_procParams.toneCurveContrast = std::stof(val);
+        else if (arg == "--tc-saturation") g_procParams.toneCurveSaturation = std::stof(val);
+        else if (arg == "--tc-midpoint") g_procParams.toneCurveMidpoint = std::stof(val);
+        else if (arg == "--tc-highlights") g_procParams.toneCurveHighlights = std::stof(val);
+        else if (arg == "--tc-shadows") g_procParams.toneCurveShadows = std::stof(val);
+        else if (arg == "--tc-black-level") g_procParams.toneCurveBlackLevel = std::stof(val);
+        else if (arg == "--tc-white-level") g_procParams.toneCurveWhiteLevel = std::stof(val);
+        else if (arg == "--tc-video-black") g_procParams.toneCurveVideoBlackLevel = std::stoi(val);
+        else if (arg == "--highlight-recovery") g_procParams.highlightRecovery = std::stoi(val);
+        else if (arg == "--analog-gain") g_procParams.analogGain = std::stof(val);
+        else if (arg == "--gamut-compression") g_procParams.gamutCompression = std::stoi(val);
+        else return 0;
+    } catch (const std::exception&) { return -1; }
+    return 1;
+}
+
 int main(int argc, const char* argv[]) {
     if (argc < 3) {
         std::cerr << "Usage:" << std::endl;
@@ -1796,7 +1958,7 @@ int main(int argc, const char* argv[]) {
         std::cerr << "              [--gamma S] [--gamut S] [--wb K] [--tint T] [--exposure EV] [--iso N]" << std::endl;
         std::cerr << "              [--tc-contrast|--tc-saturation|--tc-midpoint|--tc-highlights|--tc-shadows|" << std::endl;
         std::cerr << "               --tc-black-level|--tc-white-level F] [--highlight-recovery 0|1]" << std::endl;
-        std::cerr << "              [--analog-gain F] [--gamut-compression 0|1]" << std::endl;
+        std::cerr << "              [--analog-gain F] [--gamut-compression 0|1] [--csgen 4|5|6] [--tc-video-black 0|1]" << std::endl;
         std::cerr << "  braw_helper --gyro  <file.braw>  (JSON header on stderr, float32 samples on stdout)" << std::endl;
         std::cerr << "  braw_helper --audio <file.braw>  (JSON header on stderr, WAV on stdout)" << std::endl;
         std::cerr << "  braw_helper --meta  <file.braw> [--frame N]   (all clip + frame metadata)" << std::endl;
@@ -1818,9 +1980,10 @@ int main(int argc, const char* argv[]) {
         // Key-value pairs (need next arg as value)
         if (i + 1 >= argc) break;
         std::string val = argv[i + 1];
-        if (arg == "--gamma") g_procParams.gamma = val;
-        else if (arg == "--gamut") g_procParams.gamut = val;
-        else if (arg == "--look") {
+        const int cr = apply_color_option(arg, val);
+        if (cr < 0) { std::cerr << "ERROR: bad value for " << arg << ": " << val << std::endl; return 1; }
+        if (cr > 0) { i++; continue; }
+        if (arg == "--look") {
             if (!apply_look_preset(val)) { std::cerr << "ERROR: unknown --look " << val << " (film|video|extended|rec709)" << std::endl; return 1; }
         }
         else if (arg == "--scale") {
@@ -1832,20 +1995,6 @@ int main(int argc, const char* argv[]) {
         }
         else if (arg == "--step") { g_step = std::max<uint64_t>(1, std::stoull(val)); }
         else if (arg == "--zerocopy") { g_zcSlots = (uint32_t)std::stoul(val); }
-        else if (arg == "--wb") g_procParams.whiteBalanceKelvin = std::stoi(val);
-        else if (arg == "--tint") g_procParams.whiteBalanceTint = std::stoi(val);
-        else if (arg == "--exposure") g_procParams.exposure = std::stof(val);
-        else if (arg == "--iso") g_procParams.iso = std::stoi(val);
-        else if (arg == "--tc-contrast") g_procParams.toneCurveContrast = std::stof(val);
-        else if (arg == "--tc-saturation") g_procParams.toneCurveSaturation = std::stof(val);
-        else if (arg == "--tc-midpoint") g_procParams.toneCurveMidpoint = std::stof(val);
-        else if (arg == "--tc-highlights") g_procParams.toneCurveHighlights = std::stof(val);
-        else if (arg == "--tc-shadows") g_procParams.toneCurveShadows = std::stof(val);
-        else if (arg == "--tc-black-level") g_procParams.toneCurveBlackLevel = std::stof(val);
-        else if (arg == "--tc-white-level") g_procParams.toneCurveWhiteLevel = std::stof(val);
-        else if (arg == "--highlight-recovery") g_procParams.highlightRecovery = std::stoi(val);
-        else if (arg == "--analog-gain") g_procParams.analogGain = std::stof(val);
-        else if (arg == "--gamut-compression") g_procParams.gamutCompression = std::stoi(val);
         else continue;  // unknown key-value pair, don't skip value
         i++;  // skip the value arg
     }

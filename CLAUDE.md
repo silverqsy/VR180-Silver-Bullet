@@ -1393,6 +1393,61 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      frame at 2048²); the 2:1 canvas pad is < 1 ms/frame and +20 % upload
      on C006 only. Open: eighth via `resolution_scales`, `--step`, RGBA out,
      cached output textures.
+     **SDK colour controls (2026-10-22, user: "暴露 braw helper 里自带的
+     调色选项，隐去 color tab 里的重复功能")**: the Color panel shows a
+     "Blackmagic RAW" section for BRAW clips (`draw_braw_color_section`,
+     app.rs) instead of the Tone (CDL) and White balance sections, which
+     duplicate the SDK's development and are hidden + forced neutral in
+     `finish_load` for this camera (Matching Eyes and the 3D LUT stay).
+     Controls = the SDK's clip attributes (`ColorScienceGen` 4/5/6 — Gen 6
+     exists in SDK 6.0 —, `Gamma` / `Gamut` from the SDK's own lists: 17 /
+     16 entries on the PYXIS, tone curve `Contrast` 0.002–1.998,
+     `Saturation` 0–4, `Midpoint` 0–1, `Highlights` 0–1.998, `Shadows`
+     0.002–2, `BlackLevel` −1–1, `WhiteLevel` 0–2, `VideoBlackLevel`,
+     `HighlightRecovery`, `GamutCompressionEnable`) + frame attributes
+     (`WhiteBalanceKelvin` 2000–50000, `WhiteBalanceTint` −150–150 — the
+     C006 clip's own tint is 10, so "as shot" ≠ 0 —, `Exposure` ±5 stops,
+     `ISO` from `GetISOList`: 125…3200). Lens shading / distortion / CA are
+     read-only 0 on this camera and not shown. Data flow: `--info` gains a
+     `color` block (values as `[value, min, max]`, lists; frame 0 read via
+     the shutter callback's `read_frame_color`) → `BrawInfo.color:
+     Option<BrawColorInfo>` → `ClipInfo.braw_color` (Arc) for the panel;
+     the user's overrides are `Settings.braw_color: BrawColorParams` (all
+     `Option`, `None` = as shot; persisted per kind like the rest), sliders
+     show the EFFECTIVE value and mark overrides with "•", "Reset to clip"
+     clears them. Decode: `DecodeOptions.color` → `--decode` flags (the old
+     per-field options gamma/gamut/wb/tint/exposure/iso are gone; new flags
+     `--csgen N`, `--tc-video-black 0|1`; the black-level sentinel became
+     −9999 because −1 is a legal black level); the helper's argv and the
+     zero-copy stdin command `P <flag> <value…>` share one parser
+     (`apply_color_option`), `apply_clip_params` applies the clip-level
+     fields to the clip's attributes AND to the cloned per-job overrides.
+     Live path: `FisheyePairIter::apply_braw_color` (default no-op;
+     Segmented/Denoising forward; `BrawFisheyeIter` restarts the helper at
+     the next pull; `BrawZcIter` resolves overrides against the clip's
+     values and sends only the CHANGED effective values as `P` lines —
+     `BrawColorValues::changed_lines` — so a cleared override sends the
+     clip's own value back; the helper drains its in-flight frames, applies,
+     then the app's `S` re-decodes the frame on screen); the GUI worker
+     detects `settings.braw_color` changes in its step-4 block and does
+     `IterCmd::BrawColor` + a seek to the displayed frame (same gen
+     bookkeeping as a seek). Stills: `DetailCache` requests carry the
+     params and the cache key includes them; export: `FisheyeExportConfig.
+     braw_color`. The embedded "Gen 5 Film to Extended Video" LUT expects
+     the Film gamma: the panel switches it off when another gamma is chosen
+     and back on for Film (`BrawColorInfo::is_film_gamma`), with a note
+     under the LUT section + a "Use the clip's embedded LUT" button.
+     **Verified (`examples/braw_color_check`, C006 frame 600, eighth)**:
+     live `P` exposure +2 / Rec.709 gamma+gamut / tone curve + WB + ISO are
+     BYTE-IDENTICAL to a fresh helper started with the same flags (both
+     eyes), resetting every override is byte-identical to the as-shot
+     frame, and the pipe iterator after `apply_braw_color` + seek equals the
+     zero-copy frame. Trap met on the way: a regex that was meant to delete
+     the old argv colour lines in `main` matched the SAME lines inside the
+     new shared parser first — frame-level `P` options were "ignored" while
+     argv still worked (clip-level ones did apply): always assert the
+     anchor's location, not just its count. `BRAW_HELPER_DEBUG=1` prints the
+     per-frame overrides the helper applies.
    - **File facts**: gyro+accel 1022 Hz, rad/s and m/s², NO timestamps
      (sample 0 = frame 0 start, rate is the clock); no lens metadata at all
      (`lens_type` etc. empty, distortion arrays zero); shutter is AUTO and

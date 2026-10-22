@@ -261,6 +261,13 @@ pub trait FisheyePairIter {
     /// such a source again. `pts_s` always carries the true frame time.
     fn source_decimation(&self) -> u32 { 1 }
 
+    /// Blackmagic RAW only: change the SDK's colour processing (colour
+    /// science, gamma/gamut, white balance, exposure/ISO, tone curve) for
+    /// the frames that follow. Sources without such a stage ignore it. The
+    /// caller re-seeks to the frame on screen afterwards so it is decoded
+    /// again with the new look.
+    fn apply_braw_color(&mut self, _params: &vr180_braw::BrawColorParams) -> Result<()> { Ok(()) }
+
     /// Decode-forward to the first frame at/after `target_pts_s` (within half
     /// a frame `dt`), returning ONLY that frame. Call after `seek`.
     ///
@@ -305,6 +312,8 @@ pub struct SegmentedFisheyeIter {
     cur_idx: usize,
     cur: Box<dyn FisheyePairIter>,
     opener: Box<dyn FnMut(&Path) -> Result<Box<dyn FisheyePairIter>>>,
+    /// The last colour change, re-applied to every segment opened later.
+    braw_color: Option<vr180_braw::BrawColorParams>,
 }
 
 impl SegmentedFisheyeIter {
@@ -332,7 +341,17 @@ impl SegmentedFisheyeIter {
             cur_idx: 0,
             cur,
             opener,
+            braw_color: None,
         })
+    }
+
+    /// Open segment `idx` (the colour change, if any, goes with it).
+    fn open_segment(&mut self, idx: usize) -> Result<()> {
+        let path = self.seg_paths[idx].clone();
+        self.cur = (self.opener)(&path)?;
+        self.cur_idx = idx;
+        if let Some(p) = &self.braw_color { self.cur.apply_braw_color(p)?; }
+        Ok(())
     }
 
     /// Total clip duration across all segments (seconds).
@@ -350,9 +369,8 @@ impl FisheyePairIter for SegmentedFisheyeIter {
             if self.cur_idx + 1 >= self.seg_paths.len() {
                 return Ok(None);
             }
-            self.cur_idx += 1;
-            let path = self.seg_paths[self.cur_idx].clone();
-            self.cur = (self.opener)(&path)?;
+            let next = self.cur_idx + 1;
+            self.open_segment(next)?;
         }
     }
 
@@ -360,15 +378,17 @@ impl FisheyePairIter for SegmentedFisheyeIter {
         let t = target_s.clamp(0.0, self.total_dur_s);
         let idx = self.seg_start_s.iter().rposition(|&s| s <= t).unwrap_or(0);
         if idx != self.cur_idx {
-            let path = self.seg_paths[idx].clone();
-            self.cur = (self.opener)(&path)?;
-            self.cur_idx = idx;
+            self.open_segment(idx)?;
         }
         self.cur.seek(t - self.seg_start_s[idx])
     }
 
     fn eye_dims(&self) -> (u32, u32) { self.cur.eye_dims() }
     fn source_decimation(&self) -> u32 { self.cur.source_decimation() }
+    fn apply_braw_color(&mut self, params: &vr180_braw::BrawColorParams) -> Result<()> {
+        self.braw_color = Some(params.clone());
+        self.cur.apply_braw_color(params)
+    }
 }
 
 // ── SBS fisheye (single ffmpeg stream, split horizontally) ─────────
@@ -3887,13 +3907,14 @@ impl BrawFisheyeIter {
         mono: bool,
         step: u32,
         frame_limit: u32,
+        color: &vr180_braw::BrawColorParams,
     ) -> Result<Self> {
         // `VR180_BRAW_PIPELINE=cpu|metal|auto` forces the helper's decode
         // pipeline for A/B tests; unset = the helper's default (Metal when
         // the SDK offers a device, else the CPU).
         let step = step.max(1);
         let opts = vr180_braw::decoder::DecodeOptions {
-            bit_16: bit_depth >= 10, scale, look,
+            bit_16: bit_depth >= 10, scale, look, color: color.clone(),
             pipeline: std::env::var("VR180_BRAW_PIPELINE").ok().filter(|p| !p.is_empty()),
             step: (step > 1).then_some(step),
             ..Default::default()
@@ -3928,9 +3949,10 @@ impl BrawFisheyeIter {
         look: vr180_braw::DecodeLook,
         swap_eyes: bool,
         mono: bool,
+        color: &vr180_braw::BrawColorParams,
     ) -> Self {
         let opts = vr180_braw::decoder::DecodeOptions {
-            bit_16: bit_depth >= 10, scale, look,
+            bit_16: bit_depth >= 10, scale, look, color: color.clone(),
             pipeline: std::env::var("VR180_BRAW_PIPELINE").ok().filter(|p| !p.is_empty()),
             count: Some(1),
             ..Default::default()
@@ -4049,6 +4071,15 @@ impl FisheyePairIter for BrawFisheyeIter {
     }
 
     fn source_decimation(&self) -> u32 { self.step as u32 }
+
+    fn apply_braw_color(&mut self, params: &vr180_braw::BrawColorParams) -> Result<()> {
+        if self.opts.color == *params { return Ok(()); }
+        self.opts.color = params.clone();
+        // A fresh helper with the new flags at the next pull (the caller
+        // seeks to the frame on screen first).
+        self.decoder = None;
+        Ok(())
+    }
 }
 
 // ── Blackmagic RAW zero-copy (macOS) ────────────────────────────────────
@@ -4100,6 +4131,11 @@ pub struct BrawZcIter {
     /// (their slots returned at once).
     pending_seek: Option<u32>,
     seek_gen: u32,
+    /// The clip's colour processing (from the probe), to turn overrides
+    /// into the effective values the live helper is told about.
+    color_info: Option<vr180_braw::BrawColorInfo>,
+    /// What the running helper currently has (the effective values).
+    sent_color: Option<vr180_braw::BrawColorValues>,
 }
 
 #[cfg(target_os = "macos")]
@@ -4116,10 +4152,11 @@ impl BrawZcIter {
         mono: bool,
         step: u32,
         slots: u32,
+        color: &vr180_braw::BrawColorParams,
     ) -> Result<Self> {
         let step = step.max(1);
         let opts = vr180_braw::decoder::DecodeOptions {
-            bit_16: false, scale, look,
+            bit_16: false, scale, look, color: color.clone(),
             pipeline: std::env::var("VR180_BRAW_PIPELINE").ok().filter(|p| !p.is_empty()),
             step: (step > 1).then_some(step),
             ..Default::default()
@@ -4130,6 +4167,7 @@ impl BrawZcIter {
             decoder: None, textures: Vec::new(), releaser: None,
             eye_w: 0, eye_h: 0, dt_s, frame_idx: 0, frame_count: info.frame_count, step: step as u64,
             pending_seek: None, seek_gen: 0,
+            color_info: info.color.clone(), sent_color: None,
         };
         it.start_at(0)?;
         Ok(it)
@@ -4163,6 +4201,8 @@ impl BrawZcIter {
         self.releaser = Some(dec.releaser());
         self.frame_idx = frame;
         self.pending_seek = None;
+        // A fresh helper starts from the flags = these effective values.
+        self.sent_color = self.color_info.as_ref().map(|i| self.opts.color.resolve(i));
         self.decoder = Some(dec);
         Ok(())
     }
@@ -4241,6 +4281,29 @@ impl FisheyePairIter for BrawZcIter {
     fn eye_dims(&self) -> (u32, u32) { (self.eye_w, self.eye_h) }
 
     fn source_decimation(&self) -> u32 { self.step as u32 }
+
+    fn apply_braw_color(&mut self, params: &vr180_braw::BrawColorParams) -> Result<()> {
+        if self.opts.color == *params { return Ok(()); }
+        self.opts.color = params.clone();
+        // The live helper keeps its pool: tell it the EFFECTIVE values that
+        // changed (so a cleared override goes back to the clip's own). The
+        // caller's seek that follows re-decodes the frame on screen. Without
+        // the clip's values (an older helper's probe), restart the helper
+        // with the new flags instead.
+        let live = match (&self.color_info, self.sent_color.as_ref(), self.releaser.as_ref(), self.decoder.is_some()) {
+            (Some(info), Some(prev), Some(r), true) => {
+                let now = params.resolve(info);
+                let lines = now.changed_lines(prev);
+                tracing::info!("braw zero-copy: colour change → {} option(s) to the live helper", lines.len());
+                let ok = lines.is_empty() || r.set_params(&lines);
+                if ok { self.sent_color = Some(now); }
+                ok
+            }
+            _ => false,
+        };
+        if !live { self.decoder = None; }
+        Ok(())
+    }
 }
 
 /// Rows the square canvas adds above (and below) a recorded eye of
@@ -4423,6 +4486,9 @@ impl FisheyePairIter for DenoisingFisheyeIter {
         (self.eye_w, self.eye_h)
     }
     fn source_decimation(&self) -> u32 { self.inner.source_decimation() }
+    fn apply_braw_color(&mut self, params: &vr180_braw::BrawColorParams) -> Result<()> {
+        self.inner.apply_braw_color(params)
+    }
 }
 
 /// Suppress "unused" warnings on the public symbol — every consumer

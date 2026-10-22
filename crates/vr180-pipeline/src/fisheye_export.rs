@@ -185,6 +185,10 @@ pub struct FisheyeExportConfig {
     pub fisheye_cx_norm_right: f32,
     pub fisheye_cy_norm_right: f32,
     pub fisheye_swap_eyes: bool,
+    /// Blackmagic RAW: the SDK's colour processing overrides (colour science,
+    /// gamma/gamut, white balance, exposure/ISO, tone curve); as shot by
+    /// default. Mirrors `Settings.braw_color`; other sources ignore it.
+    pub braw_color: vr180_braw::BrawColorParams,
     /// Generic side-by-side `.mp4` / `.mov` sources only. `true`: each half
     /// is a raw fisheye image — dewarp it with the lens fields above.
     /// `false` (default): the file is an already-dewarped VR180 half-equirect
@@ -751,6 +755,7 @@ pub(crate) fn fisheye_export_opener(
     kind: SourceKind,
     swap_eyes: bool,
     bit_depth: u8,
+    braw_color: vr180_braw::BrawColorParams,
 ) -> Box<dyn FnMut(&std::path::Path) -> Result<Box<dyn FisheyePairIter>>> {
     let bd = if bit_depth >= 10 { 16u8 } else { 8u8 };
     Box::new(move |p: &std::path::Path| -> Result<Box<dyn FisheyePairIter>> {
@@ -781,7 +786,7 @@ pub(crate) fn fisheye_export_opener(
                 // and the resolvers swap lens_a/lens_b with the same flag.
                 let layout = crate::braw_imu::braw_layout(p, &info);
                 Box::new(BrawFisheyeIter::new_with_options(
-                    p, &info, bd, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, 1, 0)?)
+                    p, &info, bd, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, 1, 0, &braw_color)?)
             }
             other => return Err(Error::Ffmpeg(format!(
                 "export_fisheye non-fisheye source: {other:?}"))),
@@ -1247,9 +1252,9 @@ fn export_fisheye_inner(
             cfg.segments.len(), durations.iter().sum::<f64>());
         Box::new(SegmentedFisheyeIter::new(
             &cfg.segments, &durations,
-            fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth))?)
+            fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone()))?)
     } else {
-        let mut open = fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth);
+        let mut open = fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone());
         open(&cfg.source_path)?
     };
 

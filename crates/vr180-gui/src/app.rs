@@ -832,6 +832,28 @@ fn tr(en: &'static str) -> &'static str {
         "Radius" => "半径",
         "Reset tone" => "重置影调",
         "Reset color" => "重置色彩",
+        // Blackmagic RAW (the SDK's colour processing)
+        "Reset to clip" => "恢复素材原值",
+        "Developed by the Blackmagic RAW SDK from the sensor data — these replace the Tone and White balance controls for this camera. A dot marks a value changed from the clip's."
+            => "由 Blackmagic RAW SDK 直接从传感器数据解算——对此机型它们取代“影调”和“白平衡”控件。带点的项表示已偏离素材原值。",
+        "Color science" => "色彩科学",
+        "Gamut" => "色域",
+        "Exposure (stops)" => "曝光（档）",
+        "Highlight recovery" => "高光恢复",
+        "Gamut compression" => "色域压缩",
+        "Tone curve" => "色调曲线",
+        "Contrast" => "对比度",
+        "Midpoint" => "中点",
+        "Highlights" => "高光",
+        "Shadows" => "阴影",
+        "Black level" => "黑电平",
+        "White level" => "白电平",
+        "Video black level" => "视频黑电平",
+        "The clip's Film→video LUT fits the Film gamma only — it is switched off while another gamma is selected above."
+            => "素材自带的 Film→视频 LUT 只适用于 Film 伽马——上方选择其他伽马时会自动关闭。",
+        "Use the clip's embedded Film→video LUT" => "使用素材内嵌的 Film→视频 LUT",
+        "Blackmagic RAW colour controls need the clip probe's colour block — rebuild the helper (helpers/braw/build_braw.sh)."
+            => "Blackmagic RAW 调色控件需要探测结果中的颜色信息——请重新编译 helper（helpers/braw/build_braw.sh）。",
         // Matching Eyes (inter-eye trim)
         "Matching Eyes" => "双目匹配",
         "Fixes a difference between the two lenses — CT, Tint and Exposure apply oppositely to each eye."
@@ -1098,6 +1120,12 @@ struct ClipInfo {
     /// Kandao QooCam with its 4-channel microphone track (mixed to stereo
     /// for playback and export — `audio::QuadEncoder`).
     quad_audio: bool,
+    /// Blackmagic RAW: the SDK's colour processing as shot (values, ranges,
+    /// lists) for the Color panel's Blackmagic RAW section.
+    braw_color: Option<std::sync::Arc<vr180_braw::BrawColorInfo>>,
+    /// Blackmagic RAW: the clip's embedded display LUT written out as a
+    /// `.cube` (auto-applied; switched off under a non-Film gamma).
+    braw_lut: Option<String>,
 }
 
 /// An async clip load in flight (see `App::load_pending`). The worker
@@ -1154,6 +1182,9 @@ struct LoadedMeta {
     /// Blackmagic RAW: the clip's embedded display LUT written out as a
     /// `.cube` by the helper (off the UI thread), to auto-apply.
     braw_lut: Option<String>,
+    /// Blackmagic RAW: the SDK's colour processing as shot (the probe's
+    /// `color` block), for the Color panel.
+    braw_color: Option<vr180_braw::BrawColorInfo>,
 }
 
 impl App {
@@ -1712,6 +1743,7 @@ impl App {
             fisheye_cy_norm_right: settings.fisheye_cy_norm_right,
             // Effective swap: manual toggle XOR upside-down mount.
             fisheye_swap_eyes: settings.effective_swap_eyes(),
+            braw_color: settings.braw_color.clone(),
             trim_in_s: settings.trim_in_s,
             trim_out_s: settings.trim_out_s,
             color_stack,
@@ -3277,13 +3309,20 @@ impl App {
                     Err(e) => { tracing::warn!("load: BRAW embedded LUT: {e}"); None }
                 })
         } else { None };
+        // …and the SDK's colour processing as shot (probe memoised: no re-read).
+        let braw_color = if source_kind == vr180_pipeline::SourceKind::BlackmagicRaw {
+            vr180_braw::BrawInfo::probe(&path).ok().and_then(|i| i.color)
+        } else { None };
+        if source_kind == vr180_pipeline::SourceKind::BlackmagicRaw && braw_color.is_none() {
+            tracing::warn!("load: BRAW probe has no colour block — the Blackmagic RAW colour section needs a rebuilt helper");
+        }
         Ok(LoadedMeta {
             token, path, preserve_clip_settings, source_kind,
             width: probe.width, height: probe.height, fps: probe.fps,
             duration_sec, frame_count, segments,
             cori_count, grav_count, srot_ms,
             detected_rs_mode, fisheye_eye_w, fisheye_eye_h,
-            eac_cal_dim, foa_audio, quad_audio, hlg: probe.hlg, braw_lut,
+            eac_cal_dim, foa_audio, quad_audio, hlg: probe.hlg, braw_lut, braw_color,
         })
     }
 
@@ -3393,6 +3432,19 @@ impl App {
                 _ => crate::decoder::default_rs_readout_ms(),
             };
         }
+        // Blackmagic RAW: the SDK's own development controls (Color ▸
+        // Blackmagic RAW) replace the Tone and White balance stages for this
+        // camera — those sections are hidden, so keep them neutral here or an
+        // invisible setting would shape the image. The embedded Film→video
+        // LUT fits the Film gamma only: off while an override picks another.
+        if source_kind == vr180_pipeline::SourceKind::BlackmagicRaw {
+            let s = &mut self.settings;
+            s.lift = 0.0; s.gamma = 1.0; s.gain = 1.0; s.shadow = 0.0; s.highlight = 0.0;
+            s.temperature = 0.0; s.tint = 0.0; s.saturation = 1.0;
+            if let (Some(g), Some(lut)) = (s.braw_color.gamma.as_deref(), meta.braw_lut.as_deref()) {
+                if !vr180_braw::BrawColorInfo::is_film_gamma(g) && s.lut_path == lut { s.lut_path.clear(); }
+            }
+        }
         self.last_pushed_settings = self.settings.clone();
 
         let dims = vr180_core::eac::Dims::new(meta.width, meta.height);
@@ -3409,6 +3461,8 @@ impl App {
             eac_cal_dim: meta.eac_cal_dim,
             foa_audio: meta.foa_audio,
             quad_audio: meta.quad_audio,
+            braw_color: meta.braw_color.map(std::sync::Arc::new),
+            braw_lut: meta.braw_lut.clone(),
         });
         self.loaded_path = Some(meta.path);
 
@@ -5871,37 +5925,52 @@ impl App {
         let is_still = matches!(kind, Some(k) if k.is_still());
         // Still + DNG: only what the DNG carries as metadata is offered.
         let dng_mode = is_still && self.export_opts.still_format == StillFormatChoice::LinearDng;
+        // Blackmagic RAW: the SDK develops the sensor data — its colour
+        // science, gamma/gamut, white balance, exposure/ISO and tone curve
+        // replace the Tone and White balance stages for this camera (kept
+        // neutral in `finish_load`), so those sections are not shown.
+        let is_braw = matches!(kind, Some(vr180_pipeline::SourceKind::BlackmagicRaw));
+        let braw_info = if is_braw { self.clip.as_ref().and_then(|c| c.braw_color.clone()) } else { None };
+        let braw_lut = if is_braw { self.clip.as_ref().and_then(|c| c.braw_lut.clone()) } else { None };
         let s = &mut self.settings;
 
-        // CDL: lift / gamma / gain / shadow / highlight.
-        ui.label(RichText::new(tr("Tone (CDL)")).strong());
-        ui.add(egui::Slider::new(&mut s.lift, -1.0..=1.0)
-            .text(tr("Lift")).fixed_decimals(2));
-        ui.add(egui::Slider::new(&mut s.gamma, 0.2..=3.0)
-            .text(tr("Gamma")).fixed_decimals(2));
-        ui.add(egui::Slider::new(&mut s.gain, 0.2..=3.0)
-            .text(tr("Gain")).fixed_decimals(2));
-        ui.add(egui::Slider::new(&mut s.shadow, -1.0..=1.0)
-            .text(tr("Shadow")).fixed_decimals(2));
-        ui.add(egui::Slider::new(&mut s.highlight, -1.0..=1.0)
-            .text(tr("Highlight")).fixed_decimals(2));
-        if ui.button(tr("Reset tone")).clicked() {
-            s.lift = 0.0; s.gamma = 1.0; s.gain = 1.0;
-            s.shadow = 0.0; s.highlight = 0.0;
-        }
+        if let Some(info) = braw_info.as_deref() {
+            draw_braw_color_section(ui, s, info, braw_lut.as_deref());
+        } else if is_braw {
+            ui.label(RichText::new(tr(
+                "Blackmagic RAW colour controls need the clip probe's colour block — rebuild the helper (helpers/braw/build_braw.sh)."
+            )).small().color(Color32::GRAY));
+        } else {
+            // CDL: lift / gamma / gain / shadow / highlight.
+            ui.label(RichText::new(tr("Tone (CDL)")).strong());
+            ui.add(egui::Slider::new(&mut s.lift, -1.0..=1.0)
+                .text(tr("Lift")).fixed_decimals(2));
+            ui.add(egui::Slider::new(&mut s.gamma, 0.2..=3.0)
+                .text(tr("Gamma")).fixed_decimals(2));
+            ui.add(egui::Slider::new(&mut s.gain, 0.2..=3.0)
+                .text(tr("Gain")).fixed_decimals(2));
+            ui.add(egui::Slider::new(&mut s.shadow, -1.0..=1.0)
+                .text(tr("Shadow")).fixed_decimals(2));
+            ui.add(egui::Slider::new(&mut s.highlight, -1.0..=1.0)
+                .text(tr("Highlight")).fixed_decimals(2));
+            if ui.button(tr("Reset tone")).clicked() {
+                s.lift = 0.0; s.gamma = 1.0; s.gain = 1.0;
+                s.shadow = 0.0; s.highlight = 0.0;
+            }
 
-        ui.separator();
+            ui.separator();
 
-        // White balance + saturation.
-        ui.label(RichText::new(tr("White balance")).strong());
-        ui.add(egui::Slider::new(&mut s.temperature, -1.0..=1.0)
-            .text(tr("Temperature")).fixed_decimals(2));
-        ui.add(egui::Slider::new(&mut s.tint, -1.0..=1.0)
-            .text(tr("Tint")).fixed_decimals(2));
-        ui.add(egui::Slider::new(&mut s.saturation, 0.0..=2.0)
-            .text(tr("Saturation")).fixed_decimals(2));
-        if ui.button(tr("Reset color")).clicked() {
-            s.temperature = 0.0; s.tint = 0.0; s.saturation = 1.0;
+            // White balance + saturation.
+            ui.label(RichText::new(tr("White balance")).strong());
+            ui.add(egui::Slider::new(&mut s.temperature, -1.0..=1.0)
+                .text(tr("Temperature")).fixed_decimals(2));
+            ui.add(egui::Slider::new(&mut s.tint, -1.0..=1.0)
+                .text(tr("Tint")).fixed_decimals(2));
+            ui.add(egui::Slider::new(&mut s.saturation, 0.0..=2.0)
+                .text(tr("Saturation")).fixed_decimals(2));
+            if ui.button(tr("Reset color")).clicked() {
+                s.temperature = 0.0; s.tint = 0.0; s.saturation = 1.0;
+            }
         }
 
         ui.separator();
@@ -6008,6 +6077,13 @@ impl App {
                     s.lut_path.clear();
                 }
             });
+            if let Some(info) = braw_info.as_deref() {
+                if !vr180_braw::BrawColorInfo::is_film_gamma(s.braw_color.effective_gamma(info)) {
+                    ui.label(RichText::new(tr(
+                        "The clip's Film→video LUT fits the Film gamma only — it is switched off while another gamma is selected above."
+                    )).small().color(Color32::GRAY));
+                }
+            }
             // Quick re-apply of the embedded log→709 LUT for THIS source
             // (autoloaded on open; offered here in case it was cleared). Only
             // the source-matching builtin is shown — no DJI LUT on a `.360`,
@@ -6042,6 +6118,14 @@ impl App {
                 {
                     if ui.button(tr("Use built-in HLG→709 (QooCam HDR)")).clicked() {
                         s.lut_path = crate::decoder::BUILTIN_HLG_LUT_PATH.to_string();
+                        s.lut_intensity = 1.0;
+                    }
+                }
+                Some(vr180_pipeline::SourceKind::BlackmagicRaw)
+                    if braw_lut.as_deref().map_or(false, |l| s.lut_path != l) =>
+                {
+                    if ui.button(tr("Use the clip's embedded Film→video LUT")).clicked() {
+                        s.lut_path = braw_lut.clone().unwrap_or_default();
                         s.lut_intensity = 1.0;
                     }
                 }
@@ -6802,6 +6886,136 @@ fn draw_eye_lens(
 /// slider. The trick: after egui maps the cursor position to a value, we
 /// keep only `1/zoom` of this frame's change, so the value creeps at
 /// `1/zoom` of cursor speed.
+/// Color panel ▸ Blackmagic RAW: the SDK's colour processing. Every control
+/// shows the EFFECTIVE value — the clip's own until the user moves it, then
+/// the override (marked with a dot); "Reset to clip" clears every override.
+/// The embedded Film→video LUT follows the gamma: on for the Film log, off
+/// for any other, since it expects Film code values as its input.
+fn draw_braw_color_section(
+    ui: &mut egui::Ui,
+    s: &mut crate::decoder::Settings,
+    info: &vr180_braw::BrawColorInfo,
+    braw_lut: Option<&str>,
+) {
+    use vr180_braw::Ranged;
+    fn mark(label: &str, overridden: bool) -> String {
+        if overridden { format!("{label} •") } else { label.to_string() }
+    }
+    // A float slider over the SDK's range, showing the effective value.
+    fn f32_slider(ui: &mut egui::Ui, field: &mut Option<f32>, r: Ranged<f32>, label: &str, decimals: usize) {
+        let mut v = field.unwrap_or(r.value);
+        if ui.add(egui::Slider::new(&mut v, r.min..=r.max).text(mark(label, field.is_some())).fixed_decimals(decimals)).changed() {
+            *field = Some(v);
+        }
+    }
+    fn flag(ui: &mut egui::Ui, field: &mut Option<bool>, as_shot: u16, label: &str) {
+        let mut v = field.unwrap_or(as_shot != 0);
+        if ui.checkbox(&mut v, mark(label, field.is_some())).changed() { *field = Some(v); }
+    }
+
+    let p = &mut s.braw_color;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Blackmagic RAW").strong());
+        if !p.is_as_shot() && ui.small_button(tr("Reset to clip")).clicked() { *p = Default::default(); }
+    });
+    ui.label(RichText::new(tr(
+        "Developed by the Blackmagic RAW SDK from the sensor data — these replace the Tone and White balance controls for this camera. A dot marks a value changed from the clip's."
+    )).small().color(Color32::GRAY));
+
+    // Colour science / gamma / gamut.
+    let gamma_before = p.effective_gamma(info).to_string();
+    ui.horizontal(|ui| {
+        ui.label(tr("Color science"));
+        let cur = p.color_science_gen.unwrap_or(info.color_science_gen);
+        egui::ComboBox::from_id_source("braw_csgen")
+            .selected_text(mark(&format!("Gen {cur}"), p.color_science_gen.is_some()))
+            .show_ui(ui, |ui| {
+                for g in &info.color_science_gen_list {
+                    if ui.selectable_label(*g == cur, format!("Gen {g}")).clicked() { p.color_science_gen = Some(*g); }
+                }
+            });
+    });
+    ui.horizontal(|ui| {
+        ui.label(tr("Gamma"));
+        let cur = p.gamma.clone().unwrap_or_else(|| info.gamma.clone());
+        egui::ComboBox::from_id_source("braw_gamma")
+            .selected_text(mark(&cur, p.gamma.is_some())).width(220.0)
+            .show_ui(ui, |ui| {
+                for g in &info.gamma_list {
+                    if ui.selectable_label(*g == cur, g).clicked() { p.gamma = Some(g.clone()); }
+                }
+            });
+    });
+    ui.horizontal(|ui| {
+        ui.label(tr("Gamut"));
+        let cur = p.gamut.clone().unwrap_or_else(|| info.gamut.clone());
+        egui::ComboBox::from_id_source("braw_gamut")
+            .selected_text(mark(&cur, p.gamut.is_some())).width(220.0)
+            .show_ui(ui, |ui| {
+                for g in &info.gamut_list {
+                    if ui.selectable_label(*g == cur, g).clicked() { p.gamut = Some(g.clone()); }
+                }
+            });
+    });
+    // The embedded display LUT expects the Film log: follow the gamma.
+    let gamma_after = p.effective_gamma(info).to_string();
+    if gamma_after != gamma_before {
+        if let Some(lut) = braw_lut {
+            if vr180_braw::BrawColorInfo::is_film_gamma(&gamma_after) {
+                if s.lut_path.is_empty() { s.lut_path = lut.to_string(); s.lut_intensity = 1.0; }
+            } else if s.lut_path == lut {
+                s.lut_path.clear();
+            }
+        }
+    }
+    let p = &mut s.braw_color;
+
+    ui.add_space(4.0);
+    // Exposure: ISO from the camera's steps, exposure in stops, white balance.
+    ui.horizontal(|ui| {
+        ui.label("ISO");
+        let cur = p.iso.unwrap_or(info.iso);
+        egui::ComboBox::from_id_source("braw_iso")
+            .selected_text(mark(&cur.to_string(), p.iso.is_some()))
+            .show_ui(ui, |ui| {
+                for i in &info.iso_list {
+                    if ui.selectable_label(*i == cur, i.to_string()).clicked() { p.iso = Some(*i); }
+                }
+            });
+    });
+    f32_slider(ui, &mut p.exposure, info.exposure, tr("Exposure (stops)"), 2);
+    {
+        // Kelvin on a log scale (2000–50000 K); tint as the camera counts it.
+        let r = info.wb_kelvin;
+        let mut k = p.wb_kelvin.unwrap_or(r.value) as f32;
+        if ui.add(egui::Slider::new(&mut k, r.min as f32..=r.max as f32).logarithmic(true)
+            .text(mark(tr("White balance"), p.wb_kelvin.is_some())).fixed_decimals(0).suffix(" K")).changed()
+        {
+            p.wb_kelvin = Some(k.round().clamp(r.min as f32, r.max as f32) as u32);
+        }
+        let r = info.wb_tint;
+        let mut t = p.wb_tint.unwrap_or(r.value);
+        if ui.add(egui::Slider::new(&mut t, r.min..=r.max).text(mark(tr("Tint"), p.wb_tint.is_some()))).changed() {
+            p.wb_tint = Some(t);
+        }
+    }
+    ui.horizontal(|ui| {
+        flag(ui, &mut p.highlight_recovery, info.highlight_recovery, tr("Highlight recovery"));
+        flag(ui, &mut p.gamut_compression, info.gamut_compression, tr("Gamut compression"));
+    });
+
+    ui.add_space(4.0);
+    ui.label(RichText::new(tr("Tone curve")).strong());
+    f32_slider(ui, &mut p.saturation, info.saturation, tr("Saturation"), 2);
+    f32_slider(ui, &mut p.contrast, info.contrast, tr("Contrast"), 2);
+    f32_slider(ui, &mut p.midpoint, info.midpoint, tr("Midpoint"), 2);
+    f32_slider(ui, &mut p.highlights, info.highlights, tr("Highlights"), 2);
+    f32_slider(ui, &mut p.shadows, info.shadows, tr("Shadows"), 2);
+    f32_slider(ui, &mut p.black_level, info.black_level, tr("Black level"), 2);
+    f32_slider(ui, &mut p.white_level, info.white_level, tr("White level"), 2);
+    flag(ui, &mut p.video_black_level, info.video_black_level, tr("Video black level"));
+}
+
 fn fine_slider(
     ui: &mut egui::Ui,
     zoom: f32,

@@ -386,6 +386,11 @@ pub struct Settings {
     pub lut_path: String,
     /// LUT blend strength [0..1].
     pub lut_intensity: f32,
+    /// Blackmagic RAW: the SDK's own colour processing (colour science,
+    /// gamma/gamut, white balance, exposure/ISO, tone curve) as overrides on
+    /// the clip's values — `None` = as shot. Replaces the Tone and White
+    /// balance stages for this camera (hidden and kept neutral there).
+    pub braw_color: vr180_braw::BrawColorParams,
 
     /// Preview composer mode — SBS / anaglyph / 50% overlay / single eye.
     pub preview_mode: PreviewMode,
@@ -494,6 +499,7 @@ impl Default for Settings {
             auto_eye_match_mode: vr180_pipeline::gpu::EyeMatchMode::Average,
             lut_path: String::new(),
             lut_intensity: 1.0,
+            braw_color: Default::default(),
             preview_mode: PreviewMode::Sbs,
             preview_eye_right: false,
         }
@@ -1647,6 +1653,7 @@ fn open_fisheye_segment(
     fps: f32,
     braw_reframe: bool,
     gpu: Option<Arc<Device>>,
+    braw_color: &vr180_braw::BrawColorParams,
 ) -> vr180_pipeline::Result<Box<dyn vr180_pipeline::fisheye_decode::FisheyePairIter>> {
     use vr180_pipeline::fisheye_decode::{
         SbsFisheyeIter, DualStreamFisheyeIter, BrawFisheyeIter, max_decode_side_for_fps,
@@ -1700,12 +1707,12 @@ fn open_fisheye_segment(
                     // may still be in flight, and three decoding ahead.
                     return Ok(Box::new(vr180_pipeline::fisheye_decode::BrawZcIter::new(
                         dev.device.clone(), path, &info, scale, vr180_braw::DecodeLook::Film,
-                        swap_eyes, layout.mono, step, 5)?));
+                        swap_eyes, layout.mono, step, 5, braw_color)?));
                 }
             }
             let _ = &gpu;
             Box::new(BrawFisheyeIter::new_with_options(
-                path, &info, 8, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, step, 0)?)
+                path, &info, 8, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, step, 0, braw_color)?)
         }
         _ => return Err(Error::Ffmpeg(format!("non-fisheye source: {kind:?}"))),
     })
@@ -1886,9 +1893,9 @@ fn run_fisheye(
     //   pair_tx/rx: bounded(2), pre-decoded pairs tagged with a
     //               generation counter so seeks can discard stale
     //               in-flight frames without restarting the thread.
-    //   iter_cmd:   main → worker (seek)
+    //   iter_cmd:   main → worker (seek, BRAW colour change)
     //   dims_tx/rx: one-shot, worker → main with eye_dims after init.
-    enum IterCmd { Seek(f64) }
+    enum IterCmd { Seek(f64), BrawColor(vr180_braw::BrawColorParams) }
     // Buffer 8 decoded pairs ahead. At 50 fps source that's ~160 ms
     // of jitter absorption — enough to ride out GC/wgpu cleanup pauses
     // and the occasional slow-decode frame (saw 21 ms outliers vs the
@@ -1908,6 +1915,10 @@ fn run_fisheye(
     // The BRAW decode size follows the output mode at open (reframe keeps
     // more source); the UI respawns the decoder when that mode changes.
     let braw_reframe = matches!(control.settings.read().fisheye_output_mode, FisheyeOutputMode::Reframe);
+    // BRAW: the SDK colour overrides the source opens with; later changes
+    // reach the worker as `IterCmd::BrawColor` (step 4 below).
+    let initial_braw_color = control.settings.read().braw_color.clone();
+    let mut applied_braw_color = initial_braw_color.clone();
     let gpu_for_worker = pipeline.clone();
 
     let _decode_handle = std::thread::spawn(move || -> anyhow::Result<()> {
@@ -1923,12 +1934,13 @@ fn run_fisheye(
                 "decoder (fisheye): {} segments, {:.1}s total — SegmentedFisheyeIter",
                 segments_for_worker.len(), durations.iter().sum::<f64>());
             let gpu_for_segments = gpu_for_worker.clone();
+            let color_for_segments = initial_braw_color.clone();
             let opener = Box::new(move |p: &std::path::Path|
-                open_fisheye_segment(p, kind_for_worker, initial_swap_eyes, fps, braw_reframe, Some(gpu_for_segments.clone())));
+                open_fisheye_segment(p, kind_for_worker, initial_swap_eyes, fps, braw_reframe, Some(gpu_for_segments.clone()), &color_for_segments));
             Box::new(vr180_pipeline::fisheye_decode::SegmentedFisheyeIter::new(
                 &segments_for_worker, &durations, opener)?)
         } else {
-            open_fisheye_segment(&path_for_worker, kind_for_worker, initial_swap_eyes, fps, braw_reframe, Some(gpu_for_worker.clone()))?
+            open_fisheye_segment(&path_for_worker, kind_for_worker, initial_swap_eyes, fps, braw_reframe, Some(gpu_for_worker.clone()), &initial_braw_color)?
         };
         if let Some(t_in) = initial_trim_in {
             if t_in > 0.001 { let _ = iter.seek(t_in); }
@@ -1941,6 +1953,12 @@ fn run_fisheye(
             // Drain pending commands before each decode.
             while let Ok(cmd) = iter_cmd_rx.try_recv() {
                 match cmd {
+                    // BRAW: new SDK colour processing for the frames that
+                    // follow (the main loop sends a Seek to the frame on
+                    // screen right after, which decodes it again).
+                    IterCmd::BrawColor(p) => {
+                        if let Err(e) = iter.apply_braw_color(&p) { tracing::warn!("decode-worker: braw colour: {e}"); }
+                    }
                     IterCmd::Seek(t) => {
                         let _ = iter.seek(t);
                         gen = gen.wrapping_add(1);
@@ -2334,6 +2352,27 @@ fn run_fisheye(
             calib_right = r;
             drop(snap);
             cached_gen = current_gen;
+            // Blackmagic RAW: the SDK's colour processing changed → the
+            // source decodes differently from here on; re-seek to the frame
+            // on screen so it comes back with the new look (the same
+            // bookkeeping as a seek — stale pairs are discarded by gen).
+            if kind == vr180_pipeline::SourceKind::BlackmagicRaw {
+                let want = control.settings.read().braw_color.clone();
+                if want != applied_braw_color {
+                    applied_braw_color = want.clone();
+                    let t = if pair.pts_s.is_finite() && pair.pts_s >= 0.0 { pair.pts_s } else { frame_t_abs };
+                    let _ = iter_cmd_tx.send(IterCmd::BrawColor(want));
+                    let _ = iter_cmd_tx.send(IterCmd::Seek(t));
+                    expected_gen = expected_gen.wrapping_add(1);
+                    time_offset = t;
+                    frame_idx = 0;
+                    start_wall = None;
+                    paused_offset = std::time::Duration::ZERO;
+                    force_render_next = true;
+                    maybe_pair = None; // re-decoded with the new look
+                    continue 'main;
+                }
+            }
             // Live stab recompute when a stab-affecting slider (smooth /
             // max-corr / imu-phase) changed — keeps the MAIN preview in
             // sync, not just the zoom/DetailCache view. Only fires when the
@@ -5578,13 +5617,16 @@ pub(crate) struct DetailCache {
     path: PathBuf,
     kind: vr180_pipeline::SourceKind,
     fps: f32,
-    /// Background decode worker: send a requested timestamp, receive the
-    /// decoded native pair `(ts_ms, pair)`.
-    req_tx: crossbeam_channel::Sender<f64>,
-    res_rx: crossbeam_channel::Receiver<(i64, vr180_pipeline::fisheye_decode::FisheyePair)>,
+    /// Background decode worker: send a requested timestamp (+ the BRAW
+    /// colour overrides it must decode with), receive the decoded native
+    /// pair `(ts_ms, colour, pair)`.
+    req_tx: crossbeam_channel::Sender<(f64, vr180_braw::BrawColorParams)>,
+    res_rx: crossbeam_channel::Receiver<(i64, vr180_braw::BrawColorParams, vr180_pipeline::fisheye_decode::FisheyePair)>,
     _handle: std::thread::JoinHandle<()>,
-    /// Latest decoded native pair, held on the main thread.
+    /// Latest decoded native pair, held on the main thread, and the BRAW
+    /// colour it was decoded with (a change re-requests the frame).
     cached_ts: i64,
+    cached_color: vr180_braw::BrawColorParams,
     cached_pair: Option<vr180_pipeline::fisheye_decode::FisheyePair>,
     cached_stab_key: u64,
     cached_stab: Option<Vec<EquirectRotation>>,
@@ -5602,9 +5644,9 @@ impl DetailCache {
         // NOTE: the DJI IMU is NOT extracted here — that read is slow on a
         // cold network volume and `new()` runs on the main thread. The
         // decoder thread publishes it to `dji_imu_cache`; `render()` reads it.
-        let (req_tx, req_rx) = crossbeam_channel::bounded::<f64>(1);
+        let (req_tx, req_rx) = crossbeam_channel::bounded::<(f64, vr180_braw::BrawColorParams)>(1);
         let (res_tx, res_rx) =
-            crossbeam_channel::unbounded::<(i64, vr180_pipeline::fisheye_decode::FisheyePair)>();
+            crossbeam_channel::unbounded::<(i64, vr180_braw::BrawColorParams, vr180_pipeline::fisheye_decode::FisheyePair)>();
         let segs_w = if segments.is_empty() { vec![path.clone()] } else { segments };
         let handle = std::thread::spawn(move || {
             detail_decode_worker(segs_w, kind, swap_eyes, fps, req_rx, res_tx, ctx);
@@ -5613,6 +5655,7 @@ impl DetailCache {
             path, kind, fps,
             req_tx, res_rx, _handle: handle,
             cached_ts: i64::MIN,
+            cached_color: Default::default(),
             cached_pair: None,
             cached_stab_key: u64::MAX,
             cached_stab: None,
@@ -5637,16 +5680,18 @@ impl DetailCache {
         out_eye: Option<(u32, u32)>,
     ) -> Option<(wgpu::Texture, u32, u32)> {
         // Pick up any freshly-decoded native pair from the worker.
-        while let Ok((ts_ms, pair)) = self.res_rx.try_recv() {
+        while let Ok((ts_ms, color, pair)) = self.res_rx.try_recv() {
             self.cached_ts = ts_ms;
+            self.cached_color = color;
             self.cached_pair = Some(pair);
         }
         let ts_ms = (timestamp * 1000.0).round() as i64;
-        if self.cached_ts != ts_ms || self.cached_pair.is_none() {
-            // Frame not decoded yet → ask the worker. The request channel is
-            // bounded(1) + drained-to-latest in the worker, so a fast scrub
-            // just moves the target instead of queuing every frame.
-            let _ = self.req_tx.try_send(timestamp.max(0.0));
+        if self.cached_ts != ts_ms || self.cached_pair.is_none() || self.cached_color != s.braw_color {
+            // Frame not decoded yet (or decoded with another BRAW colour) →
+            // ask the worker. The request channel is bounded(1) + drained-
+            // to-latest in the worker, so a fast scrub just moves the target
+            // instead of queuing every frame.
+            let _ = self.req_tx.try_send((timestamp.max(0.0), s.braw_color.clone()));
             return None;
         }
         let pair = self.cached_pair.as_ref()?;
@@ -5684,8 +5729,8 @@ fn detail_decode_worker(
     kind: vr180_pipeline::SourceKind,
     swap_eyes: bool,
     fps: f32,
-    req_rx: crossbeam_channel::Receiver<f64>,
-    res_tx: crossbeam_channel::Sender<(i64, vr180_pipeline::fisheye_decode::FisheyePair)>,
+    req_rx: crossbeam_channel::Receiver<(f64, vr180_braw::BrawColorParams)>,
+    res_tx: crossbeam_channel::Sender<(i64, vr180_braw::BrawColorParams, vr180_pipeline::fisheye_decode::FisheyePair)>,
     ctx: egui::Context,
 ) {
     // Merged recordings chain through the segmented wrapper so the zoom
@@ -5716,10 +5761,16 @@ fn detail_decode_worker(
             }
         };
     let dt = 1.0 / (fps.max(1e-3) as f64);
+    let mut applied_color = vr180_braw::BrawColorParams::default();
     loop {
         // Block for one request, then drain to the latest (coalesce scrubs).
-        let mut ts = match req_rx.recv() { Ok(t) => t, Err(_) => return };
-        while let Ok(t) = req_rx.try_recv() { ts = t; }
+        let (mut ts, mut color) = match req_rx.recv() { Ok(r) => r, Err(_) => return };
+        while let Ok(r) = req_rx.try_recv() { ts = r.0; color = r.1; }
+        // BRAW: the still decodes with the same SDK colour as the preview.
+        if color != applied_color {
+            if let Err(e) = iter.apply_braw_color(&color) { tracing::warn!("detail decode: braw colour: {e}"); }
+            applied_color = color.clone();
+        }
         let target = ts.max(0.0);
         if iter.seek(target).is_err() { continue; }
         // `seek` lands on the keyframe at/before the target; decode forward
@@ -5733,7 +5784,7 @@ fn detail_decode_worker(
             tracing::info!("detail decode → {:.3}s in {:?}",
                 target, t0.elapsed());
             let ts_ms = (target * 1000.0).round() as i64;
-            if res_tx.send((ts_ms, p)).is_err() { return; }
+            if res_tx.send((ts_ms, color, p)).is_err() { return; }
             ctx.request_repaint(); // wake the UI to project + show the still
         }
     }
@@ -5769,7 +5820,7 @@ fn open_native_iter(
             // request and must not decode and hold the following 12K frames.
             Box::new(BrawFisheyeIter::new_single_frame(
                 path, &info, 8, vr180_braw::DecodeScale::Full, vr180_braw::DecodeLook::Film,
-                swap_eyes, layout.mono))
+                swap_eyes, layout.mono, &Default::default()))
         }
         _ => anyhow::bail!("non-fisheye source"),
     })
