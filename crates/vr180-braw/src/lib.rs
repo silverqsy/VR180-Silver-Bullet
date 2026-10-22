@@ -63,7 +63,7 @@ pub use decoder::{BrawDecoder, DecodeLook, DecodeScale};
 pub use lut::extract_embedded_lut;
 pub use shutters::BrawShutters;
 #[cfg(target_os = "macos")]
-pub use zc::{BrawZcDecoder, ZcFrame, ZcHeader, ZcReleaser};
+pub use zc::{BrawZcDecoder, ZcEvent, ZcFrame, ZcHeader, ZcReleaser};
 pub use gyro::{BrawGyroData, BrawGyroHeader};
 pub use info::BrawInfo;
 

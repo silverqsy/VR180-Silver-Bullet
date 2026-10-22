@@ -1157,31 +1157,38 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
     fprintf(stderr, "]}\n");
     fflush(stderr);
 
-    // Free slots: all at first; the app returns them on stdin. stdin EOF =
-    // the app is gone.
+    // stdin: "R <slot>" returns a slot, "S <frame> <gen>" seeks (in-flight
+    // frames are discarded, "K <gen>" acknowledges, decoding resumes at
+    // <frame>), EOF = the app is gone. The helper stays alive at the end
+    // of the clip ("E" on stdout) until a seek or EOF.
     std::mutex fm; std::condition_variable fcv;
     std::vector<uint32_t> free_slots;
     for (uint32_t s = 0; s < slots; s++) free_slots.push_back(s);
     bool app_gone = false;
+    bool seek_pending = false; uint64_t seek_frame = 0; uint32_t seek_gen = 0;
     std::thread reader([&]() {
         char line[128];
         while (fgets(line, sizeof line, stdin)) {
-            unsigned s = 0;
+            unsigned s = 0; unsigned long long f = 0; unsigned g = 0;
             if (sscanf(line, "R %u", &s) == 1 && s < slots) {
                 std::lock_guard<std::mutex> lk(fm); free_slots.push_back(s);
+            } else if (sscanf(line, "S %llu %u", &f, &g) == 2) {
+                std::lock_guard<std::mutex> lk(fm); seek_pending = true; seek_frame = f; seek_gen = g;
             }
             fcv.notify_all();
         }
         { std::lock_guard<std::mutex> lk(fm); app_gone = true; }
         fcv.notify_all();
     });
+    // A free slot, or false when a seek or the app's departure interrupts.
     auto take_slot = [&](uint32_t* slot) -> bool {
         std::unique_lock<std::mutex> lk(fm);
-        fcv.wait(lk, [&] { return app_gone || !free_slots.empty(); });
-        if (free_slots.empty()) return false;
+        fcv.wait(lk, [&] { return app_gone || seek_pending || !free_slots.empty(); });
+        if (app_gone || seek_pending || free_slots.empty()) return false;
         *slot = free_slots.back(); free_slots.pop_back();
         return true;
     };
+    auto give_back = [&](uint32_t slot) { std::lock_guard<std::mutex> lk(fm); free_slots.push_back(slot); };
 
     // Keep up to `ahead` frames decoding while the app consumes, leaving the
     // app two slots (the frame on screen and the one whose GPU work may
@@ -1190,42 +1197,65 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
     std::vector<std::pair<uint64_t, uint32_t>> inflight;   // (frame, slot), oldest first
     uint64_t next = start;
     int rc = 0;
+    bool eof_reported = false;
     auto top_up = [&]() -> bool {
         while ((int)inflight.size() < ahead && next < end) {
             uint32_t slot;
-            if (!take_slot(&slot)) return false;     // app gone
+            if (!take_slot(&slot)) return false;     // seek pending or app gone
             if (is_dual) {
                 cb.set_slot(next * 2 + 0, slot); cb.set_slot(next * 2 + 1, slot);
-                if (!submit_read(ctx, next * 2 + 0, next, 0) || !submit_read(ctx, next * 2 + 1, next, 1)) { rc = 1; return false; }
+                if (!submit_read(ctx, next * 2 + 0, next, 0) || !submit_read(ctx, next * 2 + 1, next, 1)) { give_back(slot); rc = 1; return false; }
             } else {
                 cb.set_slot(next, slot);
-                if (!submit_read(ctx, next, next, decode_track)) { rc = 1; return false; }
+                if (!submit_read(ctx, next, next, decode_track)) { give_back(slot); rc = 1; return false; }
             }
             inflight.emplace_back(next, slot);
             next += step;
         }
         return true;
     };
-    bool going = top_up();
-    while (going && !inflight.empty()) {
+    auto wait_frame = [&](uint64_t frame) -> bool {
+        if (is_dual) { FrameResult a = cb.wait(frame * 2 + 0), b = cb.wait(frame * 2 + 1); return a.status == S_OK && b.status == S_OK; }
+        return cb.wait(frame).status == S_OK;
+    };
+    for (;;) {
+        bool gone, seeking;
+        { std::lock_guard<std::mutex> lk(fm); gone = app_gone; seeking = seek_pending; }
+        if (gone || rc != 0) break;
+        if (seeking) {
+            // Drop everything decoding for the old position; their slots were
+            // never reported, so they are ours to free.
+            for (auto& [f, slot] : inflight) { wait_frame(f); give_back(slot); }
+            inflight.clear();
+            uint64_t f; uint32_t g;
+            { std::lock_guard<std::mutex> lk(fm); f = seek_frame; g = seek_gen; seek_pending = false; }
+            next = std::min(f, end);
+            eof_reported = false;
+            printf("K %u\n", g);
+            fflush(stdout);
+            continue;
+        }
+        if (inflight.empty()) {
+            if (next >= end) {
+                if (!eof_reported) { printf("E\n"); fflush(stdout); eof_reported = true; }
+                // Idle until a seek or the app leaves.
+                std::unique_lock<std::mutex> lk(fm);
+                fcv.wait(lk, [&] { return app_gone || seek_pending; });
+                continue;
+            }
+            top_up();
+            continue;
+        }
         const auto [frame, slot] = inflight.front();
         inflight.erase(inflight.begin());
-        bool ok;
-        if (is_dual) {
-            FrameResult a = cb.wait(frame * 2 + 0), b = cb.wait(frame * 2 + 1);
-            ok = a.status == S_OK && b.status == S_OK;
-        } else {
-            FrameResult r = cb.wait(frame);
-            ok = r.status == S_OK;
-        }
-        if (!ok) { fprintf(stderr, "ERROR: Decode failed at frame %llu\n", (unsigned long long)frame); rc = 1; break; }
+        if (!wait_frame(frame)) { fprintf(stderr, "ERROR: Decode failed at frame %llu\n", (unsigned long long)frame); rc = 1; break; }
         // Report BEFORE topping up: topping up may have to wait for the app
         // to return a slot, and the app returns slots only as it moves on
         // to frames it has been told about — reporting after waiting
         // deadlocked at the very first frame.
         printf("F %llu %u\n", (unsigned long long)frame, slot);
         fflush(stdout);
-        going = top_up();
+        top_up();
     }
     ctx.codec->FlushJobs();
     // Let the reader end: closing stdin from our side is not possible, so

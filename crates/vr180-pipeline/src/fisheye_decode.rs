@@ -4095,6 +4095,11 @@ pub struct BrawZcIter {
     frame_idx: u64,
     frame_count: u64,
     step: u64,
+    /// A seek sent to the live helper, not yet acknowledged: frames that
+    /// arrive before the ack belong to the old position and are dropped
+    /// (their slots returned at once).
+    pending_seek: Option<u32>,
+    seek_gen: u32,
 }
 
 #[cfg(target_os = "macos")]
@@ -4124,6 +4129,7 @@ impl BrawZcIter {
             device, path: path.to_path_buf(), opts, swap_eyes, mono, slots: slots.max(3),
             decoder: None, textures: Vec::new(), releaser: None,
             eye_w: 0, eye_h: 0, dt_s, frame_idx: 0, frame_count: info.frame_count, step: step as u64,
+            pending_seek: None, seek_gen: 0,
         };
         it.start_at(0)?;
         Ok(it)
@@ -4156,6 +4162,7 @@ impl BrawZcIter {
         self.eye_h = h.eye_height;
         self.releaser = Some(dec.releaser());
         self.frame_idx = frame;
+        self.pending_seek = None;
         self.decoder = Some(dec);
         Ok(())
     }
@@ -4164,15 +4171,32 @@ impl BrawZcIter {
 #[cfg(target_os = "macos")]
 impl FisheyePairIter for BrawZcIter {
     fn next_pair(&mut self) -> Result<Option<FisheyePair>> {
-        if self.frame_count > 0 && self.frame_idx >= self.frame_count { return Ok(None); }
         if self.decoder.is_none() {
+            if self.frame_count > 0 && self.frame_idx >= self.frame_count { return Ok(None); }
             let at = self.frame_idx;
             self.start_at(at)?;
         }
-        let f = match self.decoder.as_mut().unwrap().next_frame()
-            .map_err(|e| Error::Ffmpeg(format!("braw zero-copy next_frame: {e}")))? {
-            Some(f) => f,
-            None => { self.decoder = None; return Ok(None); }
+        let f = loop {
+            let ev = match self.decoder.as_mut().unwrap().next_event() {
+                Ok(ev) => ev,
+                Err(e) => { self.decoder = None; return Err(Error::Ffmpeg(format!("braw zero-copy: {e}"))); }
+            };
+            match ev {
+                vr180_braw::ZcEvent::SeekAck(g) => { if self.pending_seek == Some(g) { self.pending_seek = None; } }
+                vr180_braw::ZcEvent::Frame(f) => {
+                    if self.pending_seek.is_some() {
+                        // Decoded for the position we just left.
+                        if let Some(r) = &self.releaser { r.release(f.slot); }
+                        continue;
+                    }
+                    break f;
+                }
+                vr180_braw::ZcEvent::End => {
+                    if self.pending_seek.is_some() { continue; }
+                    // The helper idles for a later seek; the consumer sees EOS.
+                    return Ok(None);
+                }
+            }
         };
         let [l, r] = &self.textures[f.slot as usize];
         let (l, r) = if self.swap_eyes { (r, l) } else { (l, r) };
@@ -4197,11 +4221,20 @@ impl FisheyePairIter for BrawZcIter {
     fn seek(&mut self, target_s: f64) -> Result<()> {
         let target = (target_s.max(0.0) / self.dt_s).round() as u64;
         let target = if self.frame_count > 0 { target.min(self.frame_count.saturating_sub(1)) } else { target };
-        if target == self.frame_idx && self.decoder.is_some() { return Ok(()); }
-        // Restart lazily at the target: a new helper, a new pool. Pairs
-        // still out keep their old surfaces alive through their guards.
-        self.decoder = None;
+        if target == self.frame_idx && self.decoder.is_some() && self.pending_seek.is_none() { return Ok(()); }
         self.frame_idx = target;
+        // The live helper keeps its pool: tell it where to continue and drop
+        // what it reports until it acknowledges. Without a helper (an error
+        // ended it), the next pull starts one at the target.
+        if self.decoder.is_some() {
+            self.seek_gen = self.seek_gen.wrapping_add(1);
+            let gen = self.seek_gen;
+            if self.releaser.as_ref().map_or(false, |r| r.seek(target, gen)) {
+                self.pending_seek = Some(gen);
+            } else {
+                self.decoder = None;
+            }
+        }
         Ok(())
     }
 

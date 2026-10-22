@@ -58,6 +58,17 @@ pub struct ZcFrame {
     pub slot: u32,
 }
 
+/// What the helper says next.
+#[derive(Debug, Clone, Copy)]
+pub enum ZcEvent {
+    Frame(ZcFrame),
+    /// The seek with this generation took effect: everything before it was
+    /// discarded, the frames that follow start at its target.
+    SeekAck(u32),
+    /// The end of the clip; the helper stays alive for a later seek.
+    End,
+}
+
 /// Returns slots to the helper. Shared by the frames handed out, so a
 /// frame can release its slot from wherever it is dropped.
 pub struct ZcReleaser {
@@ -67,8 +78,17 @@ pub struct ZcReleaser {
 impl ZcReleaser {
     pub fn release(&self, slot: u32) {
         if let Some(w) = self.stdin.lock().unwrap().as_mut() {
-            // A dead helper (seek restarted it) just means the slot is gone.
+            // A dead helper just means the slot is gone with it.
             let _ = writeln!(w, "R {slot}").and_then(|_| w.flush());
+        }
+    }
+    /// Ask the helper to continue from `frame`; it answers `SeekAck(gen)`
+    /// once the frames it was decoding are dropped. `false` when the
+    /// helper's stdin is gone (restart instead).
+    pub fn seek(&self, frame: u64, gen: u32) -> bool {
+        match self.stdin.lock().unwrap().as_mut() {
+            Some(w) => writeln!(w, "S {frame} {gen}").and_then(|_| w.flush()).is_ok(),
+            None => false,
         }
     }
     fn close(&self) {
@@ -162,35 +182,42 @@ impl BrawZcDecoder {
     pub fn header(&self) -> &ZcHeader { &self.header }
     pub fn releaser(&self) -> Arc<ZcReleaser> { self.releaser.clone() }
 
-    /// The next frame the helper has placed in a slot; `None` at the end.
-    pub fn next_frame(&mut self) -> Result<Option<ZcFrame>> {
+    /// The helper's next event. The helper does not exit at the end of the
+    /// clip (it waits for a seek), so a closed pipe is a failure.
+    pub fn next_event(&mut self) -> Result<ZcEvent> {
         let mut line = String::new();
         loop {
             line.clear();
             let n = self.stdout.read_line(&mut line)?;
             if n == 0 {
                 let status = self.child.wait()?;
-                let short = self.header.frames > 0 && self.delivered < self.header.frames;
-                if !status.success() || short {
-                    let captured = self.stderr_log.take().and_then(|h| h.join().ok()).unwrap_or_default();
-                    return Err(Error::HelperFailed {
-                        code: status.code().unwrap_or(-1),
-                        stderr: format!("braw_helper ended after {} of {} zero-copy frames (exit {:?}): {}",
-                            self.delivered, self.header.frames, status.code(), captured.trim()),
-                    });
-                }
-                return Ok(None);
+                let captured = self.stderr_log.take().and_then(|h| h.join().ok()).unwrap_or_default();
+                return Err(Error::HelperFailed {
+                    code: status.code().unwrap_or(-1),
+                    stderr: format!("braw_helper ended after {} zero-copy frames (exit {:?}): {}",
+                        self.delivered, status.code(), captured.trim()),
+                });
             }
             let mut it = line.split_whitespace();
-            if it.next() != Some("F") { continue; }
-            let (Some(idx), Some(slot)) = (it.next().and_then(|s| s.parse::<u64>().ok()), it.next().and_then(|s| s.parse::<u32>().ok())) else {
-                return Err(Error::BadOutput(format!("bad zero-copy line '{}'", line.trim())));
-            };
-            if slot >= self.header.slots {
-                return Err(Error::BadOutput(format!("slot {slot} out of {}", self.header.slots)));
+            match it.next() {
+                Some("F") => {
+                    let (Some(idx), Some(slot)) = (it.next().and_then(|s| s.parse::<u64>().ok()), it.next().and_then(|s| s.parse::<u32>().ok())) else {
+                        return Err(Error::BadOutput(format!("bad zero-copy line '{}'", line.trim())));
+                    };
+                    if slot >= self.header.slots {
+                        return Err(Error::BadOutput(format!("slot {slot} out of {}", self.header.slots)));
+                    }
+                    self.delivered += 1;
+                    return Ok(ZcEvent::Frame(ZcFrame { index: idx, slot }));
+                }
+                Some("K") => {
+                    let gen = it.next().and_then(|s| s.parse::<u32>().ok())
+                        .ok_or_else(|| Error::BadOutput(format!("bad seek ack '{}'", line.trim())))?;
+                    return Ok(ZcEvent::SeekAck(gen));
+                }
+                Some("E") => return Ok(ZcEvent::End),
+                _ => continue,
             }
-            self.delivered += 1;
-            return Ok(Some(ZcFrame { index: idx, slot }));
         }
     }
 }
