@@ -55,11 +55,15 @@ pub mod gyro;
 pub mod info;
 pub mod lut;
 pub mod shutters;
+#[cfg(target_os = "macos")]
+pub mod zc;
 
 pub use audio::{extract_audio_to_tempfile, extract_audio_to_wav, BrawAudioHeader, TempWavPath};
 pub use decoder::{BrawDecoder, DecodeLook, DecodeScale};
 pub use lut::extract_embedded_lut;
 pub use shutters::BrawShutters;
+#[cfg(target_os = "macos")]
+pub use zc::{BrawZcDecoder, ZcFrame, ZcHeader, ZcReleaser};
 pub use gyro::{BrawGyroData, BrawGyroHeader};
 pub use info::BrawInfo;
 

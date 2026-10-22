@@ -54,6 +54,11 @@ frame.
   "render-bound" frame skips during playback. The BRAW audio track now
   plays (its resampler rejected every frame before), and the zoom still no
   longer decodes extra full-size frames in the background.
+- **Zero-copy BRAW preview (macOS).** The helper now hands decoded frames
+  to the app as shared GPU surfaces instead of pushing pixels through a
+  pipe: no copy on the CPU at any size, so the reframed view decodes the
+  full 12K frame and every zoom level samples native pixels. Measured
+  throughput 96 fps at full 12K (26 through the pipe), 328 at quarter.
 - **BRAW on slow storage.** Play no longer waits for the per-frame shutter
   scan (one full frame per sample, about 2 GB on a long 12K clip): the
   live view uses the clip's shutter range from the probe, and the export

@@ -1325,6 +1325,50 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      looked like the SMB share stalling, not the app. At 25 MB/s the
      preview is I/O-bound (~2 fps: the SDK reads whole frames even at
      reduced scale) — nothing in the app can fix a slow share.
+     **Zero-copy BRAW preview (2026-10-22, user: "直接做0拷贝")**: the helper
+     has `--zerocopy N [--mono]` (`helpers/braw/braw_zc.{h,mm}`, Objective-C++
+     under ARC, built as a second object + `-framework Metal -framework
+     IOSurface`; the helper itself stays plain C++ because the SDK dispatch
+     source may only be included in ONE translation unit): a pool of N
+     slots of GLOBAL IOSurfaces (`kIOSurfaceIsGlobal`, RGBA8), one per eye,
+     each already the 2:1 CANVAS (padded / cropped rows handled in the
+     copy; pad rows zero-filled to opaque black once), sized up front from
+     `IBlackmagicRawClipResolutions::GetClosestResolutionForScale`. A
+     frame is copied into its slot inside ProcessComplete — a Metal blit
+     from the SDK's MTLBuffer on the SDK's own command queue (waited), or a
+     memcpy under `IOSurfaceLock` when the SDK decodes on the CPU — and
+     only `F <frame> <slot>` crosses stdout; the app returns slots with
+     `R <slot>` on stdin (a reader thread feeds a free list; the main loop
+     never submits a read job without a slot; stdin EOF = app gone). The
+     header carries `transport: iosurface`, `slots`, `eye_width/height`,
+     `pad_rows`, `mono`, `surfaces: [[L,R],…]`; `--info` says `zerocopy:
+     true`. App side: `vr180_braw::zc::BrawZcDecoder` (header, `F` lines,
+     `ZcReleaser` on stdin), `RetainedIOSurface::lookup(id)` +
+     `wgpu_texture_from_iosurface_plane(.., RGBA8Unorm, ..)` wrap every
+     slot's surfaces ONCE per helper run, `FisheyePair` gained `gpu:
+     Option<Arc<GpuPair>>` (textures + a `ZcSlotGuard` that releases the
+     slot when the LAST Arc clone drops), `BrawZcIter` (macOS) hands such
+     pairs out with the same step / seek / canvas semantics, and the
+     preview loop renders them with `Device::project_fisheye_from_texture`
+     (one entry point for hequirect / fisheye-out × plain / RS — the same
+     kernels, no upload) and keeps an Arc clone in
+     `queue.on_submitted_work_done` so the slot is only returned after the
+     GPU finished reading it (callbacks fire on later submits / polls; the
+     UI thread's own submits keep them flowing while paused). The preview
+     opener takes the zero-copy path whenever `info.zerocopy` (and
+     `VR180_BRAW_ZC` ≠ 0) and decodes at FULL size in the reframed mode
+     (a zoomed viewport samples native pixels), the cap-based scale
+     otherwise; the still / export keep the pipe. **Verified
+     (`examples/braw_zc_check`, local C006)**: every slot surface is
+     byte-identical to the pipe path's canvas (pad rows included) at
+     eighth / quarter / full, the projection from the surface texture is
+     byte-identical to the upload path, and the iterator runs 1141 / 328 /
+     **96 fps at eighth / quarter / FULL 12K** (pipe path: 437 / 145 / 26)
+     — a 60p clip's reframe preview at full 12K needs 30. Pool of 4 and a
+     bounded(8) pair channel: the worker can only run ~3 pairs ahead (the
+     helper waits for releases), which is fine. Global IOSurfaces are a
+     deprecated-but-working route (both ends are our unsandboxed
+     binaries); the mach-port hand-off is the fallback if Apple removes it.
      **Preview perf picture (same day)**: decode wait in the GUI log is ~0
      until the worker falls behind; the CPU helper's speed swung 105 → 15
      fps at the same frames with the laptop at 7 % battery + screen sharing

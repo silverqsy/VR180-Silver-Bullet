@@ -1646,6 +1646,7 @@ fn open_fisheye_segment(
     swap_eyes: bool,
     fps: f32,
     braw_reframe: bool,
+    gpu: Option<Arc<Device>>,
 ) -> vr180_pipeline::Result<Box<dyn vr180_pipeline::fisheye_decode::FisheyePairIter>> {
     use vr180_pipeline::fisheye_decode::{
         SbsFisheyeIter, DualStreamFisheyeIter, BrawFisheyeIter, max_decode_side_for_fps,
@@ -1686,6 +1687,21 @@ fn open_fisheye_segment(
                 if info.pipeline.is_empty() { "?" } else { info.pipeline.as_str() },
                 info.gpu_device.as_deref().map(|d| format!(" ({d})")).unwrap_or_default());
             let layout = vr180_pipeline::braw_imu::braw_layout(path, &info);
+            // macOS: the helper hands frames over as IOSurfaces (no pixels
+            // through the pipe or the CPU), so a reframed view can afford the
+            // FULL frame — every zoom level samples native pixels.
+            // `VR180_BRAW_ZC=0` forces the pipe path.
+            #[cfg(target_os = "macos")]
+            if info.zerocopy && std::env::var("VR180_BRAW_ZC").map(|v| v != "0").unwrap_or(true) {
+                if let Some(dev) = &gpu {
+                    let scale = if braw_reframe { vr180_braw::DecodeScale::Full } else { scale };
+                    tracing::info!("decoder (fisheye/braw): zero-copy IOSurface path, decode scale {:?}, step {}", scale, step);
+                    return Ok(Box::new(vr180_pipeline::fisheye_decode::BrawZcIter::new(
+                        dev.device.clone(), path, &info, scale, vr180_braw::DecodeLook::Film,
+                        swap_eyes, layout.mono, step, 4)?));
+                }
+            }
+            let _ = &gpu;
             Box::new(BrawFisheyeIter::new_with_options(
                 path, &info, 8, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, step, 0)?)
         }
@@ -1890,6 +1906,7 @@ fn run_fisheye(
     // The BRAW decode size follows the output mode at open (reframe keeps
     // more source); the UI respawns the decoder when that mode changes.
     let braw_reframe = matches!(control.settings.read().fisheye_output_mode, FisheyeOutputMode::Reframe);
+    let gpu_for_worker = pipeline.clone();
 
     let _decode_handle = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut iter: Box<dyn FisheyePairIter> = if segments_for_worker.len() > 1 {
@@ -1903,12 +1920,13 @@ fn run_fisheye(
             tracing::info!(
                 "decoder (fisheye): {} segments, {:.1}s total — SegmentedFisheyeIter",
                 segments_for_worker.len(), durations.iter().sum::<f64>());
+            let gpu_for_segments = gpu_for_worker.clone();
             let opener = Box::new(move |p: &std::path::Path|
-                open_fisheye_segment(p, kind_for_worker, initial_swap_eyes, fps, braw_reframe));
+                open_fisheye_segment(p, kind_for_worker, initial_swap_eyes, fps, braw_reframe, Some(gpu_for_segments.clone())));
             Box::new(vr180_pipeline::fisheye_decode::SegmentedFisheyeIter::new(
                 &segments_for_worker, &durations, opener)?)
         } else {
-            open_fisheye_segment(&path_for_worker, kind_for_worker, initial_swap_eyes, fps, braw_reframe)?
+            open_fisheye_segment(&path_for_worker, kind_for_worker, initial_swap_eyes, fps, braw_reframe, Some(gpu_for_worker.clone()))?
         };
         if let Some(t_in) = initial_trim_in {
             if t_in > 0.001 { let _ = iter.seek(t_in); }
@@ -2522,7 +2540,14 @@ fn run_fisheye(
                 FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => {
                     // A reframed view keeps the working width and takes its aspect.
                     let (eye_w, eye_h) = preview_out_dims(mode, aspect, eye_w, eye_h);
-                    if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
+                    if let Some(g) = pair.gpu.as_deref() {
+                        // Zero-copy source: the eyes are textures already.
+                        let l = pipeline.project_fisheye_from_texture(
+                            &g.left, eye_w, eye_h, rot_left, calib_left, rs_rows_l.as_deref(), false)?;
+                        let r = pipeline.project_fisheye_from_texture(
+                            &g.right, eye_w, eye_h, rot_right, calib_right, rs_rows_r.as_deref(), false)?;
+                        (l, r)
+                    } else if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_to_equirect_rs_texture(
                             &pair.left, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_l, 0,
                         )?;
@@ -2545,7 +2570,13 @@ fn run_fisheye(
                     // both axes so the result is a circle in a square
                     // frame regardless of the half-equirect aspect.
                     let side = eye_w.min(eye_h);
-                    if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
+                    if let Some(g) = pair.gpu.as_deref() {
+                        let l = pipeline.project_fisheye_from_texture(
+                            &g.left, side, side, rot_left, calib_left, rs_rows_l.as_deref(), true)?;
+                        let r = pipeline.project_fisheye_from_texture(
+                            &g.right, side, side, rot_right, calib_right, rs_rows_r.as_deref(), true)?;
+                        (l, r)
+                    } else if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         // Per-row rolling-shutter correction, same as the
                         // half-equirect path — the RS warp operates on the
                         // source-frame direction independent of the output
@@ -2588,6 +2619,12 @@ fn run_fisheye(
             if g.is_some() { *g = None; }
         }
         let phase_compose = phase_t3.elapsed();
+        if let Some(g) = pair.gpu.clone() {
+            // A zero-copy slot goes back to the helper only once everything
+            // submitted so far — the projections and the compose that read
+            // its textures — has completed on the GPU.
+            pipeline.queue.on_submitted_work_done(move || drop(g));
+        }
         // Per-frame phase timing. First 20 rendered frames log every
         // time so we see warm-cache numbers; after that, every 30.
         // `decode` is the time `decoder.next_pair()` blocked (i.e.,

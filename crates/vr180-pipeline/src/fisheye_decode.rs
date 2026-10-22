@@ -216,6 +216,27 @@ pub struct FisheyePair {
     pub bit_depth: u8,
     /// Presentation timestamp in seconds, or `0.0` if unknown.
     pub pts_s: f64,
+    /// The eyes already on the GPU (`left`/`right` empty): a zero-copy
+    /// source. A consumer that renders from textures takes these; the
+    /// export and the CPU consumers only ever see `None`.
+    pub gpu: Option<std::sync::Arc<GpuPair>>,
+}
+
+/// A pair of eyes resident on the GPU — `eye_w × eye_h` RGBA8 textures
+/// (the same canvas as the CPU pair) — and whatever keeps their memory
+/// valid (a zero-copy slot guard). The guard drops with the LAST clone of
+/// the `Arc`, so a renderer that must outlive its submission keeps a clone
+/// until the queue reports that work done.
+pub struct GpuPair {
+    pub left: wgpu::Texture,
+    pub right: wgpu::Texture,
+    pub keep: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl std::fmt::Debug for GpuPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuPair").field("left", &self.left.size()).field("right", &self.right.size()).finish()
+    }
 }
 
 /// Common iterator interface for the three fisheye sources. Hand-
@@ -646,7 +667,7 @@ impl FisheyePairIter for SbsFisheyeIter {
                     left, right,
                     eye_w: self.eye_w, eye_h: self.eye_h,
                     bit_depth: self.output_bit_depth,
-                    pts_s,
+                    pts_s, gpu: None,
                 }));
             }
 
@@ -674,7 +695,7 @@ impl FisheyePairIter for SbsFisheyeIter {
                             left, right,
                             eye_w: self.eye_w, eye_h: self.eye_h,
                             bit_depth: self.output_bit_depth,
-                            pts_s,
+                            pts_s, gpu: None,
                         }));
                     }
                     return Ok(None);
@@ -1128,7 +1149,7 @@ impl FisheyePairIter for DualStreamFisheyeIter {
             left, right,
             eye_w: self.eye_w, eye_h: self.eye_h,
             bit_depth: self.output_bit_depth,
-            pts_s,
+            pts_s, gpu: None,
         }))
     }
 
@@ -1171,7 +1192,7 @@ impl FisheyePairIter for DualStreamFisheyeIter {
             left, right,
             eye_w: self.eye_w, eye_h: self.eye_h,
             bit_depth: self.output_bit_depth,
-            pts_s,
+            pts_s, gpu: None,
         }))
     }
 
@@ -4009,7 +4030,7 @@ impl FisheyePairIter for BrawFisheyeIter {
             left, right,
             eye_w: self.eye_w, eye_h: self.eye_h,
             bit_depth: self.bit_depth,
-            pts_s,
+            pts_s, gpu: None,
         }))
     }
 
@@ -4026,6 +4047,165 @@ impl FisheyePairIter for BrawFisheyeIter {
     fn eye_dims(&self) -> (u32, u32) {
         (self.eye_w, self.eye_h)
     }
+
+    fn source_decimation(&self) -> u32 { self.step as u32 }
+}
+
+// ── Blackmagic RAW zero-copy (macOS) ────────────────────────────────────
+//
+// `braw_helper --zerocopy` decodes on the GPU and blits each frame into a
+// slot of global IOSurfaces — one per eye, already on the 2:1 canvas — so
+// only "F <frame> <slot>" crosses the pipe. This iterator maps every
+// slot's surfaces as wgpu textures once per helper run and hands out
+// `FisheyePair`s whose `gpu` payload holds the textures and a guard that
+// returns the slot to the helper when the LAST clone of the pair drops;
+// the preview loop keeps a clone until the queue reports its submissions
+// done. No pixels pass through the CPU at any size: a 12K frame costs the
+// SDK's decode plus two GPU blits.
+
+/// Returns a zero-copy slot to the helper when dropped.
+#[cfg(target_os = "macos")]
+struct ZcSlotGuard {
+    slot: u32,
+    releaser: std::sync::Arc<vr180_braw::ZcReleaser>,
+    _surfaces: [std::sync::Arc<crate::interop_macos::IOSurfacePlaneTexture>; 2],
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ZcSlotGuard {
+    fn drop(&mut self) { self.releaser.release(self.slot); }
+}
+
+/// Blackmagic RAW pair source with the frames left on the GPU (see above).
+/// Same step / seek / canvas semantics as [`BrawFisheyeIter`].
+#[cfg(target_os = "macos")]
+pub struct BrawZcIter {
+    device: std::sync::Arc<wgpu::Device>,
+    path: PathBuf,
+    opts: vr180_braw::decoder::DecodeOptions,
+    swap_eyes: bool,
+    mono: bool,
+    slots: u32,
+    decoder: Option<vr180_braw::BrawZcDecoder>,
+    textures: Vec<[std::sync::Arc<crate::interop_macos::IOSurfacePlaneTexture>; 2]>,
+    releaser: Option<std::sync::Arc<vr180_braw::ZcReleaser>>,
+    eye_w: u32,
+    eye_h: u32,
+    dt_s: f64,
+    frame_idx: u64,
+    frame_count: u64,
+    step: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl BrawZcIter {
+    /// `slots`: the helper's pool (≥ 3: one being shown, one whose GPU work
+    /// may still be in flight, one decoding ahead).
+    pub fn new(
+        device: std::sync::Arc<wgpu::Device>,
+        path: &Path,
+        info: &vr180_braw::BrawInfo,
+        scale: vr180_braw::DecodeScale,
+        look: vr180_braw::DecodeLook,
+        swap_eyes: bool,
+        mono: bool,
+        step: u32,
+        slots: u32,
+    ) -> Result<Self> {
+        let step = step.max(1);
+        let opts = vr180_braw::decoder::DecodeOptions {
+            bit_16: false, scale, look,
+            pipeline: std::env::var("VR180_BRAW_PIPELINE").ok().filter(|p| !p.is_empty()),
+            step: (step > 1).then_some(step),
+            ..Default::default()
+        };
+        let dt_s = if info.frame_rate > 0.0 { 1.0 / info.frame_rate } else { 1.0 / 24.0 };
+        let mut it = Self {
+            device, path: path.to_path_buf(), opts, swap_eyes, mono, slots: slots.max(3),
+            decoder: None, textures: Vec::new(), releaser: None,
+            eye_w: 0, eye_h: 0, dt_s, frame_idx: 0, frame_count: info.frame_count, step: step as u64,
+        };
+        it.start_at(0)?;
+        Ok(it)
+    }
+
+    fn start_at(&mut self, frame: u64) -> Result<()> {
+        self.decoder = None;
+        self.textures.clear();
+        let mut opts = self.opts.clone();
+        opts.start_frame = Some(frame);
+        let dec = vr180_braw::BrawZcDecoder::start(&self.path, &opts, self.slots, self.mono)
+            .map_err(|e| Error::Ffmpeg(format!("braw zero-copy start at {frame}: {e}")))?;
+        let h = dec.header().clone();
+        let wrap = |id: u32| -> Result<std::sync::Arc<crate::interop_macos::IOSurfacePlaneTexture>> {
+            let surface = crate::interop_macos::RetainedIOSurface::lookup(id)
+                .ok_or_else(|| Error::Ffmpeg(format!("IOSurface {id} from braw_helper not found")))?;
+            let t = crate::interop_macos::wgpu_texture_from_iosurface_plane(
+                &self.device, surface, 0,
+                metal::MTLPixelFormat::RGBA8Unorm, wgpu::TextureFormat::Rgba8Unorm,
+                h.eye_width, h.eye_height, "braw_zc_eye",
+            )?;
+            Ok(std::sync::Arc::new(t))
+        };
+        for ids in &h.surfaces {
+            let l = wrap(ids[0])?;
+            let r = if ids[1] == ids[0] { l.clone() } else { wrap(ids[1])? };
+            self.textures.push([l, r]);
+        }
+        self.eye_w = h.eye_width;
+        self.eye_h = h.eye_height;
+        self.releaser = Some(dec.releaser());
+        self.frame_idx = frame;
+        self.decoder = Some(dec);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl FisheyePairIter for BrawZcIter {
+    fn next_pair(&mut self) -> Result<Option<FisheyePair>> {
+        if self.frame_count > 0 && self.frame_idx >= self.frame_count { return Ok(None); }
+        if self.decoder.is_none() {
+            let at = self.frame_idx;
+            self.start_at(at)?;
+        }
+        let f = match self.decoder.as_mut().unwrap().next_frame()
+            .map_err(|e| Error::Ffmpeg(format!("braw zero-copy next_frame: {e}")))? {
+            Some(f) => f,
+            None => { self.decoder = None; return Ok(None); }
+        };
+        let [l, r] = &self.textures[f.slot as usize];
+        let (l, r) = if self.swap_eyes { (r, l) } else { (l, r) };
+        let guard = ZcSlotGuard {
+            slot: f.slot,
+            releaser: self.releaser.clone().expect("releaser set with the decoder"),
+            _surfaces: [l.clone(), r.clone()],
+        };
+        self.frame_idx = f.index + self.step;
+        Ok(Some(FisheyePair {
+            left: Vec::new(), right: Vec::new(),
+            eye_w: self.eye_w, eye_h: self.eye_h,
+            bit_depth: 8,
+            pts_s: f.index as f64 * self.dt_s,
+            gpu: Some(std::sync::Arc::new(GpuPair {
+                left: l.texture.clone(), right: r.texture.clone(),
+                keep: Box::new(guard),
+            })),
+        }))
+    }
+
+    fn seek(&mut self, target_s: f64) -> Result<()> {
+        let target = (target_s.max(0.0) / self.dt_s).round() as u64;
+        let target = if self.frame_count > 0 { target.min(self.frame_count.saturating_sub(1)) } else { target };
+        if target == self.frame_idx && self.decoder.is_some() { return Ok(()); }
+        // Restart lazily at the target: a new helper, a new pool. Pairs
+        // still out keep their old surfaces alive through their guards.
+        self.decoder = None;
+        self.frame_idx = target;
+        Ok(())
+    }
+
+    fn eye_dims(&self) -> (u32, u32) { (self.eye_w, self.eye_h) }
 
     fn source_decimation(&self) -> u32 { self.step as u32 }
 }
@@ -4144,6 +4324,7 @@ impl DenoisingFisheyeIter {
                 eye_h: self.eye_h,
                 bit_depth: self.bit_depth,
                 pts_s: pts,
+                gpu: None,
             });
         }
     }

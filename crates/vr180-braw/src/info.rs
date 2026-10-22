@@ -107,6 +107,9 @@ pub struct BrawInfo {
     /// The Metal device's name when `pipeline` is "metal".
     #[serde(default)]
     pub gpu_device: Option<String>,
+    /// The helper offers `--zerocopy` (IOSurface hand-off; macOS).
+    #[serde(default)]
+    pub zerocopy: bool,
     /// The processed frame size at each `--scale`, as the SDK reports it
     /// for this clip (`null` from the helper when unavailable).
     #[serde(default)]

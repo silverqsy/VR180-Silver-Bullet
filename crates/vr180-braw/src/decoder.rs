@@ -169,7 +169,7 @@ pub struct DecodeOptions {
 }
 
 impl DecodeOptions {
-    fn extend_argv(&self, cmd: &mut Command) {
+    pub(crate) fn extend_argv(&self, cmd: &mut Command) {
         if self.bit_16 {
             cmd.arg("--16bit");
         }

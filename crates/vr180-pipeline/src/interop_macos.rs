@@ -100,6 +100,11 @@ extern "C" {
     fn IOSurfaceGetHeightOfPlane(s: IOSurfaceRef, plane: usize) -> usize;
     fn IOSurfaceGetBytesPerRowOfPlane(s: IOSurfaceRef, plane: usize) -> usize;
     fn IOSurfaceGetBytesPerElementOfPlane(s: IOSurfaceRef, plane: usize) -> usize;
+    fn IOSurfaceLookup(id: u32) -> IOSurfaceRef;
+    fn IOSurfaceGetID(s: IOSurfaceRef) -> u32;
+    fn IOSurfaceLock(s: IOSurfaceRef, options: u32, seed: *mut u32) -> i32;
+    fn IOSurfaceUnlock(s: IOSurfaceRef, options: u32, seed: *mut u32) -> i32;
+    fn IOSurfaceGetBaseAddress(s: IOSurfaceRef) -> *mut c_void;
     fn IOSurfaceGetWidth(s: IOSurfaceRef) -> usize;
     fn IOSurfaceGetHeight(s: IOSurfaceRef) -> usize;
     fn IOSurfaceGetBytesPerRow(s: IOSurfaceRef) -> usize;
@@ -131,6 +136,37 @@ impl RetainedIOSurface {
         }
     }
 
+    /// A global IOSurface by its ID (`IOSurfaceLookup`, +1 create rule —
+    /// no extra retain): how `braw_helper --zerocopy`'s pool is shared.
+    /// `None` when no such surface exists (the helper is gone and nobody
+    /// else holds it).
+    pub fn lookup(id: u32) -> Option<Self> {
+        let raw = unsafe { IOSurfaceLookup(id) };
+        NonNull::new(raw).map(|inner| Self { inner })
+    }
+    pub fn id(&self) -> u32 { unsafe { IOSurfaceGetID(self.as_raw()) } }
+    pub fn width(&self) -> usize { unsafe { IOSurfaceGetWidth(self.as_raw()) } }
+    pub fn height(&self) -> usize { unsafe { IOSurfaceGetHeight(self.as_raw()) } }
+    pub fn bytes_per_row(&self) -> usize { unsafe { IOSurfaceGetBytesPerRow(self.as_raw()) } }
+    /// Copy the surface's pixels out through the CPU (read lock): for
+    /// checks and tests, not the render path.
+    pub fn read_rows(&self) -> Vec<u8> {
+        const READ_ONLY: u32 = 1;
+        let (w, h, bpr) = (self.width(), self.height(), self.bytes_per_row());
+        let bpe = self.plane_bytes_per_element(0).max(1);
+        let mut out = vec![0u8; w * h * bpe];
+        unsafe {
+            IOSurfaceLock(self.as_raw(), READ_ONLY, std::ptr::null_mut());
+            let base = IOSurfaceGetBaseAddress(self.as_raw()) as *const u8;
+            if !base.is_null() {
+                for y in 0..h {
+                    std::ptr::copy_nonoverlapping(base.add(y * bpr), out.as_mut_ptr().add(y * w * bpe), w * bpe);
+                }
+            }
+            IOSurfaceUnlock(self.as_raw(), READ_ONLY, std::ptr::null_mut());
+        }
+        out
+    }
     pub fn as_raw(&self) -> IOSurfaceRef { self.inner.as_ptr() }
     pub fn plane_count(&self) -> usize { unsafe { IOSurfaceGetPlaneCount(self.as_raw()) } }
     pub fn plane_width(&self, p: usize) -> usize { unsafe { IOSurfaceGetWidthOfPlane(self.as_raw(), p) } }

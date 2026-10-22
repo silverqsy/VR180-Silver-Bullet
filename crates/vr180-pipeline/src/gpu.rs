@@ -5817,6 +5817,72 @@ impl Device {
         Ok(output_tex)
     }
 
+    /// Project one eye that is ALREADY a GPU texture (a zero-copy source:
+    /// an RGBA8 eye on the 2:1 canvas, e.g. a `braw_helper --zerocopy`
+    /// IOSurface) — no upload. `fisheye_out` picks the stabilized-fisheye
+    /// output kernel over the half-equirect one; `rs_rows_f32` (12 f32 per
+    /// source row) selects the per-scanline rolling-shutter kernels. The
+    /// same four kernels as the `&[u8]` entry points, so the output is
+    /// identical to uploading the texture's pixels.
+    pub fn project_fisheye_from_texture(
+        &self,
+        src: &wgpu::Texture,
+        out_w: u32, out_h: u32,
+        rotation: EquirectRotation,
+        calib: FisheyeCalib,
+        rs_rows_f32: Option<&[f32]>,
+        fisheye_out: bool,
+    ) -> Result<wgpu::Texture> {
+        let rs = rs_rows_f32.filter(|r| !r.is_empty());
+        let (pipe, layout, sampler, label) = match (fisheye_out, rs.is_some()) {
+            (false, false) => (&self.fisheye_to_hequirect.pipeline, &self.fisheye_to_hequirect.bind_group_layout, &self.fisheye_to_hequirect.sampler, "zc_hequirect"),
+            (false, true) => (&self.fisheye_to_hequirect_rs.pipeline, &self.fisheye_to_hequirect_rs.bind_group_layout, &self.fisheye_to_hequirect_rs.sampler, "zc_hequirect_rs"),
+            (true, false) => (&self.fisheye_to_fisheye.pipeline, &self.fisheye_to_fisheye.bind_group_layout, &self.fisheye_to_fisheye.sampler, "zc_fisheye"),
+            (true, true) => (&self.fisheye_to_fisheye_rs.pipeline, &self.fisheye_to_fisheye_rs.bind_group_layout, &self.fisheye_to_fisheye_rs.sampler, "zc_fisheye_rs"),
+        };
+        let output_tex = make_rw_texture(&self.device, label, out_w, out_h,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC);
+        let src_view = src.create_view(&Default::default());
+        let dst_view = output_tex.create_view(&Default::default());
+        let r_uniform = self.write_uniform("zc_R", &EquirectUniforms::from_mat3(rotation.0));
+        let cal_uniform = self.write_uniform("zc_cal", &FisheyeCalibUniforms::from_public(calib));
+        let rs_buf = rs.map(|rows| {
+            let bytes: &[u8] = bytemuck::cast_slice(rows);
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("zc_rs_rows"),
+                size: bytes.len() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&buf, 0, bytes);
+            buf
+        });
+        let mut entries = vec![
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
+        ];
+        if let Some(b) = &rs_buf {
+            entries.push(wgpu::BindGroupEntry { binding: 5, resource: b.as_entire_binding() });
+        }
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label), layout, entries: &entries,
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_tex)
+    }
+
     /// 16-bit-per-channel projection. Same KB math + cubic Hermite
     /// extension as the 8-bit variant; output texture is Rgba16Unorm
     /// instead of Rgba8Unorm. Source is uploaded as 16-bit so source

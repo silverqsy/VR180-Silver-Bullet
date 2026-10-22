@@ -47,6 +47,8 @@
 #include <mutex>
 #include <algorithm>
 #include <condition_variable>
+#include <thread>
+#include "braw_zc.h"
 
 #include <CoreServices/CoreServices.h>
 
@@ -402,6 +404,13 @@ static std::string g_pipelineArg = "auto";
 // --step N: emit every Nth frame from --start (BRAW is intra-only, so the
 // skipped frames cost nothing). The header's "frames" is the emitted count.
 static uint64_t g_step = 1;
+// --zerocopy N: hand frames over as N slots of global IOSurfaces (see
+// braw_zc.h) — only "F <frame> <slot>" lines cross the pipe, the app maps
+// the surfaces as textures and returns slots with "R <slot>" on stdin.
+// --mono: the frame is ONE fisheye (shown to both eyes), not a side-by-side
+// pair — one surface per slot.
+static uint32_t g_zcSlots = 0;
+static bool g_mono = false;
 static IBlackmagicRawPipelineDevice* g_gpuDevice = nullptr;     // alive while the codec is
 static IBlackmagicRawResourceManager* g_resourceManager = nullptr;
 static std::string g_activePipeline = "cpu";
@@ -579,6 +588,12 @@ class DecodeCallback : public IBlackmagicRawCallback {
 public:
     IBlackmagicRawClipProcessingAttributes* clipOverrides = nullptr;  // set before decode
     size_t bytesPerPixel = 4;
+    // Zero-copy: frames go into `zc` slots instead of CPU buffers. The main
+    // loop registers each ticket's slot before submitting its read job;
+    // with a two-track clip both of a frame's tickets share the slot.
+    ZcPool* zc = nullptr;
+    bool dual = false;
+    void set_slot(uint64_t ticket, uint32_t slot) { std::lock_guard<std::mutex> lk(mu_); slots_[ticket] = slot; }
 
     void ReadComplete(IBlackmagicRawJob* readJob, HRESULT result, IBlackmagicRawFrame* frame) override {
         void* ticket = nullptr;
@@ -611,7 +626,11 @@ public:
         job->GetUserData(&ticket);
         FrameResult r;
         r.status = (result == S_OK && !img) ? E_FAIL : result;
-        if (r.status == S_OK) {
+        if (r.status == S_OK && zc) {
+            img->GetWidth(&r.w);
+            img->GetHeight(&r.h);
+            r.status = fill_slot((uint64_t)(uintptr_t)ticket, img, r.w, r.h) ? S_OK : E_FAIL;
+        } else if (r.status == S_OK) {
             img->GetWidth(&r.w);
             img->GetHeight(&r.h);
             r.bytes = take_buffer();
@@ -654,6 +673,24 @@ private:
     std::condition_variable cv_;
     std::map<uint64_t, FrameResult> done_;
     std::vector<std::vector<uint8_t>> pool_;
+    std::map<uint64_t, uint32_t> slots_;
+
+    // Copy the processed image into its ticket's slot: a GPU blit from the
+    // SDK's MTLBuffer, or a memcpy from a CPU resource.
+    bool fill_slot(uint64_t ticket, IBlackmagicRawProcessedImage* img, uint32_t w, uint32_t h) {
+        uint32_t slot;
+        { std::lock_guard<std::mutex> lk(mu_); auto it = slots_.find(ticket); if (it == slots_.end()) return false; slot = it->second; slots_.erase(it); }
+        void* res = nullptr; img->GetResource(&res);
+        BlackmagicRawResourceType type = blackmagicRawResourceTypeBufferCPU;
+        img->GetResourceType(&type);
+        if (!res) return false;
+        const int track = dual ? (int)(ticket & 1) : -1;
+        if (type == blackmagicRawResourceTypeBufferCPU)
+            return zc_pool_fill_cpu(zc, slot, (const uint8_t*)res, w, h, w * 4, track);
+        void* context = nullptr; void* queue = nullptr;
+        img->GetResourceContextAndCommandQueue(&context, &queue);
+        return zc_pool_fill_metal(zc, slot, res, queue, w, h, w * 4, track);
+    }
 
     std::vector<uint8_t> take_buffer() {
         std::lock_guard<std::mutex> lk(mu_);
@@ -860,6 +897,7 @@ static int do_info(const char* path) {
     printf("  \"embedded_lut\": \"%s\",\n", json_escape(lutName).c_str());
     printf("  \"post_3dlut_mode\": \"%s\",\n", json_escape(get_metadata_string(ctx.clip, "post_3dlut_mode")).c_str());
     printf("  \"pipeline\": \"%s\",\n", pipeline.c_str());
+    printf("  \"zerocopy\": true,\n");
     if (pipeline == "metal") printf("  \"gpu_device\": \"%s\",\n", gpuDevice.c_str());
     else printf("  \"gpu_device\": null,\n");
     if (haveScales)
@@ -1076,6 +1114,124 @@ static int frames_in_flight_for(size_t frameBytes) {
     return (int)std::max<size_t>(1, std::min<size_t>(3, k));
 }
 
+// Zero-copy hand-off (`--zerocopy N`): see braw_zc.h. The app's releases
+// ("R <slot>" on stdin) feed the free list; the main loop never submits a
+// read job without a slot for it. Output order is frame order.
+static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClipProcessingAttributes* clipOverrides,
+                        uint64_t start, uint64_t end, uint64_t step, int decode_track, bool is_dual) {
+    auto fail = [&]() -> int { ctx.codec->FlushJobs(); if (clipOverrides) clipOverrides->Release(); return 1; };
+    if (g_use16bit) { fprintf(stderr, "ERROR: --zerocopy is 8-bit only\n"); return fail(); }
+    // The processed size at this scale, from the SDK (one track's for a
+    // two-track clip), sizes the pool before anything is decoded.
+    uint32_t pw = 0, ph = 0;
+    {
+        IBlackmagicRawClipResolutions* res = nullptr;
+        if (ctx.clip->QueryInterface(IID_IBlackmagicRawClipResolutions, (void**)&res) != S_OK || !res
+            || res->GetClosestResolutionForScale(g_scale, &pw, &ph) != S_OK || pw == 0 || ph == 0) {
+            if (res) res->Release();
+            fprintf(stderr, "ERROR: the SDK did not report the processed size at this scale\n");
+            return fail();
+        }
+        res->Release();
+    }
+    ZcGeometry g;
+    g.mono = g_mono;
+    if (g_mono) { g.eye_w = pw; g.eye_h = ph; g.pad_rows = 0; }
+    else if (is_dual) { g.eye_w = pw; g.eye_h = pw; g.pad_rows = ((int32_t)pw - (int32_t)ph) / 2; }
+    else { g.eye_w = pw / 2; g.eye_h = pw / 2; g.pad_rows = ((int32_t)(pw / 2) - (int32_t)ph) / 2; }
+    const uint32_t slots = std::max<uint32_t>(2, g_zcSlots);
+    ZcPool* pool = zc_pool_create(slots, g);
+    if (!pool) return fail();
+    cb.zc = pool;
+    cb.dual = is_dual;
+
+    const uint64_t emitted = (end - start + step - 1) / step;
+    fprintf(stderr, "{\"width\": %u, \"height\": %u, \"frames\": %llu, \"dual_stream\": %s, \"bit_depth\": 8, \"format\": \"rgba\", \"step\": %llu",
+            is_dual ? pw * 2 : pw, is_dual ? ph : ph, (unsigned long long)emitted, is_dual ? "true" : "false", (unsigned long long)step);
+    fprintf(stderr, ", \"pipeline\": \"%s\"", g_activePipeline.c_str());
+    if (g_activePipeline == "metal") fprintf(stderr, ", \"gpu_device\": \"%s\"", g_gpuDeviceName.c_str());
+    fprintf(stderr, ", \"transport\": \"iosurface\", \"slots\": %u, \"eye_width\": %u, \"eye_height\": %u, \"pad_rows\": %d, \"mono\": %s, \"surfaces\": [",
+            slots, g.eye_w, g.eye_h, g.pad_rows, g_mono ? "true" : "false");
+    for (uint32_t s = 0; s < slots; s++)
+        fprintf(stderr, "%s[%u, %u]", s ? ", " : "", zc_pool_surface_id(pool, s, 0), zc_pool_surface_id(pool, s, 1));
+    fprintf(stderr, "]}\n");
+    fflush(stderr);
+
+    // Free slots: all at first; the app returns them on stdin. stdin EOF =
+    // the app is gone.
+    std::mutex fm; std::condition_variable fcv;
+    std::vector<uint32_t> free_slots;
+    for (uint32_t s = 0; s < slots; s++) free_slots.push_back(s);
+    bool app_gone = false;
+    std::thread reader([&]() {
+        char line[128];
+        while (fgets(line, sizeof line, stdin)) {
+            unsigned s = 0;
+            if (sscanf(line, "R %u", &s) == 1 && s < slots) {
+                std::lock_guard<std::mutex> lk(fm); free_slots.push_back(s);
+            }
+            fcv.notify_all();
+        }
+        { std::lock_guard<std::mutex> lk(fm); app_gone = true; }
+        fcv.notify_all();
+    });
+    auto take_slot = [&](uint32_t* slot) -> bool {
+        std::unique_lock<std::mutex> lk(fm);
+        fcv.wait(lk, [&] { return app_gone || !free_slots.empty(); });
+        if (free_slots.empty()) return false;
+        *slot = free_slots.back(); free_slots.pop_back();
+        return true;
+    };
+
+    // Keep up to `ahead` frames decoding while the app consumes.
+    const int ahead = (int)std::min<uint32_t>(3, slots - 1);
+    std::vector<std::pair<uint64_t, uint32_t>> inflight;   // (frame, slot), oldest first
+    uint64_t next = start;
+    int rc = 0;
+    auto top_up = [&]() -> bool {
+        while ((int)inflight.size() < ahead && next < end) {
+            uint32_t slot;
+            if (!take_slot(&slot)) return false;     // app gone
+            if (is_dual) {
+                cb.set_slot(next * 2 + 0, slot); cb.set_slot(next * 2 + 1, slot);
+                if (!submit_read(ctx, next * 2 + 0, next, 0) || !submit_read(ctx, next * 2 + 1, next, 1)) { rc = 1; return false; }
+            } else {
+                cb.set_slot(next, slot);
+                if (!submit_read(ctx, next, next, decode_track)) { rc = 1; return false; }
+            }
+            inflight.emplace_back(next, slot);
+            next += step;
+        }
+        return true;
+    };
+    bool going = top_up();
+    while (going && !inflight.empty()) {
+        const auto [frame, slot] = inflight.front();
+        inflight.erase(inflight.begin());
+        bool ok;
+        if (is_dual) {
+            FrameResult a = cb.wait(frame * 2 + 0), b = cb.wait(frame * 2 + 1);
+            ok = a.status == S_OK && b.status == S_OK;
+        } else {
+            FrameResult r = cb.wait(frame);
+            ok = r.status == S_OK;
+        }
+        if (!ok) { fprintf(stderr, "ERROR: Decode failed at frame %llu\n", (unsigned long long)frame); rc = 1; break; }
+        going = top_up();                    // keep the SDK busy before reporting
+        printf("F %llu %u\n", (unsigned long long)frame, slot);
+        fflush(stdout);
+    }
+    ctx.codec->FlushJobs();
+    // Let the reader end: closing stdin from our side is not possible, so
+    // leave it to the app (it closes its end when it drops the decoder).
+    fclose(stdin);
+    reader.join();
+    cb.zc = nullptr;
+    zc_pool_destroy(pool);
+    if (clipOverrides) clipOverrides->Release();
+    return rc;
+}
+
 static int do_decode(const char* path, uint64_t start, uint64_t count, int track) {
     ClipContext ctx;
     if (!ctx.open(path, /*wantGpu=*/true)) return 1;
@@ -1169,6 +1325,12 @@ static int do_decode(const char* path, uint64_t start, uint64_t count, int track
         fprintf(stderr, "}\n");
         fflush(stderr);
     };
+
+    if (g_zcSlots > 0) {
+        int decode_track = track;
+        if (decode_track < 0 && ctx.videoTrackCount == 1 && ctx.multiVideo) decode_track = 0;
+        return do_decode_zc(ctx, cb, clipOverrides, start, end, step, decode_track, is_dual);
+    }
 
     if (is_dual) {
         // Two tracks per frame, written side by side (track 0 left). Tickets
@@ -1592,6 +1754,8 @@ int main(int argc, const char* argv[]) {
         std::cerr << "              [--scale full|half|quarter|eighth] [--look film|video|extended|rec709]" << std::endl;
         std::cerr << "              [--pipeline auto|metal|cpu]  (auto = the first Metal device, else CPU)" << std::endl;
         std::cerr << "              [--step N]  (every Nth frame from --start; the header's frames = emitted count)" << std::endl;
+        std::cerr << "              [--zerocopy N] [--mono]  (N slots of global IOSurfaces: \"F <frame> <slot>\" per frame on stdout," << std::endl;
+        std::cerr << "               \"R <slot>\" on stdin returns one; surface IDs + eye size in the header; 8-bit only)" << std::endl;
         std::cerr << "              (JSON header on stderr, then raw RGBA frames on stdout)" << std::endl;
         std::cerr << "              [--gamma S] [--gamut S] [--wb K] [--tint T] [--exposure EV] [--iso N]" << std::endl;
         std::cerr << "              [--tc-contrast|--tc-saturation|--tc-midpoint|--tc-highlights|--tc-shadows|" << std::endl;
@@ -1614,6 +1778,7 @@ int main(int argc, const char* argv[]) {
         std::string arg = argv[i];
         // Flags without values
         if (arg == "--16bit") { g_use16bit = true; continue; }
+        if (arg == "--mono") { g_mono = true; continue; }
         // Key-value pairs (need next arg as value)
         if (i + 1 >= argc) break;
         std::string val = argv[i + 1];
@@ -1630,6 +1795,7 @@ int main(int argc, const char* argv[]) {
             g_pipelineArg = val;
         }
         else if (arg == "--step") { g_step = std::max<uint64_t>(1, std::stoull(val)); }
+        else if (arg == "--zerocopy") { g_zcSlots = (uint32_t)std::stoul(val); }
         else if (arg == "--wb") g_procParams.whiteBalanceKelvin = std::stoi(val);
         else if (arg == "--tint") g_procParams.whiteBalanceTint = std::stoi(val);
         else if (arg == "--exposure") g_procParams.exposure = std::stof(val);
