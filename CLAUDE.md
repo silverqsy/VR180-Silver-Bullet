@@ -1448,6 +1448,38 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      argv still worked (clip-level ones did apply): always assert the
      anchor's location, not just its count. `BRAW_HELPER_DEBUG=1` prints the
      per-frame overrides the helper applies.
+     **Follow-up (same day, user: "tone curve 选项不生效 … 需要全分辨率导出
+     prores 以及 hevc 的手段")**: (1) the SDK applies its tone-curve
+     attributes ONLY under the gamma "Blackmagic Design Custom" — measured
+     with `--tc-contrast 1.9` / `--tc-black-level 0.5` on C006: no change at
+     all under Film, Video, Extended Video or Rec.709, mean 66→33 / 162 under
+     Custom (whose default curve is also brighter than Extended Video: 95 vs
+     50); highlight recovery and exposure work under every gamma. Like
+     Resolve's Camera Raw panel, moving a tone-curve control now switches the
+     gamma to Custom (note shown while it is not; the embedded Film LUT goes
+     off with it). (2) Full-resolution export: `ExportResolution::Native`
+     already exports the clip's own per-eye size (a 12K BRAW → 12288×6144
+     SBS) but was labelled with the Osmo's "7680 × 3840"; the Resolution
+     combo and the export bar now show the clip's real native size
+     (`App::native_sbs_dims`). Encoder limits measured with ffmpeg 8 on the
+     M5 Max: `hevc_videotoolbox` takes 12288×6144, 12288×6480 and even
+     16384×8192 (Main / Main10); `prores_videotoolbox` refuses anything above
+     8192×4096 (`-12903`, no compression session); `prores_ks` and `libx265`
+     take 16K. `export_fisheye` therefore tries the VT zero-copy encoder and,
+     when VT refuses the size, drops to the readback path with the software
+     encoder of the same codec (`prores_ks` / `libx265`; the flags are
+     `let mut`, `encoder_backend` carries the choice; hints under the
+     Resolution combo). **Measured (`examples/braw_export_check`, C006, 10
+     frames at native 12288×6144)**: HEVC Main10 VT zero-copy 0.22 s/frame;
+     ProRes HQ → prores_ks fallback 0.59 s/frame (readback 453 MB/frame +
+     CPU ProRes), both files probe at 12288×6144, and the ProRes run with
+     Custom gamma + contrast 1.9 (via `cfg.braw_color`) has mean luma 44
+     vs 65 as shot — the overrides reach the export. The pipe decode of a
+     12K 16-bit frame is NOT the bottleneck at this size (~2 GB/s). Zsh
+     trap met while probing: an unquoted `$VAR` is one word in zsh (no
+     SH_WORD_SPLIT), so `helper $FLAGS` passed "--exposure 2" as a single
+     argument and `size=$SZ:rate` applied the `:r` modifier — use bash for
+     such loops.
    - **File facts**: gyro+accel 1022 Hz, rad/s and m/s², NO timestamps
      (sample 0 = frame 0 start, rate is the clock); no lens metadata at all
      (`lens_type` etc. empty, distortion arrays zero); shutter is AUTO and

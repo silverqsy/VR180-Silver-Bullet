@@ -852,6 +852,14 @@ fn tr(en: &'static str) -> &'static str {
         "The clip's Film→video LUT fits the Film gamma only — it is switched off while another gamma is selected above."
             => "素材自带的 Film→视频 LUT 只适用于 Film 伽马——上方选择其他伽马时会自动关闭。",
         "Use the clip's embedded Film→video LUT" => "使用素材内嵌的 Film→视频 LUT",
+        "The SDK applies the tone curve under its \"Blackmagic Design Custom\" gamma only — moving a control switches the gamma to it (and the clip's Film LUT off)."
+            => "SDK 只在 “Blackmagic Design Custom” 伽马下应用色调曲线——拖动任一控件会自动切换到该伽马（并关闭素材的 Film LUT）。",
+        "native" => "原始",
+        "full" => "全尺寸",
+        "Above 8192 × 4096 the Mac's hardware ProRes encoder refuses the frame — the software encoder takes over (several times slower)."
+            => "超过 8192 × 4096 时 Mac 的硬件 ProRes 编码器不接受该画幅——改用软件编码器（慢数倍）。",
+        "Above 8192 × 4096 the file exceeds HEVC Level 6.2 — it encodes in hardware, but most players cannot decode it."
+            => "超过 8192 × 4096 时文件超出 HEVC Level 6.2——可用硬件编码，但多数播放器无法解码。",
         "Blackmagic RAW colour controls need the clip probe's colour block — rebuild the helper (helpers/braw/build_braw.sh)."
             => "Blackmagic RAW 调色控件需要探测结果中的颜色信息——请重新编译 helper（helpers/braw/build_braw.sh）。",
         // Matching Eyes (inter-eye trim)
@@ -3980,9 +3988,12 @@ impl App {
         let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
         let res_label = match self.settings.reframe_aspect_if_active() {
             Some(aspect) => self.export_opts.reframe_size.label(aspect),
-            None if is_still && self.export_opts.resolution == ExportResolution::Native => {
-                let (ew, eh) = self.export_eye_dims();
-                format!("{} × {}", ew * 2, eh)
+            // Native = the clip's own size (a 12K BRAW: 12288 × 6144).
+            None if self.export_opts.resolution == ExportResolution::Native => {
+                match self.native_sbs_dims() {
+                    Some((w, h)) => format!("{w} × {h}"),
+                    None => self.export_opts.resolution.label().to_string(),
+                }
             }
             None => self.export_opts.resolution.label().to_string(),
         };
@@ -4138,7 +4149,7 @@ impl App {
             let mut open = true;
             let clip_fps = self.clip.as_ref().map(|c| c.fps).unwrap_or(30.0);
             let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
-            let still_dims = self.clip.as_ref().filter(|c| c.source_kind.is_still()).map(|c| (c.width, c.height));
+            let native_dims = self.native_sbs_dims();
             egui::Window::new(tr("Export format"))
                 .collapsible(false)
                 .resizable(false)
@@ -4147,7 +4158,7 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_min_width(360.0);
                     Self::export_options_ui(ui, &mut self.export_opts, "export",
-                        self.settings.reframe_aspect_if_active(), clip_fps, is_still, still_dims);
+                        self.settings.reframe_aspect_if_active(), clip_fps, is_still, native_dims);
                 });
             self.show_export_settings = open;
         }
@@ -4161,7 +4172,7 @@ impl App {
         reframe: Option<crate::decoder::ReframeAspect>,
         fps: f32,
         is_still: bool,
-        still_dims: Option<(u32, u32)>,
+        native_dims: Option<(u32, u32)>,
     ) {
         if let Some(aspect) = reframe {
             // Reframed view: the exact viewport at a per-eye size.
@@ -4179,9 +4190,13 @@ impl App {
                 .small().color(Color32::GRAY));
         } else {
             ui.label(RichText::new(tr("Resolution")).strong());
-            let native_label: String = if is_still {
-                still_dims.map(|(w, h)| format!("{w} × {h} (full)")).unwrap_or_else(|| "native (full)".to_string())
-            } else { ExportResolution::Native.label().to_string() };
+            // Native = the clip's own size (full resolution): 7680 × 3840 for
+            // an Osmo 360, 12288 × 6144 for a 12K BRAW.
+            let native_label: String = match native_dims {
+                Some((w, h)) => format!("{w} × {h} ({})", if is_still { tr("full") } else { tr("native") }),
+                None if is_still => "native (full)".to_string(),
+                None => ExportResolution::Native.label().to_string(),
+            };
             let sel_label: &str = if opts.resolution == ExportResolution::Native { &native_label } else { ExportResolution::R8k.label() };
             egui::ComboBox::from_id_source(format!("{id_prefix}_resolution"))
                 .selected_text(sel_label)
@@ -4192,6 +4207,19 @@ impl App {
                     ui.selectable_value(&mut opts.resolution,
                         ExportResolution::R8k, ExportResolution::R8k.label());
                 });
+            // Beyond 8192×4096 (a 12K BRAW): Apple's hardware ProRes engine
+            // refuses the frame, so ProRes goes to the software encoder; HEVC
+            // encodes in hardware but exceeds Level 6.2 for most players.
+            if !is_still && opts.resolution == ExportResolution::Native {
+                if let Some((w, h)) = native_dims {
+                    if w > 8192 || h > 4096 {
+                        ui.label(RichText::new(match opts.codec {
+                            ExportCodec::ProRes => tr("Above 8192 × 4096 the Mac's hardware ProRes encoder refuses the frame — the software encoder takes over (several times slower)."),
+                            ExportCodec::H265 => tr("Above 8192 × 4096 the file exceeds HEVC Level 6.2 — it encodes in hardware, but most players cannot decode it."),
+                        }).small().color(Color32::GRAY));
+                    }
+                }
+            }
         }
         ui.add_space(8.0);
 
@@ -5378,6 +5406,28 @@ impl App {
     /// derivation as the export config builder: source eye dims (EAC: the
     /// native cross square), 4096² for the 8K target, or the reframed
     /// per-eye size. Snapshots render the paused frame at exactly this.
+    /// The side-by-side frame an export at the Native resolution produces
+    /// for the loaded clip (per-eye native dims × 2 wide), for the labels —
+    /// a 12K BRAW is 12288 × 6144, an Osmo 360 7680 × 3840. `None` without a
+    /// clip or in the reframed mode (its own size picker).
+    fn native_sbs_dims(&self) -> Option<(u32, u32)> {
+        let clip = self.clip.as_ref()?;
+        if self.settings.reframe_aspect_if_active().is_some() { return None; }
+        let kind = clip.source_kind;
+        let (ew, eh) = if clip.fisheye_eye_w > 0 {
+            (clip.fisheye_eye_w, clip.fisheye_eye_h)
+        } else if kind.is_eac() {
+            let cross_w = 2 * (clip.width.saturating_sub(1920) / 4) + 1920;
+            (cross_w.max(512), cross_w.max(512))
+        } else {
+            (clip.width.max(512), clip.height.max(512))
+        };
+        Some(match self.settings.fisheye_output_mode {
+            crate::decoder::FisheyeOutputMode::Fisheye => { let side = ew.min(eh); (side * 2, side) }
+            _ => (ew * 2, eh),
+        })
+    }
+
     fn export_eye_dims(&self) -> (u32, u32) {
         let Some(clip) = self.clip.as_ref() else { return (0, 0); };
         let kind = clip.source_kind;
@@ -7005,7 +7055,20 @@ fn draw_braw_color_section(
     });
 
     ui.add_space(4.0);
+    // The SDK applies the tone curve ONLY under its "Blackmagic Design
+    // Custom" gamma (measured: under Film / Video / Extended Video / Rec.709
+    // every tone-curve attribute is ignored). Like Resolve's Camera Raw
+    // panel, moving a tone control switches the gamma to Custom.
+    const CUSTOM_GAMMA: &str = "Blackmagic Design Custom";
+    let has_custom = info.gamma_list.iter().any(|g| g == CUSTOM_GAMMA);
+    let on_custom = p.effective_gamma(info) == CUSTOM_GAMMA;
     ui.label(RichText::new(tr("Tone curve")).strong());
+    if has_custom && !on_custom {
+        ui.label(RichText::new(tr(
+            "The SDK applies the tone curve under its \"Blackmagic Design Custom\" gamma only — moving a control switches the gamma to it (and the clip's Film LUT off)."
+        )).small().color(Color32::GRAY));
+    }
+    let tone_before = (p.saturation, p.contrast, p.midpoint, p.highlights, p.shadows, p.black_level, p.white_level, p.video_black_level);
     f32_slider(ui, &mut p.saturation, info.saturation, tr("Saturation"), 2);
     f32_slider(ui, &mut p.contrast, info.contrast, tr("Contrast"), 2);
     f32_slider(ui, &mut p.midpoint, info.midpoint, tr("Midpoint"), 2);
@@ -7014,6 +7077,14 @@ fn draw_braw_color_section(
     f32_slider(ui, &mut p.black_level, info.black_level, tr("Black level"), 2);
     f32_slider(ui, &mut p.white_level, info.white_level, tr("White level"), 2);
     flag(ui, &mut p.video_black_level, info.video_black_level, tr("Video black level"));
+    let tone_after = (p.saturation, p.contrast, p.midpoint, p.highlights, p.shadows, p.black_level, p.white_level, p.video_black_level);
+    if tone_after != tone_before && has_custom && !on_custom {
+        p.gamma = Some(CUSTOM_GAMMA.to_string());
+        // Custom is display-referred: the Film→video LUT no longer fits.
+        if let Some(lut) = braw_lut {
+            if s.lut_path == lut { s.lut_path.clear(); }
+        }
+    }
 }
 
 fn fine_slider(

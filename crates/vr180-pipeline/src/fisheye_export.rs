@@ -1364,9 +1364,19 @@ fn export_fisheye_inner(
     let on_macos_vt = cfg!(target_os = "macos")
         && matches!(cfg.encoder,
             EncoderBackend::VideoToolbox | EncoderBackend::ProResVideoToolbox);
-    let is_prores_vt = cfg.encoder == EncoderBackend::ProResVideoToolbox;
-    let use_zero_copy_bgra = on_macos_vt && cfg.bit_depth == 8 && !is_prores_vt;
-    let use_zero_copy_p010 = on_macos_vt && (cfg.bit_depth == 10 || is_prores_vt);
+    // Mutable: when VideoToolbox refuses the frame size (Apple's hardware
+    // ProRes engine stops at 8192×4096 — a 12K BRAW's native SBS frame is
+    // 12288×6144 — while its HEVC encoder takes 16384×8192), the encode
+    // drops to the readback path with the software encoder of the same
+    // codec (`prores_ks` / `libx265`). The arms that reassign are macOS-only.
+    #[allow(unused_mut)]
+    let mut is_prores_vt = cfg.encoder == EncoderBackend::ProResVideoToolbox;
+    #[allow(unused_mut)]
+    let mut use_zero_copy_bgra = on_macos_vt && cfg.bit_depth == 8 && !is_prores_vt;
+    #[allow(unused_mut)]
+    let mut use_zero_copy_p010 = on_macos_vt && (cfg.bit_depth == 10 || is_prores_vt);
+    #[allow(unused_mut)]
+    let mut encoder_backend = cfg.encoder;
     // One-pass: encode STRAIGHT to the final file and mux the source's
     // audio inline (no temp + re-mux). Otherwise write a local-scratch
     // video temp and mux audio onto it afterwards (ambisonic / APAC).
@@ -1381,24 +1391,44 @@ fn export_fisheye_inner(
         // — gate the VT-only ctor and supply `unreachable!()` where the
         // value is needed (mirrors the `#[cfg]` blocks in the encode loop).
         #[cfg(target_os = "macos")]
-        { H265Encoder::create_zero_copy_vt(
-            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
-        )? }
+        {
+            match H265Encoder::create_zero_copy_vt(&video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    tracing::warn!("fisheye_export: VideoToolbox HEVC refused {sbs_w}×{sbs_h} ({e}) — libx265 on the readback path");
+                    use_zero_copy_bgra = false;
+                    encoder_backend = EncoderBackend::Libx265;
+                    open_h265_encoder(&video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
+                        EncoderBackend::Libx265, cfg.bit_depth, cfg.prores_profile)?
+                }
+            }
+        }
         #[cfg(not(target_os = "macos"))]
         { unreachable!("zero-copy BGRA encode is macOS/VideoToolbox-only") }
     } else if use_zero_copy_p010 {
         // macOS/VideoToolbox-only zero-copy P010 path (HEVC Main10 or
-        // ProRes-VT). Same gating.
+        // ProRes-VT). Same gating. A frame VideoToolbox will not take
+        // (ProRes above 8192×4096: `-12903`, no session) goes to the
+        // software encoder of the same codec on the readback path below.
         #[cfg(target_os = "macos")]
         {
-            if is_prores_vt {
-                H265Encoder::create_zero_copy_vt_prores(
-                    &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.prores_profile,
-                )?
+            let attempt = if is_prores_vt {
+                H265Encoder::create_zero_copy_vt_prores(&video_tmp, sbs_w, sbs_h, cfg.fps, cfg.prores_profile)
             } else {
-                H265Encoder::create_zero_copy_vt_p010(
-                    &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
-                )?
+                H265Encoder::create_zero_copy_vt_p010(&video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps)
+            };
+            match attempt {
+                Ok(enc) => enc,
+                Err(e) => {
+                    let fallback = if is_prores_vt { EncoderBackend::ProResKs } else { EncoderBackend::Libx265 };
+                    tracing::warn!("fisheye_export: VideoToolbox {} refused {sbs_w}×{sbs_h} ({e}) — {:?} on the readback path (slower)",
+                        if is_prores_vt { "ProRes" } else { "HEVC" }, fallback);
+                    use_zero_copy_p010 = false;
+                    is_prores_vt = false;
+                    encoder_backend = fallback;
+                    open_h265_encoder(&video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
+                        fallback, cfg.bit_depth, cfg.prores_profile)?
+                }
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -1426,7 +1456,7 @@ fn export_fisheye_inner(
     } else {
         tracing::info!(
             "fisheye_export: readback + swscale path (bit_depth={}, backend={:?})",
-            cfg.bit_depth, cfg.encoder
+            cfg.bit_depth, encoder_backend
         );
     }
 

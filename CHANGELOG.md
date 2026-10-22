@@ -69,9 +69,18 @@ frame.
   clears the overrides. The app's Tone and White balance stages are hidden
   for this camera (they duplicate the SDK's); the embedded Film→video LUT
   switches off automatically under a non-Film gamma and back on for Film.
-  The preview re-decodes the frame on screen as a control moves (the
-  zero-copy helper takes the change live), and exports and zoom stills use
-  the same settings.
+  The SDK applies its tone curve only under the "Blackmagic Design Custom"
+  gamma, so moving a tone-curve control switches the gamma to it, as
+  DaVinci Resolve does. The preview re-decodes the frame on screen as a
+  control moves (the zero-copy helper takes the change live), and exports
+  and zoom stills use the same settings.
+- **Full-resolution export.** The Resolution picker's native entry now
+  shows the loaded clip's own size (a 12K BRAW: 12288 × 6144) instead of a
+  fixed 7680 × 3840 label. HEVC at that size encodes in hardware; the Mac's
+  hardware ProRes encoder refuses frames above 8192 × 4096, so ProRes
+  exports beyond it switch to the software encoder automatically (slower;
+  a hint says so). Such files exceed HEVC Level 6.2 and need a capable
+  player.
 - **BRAW on slow storage.** Play no longer waits for the per-frame shutter
   scan (one full frame per sample, about 2 GB on a long 12K clip): the
   live view uses the clip's shutter range from the probe, and the export
