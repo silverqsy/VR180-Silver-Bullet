@@ -472,7 +472,9 @@ struct ExportOptions {
     still_format: StillFormatChoice,
     /// Output resolution target (Native / 8192×4096).
     resolution: ExportResolution,
-    /// H.265 average bitrate in Mbps for VR180 output. Range 20..=500.
+    /// H.265 average bitrate in Mbps for VR180 output. Range 20..=1000
+    /// (a native 12K export wants the top of it; the slider is logarithmic
+    /// so the everyday 50–300 Mbps band keeps its resolution).
     h265_bitrate_mbps: u32,
     /// H.265 average bitrate in Mbps for REFRAMED (Flat 3D) output. Range
     /// 10..=300, kept apart from the VR180 rate: a flat rectilinear frame
@@ -4293,7 +4295,8 @@ impl App {
                         }
                     });
                 } else {
-                    ui.add(egui::Slider::new(&mut opts.h265_bitrate_mbps, 20..=500)
+                    ui.add(egui::Slider::new(&mut opts.h265_bitrate_mbps, 20..=1000)
+                        .logarithmic(true)
                         .text("Mbps"));
                 }
                 ui.add_space(4.0);

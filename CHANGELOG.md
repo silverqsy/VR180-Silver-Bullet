@@ -85,6 +85,9 @@ frame.
   The preview re-decodes the frame on screen as a control moves (the
   zero-copy helper takes the change live), and exports and zoom stills use
   the same settings.
+- **H.265 bitrate up to 1000 Mbps.** The VR180 bitrate slider's ceiling
+  rises from 500 to 1000 Mbps for native 12K exports (logarithmic, so the
+  usual 50–300 Mbps band keeps its fine steps).
 - **Full-resolution export.** The Resolution picker's native entry now
   shows the loaded clip's own size (a 12K BRAW: 12288 × 6144) instead of a
   fixed 7680 × 3840 label. HEVC at that size encodes in hardware; the Mac's
