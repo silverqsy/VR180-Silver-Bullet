@@ -1696,9 +1696,11 @@ fn open_fisheye_segment(
                 if let Some(dev) = &gpu {
                     let scale = if braw_reframe { vr180_braw::DecodeScale::Full } else { scale };
                     tracing::info!("decoder (fisheye/braw): zero-copy IOSurface path, decode scale {:?}, step {}", scale, step);
+                    // 5 slots: the frame on screen, the one whose GPU work
+                    // may still be in flight, and three decoding ahead.
                     return Ok(Box::new(vr180_pipeline::fisheye_decode::BrawZcIter::new(
                         dev.device.clone(), path, &info, scale, vr180_braw::DecodeLook::Film,
-                        swap_eyes, layout.mono, step, 4)?));
+                        swap_eyes, layout.mono, step, 5)?));
                 }
             }
             let _ = &gpu;

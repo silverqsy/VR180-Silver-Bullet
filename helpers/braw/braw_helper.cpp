@@ -1183,8 +1183,10 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
         return true;
     };
 
-    // Keep up to `ahead` frames decoding while the app consumes.
-    const int ahead = (int)std::min<uint32_t>(3, slots - 1);
+    // Keep up to `ahead` frames decoding while the app consumes, leaving the
+    // app two slots (the frame on screen and the one whose GPU work may
+    // still be in flight) before the helper would have to wait.
+    const int ahead = (int)std::max<uint32_t>(1, std::min<uint32_t>(3, slots - 2));
     std::vector<std::pair<uint64_t, uint32_t>> inflight;   // (frame, slot), oldest first
     uint64_t next = start;
     int rc = 0;
@@ -1217,9 +1219,13 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
             ok = r.status == S_OK;
         }
         if (!ok) { fprintf(stderr, "ERROR: Decode failed at frame %llu\n", (unsigned long long)frame); rc = 1; break; }
-        going = top_up();                    // keep the SDK busy before reporting
+        // Report BEFORE topping up: topping up may have to wait for the app
+        // to return a slot, and the app returns slots only as it moves on
+        // to frames it has been told about — reporting after waiting
+        // deadlocked at the very first frame.
         printf("F %llu %u\n", (unsigned long long)frame, slot);
         fflush(stdout);
+        going = top_up();
     }
     ctx.codec->FlushJobs();
     // Let the reader end: closing stdin from our side is not possible, so
