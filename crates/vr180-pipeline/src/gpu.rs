@@ -161,12 +161,20 @@ pub struct Device {
     compose_preview: ComposeSbsPipeline,
     compose_sbs_p010_y:  P010ComposePipeline,
     compose_sbs_p010_uv: P010ComposePipeline,
-    /// 4:2:2 UV variant (full vertical chroma) for the ProRes-VT P210
-    /// encode feed. Shares the Y pipeline with P010. Consumed only by the
-    /// macOS-gated `compose_sbs_to_biplanar`; dead on Windows (for now —
-    /// a future Windows P210-readback ProRes feed would reuse it).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// 4:2:2 UV variant (full vertical chroma) for the P210 ProRes feeds
+    /// (macOS VT, and the Windows planar readback below). Shares the Y
+    /// pipeline with P010.
     compose_sbs_p210_uv: P010ComposePipeline,
+    /// P210 textures → planar `yuv422p10le` storage buffers (the Windows
+    /// ProRes export feed; see [`Device::read_sbs_yuv422p10_planar`]).
+    compose_sbs_yuv422p10_planar: P010ComposePipeline,
+    yuv422_planar_bufs: Mutex<Option<Yuv422PlanarBufs>>,
+    /// Reused colour-stack intermediates for
+    /// [`Device::apply_color_stack_pair_16_cached`], keyed by (eye, stage
+    /// ordinal, w, h). Frees of large textures are expensive on a device
+    /// shared with FFmpeg (they wait for the whole device), so the export
+    /// keeps them instead of allocating 128 MB per stage per eye per frame.
+    color_stack_cache: Mutex<HashMap<(u8, u32, u32, u32), wgpu::Texture>>,
     bilinear_sampler: wgpu::Sampler,
 
     /// Per-slot recycling for `project_fisheye_to_equirect_rs_texture`.
@@ -500,6 +508,7 @@ impl Device {
         let compose_sbs_p210_uv = P010ComposePipeline::create(
             &device, "p210_uv", COMPOSE_SBS_P210_UV_WGSL,
             wgpu::TextureFormat::Rg16Unorm);
+        let compose_sbs_yuv422p10_planar = P010ComposePipeline::create_planar_buffers(&device);
         let bilinear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("bilinear"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -533,6 +542,9 @@ impl Device {
             mid_detail_combine_16, downsample_4x_16,
             compose_sbs, compose_preview,
             compose_sbs_p010_y, compose_sbs_p010_uv, compose_sbs_p210_uv,
+            compose_sbs_yuv422p10_planar,
+            yuv422_planar_bufs: Mutex::new(None),
+            color_stack_cache: Mutex::new(HashMap::new()),
             bilinear_sampler,
             proj_fisheye_rs_cache: Mutex::new(HashMap::new()),
             proj_fisheye_cache: Mutex::new(HashMap::new()),
@@ -2494,6 +2506,8 @@ const COMPOSE_SBS_BGRA_WGSL: &str = include_str!("shaders/compose_sbs_bgra.wgsl"
 const COMPOSE_SBS_P010_Y_WGSL:  &str = include_str!("shaders/compose_sbs_p010_y.wgsl");
 const COMPOSE_SBS_P010_UV_WGSL: &str = include_str!("shaders/compose_sbs_p010_uv.wgsl");
 const COMPOSE_SBS_P210_UV_WGSL: &str = include_str!("shaders/compose_sbs_p210_uv.wgsl");
+const COMPOSE_SBS_YUV422P10_PLANAR_WGSL: &str =
+    include_str!("shaders/compose_sbs_yuv422p10_planar.wgsl");
 const COMPOSE_PREVIEW_WGSL: &str = include_str!("shaders/compose_preview.wgsl");
 
 #[repr(C)]
@@ -2503,6 +2517,29 @@ struct ComposeSbsUniforms {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Yuv422RepackUniforms {
+    out_w: u32,
+    out_h: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+/// Reusable P210 textures, planar output buffers and one MAP_READ staging
+/// buffer for [`Device::read_sbs_yuv422p10_planar`], sized for one frame.
+#[derive(Debug)]
+struct Yuv422PlanarBufs {
+    w: u32,
+    h: u32,
+    y_tex: wgpu::Texture,
+    uv_tex: wgpu::Texture,
+    y: wgpu::Buffer,
+    u: wgpu::Buffer,
+    v: wgpu::Buffer,
+    staging: wgpu::Buffer,
 }
 
 /// Preview output mode.
@@ -7323,6 +7360,153 @@ impl Device {
         Ok((y_tex, uv_tex))
     }
 
+    /// Compose the SBS frame into planar **`yuv422p10le`** (LSB-aligned Y,
+    /// U, V — the ProRes encoders' input layout) and read all three planes
+    /// back with ONE submit and ONE map. `sink(plane, bytes)` is called for
+    /// plane 0 (Y, rows of `2*eye_w*2` bytes), 1 (U) and 2 (V) (rows of
+    /// `2*eye_w` bytes), tightly packed, while the staging buffer is mapped
+    /// — copy out inside it.
+    ///
+    /// Runs the same P210 compose as [`Self::compose_sbs_to_p210_textures`]
+    /// into cached textures, then a GPU repack pass does the `>>6` + U/V
+    /// split the encode thread used to do on the CPU — bit-identical to
+    /// that path, which also paid two GPU syncs, two fresh 64 MB zeroed
+    /// allocations and a CPU conversion pass per 8K frame. Everything GPU-
+    /// side is reused across frames. Requires `(2*eye_w) % 4 == 0`.
+    ///
+    /// Synchronous on purpose: running one frame deep (copy N out while N+1
+    /// executes) measured SLOWER at 8K — releasing the D3D11-imported eye
+    /// textures waits for the whole queue, and the GPU is already shared
+    /// with the ProRes encoder, so there was no idle time to fill.
+    pub fn read_sbs_yuv422p10_planar(
+        &self,
+        left_16: &wgpu::Texture,
+        right_16: &wgpu::Texture,
+        eye_w: u32, eye_h: u32,
+        full_range: bool,
+        mut sink: impl FnMut(usize, &[u8]),
+    ) -> Result<()> {
+        let out_w = eye_w * 2;
+        let out_h = eye_h;
+        if out_w % 4 != 0 {
+            return Err(Error::Wgpu(format!(
+                "planar yuv422p10 compose needs width % 4 == 0 (got {out_w})")));
+        }
+        let y_bytes = out_w as u64 * out_h as u64 * 2;
+        let c_bytes = y_bytes / 2;
+        let mut cache = self.yuv422_planar_bufs.lock().unwrap();
+        if !matches!(cache.as_ref(), Some(b) if b.w == out_w && b.h == out_h) {
+            let mk = |label: &str, size: u64, usage: wgpu::BufferUsages| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label), size, usage, mapped_at_creation: false,
+                })
+            };
+            let tex = |label: &str, w: u32, format: wgpu::TextureFormat| {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width: w, height: out_h, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+            };
+            let plane = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+            *cache = Some(Yuv422PlanarBufs {
+                w: out_w,
+                h: out_h,
+                y_tex: tex("yuv422p10_p210_y", out_w, wgpu::TextureFormat::R16Unorm),
+                uv_tex: tex("yuv422p10_p210_uv", out_w / 2, wgpu::TextureFormat::Rg16Unorm),
+                y: mk("yuv422p10_y", y_bytes, plane),
+                u: mk("yuv422p10_u", c_bytes, plane),
+                v: mk("yuv422p10_v", c_bytes, plane),
+                staging: mk("yuv422p10_staging", y_bytes + 2 * c_bytes,
+                    wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
+            });
+        }
+        let bufs = cache.as_ref().unwrap();
+
+        let l_v = left_16.create_view(&Default::default());
+        let r_v = right_16.create_view(&Default::default());
+        let y_v = bufs.y_tex.create_view(&Default::default());
+        let uv_v = bufs.uv_tex.create_view(&Default::default());
+        let compose_uni = self.write_uniform("yuv422p10_compose_u",
+            &ComposeSbsUniforms { eye_w, _pad0: full_range as u32, _pad1: 0, _pad2: 0 });
+        let repack_uni = self.write_uniform("yuv422p10_repack_u",
+            &Yuv422RepackUniforms { out_w, out_h, _pad0: 0, _pad1: 0 });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("yuv422p10_planar_enc"),
+        });
+        // P210 compose — the same two passes as `compose_sbs_to_p210_textures`.
+        for (pl, out_v, w) in [
+            (&self.compose_sbs_p010_y, &y_v, out_w),
+            (&self.compose_sbs_p210_uv, &uv_v, out_w / 2),
+        ] {
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yuv422p10_compose_bg"),
+                layout: &pl.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&l_v) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r_v) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(out_v) },
+                    wgpu::BindGroupEntry { binding: 3, resource: compose_uni.as_entire_binding() },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("yuv422p10_compose_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&pl.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            pass.dispatch_workgroups(w.div_ceil(8), out_h.div_ceil(8), 1);
+        }
+        // Repack to planar LSB-aligned yuv422p10le.
+        {
+            let pl = &self.compose_sbs_yuv422p10_planar;
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yuv422p10_repack_bg"),
+                layout: &pl.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_v) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_v) },
+                    wgpu::BindGroupEntry { binding: 2, resource: bufs.y.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: bufs.u.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: bufs.v.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: repack_uni.as_entire_binding() },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("yuv422p10_repack_pass"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&pl.pipeline);
+            pass.set_bind_group(0, Some(&bg), &[]);
+            // Workgroup is 16×4 threads; each thread covers 4 pixels of a row.
+            pass.dispatch_workgroups((out_w / 4).div_ceil(16), out_h.div_ceil(4), 1);
+        }
+        encoder.copy_buffer_to_buffer(&bufs.y, 0, &bufs.staging, 0, y_bytes);
+        encoder.copy_buffer_to_buffer(&bufs.u, 0, &bufs.staging, y_bytes, c_bytes);
+        encoder.copy_buffer_to_buffer(&bufs.v, 0, &bufs.staging, y_bytes + c_bytes, c_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = bufs.staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .map_err(|_| Error::Wgpu("yuv422p10 map send channel closed".into()))?
+            .map_err(|e| Error::Wgpu(format!("yuv422p10 map: {e}")))?;
+        {
+            let mapped = slice.get_mapped_range();
+            let (y, uv) = mapped.split_at(y_bytes as usize);
+            let (u, v) = uv.split_at(c_bytes as usize);
+            sink(0, y);
+            sink(1, u);
+            sink(2, v);
+        }
+        bufs.staging.unmap();
+        Ok(())
+    }
+
     /// Read back a single-mip 2D texture as tightly-packed bytes via a bulk
     /// per-row copy (no per-pixel work). `bytes_per_px` must match the
     /// format (2 = R16Unorm, 4 = Rg16Unorm). Returns `w*h*bytes_per_px`.
@@ -7918,6 +8102,40 @@ impl P010ComposePipeline {
         });
         Self { pipeline, bind_group_layout }
     }
+
+    /// The P210 → planar `yuv422p10le` repack: the Y + UV textures in,
+    /// three storage buffers (Y, U, V) out, plus a [`Yuv422RepackUniforms`].
+    fn create_planar_buffers(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("compose_sbs_yuv422p10_planar"),
+            source: wgpu::ShaderSource::Wgsl(COMPOSE_SBS_YUV422P10_PLANAR_WGSL.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("compose_sbs_yuv422p10_planar_bgl"),
+            entries: &[
+                bgle_tex(0),
+                bgle_tex(1),
+                bgle_storage_buf(2, false, 4),
+                bgle_storage_buf(3, false, 4),
+                bgle_storage_buf(4, false, 4),
+                bgle_uniform(5, std::mem::size_of::<Yuv422RepackUniforms>() as u64),
+            ],
+        });
+        let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("compose_sbs_yuv422p10_planar_pll"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("compose_sbs_yuv422p10_planar_pipeline"),
+            layout: Some(&pll),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Self { pipeline, bind_group_layout }
+    }
 }
 
 impl ComposeSbsPipeline {
@@ -8416,9 +8634,14 @@ impl Device {
         lut_resources: &Option<Lut3DResources>,
         intermediates: &mut Vec<wgpu::Texture>,
         eye_offset: Option<(&EyeMatchState, u32)>,
+        cache_eye: Option<u8>,
     ) -> Option<usize> {
+        // With `cache_eye`, stage outputs come from `color_stack_cache` (the
+        // same texture every frame — the queue orders this frame's writes
+        // after the previous frame's reads); otherwise fresh per call.
+        let ordinal = std::cell::Cell::new(0u32);
         let make_16 = |label: &str, w: u32, h: u32| {
-            self.device.create_texture(&wgpu::TextureDescriptor {
+            let create = || self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 mip_level_count: 1, sample_count: 1,
@@ -8428,7 +8651,16 @@ impl Device {
                     | wgpu::TextureUsages::STORAGE_BINDING
                     | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
-            })
+            });
+            match cache_eye {
+                Some(eye) => {
+                    let n = ordinal.get();
+                    ordinal.set(n + 1);
+                    self.color_stack_cache.lock().unwrap()
+                        .entry((eye, n, w, h)).or_insert_with(create).clone()
+                }
+                None => create(),
+            }
         };
 
         let mut current_idx: Option<usize> = None;
@@ -8567,7 +8799,7 @@ impl Device {
         } else { None };
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(12);
         let idx = self.record_color_stack_16(
-            &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates, None);
+            &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates, None, None);
         self.queue.submit(Some(encoder.finish()));
         Ok(idx.map(|i| intermediates.swap_remove(i)))
     }
@@ -8587,6 +8819,33 @@ impl Device {
         plan: &ColorStackPlan,
         eye_match: Option<(&EyeMatchState, EyeMatchFrame)>,
     ) -> Result<(Option<wgpu::Texture>, Option<wgpu::Texture>)> {
+        self.apply_color_stack_pair_16_impl(left, right, w, h, plan, eye_match, false)
+    }
+
+    /// [`Self::apply_color_stack_pair_16`] with the stage outputs reused
+    /// across calls (`color_stack_cache`) — for a caller that is done with
+    /// the returned textures before its next call, like the export loop.
+    pub fn apply_color_stack_pair_16_cached(
+        &self,
+        left: &wgpu::Texture,
+        right: &wgpu::Texture,
+        w: u32, h: u32,
+        plan: &ColorStackPlan,
+        eye_match: Option<(&EyeMatchState, EyeMatchFrame)>,
+    ) -> Result<(Option<wgpu::Texture>, Option<wgpu::Texture>)> {
+        self.apply_color_stack_pair_16_impl(left, right, w, h, plan, eye_match, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_color_stack_pair_16_impl(
+        &self,
+        left: &wgpu::Texture,
+        right: &wgpu::Texture,
+        w: u32, h: u32,
+        plan: &ColorStackPlan,
+        eye_match: Option<(&EyeMatchState, EyeMatchFrame)>,
+        cached: bool,
+    ) -> Result<(Option<wgpu::Texture>, Option<wgpu::Texture>)> {
         if !plan.any_active() {
             return Ok((None, None));
         }
@@ -8602,10 +8861,10 @@ impl Device {
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(24);
         let li = self.record_color_stack_16(
             &mut encoder, left, w, h, &plan.for_eye(true), &lut_resources, &mut intermediates,
-            matching.map(|s| (s, 0)));
+            matching.map(|s| (s, 0)), cached.then_some(0));
         let ri = self.record_color_stack_16(
             &mut encoder, right, w, h, &plan.for_eye(false), &lut_resources, &mut intermediates,
-            matching.map(|s| (s, 1)));
+            matching.map(|s| (s, 1)), cached.then_some(1));
         self.queue.submit(Some(encoder.finish()));
         // `wgpu::Texture` is a cheap handle clone; both indices may point into
         // the same Vec, so clone rather than swap_remove twice.

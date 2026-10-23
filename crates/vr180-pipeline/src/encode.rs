@@ -271,22 +271,59 @@ impl VulkanProResHw {
     /// Upload one CPU frame into a pool frame (host→GPU copy), carrying the
     /// pts. Returns the VULKAN-format frame ready for `send_frame`.
     fn upload(&mut self, sw: &ffmpeg::frame::Video) -> Result<ffmpeg::frame::Video> {
-        use ffmpeg::ffi::*;
-        unsafe {
-            let mut hw = ffmpeg::frame::Video::empty();
-            let ret = av_hwframe_get_buffer(self.frames_ref, hw.as_mut_ptr(), 0);
-            if ret < 0 {
-                return Err(Error::Ffmpeg(format!(
-                    "av_hwframe_get_buffer (vulkan): ret={ret}")));
-            }
-            let ret = av_hwframe_transfer_data(hw.as_mut_ptr(), sw.as_ptr(), 0);
-            if ret < 0 {
-                return Err(Error::Ffmpeg(format!(
-                    "av_hwframe_transfer_data (vulkan upload): ret={ret}")));
-            }
-            (*hw.as_mut_ptr()).pts = (*sw.as_ptr()).pts;
-            Ok(hw)
+        upload_to_vulkan_pool(self.frames_ref, sw)
+    }
+}
+
+fn upload_to_vulkan_pool(
+    frames_ref: *mut ffmpeg::ffi::AVBufferRef,
+    sw: &ffmpeg::frame::Video,
+) -> Result<ffmpeg::frame::Video> {
+    use ffmpeg::ffi::*;
+    unsafe {
+        let mut hw = ffmpeg::frame::Video::empty();
+        let ret = av_hwframe_get_buffer(frames_ref, hw.as_mut_ptr(), 0);
+        if ret < 0 {
+            return Err(Error::Ffmpeg(format!(
+                "av_hwframe_get_buffer (vulkan): ret={ret}")));
         }
+        let ret = av_hwframe_transfer_data(hw.as_mut_ptr(), sw.as_ptr(), 0);
+        if ret < 0 {
+            return Err(Error::Ffmpeg(format!(
+                "av_hwframe_transfer_data (vulkan upload): ret={ret}")));
+        }
+        (*hw.as_mut_ptr()).pts = (*sw.as_ptr()).pts;
+        Ok(hw)
+    }
+}
+
+/// A second reference on the GPU ProRes encoder's Vulkan frame pool, so the
+/// host→GPU upload ([`Self::upload`]) can run on its own thread and overlap
+/// the encode of the previous frame — at 8K the upload is ~16 ms of the
+/// encode thread's ~65 ms per frame. Frames it returns go to
+/// [`H265Encoder::encode_uploaded_frame`]. Concurrent upload + encode on one
+/// FFmpeg Vulkan device is what the ffmpeg CLI itself does (hwupload and
+/// the encoder run on separate threads since FFmpeg 7).
+#[derive(Debug)]
+pub struct ProResVulkanUploader {
+    frames_ref: *mut ffmpeg::ffi::AVBufferRef,
+}
+
+// The ref is only used from the thread that owns the uploader; the pool it
+// points at is FFmpeg's thread-safe AVBufferPool-backed frames context.
+unsafe impl Send for ProResVulkanUploader {}
+
+impl ProResVulkanUploader {
+    /// Upload a CPU `yuv422p10le` frame into a fresh pool frame (carries
+    /// the pts). The CPU frame can be reused once `av_frame_is_writable`.
+    pub fn upload(&mut self, sw: &ffmpeg::frame::Video) -> Result<ffmpeg::frame::Video> {
+        upload_to_vulkan_pool(self.frames_ref, sw)
+    }
+}
+
+impl Drop for ProResVulkanUploader {
+    fn drop(&mut self) {
+        unsafe { ffmpeg::ffi::av_buffer_unref(&mut self.frames_ref) };
     }
 }
 
@@ -619,6 +656,13 @@ impl H265Encoder {
                         // "Apple" vendor tag so QuickTime / FCP recognize
                         // the file as native ProRes (not "Other").
                         set_opt(raw, "vendor", "apl0")?;
+                        // Both encoders read the profile from their PRIVATE
+                        // `profile` option, not `avctx->profile` — left at its
+                        // default ("auto") every 4:2:2 export came out HQ
+                        // whatever the user picked. Same numbering (0..=5).
+                        if prores_profile >= 0 {
+                            set_opt(raw, "profile", &prores_profile.to_string())?;
+                        }
                         if let Some(hw) = vulkan_hw.as_ref() {
                             // GPU encoder: the frames ctx carries the input
                             // contract; async_depth=2 pipelines upload and
@@ -626,6 +670,8 @@ impl H265Encoder {
                             // No thread_count — it has no CPU threading.
                             (*raw).hw_frames_ctx =
                                 ffmpeg::ffi::av_buffer_ref(hw.frames_ref);
+                            // Measured at 8K HQ on an RTX 5090: depth 3 / 4
+                            // are no faster than 2 (the GPU is the floor).
                             set_opt(raw, "async_depth", "2")?;
                         } else {
                         // libavcodec defaults to thread_count = 1 through
@@ -1177,6 +1223,54 @@ impl H265Encoder {
         self.send_cpu_frame(&frame)?;
         self.drain_packets()?;
         Ok(())
+    }
+
+    /// Encode a caller-filled planar **`yuv422p10le`** frame (`w`×`h`,
+    /// LSB-aligned — what [`crate::gpu::Device::read_sbs_yuv422p10_planar`]
+    /// produces). No CPU pixel work at all, unlike
+    /// [`Self::encode_frame_yuv422p10_msb`]. The caller may refill and
+    /// resubmit the same frame once `av_frame_is_writable` reports that
+    /// FFmpeg holds no reference to its buffers.
+    /// Only valid when [`Self::wants_yuv422p10`] is true.
+    pub fn encode_frame_yuv422p10(&mut self, frame: &mut ffmpeg::frame::Video) -> Result<()> {
+        self.ensure_header_written()?;
+        if self.enc_pix_fmt != ffmpeg::format::Pixel::YUV422P10LE
+            || frame.format() != ffmpeg::format::Pixel::YUV422P10LE
+            || frame.width() != self.w || frame.height() != self.h
+        {
+            return Err(Error::Ffmpeg(format!(
+                "encode_frame_yuv422p10: want a {}x{} yuv422p10le frame on a yuv422p10 encoder",
+                self.w, self.h)));
+        }
+        frame.set_pts(Some(self.frame_count));
+        self.frame_count += 1;
+        self.send_cpu_frame(frame)?;
+        self.drain_packets()?;
+        Ok(())
+    }
+
+    /// A second handle on this encoder's Vulkan frame pool for uploading on
+    /// another thread — `None` unless the GPU ProRes encoder is engaged.
+    pub fn vulkan_uploader(&self) -> Option<ProResVulkanUploader> {
+        let hw = self.vulkan_hw.as_ref()?;
+        let frames_ref = unsafe { ffmpeg::ffi::av_buffer_ref(hw.frames_ref) };
+        (!frames_ref.is_null()).then_some(ProResVulkanUploader { frames_ref })
+    }
+
+    /// Encode a frame already uploaded by [`Self::vulkan_uploader`] (a
+    /// VULKAN-format pool frame). Frames must arrive in presentation order;
+    /// the pts is assigned here.
+    pub fn encode_uploaded_frame(&mut self, hw_frame: &mut ffmpeg::frame::Video) -> Result<()> {
+        self.ensure_header_written()?;
+        if self.vulkan_hw.is_none() {
+            return Err(Error::Ffmpeg(
+                "encode_uploaded_frame: the GPU ProRes encoder is not engaged".into()));
+        }
+        hw_frame.set_pts(Some(self.frame_count));
+        self.frame_count += 1;
+        self.encoder.send_frame(hw_frame)
+            .map_err(|e| Error::Ffmpeg(format!("send_frame (vulkan hwframe): {e}")))?;
+        self.drain_packets()
     }
 
     fn drain_packets(&mut self) -> Result<()> {

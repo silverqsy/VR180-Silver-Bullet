@@ -3124,6 +3124,30 @@ fn export_fisheye_osv_zerocopy_p010(
     Ok(())
 }
 
+/// Copy a tightly packed plane of `h` rows into a strided destination (an
+/// AVFrame plane), split across a few threads: one thread copies an 8K
+/// plane (32–64 MB) well below what the memory system can move.
+#[cfg(target_os = "windows")]
+fn copy_plane_rows_par(dst: &mut [u8], dst_stride: usize, src: &[u8], h: usize) {
+    let row = src.len() / h.max(1);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get()).unwrap_or(4).clamp(1, 8);
+    let rows_per = h.div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        for (d, sc) in dst.chunks_mut(rows_per * dst_stride).zip(src.chunks(rows_per * row)) {
+            s.spawn(move || {
+                if dst_stride == row {
+                    d[..sc.len()].copy_from_slice(sc);
+                } else {
+                    for (dr, sr) in d.chunks_mut(dst_stride).zip(sc.chunks(row)) {
+                        dr[..row].copy_from_slice(sr);
+                    }
+                }
+            });
+        }
+    });
+}
+
 // ── Fast path: zero-copy OSV → d3d11va → Vulkan → libx265 (Windows) ────
 //
 // The Windows analogue of `export_fisheye_osv_zerocopy_p010`. Pulls
@@ -3234,11 +3258,17 @@ fn export_fisheye_osv_zerocopy_d3d11(
     // instead of their sum.
     use crate::fisheye_decode::ZcFisheyeFrame;
     // What the main thread hands the encode thread. P010 = the GPU already
-    // did RGB→YUV 4:2:0 (NVENC's native input, no swscale); Yuv422 = GPU
-    // RGB→YUV 4:2:2 P210 planes (ProRes — deinterleave + >>6 on the encode
-    // thread, no swscale); Rgba64 = swscale fallback (libx265 / 8-bit).
+    // did RGB→YUV 4:2:0 (NVENC's native input, no swscale); Yuv422Frame =
+    // the GPU composed planar yuv422p10le, read back straight into a
+    // recycled encoder frame (ProRes — no CPU pixel work at all); Yuv422 =
+    // the older P210 planes (deinterleave + >>6 on the encode thread), kept
+    // for widths the planar shader can't take; Rgba64 = swscale fallback
+    // (libx265 / 8-bit). Yuv422Uploaded = a Yuv422Frame the upload thread
+    // already moved into the GPU ProRes encoder's Vulkan pool.
     enum EncFrame {
         P010 { y: Vec<u8>, uv: Vec<u8> },
+        Yuv422Frame(ffmpeg_next::frame::Video),
+        Yuv422Uploaded(ffmpeg_next::frame::Video),
         Yuv422 { y: Vec<u8>, uv: Vec<u8> },
         Rgba64(Vec<u8>),
     }
@@ -3260,7 +3290,20 @@ fn export_fisheye_osv_zerocopy_d3d11(
     }
     let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<ZcFisheyeFrame>(3);
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<EncFrame>(2);
-    let (fmt_tx, fmt_rx) = std::sync::mpsc::sync_channel::<ZcFeed>(1);
+    // The encoder's input format, plus — for the GPU ProRes encoder — a
+    // handle on its Vulkan pool so uploads can run on their own thread.
+    let (fmt_tx, fmt_rx) =
+        std::sync::mpsc::sync_channel::<(ZcFeed, Option<crate::encode::ProResVulkanUploader>)>(1);
+    // Encoded `Yuv422Frame`s come back here for reuse: at 8K each is a
+    // 128 MB buffer, and allocating (page-faulting) + freeing one per frame
+    // was a large share of the ProRes feed's CPU time.
+    let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<ffmpeg_next::frame::Video>();
+    let recycle_tx_up = recycle_tx.clone();
+    // The planar shader packs 4 pixels per thread; other widths keep the
+    // P210 + CPU-deinterleave feed. VR180_PRORES_P210_READBACK=1 forces the
+    // old feed (A/B comparisons).
+    let planar_422 = sbs_w % 4 == 0
+        && std::env::var_os("VR180_PRORES_P210_READBACK").is_none();
 
     // Decode thread — D3D11 only, never touches wgpu. `iter` was already
     // trim-seeked above; just pump frames until EOF, cancel, or the main
@@ -3309,17 +3352,23 @@ fn export_fisheye_osv_zerocopy_d3d11(
         // Report the encoder's native input so the main thread produces the
         // matching layout. On create-failure we never send → main's recv
         // errs and the pipeline winds down, surfacing the error at the join.
-        let _ = fmt_tx.send(if encoder.wants_p010() {
+        let feed = if encoder.wants_p010() {
             ZcFeed::P010
         } else if encoder.wants_yuv422p10() {
             ZcFeed::Yuv422P10
         } else {
             ZcFeed::Rgba64
-        });
+        };
+        let _ = fmt_tx.send((feed, encoder.vulkan_uploader()));
         let mut n: u64 = 0;
         while let Ok(f) = frame_rx.recv() {
             match f {
                 EncFrame::P010   { y, uv } => encoder.encode_frame_p010(&y, &uv)?,
+                EncFrame::Yuv422Frame(mut frame) => {
+                    encoder.encode_frame_yuv422p10(&mut frame)?;
+                    let _ = recycle_tx.send(frame);
+                }
+                EncFrame::Yuv422Uploaded(mut hw) => encoder.encode_uploaded_frame(&mut hw)?,
                 EncFrame::Yuv422 { y, uv } => encoder.encode_frame_yuv422p10_msb(&y, &uv)?,
                 EncFrame::Rgba64(b)        => encoder.encode_frame_rgba64(&b)?,
             }
@@ -3329,7 +3378,28 @@ fn export_fisheye_osv_zerocopy_d3d11(
         Ok(n)
     });
     // Block until the encoder is open and reports its input format.
-    let feed = fmt_rx.recv().unwrap_or(ZcFeed::Rgba64);
+    let (feed, uploader) = fmt_rx.recv().unwrap_or((ZcFeed::Rgba64, None));
+    let mut new_frames: u32 = 0;
+    // Upload thread (GPU ProRes + planar feed): the host→Vulkan upload of
+    // frame N overlaps the encode of frame N-1 instead of preceding it on
+    // the encode thread. Order is kept — one thread, FIFO channels.
+    let (up_tx, upload_handle) = match uploader {
+        Some(mut uploader) if feed == ZcFeed::Yuv422P10 && planar_422 => {
+            let (up_tx, up_rx) = std::sync::mpsc::sync_channel::<ffmpeg_next::frame::Video>(1);
+            let frame_tx = frame_tx.clone();
+            let handle = std::thread::spawn(move || -> Result<()> {
+                while let Ok(sw) = up_rx.recv() {
+                    let hw = uploader.upload(&sw)?;
+                    let _ = recycle_tx_up.send(sw);
+                    if frame_tx.send(EncFrame::Yuv422Uploaded(hw)).is_err() { break; }
+                }
+                Ok(())
+            });
+            tracing::info!("fisheye_export (zero-copy): ProRes upload thread engaged");
+            (Some(up_tx), Some(handle))
+        }
+        _ => (None, None),
+    };
     tracing::info!(
         "fisheye_export (zero-copy): encode input = {}",
         match feed {
@@ -3460,7 +3530,10 @@ fn export_fisheye_osv_zerocopy_d3d11(
             };
 
             // 16-bit color stack per eye.
-            let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
+            // Cached stage outputs: this loop is done with them before the
+            // next frame (readback), and per-frame 128 MB allocations are
+            // expensive to free on a device shared with the encoder.
+            let (left_g, right_g) = pipeline.apply_color_stack_pair_16_cached(
                 &left16, &right16, cfg.eye_w, cfg.eye_h, &color_plan,
                 Some((&eye_match_state, EyeMatchFrame::default())),
             )?;
@@ -3489,6 +3562,40 @@ fn export_fisheye_osv_zerocopy_d3d11(
                     let uv = pipeline.read_texture_planar(&uv_tex, sbs_w / 2, sbs_h / 2, 4)?;
                     t_readback += ruv.elapsed(); // pure UV copy (GPU idle)
                     Ok(EncFrame::P010 { y, uv })
+                }
+                ZcFeed::Yuv422P10 if planar_422 => {
+                    // ProRes: GPU composes planar yuv422p10le; one readback
+                    // copies it straight into an encoder frame. Reuse a frame
+                    // the encoder has finished with — unless FFmpeg still
+                    // references it (an upload in flight), then drop our
+                    // handle and allocate.
+                    let mut frame = loop {
+                        match recycle_rx.try_recv() {
+                            Ok(f) if unsafe {
+                                ffmpeg_next::ffi::av_frame_is_writable(f.as_ptr() as *mut _)
+                            } != 0 => break f,
+                            Ok(_) => continue,
+                            Err(_) => {
+                                new_frames += 1;
+                                break ffmpeg_next::frame::Video::new(
+                                    ffmpeg_next::format::Pixel::YUV422P10LE, sbs_w, sbs_h);
+                            }
+                        }
+                    };
+                    let mut t_copy = std::time::Duration::ZERO;
+                    let ry = std::time::Instant::now();
+                    pipeline.read_sbs_yuv422p10_planar(
+                        l_final, r_final, cfg.eye_w, cfg.eye_h, false,
+                        |plane, src| {
+                            let c0 = std::time::Instant::now();
+                            let stride = frame.stride(plane);
+                            copy_plane_rows_par(frame.data_mut(plane), stride, src, sbs_h as usize);
+                            t_copy += c0.elapsed();
+                        },
+                    )?;
+                    t_gpuexec += ry.elapsed().saturating_sub(t_copy); // GPU + map wait
+                    t_readback += t_copy; // plane copies into the frame
+                    Ok(EncFrame::Yuv422Frame(frame))
                 }
                 ZcFeed::Yuv422P10 => {
                     // ProRes: GPU does RGB→YUV 4:2:2 (P210 planes, full
@@ -3528,20 +3635,34 @@ fn export_fisheye_osv_zerocopy_d3d11(
             Ok(r) => r,
             Err(e) => { main_err = Some(e); break; }
         };
-        // Hand off to the encode thread. A send error means the encoder
-        // failed to open (frame_rx dropped) — stop; the join surfaces why.
+        // Hand off to the encode thread (via the upload thread when there is
+        // one). A send error means the encoder failed to open or the upload
+        // failed (receiver dropped) — stop; the joins surface why.
         let s0 = std::time::Instant::now();
-        if frame_tx.send(frame).is_err() { break; }
+        let sent = match (frame, up_tx.as_ref()) {
+            (EncFrame::Yuv422Frame(f), Some(up)) => up.send(f).is_ok(),
+            (frame, _) => frame_tx.send(frame).is_ok(),
+        };
+        if !sent { break; }
         t_send += s0.elapsed();
 
         frame_idx += 1;
         if frame_idx % 30 == 0 {
             let n = frame_idx as u32;
-            tracing::info!(
-                "zc export perf: f={} avg/frame: recv_wait={:?} gpu+readback={:?} send_wait={:?} \
-                 [readY(gpu+copy)={:?} readUV(pure copy)={:?}]",
-                frame_idx, t_recv / n, t_gpu / n, t_send / n, t_gpuexec / n, t_readback / n,
-            );
+            if feed == ZcFeed::Yuv422P10 && planar_422 {
+                tracing::info!(
+                    "zc export perf: f={} avg/frame: recv_wait={:?} gpu+readback={:?} send_wait={:?} \
+                     [planar yuv422p10: gpu+map={:?} copy={:?}, {} frames allocated]",
+                    frame_idx, t_recv / n, t_gpu / n, t_send / n, t_gpuexec / n, t_readback / n,
+                    new_frames,
+                );
+            } else {
+                tracing::info!(
+                    "zc export perf: f={} avg/frame: recv_wait={:?} gpu+readback={:?} send_wait={:?} \
+                     [readY(gpu+copy)={:?} readUV(pure copy)={:?}]",
+                    frame_idx, t_recv / n, t_gpu / n, t_send / n, t_gpuexec / n, t_readback / n,
+                );
+            }
         }
         let elapsed = t_start.elapsed().as_secs_f32().max(1e-3);
         progress_cb(ExportProgress {
@@ -3553,7 +3674,10 @@ fn export_fisheye_osv_zerocopy_d3d11(
 
     // Tear down: close the encode feed (encoder.finish runs), stop decode,
     // then join both. Order matters only in that both senders/receivers must
-    // drop so the threads can exit their recv loops.
+    // drop so the threads can exit their recv loops — the upload thread
+    // holds a `frame_tx` clone, so it drains and exits first.
+    drop(up_tx);
+    let upload_result = upload_handle.map(|h| h.join());
     drop(frame_tx);
     drop(pair_rx);
     let enc_result = encode_handle.join();
@@ -3561,6 +3685,11 @@ fn export_fisheye_osv_zerocopy_d3d11(
 
     if let Some(e) = main_err {
         return Err(e);
+    }
+    match upload_result {
+        None | Some(Ok(Ok(()))) => {}
+        Some(Ok(Err(e))) => return Err(e),
+        Some(Err(_)) => return Err(Error::Ffmpeg("zc export: upload thread panicked".into())),
     }
     match enc_result {
         Ok(Ok(_n)) => {}
