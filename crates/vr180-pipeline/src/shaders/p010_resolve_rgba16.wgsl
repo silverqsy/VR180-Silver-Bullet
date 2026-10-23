@@ -79,13 +79,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let sxy = vec2<f32>(cx + ox, cy + oy);
             // Y at full res; UV bilinear from the half-res plane = full-res
             // chroma upsample at this exact source position.
+            //
+            // `sxy` is a continuous coordinate — pixel i spans [i, i+1], its
+            // centre is i + 0.5 — so it IS the texel-space sample position:
+            // no + 0.5 here. (The projection shaders add 0.5 because their
+            // lens-model coordinates put pixel centres on the integers.) An
+            // extra half texel read each luma tap halfway to its neighbour —
+            // at 1:1 every pixel averaged with the next, and the whole image
+            // shifted by half a source pixel. Chroma sits at the same
+            // normalized position as luma (centred 4:2:0 siting), as in the
+            // Windows D3D11 converter (`P010Converter`), so at 1:1 this
+            // reproduces that converter exactly.
+            //
             // Clamp in texel space to the rect being resolved, then offset —
             // same reasoning as the projection shaders' eye sub-rect: with a
             // side-by-side plane, ClampToEdge alone would blend the other eye.
-            let y_px  = clamp(sxy + vec2<f32>(0.5),
+            let y_px  = clamp(sxy,
                               vec2<f32>(0.5), vec2<f32>(d.src_w - 0.5, d.src_h - 0.5))
                       + vec2<f32>(d.src_x0, d.src_y0);
-            let uv_px = clamp(sxy * 0.5 + vec2<f32>(0.5),
+            let uv_px = clamp(sxy * 0.5,
                               vec2<f32>(0.5), vec2<f32>(d.src_w * 0.5 - 0.5, d.src_h * 0.5 - 0.5))
                       + vec2<f32>(d.src_x0 * 0.5, d.src_y0 * 0.5);
             let y_uv  = y_px / vec2<f32>(textureDimensions(src_y));

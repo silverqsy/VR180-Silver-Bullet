@@ -48,6 +48,11 @@ pub mod vt_denoise;
 #[cfg(target_os = "windows")]
 pub mod interop_windows;
 
+// Vulkan Video decode: VkDevices shared by wgpu and FFmpeg's Vulkan decoder
+// (the export's and the app's own; the ProRes encoder keeps its own device).
+#[cfg(target_os = "windows")]
+pub mod vk_shared;
+
 #[cfg(target_os = "windows")]
 pub mod nvenc_cuda;
 

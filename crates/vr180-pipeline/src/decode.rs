@@ -1815,8 +1815,8 @@ unsafe extern "C" fn videotoolbox_get_format(
     unsafe { *pix_fmts }
 }
 
-/// Download a hardware-resident frame (VideoToolbox CVPixelBuffer) to
-/// host system memory via `av_hwframe_transfer_data`. The destination
+/// Download a hardware-resident frame (VideoToolbox CVPixelBuffer, D3D11 or
+/// Vulkan surface) to host system memory via `av_hwframe_transfer_data`. The destination
 /// frame's pixel format is determined by FFmpeg — typically `NV12` for
 /// 8-bit HEVC/H.264 and `P010` for 10-bit Main10.
 pub(crate) fn download_hw_frame(
@@ -1861,6 +1861,12 @@ pub(crate) fn try_enable_d3d11va_decode(
 /// decoders at once (dual-stream cameras open two), so the VRAM check below
 /// budgets for all of them rather than one at a time.
 ///
+/// **Despite the name, Vulkan Video comes first**: when a Vulkan-decode
+/// device exists (`vk_shared` — the app's own device, or the export's) and
+/// the stream is one Vulkan Video decodes, the decoder attaches there and
+/// emits `AV_PIX_FMT_VULKAN` frames; D3D11VA is the fallback. Every caller
+/// downloads hardware frames of either kind with [`download_hw_frame`].
+///
 /// **The VRAM gate lives here on purpose.** Every hardware attach in the app
 /// funnels through this function, and a d3d11va DPB is huge — ~240 MiB per
 /// megapixel of video (see `interop_windows::decoder_vram_estimate_mib`), so
@@ -1877,7 +1883,6 @@ pub(crate) fn try_enable_d3d11va_decode_n(
     dec_ctx: &mut ffmpeg_next::codec::context::Context,
     concurrent_streams: u32,
 ) -> bool {
-    use ffmpeg_next::ffi::*;
     // VRAM pre-flight — see the doc comment above.
     {
         let (w, h) = unsafe {
@@ -1891,6 +1896,49 @@ pub(crate) fn try_enable_d3d11va_decode_n(
             }
         }
     }
+    // Vulkan Video first, on a device that already carries an FFmpeg Vulkan
+    // context (the app's, or the export's — see `vk_shared`), for the
+    // streams it decodes. Frames come out `AV_PIX_FMT_VULKAN` and download
+    // with `download_hw_frame` like D3D11 ones. Restricted to the formats
+    // NVIDIA/AMD/Intel Vulkan Video decode: on anything else the Vulkan
+    // hwaccel would silently decode in software, where D3D11VA may not.
+    if vulkan_video_decodable(dec_ctx) {
+        if let Some(vk) = crate::vk_shared::any_decode_device() {
+            if vk.attach_decoder(dec_ctx).is_ok() {
+                tracing::info!("hw decode: Vulkan Video");
+                return true;
+            }
+        }
+    }
+    let ok = attach_d3d11va(dec_ctx);
+    if ok {
+        tracing::info!("hw decode: D3D11VA");
+    }
+    ok
+}
+
+/// True for the streams Vulkan Video decodes on every desktop GPU: HEVC
+/// Main / Main 10 and H.264 8-bit, 4:2:0.
+#[cfg(target_os = "windows")]
+fn vulkan_video_decodable(dec_ctx: &ffmpeg_next::codec::context::Context) -> bool {
+    use ffmpeg_next::ffi::{AVCodecID::*, AVPixelFormat::*};
+    // SAFETY: read-only access to two POD fields of the codec context.
+    let (codec, fmt) = unsafe {
+        let raw = dec_ctx.as_ptr();
+        ((*raw).codec_id, (*raw).pix_fmt)
+    };
+    match codec {
+        AV_CODEC_ID_HEVC => matches!(fmt, AV_PIX_FMT_YUV420P | AV_PIX_FMT_YUVJ420P | AV_PIX_FMT_YUV420P10LE),
+        AV_CODEC_ID_H264 => matches!(fmt, AV_PIX_FMT_YUV420P | AV_PIX_FMT_YUVJ420P),
+        _ => false,
+    }
+}
+
+/// Attach FFmpeg-owned D3D11VA decode (default adapter): `AV_PIX_FMT_D3D11`
+/// surfaces. No VRAM check — callers run it first.
+#[cfg(target_os = "windows")]
+fn attach_d3d11va(dec_ctx: &mut ffmpeg_next::codec::context::Context) -> bool {
+    use ffmpeg_next::ffi::*;
     let mut hw_device: *mut AVBufferRef = std::ptr::null_mut();
 
     let ret = unsafe {
@@ -2063,7 +2111,8 @@ pub fn decode_first_d3d11_frame(path: &Path) -> Result<ffmpeg_next::frame::Video
     };
     let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(params)
         .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
-    if !try_enable_d3d11va_decode(&mut codec_ctx) {
+    // D3D11 surfaces by contract (interop testing) — never Vulkan Video.
+    if !attach_d3d11va(&mut codec_ctx) {
         return Err(Error::Ffmpeg("d3d11va setup failed".into()));
     }
     let mut dec = codec_ctx
@@ -2175,7 +2224,7 @@ impl StreamPairIter {
                     && try_enable_d3d11va_decode_n(&mut codec_ctx, 2)
                 {
                     hw_active[i] = true;
-                    tracing::info!("StreamPairIter: D3D11VA hw decode active on stream {i}");
+                    tracing::info!("StreamPairIter: hw decode active on stream {i}");
                 } else if matches!(hw, HwDecode::VideoToolbox) {
                     return Err(Error::Ffmpeg("VT is macOS-only".into()));
                 }
@@ -2429,6 +2478,7 @@ fn repack_to_rgb8(
         && matches!(
             decoded.format(),
             ffmpeg_next::format::Pixel::VIDEOTOOLBOX | ffmpeg_next::format::Pixel::D3D11
+                | ffmpeg_next::format::Pixel::VULKAN
         )
     {
         download_hw_frame(decoded, sw_storage)?;

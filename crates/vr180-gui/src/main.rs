@@ -43,6 +43,94 @@ fn load_app_icon() -> Option<egui::IconData> {
     Some(egui::IconData { rgba: rgba.into_raw(), width, height })
 }
 
+/// Windows: the app's GPU device with Vulkan Video decode
+/// (`vr180_pipeline::vk_shared::create_ui_device`) — the same features and
+/// texture limit the device descriptor below requests, plus FFmpeg's decode
+/// queues on the same `VkDevice`, so the live preview decodes through Vulkan
+/// Video on the device that presents it. `None` keeps eframe's own device
+/// (the preview then decodes through D3D11, as before): no Vulkan adapter,
+/// `WGPU_BACKEND` set, `VR180_D3D11_DECODE` set (the full fallback), no
+/// MAILBOX present mode, or the device could not be created.
+///
+/// `Some` must present in MAILBOX mode. Under FIFO the UI thread waits in
+/// `get_current_texture` for a free swapchain image, and wgpu holds the
+/// device's fence lock through that wait, so a submission from any other
+/// thread on the device waits for the display too. The decode thread submits
+/// each frame's copy + resolve on this device, and FFmpeg's next decode waits
+/// for that copy (NVIDIA decodes into the reference images), so a FIFO
+/// display paced decoding: over Remote Desktop, where presenting is slow, the
+/// 50 fps preview played at 0.7× speed. MAILBOX never waits for an image.
+#[cfg(target_os = "windows")]
+fn vulkan_decode_ui_setup() -> Option<egui_wgpu::WgpuSetupExisting> {
+    if std::env::var_os("WGPU_BACKEND").is_some() || std::env::var_os("VR180_D3D11_DECODE").is_some() {
+        return None;
+    }
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN,
+        flags: wgpu::InstanceFlags::from_build_config().with_env(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    // eframe's own choice: the high-performance adapter unless overridden.
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::from_env()
+            .unwrap_or(wgpu::PowerPreference::HighPerformance),
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    })).ok()?;
+    if !vulkan_supports_mailbox(&instance, &adapter) {
+        tracing::info!("Vulkan present mode MAILBOX unsupported — the preview decodes through D3D11");
+        return None;
+    }
+    match vr180_pipeline::vk_shared::create_ui_device(&adapter) {
+        Ok((device, queue)) => {
+            tracing::info!("UI device: Vulkan Video decode, MAILBOX present");
+            Some(egui_wgpu::WgpuSetupExisting { instance, adapter, device, queue })
+        }
+        Err(e) => {
+            tracing::warn!("Vulkan-decode UI device unavailable ({e}) — the preview decodes through D3D11");
+            None
+        }
+    }
+}
+
+/// Whether `adapter` can present a Vulkan surface in MAILBOX mode, asked of a
+/// hidden throwaway window: eframe configures its surface with whatever mode
+/// it is given, unchecked, and the modes a surface supports are the driver's,
+/// not the window's.
+#[cfg(target_os = "windows")]
+fn vulkan_supports_mailbox(instance: &wgpu::Instance, adapter: &wgpu::Adapter) -> bool {
+    use std::num::NonZeroIsize;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
+    let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+    unsafe {
+        let hinstance = GetModuleHandleW(std::ptr::null());
+        let hwnd = CreateWindowExW(
+            0, class.as_ptr(), std::ptr::null(), WS_POPUP, 0, 0, 1, 1,
+            std::ptr::null_mut(), std::ptr::null_mut(), hinstance, std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            return false;
+        }
+        // wgpu panics if the driver refuses the surface.
+        let modes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (Some(h), Some(i)) = (NonZeroIsize::new(hwnd as isize), NonZeroIsize::new(hinstance as isize))
+            else { return Vec::new() };
+            let mut window = wgpu::rwh::Win32WindowHandle::new(h);
+            window.hinstance = Some(i);
+            match instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: Some(wgpu::rwh::RawDisplayHandle::Windows(wgpu::rwh::WindowsDisplayHandle::new())),
+                raw_window_handle: wgpu::rwh::RawWindowHandle::Win32(window),
+            }) {
+                Ok(surface) => surface.get_capabilities(adapter).present_modes,
+                Err(_) => Vec::new(),
+            }
+        })).unwrap_or_default();
+        DestroyWindow(hwnd);
+        modes.contains(&wgpu::PresentMode::Mailbox)
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // Logs go to `<data dir>/vr180-gui.log` (the previous launch's copy is
     // kept as `vr180-gui.prev.log`) so the
@@ -97,6 +185,12 @@ fn main() -> anyhow::Result<()> {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
 
+    #[cfg(target_os = "windows")]
+    let vulkan_ui = vulkan_decode_ui_setup();
+    #[cfg(not(target_os = "windows"))]
+    let vulkan_ui: Option<egui_wgpu::WgpuSetupExisting> = None;
+    let mailbox = vulkan_ui.is_some();
+
     let native_options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Wgpu,
@@ -122,6 +216,14 @@ fn main() -> anyhow::Result<()> {
         // a Vulkan-less machine still starts on DX12.
         wgpu_options: {
             let mut cfg = egui_wgpu::WgpuConfiguration::default();
+            // Windows: run the app on a device FFmpeg shares for Vulkan Video
+            // decode, so the live preview decodes where it draws (no D3D11),
+            // presenting in MAILBOX mode (see `vulkan_decode_ui_setup`). Any
+            // failure keeps the device eframe creates below.
+            if let Some(existing) = vulkan_ui {
+                cfg.wgpu_setup = egui_wgpu::WgpuSetup::Existing(existing);
+                cfg.present_mode = wgpu::PresentMode::Mailbox;
+            }
             if let egui_wgpu::WgpuSetup::CreateNew(create) = &mut cfg.wgpu_setup {
                 #[cfg(target_os = "windows")]
                 if std::env::var_os("WGPU_BACKEND").is_none() { // env override wins
@@ -172,7 +274,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "VR180 Silver Bullet",
         native_options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, mailbox)))),
     ).map_err(|e| anyhow::anyhow!("eframe: {e}"))?;
     Ok(())
 }

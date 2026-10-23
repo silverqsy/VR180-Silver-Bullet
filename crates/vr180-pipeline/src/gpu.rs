@@ -6046,7 +6046,8 @@ impl Device {
     /// with the `project_fisheye_rgba16_texture_to_*` family so the projection
     /// minifies only mildly (no luma moiré / chroma fringing) at the working res.
     /// `src_w`/`src_h` are the native P010 (Y-plane) dims; `out_w`/`out_h` the
-    /// working preview res.
+    /// working preview res. (Windows' Vulkan Video decode records the same
+    /// pass into its own submission: [`Self::record_p010_resolve`].)
     #[cfg(target_os = "macos")]
     /// `slot` picks the cached output texture (see `p010_resolve_out_cache`).
     /// CALLERS MUST USE A DISTINCT SLOT PER CONCURRENT OUTPUT: the dual-stream
@@ -6098,6 +6099,35 @@ impl Device {
             }
             cache.get(&slot).unwrap().2.clone()
         };
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("p010_resolve_planes_enc"),
+        });
+        self.record_p010_resolve(
+            &mut encoder, y_tex, uv_tex, src_w, src_h, src_x0, src_y0, yuv_range, yuv_mat, &out_tex);
+        self.queue.submit(Some(encoder.finish()));
+        Ok(out_tex)
+    }
+
+    /// The [`Self::resolve_p010_planes_to_rgba16`] pass, recorded into
+    /// `encoder` and writing `out_tex` (an `Rgba16Unorm` storage texture; its
+    /// size is the output size) instead of a per-slot cached output — for
+    /// callers that own their outputs and submit the resolve together with
+    /// other work (the Windows Vulkan Video decode copies the planes and
+    /// resolves them in one submission).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_p010_resolve(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        y_tex: &wgpu::Texture,
+        uv_tex: &wgpu::Texture,
+        src_w: u32, src_h: u32,
+        src_x0: u32, src_y0: u32,
+        yuv_range: [f32; 4],
+        yuv_mat: [f32; 4],
+        out_tex: &wgpu::Texture,
+    ) {
+        let (out_w, out_h) = (out_tex.width(), out_tex.height());
         // Separate plane textures — bind their default views directly (the
         // single-texture path uses plane-aspect views of one P010 texture).
         let y_view = y_tex.create_view(&Default::default());
@@ -6121,19 +6151,12 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
             ],
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("p010_resolve_planes_enc"),
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("p010_resolve_planes_pass"), timestamp_writes: None,
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("p010_resolve_planes_pass"), timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.p010_resolve.pipeline);
-            pass.set_bind_group(0, Some(&bg), &[]);
-            pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
-        }
-        self.queue.submit(Some(encoder.finish()));
-        Ok(out_tex)
+        pass.set_pipeline(&self.p010_resolve.pipeline);
+        pass.set_bind_group(0, Some(&bg), &[]);
+        pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
     }
 
     /// Project an already-on-GPU `Rgba16Unorm` fisheye texture to half-equirect

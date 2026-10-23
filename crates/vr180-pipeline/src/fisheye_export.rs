@@ -985,21 +985,20 @@ fn export_fisheye_inner(
             && pipeline.device.features().contains(wgpu::Features::TEXTURE_FORMAT_P010)
             && cfg.denoise_strength <= 0.0; // denoise needs CPU frames → portable path
         if try_gpu_resident {
-            let swap = cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes);
             let ctx = crate::interop_windows::VulkanImportCtx::from_wgpu(
                 &pipeline.adapter, &pipeline.device,
             );
             // Merged (auto-merge) recordings ride the same arm via the
-            // segment-chaining iterator — they used to be gated off onto
+            // segment-chaining iterators — they used to be gated off onto
             // the portable loop (~2 fps vs ~35 fps, the "hardware accel is
             // slow" report).
-            let iter = crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
-                &cfg.segments, swap, u32::MAX, u32::MAX,
-                ctx.as_ref().and_then(crate::interop_windows::vulkan_device_luid),
-            );
+            let iter = zc_fisheye_source(
+                &pipeline, &cfg, ctx.as_ref().and_then(crate::interop_windows::vulkan_device_luid));
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
-                    tracing::info!("fisheye_export: GPU-RESIDENT NVENC(CUDA) path ENGAGED");
+                    tracing::info!(
+                        "fisheye_export: GPU-RESIDENT NVENC(CUDA) path ENGAGED ({} decode)",
+                        if iter.is_vulkan() { "Vulkan Video" } else { "d3d11va" });
                     match export_fisheye_osv_gpu_resident(
                         Arc::clone(&pipeline), cfg.clone(), ctx, iter, &mut progress_cb, Arc::clone(&cancel),
                     ) {
@@ -1065,25 +1064,12 @@ fn export_fisheye_inner(
             // The d3d11va decoder must land on the SAME adapter wgpu chose.
             let luid = ctx.as_ref()
                 .and_then(crate::interop_windows::vulkan_device_luid);
-            let iter = if cfg.source_kind.is_single_stream_pair() {
-                crate::fisheye_decode::D3d11SharedSbsIter::new_with_layout(
-                    &cfg.source_path, u32::MAX, u32::MAX, luid, cfg.source_kind.eye_layout())
-                    .map(crate::fisheye_decode::ZcFisheyeSource::Sbs)
-            } else {
-                // OSV swap-by-default ⊕ user override (matches preview + CPU
-                // path). u32::MAX work dims → the iter clamps to native, so
-                // the D3D11 P010→RGBA16 convert is 1:1 (full-res export, no
-                // quality loss). Merged recordings chain through the
-                // segmented iterator.
-                let swap = cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes);
-                crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
-                    &cfg.segments, swap, u32::MAX, u32::MAX, luid,
-                ).map(crate::fisheye_decode::ZcFisheyeSource::Dual)
-            };
+            let iter = zc_fisheye_source(&pipeline, &cfg, luid);
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
+                    let decode = if iter.is_vulkan() { "Vulkan Video" } else { "d3d11va→Vulkan" };
                     tracing::info!(
-                        "fisheye_export: ZERO-COPY d3d11va→Vulkan export path ENGAGED \
+                        "fisheye_export: ZERO-COPY {decode} export path ENGAGED \
                          (native-res P010, no CPU download/swscale)"
                     );
                     return export_fisheye_osv_zerocopy_d3d11(
@@ -1626,6 +1612,68 @@ fn export_fisheye_inner(
     Ok(())
 }
 
+/// The Windows zero-copy `.360` EAC pair source for `cfg` (native res):
+/// Vulkan Video decode when `pipeline` runs on a Vulkan-decode device, else —
+/// or when the Vulkan iterator declines — D3D11 decode on the adapter `luid`.
+#[cfg(target_os = "windows")]
+fn zc_eac_source(
+    pipeline: &Arc<Device>,
+    cfg: &FisheyeExportConfig,
+    luid: Option<[u8; 8]>,
+) -> Result<crate::fisheye_decode::ZcEacSource> {
+    use crate::fisheye_decode as fd;
+    if let Some(decode) = crate::vk_shared::decode_device_for(&pipeline.device) {
+        match fd::SegmentedVkStreamPairIter::new(&cfg.segments, pipeline.clone(), decode) {
+            Ok(src) => return Ok(fd::ZcEacSource::Vk(src)),
+            Err(e) => tracing::warn!("export_eac: Vulkan Video decode unavailable ({e}) — D3D11 decode"),
+        }
+    }
+    fd::SegmentedD3d11SharedStreamPairIter::new(&cfg.segments, luid).map(fd::ZcEacSource::D3d11)
+}
+
+/// The Windows zero-copy fisheye frame source for `cfg` at native res:
+/// Vulkan Video decode when `pipeline` runs on a Vulkan-decode device
+/// (`crate::vk_shared`), else — or when the Vulkan iterator declines (a
+/// stream the GPU can't decode that way) — D3D11 decode on the adapter
+/// `luid`. Dual-stream sources chain their segments; a single-stream pair
+/// (SBS / stacked) is single-segment.
+#[cfg(target_os = "windows")]
+fn zc_fisheye_source(
+    pipeline: &Arc<Device>,
+    cfg: &FisheyeExportConfig,
+    luid: Option<[u8; 8]>,
+) -> Result<crate::fisheye_decode::ZcFisheyeSource> {
+    use crate::fisheye_decode as fd;
+    let single = cfg.source_kind.is_single_stream_pair();
+    // OSV swap-by-default ⊕ user override (matches preview + CPU path).
+    // u32::MAX work dims → the iterators clamp to native (1:1, full res).
+    let swap = cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes);
+    if let Some(decode) = crate::vk_shared::decode_device_for(&pipeline.device) {
+        let vk = if single {
+            fd::VkSharedSbsIter::new_with_layout(
+                &cfg.source_path, u32::MAX, u32::MAX, cfg.source_kind.eye_layout(),
+                pipeline.clone(), decode,
+            ).map(fd::ZcFisheyeSource::VkSbs)
+        } else {
+            fd::SegmentedVkDualStreamIter::new(
+                &cfg.segments, swap, u32::MAX, u32::MAX, pipeline.clone(), decode,
+            ).map(fd::ZcFisheyeSource::VkDual)
+        };
+        match vk {
+            Ok(src) => return Ok(src),
+            Err(e) => tracing::warn!("fisheye_export: Vulkan Video decode unavailable ({e}) — D3D11 decode"),
+        }
+    }
+    if single {
+        fd::D3d11SharedSbsIter::new_with_layout(
+            &cfg.source_path, u32::MAX, u32::MAX, luid, cfg.source_kind.eye_layout(),
+        ).map(fd::ZcFisheyeSource::Sbs)
+    } else {
+        fd::SegmentedD3d11SharedDualStreamIter::new(&cfg.segments, swap, u32::MAX, u32::MAX, luid)
+            .map(fd::ZcFisheyeSource::Dual)
+    }
+}
+
 /// Per-eye stab/RS rotation pair for one frame, as the GUI's
 /// `build_per_eye_frames` produces it: `((left_rot, left_rs), (right_rot, right_rs))`.
 pub type EacPerEyeFrame = (
@@ -1802,17 +1850,17 @@ fn export_eac_inner(
             );
             // Segmented iterator chains a merged recording's GS01…/GS02…/… on
             // the fast path (globalized pts → stab index stays continuous).
-            let iter = crate::fisheye_decode::SegmentedD3d11SharedStreamPairIter::new(
-                &cfg.segments, ctx.as_ref().and_then(crate::interop_windows::vulkan_device_luid),
-            );
+            let iter = zc_eac_source(
+                &pipeline, &cfg, ctx.as_ref().and_then(crate::interop_windows::vulkan_device_luid));
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
+                    let decode = if iter.is_vulkan() { "Vulkan Video" } else { "d3d11va" };
                     if matches!(cfg.encoder, EncoderBackend::HevcNvenc) {
-                        tracing::info!("export_eac: GPU-RESIDENT NVENC(CUDA) path ENGAGED");
+                        tracing::info!("export_eac: GPU-RESIDENT NVENC(CUDA) path ENGAGED ({decode} decode)");
                     } else {
                         tracing::info!(
-                            "export_eac: GPU-RESIDENT decode/project path ENGAGED \
-                             ({:?} encode tail via readback feed)", cfg.encoder);
+                            "export_eac: GPU-RESIDENT decode/project path ENGAGED ({decode} decode, \
+                             {:?} encode tail via readback feed)", cfg.encoder);
                     }
                     match export_eac_gpu_resident(
                         Arc::clone(&pipeline), cfg.clone(), per_eye.clone(),
@@ -2297,13 +2345,13 @@ fn export_eac_gpu_resident(
     per_eye: Vec<EacPerEyeFrame>,
     (lens_l, lens_r): (crate::gpu::EacLensAdjust, crate::gpu::EacLensAdjust),
     ctx: crate::interop_windows::VulkanImportCtx,
-    iter: crate::fisheye_decode::SegmentedD3d11SharedStreamPairIter,
+    iter: crate::fisheye_decode::ZcEacSource,
     progress_cb: &mut impl FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     use crate::nvenc_cuda::{CudaNvencEncoder, SharedP010Frame};
     use crate::gpu::Lens;
-    use crate::fisheye_decode::SharedEacPair;
+    use crate::fisheye_decode::ZcEacFrame;
 
     // NVENC keeps the fully GPU-resident CUDA handoff; ProRes / libx265
     // take the readback encode tail (same split as the OSV arms) — the
@@ -2483,14 +2531,16 @@ fn export_eac_gpu_resident(
     let view_active = !view.is_identity();
     let (v_l, v_r) = view.per_eye_matrices();
 
-    // Decode sub-thread (D3D11/NVDEC only — never touches CUDA/wgpu), so the
-    // ~10 ms dual-stream decode overlaps the GPU compose + NVENC on this thread.
-    let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<SharedEacPair>(3);
+    // Decode sub-thread, so the ~10 ms dual-stream decode overlaps the GPU
+    // compose + NVENC on this thread. D3D11 decode never touches CUDA/wgpu
+    // there; Vulkan Video decode also resolves each stream on wgpu's queue
+    // (submits only — this thread's work is ordered behind it).
+    let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<ZcEacFrame>(3);
     let cancel_dec = cancel.clone();
     let decode_handle = std::thread::spawn(move || -> Result<()> {
         loop {
             if cancel_dec.load(Ordering::SeqCst) { break; }
-            match iter.next_pair() {
+            match iter.next() {
                 Ok(Some(p)) => { if pair_tx.send(p).is_err() { break; } }
                 Ok(None) => break,
                 // A decode failure mid-stream must FAIL the export: finalizing
@@ -2512,14 +2562,15 @@ fn export_eac_gpu_resident(
     loop {
         let sp = match pair_rx.recv() { Ok(s) => s, Err(_) => break };
         if cancel.load(Ordering::SeqCst) { break; }
-        if sp.pts_s.is_finite() && sp.pts_s >= t_out { break; }
+        let pts_s = sp.pts_s();
+        if pts_s.is_finite() && pts_s >= t_out { break; }
         // Drop the keyframe run-in (pts before trim-in).
-        if sp.pts_s.is_finite() && sp.pts_s < t_in - 0.5 * dt { continue; }
+        if pts_s.is_finite() && pts_s < t_in - 0.5 * dt { continue; }
 
         // Absolute source frame index → per-eye stab/RS lookup (identity
         // past the end / when stabilization is off and per_eye is empty).
-        let abs_idx = if sp.pts_s.is_finite() && sp.pts_s >= 0.0 {
-            (sp.pts_s / dt).round() as usize
+        let abs_idx = if pts_s.is_finite() && pts_s >= 0.0 {
+            (pts_s / dt).round() as usize
         } else { trim_in_frame as usize + written as usize };
         let ((mut rl, sl), (mut rr, sr)) = per_eye.get(abs_idx).copied()
             .unwrap_or((
@@ -2535,8 +2586,9 @@ fn export_eac_gpu_resident(
 
         // Import both streams (RGBA16, native res) + assemble the two lens
         // crosses on the GPU (16-bit, so the 10 bits survive).
-        let s0_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.s0) };
-        let s4_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.s4) };
+        // D3D11 frames import (aliasing `sp`, held to the end of the
+        // iteration); Vulkan Video frames are already RGBA16 textures.
+        let (s0_tex, s4_tex) = unsafe { sp.textures(Some(&ctx), &pipeline.device)? };
         let cross_a = pipeline.rgba16_to_eac_cross(&s0_tex, &s4_tex, Lens::A, dims)?;
         let cross_b = pipeline.rgba16_to_eac_cross(&s0_tex, &s4_tex, Lens::B, dims)?;
 
@@ -3414,6 +3466,10 @@ fn export_fisheye_osv_zerocopy_d3d11(
                     unsafe { ctx.import_rgba16(&pipeline.device, &p.left) },
                     unsafe { ctx.import_rgba16(&pipeline.device, &p.right) },
                 ),
+                // Vulkan Video: already resolved to RGBA16 on the decode
+                // thread (same sampling and constants as the D3D11
+                // converter — byte-identical output).
+                ZcFisheyeFrame::VkPair(p) => (p.left.clone(), p.right.clone()),
                 ZcFisheyeFrame::Sbs(f) => {
                     let full = unsafe { ctx.import_rgba16(&pipeline.device, &f.tex) };
                     pipeline.split_pair_texture_16(&full, f.eye_w, f.eye_h, 33, f.layout)?
@@ -3518,9 +3574,10 @@ fn export_fisheye_osv_zerocopy_d3d11(
             }
         })();
 
-        // The RGB48 readback drained the GPU (map_async + Maintain::Wait), so
-        // this frame's imported eye textures are no longer in flight — drop
-        // the D3D11 share now (frees the import + the converted texture).
+        // The readback drained the GPU (map_async + Maintain::Wait), so this
+        // frame's eye textures are no longer in flight — drop the frame now
+        // (frees the D3D11 import + converted texture, or hands the Vulkan
+        // decoder's textures back to their pool).
         drop(sp);
         t_gpu += g0.elapsed();
 
@@ -3625,7 +3682,7 @@ fn export_fisheye_osv_gpu_resident(
     pipeline: Arc<Device>,
     cfg: FisheyeExportConfig,
     ctx: crate::interop_windows::VulkanImportCtx,
-    mut iter: crate::fisheye_decode::SegmentedD3d11SharedDualStreamIter,
+    mut iter: crate::fisheye_decode::ZcFisheyeSource,
     progress_cb: &mut impl FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -3729,16 +3786,18 @@ fn export_fisheye_osv_gpu_resident(
     let eye_match_state = pipeline.create_eye_match_state();
     let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
 
-    // Decode sub-thread (D3D11/NVDEC only — never touches CUDA/wgpu), so the
-    // ~10 ms decode overlaps the GPU compose + NVENC encode on this thread.
-    use crate::fisheye_decode::SharedFisheyePair;
-    let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<SharedFisheyePair>(3);
+    // Decode sub-thread, so the ~10 ms decode overlaps the GPU compose +
+    // NVENC encode on this thread. D3D11 decode never touches CUDA/wgpu
+    // there; Vulkan Video decode also resolves each eye on wgpu's queue
+    // (submits only — this thread's work is ordered behind it).
+    use crate::fisheye_decode::ZcFisheyeFrame;
+    let (pair_tx, pair_rx) = std::sync::mpsc::sync_channel::<ZcFisheyeFrame>(3);
     let cancel_dec = cancel.clone();
     let mut iter = iter;
     let decode_handle = std::thread::spawn(move || -> Result<()> {
         loop {
             if cancel_dec.load(Ordering::SeqCst) { break; }
-            match iter.next_pair() {
+            match iter.next() {
                 Ok(Some(p)) => { if pair_tx.send(p).is_err() { break; } }
                 Ok(None) => break,
                 // See the EAC arm: a mid-stream decode failure must fail the
@@ -3763,13 +3822,14 @@ fn export_fisheye_osv_gpu_resident(
         let sp = match pair_rx.recv() { Ok(s) => s, Err(_) => break };
         t_decode += d0.elapsed();
         if cancel.load(Ordering::SeqCst) { break; }
-        if sp.pts_s.is_finite() && sp.pts_s >= t_out { break; }
+        let pts_s = sp.pts_s();
+        if pts_s.is_finite() && pts_s >= t_out { break; }
         // Drop pre-trim frames (keyframe-backward seek, no decode-forward).
-        if sp.pts_s.is_finite() && sp.pts_s < t_in - 0.5 * dt { continue; }
+        if pts_s.is_finite() && pts_s < t_in - 0.5 * dt { continue; }
         let g0 = std::time::Instant::now();
 
-        let stab_idx = if sp.pts_s.is_finite() && sp.pts_s >= 0.0 {
-            (sp.pts_s / dt).round() as usize
+        let stab_idx = if pts_s.is_finite() && pts_s >= 0.0 {
+            (pts_s / dt).round() as usize
         } else { frame_idx as usize };
         let rot = stab_rotations.as_ref().and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(EquirectRotation::IDENTITY);
@@ -3789,9 +3849,17 @@ fn export_fisheye_osv_gpu_resident(
             )).unwrap_or((None, None))
         } else { (None, None) };
 
-        // Import + project + color (same as the readback path).
-        let l_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.left) };
-        let r_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.right) };
+        // Import + project + color (same as the readback path). Vulkan Video
+        // frames arrive already resolved to RGBA16.
+        let (l_tex, r_tex) = match &sp {
+            ZcFisheyeFrame::Pair(p) => (
+                unsafe { ctx.import_rgba16(&pipeline.device, &p.left) },
+                unsafe { ctx.import_rgba16(&pipeline.device, &p.right) },
+            ),
+            ZcFisheyeFrame::VkPair(p) => (p.left.clone(), p.right.clone()),
+            ZcFisheyeFrame::Sbs(_) => return Err(Error::Ffmpeg(
+                "gpu-resident export: single-stream sources take the readback arm".into())),
+        };
         let (left16, right16) = if cfg.projection == FisheyeExportProjection::Fisheye {
             // Normalized fisheye SBS output (slots 32/33 so the cache doesn't
             // collide with the equirect slots). RS-corrected when stabilizing —

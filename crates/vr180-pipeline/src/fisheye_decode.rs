@@ -552,7 +552,7 @@ impl SbsFisheyeIter {
             && crate::decode::try_enable_d3d11va_decode(&mut codec_ctx)
         {
             hw_attached = true;
-            tracing::info!("SbsFisheyeIter: d3d11va (NVDEC) hardware decode attached");
+            tracing::info!("SbsFisheyeIter: hardware decode attached");
         }
         // Multi-threaded SOFTWARE decode. libavcodec defaults `thread_count`
         // to 1 and no decoder in this workspace ever set it, so every software
@@ -728,6 +728,7 @@ impl SbsFisheyeIter {
                 decoded.format(),
                 ffmpeg_next::format::Pixel::VIDEOTOOLBOX
                     | ffmpeg_next::format::Pixel::D3D11
+                    | ffmpeg_next::format::Pixel::VULKAN
             ) {
                 crate::decode::download_hw_frame(decoded, sw_storage)?;
                 sw_storage
@@ -1052,7 +1053,7 @@ impl DualStreamFisheyeIter {
                 {
                     hw_active[i] = true;
                     tracing::info!(
-                        "DualStreamFisheyeIter: D3D11VA hw decode active on stream {i}"
+                        "DualStreamFisheyeIter: hw decode active on stream {i}"
                     );
                 }
                 #[cfg(not(target_os = "windows"))]
@@ -1205,6 +1206,7 @@ impl DualStreamFisheyeIter {
                 decoded.format(),
                 ffmpeg_next::format::Pixel::VIDEOTOOLBOX
                     | ffmpeg_next::format::Pixel::D3D11
+                    | ffmpeg_next::format::Pixel::VULKAN
             )
         {
             let t_dl = std::time::Instant::now();
@@ -2634,6 +2636,10 @@ impl D3d11SharedSbsIter {
 pub enum ZcFisheyeSource {
     Dual(SegmentedD3d11SharedDualStreamIter),
     Sbs(D3d11SharedSbsIter),
+    /// Vulkan Video decode (`crate::vk_shared`): dual-stream, segment-chained.
+    VkDual(SegmentedVkDualStreamIter),
+    /// Vulkan Video decode: single-stream side by side / stacked.
+    VkSbs(VkSharedSbsIter),
 }
 
 #[cfg(target_os = "windows")]
@@ -2642,25 +2648,38 @@ impl ZcFisheyeSource {
         match self {
             Self::Dual(i) => i.eye_dims(),
             Self::Sbs(i) => i.eye_dims(),
+            Self::VkDual(i) => i.eye_dims(),
+            Self::VkSbs(i) => i.eye_dims(),
         }
     }
     pub fn native_dims(&self) -> (u32, u32) {
         match self {
             Self::Dual(i) => i.native_dims(),
             Self::Sbs(i) => i.native_dims(),
+            Self::VkDual(i) => i.native_dims(),
+            Self::VkSbs(i) => i.native_dims(),
         }
     }
     pub fn seek(&mut self, t: f64) -> Result<()> {
         match self {
             Self::Dual(i) => i.seek(t),
             Self::Sbs(i) => i.seek(t),
+            Self::VkDual(i) => i.seek(t),
+            Self::VkSbs(i) => i.seek(t),
         }
     }
     pub fn next(&mut self) -> Result<Option<ZcFisheyeFrame>> {
         match self {
             Self::Dual(i) => Ok(i.next_pair()?.map(ZcFisheyeFrame::Pair)),
             Self::Sbs(i) => Ok(i.next_frame()?.map(ZcFisheyeFrame::Sbs)),
+            Self::VkDual(i) => Ok(i.next_pair()?.map(ZcFisheyeFrame::VkPair)),
+            Self::VkSbs(i) => Ok(i.next_frame()?.map(ZcFisheyeFrame::VkPair)),
         }
+    }
+
+    /// True when frames come from Vulkan Video decode (no D3D11 import).
+    pub fn is_vulkan(&self) -> bool {
+        matches!(self, Self::VkDual(_) | Self::VkSbs(_))
     }
 }
 
@@ -2670,6 +2689,518 @@ impl ZcFisheyeSource {
 pub enum ZcFisheyeFrame {
     Pair(SharedFisheyePair),
     Sbs(SharedSbsFrame),
+    /// Vulkan Video decode: both eyes already resolved to RGBA16.
+    VkPair(VkRgbaPair),
+}
+
+/// Coded dims of stream `idx` from its parameters (before any decoder opens).
+#[cfg(target_os = "windows")]
+fn stream_dims(ictx: &ffmpeg_next::format::context::Input, idx: usize) -> (u32, u32) {
+    ictx.stream(idx).map(|s| unsafe {
+        let p = &*s.parameters().as_ptr();
+        (p.width.max(0) as u32, p.height.max(0) as u32)
+    }).unwrap_or((0, 0))
+}
+
+/// Both eyes of one frame decoded through Vulkan Video ([`crate::vk_shared`])
+/// and resolved to single-plane `Rgba16Unorm` at the iterator's working size
+/// — the Vulkan analogue of an imported [`SharedFisheyePair`] /
+/// [`SharedSbsFrame`] split, used directly (no import, no split).
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub struct VkRgbaPair {
+    pub left: wgpu::Texture,
+    pub right: wgpu::Texture,
+    /// Dims of `left`/`right` (the working size; native for an export).
+    pub eye_w: u32,
+    pub eye_h: u32,
+    /// Presentation timestamp in seconds, `0.0` if unknown.
+    pub pts_s: f64,
+    /// Return the textures to the device's pool on drop — keep the pair until
+    /// the GPU work reading them has been SUBMITTED.
+    pub leases: [crate::vk_shared::RgbaLease; 2],
+}
+
+/// The VRAM pre-flight every zero-copy decode runs before it opens decoders
+/// (see `interop_windows::hw_decode_fits`): a pool that doesn't fit fails on
+/// the first frame or mid-stream, past the point where a caller can still
+/// fall back. Vulkan Video uses no more than D3D11 here (measured on an RTX
+/// 5090: two 3840² streams +2.7 GB vs +3.1 GB), so the same gate is safe.
+#[cfg(target_os = "windows")]
+fn vk_vram_preflight(streams: &[(u32, u32)]) -> Result<()> {
+    if crate::interop_windows::hw_decode_fits(streams) {
+        return Ok(());
+    }
+    Err(Error::Ffmpeg(crate::interop_windows::hw_decode_decline_reason()
+        .unwrap_or_else(|| "hardware decode does not fit in VRAM".into())))
+}
+
+/// Resolve one Vulkan-decoded frame's planes (`frame`, its sub-rect at
+/// `origins[i]` of size `src`) into a fresh pooled RGBA16 texture per entry
+/// of `origins`, all in one submission. 1:1 when `out` == `src`.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn vk_resolve_frame<const N: usize>(
+    decode: &crate::vk_shared::VkDecodeDevice,
+    pipeline: &crate::gpu::Device,
+    frame: &ffmpeg_next::frame::Video,
+    src: (u32, u32),
+    origins: [(u32, u32); N],
+    out: (u32, u32),
+    full_range: bool,
+    bt2020: bool,
+) -> Result<[crate::vk_shared::RgbaLease; N]> {
+    let leases: [crate::vk_shared::RgbaLease; N] =
+        std::array::from_fn(|_| decode.take_rgba16(out.0, out.1));
+    decode.with_frame_planes(frame, |enc, p| {
+        let range = crate::gpu::yuv_range_constants(p.bits, full_range);
+        let mat = crate::gpu::yuv_matrix_constants(bt2020);
+        for (lease, (x0, y0)) in leases.iter().zip(origins) {
+            pipeline.record_p010_resolve(
+                enc, p.y, p.uv, src.0, src.1, x0, y0, range, mat, lease.texture());
+        }
+        Ok(())
+    })?;
+    Ok(leases)
+}
+
+/// Dual-stream iterator (DJI OSV / Insta360 X6) decoding through FFmpeg's
+/// Vulkan Video hwaccel on a [`crate::vk_shared::VkDecodeDevice`] — the
+/// [`D3d11SharedDualStreamIter`] analogue: each eye is resolved to RGBA16 at
+/// the working size (native for an export, ~1280 for the preview) with the
+/// same limited-range BT.709 constants, so a 1:1 export is byte-identical to
+/// the D3D11 path. Construction decodes the first pair and declines unless
+/// it came out as Vulkan frames (a stream the GPU can't decode through
+/// Vulkan Video silently yields software frames), so the caller can fall
+/// back to D3D11 before any frame is consumed.
+#[cfg(target_os = "windows")]
+pub struct VkSharedDualStreamIter {
+    ictx: ffmpeg_next::format::context::Input,
+    video_indices: [usize; 2],
+    decoders: Vec<ffmpeg_next::codec::decoder::Video>,
+    native_w: u32,
+    native_h: u32,
+    work_w: u32,
+    work_h: u32,
+    time_base_s: f64,
+    /// If true output left = stream[1], right = stream[0] (DJI OSV).
+    swap_eyes: bool,
+    pump: DualPacketPump,
+    /// The construction probe's pair, yielded first.
+    pending: Option<([ffmpeg_next::frame::Video; 2], i64)>,
+    pipeline: std::sync::Arc<crate::gpu::Device>,
+    decode: std::sync::Arc<crate::vk_shared::VkDecodeDevice>,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for VkSharedDualStreamIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VkSharedDualStreamIter")
+            .field("native", &(self.native_w, self.native_h))
+            .field("work", &(self.work_w, self.work_h))
+            .field("swap_eyes", &self.swap_eyes)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl VkSharedDualStreamIter {
+    /// `work_w`/`work_h` = the resolve size (clamped to native; `u32::MAX`
+    /// for native, as the export asks). `pipeline` must run on `decode`'s
+    /// device.
+    pub fn new(
+        path: &Path,
+        swap_eyes: bool,
+        work_w: u32,
+        work_h: u32,
+        pipeline: std::sync::Arc<crate::gpu::Device>,
+        decode: std::sync::Arc<crate::vk_shared::VkDecodeDevice>,
+    ) -> Result<Self> {
+        ffmpeg_init();
+        let mut ictx = ffmpeg_next::format::input(path)
+            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+        let video_indices: Vec<usize> = ictx
+            .streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+            .map(|s| s.index())
+            .take(2)
+            .collect();
+        if video_indices.len() < 2 {
+            return Err(Error::Ffmpeg(format!(
+                "expected 2 video streams (OSV / dual-camera), found {}", video_indices.len())));
+        }
+        let video_indices = [video_indices[0], video_indices[1]];
+        vk_vram_preflight(&video_indices.map(|i| stream_dims(&ictx, i)))?;
+        let mut decoders = Vec::with_capacity(2);
+        for &idx in video_indices.iter() {
+            let stream = ictx.stream(idx).unwrap();
+            let mut codec_ctx =
+                ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+                    .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+            decode.attach_decoder(&mut codec_ctx)?;
+            decoders.push(codec_ctx.decoder().video()
+                .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?);
+        }
+        let (w0, h0) = (decoders[0].width(), decoders[0].height());
+        let (w1, h1) = (decoders[1].width(), decoders[1].height());
+        if (w0, h0) != (w1, h1) {
+            return Err(Error::Ffmpeg(format!(
+                "dual-stream streams disagree on dims: {w0}x{h0} vs {w1}x{h1}")));
+        }
+        let time_base = ictx.stream(video_indices[0]).unwrap().time_base();
+        let time_base_s = time_base.numerator() as f64 / time_base.denominator() as f64;
+        let mut pump = DualPacketPump::default();
+        let pending = pump.next_pair(&mut ictx, &video_indices, &mut decoders)
+            .ok_or_else(|| Error::Ffmpeg("Vulkan Video: no frame decoded".into()))?;
+        if !pending.0.iter().all(crate::vk_shared::is_vulkan_frame) {
+            return Err(Error::Ffmpeg(
+                "the GPU can't decode these streams through Vulkan Video (software frames)".into()));
+        }
+        let work_w = work_w.clamp(2, w0);
+        let work_h = work_h.clamp(2, h0);
+        tracing::info!(
+            "VkSharedDualStreamIter: native {w0}x{h0} → work {work_w}x{work_h}, Vulkan Video decode, swap_eyes={swap_eyes}");
+        Ok(Self {
+            ictx, video_indices, decoders,
+            native_w: w0, native_h: h0, work_w, work_h,
+            time_base_s, swap_eyes, pump,
+            pending: Some(pending),
+            pipeline, decode,
+        })
+    }
+
+    /// Working dims — what `next_pair` yields.
+    pub fn eye_dims(&self) -> (u32, u32) { (self.work_w, self.work_h) }
+    pub fn native_dims(&self) -> (u32, u32) { (self.native_w, self.native_h) }
+
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        self.pending = None;
+        let ts = (target_s.max(0.0) * 1_000_000.0) as i64;
+        self.ictx.seek(ts, ..ts)
+            .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        for d in &mut self.decoders {
+            d.flush();
+        }
+        self.pump.reset();
+        Ok(())
+    }
+
+    /// Decode one PTS-matched pair and resolve both eyes. `Ok(None)` at EOF.
+    pub fn next_pair(&mut self) -> Result<Option<VkRgbaPair>> {
+        let pair = match self.pending.take() {
+            Some(p) => Some(p),
+            None => self.pump.next_pair(&mut self.ictx, &self.video_indices, &mut self.decoders),
+        };
+        let Some(([f0, f1], pts0)) = pair else { return Ok(None) };
+        let pts_s = pts0 as f64 * self.time_base_s;
+        let (src, out) = ((self.native_w, self.native_h), (self.work_w, self.work_h));
+        let [l0] = vk_resolve_frame(&self.decode, &self.pipeline, &f0, src, [(0, 0)], out, false, false)?;
+        let [l1] = vk_resolve_frame(&self.decode, &self.pipeline, &f1, src, [(0, 0)], out, false, false)?;
+        let (left, right) = if self.swap_eyes { (l1, l0) } else { (l0, l1) };
+        Ok(Some(VkRgbaPair {
+            left: left.texture().clone(),
+            right: right.texture().clone(),
+            eye_w: self.work_w, eye_h: self.work_h,
+            pts_s,
+            leases: [left, right],
+        }))
+    }
+}
+
+/// Segment-chaining wrapper around [`VkSharedDualStreamIter`] — the Vulkan
+/// twin of [`SegmentedD3d11SharedDualStreamIter`] (same global-pts rebase,
+/// rollover and seek mapping; see there).
+#[cfg(target_os = "windows")]
+pub struct SegmentedVkDualStreamIter {
+    segments: Vec<std::path::PathBuf>,
+    seg_start_s: Vec<f64>,
+    total_dur_s: f64,
+    cur_idx: usize,
+    cur: VkSharedDualStreamIter,
+    swap_eyes: bool,
+    work_w: u32,
+    work_h: u32,
+    pipeline: std::sync::Arc<crate::gpu::Device>,
+    decode: std::sync::Arc<crate::vk_shared::VkDecodeDevice>,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for SegmentedVkDualStreamIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentedVkDualStreamIter")
+            .field("segments", &self.segments.len())
+            .field("cur_idx", &self.cur_idx)
+            .field("total_dur_s", &self.total_dur_s)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl SegmentedVkDualStreamIter {
+    pub fn new(
+        segments: &[std::path::PathBuf],
+        swap_eyes: bool,
+        work_w: u32,
+        work_h: u32,
+        pipeline: std::sync::Arc<crate::gpu::Device>,
+        decode: std::sync::Arc<crate::vk_shared::VkDecodeDevice>,
+    ) -> Result<Self> {
+        assert!(!segments.is_empty(), "segments must be non-empty");
+        let mut seg_start_s = Vec::with_capacity(segments.len());
+        let mut acc = 0.0_f64;
+        for seg in segments {
+            seg_start_s.push(acc);
+            // VIDEO-track duration — see SegmentedD3d11SharedDualStreamIter.
+            acc += crate::decode::probe_video_duration_via_moov(seg).ok()
+                .or_else(|| crate::decode::probe_video(seg).ok().map(|p| p.duration_sec))
+                .unwrap_or(0.0);
+        }
+        let cur = VkSharedDualStreamIter::new(
+            &segments[0], swap_eyes, work_w, work_h, pipeline.clone(), decode.clone())?;
+        if segments.len() > 1 {
+            tracing::info!("SegmentedVkDualStreamIter: {} segments, {:.1}s total", segments.len(), acc);
+        }
+        Ok(Self {
+            segments: segments.to_vec(),
+            seg_start_s, total_dur_s: acc, cur_idx: 0, cur,
+            swap_eyes, work_w, work_h, pipeline, decode,
+        })
+    }
+
+    pub fn eye_dims(&self) -> (u32, u32) { self.cur.eye_dims() }
+    pub fn native_dims(&self) -> (u32, u32) { self.cur.native_dims() }
+    pub fn total_duration_s(&self) -> f64 { self.total_dur_s }
+
+    fn open_segment(&self, idx: usize) -> Result<VkSharedDualStreamIter> {
+        VkSharedDualStreamIter::new(
+            &self.segments[idx], self.swap_eyes, self.work_w, self.work_h,
+            self.pipeline.clone(), self.decode.clone())
+    }
+
+    /// Seek to a GLOBAL clip time (see the D3D11 twin).
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let t = if self.total_dur_s > 0.0 {
+            target_s.clamp(0.0, self.total_dur_s)
+        } else {
+            target_s.max(0.0)
+        };
+        let idx = self.seg_start_s.iter().rposition(|&s| s <= t).unwrap_or(0);
+        if idx != self.cur_idx {
+            self.cur = self.open_segment(idx)?;
+            self.cur_idx = idx;
+        }
+        self.cur.seek(t - self.seg_start_s[idx])
+    }
+
+    pub fn next_pair(&mut self) -> Result<Option<VkRgbaPair>> {
+        loop {
+            if let Some(mut p) = self.cur.next_pair()? {
+                p.pts_s += self.seg_start_s[self.cur_idx];
+                return Ok(Some(p));
+            }
+            if self.cur_idx + 1 >= self.segments.len() {
+                return Ok(None);
+            }
+            self.cur_idx += 1;
+            let expect = self.cur.native_dims();
+            self.cur = self.open_segment(self.cur_idx)?;
+            if self.cur.native_dims() != expect {
+                tracing::warn!(
+                    "segmented dual-stream: segment {} native dims {:?} != {:?} — output may be wrong",
+                    self.cur_idx, self.cur.native_dims(), expect);
+            }
+        }
+    }
+}
+
+/// Single-stream side-by-side / stacked source (generic SBS, QooCam) decoding
+/// through Vulkan Video — the [`D3d11SharedSbsIter`] analogue. Each eye is
+/// resolved straight from its own sub-rect of the decoded planes (no
+/// whole-frame convert + split), with the stream's range and matrix tags.
+/// Same precise-seek run-in and first-frame Vulkan probe as the others.
+#[cfg(target_os = "windows")]
+pub struct VkSharedSbsIter {
+    ictx: ffmpeg_next::format::context::Input,
+    video_idx: usize,
+    decoder: ffmpeg_next::codec::decoder::Video,
+    native_eye_w: u32,
+    native_eye_h: u32,
+    eye_w: u32,
+    eye_h: u32,
+    time_base_s: f64,
+    dt_s: f64,
+    skip_until_s: Option<f64>,
+    full_range: bool,
+    bt2020: bool,
+    layout: EyeLayout,
+    pending: Option<ffmpeg_next::frame::Video>,
+    pipeline: std::sync::Arc<crate::gpu::Device>,
+    decode: std::sync::Arc<crate::vk_shared::VkDecodeDevice>,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for VkSharedSbsIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VkSharedSbsIter")
+            .field("video_idx", &self.video_idx)
+            .field("eye", &(self.eye_w, self.eye_h))
+            .field("layout", &self.layout)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl VkSharedSbsIter {
+    /// `work_w`/`work_h` are PER-EYE working dims, clamped to native
+    /// (`u32::MAX` = native, the export).
+    pub fn new_with_layout(
+        path: &Path,
+        work_w: u32,
+        work_h: u32,
+        layout: EyeLayout,
+        pipeline: std::sync::Arc<crate::gpu::Device>,
+        decode: std::sync::Arc<crate::vk_shared::VkDecodeDevice>,
+    ) -> Result<Self> {
+        ffmpeg_init();
+        let ictx = ffmpeg_next::format::input(path)
+            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+        // Largest video stream wins — same selection as `D3d11SharedSbsIter`.
+        let video = ictx
+            .streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+            .max_by_key(|s| {
+                let p = s.parameters();
+                unsafe {
+                    let cp = &*p.as_ptr();
+                    (cp.width as u64) * (cp.height as u64)
+                }
+            })
+            .ok_or_else(|| Error::Ffmpeg("no video stream".into()))?;
+        let video_idx = video.index();
+        let time_base = video.time_base();
+        let time_base_s = time_base.numerator() as f64 / time_base.denominator().max(1) as f64;
+        let fr = video.avg_frame_rate();
+        let dt_s = if fr.numerator() > 0 {
+            fr.denominator() as f64 / fr.numerator() as f64
+        } else {
+            1.0 / 30.0
+        };
+        // Range + matrix tags, read exactly as `D3d11SharedSbsIter` does.
+        // SAFETY: read-only access to POD fields of AVCodecParameters.
+        let full_range = unsafe { (*video.parameters().as_ptr()).color_range }
+            == ffmpeg_next::ffi::AVColorRange::AVCOL_RANGE_JPEG;
+        let bt2020 = matches!(unsafe { (*video.parameters().as_ptr()).color_space },
+            ffmpeg_next::ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL
+            | ffmpeg_next::ffi::AVColorSpace::AVCOL_SPC_BT2020_CL);
+        vk_vram_preflight(&[stream_dims(&ictx, video_idx)])?;
+        let mut codec_ctx =
+            ffmpeg_next::codec::context::Context::from_parameters(video.parameters())
+                .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+        decode.attach_decoder(&mut codec_ctx)?;
+        let decoder = codec_ctx.decoder().video()
+            .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?;
+        let (fw, fh) = (decoder.width(), decoder.height());
+        if !layout.split_axis_ok(fw, fh) || fw == 0 || fh == 0 {
+            return Err(Error::Ffmpeg(format!(
+                "{layout:?} frame {fw}x{fh} not splittable (the split axis must be even)")));
+        }
+        let (native_eye_w, native_eye_h) = layout.eye_dims(fw, fh);
+        let eye_w = work_w.clamp(2, native_eye_w);
+        let eye_h = work_h.clamp(2, native_eye_h);
+        let mut it = Self {
+            ictx, video_idx, decoder,
+            native_eye_w, native_eye_h, eye_w, eye_h,
+            time_base_s, dt_s,
+            skip_until_s: None,
+            full_range, bt2020, layout,
+            pending: None,
+            pipeline, decode,
+        };
+        let first = it.decode_next()?
+            .ok_or_else(|| Error::Ffmpeg("Vulkan Video: no frame decoded".into()))?;
+        if !crate::vk_shared::is_vulkan_frame(&first) {
+            return Err(Error::Ffmpeg(
+                "the GPU can't decode this stream through Vulkan Video (software frames)".into()));
+        }
+        it.pending = Some(first);
+        tracing::info!(
+            "VkSharedSbsIter: {fw}x{fh} {layout:?} (native {native_eye_w}x{native_eye_h} per eye → \
+             work {eye_w}x{eye_h}), Vulkan Video decode, {} range, {} matrix",
+            if full_range { "full" } else { "limited" },
+            if bt2020 { "BT.2020" } else { "BT.709" });
+        Ok(it)
+    }
+
+    pub fn eye_dims(&self) -> (u32, u32) { (self.eye_w, self.eye_h) }
+    pub fn native_dims(&self) -> (u32, u32) { (self.native_eye_w, self.native_eye_h) }
+
+    /// PRECISE seek — see [`D3d11SharedStreamPairIter::seek`].
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        self.pending = None;
+        let target_s = target_s.max(0.0);
+        let ts = (target_s * 1_000_000.0) as i64;
+        self.ictx.seek(ts, ..ts)
+            .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        self.decoder.flush();
+        self.skip_until_s = Some(target_s);
+        Ok(())
+    }
+
+    /// The next decoded frame (the same demux/drain loop as the D3D11 twin).
+    fn decode_next(&mut self) -> Result<Option<ffmpeg_next::frame::Video>> {
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        if self.decoder.receive_frame(&mut decoded).is_ok() {
+            return Ok(Some(decoded));
+        }
+        loop {
+            match self.ictx.packets().next() {
+                Some((stream, packet)) => {
+                    if stream.index() != self.video_idx { continue; }
+                    let _ = self.decoder.send_packet(&packet);
+                    if self.decoder.receive_frame(&mut decoded).is_ok() {
+                        return Ok(Some(decoded));
+                    }
+                }
+                None => {
+                    // A read ERROR reports as EOF too (see `demux_eof_or_error`).
+                    demux_eof_or_error(&self.ictx, "Vulkan single-stream")?;
+                    let _ = self.decoder.send_eof();
+                    return Ok(self.decoder.receive_frame(&mut decoded).is_ok().then_some(decoded));
+                }
+            }
+        }
+    }
+
+    /// Pull the next frame, both eyes resolved. `Ok(None)` at EOF.
+    pub fn next_frame(&mut self) -> Result<Option<VkRgbaPair>> {
+        loop {
+            let frame = match self.pending.take() {
+                Some(f) => f,
+                None => match self.decode_next()? {
+                    Some(f) => f,
+                    None => return Ok(None),
+                },
+            };
+            let pts_s = frame.pts().unwrap_or(0) as f64 * self.time_base_s;
+            // Precise-seek run-in: decode-and-discard without the resolve.
+            if let Some(target) = self.skip_until_s {
+                if pts_s < target - 0.5 * self.dt_s { continue; }
+                self.skip_until_s = None;
+            }
+            let (nw, nh) = (self.native_eye_w, self.native_eye_h);
+            let [left, right] = vk_resolve_frame(
+                &self.decode, &self.pipeline, &frame, (nw, nh),
+                [self.layout.eye_origin(0, nw, nh), self.layout.eye_origin(1, nw, nh)],
+                (self.eye_w, self.eye_h), self.full_range, self.bt2020)?;
+            return Ok(Some(VkRgbaPair {
+                left: left.texture().clone(),
+                right: right.texture().clone(),
+                eye_w: self.eye_w, eye_h: self.eye_h,
+                pts_s,
+                leases: [left, right],
+            }));
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2678,6 +3209,7 @@ impl ZcFisheyeFrame {
         match self {
             Self::Pair(p) => p.pts_s,
             Self::Sbs(f) => f.pts_s,
+            Self::VkPair(p) => p.pts_s,
         }
     }
 }
@@ -3000,6 +3532,351 @@ impl SegmentedD3d11SharedStreamPairIter {
             }
             self.cur_idx += 1;
             self.cur = D3d11SharedStreamPairIter::new(&self.segments[self.cur_idx], self.adapter_luid)?;
+        }
+    }
+}
+
+/// One GoPro `.360` EAC stream pair decoded through Vulkan Video and resolved
+/// 1:1 to `Rgba16Unorm` — the Vulkan analogue of an imported
+/// [`SharedEacPair`].
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub struct VkEacPair {
+    pub s0: wgpu::Texture,
+    pub s4: wgpu::Texture,
+    /// EAC layout (stream/tile/cross dims), derived from the s0 stream.
+    pub dims: vr180_core::eac::Dims,
+    /// Presentation timestamp in seconds, `0.0` if unknown.
+    pub pts_s: f64,
+    /// Return the textures to the device's pool on drop — keep the pair until
+    /// the GPU work reading them has been SUBMITTED.
+    pub leases: [crate::vk_shared::RgbaLease; 2],
+}
+
+/// GoPro `.360` EAC pair iterator decoding through Vulkan Video — the
+/// [`D3d11SharedStreamPairIter`] analogue, with its exact packet pairing and
+/// precise-seek run-in, resolving each stream 1:1 with the same constants
+/// (limited range, BT.709 — the D3D11 converter's and swscale's reading of
+/// these streams, whatever their tag says; see CLAUDE.md item 14).
+/// Construction decodes the first pair and declines unless it came out as
+/// Vulkan frames, so the caller can fall back to D3D11.
+#[cfg(target_os = "windows")]
+pub struct VkSharedStreamPairIter {
+    ictx: ffmpeg_next::format::context::Input,
+    video_indices: [usize; 2],
+    decoders: Vec<ffmpeg_next::codec::decoder::Video>,
+    dims: vr180_core::eac::Dims,
+    time_base_s: f64,
+    dt_s: f64,
+    skip_until_s: Option<f64>,
+    pending: Option<([ffmpeg_next::frame::Video; 2], i64)>,
+    pipeline: std::sync::Arc<crate::gpu::Device>,
+    decode: std::sync::Arc<crate::vk_shared::VkDecodeDevice>,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for VkSharedStreamPairIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VkSharedStreamPairIter")
+            .field("video_indices", &self.video_indices)
+            .field("dims", &self.dims)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl VkSharedStreamPairIter {
+    pub fn new(
+        path: &Path,
+        pipeline: std::sync::Arc<crate::gpu::Device>,
+        decode: std::sync::Arc<crate::vk_shared::VkDecodeDevice>,
+    ) -> Result<Self> {
+        ffmpeg_init();
+        let ictx = ffmpeg_next::format::input(path)
+            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
+        let video_indices: Vec<usize> = ictx
+            .streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+            .map(|s| s.index())
+            .take(2)
+            .collect();
+        if video_indices.len() < 2 {
+            return Err(Error::Ffmpeg(format!(
+                "expected 2 video streams (.360 EAC), found {}", video_indices.len())));
+        }
+        let video_indices = [video_indices[0], video_indices[1]];
+        vk_vram_preflight(&video_indices.map(|i| stream_dims(&ictx, i)))?;
+        let mut decoders = Vec::with_capacity(2);
+        for &idx in video_indices.iter() {
+            let stream = ictx.stream(idx).unwrap();
+            let mut codec_ctx =
+                ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+                    .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
+            decode.attach_decoder(&mut codec_ctx)?;
+            decoders.push(codec_ctx.decoder().video()
+                .map_err(|e| Error::Ffmpeg(format!("video decoder: {e}")))?);
+        }
+        let (w0, h0) = (decoders[0].width(), decoders[0].height());
+        let (w1, h1) = (decoders[1].width(), decoders[1].height());
+        if (w0, h0) != (w1, h1) {
+            return Err(Error::Ffmpeg(format!(
+                "EAC streams disagree on dims: {w0}x{h0} vs {w1}x{h1}")));
+        }
+        let dims = vr180_core::eac::Dims::new(w0, h0);
+        if !dims.is_valid() {
+            return Err(Error::Ffmpeg(format!("EAC: stream width {w0} not a valid EAC layout")));
+        }
+        let s0_stream = ictx.stream(video_indices[0]).unwrap();
+        let time_base = s0_stream.time_base();
+        let time_base_s = time_base.numerator() as f64 / time_base.denominator().max(1) as f64;
+        let fr = s0_stream.avg_frame_rate();
+        let dt_s = if fr.numerator() > 0 {
+            fr.denominator() as f64 / fr.numerator() as f64
+        } else {
+            1.0 / 30.0
+        };
+        let mut it = Self {
+            ictx, video_indices, decoders, dims, time_base_s, dt_s,
+            skip_until_s: None,
+            pending: None,
+            pipeline, decode,
+        };
+        let first = it.decode_pair()?
+            .ok_or_else(|| Error::Ffmpeg("Vulkan Video: no EAC pair decoded".into()))?;
+        if !first.0.iter().all(crate::vk_shared::is_vulkan_frame) {
+            return Err(Error::Ffmpeg(
+                "the GPU can't decode these streams through Vulkan Video (software frames)".into()));
+        }
+        it.pending = Some(first);
+        tracing::info!(
+            "VkSharedStreamPairIter: EAC streams {:?}, native {w0}x{h0}, cross_w={} (Vulkan Video decode)",
+            it.video_indices, dims.cross_w());
+        Ok(it)
+    }
+
+    pub fn dims(&self) -> vr180_core::eac::Dims { self.dims }
+    pub fn native_dims(&self) -> (u32, u32) { (self.dims.stream_w, self.dims.stream_h) }
+
+    /// PRECISE seek — see [`D3d11SharedStreamPairIter::seek`].
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        self.pending = None;
+        let target_s = target_s.max(0.0);
+        let ts = (target_s * 1_000_000.0) as i64;
+        self.ictx.seek(ts, ..ts)
+            .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        for d in &mut self.decoders { d.flush(); }
+        self.skip_until_s = Some(target_s);
+        Ok(())
+    }
+
+    /// The next `(s0, s4)` frame pair — the D3D11 twin's pairing loop: every
+    /// packet goes to its decoder so the two stay in lockstep.
+    fn decode_pair(&mut self) -> Result<Option<([ffmpeg_next::frame::Video; 2], i64)>> {
+        let mut frames: [Option<(ffmpeg_next::frame::Video, i64)>; 2] = [None, None];
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        for pos in 0..2 {
+            if self.decoders[pos].receive_frame(&mut decoded).is_ok() {
+                let pts = decoded.pts().unwrap_or(0);
+                frames[pos] = Some((std::mem::replace(&mut decoded, ffmpeg_next::frame::Video::empty()), pts));
+            }
+        }
+        if frames.iter().any(|f| f.is_none()) {
+            while let Some((stream, packet)) = self.ictx.packets().next() {
+                let Some(pos) = self.video_indices.iter().position(|&i| i == stream.index()) else { continue };
+                if self.decoders[pos].send_packet(&packet).is_err() { continue; }
+                if frames[pos].is_none() && self.decoders[pos].receive_frame(&mut decoded).is_ok() {
+                    let pts = decoded.pts().unwrap_or(0);
+                    frames[pos] = Some((std::mem::replace(&mut decoded, ffmpeg_next::frame::Video::empty()), pts));
+                }
+                if frames.iter().all(|f| f.is_some()) { break; }
+            }
+        }
+        if frames.iter().any(|f| f.is_none()) {
+            demux_eof_or_error(&self.ictx, "Vulkan EAC")?;
+        }
+        let (Some((f0, pts0)), Some((f4, _))) = (frames[0].take(), frames[1].take()) else {
+            return Ok(None);
+        };
+        Ok(Some(([f0, f4], pts0)))
+    }
+
+    /// Pull the next pair, both streams resolved 1:1. `Ok(None)` at EOF.
+    pub fn next_pair(&mut self) -> Result<Option<VkEacPair>> {
+        loop {
+            let pair = match self.pending.take() {
+                Some(p) => Some(p),
+                None => self.decode_pair()?,
+            };
+            let Some(([f0, f4], pts0)) = pair else { return Ok(None) };
+            let pts_s = pts0 as f64 * self.time_base_s;
+            // Precise-seek run-in: drop pairs before the target unresolved.
+            if let Some(target) = self.skip_until_s {
+                if pts_s < target - 0.5 * self.dt_s { continue; }
+                self.skip_until_s = None;
+            }
+            let n = (self.dims.stream_w, self.dims.stream_h);
+            let [l0] = vk_resolve_frame(&self.decode, &self.pipeline, &f0, n, [(0, 0)], n, false, false)?;
+            let [l4] = vk_resolve_frame(&self.decode, &self.pipeline, &f4, n, [(0, 0)], n, false, false)?;
+            return Ok(Some(VkEacPair {
+                s0: l0.texture().clone(),
+                s4: l4.texture().clone(),
+                dims: self.dims,
+                pts_s,
+                leases: [l0, l4],
+            }));
+        }
+    }
+}
+
+/// Segment-chaining wrapper around [`VkSharedStreamPairIter`] — the Vulkan
+/// twin of [`SegmentedD3d11SharedStreamPairIter`].
+#[cfg(target_os = "windows")]
+pub struct SegmentedVkStreamPairIter {
+    segments: Vec<std::path::PathBuf>,
+    seg_start_s: Vec<f64>,
+    total_dur_s: f64,
+    cur_idx: usize,
+    cur: VkSharedStreamPairIter,
+    pipeline: std::sync::Arc<crate::gpu::Device>,
+    decode: std::sync::Arc<crate::vk_shared::VkDecodeDevice>,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Debug for SegmentedVkStreamPairIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentedVkStreamPairIter")
+            .field("segments", &self.segments.len())
+            .field("cur_idx", &self.cur_idx)
+            .field("total_dur_s", &self.total_dur_s)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl SegmentedVkStreamPairIter {
+    pub fn new(
+        segments: &[std::path::PathBuf],
+        pipeline: std::sync::Arc<crate::gpu::Device>,
+        decode: std::sync::Arc<crate::vk_shared::VkDecodeDevice>,
+    ) -> Result<Self> {
+        assert!(!segments.is_empty(), "segments must be non-empty");
+        let mut seg_start_s = Vec::with_capacity(segments.len());
+        let mut acc = 0.0_f64;
+        for seg in segments {
+            seg_start_s.push(acc);
+            // VIDEO-track duration — see SegmentedD3d11SharedStreamPairIter.
+            acc += crate::decode::probe_video_duration_via_moov(seg).ok()
+                .or_else(|| crate::decode::probe_video(seg).ok().map(|p| p.duration_sec))
+                .unwrap_or(0.0);
+        }
+        let cur = VkSharedStreamPairIter::new(&segments[0], pipeline.clone(), decode.clone())?;
+        if segments.len() > 1 {
+            tracing::info!("SegmentedVkStreamPairIter: {} segments, {:.1}s total", segments.len(), acc);
+        }
+        Ok(Self {
+            segments: segments.to_vec(),
+            seg_start_s, total_dur_s: acc, cur_idx: 0, cur, pipeline, decode,
+        })
+    }
+
+    pub fn dims(&self) -> vr180_core::eac::Dims { self.cur.dims() }
+    pub fn native_dims(&self) -> (u32, u32) { self.cur.native_dims() }
+    pub fn total_duration_s(&self) -> f64 { self.total_dur_s }
+
+    /// PRECISE seek to a GLOBAL clip time (see the D3D11 twin).
+    pub fn seek(&mut self, target_s: f64) -> Result<()> {
+        let t = target_s.clamp(0.0, self.total_dur_s);
+        let idx = self.seg_start_s.iter().rposition(|&s| s <= t).unwrap_or(0);
+        if idx != self.cur_idx {
+            self.cur = VkSharedStreamPairIter::new(&self.segments[idx], self.pipeline.clone(), self.decode.clone())?;
+            self.cur_idx = idx;
+        }
+        self.cur.seek(t - self.seg_start_s[idx])
+    }
+
+    pub fn next_pair(&mut self) -> Result<Option<VkEacPair>> {
+        loop {
+            if let Some(mut p) = self.cur.next_pair()? {
+                p.pts_s += self.seg_start_s[self.cur_idx];
+                return Ok(Some(p));
+            }
+            if self.cur_idx + 1 >= self.segments.len() {
+                return Ok(None);
+            }
+            self.cur_idx += 1;
+            self.cur = VkSharedStreamPairIter::new(
+                &self.segments[self.cur_idx], self.pipeline.clone(), self.decode.clone())?;
+        }
+    }
+}
+
+/// The zero-copy `.360` arms' frame source: D3D11 or Vulkan Video decode.
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub enum ZcEacSource {
+    D3d11(SegmentedD3d11SharedStreamPairIter),
+    Vk(SegmentedVkStreamPairIter),
+}
+
+#[cfg(target_os = "windows")]
+impl ZcEacSource {
+    pub fn dims(&self) -> vr180_core::eac::Dims {
+        match self { Self::D3d11(i) => i.dims(), Self::Vk(i) => i.dims() }
+    }
+    pub fn native_dims(&self) -> (u32, u32) {
+        match self { Self::D3d11(i) => i.native_dims(), Self::Vk(i) => i.native_dims() }
+    }
+    pub fn total_duration_s(&self) -> f64 {
+        match self { Self::D3d11(i) => i.total_duration_s(), Self::Vk(i) => i.total_duration_s() }
+    }
+    pub fn seek(&mut self, t: f64) -> Result<()> {
+        match self { Self::D3d11(i) => i.seek(t), Self::Vk(i) => i.seek(t) }
+    }
+    pub fn next(&mut self) -> Result<Option<ZcEacFrame>> {
+        match self {
+            Self::D3d11(i) => Ok(i.next_pair()?.map(ZcEacFrame::D3d11)),
+            Self::Vk(i) => Ok(i.next_pair()?.map(ZcEacFrame::Vk)),
+        }
+    }
+    /// True when frames come from Vulkan Video decode (no D3D11 import).
+    pub fn is_vulkan(&self) -> bool {
+        matches!(self, Self::Vk(_))
+    }
+}
+
+/// One pair from [`ZcEacSource`].
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub enum ZcEacFrame {
+    D3d11(SharedEacPair),
+    Vk(VkEacPair),
+}
+
+#[cfg(target_os = "windows")]
+impl ZcEacFrame {
+    pub fn pts_s(&self) -> f64 {
+        match self { Self::D3d11(p) => p.pts_s, Self::Vk(p) => p.pts_s }
+    }
+    pub fn dims(&self) -> vr180_core::eac::Dims {
+        match self { Self::D3d11(p) => p.dims, Self::Vk(p) => p.dims }
+    }
+    /// Both streams as wgpu `Rgba16Unorm` textures — imported from D3D11
+    /// (`ctx`), or the Vulkan pair's own textures.
+    ///
+    /// # Safety
+    /// The D3D11 import aliases the pair's memory: keep `self` alive until the
+    /// GPU work reading the returned textures has completed (as before).
+    pub unsafe fn textures(
+        &self,
+        ctx: Option<&crate::interop_windows::VulkanImportCtx>,
+        device: &wgpu::Device,
+    ) -> Result<(wgpu::Texture, wgpu::Texture)> {
+        match self {
+            Self::D3d11(p) => {
+                let ctx = ctx.ok_or_else(|| Error::Wgpu("D3D11 EAC pair without an import ctx".into()))?;
+                Ok(unsafe { (ctx.import_rgba16(device, &p.s0), ctx.import_rgba16(device, &p.s4)) })
+            }
+            Self::Vk(p) => Ok((p.s0.clone(), p.s4.clone())),
         }
     }
 }

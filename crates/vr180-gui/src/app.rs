@@ -56,6 +56,13 @@ pub struct App {
     /// `open App.app --args …`): opened on the first frame, once the
     /// window exists.
     pending_open: Vec<PathBuf>,
+    /// Diagnostic `VR180_AUTOPLAY=<seconds>` (with a file on the command
+    /// line): play once the clip is open, pause after that long, and quit
+    /// 5 s later (time for the paused full-res still) — drives the live
+    /// preview without a mouse or keyboard. The instant is when playback was
+    /// requested; `paused_at` when autoplay paused.
+    autoplay: Option<(std::time::Duration, Option<std::time::Instant>)>,
+    autoplay_paused_at: Option<std::time::Instant>,
     /// Last (swap, upside_down) pair the decoder was opened with —
     /// a change triggers an automatic clip reload (the dual-stream
     /// iterators bind eye order at open).
@@ -106,6 +113,8 @@ pub struct App {
     /// repaint and pick the most recent one — naturally drops frames
     /// the UI couldn't keep up with.
     frame_rx: Option<Receiver<DecodedFrame>>,
+    /// `Some` while the UI presents in MAILBOX mode.
+    ui_pacer: Option<UiPacer>,
     /// Native-res zoom stills for EAC (.360) clips. The decoder thread
     /// emits these while `control.want_detail` is set (paused + zoomed);
     /// we register them into `full_res_display`. Fisheye sources use the
@@ -979,6 +988,71 @@ fn install_cjk_font(ctx: &egui::Context) {
     tracing::info!("CJK: loaded fallback font {path}");
 }
 
+/// Caps the UI's frame rate at the display's refresh rate while it presents
+/// in MAILBOX mode (Windows with Vulkan Video decode — see
+/// `vulkan_decode_ui_setup` in main.rs). MAILBOX never waits for the display,
+/// so a continuously animating widget (the loading spinners) would repaint as
+/// fast as the CPU allows and take GPU time from a running export. This
+/// sleep holds no wgpu lock, unlike FIFO's wait for a swapchain image.
+struct UiPacer {
+    interval: std::time::Duration,
+    last: Option<std::time::Instant>,
+    measured: Option<std::time::Instant>,
+}
+
+impl UiPacer {
+    fn new() -> Self {
+        Self { interval: std::time::Duration::from_secs_f64(1.0 / 60.0), last: None, measured: None }
+    }
+
+    fn pace(&mut self, frame: &eframe::Frame) {
+        let now = std::time::Instant::now();
+        // Re-read now and then: the window can move to another monitor.
+        if self.measured.map_or(true, |t| now - t > std::time::Duration::from_secs(2)) {
+            self.measured = Some(now);
+            let hz = display_refresh_hz(frame).unwrap_or(60).clamp(30, 500);
+            self.interval = std::time::Duration::from_secs_f64(1.0 / hz as f64);
+        }
+        if let Some(next) = self.last.map(|t| t + self.interval) {
+            if now < next {
+                std::thread::sleep(next - now);
+            }
+        }
+        self.last = Some(std::time::Instant::now());
+    }
+}
+
+/// Refresh rate of the monitor showing the app's window.
+#[cfg(target_os = "windows")]
+fn display_refresh_hz(frame: &eframe::Frame) -> Option<u32> {
+    use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow, DEVMODEW, ENUM_CURRENT_SETTINGS,
+        MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    };
+    let RawWindowHandle::Win32(h) = frame.window_handle().ok()?.as_raw() else { return None };
+    unsafe {
+        let monitor = MonitorFromWindow(h.hwnd.get() as _, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFOEXW = std::mem::zeroed();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(monitor, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) == 0 {
+            return None;
+        }
+        let mut mode: DEVMODEW = std::mem::zeroed();
+        mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        if EnumDisplaySettingsW(info.szDevice.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode) == 0 {
+            return None;
+        }
+        // 0 and 1 mean "the hardware's default rate".
+        (mode.dmDisplayFrequency > 1).then_some(mode.dmDisplayFrequency)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn display_refresh_hz(_frame: &eframe::Frame) -> Option<u32> {
+    None
+}
+
 struct DisplayFrame {
     texture: Arc<wgpu::Texture>,
     egui_id: egui::TextureId,
@@ -1141,7 +1215,8 @@ struct LoadedMeta {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// `mailbox`: the UI presents in MAILBOX mode (see [`UiPacer`]).
+    pub fn new(cc: &eframe::CreationContext<'_>, mailbox: bool) -> Self {
         // Force dark visuals regardless of the OS appearance preference.
         // egui's dark theme reads better against the half-equirect
         // preview (which is typically dark imagery itself) and matches
@@ -1220,6 +1295,11 @@ impl App {
             loaded_path: None,
             pending_open: std::env::args_os().skip(1).map(PathBuf::from)
                 .filter(|p| p.is_file()).collect(),
+            autoplay: std::env::var("VR180_AUTOPLAY").ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .map(|s| (std::time::Duration::from_secs_f64(s), None)),
+            autoplay_paused_at: None,
             eye_orientation_applied: (defaults.fisheye_swap_eyes, defaults.camera_upside_down),
             clip: None,
             playing: false,
@@ -1230,6 +1310,7 @@ impl App {
             decoder_retried: false,
             current_display: None,
             frame_rx: None,
+            ui_pacer: mailbox.then(UiPacer::new),
             detail_frame_rx: None,
             cmd_tx: None,
             control: None,
@@ -1739,25 +1820,45 @@ impl App {
         // Windows we give it a DEDICATED logical device on the same adapter —
         // fully isolated from eframe's present queue. Falls back to the shared
         // device if the dedicated one can't be created.
+        // Exports run on the Vulkan-decode device (`vk_shared`) when it can be
+        // created: FFmpeg decodes through Vulkan Video on the same VkDevice
+        // and frames reach wgpu without D3D11. It is likewise export-only and
+        // never presents. A failure to set it up gets the plain dedicated
+        // device and D3D11 decode; so does a stream the GPU can't decode
+        // through Vulkan Video (the export's decode path falls back itself).
         #[cfg(target_os = "windows")]
-        let pipeline = match vr180_pipeline::gpu::Device::new_dedicated_from_adapter(
-            &self.pipeline.adapter,
-        ) {
-            Ok(d) => {
-                tracing::info!(
-                    "export: dedicated wgpu device (isolated from eframe present queue)"
-                );
-                Arc::new(d)
+        let vk_decode_device = vr180_pipeline::vk_shared::shared_export_device(&self.pipeline.adapter)
+            .map_err(|e| {
+                tracing::warn!("export: Vulkan-decode device unavailable ({e}); D3D11 decode");
+            }).ok();
+        #[cfg(target_os = "windows")]
+        let pipeline = match &vk_decode_device {
+            Some(d) => {
+                tracing::info!("export: Vulkan-decode device (wgpu + FFmpeg Vulkan Video)");
+                d.device.clone()
             }
-            Err(e) => {
-                tracing::warn!("export: dedicated device unavailable ({e}); sharing eframe device");
-                self.pipeline.clone()
-            }
+            None => match vr180_pipeline::gpu::Device::new_dedicated_from_adapter(
+                &self.pipeline.adapter,
+            ) {
+                Ok(d) => {
+                    tracing::info!(
+                        "export: dedicated wgpu device (isolated from eframe present queue)"
+                    );
+                    Arc::new(d)
+                }
+                Err(e) => {
+                    tracing::warn!("export: dedicated device unavailable ({e}); sharing eframe device");
+                    self.pipeline.clone()
+                }
+            },
         };
         #[cfg(not(target_os = "windows"))]
         let pipeline = self.pipeline.clone();
         let progress_tx2 = progress_tx.clone();
         let handle = std::thread::spawn(move || {
+            // Released when the export is over (see `ExportDevice`).
+            #[cfg(target_os = "windows")]
+            let _vk_export = vk_decode_device;
             if let Some((settings, n_frames)) = eac_stab {
                 // GoPro EAC: compute the same per-eye stab the preview uses,
                 // then run the EAC export. build_per_eye_frames_multi is
@@ -4281,12 +4382,38 @@ impl eframe::App for App {
     }
 
     #[allow(deprecated)]
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if ctx.current_pass_index() == 0 {
+            if let Some(p) = &mut self.ui_pacer { p.pace(frame); }
+        }
         // Mirror the chosen language into the process global that `tr` reads.
         set_cur_lang(self.lang);
         if !self.pending_open.is_empty() {
             let paths = std::mem::take(&mut self.pending_open);
             self.open_paths(paths);
+            if let Some((secs, started @ None)) = self.autoplay.as_mut() {
+                // Remembered through the async load (see toggle_play_pause).
+                *started = Some(std::time::Instant::now());
+                tracing::info!("autoplay: playing for {:.1}s (VR180_AUTOPLAY)", secs.as_secs_f64());
+                self.toggle_play_pause();
+            }
+        }
+        if let Some((secs, Some(t0))) = self.autoplay {
+            if t0.elapsed() >= secs {
+                self.autoplay = None;
+                self.autoplay_paused_at = Some(std::time::Instant::now());
+                tracing::info!("autoplay: pausing (closing in 5 s)");
+                self.toggle_play_pause();
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if let Some(t) = self.autoplay_paused_at {
+            if t.elapsed() >= std::time::Duration::from_secs(5) {
+                tracing::info!("autoplay: done — closing");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
         }
         // Still + DNG output: the preview and the sidebar follow what the
         // DNG can carry (the flag rides on Settings so the decoder sees it).

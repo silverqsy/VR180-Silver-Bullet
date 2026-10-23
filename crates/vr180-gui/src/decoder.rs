@@ -1504,9 +1504,21 @@ pub fn start_decoder(
         let zc = vr180_pipeline::interop_windows::VulkanImportCtx::from_wgpu(
             &pipeline.adapter, &pipeline.device,
         ).and_then(|ctx| {
-            match vr180_pipeline::fisheye_decode::SegmentedD3d11SharedStreamPairIter::new(
-                &cfg.segments, vr180_pipeline::interop_windows::vulkan_device_luid(&ctx),
-            ) {
+            use vr180_pipeline::fisheye_decode as fd;
+            // Vulkan Video decode on the app's device when it has one (see
+            // `vk_shared`); D3D11 decode otherwise, or if Vulkan declines.
+            let vk = vr180_pipeline::vk_shared::decode_device_for(&pipeline.device).and_then(|decode| {
+                fd::SegmentedVkStreamPairIter::new(&cfg.segments, pipeline.clone(), decode)
+                    .map_err(|e| tracing::warn!("decoder: EAC Vulkan Video decode unavailable ({e}) — D3D11"))
+                    .ok()
+            });
+            let iter = match vk {
+                Some(it) => Ok(fd::ZcEacSource::Vk(it)),
+                None => fd::SegmentedD3d11SharedStreamPairIter::new(
+                    &cfg.segments, vr180_pipeline::interop_windows::vulkan_device_luid(&ctx),
+                ).map(fd::ZcEacSource::D3d11),
+            };
+            match iter {
                 Ok(iter) => Some((ctx, iter)),
                 Err(e) => { tracing::warn!("decoder: EAC zero-copy iter unavailable ({e})"); None }
             }
@@ -1514,7 +1526,8 @@ pub fn start_decoder(
         match zc {
             Some((ctx, iter)) => {
                 tracing::info!(
-                    "decoder: EAC zero-copy (d3d11va→Vulkan, GPU cross) preview ENGAGED ({} segment(s))",
+                    "decoder: EAC zero-copy ({}, GPU cross) preview ENGAGED ({} segment(s))",
+                    if iter.is_vulkan() { "Vulkan Video" } else { "d3d11va→Vulkan" },
                     cfg.segments.len()
                 );
                 return run_eac_zerocopy(pipeline, &cfg, control, fps, dt, eye_w, eye_h, per_eye, stab_key, cached_gen, geoc, ctx, iter, frame_tx, cmd_rx);
@@ -1626,23 +1639,16 @@ fn run_fisheye(
             // the iterator decline, so we fall back to the portable path.
             let luid = ctx.as_ref()
                 .and_then(vr180_pipeline::interop_windows::vulkan_device_luid);
-            let iter = if sbs_ok {
-                vr180_pipeline::fisheye_decode::D3d11SharedSbsIter::new_with_layout(
-                    &cfg.path, work, work, luid, kind.eye_layout(),
-                ).map(vr180_pipeline::fisheye_decode::ZcFisheyeSource::Sbs)
-            } else {
-                // XOR with DJI's "swap by default" (matches the CPU worker).
-                let swap = kind.dual_stream_iter_swap(
-                    control.settings.read().effective_swap_eyes());
-                vr180_pipeline::fisheye_decode::SegmentedD3d11SharedDualStreamIter::new(
-                    &cfg.segments, swap, work, work, luid,
-                ).map(vr180_pipeline::fisheye_decode::ZcFisheyeSource::Dual)
-            };
+            // XOR with DJI's "swap by default" (matches the CPU worker).
+            let swap = kind.dual_stream_iter_swap(
+                control.settings.read().effective_swap_eyes());
+            let iter = zc_preview_source(&pipeline, cfg, sbs_ok, kind, swap, work, luid);
             match (ctx, iter) {
                 (Some(ctx), Ok(iter)) => {
                     tracing::info!(
-                        "decoder (fisheye): ZERO-COPY d3d11va→Vulkan path ENGAGED \
-                         (full-res P010, no CPU download/swscale)"
+                        "decoder (fisheye): ZERO-COPY {} path ENGAGED \
+                         (full-res P010, no CPU download/swscale)",
+                        if iter.is_vulkan() { "Vulkan Video" } else { "d3d11va→Vulkan" }
                     );
                     return run_fisheye_zerocopy(
                         pipeline, cfg, control, kind, fps, dt, eye_w, eye_h,
@@ -2549,6 +2555,46 @@ struct FrameHold {
     _full_tex: Option<wgpu::Texture>,
 }
 
+/// The Windows zero-copy preview source at the working res `work`: Vulkan
+/// Video decode when the app's device has a Vulkan-decode side (see
+/// `vr180_pipeline::vk_shared`), else — or when the Vulkan iterator declines
+/// (a stream the GPU can't decode that way) — D3D11 decode on `luid`'s
+/// adapter. Dual-stream sources chain `cfg.segments`; a single-stream pair
+/// (`sbs`) opens `cfg.path` and takes no swap (frame order).
+#[cfg(target_os = "windows")]
+fn zc_preview_source(
+    pipeline: &Arc<vr180_pipeline::gpu::Device>,
+    cfg: &DecoderConfig,
+    sbs: bool,
+    kind: vr180_pipeline::SourceKind,
+    swap: bool,
+    work: u32,
+    luid: Option<[u8; 8]>,
+) -> vr180_pipeline::Result<vr180_pipeline::fisheye_decode::ZcFisheyeSource> {
+    use vr180_pipeline::fisheye_decode as fd;
+    if let Some(decode) = vr180_pipeline::vk_shared::decode_device_for(&pipeline.device) {
+        let vk = if sbs {
+            fd::VkSharedSbsIter::new_with_layout(
+                &cfg.path, work, work, kind.eye_layout(), pipeline.clone(), decode,
+            ).map(fd::ZcFisheyeSource::VkSbs)
+        } else {
+            fd::SegmentedVkDualStreamIter::new(&cfg.segments, swap, work, work, pipeline.clone(), decode)
+                .map(fd::ZcFisheyeSource::VkDual)
+        };
+        match vk {
+            Ok(src) => return Ok(src),
+            Err(e) => tracing::warn!("decoder (fisheye): Vulkan Video decode unavailable ({e}) — D3D11"),
+        }
+    }
+    if sbs {
+        fd::D3d11SharedSbsIter::new_with_layout(&cfg.path, work, work, luid, kind.eye_layout())
+            .map(fd::ZcFisheyeSource::Sbs)
+    } else {
+        fd::SegmentedD3d11SharedDualStreamIter::new(&cfg.segments, swap, work, work, luid)
+            .map(fd::ZcFisheyeSource::Dual)
+    }
+}
+
 /// Push a just-replaced frame onto the retire queue and drop anything older
 /// than the last two frames (deferred GPU-completion drop — see [`FrameHold`]).
 #[cfg(target_os = "windows")]
@@ -2598,7 +2644,9 @@ fn run_fisheye_zerocopy(
     let eye_match_state = pipeline.create_eye_match_state();
     let mut eye_match_rb = pipeline.create_eye_match_readback();
 
-    // ── Worker sub-thread: decode + share (D3D11 only, never touches wgpu) ──
+    // ── Worker sub-thread: decode + share. D3D11 decode never touches wgpu
+    // there; Vulkan Video decode copies + resolves on wgpu's queue — submits
+    // only, never a blocking poll (that would stall the UI thread's submits).
     enum IterCmd { Seek(f64) }
     let (pair_tx, pair_rx) = crossbeam_channel::bounded::<(u64, ZcFisheyeFrame)>(8);
     let (iter_cmd_tx, iter_cmd_rx) = crossbeam_channel::bounded::<IterCmd>(8);
@@ -2773,6 +2821,9 @@ fn run_fisheye_zerocopy(
                                 .split_pair_texture_16(&full, f.eye_w, f.eye_h, 3, f.layout)?;
                             (l, r, Some(full))
                         }
+                        // Vulkan Video: already resolved to RGBA16 at the
+                        // working res on the decode sub-thread.
+                        ZcFisheyeFrame::VkPair(p) => (p.left.clone(), p.right.clone(), None),
                     };
                     let prev = current.take();
                     retire_frame(&mut retire_q, prev);
@@ -4735,11 +4786,11 @@ fn run_eac_zerocopy(
     mut cached_gen: u64,
     geoc: Option<vr180_core::geoc::Geoc>,
     ctx: vr180_pipeline::interop_windows::VulkanImportCtx,
-    iter: vr180_pipeline::fisheye_decode::SegmentedD3d11SharedStreamPairIter,
+    iter: vr180_pipeline::fisheye_decode::ZcEacSource,
     frame_tx: Sender<DecodedFrame>,
     cmd_rx: Receiver<DecoderCommand>,
 ) -> anyhow::Result<()> {
-    use vr180_pipeline::fisheye_decode::SharedEacPair;
+    use vr180_pipeline::fisheye_decode::ZcEacFrame;
     use vr180_pipeline::gpu::Lens;
 
     let mut iter = iter;
@@ -4766,7 +4817,7 @@ fn run_eac_zerocopy(
         }
     }
 
-    let mut held_pair: Option<SharedEacPair> = None;
+    let mut held_pair: Option<ZcEacFrame> = None;
 
     // ── Native-res zoom still (the .360 equivalent of the fisheye
     //    `DetailCache`; mirrors the macOS `run_zero_copy` block). When the
@@ -4785,7 +4836,7 @@ fn run_eac_zerocopy(
     'main: loop {
         let stay_on_pair = control.paused.load(Ordering::SeqCst) && held_pair.is_some();
         if held_pair.is_none() {
-            match iter.next_pair()? {
+            match iter.next()? {
                 Some(p) => held_pair = Some(p),
                 None => break,
             }
@@ -4868,8 +4919,9 @@ fn run_eac_zerocopy(
         let absolute_frame_idx = ((time_offset / dt).round() as u32) + frame_idx;
 
         // GPU EAC cross assembly from the two zero-copy stream textures.
-        let s0 = unsafe { ctx.import_rgba16(&pipeline.device, &pair.s0) };
-        let s4 = unsafe { ctx.import_rgba16(&pipeline.device, &pair.s4) };
+        // D3D11 pairs import (aliasing `held_pair`); Vulkan Video pairs are
+        // already RGBA16 textures.
+        let (s0, s4) = unsafe { pair.textures(Some(&ctx), &pipeline.device)? };
         let cross_a = pipeline.rgba8_to_eac_cross(&s0, &s4, Lens::A, dims)?;
         let cross_b = pipeline.rgba8_to_eac_cross(&s0, &s4, Lens::B, dims)?;
 
