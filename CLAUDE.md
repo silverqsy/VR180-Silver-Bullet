@@ -1704,6 +1704,57 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      circles (the fit still landed: r ≈ 4050 on 8160-px eyes). Examples
      (gitignored): `rs_probe_export`, `audio_window_probe`, `wav_probe`.
 
+26. **Dropped frames: per-frame tables are indexed by the container's
+   sample table, not `round(pts / dt)` (2026-10-29).** Report: X6 clips
+   with dropped frames lost stabilization entirely. Four sample clips
+   (`/Volumes/Database/x6 firm/testfootage/VID_20261027_14*.insv`,
+   `VID_20261026_235735_00_074.insv`) show what the camera does: the video
+   track keeps REAL time — `stts` has 2×…10× deltas where the sensor dropped
+   frames (017: 1359 frames, 52 missing in 41 holes over 28.2 s; 074: 2357
+   frames, 289 missing — avg 44.5 fps for a 50 fps mode), audio continuous,
+   no `ctts`, trivial `elst`. The trailer's exposure stamps (`frames` /
+   `frames_b`) have ONE entry per ENCODED frame with the same holes at the
+   same rows (1359 = 1359; container-vs-stamp |Δ| < 1 ms except one row at
+   a drop burst where the two sensors' stamps disagree by 4 periods), so
+   `build_insv_imu`'s row-i ↔ stamp-i pairing was right all along. What
+   broke: libavformat's `avg_frame_rate` is `frames / duration` (48.16 fps),
+   `dt = 1/fps` was too long, and every `stab_idx = round(pts / dt)` landed
+   rows EARLY — 10 rows (200 ms) at row 300, before any hole — so the
+   stabilizer applied another frame's pose. Fix (`crates/vr180-pipeline/src/
+   frame_timeline.rs`, the first of the two suggested fixes, "index by frame
+   number via the sample table"): `FrameTimeline::from_mp4/from_segments`
+   reads `moov` only (stts + ctts + elst of the largest `vide` trak; chains
+   rebased with the video-track durations like the iterators), `row(pts)` =
+   last frame at/before pts (quarter-period slack; inside a hole = the frame
+   a player keeps showing), `stab_row(tl, pts, dt, fallback)` is the one
+   lookup every stab/RS/eye-match site now uses (3 preview paths, the zoom
+   still via `compute_stab_for`/`render_still_from_pair`, the 4 fisheye
+   export loops); `probe_video().fps` is the NOMINAL rate (dominant stts
+   delta — kept bit-identical to `avg_frame_rate` when within 0.5 %, so
+   constant-rate files are untouched); stab tables are sized by the track's
+   frame count (`timeline_frames_or`; rows past the last frame were identity
+   poses the smoother bent toward); the X6/Kandao IMU builders get that
+   count as their hint. Export: `export_fill_plan` → each frame before a
+   hole is encoded `1 + hold` times (and the first frame leads when the
+   trim-in fell inside a hole), so the output is constant-rate at the
+   nominal fps on the audio's clock (the second suggestion's export half;
+   verified: 5–7 s of clip 017 = 91 source frames → 100 frames @ 50 fps,
+   2.000 s, no irregular deltas, audio 2.005 s). Progress counts output
+   frames (`written`); `frame_idx` stays the source-frame counter (the
+   GPU-resident ring slot is chosen by it — do not choose it by message
+   count). The GUI publishes the timeline in `timeline_cache` (path-keyed
+   like the IMU cache; built first thing in `run_fisheye`, before the IMU
+   loads and the zero-copy dispatch) and reports `timestamp_s` as the
+   frame's own pts (`frame_time_s`). `ClipInfo.frame_count` = frames in
+   the track. Kandao's PTS table pairs by index the same way, so a Kandao
+   drop is covered too; GoPro repeats frames in the video (MSKP) and is
+   untouched; BRAW/stills have no sample table (timeline `None` → the old
+   arithmetic). Windows D3D11/GPU-resident loops edited blind (`EncFrame`
+   now `Clone`; copies sent as extra channel messages). Diagnostics
+   (gitignored examples): `insv_stamp_check` (container vs trailer rows,
+   old-vs-new row error), `insv_drop_export_check` (window export + probe);
+   `scratchpad/drop/mp4_stts.py` dumps a moov's timing tables.
+
 
 20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac
    side's ambisonic work pulled, built clean first try (the new `build.rs`

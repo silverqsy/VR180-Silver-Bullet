@@ -898,6 +898,34 @@ pub fn probe_video_duration_via_moov(path: &Path) -> Result<f64> {
     best.ok_or_else(|| Error::Ffmpeg("mp4: no video trak mdhd".into()))
 }
 
+/// The frame rate every caller means by `fps`: the NOMINAL one — the frame
+/// period the camera records at — from the video track's dominant sample
+/// delta. libavformat's `avg_frame_rate` is `frames / duration`: identical
+/// for a constant-rate file, LOWER for one with dropped frames (an Insta360
+/// X6 clip with 52 holes in 28 s reads 48.16 fps for its 50 fps mode), where
+/// it would mis-size the frame period, every frame-indexed table and the
+/// export rate alike. The average stands when the two agree within 0.5 % (a
+/// constant-rate file — nothing changes for it) and when the container has
+/// no readable sample table (not MP4, fragmented).
+fn nominal_or_average_fps(path: &Path, avg_fps: f32) -> f32 {
+    match crate::frame_timeline::FrameTimeline::nominal_rate(path) {
+        Ok(rate) if rate.fps() > 0.0 => {
+            let nominal = rate.fps();
+            if avg_fps > 0.0 && ((nominal - avg_fps) / nominal).abs() <= 0.005 {
+                avg_fps
+            } else {
+                tracing::debug!(
+                    "probe: {} — nominal {:.3} fps (sample delta {}/{}) vs average {:.3}: \
+                     frames are missing from the track; using the nominal rate",
+                    path.display(), nominal, rate.delta_ticks, rate.timescale, avg_fps
+                );
+                nominal
+            }
+        }
+        _ => avg_fps,
+    }
+}
+
 pub fn probe_video(path: &Path) -> Result<VideoProbe> {
     // Blackmagic RAW: not an ffmpeg format (ffprobe opens some files with
     // padded dimensions and fails on others) — the SDK helper's metadata is
@@ -936,11 +964,12 @@ pub fn probe_video(path: &Path) -> Result<VideoProbe> {
         .ok_or_else(|| Error::Ffmpeg("no video stream".into()))?;
     let params = stream.parameters();
     let avg = stream.avg_frame_rate();
-    let fps = if avg.denominator() != 0 {
+    let avg_fps = if avg.denominator() != 0 {
         avg.numerator() as f32 / avg.denominator() as f32
     } else {
         0.0
     };
+    let fps = nominal_or_average_fps(path, avg_fps);
     let tb = stream.time_base();
     let duration_sec = if tb.denominator() != 0 && stream.duration() != ffmpeg_next::ffi::AV_NOPTS_VALUE {
         stream.duration() as f64 * tb.numerator() as f64 / tb.denominator() as f64

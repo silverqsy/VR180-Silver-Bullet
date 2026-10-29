@@ -813,6 +813,43 @@ fn chain_segment_frames(path: &std::path::Path, fps: f32) -> usize {
         .unwrap_or(0)
 }
 
+/// The clip's frame timeline — every video frame's presentation time from
+/// the container's sample table (chapter chains rebased like the iterators).
+/// It gives each decoded frame its row in the per-frame tables and says how
+/// many output slots a frame holds across a hole left by dropped frames.
+/// `None` for sources without an MP4 sample table (BRAW, stills); the
+/// constant-rate arithmetic then stands, as it did before.
+fn export_timeline(cfg: &FisheyeExportConfig) -> Option<crate::frame_timeline::FrameTimeline> {
+    if cfg.source_kind == SourceKind::BlackmagicRaw || cfg.source_kind.is_still() {
+        return None;
+    }
+    let segs: Vec<PathBuf> = if cfg.segments.is_empty() {
+        vec![cfg.source_path.clone()]
+    } else {
+        cfg.segments.clone()
+    };
+    let tl = crate::frame_timeline::FrameTimeline::from_segments(&segs)?;
+    if tl.is_empty() {
+        return None;
+    }
+    if tl.dropped_frames() > 0 {
+        tracing::info!(
+            "fisheye_export: frame timeline — {}; each frame before a hole is written again to fill it",
+            tl.summary()
+        );
+    } else {
+        tracing::info!("fisheye_export: frame timeline — {}", tl.summary());
+    }
+    Some(tl)
+}
+
+/// Frames of a sample-table timeline when there is one, else `fallback`
+/// (the constant-rate estimate). Sizes the per-frame stab table: rows past
+/// the last frame would be identity poses the smoother bends toward.
+fn timeline_frames_or(tl: Option<&crate::frame_timeline::FrameTimeline>, fallback: usize) -> usize {
+    tl.map(|t| t.len()).filter(|n| *n > 0).unwrap_or(fallback)
+}
+
 fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
     if cfg.source_kind == SourceKind::Insta360Insv {
         return resolve_export_insv_imu(cfg);
@@ -886,8 +923,11 @@ fn resolve_export_insv_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::D
     };
     let probe = crate::decode::probe_video(path).ok();
     let (w, h) = probe.as_ref().map(|p| (p.width, p.height)).unwrap_or((3840, 3840));
-    let n_frames = probe.as_ref()
-        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+    // Frames in the track (its sample table), not duration × fps: a clip
+    // with dropped frames has fewer rows than slots.
+    let n_frames = crate::frame_timeline::FrameTimeline::nominal_rate(path).ok()
+        .map(|r| r.frames).filter(|n| *n > 0)
+        .or_else(|| probe.as_ref().map(|p| (p.duration_sec * p.fps as f64).round() as usize))
         .unwrap_or(0);
     Some(if cfg.stabilize {
         crate::insv_imu::build_insv_imu(&meta, cfg.fps, n_frames, w, h)
@@ -913,8 +953,9 @@ fn resolve_export_kandao_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye:
     let (w, h) = probe.as_ref()
         .map(|p| crate::source_kind::EyeLayout::TopBottom.eye_dims(p.width, p.height))
         .unwrap_or((3840, 3840));
-    let n_frames = probe.as_ref()
-        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+    let n_frames = crate::frame_timeline::FrameTimeline::nominal_rate(path).ok()
+        .map(|r| r.frames).filter(|n| *n > 0)
+        .or_else(|| probe.as_ref().map(|p| (p.duration_sec * p.fps as f64).round() as usize))
         .unwrap_or(0);
     Some(if cfg.stabilize {
         crate::kandao_imu::build_kandao_imu(&meta, cfg.fps, n_frames, w, h)
@@ -1300,7 +1341,11 @@ fn export_fisheye_inner(
     );
 
     // ── Stab rotations (one per source frame) ────────────────────
-    let total_clip_frames = if cfg.segments.len() > 1 {
+    // `clip_slots` = duration × nominal fps (the OUTPUT frames, holes
+    // included); `total_clip_frames` = frames in the track (the per-frame
+    // table rows) — equal unless frames were dropped.
+    let timeline = export_timeline(&cfg);
+    let clip_slots = if cfg.segments.len() > 1 {
         cfg.segments.iter()
             .map(|p| chain_segment_frames(p, cfg.fps))
             .sum::<usize>().max(1)
@@ -1309,6 +1354,7 @@ fn export_fisheye_inner(
             .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
             .unwrap_or(0).max(1)
     };
+    let total_clip_frames = timeline_frames_or(timeline.as_ref(), clip_slots);
     let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
         match cfg.source_kind {
             SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam | SourceKind::BlackmagicRaw => {
@@ -1343,7 +1389,7 @@ fn export_fisheye_inner(
     let total_frames_to_write = if t_out.is_finite() {
         ((t_out - t_in) * cfg.fps as f64).round() as u64
     } else {
-        (total_clip_frames as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
+        (clip_slots as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
     };
     tracing::info!(
         "fisheye_export: writing ~{} frames (trim {:?}..{:?})",
@@ -1474,6 +1520,8 @@ fn export_fisheye_inner(
     let dt = 1.0 / cfg.fps as f64;
     let t_start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
+    // Output frames written (source frames + the copies that fill holes).
+    let mut written: u64 = 0;
     let identity_plan = ColorStackPlan::default();
     let color_plan = cfg.color_stack.clone();
     let color_any = color_plan.any_active();
@@ -1529,12 +1577,12 @@ fn export_fisheye_inner(
             continue;
         }
 
-        // PTS-based stab lookup (same logic as the preview).
-        let stab_idx = if pair.pts_s.is_finite() && pair.pts_s >= 0.0 {
-            (pair.pts_s / dt).round() as usize
-        } else {
-            frame_idx as usize
-        };
+        // The frame's row in the per-frame tables — from the sample table
+        // (exact across dropped frames), else round(pts / dt) as the
+        // preview does — and the output slots it has to fill.
+        let stab_idx = crate::frame_timeline::stab_row(timeline.as_ref(), pair.pts_s, dt, frame_idx as usize);
+        let fill = crate::frame_timeline::export_fill_plan(
+            timeline.as_ref(), stab_idx, pair.pts_s, t_in, written, total_frames_to_write);
         let rot = stab_rotations
             .as_ref()
             .and_then(|v| v.get(stab_idx).copied())
@@ -1632,7 +1680,7 @@ fn export_fisheye_inner(
                     &left_tex, &right_tex, &encode_pb.wgpu_tex,
                     cfg.eye_w, cfg.eye_h, &color_plan, eye_match(),
                 )?;
-                encoder.encode_pixel_buffer(&encode_pb)?;
+                for _ in 0..fill.copies() { encoder.encode_pixel_buffer(&encode_pb)?; }
             }
             #[cfg(not(target_os = "macos"))]
             { let _ = identity_plan; unreachable!(); }
@@ -1667,7 +1715,7 @@ fn export_fisheye_inner(
                     pipeline.compose_sbs_to_p010(
                         l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
                 }
-                encoder.encode_pixel_buffer_p010(&encode_pb)?;
+                for _ in 0..fill.copies() { encoder.encode_pixel_buffer_p010(&encode_pb)?; }
             }
             #[cfg(not(target_os = "macos"))]
             { let _ = identity_plan; unreachable!(); }
@@ -1690,7 +1738,7 @@ fn export_fisheye_inner(
                 l_final, r_final, cfg.eye_w, cfg.eye_h,
             )?;
             let sbs_rgb48 = pipeline.read_texture_rgb48(&sbs_tex_16, sbs_w, sbs_h)?;
-            encoder.encode_frame_rgb48(&sbs_rgb48)?;
+            for _ in 0..fill.copies() { encoder.encode_frame_rgb48(&sbs_rgb48)?; }
         } else {
             // 8-bit non-zero-copy fallback. Color stack happens via the
             // legacy CPU roundtrip on the SBS readback below (acceptable
@@ -1716,14 +1764,15 @@ fn export_fisheye_inner(
                 graded = pipeline.apply_eye_scale_sbs_rgb8(
                     &graded, sbs_w, sbs_h, cfg.eye_w, color_plan.eye_scale)?;
             }
-            encoder.encode_frame(&graded)?;
+            for _ in 0..fill.copies() { encoder.encode_frame(&graded)?; }
         }
 
         frame_idx += 1;
+        written += fill.copies();
         let elapsed = t_start.elapsed().as_secs_f32().max(1e-3);
         let fps_avg = frame_idx as f32 / elapsed;
         progress_cb(ExportProgress {
-            frame_idx,
+            frame_idx: written,
             total_frames: total_frames_to_write,
             fps_avg,
         });
@@ -2896,14 +2945,17 @@ fn export_fisheye_osv_zerocopy_p010(
     );
 
     // Stab rotations span the whole chain (a merged recording indexes by
-    // absolute frame). Total = chain duration × fps for multi-segment.
-    let total_clip_frames = if cfg.segments.len() > 1 {
+    // absolute frame). `clip_slots` = chain duration × nominal fps (output
+    // frames, holes included); the table has one row per frame in the track.
+    let timeline = export_timeline(&cfg);
+    let clip_slots = if cfg.segments.len() > 1 {
         (seg_durs.iter().sum::<f64>() * cfg.fps as f64).round() as usize
     } else {
         crate::decode::probe_video(&cfg.source_path)
             .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
             .unwrap_or(0)
     }.max(1);
+    let total_clip_frames = timeline_frames_or(timeline.as_ref(), clip_slots);
     let stab_rotations: Option<Vec<crate::gpu::EquirectRotation>> = if cfg.stabilize {
         dji_osv_imu.as_ref().and_then(|osv| {
             let max_corr = if cfg.dji_max_corr_deg > 0.0 {
@@ -2930,7 +2982,7 @@ fn export_fisheye_osv_zerocopy_p010(
     let total_frames_to_write = if t_out.is_finite() {
         ((t_out - t_in) * cfg.fps as f64).round() as u64
     } else {
-        (total_clip_frames as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
+        (clip_slots as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
     };
     tracing::info!(
         "fisheye_export (zero-copy): writing ~{} frames (trim {:?}..{:?})",
@@ -3007,6 +3059,7 @@ fn export_fisheye_osv_zerocopy_p010(
     let dt = 1.0 / cfg.fps as f64;
     let t_start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
+    let mut written: u64 = 0;
     // Automatic eye-exposure matching (X6): GPU-resident state for this stream.
     let eye_match_state = pipeline.create_eye_match_state();
 
@@ -3025,11 +3078,9 @@ fn export_fisheye_osv_zerocopy_p010(
             continue;
         }
 
-        let stab_idx = if pts_s.is_finite() && pts_s >= 0.0 {
-            (pts_s / dt).round() as usize
-        } else {
-            frame_idx as usize
-        };
+        let stab_idx = crate::frame_timeline::stab_row(timeline.as_ref(), pts_s, dt, frame_idx as usize);
+        let fill = crate::frame_timeline::export_fill_plan(
+            timeline.as_ref(), stab_idx, pts_s, t_in, written, total_frames_to_write);
         let rot = stab_rotations
             .as_ref()
             .and_then(|v| v.get(stab_idx).copied())
@@ -3200,7 +3251,7 @@ fn export_fisheye_osv_zerocopy_p010(
                 pipeline.compose_sbs_to_p010(
                     l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
             }
-            encoder.encode_pixel_buffer_p010(&encode_pb)?;
+            for _ in 0..fill.copies() { encoder.encode_pixel_buffer_p010(&encode_pb)?; }
         } else {
             let encode_pb = crate::interop_macos::create_bgra_encode_buffer(
                 &pipeline.device, sbs_w, sbs_h,
@@ -3209,7 +3260,7 @@ fn export_fisheye_osv_zerocopy_p010(
                 l_final, r_final, &encode_pb.wgpu_tex,
                 cfg.eye_w, cfg.eye_h, &ColorStackPlan::default(),
             )?;
-            encoder.encode_pixel_buffer(&encode_pb)?;
+            for _ in 0..fill.copies() { encoder.encode_pixel_buffer(&encode_pb)?; }
         }
 
         // Drop decode + compose textures so the IOSurface retains
@@ -3221,10 +3272,11 @@ fn export_fisheye_osv_zerocopy_p010(
         drop(frame);
 
         frame_idx += 1;
+        written += fill.copies();
         let elapsed = t_start.elapsed().as_secs_f32().max(1e-3);
         let fps_avg = frame_idx as f32 / elapsed;
         progress_cb(ExportProgress {
-            frame_idx,
+            frame_idx: written,
             total_frames: total_frames_to_write,
             fps_avg,
         });
@@ -3288,7 +3340,8 @@ fn export_fisheye_osv_zerocopy_d3d11(
     // WHOLE-CHAIN frame count — a merged recording's stab table must cover
     // every segment (probing source_path alone = segment 0 only, which
     // truncated stab to identity past the first seam).
-    let total_clip_frames = if cfg.segments.len() > 1 {
+    let timeline = export_timeline(&cfg);
+    let clip_slots = if cfg.segments.len() > 1 {
         cfg.segments.iter()
             .map(|s| chain_segment_frames(s, cfg.fps))
             .sum::<usize>()
@@ -3298,6 +3351,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
             .unwrap_or(0)
     }
     .max(1);
+    let total_clip_frames = timeline_frames_or(timeline.as_ref(), clip_slots);
     let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
         dji_osv_imu.as_ref().and_then(|osv| {
             let max_corr = if cfg.dji_max_corr_deg > 0.0 {
@@ -3322,7 +3376,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     let total_frames_to_write = if t_out.is_finite() {
         ((t_out - t_in) * cfg.fps as f64).round() as u64
     } else {
-        (total_clip_frames as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
+        (clip_slots as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
     };
 
     let sbs_w = cfg.eye_w * 2;
@@ -3363,6 +3417,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     // did RGB→YUV 4:2:0 (NVENC's native input, no swscale); Yuv422 = GPU
     // RGB→YUV 4:2:2 P210 planes (ProRes — deinterleave + >>6 on the encode
     // thread, no swscale); Rgba64 = swscale fallback (libx265 / 8-bit).
+    #[derive(Clone)]
     enum EncFrame {
         P010 { y: Vec<u8>, uv: Vec<u8> },
         Yuv422 { y: Vec<u8>, uv: Vec<u8> },
@@ -3468,6 +3523,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     // Main thread — GPU work. import → project → color → compose → readback.
     let t_start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
+    let mut written: u64 = 0;
     let mut main_err: Option<Error> = None;
     // Per-stage wall-clock accountancy (which pipeline stage is the floor?).
     let (mut t_recv, mut t_gpu, mut t_send) = (
@@ -3501,10 +3557,11 @@ fn export_fisheye_osv_zerocopy_d3d11(
             continue;
         }
 
-        // PTS-based stab lookup (same logic as preview + portable path).
-        let stab_idx = if pts_s.is_finite() && pts_s >= 0.0 {
-            (pts_s / dt).round() as usize
-        } else { frame_idx as usize };
+        // The frame's row from the sample table (exact across dropped
+        // frames) and the output slots it fills.
+        let stab_idx = crate::frame_timeline::stab_row(timeline.as_ref(), pts_s, dt, frame_idx as usize);
+        let fill = crate::frame_timeline::export_fill_plan(
+            timeline.as_ref(), stab_idx, pts_s, t_in, written, total_frames_to_write);
         let rot = stab_rotations
             .as_ref()
             .and_then(|v| v.get(stab_idx).copied())
@@ -3657,10 +3714,17 @@ fn export_fisheye_osv_zerocopy_d3d11(
         // Hand off to the encode thread. A send error means the encoder
         // failed to open (frame_rx dropped) — stop; the join surfaces why.
         let s0 = std::time::Instant::now();
-        if frame_tx.send(frame).is_err() { break; }
+        // Copies fill the hole after a dropped frame (output stays on the
+        // audio's clock); the frame itself goes last so no clone is wasted.
+        let mut sent_ok = true;
+        for _ in 1..fill.copies() {
+            if frame_tx.send(frame.clone()).is_err() { sent_ok = false; break; }
+        }
+        if !sent_ok || frame_tx.send(frame).is_err() { break; }
         t_send += s0.elapsed();
 
         frame_idx += 1;
+        written += fill.copies();
         if frame_idx % 30 == 0 {
             let n = frame_idx as u32;
             tracing::info!(
@@ -3671,7 +3735,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
         }
         let elapsed = t_start.elapsed().as_secs_f32().max(1e-3);
         progress_cb(ExportProgress {
-            frame_idx,
+            frame_idx: written,
             total_frames: total_frames_to_write,
             fps_avg: frame_idx as f32 / elapsed,
         });
@@ -3777,7 +3841,8 @@ fn export_fisheye_osv_gpu_resident(
     // WHOLE-CHAIN frame count — a merged recording's stab table must cover
     // every segment (probing source_path alone = segment 0 only, which
     // truncated stab to identity past the first seam).
-    let total_clip_frames = if cfg.segments.len() > 1 {
+    let timeline = export_timeline(&cfg);
+    let clip_slots = if cfg.segments.len() > 1 {
         cfg.segments.iter()
             .map(|s| chain_segment_frames(s, cfg.fps))
             .sum::<usize>()
@@ -3787,6 +3852,7 @@ fn export_fisheye_osv_gpu_resident(
             .unwrap_or(0)
     }
     .max(1);
+    let total_clip_frames = timeline_frames_or(timeline.as_ref(), clip_slots);
     let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
         dji_osv_imu.as_ref().and_then(|osv| {
             let max_corr = if cfg.dji_max_corr_deg > 0.0 { cfg.dji_max_corr_deg } else { f32::INFINITY };
@@ -3802,7 +3868,7 @@ fn export_fisheye_osv_gpu_resident(
     let total_frames_to_write = if t_out.is_finite() {
         ((t_out - t_in) * cfg.fps as f64).round() as u64
     } else {
-        (total_clip_frames as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
+        (clip_slots as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
     };
 
     // One-pass: encode straight to the final file with the audio muxed
@@ -3880,6 +3946,7 @@ fn export_fisheye_osv_gpu_resident(
 
     let t_start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
+    let mut written: u64 = 0;
     let (mut t_decode, mut t_gpu, mut t_enc) = (
         std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO,
     );
@@ -3894,9 +3961,9 @@ fn export_fisheye_osv_gpu_resident(
         if sp.pts_s.is_finite() && sp.pts_s < t_in - 0.5 * dt { continue; }
         let g0 = std::time::Instant::now();
 
-        let stab_idx = if sp.pts_s.is_finite() && sp.pts_s >= 0.0 {
-            (sp.pts_s / dt).round() as usize
-        } else { frame_idx as usize };
+        let stab_idx = crate::frame_timeline::stab_row(timeline.as_ref(), sp.pts_s, dt, frame_idx as usize);
+        let fill = crate::frame_timeline::export_fill_plan(
+            timeline.as_ref(), stab_idx, sp.pts_s, t_in, written, total_frames_to_write);
         let rot = stab_rotations.as_ref().and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(EquirectRotation::IDENTITY);
         let (rot_l0, rot_r0) = crate::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes);
@@ -4007,13 +4074,23 @@ fn export_fisheye_osv_gpu_resident(
         let e0 = std::time::Instant::now();
         let (y_ptr, y_pitch) = sh.y_cuda();
         let (uv_ptr, uv_pitch) = sh.uv_cuda();
-        if enc_tx.send(EncMsg { y_ptr, y_pitch, uv_ptr, uv_pitch }).is_err() {
+        // One message per output slot: copies fill the hole after a dropped
+        // frame. The ring slot is chosen per SOURCE frame (`frame_idx`), so
+        // the bounded channel's overwrite guard holds with the extra sends.
+        let mut sent_ok = true;
+        for _ in 0..fill.copies() {
+            if enc_tx.send(EncMsg { y_ptr, y_pitch, uv_ptr, uv_pitch }).is_err() {
+                sent_ok = false; break;
+            }
+        }
+        if !sent_ok {
             break; // encode thread died — surfaced at join
         }
         t_enc += e0.elapsed();
 
         drop(sp);
         frame_idx += 1;
+        written += fill.copies();
         if frame_idx % 30 == 0 {
             let n = frame_idx as u32;
             tracing::info!(
@@ -4023,7 +4100,7 @@ fn export_fisheye_osv_gpu_resident(
             );
         }
         progress_cb(ExportProgress {
-            frame_idx,
+            frame_idx: written,
             total_frames: total_frames_to_write,
             fps_avg: frame_idx as f32 / t_start.elapsed().as_secs_f32().max(1e-3),
         });

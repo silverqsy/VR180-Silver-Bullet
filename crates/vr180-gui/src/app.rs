@@ -3293,6 +3293,15 @@ impl App {
         } else {
             (probe.duration_sec, (probe.duration_sec * probe.fps as f64).round() as u32)
         };
+        // Frames actually in the track: a clip with dropped frames has fewer
+        // than duration × fps (the X6 leaves holes where the sensor dropped
+        // frames). BRAW and stills have no MP4 sample table — keep the count.
+        let frame_count = if source_kind == vr180_pipeline::SourceKind::BlackmagicRaw || source_kind.is_still() {
+            frame_count
+        } else {
+            vr180_pipeline::frame_timeline::FrameTimeline::from_segments(&segments)
+                .map(|t| t.len() as u32).filter(|n| *n > 0).unwrap_or(frame_count)
+        };
 
         // NOTE: no DJI metadata read here — the decoder loads the lens calib
         // FAST (first sample) for an immediate preview and streams the heavy

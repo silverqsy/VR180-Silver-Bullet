@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Footage with dropped frames (Insta360 X6)
+
+An X6 clip in which the camera dropped frames — the video track keeps real
+time, so it has holes where frames are missing and plays at a lower average
+rate than the recording mode — lost its stabilization: the app looked up
+each frame's pose by `round(pts / dt)` with `dt` taken from the average
+rate, which lands tens of frames early long before the first hole.
+
+- **Frames are now located by the file's own sample table.** Each decoded
+  frame finds its row in the per-frame tables (stabilization, rolling
+  shutter, exposure, eye matching) by its position in the video track, in
+  the preview, the zoom still and every export path. The clip's frame rate
+  is the nominal one (the camera's recording mode), not the average; a clip
+  without holes is unchanged.
+- **Exports stay in sync with the audio.** The output is constant-rate at
+  the nominal frame rate: the frame before each hole is held for the missing
+  slots, so the picture never drifts against the sound (verified: a 2 s
+  window with 91 source frames exports as 100 frames at 50 fps, 2.000 s).
+- The clip info shows the frames actually in the track; the frame counter
+  counts output frames while exporting.
+
 ### Blackmagic RAW: rebuilt on the current stabilization path
 
 Blackmagic cameras with a VR180 lens (tested on a PYXIS 12K, 12288×6480

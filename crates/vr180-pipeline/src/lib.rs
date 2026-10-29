@@ -19,6 +19,7 @@ pub mod dng_write;
 pub mod encode;
 pub mod fisheye_decode;
 pub mod fisheye_export;
+pub mod frame_timeline;
 pub mod stereo_align;
 pub mod gpu;
 pub mod helpers;

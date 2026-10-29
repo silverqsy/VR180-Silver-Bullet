@@ -1225,7 +1225,9 @@ fn load_insv_imu(
     let probe = vr180_pipeline::decode::probe_video(&cfg.path).ok();
     let fps = probe.as_ref().map(|p| p.fps).filter(|f| *f > 0.0).unwrap_or(30.0);
     let (w, h) = probe.as_ref().map(|p| (p.width, p.height)).unwrap_or((src_w, src_h));
-    let total = segments_total_frames(&cfg.segments).max(1);
+    // Frames in the track (one exposure stamp each), not duration × fps —
+    // a clip with dropped frames has fewer rows than slots.
+    let total = timeline_frames_or(cached_timeline(&cfg.path).as_deref(), segments_total_frames(&cfg.segments)).max(1);
     let imu = vr180_pipeline::insv_imu::build_insv_imu(&meta, fps, total, w, h);
     tracing::info!(
         "decoder (fisheye/insv): {} fw {} — {} imu samples @ {:.0} Hz, {} frame stamps, {} frame quats",
@@ -1264,7 +1266,7 @@ fn load_kandao_imu(
     let (w, h) = probe.as_ref()
         .map(|p| vr180_pipeline::source_kind::EyeLayout::TopBottom.eye_dims(p.width, p.height))
         .unwrap_or((src_w, src_h));
-    let total = segments_total_frames(&cfg.segments).max(1);
+    let total = timeline_frames_or(cached_timeline(&cfg.path).as_deref(), segments_total_frames(&cfg.segments)).max(1);
     let imu = vr180_pipeline::kandao_imu::build_kandao_imu(&meta, fps, total, w, h);
     tracing::info!(
         "decoder (fisheye/kandao): {} fw {} — {} imu samples @ {:.0} Hz, {} PTS entries, {} exposures, {} frame quats, HDR {}",
@@ -1744,6 +1746,12 @@ fn run_fisheye(
     let eye_match_state = pipeline.create_eye_match_state();
     let mut eye_match_rb = pipeline.create_eye_match_readback();
 
+    // The clip's frame timeline (per-frame pts from the sample table): the
+    // stab row of every decoded frame, exact across dropped frames. Built
+    // before the IMU loads and the zero-copy dispatch so all of them, and
+    // the zoom still, read the same cached one.
+    let timeline = clip_timeline(cfg, kind);
+
     // ── Windows zero-copy fast path (DJI OSV only) ───────────────────
     // Probe synchronously so the decision is made BEFORE the live
     // channels are consumed: if wgpu is on Vulkan with P010 support AND
@@ -2055,8 +2063,8 @@ fn run_fisheye(
         // Merged recording: total frames across ALL segments (the IMU is
         // aggregated the same way, so the per-frame rotations span the whole
         // timeline). For a lone clip `segments` is `[path]`, so this is the
-        // single-file count.
-        let total_frames = segments_total_frames(&cfg.segments).max(1);
+        // single-file count. The sample table's count when known.
+        let total_frames = timeline_frames_or(timeline.as_deref(), segments_total_frames(&cfg.segments)).max(1);
         match kind {
             vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv
             | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw => {
@@ -2456,13 +2464,12 @@ fn run_fisheye(
         // guaranteed to line up with the protobuf's frame-block
         // index (one frame_block per video frame, by construction).
         let phase_t0 = std::time::Instant::now();
-        let stab_idx = if pair.pts_s.is_finite() && pair.pts_s >= 0.0 {
-            (pair.pts_s / dt).round() as usize
-        } else {
-            // Fallback if the iterator didn't supply PTS (e.g. BRAW —
-            // we synthesise PTS from frame_idx there, but be defensive).
+        // Row from the sample table when the clip has one (exact across
+        // dropped frames), else round(pts / dt); the loop counter only if
+        // the iterator supplied no PTS (BRAW synthesises one — defensive).
+        let stab_idx = {
             let abs = ((time_offset / dt).round() as i64) + frame_idx as i64;
-            abs.max(0) as usize
+            vr180_pipeline::frame_timeline::stab_row(timeline.as_deref(), pair.pts_s, dt, abs.max(0) as usize)
         };
         let absolute_frame_idx = stab_idx as u32;
         let rot = stab_rotations
@@ -2692,10 +2699,10 @@ fn run_fisheye(
             width: out_w,
             height: out_h,
             frame_idx: absolute_frame_idx,
-            // Shown frame's own time (pts via stab_idx), not the pacing clock —
-            // keeps the zoom still (DetailCache) on the same frame as the preview
+            // Shown frame's own time (its pts), not the pacing clock — keeps
+            // the zoom still (DetailCache) on the same frame as the preview
             // even after render-bound skips. See the macOS vt-zc path.
-            timestamp_s: absolute_frame_idx as f64 * dt,
+            timestamp_s: frame_time_s(pair.pts_s, absolute_frame_idx, dt),
         };
         match frame_tx.try_send(out) {
             Ok(()) => control.wake_ui(),
@@ -2791,6 +2798,7 @@ fn run_fisheye_zerocopy(
     // preview stream + a non-blocking readout ring for the UI.
     let eye_match_state = pipeline.create_eye_match_state();
     let mut eye_match_rb = pipeline.create_eye_match_readback();
+    let timeline = clip_timeline(cfg, kind);
 
     // ── Worker sub-thread: decode + share (D3D11 only, never touches wgpu) ──
     enum IterCmd { Seek(f64) }
@@ -2864,7 +2872,7 @@ fn run_fisheye_zerocopy(
     // Whole-chain frame count (matches the CPU worker) — probing cfg.path
     // alone covered only segment 0 of a merged recording, truncating the
     // stab table to identity past the first seam.
-    let total_frames = segments_total_frames(&cfg.segments).max(1);
+    let total_frames = timeline_frames_or(timeline.as_deref(), segments_total_frames(&cfg.segments)).max(1);
     let compute_stab = |osv: Option<&vr180_fisheye::DjiOsvImu>,
                         control: &DecoderControl| -> Option<Vec<EquirectRotation>> {
         let osv = osv?;
@@ -3123,11 +3131,9 @@ fn run_fisheye_zerocopy(
 
         // ── Project each eye (P010 planar) + compose SBS ─────────────
         let phase_t0 = std::time::Instant::now();
-        let stab_idx = if fh.pair.pts_s().is_finite() && fh.pair.pts_s() >= 0.0 {
-            (fh.pair.pts_s() / dt).round() as usize
-        } else {
-            (((time_offset / dt).round() as i64) + frame_idx as i64).max(0) as usize
-        };
+        let stab_idx = vr180_pipeline::frame_timeline::stab_row(
+            timeline.as_deref(), fh.pair.pts_s(), dt,
+            (((time_offset / dt).round() as i64) + frame_idx as i64).max(0) as usize);
         let absolute_frame_idx = stab_idx as u32;
         let rot = stab_rotations.as_ref().and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(EquirectRotation::IDENTITY);
@@ -3267,10 +3273,10 @@ fn run_fisheye_zerocopy(
             texture: Arc::new(sbs_tex),
             width: out_w, height: out_h,
             frame_idx: absolute_frame_idx,
-            // Shown frame's own time (pts via stab_idx), not the pacing clock —
-            // keeps the zoom still (DetailCache) on the same frame as the preview
+            // Shown frame's own time (its pts), not the pacing clock — keeps
+            // the zoom still (DetailCache) on the same frame as the preview
             // even after render-bound skips. See the macOS vt-zc path.
-            timestamp_s: absolute_frame_idx as f64 * dt,
+            timestamp_s: frame_time_s(fh.pair.pts_s(), absolute_frame_idx, dt),
         };
         match frame_tx.try_send(out) {
             Ok(()) => control.wake_ui(),
@@ -3332,6 +3338,7 @@ fn run_fisheye_vt_zerocopy(
     // preview stream + a non-blocking readout ring for the UI.
     let eye_match_state = pipeline.create_eye_match_state();
     let mut eye_match_rb = pipeline.create_eye_match_readback();
+    let timeline = clip_timeline(cfg, kind);
 
     // Native fisheye dims (what the iterator yields) → working preview res (what
     // we resolve to + project from). Calib resolves against the WORKING res,
@@ -3370,9 +3377,12 @@ fn run_fisheye_vt_zerocopy(
         calib_left.fx, calib_left.cx, calib_left.cy, calib_right.fx, calib_right.cx, calib_right.cy
     );
 
-    let total_frames = vr180_pipeline::decode::probe_video(&cfg.path)
-        .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
-        .unwrap_or(0).max(1);
+    let total_frames = timeline_frames_or(
+        timeline.as_deref(),
+        vr180_pipeline::decode::probe_video(&cfg.path)
+            .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+            .unwrap_or(0),
+    ).max(1);
     let compute_stab = |osv: Option<&vr180_fisheye::DjiOsvImu>,
                         control: &DecoderControl| -> Option<Vec<EquirectRotation>> {
         let osv = osv?;
@@ -3641,13 +3651,12 @@ fn run_fisheye_vt_zerocopy(
             }
         };
 
-        // Frame-level stab rotation.
+        // Frame-level stab rotation: the frame's row from the sample table
+        // (exact across dropped frames), else round(pts / dt).
         let pts_s = pair.pts_s();
-        let stab_idx = if pts_s.is_finite() && pts_s >= 0.0 {
-            (pts_s / dt).round() as usize
-        } else {
-            (((time_offset / dt).round() as i64) + frame_idx as i64).max(0) as usize
-        };
+        let stab_idx = vr180_pipeline::frame_timeline::stab_row(
+            timeline.as_deref(), pts_s, dt,
+            (((time_offset / dt).round() as i64) + frame_idx as i64).max(0) as usize);
         let absolute_frame_idx = stab_idx as u32;
         let rot = stab_rotations.as_ref().and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(EquirectRotation::IDENTITY);
@@ -3747,11 +3756,11 @@ fn run_fisheye_vt_zerocopy(
             texture: Arc::new(sbs_tex),
             width: out_w, height: out_h,
             frame_idx: absolute_frame_idx,
-            // Report the SHOWN frame's own time (its pts, via stab_idx), NOT the
-            // pacing clock: render-bound frame-skips drift `frame_t_abs` ahead of
+            // Report the SHOWN frame's own time (its pts), NOT the pacing
+            // clock: render-bound frame-skips drift `frame_t_abs` ahead of
             // the frame actually on screen, and the zoom still (DetailCache) is
             // keyed on this timestamp — a drift makes it decode a DIFFERENT frame.
-            timestamp_s: absolute_frame_idx as f64 * dt,
+            timestamp_s: frame_time_s(pts_s, absolute_frame_idx, dt),
         };
         match frame_tx.try_send(out) {
             Ok(()) => control.wake_ui(),
@@ -5585,6 +5594,64 @@ pub(crate) fn cached_dji_imu(path: &std::path::Path) -> Option<std::sync::Arc<vr
     dji_imu_cache().lock().iter().find(|(p, _)| p == path).map(|(_, imu)| imu.clone())
 }
 
+/// Per-clip frame timeline — every video frame's pts from the container's
+/// sample table (`vr180_pipeline::frame_timeline`). The decoder thread builds
+/// it when a fisheye clip opens and publishes it here; the zoom still and the
+/// stab-table sizing read it. Keyed by clip path like the IMU cache.
+fn timeline_cache(
+) -> &'static parking_lot::Mutex<Vec<(PathBuf, std::sync::Arc<vr180_pipeline::frame_timeline::FrameTimeline>)>> {
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<Vec<(PathBuf, std::sync::Arc<vr180_pipeline::frame_timeline::FrameTimeline>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+pub(crate) fn cached_timeline(path: &std::path::Path) -> Option<std::sync::Arc<vr180_pipeline::frame_timeline::FrameTimeline>> {
+    timeline_cache().lock().iter().find(|(p, _)| p == path).map(|(_, t)| t.clone())
+}
+
+/// Build (or reuse) the clip's frame timeline: the per-frame table row of a
+/// decoded frame is its position in the sample table, which stays exact when
+/// the camera dropped frames (the X6 leaves holes in the track; `round(pts /
+/// dt)` then lands rows early). Sources without an MP4 sample table (BRAW,
+/// stills) have none — every caller then keeps the constant-rate arithmetic.
+fn clip_timeline(cfg: &DecoderConfig, kind: vr180_pipeline::SourceKind)
+    -> Option<std::sync::Arc<vr180_pipeline::frame_timeline::FrameTimeline>>
+{
+    if kind == vr180_pipeline::SourceKind::BlackmagicRaw || kind.is_still() {
+        return None;
+    }
+    if let Some(t) = cached_timeline(&cfg.path) {
+        return Some(t);
+    }
+    let segs: Vec<PathBuf> = if cfg.segments.is_empty() { vec![cfg.path.clone()] } else { cfg.segments.clone() };
+    let tl = vr180_pipeline::frame_timeline::FrameTimeline::from_segments(&segs)?;
+    if tl.is_empty() {
+        return None;
+    }
+    tracing::info!("decoder: frame timeline — {}", tl.summary());
+    let arc = std::sync::Arc::new(tl);
+    let mut c = timeline_cache().lock();
+    c.retain(|(p, _)| p != &cfg.path);
+    c.push((cfg.path.clone(), arc.clone()));
+    let n = c.len();
+    if n > 8 { c.drain(0..n - 8); }
+    Some(arc)
+}
+
+/// Frames in the clip for sizing per-frame tables: the sample table's count
+/// when it is known (rows past the last frame would be identity poses the
+/// smoother bends toward), else `fallback` (duration × fps).
+fn timeline_frames_or(tl: Option<&vr180_pipeline::frame_timeline::FrameTimeline>, fallback: usize) -> usize {
+    tl.map(|t| t.len()).filter(|n| *n > 0).unwrap_or(fallback)
+}
+
+/// The shown frame's own time for the UI (playhead, zoom-still key): its pts
+/// when the source stamps frames, else its row on the constant-rate grid.
+fn frame_time_s(pts_s: f64, row: u32, dt: f64) -> f64 {
+    if pts_s.is_finite() && pts_s >= 0.0 { pts_s } else { row as f64 * dt }
+}
+
 fn gpmf_cache(
 ) -> &'static parking_lot::Mutex<Vec<(PathBuf, std::sync::Arc<Vec<u8>>)>> {
     static CACHE: std::sync::OnceLock<
@@ -5706,9 +5773,12 @@ impl DetailCache {
         // Stabilization — recompute when the stab params change OR when the
         // IMU first becomes available (folded into the key).
         let sk = stab_key(s) ^ imu.as_ref().map_or(0, |i| i.frame_quats.len() as u64);
+        // The clip's frame timeline, published by the decoder thread when
+        // the clip opened (None only for sources without a sample table).
+        let timeline = cached_timeline(&self.path);
         if self.cached_stab_key != sk {
             self.cached_stab = compute_stab_for(
-                self.kind, &self.path, imu.as_deref(), s, self.fps);
+                self.kind, &self.path, imu.as_deref(), s, self.fps, timeline.as_deref());
             self.cached_stab_key = sk;
         }
 
@@ -5716,6 +5786,7 @@ impl DetailCache {
         render_still_from_pair(
             pipeline, self.kind, s, self.fps, pair,
             imu.as_deref(), self.cached_stab.as_deref(), out_cap, out_eye,
+            timeline.as_deref(),
         ).ok().flatten()
     }
 }
@@ -5843,10 +5914,14 @@ fn compute_stab_for(
     imu: Option<&vr180_fisheye::DjiOsvImu>,
     s: &Settings,
     fps: f32,
+    timeline: Option<&vr180_pipeline::frame_timeline::FrameTimeline>,
 ) -> Option<Vec<EquirectRotation>> {
     if !s.stabilize { return None; }
-    let total = vr180_pipeline::decode::probe_video(path)
-        .map(|p| (p.duration_sec * p.fps as f64).round() as usize).unwrap_or(0).max(1);
+    let total = timeline_frames_or(
+        timeline,
+        vr180_pipeline::decode::probe_video(path)
+            .map(|p| (p.duration_sec * p.fps as f64).round() as usize).unwrap_or(0),
+    ).max(1);
     match kind {
         vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv
         | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw => imu.and_then(|osv| {
@@ -5873,6 +5948,7 @@ fn render_still_from_pair(
     stab_rotations: Option<&[EquirectRotation]>,
     out_cap: u32,
     out_eye: Option<(u32, u32)>,
+    timeline: Option<&vr180_pipeline::frame_timeline::FrameTimeline>,
 ) -> anyhow::Result<Option<(wgpu::Texture, u32, u32)>> {
     let (src_w, src_h) = (pair.eye_w, pair.eye_h);
     let (calib_left, calib_right) =
@@ -5892,9 +5968,7 @@ fn render_still_from_pair(
     let oside = (((src_w.min(src_h)) as f32 * proj_scale).round() as u32).max(16);
 
     let dt = 1.0 / fps as f64;
-    let stab_idx = if pair.pts_s.is_finite() && pair.pts_s >= 0.0 {
-        (pair.pts_s / dt).round() as usize
-    } else { 0 };
+    let stab_idx = vr180_pipeline::frame_timeline::stab_row(timeline, pair.pts_s, dt, 0);
     let rot = stab_rotations
         .and_then(|v| v.get(stab_idx).copied())
         .unwrap_or(EquirectRotation::IDENTITY);
