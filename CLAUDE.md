@@ -1754,6 +1754,31 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    (gitignored examples): `insv_stamp_check` (container vs trailer rows,
    old-vs-new row error), `insv_drop_export_check` (window export + probe);
    `scratchpad/drop/mp4_stts.py` dumps a moov's timing tables.
+   **Preview pacing + the NAS (same day, follow-up report "this build
+   stutters on insv").** Two things, measured apart: (a) the three
+   fisheye preview loops paced by their loop counter (`frame_idx ×
+   preview_dt`), so on a dropped-frame clip the picture ran through the
+   holes (4.7 % fast on 023, drifting off the free-running audio) and,
+   with the nominal fps, no longer averaged out; now `preview_frame_t_rel`
+   paces by the held frame's own pts (relative to the seek origin, clamped
+   ≥ 0 — `Duration::from_secs_f64` panics on a negative): a hole holds the
+   previous frame for the missing slots and the clip stays on the audio's
+   clock; the no-timeline stab fallback is `round(frame_t_abs / dt)` (the
+   old `round(time_offset/dt) + frame_idx` mixed source rows with preview
+   slots — half a row per frame under 2× decimation). (b) The stutter
+   itself is I/O: `insv_decode_pace` (gitignored example; demux + VT decode
+   per `next_pair`, as the preview thread sees it) on clip 023 — local copy
+   11.8 ms per pair (p99 22 ms, 58 % of real time at 50 fps, no stalls);
+   the same file on `/Volumes/Database` (smbfs over Wi-Fi, en0 the only
+   active link): p50 still 11.7 ms but a 0.3–1.5 s stall every ~36 groups
+   (10 in 10 s, 166 % of real time) — each one trips the loop's
+   decode-bound branch (wall-clock rebase → a visible freeze). `dd` from
+   the share: 20–32 MB/s with 1 MiB reads, 30 MB/s with 32 KiB reads, so the
+   LINK is the ceiling, not the read pattern — and 023 needs 33.6 MB/s
+   (269 Mbps). No prefetch depth fixes an average deficit; play X6 50p from
+   local storage (or a wired link). The pump reads and decodes
+   synchronously on the pull (`DualPacketPump` → `ictx.packets()`), so a
+   read-ahead thread would only smooth jitter when the average suffices.
 
 
 20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac

@@ -2282,10 +2282,14 @@ fn run_fisheye(
         }
 
         // ── 2. Trim-out loop.
-        // `frame_idx` counts loop iterations (= rendered frames after
-        // decimation), so pacing uses `preview_dt` not the source `dt`.
-        // `frame_t_abs` is still in source-time for trim/seek lookups.
-        let frame_t_rel = frame_idx as f64 * preview_dt;
+        // Pacing position = the held pair's own time (its pts relative to
+        // the seek origin): a hole in the sample table holds the previous
+        // frame for the missing slots and playback stays on the audio's
+        // clock. The loop counter — at `preview_dt`, not the source `dt`,
+        // since it counts iterations after decimation — only when the
+        // iterator supplied no pts. `frame_t_abs` is in source time for
+        // trim/seek lookups.
+        let frame_t_rel = preview_frame_t_rel(pair.pts_s, time_offset, frame_idx as f64 * preview_dt);
         let frame_t_abs = time_offset + frame_t_rel;
         {
             let s = control.settings.read();
@@ -2467,10 +2471,8 @@ fn run_fisheye(
         // Row from the sample table when the clip has one (exact across
         // dropped frames), else round(pts / dt); the loop counter only if
         // the iterator supplied no PTS (BRAW synthesises one — defensive).
-        let stab_idx = {
-            let abs = ((time_offset / dt).round() as i64) + frame_idx as i64;
-            vr180_pipeline::frame_timeline::stab_row(timeline.as_deref(), pair.pts_s, dt, abs.max(0) as usize)
-        };
+        let stab_idx = vr180_pipeline::frame_timeline::stab_row(
+            timeline.as_deref(), pair.pts_s, dt, (frame_t_abs / dt).round().max(0.0) as usize);
         let absolute_frame_idx = stab_idx as u32;
         let rot = stab_rotations
             .as_ref()
@@ -3041,8 +3043,9 @@ fn run_fisheye_zerocopy(
             continue 'main;
         }
 
-        // Trim-out loop.
-        let frame_t_rel = frame_idx as f64 * preview_dt;
+        // Trim-out loop. Paced by the held frame's pts (see
+        // `preview_frame_t_rel`: holds through dropped-frame holes).
+        let frame_t_rel = preview_frame_t_rel(fh.pair.pts_s(), time_offset, frame_idx as f64 * preview_dt);
         let frame_t_abs = time_offset + frame_t_rel;
         {
             let s = control.settings.read();
@@ -3133,7 +3136,7 @@ fn run_fisheye_zerocopy(
         let phase_t0 = std::time::Instant::now();
         let stab_idx = vr180_pipeline::frame_timeline::stab_row(
             timeline.as_deref(), fh.pair.pts_s(), dt,
-            (((time_offset / dt).round() as i64) + frame_idx as i64).max(0) as usize);
+            (frame_t_abs / dt).round().max(0.0) as usize);
         let absolute_frame_idx = stab_idx as u32;
         let rot = stab_rotations.as_ref().and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(EquirectRotation::IDENTITY);
@@ -3521,7 +3524,9 @@ fn run_fisheye_vt_zerocopy(
         }
 
         // Trim-out loop.
-        let frame_t_rel = frame_idx as f64 * preview_dt;
+        // Paced by the held frame's pts (see `preview_frame_t_rel`: holds
+        // through dropped-frame holes, stays on the audio's clock).
+        let frame_t_rel = preview_frame_t_rel(pair.pts_s(), time_offset, frame_idx as f64 * preview_dt);
         let frame_t_abs = time_offset + frame_t_rel;
         {
             let s = control.settings.read();
@@ -3656,7 +3661,7 @@ fn run_fisheye_vt_zerocopy(
         let pts_s = pair.pts_s();
         let stab_idx = vr180_pipeline::frame_timeline::stab_row(
             timeline.as_deref(), pts_s, dt,
-            (((time_offset / dt).round() as i64) + frame_idx as i64).max(0) as usize);
+            (frame_t_abs / dt).round().max(0.0) as usize);
         let absolute_frame_idx = stab_idx as u32;
         let rot = stab_rotations.as_ref().and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(EquirectRotation::IDENTITY);
@@ -5650,6 +5655,17 @@ fn timeline_frames_or(tl: Option<&vr180_pipeline::frame_timeline::FrameTimeline>
 /// when the source stamps frames, else its row on the constant-rate grid.
 fn frame_time_s(pts_s: f64, row: u32, dt: f64) -> f64 {
     if pts_s.is_finite() && pts_s >= 0.0 { pts_s } else { row as f64 * dt }
+}
+
+/// Pacing position of the frame in hand, relative to the seek origin
+/// `time_offset`: its pts when the iterator supplied one — exact across
+/// dropped frames, where a hole in the sample table holds the previous frame
+/// on screen for the missing slots and the clip stays on the audio's clock —
+/// else `counter_rel`, the loop counter at the preview rate. Never negative:
+/// the precise seek's first pair may sit up to half a period before the
+/// target, and the pacing clock rebases through `Duration::from_secs_f64`.
+fn preview_frame_t_rel(pts_s: f64, time_offset: f64, counter_rel: f64) -> f64 {
+    if pts_s.is_finite() && pts_s >= 0.0 { (pts_s - time_offset).max(0.0) } else { counter_rel }
 }
 
 fn gpmf_cache(

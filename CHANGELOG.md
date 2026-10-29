@@ -20,6 +20,10 @@ rate, which lands tens of frames early long before the first hole.
   the nominal frame rate: the frame before each hole is held for the missing
   slots, so the picture never drifts against the sound (verified: a 2 s
   window with 91 source frames exports as 100 frames at 50 fps, 2.000 s).
+- **The preview plays on the audio's clock too.** Playback is paced by each
+  frame's own time: a hole holds the previous frame for the missing slots
+  instead of running through it, so the picture no longer drifts ahead of
+  the sound on a dropped-frame clip.
 - The clip info shows the frames actually in the track; the frame counter
   counts output frames while exporting.
 
