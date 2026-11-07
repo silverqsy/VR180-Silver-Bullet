@@ -1914,6 +1914,19 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    timeline ("52 dropped in 41 holes"), engages, and plays (Space, 12 s);
    pacing is not measurable from the log. The gitignored `export_smoke`
    needed `braw_color: Default::default()` for the new config field.
+   **MAC SIDE PULLED THE WINDOWS BATCH (2026-11-07, Mac):** fast-forward
+   to `e3955cd`, `vr180-gui` builds clean, lib tests 90 / 2 / 6; the macOS
+   helper REBUILT from the platform-neutral source (`build_braw.sh`, one
+   pre-existing `kIOSurfaceIsGlobal` deprecation warning) — `--info` on C006
+   reports `pipeline metal`, `zerocopy true`, `gpu_device Apple M5 Max`;
+   `braw_zc_check` (gitignored, updated to the new signatures:
+   `BrawZcIter::new(adapter, device, ..)`, `BrawZcDecoder::start(.., None)`,
+   `surfaces` tokens `as u32` for the IOSurface lookup) at eighth / 5.0 s:
+   zc-vs-pipe IDENTICAL both eyes, projection identical, 712 fps through the
+   ring, 471 fps holding two pairs, seeks OK. The OLD Oct-22 helper binary
+   also still satisfied the new Rust side (the header fields are additive),
+   so a stale `helpers/bin/braw_helper` is not a hard failure — but rebuild
+   it after any `helpers/braw/*` change; the release script hash-checks.
 
 
 20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac
