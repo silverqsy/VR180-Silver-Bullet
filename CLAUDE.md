@@ -1737,7 +1737,8 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      171, quarter 381; CPU quarter 651 (the SDK's partial decode is cheap,
      CUDA pays a ~1 s start-up). The GUI opens it (circles found, LUT
      extracted, preview at eighth/2048×852 step 2 on CUDA, gyro
-     integrated, first frame up) and `export_smoke` 5–6 s through the
+     integrated, first frame up; plays at the 30 fps preview cadence — ~0.6 ms
+     per frame off the pipe, 2–3 ms render) and `export_smoke` 5–6 s through the
      portable loop writes 60 frames @ 60 fps, 3072×1536 yuv420p10 from the
      16-bit CUDA decode, stab engaged, audio muxed (1.79 fps at 12K — the
      readback pipe + libx265; a reduced-scale decode for sub-12K eyes and
