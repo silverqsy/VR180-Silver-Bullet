@@ -20,7 +20,6 @@ exactly as they are in the Python app.
 ./helpers/build_swift.sh   # mvhevc_encode, vt_denoise, apac_encode
 ./helpers/braw/build_braw.sh   # braw_helper (requires Blackmagic RAW SDK installed)
 .\helpers\braw\build_braw.ps1  # the same helper on Windows (MSVC; requires the Blackmagic RAW SDK with its Windows headers)
-.helpersrawuild_braw.ps1  # the same helper on Windows (MSVC; requires the Blackmagic RAW SDK with the Windows headers)
 ```
 
 Output binaries go to `helpers/bin/`, which is `.gitignore`d. The
