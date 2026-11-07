@@ -1779,6 +1779,25 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    local storage (or a wired link). The pump reads and decodes
    synchronously on the pull (`DualPacketPump` → `ictx.packets()`), so a
    read-ahead thread would only smooth jitter when the average suffices.
+   **WINDOWS ARMS VERIFIED (2026-11-06, Windows box):** pulled the 25
+   commits, built clean (the BRAW helper is macOS-only by construction;
+   `vr180-braw` compiles here with its macOS zero-copy module gated), lib
+   tests 57 / 39 / 89. Regression first: OSV cpu / zc readback / GPU-
+   resident NVENC and the `.360` NVENC export are byte-size IDENTICAL to
+   the pre-pull baseline (6701542 / 6702715 / 9527805 / 7587651 B, cpu-vs-zc
+   1.189/255 as before) — the sample-table row equals `round(pts/dt)` on a
+   constant-rate file, as designed. Then the mac's own dropped-frame clip
+   017 (recovered from the NAS `#recycle`; `examples/timeline_probe.rs`,
+   gitignored, reads the same 1359 frames / 52 missing in 41 holes / 48.16
+   fps the mac reported; 074: 2357 / 289 / 44.54): the 5–7 s window through
+   the portable loop, the blind-edited zc d3d11 arm AND the GPU-resident
+   NVENC arm each write **exactly 100 frames @ 50 fps, one 0.02 s delta,
+   2.018 s video / 2.005 s audio**, cpu-vs-zc parity 1.263/255 — the
+   cloned `EncFrame` copies and the repeated ring-slot messages land where
+   the fill plan says. The Windows zero-copy PREVIEW on 017 logs the
+   timeline ("52 dropped in 41 holes"), engages, and plays (Space, 12 s);
+   pacing is not measurable from the log. The gitignored `export_smoke`
+   needed `braw_color: Default::default()` for the new config field.
 
 
 20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac
