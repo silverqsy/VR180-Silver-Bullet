@@ -6,7 +6,7 @@
 
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Dump the embedded LUT of `path` to a `.cube` in the system temp dir,
 /// named after the LUT's `title` (the same title → the same file, reused
@@ -26,7 +26,7 @@ pub fn extract_embedded_lut(path: impl AsRef<Path>, title: &str) -> Result<PathB
     // Write to a per-process partial and rename, so a crash or a second
     // process never leaves a half-written cube under the shared name.
     let partial = out.with_extension(format!("{}.partial", std::process::id()));
-    let res = Command::new(&helper)
+    let res = crate::helper_command(&helper)
         .arg("--lut").arg(src).arg(&partial)
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .output()?;

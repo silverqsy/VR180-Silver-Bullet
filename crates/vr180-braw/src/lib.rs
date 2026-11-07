@@ -130,3 +130,19 @@ pub fn locate_helper() -> Option<std::path::PathBuf> {
     }
     None
 }
+
+/// A `Command` for the helper. On Windows it carries `CREATE_NO_WINDOW`:
+/// `braw_helper.exe` is a console-subsystem program while the GUI has no
+/// console, so without the flag every spawn (probe, gyro, LUT, decode)
+/// opened a terminal window on the desktop. Every helper call in this crate
+/// pipes or nulls the helper's stdio, so the missing console is never seen.
+pub(crate) fn helper_command(helper: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(helper);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}

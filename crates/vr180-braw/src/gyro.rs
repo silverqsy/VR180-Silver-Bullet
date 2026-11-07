@@ -7,7 +7,7 @@ use crate::{Error, Result};
 use serde::Deserialize;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// JSON header emitted on stderr by `braw_helper --gyro`.
 #[derive(Debug, Clone, Deserialize)]
@@ -60,7 +60,7 @@ impl BrawGyroData {
         let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
             expected: format!("helpers/bin/{}", crate::helper_file_name()),
         })?;
-        let mut child = Command::new(&helper)
+        let mut child = crate::helper_command(&helper)
             .arg("--gyro")
             .arg(path.as_ref())
             .stdin(Stdio::null())

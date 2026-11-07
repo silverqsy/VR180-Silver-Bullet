@@ -10,7 +10,7 @@
 
 use crate::{Error, Result};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Sampled per-frame shutter times.
 #[derive(Debug, Clone, Default)]
@@ -25,7 +25,7 @@ impl BrawShutters {
         let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
             expected: format!("helpers/bin/{}", crate::helper_file_name()),
         })?;
-        let out = Command::new(&helper)
+        let out = crate::helper_command(&helper)
             .arg("--shutters").arg(path.as_ref())
             .arg("--step").arg(step.max(1).to_string())
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())

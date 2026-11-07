@@ -13,7 +13,7 @@ use crate::{Error, Result};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 
 /// The zero-copy decode header (`--zerocopy`): the pipe header's fields
@@ -136,7 +136,7 @@ impl BrawZcDecoder {
         let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
             expected: format!("helpers/bin/{}", crate::helper_file_name()),
         })?;
-        let mut cmd = Command::new(&helper);
+        let mut cmd = crate::helper_command(&helper);
         cmd.arg("--decode").arg(path.as_ref());
         opts.extend_argv(&mut cmd);
         cmd.arg("--zerocopy").arg(slots.max(2).to_string());

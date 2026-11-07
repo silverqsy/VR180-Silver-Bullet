@@ -217,7 +217,8 @@ file, stills, and the camera's own colour handling.
   mode the preview decodes the full 12K frame on the GPU and hands it over
   with a CUDA → D3D11 copy, so a zoomed viewport shows native pixels as on
   macOS, at the full playback rate from local storage. Exports take the
-  readback path.
+  readback path. The helper runs without a console window (opening a
+  BRAW clip used to pop up a terminal window on Windows).
 
 ## 2.5.2 — 2026-10-10
 

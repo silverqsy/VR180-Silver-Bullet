@@ -275,7 +275,16 @@ impl Drop for FinalizePhaseNote {
 /// Available bytes on the filesystem holding `dir`, via `df -kP`
 /// (POSIX one-line-per-fs output). Best-effort — `None` on any failure.
 fn fs_avail_bytes(dir: &std::path::Path) -> Option<u64> {
-    let out = std::process::Command::new("df").arg("-kP").arg(dir).output().ok()?;
+    let mut cmd = std::process::Command::new("df");
+    // The GUI has no console on Windows: without this a `df` found on PATH
+    // (Git for Windows) would open a terminal window for the duration of the
+    // call.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd.arg("-kP").arg(dir).output().ok()?;
     if !out.status.success() { return None; }
     let text = String::from_utf8_lossy(&out.stdout);
     // Columns: Filesystem 1024-blocks Used Available Capacity Mounted-on.

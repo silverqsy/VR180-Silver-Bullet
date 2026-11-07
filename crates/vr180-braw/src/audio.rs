@@ -14,7 +14,7 @@ use crate::{Error, Result};
 use serde::Deserialize;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// JSON header on stderr.
 ///
@@ -54,7 +54,7 @@ pub fn extract_audio_to_wav(
         helper.display(), braw_path.display(), dst.display()
     );
 
-    let mut child = Command::new(&helper)
+    let mut child = crate::helper_command(&helper)
         .arg("--audio")
         .arg(braw_path)
         .stdin(Stdio::null())

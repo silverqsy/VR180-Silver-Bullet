@@ -5,7 +5,7 @@
 use crate::{Error, Result};
 use serde::Deserialize;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Metadata extracted from a `.braw` file by `braw_helper --info`.
 #[derive(Debug, Clone, Deserialize)]
@@ -159,7 +159,7 @@ impl BrawInfo {
         let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
             expected: format!("helpers/bin/{}", crate::helper_file_name()),
         })?;
-        let out = Command::new(&helper)
+        let out = crate::helper_command(&helper)
             .arg("--info")
             .arg(path.as_ref())
             .stdin(Stdio::null())

@@ -232,7 +232,7 @@ impl BrawDecoder {
         let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
             expected: format!("helpers/bin/{}", crate::helper_file_name()),
         })?;
-        let mut cmd = Command::new(&helper);
+        let mut cmd = crate::helper_command(&helper);
         cmd.arg("--decode").arg(path.as_ref());
         opts.extend_argv(&mut cmd);
 

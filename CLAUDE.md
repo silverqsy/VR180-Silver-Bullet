@@ -1719,7 +1719,14 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      `--zerocopy` is refused off macOS (inert `zc_pool_*` stubs keep the
      decode loop one source) and `--info` reports `zerocopy: false` there;
      `--pipeline` takes `auto|metal|cuda|cpu` and refuses the other
-     platform's name. The Windows SDK ships the API as an IDL:
+     platform's name. Every helper spawn in `vr180-braw` goes through
+     `helper_command` (2026-11-07): `CREATE_NO_WINDOW` on Windows — the GUI
+     has no console and the helper is a console-subsystem exe, so a bare
+     `Command::new(&helper)` opened a Windows Terminal window on every
+     probe / gyro / LUT / decode (verified by window enumeration: WT +
+     PseudoConsoleWindow without the flag, nothing with it; the export's
+     `df` probe got the same flag). Never spawn the helper with a bare
+     `Command::new`. The Windows SDK ships the API as an IDL:
      `helpers/braw/build_braw.ps1` runs MIDL (header + the `_i.c` IIDs,
      linked in), compiles the helper with `/FI` on the SDK's dispatch
      source (its LoadLibrary of BlackmagicRawAPI.dll) and links
