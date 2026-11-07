@@ -80,7 +80,7 @@ windows = { version = "0.62", features = [
 # zero-copy preview output without the GUI).
 # Surfaces the pipeline's `tracing` logs (perf timings, path-engaged lines) in
 # the headless examples — the lib emits via `tracing`, which needs a subscriber.
-tracing-subscriber = "0.3"
+tracing-subscriber = { workspace = true }
 
 [features]
 default = []

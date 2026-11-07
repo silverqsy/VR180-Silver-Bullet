@@ -1699,13 +1699,15 @@ fn open_fisheye_segment(
             // The helper hands frames over on the GPU — IOSurfaces on macOS,
             // shareable D3D11 textures on Windows (no pixels through the
             // pipe or the app's CPU) — so a reframed view can afford the
-            // FULL frame on macOS, where the hand-off is a GPU blit; on
-            // Windows the helper reads a GPU decode back to host memory
-            // first, so the reframed view keeps the pipe path's scale.
+            // FULL frame: every zoom level samples native pixels. On Windows
+            // that holds when the SDK decodes on CUDA (the helper blits
+            // CUDA → D3D11); a CPU-pipeline decode would have to upload
+            // 250 MB a frame, so it keeps the pipe path's scale.
             // `VR180_BRAW_ZC=0` forces the pipe path.
             if info.zerocopy && std::env::var("VR180_BRAW_ZC").map(|v| v != "0").unwrap_or(true) {
                 if let Some(dev) = &gpu {
-                    let scale = if braw_reframe && cfg!(target_os = "macos") { vr180_braw::DecodeScale::Full } else { scale };
+                    let full_ok = cfg!(target_os = "macos") || info.gpu_device.as_deref().map_or(false, |d| !d.is_empty());
+                    let scale = if braw_reframe && full_ok { vr180_braw::DecodeScale::Full } else { scale };
                     // 5 slots: the frame on screen, the one whose GPU work
                     // may still be in flight, and three decoding ahead.
                     match vr180_pipeline::fisheye_decode::BrawZcIter::new(

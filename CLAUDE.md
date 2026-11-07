@@ -1751,13 +1751,23 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      square canvas / pad rows (`row_map` verbatim), created on the adapter
      the app names (`--adapter-luid <hex>` = its Vulkan device's LUID — a
      cross-adapter handle cannot be imported) else the first hardware
-     adapter. Fill = `UpdateSubresource` + Flush + event-query wait BEFORE
-     the "F" line (the app reads the memory through Vulkan the moment it
-     sees the line); a CUDA-decoded frame is first read back through the
-     SDK's resource manager (`fill_slot` → `fetch_processed_bytes`, the pipe
-     decode's own path) because `cuGraphicsD3D11RegisterResource` refuses
-     shared textures and CUDA IPC is Linux-only — a CUDA external-memory
-     blit straight from the SDK buffer is the remaining optimisation. The
+     adapter. Fill, CUDA pipeline (`zc_pool_fill_gpu`, compiled when the
+     CUDA toolkit headers are present — `BRAW_ZC_CUDA`, `build_braw.ps1`
+     finds them via `CUDA_PATH`; `nvcuda.dll` is loaded at runtime and its
+     `cuDeviceGetLuid` must equal the pool's adapter): the SDK's processed
+     image is a CUDA device buffer, and `cuGraphicsD3D11RegisterResource`
+     REFUSES shared textures (CUDA IPC is Linux-only), so each slot has a
+     non-shared RGBA8 STAGING texture per eye registered with CUDA once; a
+     fill is `cuMemcpy2DAsync` device → array (the eye's half of the frame
+     straight into the canvas rows, pad rows pre-zeroed) + a CUDA event
+     wait, then a D3D11 `CopyResource` staging → shared slot and an
+     event-query wait, all BEFORE the "F" line (the app reads the memory
+     through Vulkan the moment it sees the line). CPU pipeline / no CUDA
+     headers: `UpdateSubresource` from the SDK's host buffer, or (CUDA
+     decode without the blit) a resource-manager readback first
+     (`BRAW_ZC_HOST_FALLBACK`; macOS keeps a failed blit a failed frame).
+     Per fill at 6144² eyes (`BRAW_HELPER_DEBUG=1`): map 0.1 ms, copy
+     enqueue 0.1, event wait 5.3–5.5, D3D copy + fence 0.4. The
      header gained `transport` ("iosurface" | "d3d11") and `helper_pid`;
      `surfaces` carry 64-bit tokens (IOSurface IDs / NT handle values —
      `zc_pool_handle`, `zc_transport`, `zc_owner_pid`, `zc_set_adapter_luid`
@@ -1773,15 +1783,35 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      validates it with `vkGetMemoryWin32HandlePropertiesKHR` (a wrong-adapter
      handle reports instead of panicking) and imports it once per slot with
      the existing `import_d3d11_handle_to_wgpu` (`Rgba8Unorm`). The GUI's
-     dispatch is ungated with a fallback to the pipe on error; on Windows a
-     reframed view keeps the pipe scale (no full-frame decode — the
-     host round trip would not pay). VERIFIED (`examples/braw_zc_check.rs`,
+     dispatch is ungated with a fallback to the pipe on error; the reframed
+     view decodes at FULL size on Windows too when the SDK runs on a GPU
+     (`full_ok`: `info.gpu_device` non-empty — a CPU-pipeline box keeps the
+     cap-based scale, where a host upload of 12K frames would not pay).
+     VERIFIED (`examples/braw_zc_check.rs`,
      gitignored, on C006 at eighth): zc-vs-pipe **0.000/255, max 0** on both
      eyes (same canvas, pad rows black), zc-left vs pipe-right 12.5 (not
      swapped), 90 frames sustained through the 5-slot ring at **295 fps**
      with a 2-deep hold, seek to 5.0 s lands on frame 300 exactly; the GUI
      logs "zero-copy d3d11 path", plays at the 30 fps cadence with a 1 ms
-     render.
+     render. **FULL 12K ("fix Reframed preview sharpness", same day)**: the
+     harness at `SCALE=full` (6144² eyes) is pixel-exact too (0.000/255)
+     and sustains **61 fps** through the 5-slot ring with the frames in the
+     page cache (hold depth 0 or 2: identical — the ring is not the
+     limiter), 28 fps on a cold read of the same frames; the helper alone
+     (`zc_drive.py`, R answered at once, `BRAW_HELPER_DEBUG=1` — the loop
+     now reports ms/frame split into "waiting for the SDK" / "waiting for a
+     slot" every 30 frames) reads 59 fps warm / 25 fps cold with the whole
+     frame time in the SDK wait and the slot wait at 0.0 in both. In the
+     GUI (Reframe set in the settings file, clip on the command line, Space
+     posted): "zero-copy d3d11 path, decode scale Full, step 2"; cached
+     frames play at EXACTLY 30 frames per second (decode wait ~30 µs,
+     project 0.3 ms, compose 0.4 ms, render 1 ms); past the cached range
+     the same play drops to ~20 fps with 45–83 ms decode waits — the SMB
+     share delivers ~300 MB/s cold and a 60p 12K clip at step 2 needs
+     30 × 11.75 MB = 352 MB/s. So the reframed BRAW preview is sharp at
+     full source resolution on Windows and I/O-bound only on network
+     storage; the 26 fps reading that started this was the cold read, not
+     the zero-copy path.
 
 26. **Dropped frames: per-frame tables are indexed by the container's
    sample table, not `round(pts / dt)` (2026-10-29).** Report: X6 clips

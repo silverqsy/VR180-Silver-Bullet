@@ -58,3 +58,9 @@ bool zc_pool_fill_metal(ZcPool* p, uint32_t slot, void* mtl_buffer, void* mtl_qu
                         uint32_t src_w, uint32_t src_h, uint32_t src_row_bytes, int track);
 bool zc_pool_fill_cpu(ZcPool* p, uint32_t slot, const uint8_t* src,
                       uint32_t src_w, uint32_t src_h, uint32_t src_row_bytes, int track);
+// A GPU-resident processed image (`resource` + the pipeline's `context` /
+// `queue`: a MTLBuffer + queue on macOS, a CUdeviceptr + CUcontext + CUstream
+// on Windows) blitted into the slot on the GPU. `false` when this platform
+// cannot (the caller then reads the frame back and uses zc_pool_fill_cpu).
+bool zc_pool_fill_gpu(ZcPool* p, uint32_t slot, void* resource, void* context, void* queue,
+                      uint32_t src_w, uint32_t src_h, uint32_t src_row_bytes, int track);

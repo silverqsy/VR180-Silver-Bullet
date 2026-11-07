@@ -67,6 +67,17 @@ if (-not $vcvars) { Write-Error 'vcvars64.bat not found - install Visual Studio 
 
 $opt = if ($Config -eq 'Release') { '/O2 /DNDEBUG' } else { '/Od /Zi /DDEBUG' }
 $defs = '/DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE'
+# The zero-copy pool's CUDA → D3D11 blit needs the CUDA driver API headers
+# (cuda.h, cudaD3D11.h) from a CUDA toolkit at build time only — the driver
+# itself (nvcuda.dll) is loaded at runtime. Without them the helper still
+# builds; GPU-decoded zero-copy frames then go through host memory.
+$cudaInc = if ($env:CUDA_PATH) { Join-Path $env:CUDA_PATH 'include' } else { '' }
+if ($cudaInc -and (Test-Path (Join-Path $cudaInc 'cudaD3D11.h'))) {
+    $defs = "$defs /DBRAW_ZC_CUDA=1 /I`"$cudaInc`""
+    Write-Host "CUDA headers: $cudaInc (zero-copy GPU blit enabled)"
+} else {
+    Write-Host 'CUDA headers not found (CUDA_PATH); zero-copy GPU frames will go through host memory'
+}
 # /utf-8: the sources and the paths passed around are UTF-8. /EHsc: C++
 # exceptions (std::stoull etc.). The IID source is C and must not see the
 # C++ dispatch include, hence the separate compile.

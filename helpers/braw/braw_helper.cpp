@@ -48,6 +48,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <thread>
+#include <chrono>
 #include "braw_platform.h"
 
 #ifdef DEBUG
@@ -716,16 +717,19 @@ private:
         const int track = dual ? (int)(ticket & 1) : -1;
         if (type == blackmagicRawResourceTypeBufferCPU)
             return zc_pool_fill_cpu(zc, slot, (const uint8_t*)res, w, h, w * 4, track);
-#if BRAW_ZC_GPU_BLIT
         void* context = nullptr; void* queue = nullptr;
         img->GetResourceContextAndCommandQueue(&context, &queue);
-        return zc_pool_fill_metal(zc, slot, res, queue, w, h, w * 4, track);
-#else
-        // No GPU-side blit into the pool on this platform: read the SDK's GPU
-        // resource back (the pipe decode's own path) and upload it.
+        if (zc_pool_fill_gpu(zc, slot, res, context, queue, w, h, w * 4, track)) return true;
+#if BRAW_ZC_HOST_FALLBACK
+        // The GPU blit is unavailable here (no CUDA driver, the SDK's CUDA
+        // device is not the pool's adapter, or the helper was built without
+        // the CUDA headers): read the SDK's GPU resource back (the pipe
+        // decode's own path) and upload it.
         std::vector<uint8_t> bytes;
         if (fetch_processed_bytes(img, (size_t)w * h * 4, bytes) != S_OK) return false;
         return zc_pool_fill_cpu(zc, slot, bytes.data(), w, h, w * 4, track);
+#else
+        return false;
 #endif
     }
 
@@ -1409,6 +1413,10 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
     };
     auto give_back = [&](uint32_t slot) { std::lock_guard<std::mutex> lk(fm); free_slots.push_back(slot); };
 
+    // BRAW_HELPER_DEBUG: where the loop spends its time, every 30 frames.
+    static const bool dbg = getenv("BRAW_HELPER_DEBUG") != nullptr;
+    auto now_ms = []() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double t_in_wait = 0, t_in_slot = 0, t_loop0 = dbg ? now_ms() : 0; uint64_t reported = 0;
     // Keep up to `ahead` frames decoding while the app consumes, leaving the
     // app two slots (the frame on screen and the one whose GPU work may
     // still be in flight) before the helper would have to wait.
@@ -1420,7 +1428,10 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
     auto top_up = [&]() -> bool {
         while ((int)inflight.size() < ahead && next < end) {
             uint32_t slot;
-            if (!take_slot(&slot)) return false;     // seek pending or app gone
+            const double ts0 = dbg ? now_ms() : 0;
+            const bool took = take_slot(&slot);
+            if (dbg) t_in_slot += now_ms() - ts0;
+            if (!took) return false;     // seek pending or app gone
             if (is_dual) {
                 cb.set_slot(next * 2 + 0, slot); cb.set_slot(next * 2 + 1, slot);
                 if (!submit_read(ctx, next * 2 + 0, next, 0) || !submit_read(ctx, next * 2 + 1, next, 1)) { give_back(slot); rc = 1; return false; }
@@ -1483,7 +1494,10 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
         }
         const auto [frame, slot] = inflight.front();
         inflight.erase(inflight.begin());
-        if (!wait_frame(frame)) { fprintf(stderr, "ERROR: Decode failed at frame %llu\n", (unsigned long long)frame); rc = 1; break; }
+        const double tw0 = dbg ? now_ms() : 0;
+        const bool okf = wait_frame(frame);
+        if (dbg) { t_in_wait += now_ms() - tw0; if (++reported % 30 == 0) { const double el = now_ms() - t_loop0; fprintf(stderr, "note: zc loop (30 frames): %.1f ms/frame, waiting for the SDK %.1f ms/frame, waiting for a slot %.1f ms/frame\n", el / 30, t_in_wait / 30, t_in_slot / 30); t_in_wait = t_in_slot = 0; t_loop0 = now_ms(); } }
+        if (!okf) { fprintf(stderr, "ERROR: Decode failed at frame %llu\n", (unsigned long long)frame); rc = 1; break; }
         // Report BEFORE topping up: topping up may have to wait for the app
         // to return a slot, and the app returns slots only as it moves on
         // to frames it has been told about — reporting after waiting

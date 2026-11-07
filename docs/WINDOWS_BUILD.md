@@ -182,21 +182,29 @@ builds and runs; loading a `.braw` reports the helper as missing.
 1. Install the Blackmagic RAW package (Capture and Playback Software →
    Blackmagic RAW on blackmagicdesign.com/support), version 6.x, and tick
    the **SDK** component — it lands in
-   `C:Program Files (x86)Blackmagic DesignBlackmagic RAWBlackmagic RAW SDKWin`
-   (`IncludeBlackmagicRawAPI.h` must exist). DaVinci Resolve / the RAW
-   Player ship only the runtime DLL, not the headers.
+   `C:\Program Files (x86)\Blackmagic Design\Blackmagic RAW\Blackmagic RAW SDK\Win`
+   (`Include\BlackmagicRawAPI.idl` and `Include\BlackmagicRawAPIDispatch.cpp`
+   must exist; the build script runs MIDL on the IDL). DaVinci Resolve / the
+   RAW Player ship only the runtime DLL, not the SDK.
 2. With Visual Studio 2022/2019 Build Tools installed:
    ```pwsh
-   .helpersrawuild_braw.ps1          # → helpersinraw_helper.exe
-   .helpersinraw_helper.exe --info <clip.braw>
+   .\helpers\braw\build_braw.ps1          # → helpers\bin\braw_helper.exe
+   .\helpers\bin\braw_helper.exe --info <clip.braw>
    ```
-   `-SdkDir` / `:BRAW_SDK_DIR` override the SDK location.
+   `-SdkDir` / `$env:BRAW_SDK_DIR` override the SDK location. If a CUDA
+   toolkit is installed (`$env:CUDA_PATH` with `include\cudaD3D11.h`), the
+   script also compiles the zero-copy pool's CUDA → D3D11 blit
+   (`/DBRAW_ZC_CUDA=1`); only the headers are needed at build time, the
+   driver (`nvcuda.dll`) is loaded at runtime. Without them the helper still
+   builds, and a CUDA-decoded preview frame is read back through host memory
+   before it reaches the shared texture (slower at full 12K).
 3. At runtime the helper loads `BlackmagicRawAPI.dll` from the SDK's
    `Libraries` folder, else the RAW Player / Speed Test runtime, else its own
-   directory (`:BRAW_SDK_LIB_DIR` overrides). Decoding uses the SDK's
+   directory (`$env:BRAW_SDK_LIB_DIR` overrides). Decoding uses the SDK's
    CUDA pipeline when an NVIDIA GPU is present (`--pipeline cpu` forces the
-   CPU). The IOSurface zero-copy hand-off is macOS-only; on Windows frames
-   come back through the pipe (the same path the CPU preview uses).
+   CPU). The preview hand-off is zero-copy on Windows too: the helper fills
+   shareable D3D11 textures (the twin of the macOS IOSurface pool) that the
+   app imports into Vulkan once per slot; `VR180_BRAW_ZC=0` forces the pipe.
 
 ## Optional polish (do after it builds & runs)
 

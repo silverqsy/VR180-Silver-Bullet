@@ -213,7 +213,10 @@ file, stills, and the camera's own colour handling.
   CUDA pipeline when an NVIDIA GPU is present. The preview hand-off is
   GPU-resident on Windows too: the helper fills shareable D3D11 textures
   the app maps directly (the Windows twin of the macOS IOSurface path), so
-  no frame pixels cross the pipe during playback. Exports take the
+  no frame pixels cross the pipe during playback. In the reframed output
+  mode the preview decodes the full 12K frame on the GPU and hands it over
+  with a CUDA → D3D11 copy, so a zoomed viewport shows native pixels as on
+  macOS, at the full playback rate from local storage. Exports take the
   readback path.
 
 ## 2.5.2 — 2026-10-10

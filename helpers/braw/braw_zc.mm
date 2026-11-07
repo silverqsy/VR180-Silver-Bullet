@@ -121,6 +121,11 @@ uint64_t zc_pool_handle(const ZcPool* p, uint32_t slot, int eye) { return zc_poo
 const char* zc_transport() { return "iosurface"; }
 uint32_t zc_owner_pid() { return (uint32_t)getpid(); }
 void zc_set_adapter_luid(uint64_t) {}
+bool zc_pool_fill_gpu(ZcPool* p, uint32_t slot, void* resource, void* context, void* queue,
+                      uint32_t src_w, uint32_t src_h, uint32_t src_row_bytes, int track) {
+    (void)context;   // the Metal device comes from the queue
+    return zc_pool_fill_metal(p, slot, resource, queue, src_w, src_h, src_row_bytes, track);
+}
 
 bool zc_pool_fill_metal(ZcPool* p, uint32_t slot, void* mtl_buffer, void* mtl_queue,
                         uint32_t src_w, uint32_t src_h, uint32_t src_row_bytes, int track) {

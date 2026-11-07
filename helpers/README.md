@@ -49,7 +49,9 @@ only C++ headers. It links against the user's installed SDK at build time
 the SDK is not redistributable); `helpers/braw/braw_platform.h` is the
 platform shim (strings, GPU pipeline: Metal / CUDA); the zero-copy
 hand-off is `braw_zc.mm` (IOSurfaces) on macOS and `braw_zc_win.cpp`
-(shareable D3D11 textures) on Windows, behind the one `braw_zc.h`. Without the SDK installed, the BRAW input
+(shareable D3D11 textures, filled by a CUDA → D3D11 copy when the SDK
+decodes on CUDA and the CUDA headers were present at build time) on
+Windows, behind the one `braw_zc.h`. Without the SDK installed, the BRAW input
 path is unavailable — the rest of the app still works.
 
 ## Why these stay Swift

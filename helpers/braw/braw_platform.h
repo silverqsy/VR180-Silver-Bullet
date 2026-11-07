@@ -55,9 +55,10 @@ static inline void sdk_str_free(SdkString s) { if (s) CFRelease(s); }
 #define BRAW_GPU_PIPELINE      blackmagicRawPipelineMetal
 #define BRAW_GPU_PIPELINE_NAME "metal"
 // Zero-copy hand-off: global IOSurfaces (braw_zc.mm), filled by a Metal
-// blit straight from the SDK's buffer.
+// blit straight from the SDK's buffer (no host fallback: a failed blit is
+// a failed frame, as before).
 #define BRAW_HAVE_ZEROCOPY 1
-#define BRAW_ZC_GPU_BLIT 1
+#define BRAW_ZC_HOST_FALLBACK 0
 
 // The directory handed to CreateBlackmagicRawFactoryInstanceFromPath.
 static inline std::string sdk_library_dir() {
@@ -127,11 +128,16 @@ static inline void sdk_str_free(SdkString s) { if (s) SysFreeString(s); }
 
 #define BRAW_GPU_PIPELINE      blackmagicRawPipelineCUDA
 #define BRAW_GPU_PIPELINE_NAME "cuda"
-// Zero-copy hand-off: shareable D3D11 textures (braw_zc_win.cpp). No
-// GPU-side blit into the pool: a GPU-decoded frame is read back through the
-// SDK and uploaded (see `fill_slot`).
+// Zero-copy hand-off: shareable D3D11 textures (braw_zc_win.cpp), filled
+// by a CUDA → D3D11 blit when the SDK decodes on CUDA and the driver is
+// present (`BRAW_ZC_CUDA`, set by the build when the CUDA headers are
+// found); otherwise a GPU frame is read back through the SDK and uploaded
+// (see `fill_slot`).
 #define BRAW_HAVE_ZEROCOPY 1
-#define BRAW_ZC_GPU_BLIT 0
+#define BRAW_ZC_HOST_FALLBACK 1
+#ifndef BRAW_ZC_CUDA
+#define BRAW_ZC_CUDA 0
+#endif
 #include "braw_zc.h"
 
 // The SDK library directory: `BRAW_SDK_LIB_DIR` if set, else the SDK's own
