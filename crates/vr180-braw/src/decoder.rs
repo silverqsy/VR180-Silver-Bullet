@@ -230,7 +230,7 @@ impl BrawDecoder {
     /// blocks on a full stderr pipe.
     pub fn start(path: impl AsRef<Path>, opts: &DecodeOptions) -> Result<Self> {
         let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
-            expected: "helpers/bin/braw_helper".into(),
+            expected: format!("helpers/bin/{}", crate::helper_file_name()),
         })?;
         let mut cmd = Command::new(&helper);
         cmd.arg("--decode").arg(path.as_ref());

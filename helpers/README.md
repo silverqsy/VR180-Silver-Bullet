@@ -19,6 +19,8 @@ exactly as they are in the Python app.
 ```sh
 ./helpers/build_swift.sh   # mvhevc_encode, vt_denoise, apac_encode
 ./helpers/braw/build_braw.sh   # braw_helper (requires Blackmagic RAW SDK installed)
+.\helpers\braw\build_braw.ps1  # the same helper on Windows (MSVC; requires the Blackmagic RAW SDK with its Windows headers)
+.helpersrawuild_braw.ps1  # the same helper on Windows (MSVC; requires the Blackmagic RAW SDK with the Windows headers)
 ```
 
 Output binaries go to `helpers/bin/`, which is `.gitignore`d. The
@@ -43,10 +45,12 @@ Three guards now close that gap:
   stays current after a plain `cargo build`.
 
 `braw_helper` is C++ (not Swift) because the Blackmagic RAW SDK ships
-only C++ headers. It links against the user's installed `Blackmagic
-RAW.framework` at build time (the SDK is not redistributable). Without
-the SDK installed, the BRAW input path is unavailable — the rest of the
-app still works.
+only C++ headers. It links against the user's installed SDK at build time
+(`BlackmagicRawAPI.framework` on macOS, `BlackmagicRawAPI.dll` on Windows —
+the SDK is not redistributable); `helpers/braw/braw_platform.h` is the
+platform shim (strings, GPU pipeline: Metal / CUDA, the macOS-only
+IOSurface zero-copy hand-off). Without the SDK installed, the BRAW input
+path is unavailable — the rest of the app still works.
 
 ## Why these stay Swift
 

@@ -23,7 +23,7 @@ impl BrawShutters {
     /// Run `braw_helper --shutters <path> --step <step>`.
     pub fn extract(path: impl AsRef<Path>, step: u64) -> Result<Self> {
         let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
-            expected: "helpers/bin/braw_helper".into(),
+            expected: format!("helpers/bin/{}", crate::helper_file_name()),
         })?;
         let out = Command::new(&helper)
             .arg("--shutters").arg(path.as_ref())

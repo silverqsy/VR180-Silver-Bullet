@@ -46,7 +46,7 @@ pub fn extract_audio_to_wav(
     dst: &Path,
 ) -> Result<BrawAudioHeader> {
     let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
-        expected: "helpers/bin/braw_helper".into(),
+        expected: format!("helpers/bin/{}", crate::helper_file_name()),
     })?;
 
     tracing::info!(

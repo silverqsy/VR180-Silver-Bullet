@@ -77,7 +77,7 @@ pub use info::BrawInfo;
 /// Crate-level error.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("braw_helper binary not found at {expected}")]
+    #[error("braw_helper binary not found at {expected} — build it with helpers/braw/build_braw.sh (macOS) or helpers/braw/build_braw.ps1 (Windows); both need the Blackmagic RAW SDK installed")]
     HelperMissing { expected: String },
 
     #[error("braw_helper exited with code {code}: {stderr}")]
@@ -98,6 +98,11 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The helper's file name on this platform (`braw_helper.exe` on Windows).
+pub fn helper_file_name() -> String {
+    format!("braw_helper{}", std::env::consts::EXE_SUFFIX)
+}
+
 /// Locate the `braw_helper` binary.
 ///
 /// Mirrors the Swift-helper logic in `vr180-pipeline::helpers`:
@@ -111,7 +116,7 @@ pub fn locate_helper() -> Option<std::path::PathBuf> {
     // Dev path: walk up from CARGO_MANIFEST_DIR to workspace root.
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     if let Some(ws_root) = manifest.parent().and_then(|p| p.parent()) {
-        let dev = ws_root.join("helpers").join("bin").join("braw_helper");
+        let dev = ws_root.join("helpers").join("bin").join(helper_file_name());
         if dev.is_file() {
             return Some(dev);
         }
@@ -119,7 +124,7 @@ pub fn locate_helper() -> Option<std::path::PathBuf> {
     // Release: next to current exe.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("braw_helper");
+            let p = dir.join(helper_file_name());
             if p.is_file() {
                 return Some(p);
             }

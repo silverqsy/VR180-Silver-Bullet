@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 /// `Err` when the clip carries none or the helper is missing.
 pub fn extract_embedded_lut(path: impl AsRef<Path>, title: &str) -> Result<PathBuf> {
     let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
-        expected: "helpers/bin/braw_helper".into(),
+        expected: format!("helpers/bin/{}", crate::helper_file_name()),
     })?;
     let src = path.as_ref();
     let safe: String = title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();

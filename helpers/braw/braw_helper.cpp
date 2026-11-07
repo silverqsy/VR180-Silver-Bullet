@@ -6,7 +6,7 @@
  *   --decode <file.braw> [--start N] [--count M] [--track T]     → raw RGBA frames to stdout (older builds: BGRA)
  *            [--16bit] [--scale full|half|quarter|eighth]          (JSON header on stderr first)
  *            [--look film|video|extended|rec709] [--gamma S] [--gamut S] [--wb K] ...
- *            [--pipeline auto|metal|cpu]  (auto: the first Metal device, else the CPU;
+ *            [--pipeline auto|metal|cuda|cpu]  (auto: the first GPU device — Metal on macOS, CUDA on Windows — else the CPU;
  *             the header reports "pipeline" + "gpu_device"; frames are pipelined 2–3 deep)
  *            [--step N]  (every Nth frame; "frames" in the header = the emitted count, "format": "rgba")
  *   --gyro  <file.braw>                                          → binary gyro+accel to stdout, JSON header to stderr
@@ -48,9 +48,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <thread>
-#include "braw_zc.h"
-
-#include <CoreServices/CoreServices.h>
+#include "braw_platform.h"
 
 #ifdef DEBUG
     #include <cassert>
@@ -59,19 +57,11 @@
     #define VERIFY(condition) condition
 #endif
 
-static const char* SDK_LIB_PATH = "/Applications/Blackmagic RAW/Blackmagic RAW SDK/Mac/Libraries";
+// The SDK library directory is platform-specific: `sdk_library_dir()` in braw_platform.h.
 
 // ── Utility ──────────────────────────────────────────────────────────────────
 
-static std::string cfstr_to_string(CFStringRef cfStr) {
-    if (!cfStr) return "";
-    const char* cStr = CFStringGetCStringPtr(cfStr, kCFStringEncodingUTF8);
-    if (cStr) return cStr;
-    char buf[2048];
-    if (CFStringGetCString(cfStr, buf, sizeof(buf), kCFStringEncodingUTF8))
-        return buf;
-    return "";
-}
+static std::string cfstr_to_string(SdkString s) { return std_str(s); }
 
 // Minimal JSON string escaping for the values we print (titles, names).
 static std::string json_escape(const std::string& s) {
@@ -87,9 +77,9 @@ static std::string json_escape(const std::string& s) {
 static std::string get_metadata_string(IBlackmagicRawClip* clip, const char* key) {
     Variant v;
     VariantInit(&v);
-    CFStringRef cfKey = CFStringCreateWithCString(NULL, key, kCFStringEncodingUTF8);
+    SdkString cfKey = sdk_str(key);
     HRESULT result = clip->GetMetadata(cfKey, &v);
-    CFRelease(cfKey);
+    sdk_str_free(cfKey);
     if (result != S_OK) return "";
     std::string s;
     if (v.vt == blackmagicRawVariantTypeString)
@@ -101,9 +91,9 @@ static std::string get_metadata_string(IBlackmagicRawClip* clip, const char* key
 static double get_metadata_float(IBlackmagicRawClip* clip, const char* key, double def = 0.0) {
     Variant v;
     VariantInit(&v);
-    CFStringRef cfKey = CFStringCreateWithCString(NULL, key, kCFStringEncodingUTF8);
+    SdkString cfKey = sdk_str(key);
     HRESULT result = clip->GetMetadata(cfKey, &v);
-    CFRelease(cfKey);
+    sdk_str_free(cfKey);
     if (result != S_OK) return def;
     double val = def;
     if (v.vt == blackmagicRawVariantTypeFloat32) val = v.fltVal;
@@ -120,11 +110,11 @@ static double get_metadata_float(IBlackmagicRawClip* clip, const char* key, doub
 // A 2-element numeric array ([w, h] / [x, y]) → both values, 0 if absent.
 static bool get_metadata_pair(IBlackmagicRawClip* clip, const char* key, double* a, double* b) {
     Variant v; VariantInit(&v);
-    CFStringRef cfKey = CFStringCreateWithCString(NULL, key, kCFStringEncodingUTF8);
-    HRESULT result = clip->GetMetadata(cfKey, &v); CFRelease(cfKey);
+    SdkString cfKey = sdk_str(key);
+    HRESULT result = clip->GetMetadata(cfKey, &v); sdk_str_free(cfKey);
     bool ok = false;
     if (result == S_OK && v.vt == blackmagicRawVariantTypeSafeArray && v.parray) {
-        BlackmagicRawVariantType et; long lo = 0, hi = -1; void* data = nullptr;
+        SdkVarType et; long lo = 0, hi = -1; void* data = nullptr;
         SafeArrayGetVartype(v.parray, &et); SafeArrayGetLBound(v.parray, 1, &lo); SafeArrayGetUBound(v.parray, 1, &hi); SafeArrayAccessData(v.parray, &data);
         if (data && hi - lo >= 1) {
             auto at = [&](long k) -> double {
@@ -218,10 +208,10 @@ public:
             haveIdx = frame->GetFrameIndex(&idx) == S_OK;
             if (wantColor) read_frame_color(frame);
             Variant v; VariantInit(&v);
-            CFStringRef k = CFStringCreateWithCString(NULL, "shutter_value", kCFStringEncodingUTF8);
+            SdkString k = sdk_str("shutter_value");
             if (frame->GetMetadata(k, &v) == S_OK && v.vt == blackmagicRawVariantTypeString)
                 fs = parse_shutter_text(cfstr_to_string(v.bstrVal), fps);
-            VariantClear(&v); CFRelease(k);
+            VariantClear(&v); sdk_str_free(k);
         }
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -236,8 +226,8 @@ public:
     void ProcessComplete(IBlackmagicRawJob*, HRESULT, IBlackmagicRawProcessedImage*) override {}
     void TrimProgress(IBlackmagicRawJob*, float) override {}
     void TrimComplete(IBlackmagicRawJob*, HRESULT) override {}
-    void SidecarMetadataParseWarning(IBlackmagicRawClip*, CFStringRef, uint32_t, CFStringRef) override {}
-    void SidecarMetadataParseError(IBlackmagicRawClip*, CFStringRef, uint32_t, CFStringRef) override {}
+    void SidecarMetadataParseWarning(IBlackmagicRawClip*, SdkString, uint32_t, SdkString) override {}
+    void SidecarMetadataParseError(IBlackmagicRawClip*, SdkString, uint32_t, SdkString) override {}
     void PreparePipelineComplete(void*, HRESULT) override {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, LPVOID*) override { return E_NOTIMPL; }
     ULONG STDMETHODCALLTYPE AddRef() override { return 0; }
@@ -324,10 +314,10 @@ static void print_attribute_list(IBlackmagicRawClipProcessingAttributes* attrs, 
 // Set a string clip attribute; on rejection report the accepted list.
 static bool set_clip_string_attr(IBlackmagicRawClipProcessingAttributes* attrs, BlackmagicRawClipProcessingAttribute attr, const std::string& val) {
     if (val.empty()) return true;
-    CFStringRef cf = CFStringCreateWithCString(NULL, val.c_str(), kCFStringEncodingUTF8);
+    SdkString cf = sdk_str(val.c_str());
     Variant v; VariantInit(&v); v.vt = blackmagicRawVariantTypeString; v.bstrVal = cf;
     HRESULT hr = attrs->SetClipAttribute(attr, &v);
-    CFRelease(cf);
+    sdk_str_free(cf);
     if (hr != S_OK) {
         // The same override is applied to the clip and to the cloned
         // per-job attributes; report each rejection once.
@@ -484,34 +474,29 @@ static bool parse_scale(const std::string& s, BlackmagicRawResolutionScale* out)
 
 // ── GPU pipeline ─────────────────────────────────────────────────────────────
 
-static std::string cfstr(CFStringRef str) {
-    if (!str) return "";
-    char buf[512];
-    if (CFStringGetCString(str, buf, sizeof buf, kCFStringEncodingUTF8)) return buf;
-    return "";
-}
+static std::string cfstr(SdkString s) { return std_str(s); }
 
-// The first Metal pipeline device the SDK offers (caller owns the
-// reference; `name` receives its name), or null when the SDK has no Metal
-// pipeline on this machine.
-static IBlackmagicRawPipelineDevice* first_metal_device(IBlackmagicRawFactory* factory, IBlackmagicRaw* codec, std::string* name) {
+// The first GPU pipeline device the SDK offers — Metal on macOS, CUDA on
+// Windows (caller owns the reference; `name` receives its name), or null
+// when the SDK has no such pipeline on this machine.
+static IBlackmagicRawPipelineDevice* first_gpu_device(IBlackmagicRawFactory* factory, IBlackmagicRaw* codec, std::string* name) {
     IBlackmagicRawConfiguration* cfg = nullptr;
     if (codec->QueryInterface(IID_IBlackmagicRawConfiguration, (void**)&cfg) != S_OK || !cfg) return nullptr;
     bool supported = false;
-    HRESULT r = cfg->IsPipelineSupported(blackmagicRawPipelineMetal, &supported);
+    HRESULT r = cfg->IsPipelineSupported(BRAW_GPU_PIPELINE, &supported);
     cfg->Release();
     if (r != S_OK || !supported) return nullptr;
     IBlackmagicRawPipelineDeviceIterator* it = nullptr;
-    if (factory->CreatePipelineDeviceIterator(blackmagicRawPipelineMetal, blackmagicRawInteropNone, &it) != S_OK || !it) {
+    if (factory->CreatePipelineDeviceIterator(BRAW_GPU_PIPELINE, blackmagicRawInteropNone, &it) != S_OK || !it) {
         it = nullptr;
-        if (factory->CreatePipelineDeviceIterator(blackmagicRawPipelineMetal, blackmagicRawInteropOpenGL, &it) != S_OK || !it) return nullptr;
+        if (factory->CreatePipelineDeviceIterator(BRAW_GPU_PIPELINE, blackmagicRawInteropOpenGL, &it) != S_OK || !it) return nullptr;
     }
     IBlackmagicRawPipelineDevice* dev = nullptr;
     r = it->CreateDevice(&dev);
     it->Release();
     if (r != S_OK || !dev) return nullptr;
-    CFStringRef n = nullptr;
-    if (dev->GetName(&n) == S_OK && n) { *name = cfstr(n); CFRelease(n); }
+    SdkString n = nullptr;
+    if (dev->GetName(&n) == S_OK && n) { *name = cfstr(n); sdk_str_free(n); }
     return dev;
 }
 
@@ -531,26 +516,26 @@ static bool setup_gpu_pipeline(IBlackmagicRawFactory* factory, IBlackmagicRaw* c
     g_activePipeline = "cpu";
     if (g_pipelineArg == "cpu") return true;
     std::string name;
-    IBlackmagicRawPipelineDevice* dev = first_metal_device(factory, codec, &name);
+    IBlackmagicRawPipelineDevice* dev = first_gpu_device(factory, codec, &name);
     const BlackmagicRawResourceFormat fmt = g_use16bit ? blackmagicRawResourceFormatRGBAU16 : blackmagicRawResourceFormatRGBAU8;
     if (dev && !device_supports_format(dev, fmt)) {
-        fprintf(stderr, "note: Metal device '%s' does not offer the RGBA %d-bit format; decoding on the CPU\n", name.c_str(), g_use16bit ? 16 : 8);
+        fprintf(stderr, "note: %s device '%s' does not offer the RGBA %d-bit format; decoding on the CPU\n", BRAW_GPU_PIPELINE_NAME, name.c_str(), g_use16bit ? 16 : 8);
         dev->Release(); dev = nullptr;
     }
     if (!dev) {
-        if (g_pipelineArg == "metal") { fprintf(stderr, "ERROR: no Metal pipeline device available\n"); return false; }
-        fprintf(stderr, "note: no Metal pipeline device; decoding on the CPU\n");
+        if (g_pipelineArg == BRAW_GPU_PIPELINE_NAME) { fprintf(stderr, "ERROR: no %s pipeline device available\n", BRAW_GPU_PIPELINE_NAME); return false; }
+        fprintf(stderr, "note: no %s pipeline device; decoding on the CPU\n", BRAW_GPU_PIPELINE_NAME);
         return true;
     }
     IBlackmagicRawConfiguration* cfg = nullptr;
-    if (codec->QueryInterface(IID_IBlackmagicRawConfiguration, (void**)&cfg) != S_OK || !cfg) { dev->Release(); return g_pipelineArg != "metal"; }
+    if (codec->QueryInterface(IID_IBlackmagicRawConfiguration, (void**)&cfg) != S_OK || !cfg) { dev->Release(); return g_pipelineArg != BRAW_GPU_PIPELINE_NAME; }
     HRESULT r = cfg->SetFromDevice(dev);
     cfg->Release();
     if (r != S_OK) {
-        fprintf(stderr, "%s: SetFromDevice('%s') failed (0x%08x)%s\n", g_pipelineArg == "metal" ? "ERROR" : "note",
-                name.c_str(), (unsigned)r, g_pipelineArg == "metal" ? "" : "; decoding on the CPU");
+        fprintf(stderr, "%s: SetFromDevice('%s') failed (0x%08x)%s\n", g_pipelineArg == BRAW_GPU_PIPELINE_NAME ? "ERROR" : "note",
+                name.c_str(), (unsigned)r, g_pipelineArg == BRAW_GPU_PIPELINE_NAME ? "" : "; decoding on the CPU");
         dev->Release();
-        return g_pipelineArg != "metal";
+        return g_pipelineArg != BRAW_GPU_PIPELINE_NAME;
     }
     IBlackmagicRawConfigurationEx* ex = nullptr;
     if (codec->QueryInterface(IID_IBlackmagicRawConfigurationEx, (void**)&ex) == S_OK && ex) {
@@ -559,7 +544,7 @@ static bool setup_gpu_pipeline(IBlackmagicRawFactory* factory, IBlackmagicRaw* c
     }
     g_gpuDevice = dev;
     g_gpuDeviceName = name;
-    g_activePipeline = "metal";
+    g_activePipeline = BRAW_GPU_PIPELINE_NAME;
     return true;
 }
 
@@ -690,8 +675,8 @@ public:
     // SDK ≥ 4.x adds audio read jobs to the callback interface; we read audio
     // synchronously, so nothing to do here.
     void ReadAudioComplete(IBlackmagicRawJob* job, HRESULT, IBlackmagicRawAudioBuffer*) override { if (job) job->Release(); }
-    void SidecarMetadataParseWarning(IBlackmagicRawClip*, CFStringRef, uint32_t, CFStringRef) override {}
-    void SidecarMetadataParseError(IBlackmagicRawClip*, CFStringRef, uint32_t, CFStringRef) override {}
+    void SidecarMetadataParseWarning(IBlackmagicRawClip*, SdkString, uint32_t, SdkString) override {}
+    void SidecarMetadataParseError(IBlackmagicRawClip*, SdkString, uint32_t, SdkString) override {}
     void PreparePipelineComplete(void*, HRESULT) override {}
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, LPVOID*) override { return E_NOTIMPL; }
@@ -761,16 +746,19 @@ struct ClipContext {
     // `wantGpu`: configure the decode pipeline per `--pipeline` (only the
     // modes that decode frames pay for the Metal device).
     bool open(const char* path, bool wantGpu = false) {
-        factory = CreateBlackmagicRawFactoryInstanceFromPath(
-            CFStringCreateWithCString(NULL, SDK_LIB_PATH, kCFStringEncodingUTF8));
+        {
+            SdkString libDir = sdk_str(sdk_library_dir().c_str());
+            factory = CreateBlackmagicRawFactoryInstanceFromPath(libDir);
+            sdk_str_free(libDir);
+        }
         if (!factory) { std::cerr << "ERROR: Cannot create BRAW factory. SDK not found." << std::endl; return false; }
 
         if (factory->CreateCodec(&codec) != S_OK) { std::cerr << "ERROR: Cannot create codec." << std::endl; return false; }
         if (wantGpu && !setup_gpu_pipeline(factory, codec)) return false;
 
-        CFStringRef cfPath = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
+        SdkString cfPath = sdk_str(path);
         HRESULT result = codec->OpenClip(cfPath, &clip);
-        CFRelease(cfPath);
+        sdk_str_free(cfPath);
         if (result != S_OK) { std::cerr << "ERROR: Cannot open clip." << std::endl; return false; }
 
         // Check for multi-video tracks
@@ -942,7 +930,7 @@ static int do_info(const char* path) {
             // starts a Custom edit from these instead of the flat defaults.
             IBlackmagicRawToneCurve* tc = nullptr;
             if (ctx.codec->QueryInterface(IID_IBlackmagicRawToneCurve, (void**)&tc) != S_OK) tc = nullptr;
-            CFStringRef camCf = CFStringCreateWithCString(NULL, cameraModel.c_str(), kCFStringEncodingUTF8);
+            SdkString camCf = sdk_str(cameraModel.c_str());
             auto tonePresetsOf = [&](IBlackmagicRawClipProcessingAttributes* at, uint16_t gen) -> std::string {
                 std::string out = "{";
                 if (!tc) return out + "}";
@@ -1007,7 +995,7 @@ static int do_info(const char* path) {
             }
             gensJson += "}";
             const std::string tonePresets = tonePresetsOf(ca, curGen);
-            CFRelease(camCf);
+            sdk_str_free(camCf);
             if (tc) tc->Release();
 
             std::string isoList = "[";
@@ -1051,8 +1039,8 @@ static int do_info(const char* path) {
     // The pipeline `--decode` takes by default: the first Metal device when
     // the SDK offers one, else the CPU.
     std::string pipeline = "cpu", gpuDevice;
-    if (IBlackmagicRawPipelineDevice* dev = first_metal_device(ctx.factory, ctx.codec, &gpuDevice)) {
-        pipeline = "metal";
+    if (IBlackmagicRawPipelineDevice* dev = first_gpu_device(ctx.factory, ctx.codec, &gpuDevice)) {
+        pipeline = BRAW_GPU_PIPELINE_NAME;
         dev->Release();
     }
 
@@ -1106,7 +1094,7 @@ static int do_info(const char* path) {
     printf("  \"color\": %s,\n", colorJson.c_str());
     printf("  \"pipeline\": \"%s\",\n", pipeline.c_str());
     printf("  \"zerocopy\": true,\n");
-    if (pipeline == "metal") printf("  \"gpu_device\": \"%s\",\n", gpuDevice.c_str());
+    if (pipeline != "cpu") printf("  \"gpu_device\": \"%s\",\n", gpuDevice.c_str());
     else printf("  \"gpu_device\": null,\n");
     if (haveScales)
         printf("  \"resolution_scales\": {\"full\": [%u, %u], \"half\": [%u, %u], \"quarter\": [%u, %u], \"eighth\": [%u, %u]}\n",
@@ -1201,12 +1189,12 @@ static bool read_embedded_lut(IBlackmagicRawClip* clip, uint32_t* size, std::str
     if (clip->QueryInterface(IID_IBlackmagicRawClipProcessingAttributes, (void**)&attrs) == S_OK && attrs) {
         IBlackmagicRawPost3DLUT* lut = nullptr;
         if (attrs->GetEmbeddedPost3DLUT(&lut) == S_OK && lut) {
-            uint32_t n = 0, bytes = 0; void* buf = nullptr; CFStringRef s = nullptr;
+            uint32_t n = 0, bytes = 0; void* buf = nullptr; SdkString s = nullptr;
             lut->GetSize(&n);
             lut->GetResourceSizeBytes(&bytes);
             lut->GetResourceCPU(&buf);
-            if (lut->GetName(&s) == S_OK && s) { *name = cfstr_to_string(s); CFRelease(s); }
-            if (lut->GetTitle(&s) == S_OK && s) { *title = cfstr_to_string(s); CFRelease(s); }
+            if (lut->GetName(&s) == S_OK && s) { *name = cfstr_to_string(s); sdk_str_free(s); }
+            if (lut->GetTitle(&s) == S_OK && s) { *title = cfstr_to_string(s); sdk_str_free(s); }
             const size_t want = (size_t)n * n * n * 3;
             if (n > 0 && buf && bytes >= want * sizeof(float)) {
                 data->assign((const float*)buf, (const float*)buf + want);
@@ -1226,11 +1214,11 @@ static bool read_embedded_lut(IBlackmagicRawClip* clip, uint32_t* size, std::str
     if (n == 0) return false;
     const size_t want = (size_t)n * n * n * 3;
     Variant v; VariantInit(&v);
-    CFStringRef k = CFStringCreateWithCString(NULL, "post_3dlut_embedded_data", kCFStringEncodingUTF8);
-    HRESULT hr = clip->GetMetadata(k, &v); CFRelease(k);
+    SdkString k = sdk_str("post_3dlut_embedded_data");
+    HRESULT hr = clip->GetMetadata(k, &v); sdk_str_free(k);
     bool ok = false;
     if (hr == S_OK && v.vt == blackmagicRawVariantTypeSafeArray && v.parray) {
-        BlackmagicRawVariantType et; long lo = 0, hi = -1; void* raw = nullptr;
+        SdkVarType et; long lo = 0, hi = -1; void* raw = nullptr;
         SafeArrayGetVartype(v.parray, &et); SafeArrayGetLBound(v.parray, 1, &lo); SafeArrayGetUBound(v.parray, 1, &hi); SafeArrayAccessData(v.parray, &raw);
         const size_t count = (hi >= lo) ? (size_t)(hi - lo + 1) : 0;
         if (raw && et == blackmagicRawVariantTypeFloat32 && count >= want) {
@@ -1362,7 +1350,7 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
     fprintf(stderr, "{\"width\": %u, \"height\": %u, \"frames\": %llu, \"dual_stream\": %s, \"bit_depth\": 8, \"format\": \"rgba\", \"step\": %llu",
             is_dual ? pw * 2 : pw, is_dual ? ph : ph, (unsigned long long)emitted, is_dual ? "true" : "false", (unsigned long long)step);
     fprintf(stderr, ", \"pipeline\": \"%s\"", g_activePipeline.c_str());
-    if (g_activePipeline == "metal") fprintf(stderr, ", \"gpu_device\": \"%s\"", g_gpuDeviceName.c_str());
+    if (g_activePipeline != "cpu") fprintf(stderr, ", \"gpu_device\": \"%s\"", g_gpuDeviceName.c_str());
     fprintf(stderr, ", \"transport\": \"iosurface\", \"slots\": %u, \"eye_width\": %u, \"eye_height\": %u, \"pad_rows\": %d, \"mono\": %s, \"surfaces\": [",
             slots, g.eye_w, g.eye_h, g.pad_rows, g_mono ? "true" : "false");
     for (uint32_t s = 0; s < slots; s++)
@@ -1579,7 +1567,7 @@ static int do_decode(const char* path, uint64_t start, uint64_t count, int track
         if (dual)
             fprintf(stderr, ", \"track0_width\": %u, \"track0_height\": %u, \"track1_width\": %u, \"track1_height\": %u", w0, h0, w1, h1);
         fprintf(stderr, ", \"pipeline\": \"%s\"", g_activePipeline.c_str());
-        if (g_activePipeline == "metal") fprintf(stderr, ", \"gpu_device\": \"%s\"", g_gpuDeviceName.c_str());
+        if (g_activePipeline != "cpu") fprintf(stderr, ", \"gpu_device\": \"%s\"", g_gpuDeviceName.c_str());
         fprintf(stderr, "}\n");
         fflush(stderr);
     };
@@ -1714,7 +1702,7 @@ static std::string variant_repr(const Variant& v) {
         case blackmagicRawVariantTypeString: return "\"" + cfstr_to_string(v.bstrVal) + "\"";
         case blackmagicRawVariantTypeSafeArray: {
             SafeArray* a = v.parray; if (!a) return "<null array>";
-            BlackmagicRawVariantType et; long lo = 0, hi = -1; void* data = nullptr;
+            SdkVarType et; long lo = 0, hi = -1; void* data = nullptr;
             SafeArrayGetVartype(a, &et); SafeArrayGetLBound(a, 1, &lo); SafeArrayGetUBound(a, 1, &hi); SafeArrayAccessData(a, &data);
             std::string out = "[";
             for (long i = lo; i <= hi && data; i++) {
@@ -1742,7 +1730,7 @@ static std::string variant_repr(const Variant& v) {
 static void dump_iterator(IBlackmagicRawMetadataIterator* it, const char* prefix) {
     if (!it) return;
     while (true) {
-        CFStringRef key = nullptr; Variant v; VariantInit(&v);
+        SdkString key = nullptr; Variant v; VariantInit(&v);
         if (it->GetKey(&key) != S_OK || !key) break;
         std::string ks = cfstr_to_string(key);
         if (it->GetData(&v) == S_OK) printf("%s%s = %s\n", prefix, ks.c_str(), variant_repr(v).c_str());
@@ -1759,8 +1747,8 @@ public:
         if (result == S_OK && frame) {
             IBlackmagicRawMetadataIterator* it = nullptr;
             if (frame->GetMetadataIterator(&it) == S_OK && it) { dump_iterator(it, "frame."); it->Release(); }
-            uint64_t ts = 0; CFStringRef tc = nullptr;
-            if (frame->GetTimecode(&tc) == S_OK && tc) { printf("frame.timecode = \"%s\"\n", cfstr_to_string(tc).c_str()); CFRelease(tc); }
+            uint64_t ts = 0; SdkString tc = nullptr;
+            if (frame->GetTimecode(&tc) == S_OK && tc) { printf("frame.timecode = \"%s\"\n", cfstr_to_string(tc).c_str()); sdk_str_free(tc); }
             (void)ts;
         } else {
             fprintf(stderr, "ERROR: read frame failed (%ld)\n", (long)result);
@@ -1773,8 +1761,8 @@ public:
     void ProcessComplete(IBlackmagicRawJob*, HRESULT, IBlackmagicRawProcessedImage*) override {}
     void TrimProgress(IBlackmagicRawJob*, float) override {}
     void TrimComplete(IBlackmagicRawJob*, HRESULT) override {}
-    void SidecarMetadataParseWarning(IBlackmagicRawClip*, CFStringRef, uint32_t, CFStringRef) override {}
-    void SidecarMetadataParseError(IBlackmagicRawClip*, CFStringRef, uint32_t, CFStringRef) override {}
+    void SidecarMetadataParseWarning(IBlackmagicRawClip*, SdkString, uint32_t, SdkString) override {}
+    void SidecarMetadataParseError(IBlackmagicRawClip*, SdkString, uint32_t, SdkString) override {}
     void PreparePipelineComplete(void*, HRESULT) override {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, LPVOID*) override { return E_NOTIMPL; }
     ULONG STDMETHODCALLTYPE AddRef() override { return 0; }
@@ -1788,8 +1776,8 @@ static int do_meta(const char* path, uint64_t frameIndex) {
     ctx.clip->GetWidth(&w); ctx.clip->GetHeight(&h); ctx.clip->GetFrameCount(&n); ctx.clip->GetFrameRate(&fps);
     printf("clip.width = %u\nclip.height = %u\nclip.frame_count = %llu\nclip.frame_rate = %.6f\nclip.video_tracks = %u\n",
            w, h, (unsigned long long)n, fps, ctx.videoTrackCount);
-    CFStringRef tc = nullptr;
-    if (ctx.clip->GetTimecodeForFrame(0, &tc) == S_OK && tc) { printf("clip.timecode_frame0 = \"%s\"\n", cfstr_to_string(tc).c_str()); CFRelease(tc); }
+    SdkString tc = nullptr;
+    if (ctx.clip->GetTimecodeForFrame(0, &tc) == S_OK && tc) { printf("clip.timecode_frame0 = \"%s\"\n", cfstr_to_string(tc).c_str()); sdk_str_free(tc); }
     IBlackmagicRawMetadataIterator* it = nullptr;
     if (ctx.clip->GetMetadataIterator(&it) == S_OK && it) { dump_iterator(it, "clip."); it->Release(); }
     MetaCallback cb;
@@ -2033,12 +2021,18 @@ static int apply_color_option(const std::string& arg, const std::string& val) {
 }
 
 int main(int argc, const char* argv[]) {
+    // Binary stdio + COM + a UTF-8 argv on Windows; a plain copy on macOS.
+    std::vector<std::string> argsUtf8 = platform_init_args(argc, argv);
+    std::vector<const char*> argvUtf8;
+    for (const std::string& a : argsUtf8) argvUtf8.push_back(a.c_str());
+    argc = (int)argvUtf8.size();
+    argv = argvUtf8.data();
     if (argc < 3) {
         std::cerr << "Usage:" << std::endl;
         std::cerr << "  braw_helper --info  <file.braw>" << std::endl;
         std::cerr << "  braw_helper --decode <file.braw> [--start N] [--count M] [--track T] [--16bit]" << std::endl;
         std::cerr << "              [--scale full|half|quarter|eighth] [--look film|video|extended|rec709]" << std::endl;
-        std::cerr << "              [--pipeline auto|metal|cpu]  (auto = the first Metal device, else CPU)" << std::endl;
+        std::cerr << "              [--pipeline auto|metal|cuda|cpu]  (auto = the first GPU device: Metal on macOS, CUDA on Windows; else CPU)" << std::endl;
         std::cerr << "              [--step N]  (every Nth frame from --start; the header's frames = emitted count)" << std::endl;
         std::cerr << "              [--zerocopy N] [--mono]  (N slots of global IOSurfaces: \"F <frame> <slot>\" per frame on stdout," << std::endl;
         std::cerr << "               \"R <slot>\" on stdin returns one; surface IDs + eye size in the header; 8-bit only)" << std::endl;
@@ -2078,11 +2072,15 @@ int main(int argc, const char* argv[]) {
             if (!parse_scale(val, &g_scale)) { std::cerr << "ERROR: unknown --scale " << val << " (full|half|quarter|eighth)" << std::endl; return 1; }
         }
         else if (arg == "--pipeline") {
-            if (val != "auto" && val != "metal" && val != "cpu") { std::cerr << "ERROR: unknown --pipeline " << val << " (auto|metal|cpu)" << std::endl; return 1; }
+            if (val != "auto" && val != "metal" && val != "cuda" && val != "cpu") { std::cerr << "ERROR: unknown --pipeline " << val << " (auto|metal|cuda|cpu)" << std::endl; return 1; }
+            if ((val == "metal" || val == "cuda") && val != BRAW_GPU_PIPELINE_NAME) { std::cerr << "ERROR: --pipeline " << val << " is not available on this platform (its GPU pipeline is " << BRAW_GPU_PIPELINE_NAME << ")" << std::endl; return 1; }
             g_pipelineArg = val;
         }
         else if (arg == "--step") { g_step = std::max<uint64_t>(1, std::stoull(val)); }
-        else if (arg == "--zerocopy") { g_zcSlots = (uint32_t)std::stoul(val); }
+        else if (arg == "--zerocopy") {
+            if (!BRAW_HAVE_ZEROCOPY) { std::cerr << "ERROR: --zerocopy (the IOSurface hand-off) is macOS-only" << std::endl; return 1; }
+            g_zcSlots = (uint32_t)std::stoul(val);
+        }
         else continue;  // unknown key-value pair, don't skip value
         i++;  // skip the value arg
     }

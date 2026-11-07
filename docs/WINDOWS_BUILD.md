@@ -172,6 +172,32 @@ cargo check -p vr180-gui
 
 ---
 
+## Blackmagic RAW (optional)
+
+The BRAW path runs through `helpers/bin/braw_helper.exe`, a small C++
+program built against the Blackmagic RAW SDK (the SDK is not
+redistributable, so it is built on your machine). Without it the app still
+builds and runs; loading a `.braw` reports the helper as missing.
+
+1. Install the Blackmagic RAW package (Capture and Playback Software →
+   Blackmagic RAW on blackmagicdesign.com/support), version 6.x, and tick
+   the **SDK** component — it lands in
+   `C:Program Files (x86)Blackmagic DesignBlackmagic RAWBlackmagic RAW SDKWin`
+   (`IncludeBlackmagicRawAPI.h` must exist). DaVinci Resolve / the RAW
+   Player ship only the runtime DLL, not the headers.
+2. With Visual Studio 2022/2019 Build Tools installed:
+   ```pwsh
+   .helpersrawuild_braw.ps1          # → helpersinraw_helper.exe
+   .helpersinraw_helper.exe --info <clip.braw>
+   ```
+   `-SdkDir` / `:BRAW_SDK_DIR` override the SDK location.
+3. At runtime the helper loads `BlackmagicRawAPI.dll` from the SDK's
+   `Libraries` folder, else the RAW Player / Speed Test runtime, else its own
+   directory (`:BRAW_SDK_LIB_DIR` overrides). Decoding uses the SDK's
+   CUDA pipeline when an NVIDIA GPU is present (`--pipeline cpu` forces the
+   CPU). The IOSurface zero-copy hand-off is macOS-only; on Windows frames
+   come back through the pipe (the same path the CPU preview uses).
+
 ## Optional polish (do after it builds & runs)
 
 - **Hide the console window.** A Windows GUI exe currently also opens a

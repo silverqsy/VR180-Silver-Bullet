@@ -58,7 +58,7 @@ impl BrawGyroData {
     /// small (a few hundred KB at 5 kHz × seconds), no streaming needed.
     pub fn extract(path: impl AsRef<Path>) -> Result<Self> {
         let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
-            expected: "helpers/bin/braw_helper".into(),
+            expected: format!("helpers/bin/{}", crate::helper_file_name()),
         })?;
         let mut child = Command::new(&helper)
             .arg("--gyro")

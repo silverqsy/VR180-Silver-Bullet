@@ -157,7 +157,7 @@ impl BrawInfo {
     /// The probe itself (one helper run).
     pub fn probe_uncached(path: impl AsRef<Path>) -> Result<Self> {
         let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
-            expected: "helpers/bin/braw_helper".into(),
+            expected: format!("helpers/bin/{}", crate::helper_file_name()),
         })?;
         let out = Command::new(&helper)
             .arg("--info")
