@@ -175,7 +175,7 @@ public:
     void read_frame_color(IBlackmagicRawFrame* frame) {
         IBlackmagicRawFrameProcessingAttributes* fa = nullptr;
         if (frame->QueryInterface(IID_IBlackmagicRawFrameProcessingAttributes, (void**)&fa) != S_OK || !fa) return;
-        FrameColor c; bool ro = false;
+        FrameColor c; SdkBool ro = false;
         Variant v; Variant lo; Variant hi;
         VariantInit(&v); VariantInit(&lo); VariantInit(&hi);
         if (fa->GetFrameAttribute(blackmagicRawFrameProcessingAttributeWhiteBalanceKelvin, &v) == S_OK && v.vt == blackmagicRawVariantTypeU32) c.kelvin = v.uintVal;
@@ -291,7 +291,7 @@ static const char* attr_name(BlackmagicRawClipProcessingAttribute attr) {
 // (used when a string override is rejected, so the caller sees what the
 // SDK actually wants).
 static void print_attribute_list(IBlackmagicRawClipProcessingAttributes* attrs, BlackmagicRawClipProcessingAttribute attr) {
-    uint32_t count = 0; bool readOnly = false;
+    uint32_t count = 0; SdkBool readOnly = false;
     if (attrs->GetClipAttributeList(attr, nullptr, &count, &readOnly) != S_OK || count == 0) {
         fprintf(stderr, "  %s: no value list available\n", attr_name(attr));
         return;
@@ -482,7 +482,7 @@ static std::string cfstr(SdkString s) { return std_str(s); }
 static IBlackmagicRawPipelineDevice* first_gpu_device(IBlackmagicRawFactory* factory, IBlackmagicRaw* codec, std::string* name) {
     IBlackmagicRawConfiguration* cfg = nullptr;
     if (codec->QueryInterface(IID_IBlackmagicRawConfiguration, (void**)&cfg) != S_OK || !cfg) return nullptr;
-    bool supported = false;
+    SdkBool supported = false;
     HRESULT r = cfg->IsPipelineSupported(BRAW_GPU_PIPELINE, &supported);
     cfg->Release();
     if (r != S_OK || !supported) return nullptr;
@@ -882,7 +882,7 @@ static int do_info(const char* path) {
         IBlackmagicRawClipProcessingAttributes* ca = nullptr;
         if (frameColor.valid && ctx.clip->QueryInterface(IID_IBlackmagicRawClipProcessingAttributes, (void**)&ca) == S_OK && ca) {
             auto f32Triple = [&](BlackmagicRawClipProcessingAttribute a) -> std::string {   // "[value, min, max]"
-                float val = 0, mn = 0, mx = 0; bool ro = false;
+                float val = 0, mn = 0, mx = 0; SdkBool ro = false;
                 Variant v; VariantInit(&v);
                 if (ca->GetClipAttribute(a, &v) == S_OK && v.vt == blackmagicRawVariantTypeFloat32) val = v.fltVal;
                 VariantClear(&v);
@@ -903,7 +903,7 @@ static int do_info(const char* path) {
                 VariantClear(&v); return s;
             };
             auto listJsonOf = [&](IBlackmagicRawClipProcessingAttributes* at, BlackmagicRawClipProcessingAttribute a) -> std::string {
-                uint32_t n = 0; bool ro = false;
+                uint32_t n = 0; SdkBool ro = false;
                 if (at->GetClipAttributeList(a, nullptr, &n, &ro) != S_OK || n == 0) return "[]";
                 std::vector<Variant> items(n);
                 for (auto& it : items) VariantInit(&it);
@@ -934,7 +934,7 @@ static int do_info(const char* path) {
             auto tonePresetsOf = [&](IBlackmagicRawClipProcessingAttributes* at, uint16_t gen) -> std::string {
                 std::string out = "{";
                 if (!tc) return out + "}";
-                uint32_t n = 0; bool ro = false;
+                uint32_t n = 0; SdkBool ro = false;
                 std::vector<Variant> gammas;
                 if (at->GetClipAttributeList(blackmagicRawClipProcessingAttributeGamma, nullptr, &n, &ro) == S_OK && n > 0) {
                     gammas.resize(n);
@@ -969,7 +969,7 @@ static int do_info(const char* path) {
             const uint16_t curGen = (uint16_t)u16Val(blackmagicRawClipProcessingAttributeColorScienceGen);
             std::string gensJson = "{";
             {
-                uint32_t n = 0; bool ro = false;
+                uint32_t n = 0; SdkBool ro = false;
                 std::vector<Variant> gens;
                 if (ca->GetClipAttributeList(blackmagicRawClipProcessingAttributeColorScienceGen, nullptr, &n, &ro) == S_OK && n > 0) {
                     gens.resize(n);
@@ -1093,7 +1093,7 @@ static int do_info(const char* path) {
     printf("  \"post_3dlut_mode\": \"%s\",\n", json_escape(get_metadata_string(ctx.clip, "post_3dlut_mode")).c_str());
     printf("  \"color\": %s,\n", colorJson.c_str());
     printf("  \"pipeline\": \"%s\",\n", pipeline.c_str());
-    printf("  \"zerocopy\": true,\n");
+    printf("  \"zerocopy\": %s,\n", BRAW_HAVE_ZEROCOPY ? "true" : "false");
     if (pipeline != "cpu") printf("  \"gpu_device\": \"%s\",\n", gpuDevice.c_str());
     else printf("  \"gpu_device\": null,\n");
     if (haveScales)

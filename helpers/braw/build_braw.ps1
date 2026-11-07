@@ -2,9 +2,16 @@
 #
 # The twin of build_braw.sh: the same helpers/braw/braw_helper.cpp (plus the
 # platform shim braw_platform.h) compiled with MSVC against the SDK's Windows
-# headers, landing in helpers/bin/braw_helper.exe (gitignored).
+# API, landing in helpers/bin/braw_helper.exe (gitignored).
 # vr180-braw::locate_helper finds it there during development, or next to
 # vr180-gui.exe in a release bundle.
+#
+# On Windows the SDK ships the API as an IDL file (Include\BlackmagicRawAPI.idl):
+# MIDL generates BlackmagicRawAPI.h (the interfaces) and BlackmagicRawAPI_i.c
+# (the IID/CLSID definitions, linked in) into a scratch directory first; the
+# SDK's BlackmagicRawAPIDispatch.cpp (LoadLibrary of BlackmagicRawAPI.dll) is
+# force-included into the helper's translation unit, as build_braw.sh does
+# with -include on macOS.
 #
 # Requires:
 #   * the Blackmagic RAW SDK — the "Blackmagic RAW" installer from
@@ -14,7 +21,8 @@
 #     (override with -SdkDir or $env:BRAW_SDK_DIR). The SDK is not
 #     redistributable: the helper loads the user's installed
 #     BlackmagicRawAPI.dll at runtime (see sdk_library_dir() in the shim).
-#   * Visual Studio 2022/2019 Build Tools (cl.exe via vcvars64.bat).
+#   * Visual Studio 2022/2019 with the C++ workload (cl.exe, midl.exe and
+#     the Windows SDK, all reached through vcvars64.bat).
 #
 # Usage:  .\helpers\braw\build_braw.ps1 [-SdkDir <path>] [-Config Release|Debug]
 
@@ -28,16 +36,16 @@ if (-not $SdkDir) {
     $SdkDir = 'C:\Program Files (x86)\Blackmagic Design\Blackmagic RAW\Blackmagic RAW SDK\Win'
 }
 $Include = Join-Path $SdkDir 'Include'
-$Header = Join-Path $Include 'BlackmagicRawAPI.h'
+$Idl = Join-Path $Include 'BlackmagicRawAPI.idl'
 $Dispatch = Join-Path $Include 'BlackmagicRawAPIDispatch.cpp'
-if (-not (Test-Path $Header)) {
+if (-not (Test-Path $Idl) -or -not (Test-Path $Dispatch)) {
     Write-Error @"
-Blackmagic RAW SDK not found: $Header
+Blackmagic RAW SDK not found: $Idl
 
 Install the SDK: run the Blackmagic RAW installer (Capture and Playback
-Software → Blackmagic RAW on https://www.blackmagicdesign.com/support/) and
-select the SDK component, or point -SdkDir / `$env:BRAW_SDK_DIR at an
-unpacked SDK whose Include\ holds BlackmagicRawAPI.h.
+Software -> Blackmagic RAW on https://www.blackmagicdesign.com/support/) and
+select the SDK component, or point -SdkDir / `$env:BRAW_SDK_DIR at an SDK
+whose Include\ holds BlackmagicRawAPI.idl and BlackmagicRawAPIDispatch.cpp.
 "@
 }
 
@@ -55,24 +63,37 @@ $vcvars = Get-ChildItem @(
     'C:\Program Files\Microsoft Visual Studio\2022\*\VC\Auxiliary\Build\vcvars64.bat',
     'C:\Program Files (x86)\Microsoft Visual Studio\2019\*\VC\Auxiliary\Build\vcvars64.bat'
 ) -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $vcvars) { Write-Error 'vcvars64.bat not found — install Visual Studio Build Tools (C++ workload).' }
+if (-not $vcvars) { Write-Error 'vcvars64.bat not found - install Visual Studio Build Tools (C++ workload).' }
 
 $opt = if ($Config -eq 'Release') { '/O2 /DNDEBUG' } else { '/Od /Zi /DDEBUG' }
-# The SDK dispatch source is included into this one translation unit (/FI),
-# as build_braw.sh does with -include. /utf-8: the sources and the paths
-# passed around are UTF-8. /EHsc: C++ exceptions (std::stoull etc.).
+$defs = '/DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE'
+# /utf-8: the sources and the paths passed around are UTF-8. /EHsc: C++
+# exceptions (std::stoull etc.). The IID source is C and must not see the
+# C++ dispatch include, hence the separate compile.
 $cmd = @"
-call "$($vcvars.FullName)" >nul
-cl /nologo /std:c++17 $opt /EHsc /utf-8 /W3 /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE ^
-   /I"$Include" /FI"$Dispatch" ^
-   /Fo"$Obj\\" /Fe"$Out" "$Src" ^
-   /link ole32.lib oleaut32.lib shell32.lib
+@echo off
+call "$($vcvars.FullName)" >nul 2>&1
+if errorlevel 1 exit /b 1
+echo [midl] BlackmagicRawAPI.idl
+midl /nologo /env x64 /out "$Obj" /h BlackmagicRawAPI.h /iid BlackmagicRawAPI_i.c /proxy BlackmagicRawAPI_p.c /dlldata dlldata.c /tlb BlackmagicRawAPI.tlb "$Idl"
+if errorlevel 1 exit /b 2
+echo [cl] BlackmagicRawAPI_i.c
+cl /nologo /c $opt /W3 $defs /I"$Obj" /I"$Include" /Fo"$Obj\api_i.obj" "$Obj\BlackmagicRawAPI_i.c"
+if errorlevel 1 exit /b 3
+echo [cl] braw_helper.cpp
+cl /nologo /c /std:c++17 $opt /EHsc /utf-8 /W3 $defs /I"$Obj" /I"$Include" /I"$ScriptDir" /FI"$Dispatch" /Fo"$Obj\braw_helper.obj" "$Src"
+if errorlevel 1 exit /b 4
+echo [link] braw_helper.exe
+link /nologo /OUT:"$Out" "$Obj\braw_helper.obj" "$Obj\api_i.obj" ole32.lib oleaut32.lib shell32.lib
+if errorlevel 1 exit /b 5
 "@
 $bat = Join-Path $Obj 'build.cmd'
 Set-Content -Path $bat -Value $cmd -Encoding ASCII
 Write-Host "Compiling braw_helper.exe (SDK: $SdkDir)..."
-& cmd.exe /c "`"$bat`""
-if ($LASTEXITCODE -ne 0) { Remove-Item -Recurse -Force $Obj -ErrorAction SilentlyContinue; Write-Error "cl.exe failed ($LASTEXITCODE)" }
+$prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+& cmd.exe /c "`"$bat`"" 2>&1 | ForEach-Object { "$_" }
+$ErrorActionPreference = $prevEap
+$rc = $LASTEXITCODE
+if ($rc -ne 0) { Write-Error "build failed at step $rc (scratch kept in $Obj)" }
 Remove-Item -Recurse -Force $Obj -ErrorAction SilentlyContinue
 Write-Host "Build successful: $Out"
-& $Out 2>&1 | Select-Object -First 3 | ForEach-Object { Write-Host "  $_" }

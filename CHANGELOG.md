@@ -206,6 +206,13 @@ file, stills, and the camera's own colour handling.
   Play" with Play doing nothing. The decoders now tell a read error from
   the end of the clip (the error is logged), and the app restarts a
   decoder once by itself when it stops before its first frame.
+- **Blackmagic RAW on Windows.** The BRAW helper now builds and runs on
+  Windows (`helpers/braw/build_braw.ps1`, needs Blackmagic RAW 6.x with the
+  SDK component installed): preview and export of PYXIS clips with the
+  gyro stabilization, the embedded LUT and the audio, decoding on the SDK's
+  CUDA pipeline when an NVIDIA GPU is present. The GPU-resident preview
+  hand-off remains macOS-only, so Windows previews and exports go through
+  the readback path.
 
 ## 2.5.2 — 2026-10-10
 

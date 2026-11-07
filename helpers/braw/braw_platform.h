@@ -36,6 +36,8 @@
 typedef CFStringRef SdkString;
 // `SafeArrayGetVartype` takes the SDK's own enum on macOS, a VARTYPE on Windows.
 typedef BlackmagicRawVariantType SdkVarType;
+// Out-flags (`isReadOnly`, `supported`): `bool*` on macOS, COM `BOOL*` on Windows.
+typedef bool SdkBool;
 
 static inline SdkString sdk_str(const char* utf8) {
     return CFStringCreateWithCString(NULL, utf8, kCFStringEncodingUTF8);
@@ -84,6 +86,7 @@ static inline std::vector<std::string> platform_init_args(int argc, const char**
 
 typedef BSTR SdkString;
 typedef VARTYPE SdkVarType;
+typedef BOOL SdkBool;
 // The SDK's Windows header uses the COM types directly; these spellings are
 // what the helper (written against the macOS header) uses. A repeated
 // typedef to the same type is legal, so this is safe if the SDK has them.

@@ -1702,39 +1702,48 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      own cube writer; `--look` not exposed; the URSA hood intrudes into its
      circles (the fit still landed: r ≈ 4050 on 8160-px eyes). Examples
      (gitignored): `rs_probe_export`, `audio_window_probe`, `wav_probe`.
-   - **WINDOWS (2026-11-07, Windows box) — helper ported, NOT YET BUILT.**
-     The helper source is platform-neutral now, through
-     `helpers/braw/braw_platform.h`: `SdkString` + `sdk_str` / `std_str` /
-     `sdk_str_free` wrap CFStringRef (macOS, byte-for-byte the old code) or
-     BSTR (Windows); `SdkVarType` for `SafeArrayGetVartype`;
-     `sdk_library_dir()` (mac: the SDK Libraries dir; Windows:
-     `BRAW_SDK_LIB_DIR`, the SDK's `Win/Libraries`, the RAW Player / Speed
-     Test runtime, the exe's own dir — the first holding
-     BlackmagicRawAPI.dll); `BRAW_GPU_PIPELINE` = Metal on macOS, **CUDA on
-     Windows** (device iteration, `SetFromDevice` and the resource-manager
-     readback are the same SDK calls; only the pipeline enum differs);
-     `platform_init_args` (Windows: binary stdout/stdin, `CoInitializeEx`,
-     UTF-8 argv from `CommandLineToArgvW`); `--zerocopy` is refused off
-     macOS (inert `zc_pool_*` stubs keep the decode loop one source);
+   - **WINDOWS (2026-11-07, Windows box) — BRAW works on Windows.** The
+     helper source is platform-neutral through `helpers/braw/braw_platform.h`:
+     `SdkString` + `sdk_str` / `std_str` / `sdk_str_free` wrap CFStringRef
+     (macOS, byte-for-byte the old code) or BSTR (Windows); `SdkVarType`
+     (the SDK enum / VARTYPE) for `SafeArrayGetVartype`; `SdkBool` (bool /
+     COM BOOL) for the out-flags of `GetClipAttributeList` & co. — the ONE
+     class of compile error the port hit; `sdk_library_dir()` (mac: the
+     SDK Libraries dir; Windows: `BRAW_SDK_LIB_DIR`, the SDK's
+     `Win/Libraries`, the RAW Player / Speed Test runtime, the exe's own
+     dir — the first holding BlackmagicRawAPI.dll); `BRAW_GPU_PIPELINE` =
+     Metal on macOS, **CUDA on Windows** (device iteration, `SetFromDevice`
+     and the resource-manager readback are the same SDK calls; only the
+     pipeline enum differs); `platform_init_args` (Windows: binary
+     stdout/stdin, `CoInitializeEx`, UTF-8 argv from `CommandLineToArgvW`);
+     `--zerocopy` is refused off macOS (inert `zc_pool_*` stubs keep the
+     decode loop one source) and `--info` reports `zerocopy: false` there;
      `--pipeline` takes `auto|metal|cuda|cpu` and refuses the other
-     platform's name. Rust: `vr180_braw::helper_file_name()` =
-     `braw_helper.exe` on Windows (locate + the missing-helper message); the
-     readback `BrawFisheyeIter` is what Windows will use for preview AND
-     export (the IOSurface zero-copy preview stays macOS). Build recipe:
-     `helpers/braw/build_braw.ps1` (MSVC via vcvars64, `/FI` the SDK's
-     dispatch source, links ole32/oleaut32/shell32), documented in
-     docs/WINDOWS_BUILD.md. VERIFIED so far: the shim's Windows branch
-     compiles with MSVC, round-trips a non-ASCII UNC path, picks the CUDA
-     name and finds the Player's DLL dir (scratchpad `shim_check.cpp`).
-     BLOCKED on the SDK: this box has the Blackmagic RAW **3.6.1** runtime
-     only (Player + Speed Test + Resolve's DLL, no `Include/`), and the
-     helper targets SDK 6.0 interfaces — the user must install Blackmagic
-     RAW 6.x with the SDK component before `build_braw.ps1` can run, so the
-     helper port is UNCOMPILED on both platforms (mac side: run
-     `build_braw.sh` after pulling; the macOS branch should be a no-op).
-     Test clips here: `W:/#recycle/Pyxis braw stab footage/
-     A001_04071606_C006.braw` (the mac's C006) and the Speed Test's
-     `profile.braw`.
+     platform's name. The Windows SDK ships the API as an IDL:
+     `helpers/braw/build_braw.ps1` runs MIDL (header + the `_i.c` IIDs,
+     linked in), compiles the helper with `/FI` on the SDK's dispatch
+     source (its LoadLibrary of BlackmagicRawAPI.dll) and links
+     ole32/oleaut32/shell32 — needs Blackmagic RAW **6.x with the SDK
+     component** (this box had only the 3.6.1 runtime from Resolve / the
+     Player until the user installed it). Rust: `vr180_braw::helper_file_name()`
+     = `braw_helper.exe` on Windows. VERIFIED on the user's PYXIS 12K clip
+     `W:/Pyxis braw stab footage/A001_04071606_C006.braw` (34 GB over SMB,
+     12288×5112 @ 60, 2894 frames): `--info` 0.5 s (gyro 49 295 @ 1022 Hz,
+     readout 15.336 ms, 51.3° shutter, embedded "Gen 5 Film to Extended
+     Video" LUT, pipeline cuda / RTX 4090), `--gyro` 0.2 s, `--audio` 0.2 s
+     (2 ch 24-bit WAV), `--shutters`; decode CUDA vs CPU of the same 3
+     quarter-scale frames 0.84/255 mean, max 14 (the two SDK pipelines'
+     own rounding); throughput over SMB: CUDA full 12K **71 fps**, half
+     171, quarter 381; CPU quarter 651 (the SDK's partial decode is cheap,
+     CUDA pays a ~1 s start-up). The GUI opens it (circles found, LUT
+     extracted, preview at eighth/2048×852 step 2 on CUDA, gyro
+     integrated, first frame up) and `export_smoke` 5–6 s through the
+     portable loop writes 60 frames @ 60 fps, 3072×1536 yuv420p10 from the
+     16-bit CUDA decode, stab engaged, audio muxed (1.79 fps at 12K — the
+     readback pipe + libx265; a reduced-scale decode for sub-12K eyes and
+     NVENC would be the speed-ups). The frame matches the mac's own
+     `A001_04071606_C006_SBS.mp4` of the same instant. No Windows
+     zero-copy: the IOSurface hand-off has no D3D11/CUDA twin yet.
 
 26. **Dropped frames: per-frame tables are indexed by the container's
    sample table, not `round(pts / dt)` (2026-10-29).** Report: X6 clips
