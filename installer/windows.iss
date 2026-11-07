@@ -10,7 +10,7 @@
 ; The app's settings (%APPDATA%\VR180SilverBullet2.0) are user data and are
 ; deliberately NOT removed on uninstall.
 
-#define AppVer "2.5.2"
+#define AppVer "2.5.5"
 #define BundleDir "..\dist\VR180-Silver-Bullet-" + AppVer + "-windows-x64"
 
 [Setup]
@@ -50,6 +50,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#BundleDir}\vr180-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BundleDir}\*.dll";         DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BundleDir}\README.txt";    DestDir: "{app}"; Flags: ignoreversion
+; Blackmagic RAW decoding helper. Optional in the bundle; needs Blackmagic RAW 6.x (SDK component) on the target.
+Source: "{#BundleDir}\braw_helper.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 ; Upgrades keep AppId (so the previous install dir is reused), but Inno
 ; does not remove shortcuts whose NAME changed. Clear the pre-2.5.2

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.5.5 — 2026-11-07
 
 ### Footage with dropped frames (Insta360 X6)
 
@@ -125,8 +125,12 @@ frame.
   live view uses the clip's shutter range from the probe, and the export
   reads the exact per-frame table. The clip probe is cached, and the zoom
   still starts its decoder only when a frame is asked for.
-- Requires the Blackmagic RAW SDK (macOS) for the helper; the helper now
-  builds against SDK 6.0.
+- **Needs Blackmagic RAW installed.** The decoding helper ships inside the
+  app, but Blackmagic's RAW library is not redistributable: install the
+  free "Blackmagic RAW" package from Blackmagic's support site (macOS; the
+  SDK is part of it) or Blackmagic RAW 6.x with the SDK component
+  (Windows). The helper is built against SDK 6.0; without the library a
+  `.braw` clip cannot be opened.
 
 ### Kandao QooCam 3 Ultra: video and stills
 
@@ -200,6 +204,8 @@ file, stills, and the camera's own colour handling.
   had BT.709 built in). A single-lens QooCam recording (`Q180_…`, one
   3840×3840 circle) is reported as an unsupported format instead of being
   split into two half-eyes.
+### Also in this release
+
 - **Preview no longer dies silently on a network read error.** A stalled
   read from a network share reported as end-of-stream, so the preview
   decoder could exit after zero frames and leave the window on "Click ▶
@@ -219,6 +225,12 @@ file, stills, and the camera's own colour handling.
   macOS, at the full playback rate from local storage. Exports take the
   readback path. The helper runs without a console window (opening a
   BRAW clip used to pop up a terminal window on Windows).
+- **Larger reframed stills.** A photo's reframed (Flat 3D) export goes up
+  to 5760×3240 per eye at 16:9 and 4320×4320 at 1:1; the 2160-line cap
+  that keeps video encodes sane now applies to video only.
+- **The previous launch's log is kept** as `vr180-gui.prev.log` next to
+  the current one, so a problem that shows up after a relaunch still has
+  a trail to read.
 
 ## 2.5.2 — 2026-10-10
 

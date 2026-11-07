@@ -16,6 +16,11 @@
 #      helper built from older sources (every helper answers `--version` with its
 #      source hash; `--check` compares it, and this script refuses to continue
 #      on a mismatch).
+#   2b. helpers/braw/build_braw.sh     rebuilds braw_helper against the installed Blackmagic
+#      RAW SDK and copies it next to the app binary. It is signed with the
+#      disable-library-validation entitlement (helpers/braw/braw_helper.entitlements):
+#      it loads Blackmagic's own framework from the SDK install, signed by another team,
+#      which the hardened runtime otherwise refuses ("different Team IDs") — verified.
 #   3. copy vr180-gui, bump Info.plist to the Cargo version
 #   4. dylibbundler (fresh binary → /opt/homebrew refs → ~14 dylibs into Frameworks/)
 #   5. sign inside-out with Developer ID (dylibs → helpers → binary → bundle),
@@ -40,6 +45,9 @@ IDENTITY="${VR180_SIGN_IDENTITY:-Developer ID Application: Yuanming Ni (655S25MM
 PROFILE="${VR180_NOTARY_PROFILE:-vr180-notary}"
 MODE="${1:-build}"
 HELPERS=(mvhevc_encode vt_denoise apac_encode)
+BRAW_HELPER="$MACOS/braw_helper"
+BRAW_ENTITLEMENTS="$ROOT/helpers/braw/braw_helper.entitlements"
+BRAW_SDK_LIBS="/Applications/Blackmagic RAW/Blackmagic RAW SDK/Mac/Libraries"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 die() { echo "✗ $*" >&2; exit 1; }
@@ -54,6 +62,15 @@ verify_bundle() {
     codesign --verify --deep --strict --verbose=2 "$APP" || die "signature invalid"
     say "verify: smoke (helpers answer --version from inside the bundle)"
     for h in "${HELPERS[@]}"; do "$MACOS/$h" --version; done
+    say "verify: braw_helper (built from the current sources, entitled, starts with the SDK framework)"
+    local stale braw_out
+    [[ -x "$BRAW_HELPER" ]] || die "braw_helper missing from the bundle"
+    stale="$(find helpers/braw -type f \( -name '*.cpp' -o -name '*.mm' -o -name '*.h' -o -name '*.sh' \) -newer "$BRAW_HELPER" | head -1)"
+    [[ -z "$stale" ]] || die "bundled braw_helper is older than $stale — rebuild it (helpers/braw/build_braw.sh)"
+    codesign -d --entitlements - "$BRAW_HELPER" 2>&1 | grep -q 'disable-library-validation' \
+        || die "braw_helper lacks the disable-library-validation entitlement (it could not load Blackmagic's framework)"
+    braw_out="$("$BRAW_HELPER" 2>&1 || true)"
+    grep -q '^Usage:' <<<"$braw_out" || die "braw_helper did not start: $braw_out"
     echo "bundle version: $(plutil -extract CFBundleShortVersionString raw "$PLIST")"
 }
 
@@ -70,6 +87,12 @@ cargo build --release -p vr180-gui
 say "2. Swift helpers: rebuild from source and install into the bundle"
 bash helpers/build_swift.sh --install "$MACOS"
 
+say "2b. BRAW helper: rebuild against the installed Blackmagic RAW SDK and install into the bundle"
+[[ -d "$BRAW_SDK_LIBS/BlackmagicRawAPI.framework" ]] \
+    || die "Blackmagic RAW SDK not installed ($BRAW_SDK_LIBS) — the release ships braw_helper, so the build Mac needs the SDK (see helpers/braw/build_braw.sh)"
+bash helpers/braw/build_braw.sh >/dev/null || die "braw_helper build failed"
+cp -f helpers/bin/braw_helper "$BRAW_HELPER"
+
 say "3. app binary + Info.plist $VER"
 cp -f target/release/vr180-gui "$MACOS/vr180-gui"
 plutil -replace CFBundleShortVersionString -string "$VER" "$PLIST"
@@ -84,6 +107,9 @@ if otool -L "$MACOS/vr180-gui" | grep -q /opt/homebrew; then die "binary still r
 say "5. sign inside-out: $IDENTITY"
 for f in "$FRAMEWORKS"/*.dylib; do codesign --force --options runtime --timestamp -s "$IDENTITY" "$f"; done
 for h in "${HELPERS[@]}"; do codesign --force --options runtime --timestamp -s "$IDENTITY" "$MACOS/$h"; done
+# braw_helper loads Blackmagic's framework from the SDK install, signed by another team, which the
+# hardened runtime refuses ("different Team IDs") unless library validation is disabled for it.
+codesign --force --options runtime --timestamp --entitlements "$BRAW_ENTITLEMENTS" -s "$IDENTITY" "$BRAW_HELPER"
 codesign --force --options runtime --timestamp -s "$IDENTITY" "$MACOS/vr180-gui"
 codesign --force --options runtime --timestamp -s "$IDENTITY" "$APP"
 verify_bundle
