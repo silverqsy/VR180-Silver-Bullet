@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: **Unreleased on `main`: X6 automatic per-frame eye-exposure matching (2026-09-27, item 15) + GoPro per-frame exposure timing from SHUT (2026-10-07, item 16) + Kandao QooCam 3 Ultra video/stills/audio (2026-10-14, item 23; Windows arms verified + matrix/gate fixes 2026-10-17, item 24) + Blackmagic RAW rebuilt on the modern path (2026-10-19, item 25).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
+## ⚡ Status: **2.5.5 CUT ON macOS 2026-11-07 as a DRAFT GitHub release (item 27; publish = `gh release edit v2.5.5 --draft=false --latest`), Windows build PENDING — it ships everything since 2.5.2: X6 per-frame eye-exposure matching (item 15), GoPro exposure timing from SHUT (item 16), Kandao QooCam 3 Ultra (items 23/24), Blackmagic RAW rebuilt + on Windows (item 25), dropped-frame tables + pts-paced preview (item 26).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -1928,6 +1928,44 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    so a stale `helpers/bin/braw_helper` is not a hard failure — but rebuild
    it after any `helpers/braw/*` change; the release script hash-checks.
 
+
+27. **2.5.5 release (2026-11-07, Mac) — macOS CUT; GitHub release `v2.5.5`
+   is a DRAFT (target `main` @ `4bd548d`; assets = DMG + mac app zip +
+   darwin-only `latest.json`); publish = `gh release edit v2.5.5
+   --draft=false --latest` (the tag is created then). Windows build
+   PENDING.** Version carriers bumped in `4bd548d` (Cargo workspace + GUI
+   crate, README, `installer/windows.iss` AppVer — the Windows box needs no
+   bump commit); CHANGELOG `Unreleased` closed as `2.5.5 — 2026-11-07`;
+   release-note draft `~/vr180-internal/RELEASE-2.5.5.md` =
+   `release-staging/RELEASE_NOTES.md` = the release body. Cut with
+   `scripts/release_mac.sh --notarize`: both notarizations Accepted first
+   try, app + DMG stapled, `spctl` "Notarized Developer ID", 14 dylibs,
+   bundle 2.5.5, mac zip minisign-verified against the updater.rs pubkey.
+   **NEW: the Mac bundle ships `braw_helper`** — script step 2b rebuilds it
+   against the installed SDK, copies it to Contents/MacOS, signs it with
+   `helpers/braw/braw_helper.entitlements` (`disable-library-validation`),
+   and `verify_bundle` checks it is newer than `helpers/braw/*`, carries the
+   entitlement and prints `Usage:` from inside the bundle. Why: the hardened
+   helper loads Blackmagic's framework from `/Applications/Blackmagic
+   RAW/…/Libraries` (rpath), signed by another team, and dyld refuses it
+   ("different Team IDs") without the entitlement — measured on a signed
+   copy; with it `--info` on C006 runs through the Metal pipeline from
+   inside the bundle, and Apple notarized it. The framework is not
+   redistributable: users install the "Blackmagic RAW" package (release
+   note + CHANGELOG say so). Trap: `vr180-gui --version` / `--help` are not
+   flags — they launch the GUI. **WINDOWS TODO (release box):** pull
+   `4bd548d`+; build; put `braw_helper.exe` into the bundle folder and the
+   portable zip (`windows.iss` `[Files]` now lists it with
+   `skipifsourcedoesntexist`; it LoadLibrary's BlackmagicRawAPI.dll from the
+   installed SDK and nvcuda.dll at runtime — no extra DLLs); ISCC →
+   setup.exe; `gh release download v2.5.5 --pattern latest.json --clobber
+   --dir release-staging` FIRST (merge hazard), `gh release view v2.5.5
+   --json body -q .body > release-staging/RELEASE_NOTES.md`, `node
+   scripts/make-latest-json.mjs --version 2.5.5 --notes-file
+   release-staging/RELEASE_NOTES.md`, then `gh release upload v2.5.5
+   --clobber` setup.exe + portable zip + merged `latest.json` (NOT the
+   .minisig). gh addresses the draft by its tag name (view/upload/download
+   all worked on the 2.5.2 and 2.5.5 drafts).
 
 20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac
    side's ambisonic work pulled, built clean first try (the new `build.rs`
