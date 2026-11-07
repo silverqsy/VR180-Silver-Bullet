@@ -1,4 +1,8 @@
-// braw_zc.h — zero-copy frame hand-off for braw_helper (macOS).
+// braw_zc.h — zero-copy frame hand-off for braw_helper.
+//
+// macOS (braw_zc.mm): global IOSurfaces. Windows (braw_zc_win.cpp): shareable
+// D3D11 textures (NT handles the app duplicates and imports into Vulkan).
+// The protocol is the same on both; `zc_transport()` names the kind.
 //
 // A pool of IOSurfaces, one or two per slot, each already laid out the way
 // the app's kernels want an eye: a SQUARE canvas of the eye's width (the
@@ -30,6 +34,16 @@ void zc_pool_destroy(ZcPool* p);
 
 // The global IOSurface ID of slot `slot`, eye 0 (left) / 1 (right).
 uint32_t zc_pool_surface_id(const ZcPool* p, uint32_t slot, int eye);
+// The slot/eye's share token as the helper prints it: the IOSurface ID on
+// macOS, the NT handle value on Windows (valid in `zc_owner_pid()`).
+uint64_t zc_pool_handle(const ZcPool* p, uint32_t slot, int eye);
+// "iosurface" or "d3d11".
+const char* zc_transport();
+// The helper's own process id (the app duplicates handles out of it).
+uint32_t zc_owner_pid();
+// Windows: the DXGI adapter LUID the pool must live on (the app's GPU);
+// ignored on macOS.
+void zc_set_adapter_luid(uint64_t luid);
 
 // Fill a slot from a processed frame.
 //   `src_w × src_h` is the frame as processed; `src_row_bytes` its pitch

@@ -33,9 +33,13 @@ pub struct ZcHeader {
     pub pipeline: Option<String>,
     #[serde(default)]
     pub gpu_device: Option<String>,
-    /// `"iosurface"`.
+    /// `"iosurface"` (macOS) or `"d3d11"` (Windows: shareable textures).
     #[serde(default)]
     pub transport: String,
+    /// The helper's process id — the owner of the NT handles in `surfaces`
+    /// on Windows (the app duplicates them out of that process).
+    #[serde(default)]
+    pub helper_pid: Option<u32>,
     pub slots: u32,
     /// One eye's surface: the square canvas for a pair, the frame for a
     /// mono clip.
@@ -46,9 +50,13 @@ pub struct ZcHeader {
     pub pad_rows: i32,
     #[serde(default)]
     pub mono: bool,
-    /// Per slot `[left, right]` global IOSurface IDs (equal for mono).
-    pub surfaces: Vec<[u32; 2]>,
+    /// Per slot `[left, right]` share tokens (equal for mono): global
+    /// IOSurface IDs on macOS, NT handle values (in `helper_pid`) on Windows.
+    pub surfaces: Vec<[u64; 2]>,
 }
+
+/// The transport this platform's helper hands frames over with.
+pub const EXPECTED_TRANSPORT: &str = if cfg!(target_os = "macos") { "iosurface" } else { "d3d11" };
 
 /// A frame the helper placed in a slot.
 #[derive(Debug, Clone, Copy)]
@@ -121,7 +129,10 @@ pub struct BrawZcDecoder {
 impl BrawZcDecoder {
     /// Spawn `braw_helper --decode <path> --zerocopy <slots> …` and read
     /// its header. `mono`: one fisheye per frame (one surface per slot).
-    pub fn start(path: impl AsRef<Path>, opts: &DecodeOptions, slots: u32, mono: bool) -> Result<Self> {
+    /// `adapter_luid`: on Windows the app's GPU (its Vulkan device's LUID),
+    /// so the helper's shareable textures live where they can be imported;
+    /// `None` / macOS: not passed.
+    pub fn start(path: impl AsRef<Path>, opts: &DecodeOptions, slots: u32, mono: bool, adapter_luid: Option<[u8; 8]>) -> Result<Self> {
         let helper = crate::locate_helper().ok_or_else(|| Error::HelperMissing {
             expected: format!("helpers/bin/{}", crate::helper_file_name()),
         })?;
@@ -130,6 +141,9 @@ impl BrawZcDecoder {
         opts.extend_argv(&mut cmd);
         cmd.arg("--zerocopy").arg(slots.max(2).to_string());
         if mono { cmd.arg("--mono"); }
+        if let Some(luid) = adapter_luid {
+            cmd.arg("--adapter-luid").arg(format!("{:016x}", u64::from_le_bytes(luid)));
+        }
         tracing::info!(helper = %helper.display(), file = %path.as_ref().display(), slots, "spawning braw_helper --decode --zerocopy");
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         let stdin = child.stdin.take().expect("stdin piped");
@@ -168,8 +182,8 @@ impl BrawZcDecoder {
             }
             Err(_) => return Err(Error::BadOutput("stderr thread died before the zero-copy header".into())),
         };
-        if header.transport != "iosurface" {
-            return Err(Error::BadOutput(format!("helper transport '{}' is not iosurface", header.transport)));
+        if header.transport != EXPECTED_TRANSPORT {
+            return Err(Error::BadOutput(format!("helper transport '{}' is not {EXPECTED_TRANSPORT}", header.transport)));
         }
         if header.surfaces.len() != header.slots as usize {
             return Err(Error::BadOutput(format!("{} surface pairs for {} slots", header.surfaces.len(), header.slots)));

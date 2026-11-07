@@ -1696,20 +1696,29 @@ fn open_fisheye_segment(
                 if info.pipeline.is_empty() { "?" } else { info.pipeline.as_str() },
                 info.gpu_device.as_deref().map(|d| format!(" ({d})")).unwrap_or_default());
             let layout = vr180_pipeline::braw_imu::braw_layout(path, &info);
-            // macOS: the helper hands frames over as IOSurfaces (no pixels
-            // through the pipe or the CPU), so a reframed view can afford the
-            // FULL frame — every zoom level samples native pixels.
+            // The helper hands frames over on the GPU — IOSurfaces on macOS,
+            // shareable D3D11 textures on Windows (no pixels through the
+            // pipe or the app's CPU) — so a reframed view can afford the
+            // FULL frame on macOS, where the hand-off is a GPU blit; on
+            // Windows the helper reads a GPU decode back to host memory
+            // first, so the reframed view keeps the pipe path's scale.
             // `VR180_BRAW_ZC=0` forces the pipe path.
-            #[cfg(target_os = "macos")]
             if info.zerocopy && std::env::var("VR180_BRAW_ZC").map(|v| v != "0").unwrap_or(true) {
                 if let Some(dev) = &gpu {
-                    let scale = if braw_reframe { vr180_braw::DecodeScale::Full } else { scale };
-                    tracing::info!("decoder (fisheye/braw): zero-copy IOSurface path, decode scale {:?}, step {}", scale, step);
+                    let scale = if braw_reframe && cfg!(target_os = "macos") { vr180_braw::DecodeScale::Full } else { scale };
                     // 5 slots: the frame on screen, the one whose GPU work
                     // may still be in flight, and three decoding ahead.
-                    return Ok(Box::new(vr180_pipeline::fisheye_decode::BrawZcIter::new(
-                        dev.device.clone(), path, &info, scale, vr180_braw::DecodeLook::Film,
-                        swap_eyes, layout.mono, step, 5, braw_color)?));
+                    match vr180_pipeline::fisheye_decode::BrawZcIter::new(
+                        dev.adapter.clone(), dev.device.clone(), path, &info, scale, vr180_braw::DecodeLook::Film,
+                        swap_eyes, layout.mono, step, 5, braw_color)
+                    {
+                        Ok(it) => {
+                            tracing::info!("decoder (fisheye/braw): zero-copy {} path, decode scale {:?}, step {}",
+                                vr180_braw::zc::EXPECTED_TRANSPORT, scale, step);
+                            return Ok(Box::new(it));
+                        }
+                        Err(e) => tracing::warn!("decoder (fisheye/braw): zero-copy path unavailable ({e}) — frames through the pipe"),
+                    }
                 }
             }
             let _ = &gpu;

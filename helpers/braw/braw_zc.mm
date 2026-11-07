@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <unistd.h>
 
 namespace {
 
@@ -115,6 +116,11 @@ uint32_t zc_pool_surface_id(const ZcPool* p, uint32_t slot, int eye) {
     if (!p || slot >= p->slots.size()) return 0;
     return p->slots[slot].eye[eye ? 1 : 0].id;
 }
+
+uint64_t zc_pool_handle(const ZcPool* p, uint32_t slot, int eye) { return zc_pool_surface_id(p, slot, eye); }
+const char* zc_transport() { return "iosurface"; }
+uint32_t zc_owner_pid() { return (uint32_t)getpid(); }
+void zc_set_adapter_luid(uint64_t) {}
 
 bool zc_pool_fill_metal(ZcPool* p, uint32_t slot, void* mtl_buffer, void* mtl_queue,
                         uint32_t src_w, uint32_t src_h, uint32_t src_row_bytes, int track) {

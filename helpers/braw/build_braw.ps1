@@ -83,8 +83,11 @@ if errorlevel 1 exit /b 3
 echo [cl] braw_helper.cpp
 cl /nologo /c /std:c++17 $opt /EHsc /utf-8 /W3 $defs /I"$Obj" /I"$Include" /I"$ScriptDir" /FI"$Dispatch" /Fo"$Obj\braw_helper.obj" "$Src"
 if errorlevel 1 exit /b 4
+echo [cl] braw_zc_win.cpp
+cl /nologo /c /std:c++17 $opt /EHsc /utf-8 /W3 $defs /I"$Obj" /I"$Include" /I"$ScriptDir" /Fo"$Obj\braw_zc_win.obj" "$ScriptDir\braw_zc_win.cpp"
+if errorlevel 1 exit /b 4
 echo [link] braw_helper.exe
-link /nologo /OUT:"$Out" "$Obj\braw_helper.obj" "$Obj\api_i.obj" ole32.lib oleaut32.lib shell32.lib
+link /nologo /OUT:"$Out" "$Obj\braw_helper.obj" "$Obj\braw_zc_win.obj" "$Obj\api_i.obj" ole32.lib oleaut32.lib shell32.lib d3d11.lib dxgi.lib
 if errorlevel 1 exit /b 5
 "@
 $bat = Join-Path $Obj 'build.cmd'

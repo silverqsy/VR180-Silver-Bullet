@@ -47,8 +47,9 @@ Three guards now close that gap:
 only C++ headers. It links against the user's installed SDK at build time
 (`BlackmagicRawAPI.framework` on macOS, `BlackmagicRawAPI.dll` on Windows —
 the SDK is not redistributable); `helpers/braw/braw_platform.h` is the
-platform shim (strings, GPU pipeline: Metal / CUDA, the macOS-only
-IOSurface zero-copy hand-off). Without the SDK installed, the BRAW input
+platform shim (strings, GPU pipeline: Metal / CUDA); the zero-copy
+hand-off is `braw_zc.mm` (IOSurfaces) on macOS and `braw_zc_win.cpp`
+(shareable D3D11 textures) on Windows, behind the one `braw_zc.h`. Without the SDK installed, the BRAW input
 path is unavailable — the rest of the app still works.
 
 ## Why these stay Swift

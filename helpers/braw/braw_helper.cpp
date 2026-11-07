@@ -716,9 +716,17 @@ private:
         const int track = dual ? (int)(ticket & 1) : -1;
         if (type == blackmagicRawResourceTypeBufferCPU)
             return zc_pool_fill_cpu(zc, slot, (const uint8_t*)res, w, h, w * 4, track);
+#if BRAW_ZC_GPU_BLIT
         void* context = nullptr; void* queue = nullptr;
         img->GetResourceContextAndCommandQueue(&context, &queue);
         return zc_pool_fill_metal(zc, slot, res, queue, w, h, w * 4, track);
+#else
+        // No GPU-side blit into the pool on this platform: read the SDK's GPU
+        // resource back (the pipe decode's own path) and upload it.
+        std::vector<uint8_t> bytes;
+        if (fetch_processed_bytes(img, (size_t)w * h * 4, bytes) != S_OK) return false;
+        return zc_pool_fill_cpu(zc, slot, bytes.data(), w, h, w * 4, track);
+#endif
     }
 
     std::vector<uint8_t> take_buffer() {
@@ -1351,10 +1359,10 @@ static int do_decode_zc(ClipContext& ctx, DecodeCallback& cb, IBlackmagicRawClip
             is_dual ? pw * 2 : pw, is_dual ? ph : ph, (unsigned long long)emitted, is_dual ? "true" : "false", (unsigned long long)step);
     fprintf(stderr, ", \"pipeline\": \"%s\"", g_activePipeline.c_str());
     if (g_activePipeline != "cpu") fprintf(stderr, ", \"gpu_device\": \"%s\"", g_gpuDeviceName.c_str());
-    fprintf(stderr, ", \"transport\": \"iosurface\", \"slots\": %u, \"eye_width\": %u, \"eye_height\": %u, \"pad_rows\": %d, \"mono\": %s, \"surfaces\": [",
-            slots, g.eye_w, g.eye_h, g.pad_rows, g_mono ? "true" : "false");
+    fprintf(stderr, ", \"transport\": \"%s\", \"helper_pid\": %u, \"slots\": %u, \"eye_width\": %u, \"eye_height\": %u, \"pad_rows\": %d, \"mono\": %s, \"surfaces\": [",
+            zc_transport(), zc_owner_pid(), slots, g.eye_w, g.eye_h, g.pad_rows, g_mono ? "true" : "false");
     for (uint32_t s = 0; s < slots; s++)
-        fprintf(stderr, "%s[%u, %u]", s ? ", " : "", zc_pool_surface_id(pool, s, 0), zc_pool_surface_id(pool, s, 1));
+        fprintf(stderr, "%s[%llu, %llu]", s ? ", " : "", (unsigned long long)zc_pool_handle(pool, s, 0), (unsigned long long)zc_pool_handle(pool, s, 1));
     fprintf(stderr, "]}\n");
     fflush(stderr);
 
@@ -2081,6 +2089,7 @@ int main(int argc, const char* argv[]) {
             if (!BRAW_HAVE_ZEROCOPY) { std::cerr << "ERROR: --zerocopy (the IOSurface hand-off) is macOS-only" << std::endl; return 1; }
             g_zcSlots = (uint32_t)std::stoul(val);
         }
+        else if (arg == "--adapter-luid") { zc_set_adapter_luid(std::stoull(val, nullptr, 16)); }   // the app's GPU (Windows zero-copy pool)
         else continue;  // unknown key-value pair, don't skip value
         i++;  // skip the value arg
     }

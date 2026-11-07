@@ -762,6 +762,90 @@ impl VulkanImportCtx {
     }
 }
 
+/// A shareable D3D11 texture that ANOTHER process owns (the `braw_helper`
+/// zero-copy pool), imported into wgpu as an RGBA8 texture aliasing its
+/// memory. Holds the NT handle this process duplicated out of the owner
+/// (closed on drop; Vulkan dup'd its own reference at import time, so the
+/// texture outlives the handle) — the Windows twin of the macOS
+/// `IOSurfacePlaneTexture`.
+pub struct ImportedSharedTexture {
+    pub texture: wgpu::Texture,
+    pub width: u32,
+    pub height: u32,
+    handle: HANDLE,
+}
+
+impl std::fmt::Debug for ImportedSharedTexture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportedSharedTexture").field("handle", &self.handle.0)
+            .field("width", &self.width).field("height", &self.height).finish()
+    }
+}
+
+// SAFETY: the only non-Send/Sync member is the NT handle, an opaque kernel
+// object reference that any thread may close exactly once (Drop does); the
+// wgpu texture is Send + Sync on its own. Same reasoning as the COM-holding
+// `D3d11SharedTexture`.
+unsafe impl Send for ImportedSharedTexture {}
+unsafe impl Sync for ImportedSharedTexture {}
+
+impl Drop for ImportedSharedTexture {
+    fn drop(&mut self) {
+        if !self.handle.is_invalid() && !self.handle.0.is_null() {
+            // SAFETY: a handle this process owns (DuplicateHandle gave us our
+            // own reference), closed exactly once.
+            unsafe { let _ = CloseHandle(self.handle); }
+        }
+    }
+}
+
+impl VulkanImportCtx {
+    /// Import an **RGBA8** shareable texture created by process `owner_pid`
+    /// (`handle_value` is the NT handle AS SEEN IN THAT PROCESS): duplicate
+    /// the handle into this process, then alias the texture's memory as a
+    /// `Rgba8Unorm` wgpu texture. The owner must have created it on the
+    /// adapter of this context's Vulkan device (`vulkan_device_luid`).
+    ///
+    /// # Safety
+    /// `handle_value` must name a live shared NT handle for an
+    /// `R8G8B8A8_UNORM` texture of `w`×`h` in `owner_pid`.
+    pub unsafe fn import_foreign_rgba8(
+        &self,
+        wgpu_device: &wgpu::Device,
+        owner_pid: u32,
+        handle_value: u64,
+        w: u32,
+        h: u32,
+    ) -> crate::Result<ImportedSharedTexture> {
+        use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
+        let owner = OpenProcess(PROCESS_DUP_HANDLE, false, owner_pid)
+            .map_err(|e| crate::Error::Ffmpeg(format!("OpenProcess({owner_pid}) for the zero-copy pool: {e}")))?;
+        let mut local = HANDLE::default();
+        let dup = DuplicateHandle(
+            owner, HANDLE(handle_value as usize as *mut core::ffi::c_void), GetCurrentProcess(),
+            &mut local, 0, false, DUPLICATE_SAME_ACCESS,
+        );
+        let _ = CloseHandle(owner);
+        dup.map_err(|e| crate::Error::Ffmpeg(format!(
+            "DuplicateHandle({handle_value:#x} from pid {owner_pid}) for the zero-copy pool: {e}")))?;
+        // The importer asserts on failure; validate what we can first so a
+        // wrong-adapter handle reports instead of panicking the decoder.
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE;
+        let mut hprops = vk::MemoryWin32HandlePropertiesKHR::default();
+        if let Err(e) = self.ext_mem_win32.get_memory_win32_handle_properties(handle_type, local.0 as _, &mut hprops) {
+            let _ = CloseHandle(local);
+            return Err(crate::Error::Ffmpeg(format!(
+                "the zero-copy pool's texture cannot be imported on this GPU ({e}) — is the helper on the same adapter?")));
+        }
+        let texture = import_d3d11_handle_to_wgpu(
+            wgpu_device, self, local, w, h,
+            wgpu::TextureFormat::Rgba8Unorm, vk::Format::R8G8B8A8_UNORM,
+        );
+        Ok(ImportedSharedTexture { texture, width: w, height: h, handle: local })
+    }
+}
+
 /// Minimal mirror of libavutil's `AVD3D11VADeviceContext` (ffmpeg-sys-next
 /// doesn't generate a binding for it). Field order/layout matches
 /// `libavutil/hwcontext_d3d11va.h`; we only read `device`/`device_context`.

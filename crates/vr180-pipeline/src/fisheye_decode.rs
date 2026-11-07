@@ -4095,30 +4095,44 @@ impl FisheyePairIter for BrawFisheyeIter {
 // SDK's decode plus two GPU blits.
 
 /// Returns a zero-copy slot to the helper when dropped.
+/// One eye of a zero-copy slot as a wgpu texture: an IOSurface wrap on
+/// macOS, an imported shared D3D11 texture on Windows (the helper's
+/// `braw_zc.mm` / `braw_zc_win.cpp` twins). Both expose `.texture`.
 #[cfg(target_os = "macos")]
+type ZcEyeTexture = crate::interop_macos::IOSurfacePlaneTexture;
+#[cfg(target_os = "windows")]
+type ZcEyeTexture = crate::interop_windows::ImportedSharedTexture;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 struct ZcSlotGuard {
     slot: u32,
     releaser: std::sync::Arc<vr180_braw::ZcReleaser>,
-    _surfaces: [std::sync::Arc<crate::interop_macos::IOSurfacePlaneTexture>; 2],
+    _surfaces: [std::sync::Arc<ZcEyeTexture>; 2],
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl Drop for ZcSlotGuard {
     fn drop(&mut self) { self.releaser.release(self.slot); }
 }
 
 /// Blackmagic RAW pair source with the frames left on the GPU (see above).
 /// Same step / seek / canvas semantics as [`BrawFisheyeIter`].
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub struct BrawZcIter {
     device: std::sync::Arc<wgpu::Device>,
+    /// Windows: the Vulkan import context (the helper's textures are
+    /// imported through `VK_KHR_external_memory_win32`) and the adapter LUID
+    /// the helper is told to create them on.
+    #[cfg(target_os = "windows")]
+    import: crate::interop_windows::VulkanImportCtx,
+    adapter_luid: Option<[u8; 8]>,
     path: PathBuf,
     opts: vr180_braw::decoder::DecodeOptions,
     swap_eyes: bool,
     mono: bool,
     slots: u32,
     decoder: Option<vr180_braw::BrawZcDecoder>,
-    textures: Vec<[std::sync::Arc<crate::interop_macos::IOSurfacePlaneTexture>; 2]>,
+    textures: Vec<[std::sync::Arc<ZcEyeTexture>; 2]>,
     releaser: Option<std::sync::Arc<vr180_braw::ZcReleaser>>,
     eye_w: u32,
     eye_h: u32,
@@ -4138,11 +4152,14 @@ pub struct BrawZcIter {
     sent_color: Option<vr180_braw::BrawColorValues>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl BrawZcIter {
     /// `slots`: the helper's pool (≥ 3: one being shown, one whose GPU work
-    /// may still be in flight, one decoding ahead).
+    /// may still be in flight, one decoding ahead). `adapter` is the wgpu
+    /// adapter of `device` (Windows: the helper's textures must be created
+    /// on that GPU and the device must be on the Vulkan backend).
     pub fn new(
+        adapter: std::sync::Arc<wgpu::Adapter>,
         device: std::sync::Arc<wgpu::Device>,
         path: &Path,
         info: &vr180_braw::BrawInfo,
@@ -4162,8 +4179,20 @@ impl BrawZcIter {
             ..Default::default()
         };
         let dt_s = if info.frame_rate > 0.0 { 1.0 / info.frame_rate } else { 1.0 / 24.0 };
+        #[cfg(target_os = "windows")]
+        let import = crate::interop_windows::VulkanImportCtx::from_wgpu(&adapter, &device)
+            .ok_or_else(|| Error::Ffmpeg("braw zero-copy needs the Vulkan backend".into()))?;
+        #[cfg(target_os = "windows")]
+        let adapter_luid = crate::interop_windows::vulkan_device_luid(&import);
+        #[cfg(not(target_os = "windows"))]
+        let adapter_luid = None;
+        let _ = &adapter;
         let mut it = Self {
-            device, path: path.to_path_buf(), opts, swap_eyes, mono, slots: slots.max(3),
+            device,
+            #[cfg(target_os = "windows")]
+            import,
+            adapter_luid,
+            path: path.to_path_buf(), opts, swap_eyes, mono, slots: slots.max(3),
             decoder: None, textures: Vec::new(), releaser: None,
             eye_w: 0, eye_h: 0, dt_s, frame_idx: 0, frame_count: info.frame_count, step: step as u64,
             pending_seek: None, seek_gen: 0,
@@ -4178,10 +4207,12 @@ impl BrawZcIter {
         self.textures.clear();
         let mut opts = self.opts.clone();
         opts.start_frame = Some(frame);
-        let dec = vr180_braw::BrawZcDecoder::start(&self.path, &opts, self.slots, self.mono)
+        let dec = vr180_braw::BrawZcDecoder::start(&self.path, &opts, self.slots, self.mono, self.adapter_luid)
             .map_err(|e| Error::Ffmpeg(format!("braw zero-copy start at {frame}: {e}")))?;
         let h = dec.header().clone();
-        let wrap = |id: u32| -> Result<std::sync::Arc<crate::interop_macos::IOSurfacePlaneTexture>> {
+        #[cfg(target_os = "macos")]
+        let wrap = |id: u64| -> Result<std::sync::Arc<ZcEyeTexture>> {
+            let id = id as u32;
             let surface = crate::interop_macos::RetainedIOSurface::lookup(id)
                 .ok_or_else(|| Error::Ffmpeg(format!("IOSurface {id} from braw_helper not found")))?;
             let t = crate::interop_macos::wgpu_texture_from_iosurface_plane(
@@ -4189,6 +4220,16 @@ impl BrawZcIter {
                 metal::MTLPixelFormat::RGBA8Unorm, wgpu::TextureFormat::Rgba8Unorm,
                 h.eye_width, h.eye_height, "braw_zc_eye",
             )?;
+            Ok(std::sync::Arc::new(t))
+        };
+        #[cfg(target_os = "windows")]
+        let wrap = |handle: u64| -> Result<std::sync::Arc<ZcEyeTexture>> {
+            let pid = h.helper_pid
+                .ok_or_else(|| Error::Ffmpeg("braw_helper's zero-copy header names no helper_pid".into()))?;
+            // SAFETY: the handle names a live R8G8B8A8 texture of the header's
+            // eye size in the helper process, created on this device's adapter
+            // (the helper was told the LUID); the import validates the handle.
+            let t = unsafe { self.import.import_foreign_rgba8(&self.device, pid, handle, h.eye_width, h.eye_height)? };
             Ok(std::sync::Arc::new(t))
         };
         for ids in &h.surfaces {
@@ -4208,7 +4249,7 @@ impl BrawZcIter {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl FisheyePairIter for BrawZcIter {
     fn next_pair(&mut self) -> Result<Option<FisheyePair>> {
         if self.decoder.is_none() {

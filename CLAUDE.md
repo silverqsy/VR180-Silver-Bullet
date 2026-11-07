@@ -1743,8 +1743,45 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      16-bit CUDA decode, stab engaged, audio muxed (1.79 fps at 12K — the
      readback pipe + libx265; a reduced-scale decode for sub-12K eyes and
      NVENC would be the speed-ups). The frame matches the mac's own
-     `A001_04071606_C006_SBS.mp4` of the same instant. No Windows
-     zero-copy: the IOSurface hand-off has no D3D11/CUDA twin yet.
+     `A001_04071606_C006_SBS.mp4` of the same instant.
+   - **WINDOWS ZERO-COPY PREVIEW (2026-11-07, same day).** The IOSurface
+     hand-off has a D3D11 twin: `helpers/braw/braw_zc_win.cpp` implements the
+     same `braw_zc.h` pool with SHAREABLE D3D11 RGBA8 textures (NT handles,
+     `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`), one per eye per slot on the same
+     square canvas / pad rows (`row_map` verbatim), created on the adapter
+     the app names (`--adapter-luid <hex>` = its Vulkan device's LUID — a
+     cross-adapter handle cannot be imported) else the first hardware
+     adapter. Fill = `UpdateSubresource` + Flush + event-query wait BEFORE
+     the "F" line (the app reads the memory through Vulkan the moment it
+     sees the line); a CUDA-decoded frame is first read back through the
+     SDK's resource manager (`fill_slot` → `fetch_processed_bytes`, the pipe
+     decode's own path) because `cuGraphicsD3D11RegisterResource` refuses
+     shared textures and CUDA IPC is Linux-only — a CUDA external-memory
+     blit straight from the SDK buffer is the remaining optimisation. The
+     header gained `transport` ("iosurface" | "d3d11") and `helper_pid`;
+     `surfaces` carry 64-bit tokens (IOSurface IDs / NT handle values —
+     `zc_pool_handle`, `zc_transport`, `zc_owner_pid`, `zc_set_adapter_luid`
+     exist on both platforms; mac side: `braw_zc.mm` gained the four
+     one-liners + `<unistd.h>`, rebuild with `build_braw.sh`). App:
+     `vr180_braw::zc` is cross-platform (`EXPECTED_TRANSPORT`,
+     `BrawZcDecoder::start(.., adapter_luid)`), `BrawZcIter` is one source
+     for both (`ZcEyeTexture` = `IOSurfacePlaneTexture` /
+     `interop_windows::ImportedSharedTexture`; `new` takes the adapter and
+     builds a `VulkanImportCtx` on Windows), and
+     `VulkanImportCtx::import_foreign_rgba8` duplicates the helper's handle
+     (`OpenProcess` + `DuplicateHandle`; `Win32_System_Threading` feature),
+     validates it with `vkGetMemoryWin32HandlePropertiesKHR` (a wrong-adapter
+     handle reports instead of panicking) and imports it once per slot with
+     the existing `import_d3d11_handle_to_wgpu` (`Rgba8Unorm`). The GUI's
+     dispatch is ungated with a fallback to the pipe on error; on Windows a
+     reframed view keeps the pipe scale (no full-frame decode — the
+     host round trip would not pay). VERIFIED (`examples/braw_zc_check.rs`,
+     gitignored, on C006 at eighth): zc-vs-pipe **0.000/255, max 0** on both
+     eyes (same canvas, pad rows black), zc-left vs pipe-right 12.5 (not
+     swapped), 90 frames sustained through the 5-slot ring at **295 fps**
+     with a 2-deep hold, seek to 5.0 s lands on frame 300 exactly; the GUI
+     logs "zero-copy d3d11 path", plays at the 30 fps cadence with a 1 ms
+     render.
 
 26. **Dropped frames: per-frame tables are indexed by the container's
    sample table, not `round(pts / dt)` (2026-10-29).** Report: X6 clips

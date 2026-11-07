@@ -210,9 +210,11 @@ file, stills, and the camera's own colour handling.
   Windows (`helpers/braw/build_braw.ps1`, needs Blackmagic RAW 6.x with the
   SDK component installed): preview and export of PYXIS clips with the
   gyro stabilization, the embedded LUT and the audio, decoding on the SDK's
-  CUDA pipeline when an NVIDIA GPU is present. The GPU-resident preview
-  hand-off remains macOS-only, so Windows previews and exports go through
-  the readback path.
+  CUDA pipeline when an NVIDIA GPU is present. The preview hand-off is
+  GPU-resident on Windows too: the helper fills shareable D3D11 textures
+  the app maps directly (the Windows twin of the macOS IOSurface path), so
+  no frame pixels cross the pipe during playback. Exports take the
+  readback path.
 
 ## 2.5.2 — 2026-10-10
 

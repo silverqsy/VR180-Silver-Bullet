@@ -54,7 +54,10 @@ static inline void sdk_str_free(SdkString s) { if (s) CFRelease(s); }
 
 #define BRAW_GPU_PIPELINE      blackmagicRawPipelineMetal
 #define BRAW_GPU_PIPELINE_NAME "metal"
+// Zero-copy hand-off: global IOSurfaces (braw_zc.mm), filled by a Metal
+// blit straight from the SDK's buffer.
 #define BRAW_HAVE_ZEROCOPY 1
+#define BRAW_ZC_GPU_BLIT 1
 
 // The directory handed to CreateBlackmagicRawFactoryInstanceFromPath.
 static inline std::string sdk_library_dir() {
@@ -124,21 +127,12 @@ static inline void sdk_str_free(SdkString s) { if (s) SysFreeString(s); }
 
 #define BRAW_GPU_PIPELINE      blackmagicRawPipelineCUDA
 #define BRAW_GPU_PIPELINE_NAME "cuda"
-#define BRAW_HAVE_ZEROCOPY 0
-
-// Inert twins of braw_zc.h (same shapes) so the decode loop compiles
-// unchanged; `--zerocopy` is refused before any of these could run.
-struct ZcPool;
-struct ZcGeometry {
-    uint32_t eye_w = 0, eye_h = 0;
-    int32_t pad_rows = 0;
-    bool mono = false;
-};
-static inline ZcPool* zc_pool_create(uint32_t, const ZcGeometry&) { return nullptr; }
-static inline void zc_pool_destroy(ZcPool*) {}
-static inline uint32_t zc_pool_surface_id(const ZcPool*, uint32_t, int) { return 0; }
-static inline bool zc_pool_fill_metal(ZcPool*, uint32_t, void*, void*, uint32_t, uint32_t, uint32_t, int) { return false; }
-static inline bool zc_pool_fill_cpu(ZcPool*, uint32_t, const uint8_t*, uint32_t, uint32_t, uint32_t, int) { return false; }
+// Zero-copy hand-off: shareable D3D11 textures (braw_zc_win.cpp). No
+// GPU-side blit into the pool: a GPU-decoded frame is read back through the
+// SDK and uploaded (see `fill_slot`).
+#define BRAW_HAVE_ZEROCOPY 1
+#define BRAW_ZC_GPU_BLIT 0
+#include "braw_zc.h"
 
 // The SDK library directory: `BRAW_SDK_LIB_DIR` if set, else the SDK's own
 // install location, else the runtime that ships with Blackmagic RAW Player /
