@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: **UNRELEASED on `main` (pushed 2026-11-11): Insta360 X6 7.4K / 7.4K Crop / 10K / 10K Crop recording modes + Crop mask + the few-dropped-frames rate fix (item 28) — Windows needs a build + a look at the masked shaders; spatial video export of the reframed view, macOS only (item 29) — Windows needs only a build (the change adds a codec choice that is never offered there).** **2.5.5 RELEASED 2026-11-07 — tag `v2.5.5` @ `90f11b7`, macOS live on the updater feed (item 27), Windows build PENDING — it ships everything since 2.5.2: X6 per-frame eye-exposure matching (item 15), GoPro exposure timing from SHUT (item 16), Kandao QooCam 3 Ultra (items 23/24), Blackmagic RAW rebuilt + on Windows (item 25), dropped-frame tables + pts-paced preview (item 26).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
+## ⚡ Status: **UNRELEASED on `main` (pushed 2026-11-11): Insta360 X6 7.4K / 7.4K Crop / 10K / 10K Crop recording modes + Crop mask + the few-dropped-frames rate fix (item 28) — Windows needs a build + a look at the masked shaders; spatial video export of the reframed view, macOS only (item 29) — Windows needs only a build (the change adds a codec choice that is never offered there).** **2.5.5 RELEASED 2026-11-07 on BOTH platforms — tag `v2.5.5` @ `90f11b7`, macOS and Windows live on the updater feed (item 27) — it ships everything since 2.5.2: X6 per-frame eye-exposure matching (item 15), GoPro exposure timing from SHUT (item 16), Kandao QooCam 3 Ultra (items 23/24), Blackmagic RAW rebuilt + on Windows (item 25), dropped-frame tables + pts-paced preview (item 26).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -2135,7 +2135,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    = 2.5.5 immediately). The release note was cut from 950 to ~400 words
    before publishing (keep them at the 2.5.1 length; the note is embedded in
    `latest.json`, so an edited body means re-running `make-latest-json.mjs`
-   and re-uploading with `--clobber`). Windows build PENDING.** Version carriers bumped in `4bd548d` (Cargo workspace + GUI
+   and re-uploading with `--clobber`). Windows released the same day — see the end of this item.** Version carriers bumped in `4bd548d` (Cargo workspace + GUI
    crate, README, `installer/windows.iss` AppVer — the Windows box needs no
    bump commit); CHANGELOG `Unreleased` closed as `2.5.5 — 2026-11-07`;
    release-note draft `~/vr180-internal/RELEASE-2.5.5.md` =
@@ -2168,6 +2168,31 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    --clobber` setup.exe + portable zip + merged `latest.json` (NOT the
    .minisig). gh addresses the draft by its tag name (view/upload/download
    all worked on the 2.5.2 and 2.5.5 drafts).
+   **WINDOWS RELEASED (2026-11-07, Windows box, from `2ad13d3` + the
+   no-console commit `e3955cd`):** built `vr180-gui.exe` 2.5.5 (file version
+   2.5.5), bundle = exe + the SEVEN FFmpeg DLLs the exe imports (the import
+   closure — `ffmpeg-8.dll` next to the exe is the CLI's own and is NOT
+   shipped) + README.txt (rewritten: input list, update note, the Blackmagic
+   RAW runtime requirement) + **`braw_helper.exe`** (rebuilt the same minute
+   by `build_braw.ps1` with the CUDA blit; imports only system DLLs —
+   static CRT — and LoadLibrary's BlackmagicRawAPI.dll / nvcuda.dll at run
+   time). Smoke: the bundled exe launched from its folder loads its OWN
+   DLLs (module list), opens C006 on the zero-copy d3d11 path with no
+   console window. ISCC → setup.exe 16 939 579 B (sha256 cf73abe6…),
+   portable zip 21 622 945 B (folder-rooted like 2.1.0). Manifest: the
+   mac's `latest.json` synced first, `make-latest-json.mjs --version 2.5.5`
+   signed + merged; NOTE `gh release view --json body -q .body` ends with
+   a newline the mac's notes lack, so the merge was re-run with
+   `--notes ""` (= keep `prev.notes`) to leave the mac's notes byte-
+   identical; darwin entry byte-identical. Uploaded `--clobber`: setup.exe,
+   zip, merged `latest.json` (no .minisig). VERIFIED live: the release's
+   `latest.json` asset and setup.exe are sha-identical to local, the live
+   installer verifies against the signature IN the live manifest with the
+   updater.rs pubkey; the STABLE `releases/latest/download/latest.json`
+   URL kept serving the mac's darwin-only manifest for ~6 min after the
+   upload (CDN redirect cache) and then served the merged one byte-
+   identically — check it twice, not once. Feed serves 2.5.5 to BOTH
+   platforms.
 
 20. **X6 360° Audio on Windows (2026-10-10, Windows box)** — the mac
    side's ambisonic work pulled, built clean first try (the new `build.rs`
