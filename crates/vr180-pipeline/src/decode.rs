@@ -426,6 +426,22 @@ mod nominal_rate_tests {
             assert!((probe.fps - nominal).abs() < 1e-3, "{path}: probed {} fps, nominal {nominal}", probe.fps);
         }
     }
+
+    /// The probe reports both eyes' stream bit rates of a dual-stream clip
+    /// (sample bytes over the track's duration). Skipped when not mounted.
+    #[test]
+    fn dual_stream_bit_rates() {
+        let p = std::path::Path::new("/Volumes/Database/x6/1110/VID_20261110_144736_00_003.insv");
+        if !p.exists() { eprintln!("skip: sample not present"); return; }
+        let probe = super::probe_video(p).expect("probe");
+        // 126.64 and 126.01 Mbps per eye; the file is 1002 MB over 31.13 s
+        // (video + a 6 MB trailer + audio), i.e. the two together.
+        let [a, b] = probe.video_bitrates_bps;
+        assert!((a as f64 / 126_637_340.0 - 1.0).abs() < 0.01, "stream 0: {a}");
+        assert!((b as f64 / 126_014_114.0 - 1.0).abs() < 0.01, "stream 1: {b}");
+        let file_bps = std::fs::metadata(p).unwrap().len() as f64 * 8.0 / probe.duration_sec;
+        assert!(((a + b) as f64 / file_bps) > 0.95 && ((a + b) as f64 / file_bps) < 1.0, "{} vs {file_bps}", a + b);
+    }
 }
 
 #[cfg(test)]
@@ -769,6 +785,12 @@ pub struct VideoProbe {
     /// Kandao QooCam's HDR mode; the GUI then auto-applies the HLG → Rec.709
     /// LUT. `false` for every SDR / log-encoded camera file.
     pub hlg: bool,
+    /// Bit rate (bits per second) of the recording's video streams — the
+    /// first two of the largest frame size, in stream order (the two eyes of
+    /// a dual-stream file) — as the container reports it (for MP4: the
+    /// track's sample bytes over its duration). `0` = no such stream, or
+    /// the container does not say (Blackmagic RAW, stills).
+    pub video_bitrates_bps: [u64; 2],
 }
 
 /// FAST clip duration (seconds) via the MP4 `moov`/`mvhd`, WITHOUT ffmpeg's
@@ -968,6 +990,7 @@ pub fn probe_video(path: &Path) -> Result<VideoProbe> {
             width: w, height: h, fps,
             duration_sec: if fps > 0.0 { info.frame_count as f64 / fps as f64 } else { info.duration },
             hlg: false,
+            video_bitrates_bps: [0; 2],
         });
     }
     init();
@@ -1008,12 +1031,27 @@ pub fn probe_video(path: &Path) -> Result<VideoProbe> {
     // we read width/height which are POD fields.
     let raw = unsafe { &*params.as_ptr() };
     let hlg = raw.color_trc == ffmpeg_next::ffi::AVColorTransferCharacteristic::AVCOL_TRC_ARIB_STD_B67;
+    // Every video stream of the recording's own frame size: the second eye
+    // of a dual-stream file counts, a thumbnail / preview stream does not.
+    let mut video_bitrates_bps = [0u64; 2];
+    for (slot, rate) in video_bitrates_bps.iter_mut().zip(
+        ictx.streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+            .filter_map(|s| {
+                // SAFETY: reading POD fields from AVCodecParameters.
+                let p = unsafe { &*s.parameters().as_ptr() };
+                (p.width == raw.width && p.height == raw.height).then(|| p.bit_rate.max(0) as u64)
+            }),
+    ) {
+        *slot = rate;
+    }
     Ok(VideoProbe {
         width: raw.width as u32,
         height: raw.height as u32,
         fps,
         duration_sec,
         hlg,
+        video_bitrates_bps,
     })
 }
 

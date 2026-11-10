@@ -54,6 +54,13 @@ own rolling-shutter time.
 - Native export sizes follow the mode: 7424 × 3712, 9728 × 4864 and
   9824 × 4912.
 
+### File info: bit rate
+
+The file info (Source panel) and the clip header show the video bit rate
+read from the file. A dual-stream recording lists each eye's stream next to
+the total (`252.7 Mbps (126.6 + 126.0)`); where the container states none
+(Blackmagic RAW) the figure is the file's size over its duration, marked ≈.
+
 ### Fixes
 
 - **A clip that lost only a few frames exported slightly slow.** The

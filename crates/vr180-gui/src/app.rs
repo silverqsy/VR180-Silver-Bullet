@@ -516,6 +516,25 @@ struct ExportOptions {
 }
 
 #[cfg(test)]
+mod file_info_tests {
+    use super::bitrate_label;
+
+    #[test]
+    fn bitrate_text() {
+        // Dual-stream: the total, with each eye's stream in the info grid.
+        let dual = [126_637_340u64, 126_014_114];
+        assert_eq!(bitrate_label(&dual, Some(257_000_000), true).as_deref(), Some("252.7 Mbps (126.6 + 126.0)"));
+        assert_eq!(bitrate_label(&dual, Some(257_000_000), false).as_deref(), Some("252.7 Mbps"));
+        // One stream: no brackets.
+        assert_eq!(bitrate_label(&[98_400_000], None, true).as_deref(), Some("98.4 Mbps"));
+        // The container states none: the file's size over its duration, marked.
+        assert_eq!(bitrate_label(&[], Some(1_234_560_000), true).as_deref(), Some("≈ 1234.6 Mbps"));
+        // Nothing known (a still).
+        assert_eq!(bitrate_label(&[], None, true), None);
+    }
+}
+
+#[cfg(test)]
 mod reframe_bitrate_tests {
     use super::ReframeSize;
     use crate::decoder::ReframeAspect;
@@ -894,6 +913,9 @@ fn tr(en: &'static str) -> &'static str {
         "Match to left eye" => "以左眼为准",
         "Match to right eye" => "以右眼为准",
         "Mode" => "档位",
+        "Bitrate" => "比特率",
+        "Video bit rate from the file. Two numbers in brackets are the two eyes' streams. ≈ means the whole file's size over its duration."
+            => "文件里的视频比特率。括号里的两个数是两眼各自的码流。≈ 表示按整个文件大小除以时长估算。",
         "view to be confirmed" => "视角待确认",
         "unrecognized X6 mode" => "未识别的 X6 档位",
         "View" => "视角",
@@ -1193,6 +1215,14 @@ struct ClipInfo {
     /// Insta360 X6 video: the trailer's recording-mode signature and
     /// picture profile.
     x6: Option<X6ClipInfo>,
+    /// Bit rate of each video stream of the recording, bits per second, as
+    /// the container reports it (two entries = the two eyes of a
+    /// dual-stream file; the first chapter's for a chain). Empty when the
+    /// container does not say.
+    video_bitrates_bps: Vec<u64>,
+    /// The clip's size over its duration, bits per second — shown when the
+    /// container states no stream rate (Blackmagic RAW). `None` for a still.
+    file_bitrate_bps: Option<u64>,
 }
 
 impl ClipInfo {
@@ -1261,6 +1291,9 @@ struct LoadedMeta {
     braw_color: Option<vr180_braw::BrawColorInfo>,
     /// Insta360 X6 video: recording-mode signature + picture profile.
     x6: Option<X6ClipInfo>,
+    /// See `ClipInfo::video_bitrates_bps` / `file_bitrate_bps`.
+    video_bitrates_bps: Vec<u64>,
+    file_bitrate_bps: Option<u64>,
 }
 
 impl App {
@@ -2410,7 +2443,7 @@ impl App {
             let probe = if source_kind.is_still() {
                 // One Bayer frame, both eyes side by side: no video probe.
                 match vr180_fisheye::dng::probe(&path) {
-                    Ok((w, h)) => vr180_pipeline::decode::VideoProbe { width: w, height: h, fps: 1.0, duration_sec: 0.0, hlg: false },
+                    Ok((w, h)) => vr180_pipeline::decode::VideoProbe { width: w, height: h, fps: 1.0, duration_sec: 0.0, hlg: false, video_bitrates_bps: [0; 2] },
                     Err(e) => { tracing::warn!("batch: DNG probe failed for {}: {e}", path.display()); continue; }
                 }
             } else { match vr180_pipeline::decode::probe_video(&path) {
@@ -3264,7 +3297,7 @@ impl App {
 
         let probe = if source_kind.is_still() {
             let (w, h) = vr180_fisheye::dng::probe(&path).map_err(|e| format!("DNG probe failed: {e}"))?;
-            vr180_pipeline::decode::VideoProbe { width: w, height: h, fps: 1.0, duration_sec: 0.0, hlg: false }
+            vr180_pipeline::decode::VideoProbe { width: w, height: h, fps: 1.0, duration_sec: 0.0, hlg: false, video_bitrates_bps: [0; 2] }
         } else {
             vr180_pipeline::decode::probe_video(&path)
                 .map_err(|e| format!("probe failed: {e}"))?
@@ -3361,6 +3394,18 @@ impl App {
                 .map(|t| t.len() as u32).filter(|n| *n > 0).unwrap_or(frame_count)
         };
 
+        // Bit rate for the file info: the video streams' own rates come with
+        // the probe; the whole clip's bytes over its duration stand in where
+        // the container states none (Blackmagic RAW). File sizes only.
+        let file_bitrate_bps = (!source_kind.is_still() && duration_sec > 0.0).then(|| {
+            let bytes: u64 = segments.iter().filter_map(|s| std::fs::metadata(s).ok()).map(|m| m.len()).sum();
+            (bytes as f64 * 8.0 / duration_sec) as u64
+        }).filter(|b| *b > 0);
+        tracing::info!(
+            "load: bit rate — video streams {:?} bps, whole file {:?} bps",
+            probe.video_bitrates_bps, file_bitrate_bps
+        );
+
         // NOTE: no DJI metadata read here — the decoder loads the lens calib
         // FAST (first sample) for an immediate preview and streams the heavy
         // per-frame quats in the background (see `load_dji_imu_progressive`), so
@@ -3431,6 +3476,7 @@ impl App {
             cori_count, grav_count, srot_ms,
             detected_rs_mode, fisheye_eye_w, fisheye_eye_h,
             eac_cal_dim, foa_audio, quad_audio, hlg: probe.hlg, braw_lut, braw_color, x6,
+            video_bitrates_bps: probe.video_bitrates_bps.iter().copied().filter(|b| *b > 0).collect(), file_bitrate_bps,
         })
     }
 
@@ -3577,6 +3623,8 @@ impl App {
             braw_color: meta.braw_color.map(std::sync::Arc::new),
             braw_lut: meta.braw_lut.clone(),
             x6: meta.x6,
+            video_bitrates_bps: meta.video_bitrates_bps,
+            file_bitrate_bps: meta.file_bitrate_bps,
         });
         self.loaded_path = Some(meta.path);
         // The decoder about to start is built for the current view choice.
@@ -5006,9 +5054,11 @@ impl eframe::App for App {
                     let mode = clip.x6_geometry(self.settings.insv_view)
                         .and_then(|g| x6_mode_label(&g))
                         .map(|m| format!("{m} · ")).unwrap_or_default();
+                    let rate = bitrate_label(&clip.video_bitrates_bps, clip.file_bitrate_bps, false)
+                        .map(|r| format!(" · {r}")).unwrap_or_default();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(format!(
-                            "{mode}{} × {} @ {:.2} fps · {} frames",
+                            "{mode}{} × {} @ {:.2} fps · {} frames{rate}",
                             clip.width, clip.height, clip.fps, clip.frame_count,
                         )).small().color(Color32::GRAY));
                     });
@@ -5937,6 +5987,12 @@ impl App {
                         ui.label(RichText::new(tr("Duration")).color(Color32::GRAY).small());
                         ui.label(format!("{:.2}s ({} frames)", c.duration_sec, c.frame_count));
                     });
+                    if let Some(rate) = bitrate_label(&c.video_bitrates_bps, c.file_bitrate_bps, true) {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr("Bitrate")).color(Color32::GRAY).small());
+                            ui.label(rate);
+                        }).response.on_hover_text(tr("Video bit rate from the file. Two numbers in brackets are the two eyes' streams. ≈ means the whole file's size over its duration."));
+                    }
                 }
                 if c.source_kind.is_eac() {
                     ui.horizontal(|ui| {
@@ -7339,6 +7395,23 @@ fn seed_tone_curve(p: &mut vr180_braw::BrawColorParams, base: vr180_braw::TonePr
     p.black_level.get_or_insert(base.black_level);
     p.white_level.get_or_insert(base.white_level);
     p.video_black_level.get_or_insert(base.video_black_level);
+}
+
+/// Bit rate text for the file info. The video streams' total — and, with
+/// `per_stream`, each eye's stream of a dual-stream file in brackets
+/// (`253.3 Mbps (126.6 + 126.7)`); `≈ … Mbps` from the file size when the
+/// container states no stream rate; `None` when neither is known (a still).
+fn bitrate_label(video_bps: &[u64], file_bps: Option<u64>, per_stream: bool) -> Option<String> {
+    let mbps = |b: u64| b as f64 / 1e6;
+    match video_bps {
+        [] => file_bps.map(|b| format!("≈ {:.1} Mbps", mbps(b))),
+        many if per_stream && many.len() > 1 => Some(format!(
+            "{:.1} Mbps ({})",
+            mbps(many.iter().sum()),
+            many.iter().map(|b| format!("{:.1}", mbps(*b))).collect::<Vec<_>>().join(" + "),
+        )),
+        some => Some(format!("{:.1} Mbps", mbps(some.iter().sum()))),
+    }
 }
 
 /// Menu name of an X6 clip's recording mode for the UI: `None` for the
