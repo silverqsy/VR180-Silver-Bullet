@@ -26,11 +26,17 @@
 //! calibration string — a Unified Camera Model (ξ) + even radial polynomial
 //! + tangential + thin-prism terms (`vr180_fisheye::insta360::InsvLensCalib`,
 //! matched to Insta360 Studio's output). [`stream_lens_calib`] expresses it
-//! in stream coordinates: the video is the sensor window from the file's
-//! `window_crop_info` (X6: the 7744² half minus a 32 px border, i.e. 7680²)
-//! binned 2×2 to 3840², so `fx` halves and the principal point is
-//! `(c − 32)/2` — per lens, NOT the frame centre (entry 2 sits ~24 px left
-//! of it). The exact model rides along as `DjiLensCalib::omni` for the
+//! in stream coordinates through the clip's
+//! [`InsvStreamGeometry`](vr180_fisheye::InsvStreamGeometry): the stock
+//! video is the sensor window from the file's `window_crop_info` (the 7744²
+//! half minus a 32 px border, i.e. 7680²) binned 2×2 to 3840², so `fx`
+//! halves and the principal point is `(c − 32)/2` — per lens, NOT the frame
+//! centre (entry 2 sits ~24 px left of it). The 7.4K and 10K modes scale
+//! their window the same way; the Crop modes are native pixels cut from the
+//! middle of the sensor (scale 1, the frame holds part of the image circle,
+//! and the 7.4K Crop spans 3712 of the 3968 rows the sensor reads — its
+//! readout is the file's value times that share). The exact model rides
+//! along as `DjiLensCalib::omni` for the
 //! renderers; `fx/k1..k5` hold a KB-5 fit of its radial curve (0.02 px
 //! inside 95°) for the override UI and CPU consumers. Without a usable
 //! string the measured X6 profile in [`x6_stream_lens_calib`] is the
@@ -40,7 +46,7 @@
 //! the factory extrinsics.
 
 use vr180_core::gyro::cori_iori::Quat;
-use vr180_fisheye::insta360::{Insta360Meta, InsvLensCalib, InsvWindowCrop};
+use vr180_fisheye::insta360::{Insta360Meta, InsvLensCalib, InsvStreamGeometry, X6ViewChoice};
 use vr180_fisheye::{DjiLensCalib, DjiOsvImu, OmniLensModel};
 
 /// IMU→camera basis for the VR180-modded X6 — rows are the camera axes
@@ -98,11 +104,6 @@ const INSV_TRIM_LP_S: f64 = 2.0;
 /// sampled that much earlier.
 pub const INSV_STUDIO_SAMPLE_LAG_MS: f64 = 0.63;
 
-/// X6 video sensor window when the file omits `window_crop_info`.
-const X6_DEFAULT_CROP: InsvWindowCrop = InsvWindowCrop {
-    src_w: 7744, src_h: 7744, dst_w: 7680, dst_h: 7680, offset_x: 0, offset_y: 0,
-};
-
 /// Fallback stream-space (3840²) focal length, px/rad — KB-4 fit of a
 /// typical X6 factory entry (paraxial 1044 px/rad); used only when the
 /// trailer has no usable calibration string.
@@ -144,12 +145,20 @@ pub fn insv_x6_imu_to_cam() -> [[f32; 3]; 3] {
 }
 
 /// The measured X6 lens model expressed for a `stream_w × stream_h`
-/// working frame (both lenses share it; the two factory entries differ by
-/// 0.15 % in focal, below what the measurement resolves). Principal point
-/// = frame centre: the firmware re-centres each lens when cropping the
-/// 3840² streams (rim fit lands within 2 px of centre on both streams).
+/// working frame holding the stock window (both lenses share it; the two
+/// factory entries differ by 0.15 % in focal, below what the measurement
+/// resolves). Principal point = frame centre: the firmware re-centres each
+/// lens when cropping the 3840² streams (rim fit lands within 2 px of
+/// centre on both streams).
 pub fn x6_stream_lens_calib(stream_w: u32, stream_h: u32) -> DjiLensCalib {
-    let s = stream_w as f32 / INSV_X6_CALIB_SIDE;
+    x6_profile_lens_calib(stream_w as f64 / (2.0 * INSV_X6_CALIB_SIDE as f64), false, stream_w, stream_h)
+}
+
+/// The same fallback profile for a stream at `scale` stream pixels per
+/// native pixel (the profile was measured at ½, the 3840² stream); `cropped`
+/// marks a frame that holds only part of the image circle.
+pub fn x6_profile_lens_calib(scale: f64, cropped: bool, stream_w: u32, stream_h: u32) -> DjiLensCalib {
+    let s = (scale * 2.0) as f32;
     DjiLensCalib {
         fx: Some(INSV_X6_FX * s),
         fy: Some(INSV_X6_FX * s),
@@ -164,57 +173,38 @@ pub fn x6_stream_lens_calib(stream_w: u32, stream_h: u32) -> DjiLensCalib {
         p2: Some(0.0),
         width: Some(stream_w as f32),
         height: Some(stream_h as f32),
+        frame_crop: cropped,
         ..Default::default()
     }
 }
 
-/// Stream pixels per native calibration pixel: the recorded window
-/// (`dst`) is scaled to the stream size (X6: 7680 → 3840 = ½, the 2×2 binning).
-pub fn stream_scale(crop: Option<&InsvWindowCrop>, stream_w: u32) -> f64 {
-    let c = crop.copied().unwrap_or(X6_DEFAULT_CROP);
-    stream_w as f64 / c.dst_w.max(1) as f64
-}
-
-/// Principal point of a factory entry in stream coordinates: the native
-/// centre, relative to its sensor half, shifted by the window origin —
-/// centred `(src − dst)/2` plus the stored offset — then scaled. Matches
-/// Insta360 Studio's conversion.
-pub fn stream_principal_point(entry: &InsvLensCalib, crop: Option<&InsvWindowCrop>, stream_w: u32, stream_h: u32) -> (f32, f32) {
-    let c = crop.copied().unwrap_or(X6_DEFAULT_CROP);
-    let sx = stream_w as f64 / c.dst_w.max(1) as f64;
-    let sy = stream_h as f64 / c.dst_h.max(1) as f64;
-    let ox = entry.half_origin_x() as f64 + (c.src_w as f64 - c.dst_w as f64) * 0.5 + c.offset_x as f64;
-    let oy = (c.src_h as f64 - c.dst_h as f64) * 0.5 + c.offset_y as f64;
-    (((entry.cx as f64 - ox) * sx) as f32, ((entry.cy as f64 - oy) * sy) as f32)
-}
-
 /// Per-file lens calibration for one video stream, in stream coordinates.
 ///
-/// - Frame: the file's sensor window (`crop`, X6 default 7744² → 7680²
-///   centred) scaled to the stream (3840² = 2×2-binned → exactly ½), so the
-///   principal point is `(c − 32)/2` per lens and `fx` halves.
+/// - Frame: `geom` places the stream in the calibration's native frame —
+///   the stock 3840² stream is the 7680² window binned 2×2 (principal point
+///   `(c − 32)/2` per lens, `fx` halved); a Crop mode is native pixels
+///   (`fx` unchanged, principal point `c − origin`) and sets `frame_crop`.
 /// - `omni`: the exact factory model (UCM + radial + tangential + prism),
 ///   which the renderers use.
 /// - `fx/k1..k5`: a weighted linear least-squares KB-5 fit of the radial
 ///   curve `r(θ)` on θ ∈ [0, 106°] (full weight inside 96°) for the override
-///   UI seeds and CPU consumers (0.02 px inside 95°).
-pub fn stream_lens_calib(entry: &InsvLensCalib, crop: Option<&InsvWindowCrop>, stream_w: u32, stream_h: u32) -> DjiLensCalib {
-    let bin = stream_scale(crop, stream_w);
-    let (cx, cy) = stream_principal_point(entry, crop, stream_w, stream_h);
-    let (f, k) = fit_kb5(|th| entry.project_radius(th) * bin);
+///   UI seeds and CPU consumers (0.02 px inside 95° at the 3840² scale).
+pub fn stream_lens_calib(entry: &InsvLensCalib, geom: &InsvStreamGeometry, stream_w: u32, stream_h: u32) -> DjiLensCalib {
+    let (cx, cy) = geom.principal_point(entry);
+    let (f, k) = fit_kb5(|th| entry.project_radius(th) * geom.scale_x);
     let omni = OmniLensModel {
         xi: entry.xi,
-        fx: (entry.fx as f64 * bin) as f32,
-        fy: (entry.fy as f64 * bin) as f32,
+        fx: (entry.fx as f64 * geom.scale_x) as f32,
+        fy: (entry.fy as f64 * geom.scale_y) as f32,
         radial: entry.radial5(),
         tangential: entry.tangential(),
         prism: entry.prism(),
     };
     DjiLensCalib {
         fx: Some(f as f32),
-        fy: Some(f as f32),
-        cx: Some(cx),
-        cy: Some(cy),
+        fy: Some((f * geom.scale_y / geom.scale_x.max(1e-12)) as f32),
+        cx: Some(cx as f32),
+        cy: Some(cy as f32),
         k1: Some(k[0] as f32),
         k2: Some(k[1] as f32),
         k3: Some(k[2] as f32),
@@ -225,6 +215,7 @@ pub fn stream_lens_calib(entry: &InsvLensCalib, crop: Option<&InsvWindowCrop>, s
         width: Some(stream_w as f32),
         height: Some(stream_h as f32),
         omni: Some(omni),
+        frame_crop: geom.cropped,
         ..Default::default()
     }
 }
@@ -280,7 +271,7 @@ fn fit_kb5(r_of_theta: impl Fn(f64) -> f64) -> (f64, [f64; 5]) {
 
 /// Calibration-only IMU (no quats) — enough to dewarp and to seed the
 /// Override UI; stabilization stays off until the full build lands.
-pub fn insv_calib_only(meta: &Insta360Meta, stream_w: u32, stream_h: u32) -> DjiOsvImu {
+pub fn insv_calib_only(meta: &Insta360Meta, stream_w: u32, stream_h: u32, view: X6ViewChoice) -> DjiOsvImu {
     // Stream 0 (back lens = RIGHT eye by default = `lens_a`, the DJI
     // convention — see `SourceKind::dual_stream_iter_swap`) carries
     // calibration entry 2 on the X6 — its tracks are stored in reverse lens
@@ -288,20 +279,33 @@ pub fn insv_calib_only(meta: &Insta360Meta, stream_w: u32, stream_h: u32) -> Dji
     // (screen lens = `lens_b`) entry 1.
     let reversed = meta.track_order_reversed.unwrap_or(true);
     let (i0, i1) = if reversed { (1, 0) } else { (0, 1) };
-    let crop = meta.window_crop.as_ref();
+    // Where the stream sits in the calibration frame — per recording mode
+    // (the file's window record + the encoded size; see `X6Mode`).
+    let geom = meta.stream_geometry(stream_w, stream_h, view);
+    tracing::info!(
+        "insv: {}x{} window {:?} → mode {:?}{} — scale {:.6}, origin ({:.1}, {:.1}), rows span {:.4} of the readout{}",
+        stream_w, stream_h, meta.window_crop.map(|w| (w.dst_w, w.dst_h, w.offset_x, w.offset_y)), geom.mode,
+        if geom.detected != geom.mode { format!(" (file: {:?}, view {:?})", geom.detected, view) } else { String::new() },
+        geom.scale_x, geom.origin_x, geom.origin_y, geom.readout_fraction,
+        if geom.cropped { ", frame = crop of the image circle" } else { "" },
+    );
     let (lens_a, lens_b) = if meta.lenses.len() >= 2 {
-        (stream_lens_calib(&meta.lenses[i0], crop, stream_w, stream_h),
-         stream_lens_calib(&meta.lenses[i1], crop, stream_w, stream_h))
+        (stream_lens_calib(&meta.lenses[i0], &geom, stream_w, stream_h),
+         stream_lens_calib(&meta.lenses[i1], &geom, stream_w, stream_h))
     } else {
         tracing::warn!("insv: no per-lens calibration string — using the generic X6 profile");
-        (x6_stream_lens_calib(stream_w, stream_h), x6_stream_lens_calib(stream_w, stream_h))
+        let c = x6_profile_lens_calib(geom.scale_x, geom.cropped, stream_w, stream_h);
+        (c.clone(), c)
     };
     DjiOsvImu {
         lens_a,
         lens_b,
         camera_model: Some(if meta.model.is_empty() { "Insta360".to_string() } else { meta.model.clone() }),
         imu_to_cam: Some(insv_x6_imu_to_cam()),
-        readout_ms: meta.readout_ms.map(|v| v as f32).filter(|v| *v > 0.0),
+        // The file's readout covers every row the sensor read; a frame that
+        // is the centred part of them spans that share of it.
+        readout_ms: meta.readout_ms.map(|v| (v * geom.readout_fraction) as f32).filter(|v| *v > 0.0),
+        insv_view: view,
         ..Default::default()
     }
 }
@@ -450,8 +454,9 @@ pub fn build_insv_imu(
     n_frames_hint: usize,
     stream_w: u32,
     stream_h: u32,
+    view: X6ViewChoice,
 ) -> DjiOsvImu {
-    let mut out = insv_calib_only(meta, stream_w, stream_h);
+    let mut out = insv_calib_only(meta, stream_w, stream_h, view);
     // The synthetic blocks below are centred on each frame's content time.
     out.sample_anchor = vr180_fisheye::SampleAnchor::BlockMid;
     let n_imu = meta.imu.len();
@@ -550,6 +555,7 @@ pub fn build_insv_imu(
             camera_model: out.camera_model.clone(),
             imu_to_cam: out.imu_to_cam,
             readout_ms: out.readout_ms,
+            insv_view: out.insv_view,
             sample_anchor: vr180_fisheye::SampleAnchor::BlockMid,
             ..Default::default()
         };
@@ -611,7 +617,7 @@ mod tests {
         let p = std::path::Path::new("/Volumes/Database/x6/concert/VID_20260815_193658_00_030.insv");
         if !p.exists() { return; }
         let meta = vr180_fisheye::insta360::read_insta360_meta(p).expect("meta");
-        let imu = build_insv_imu(&meta, 50.0, 2161, 3840, 3840);
+        let imu = build_insv_imu(&meta, 50.0, 2161, 3840, 3840, X6ViewChoice::Auto);
         assert_eq!(imu.frame_quats.len(), 2161);
         assert_eq!(imu.high_rate_quats[100].len(), HR_PER_FRAME);
         // Mid sample of the HR block == the frame quat (content time).
@@ -641,11 +647,71 @@ mod tests {
         assert_eq!(b.omni.unwrap().tangential, [-0.00032840, 0.00113587, 0.00412989, 0.00653467]);
     }
 
+    /// The four new X6 modes on the real samples (skipped when not mounted):
+    /// each stream's calibration is the factory entry moved into the mode's
+    /// frame, and the readout is the file's value over the rows encoded.
+    #[test]
+    fn real_x6_modes_calibrate() {
+        let dir = std::path::Path::new("/Volumes/Database/x6/1110");
+        // (file, eye side, scale, origin x, origin y, readout ms, cropped)
+        let cases: [(&str, u32, f64, f64, f64, f64, bool); 4] = [
+            ("VID_20261110_144736_00_003.insv", 3712, 3712.0 / 7680.0, 32.0, 32.0, 14.56, false),
+            ("drop frame/VID_20261110_144829_00_004.insv", 3712, 1.0, 2016.0, 2016.0, 16.037333 * 3712.0 / 3968.0, true),
+            ("VID_20261110_145518_00_008.insv", 4864, 4864.0 / 7912.0, -80.0, -84.0, 31.648, false),
+            ("VID_20261110_145135_00_006.insv", 4912, 1.0, 1416.0, 1416.0, 21.285333, true),
+        ];
+        for (name, side, scale, ox, oy, readout, cropped) in cases {
+            let p = dir.join(name);
+            if !p.exists() { continue; }
+            let meta = vr180_fisheye::insta360::read_insta360_identity(&p).expect("identity");
+            let imu = insv_calib_only(&meta, side, side, X6ViewChoice::Auto);
+            // Reversed track order: lens_a = stream 0 = entry 2, lens_b = entry 1.
+            for (lens, entry) in [(&imu.lens_a, &meta.lenses[1]), (&imu.lens_b, &meta.lenses[0])] {
+                let o = lens.omni.expect("factory model");
+                assert!((o.fx as f64 - entry.fx as f64 * scale).abs() < 2e-3, "{name}: fx {}", o.fx);
+                let cx = (entry.cx as f64 - entry.half_origin_x() as f64 - ox) * scale;
+                let cy = (entry.cy as f64 - oy) * scale;
+                assert!((lens.cx.unwrap() as f64 - cx).abs() < 2e-3 && (lens.cy.unwrap() as f64 - cy).abs() < 2e-3,
+                    "{name}: pp {:?} {:?} want ({cx}, {cy})", lens.cx, lens.cy);
+                // Every mode is centred on the sensor: the optical axis
+                // lands within 2 % of the frame centre.
+                let half = side as f32 * 0.5;
+                assert!((lens.cx.unwrap() - half).abs() < 0.02 * side as f32 && (lens.cy.unwrap() - half).abs() < 0.02 * side as f32,
+                    "{name}: pp {:?} {:?}", lens.cx, lens.cy);
+                assert_eq!(lens.frame_crop, cropped, "{name}");
+                assert_eq!((lens.width, lens.height), (Some(side as f32), Some(side as f32)));
+                // KB seed for the override UI follows the same scale.
+                assert!((lens.fx.unwrap() as f64 / (entry.paraxial_focal() * scale) - 1.0).abs() < 0.01, "{name}: kb fx {:?}", lens.fx);
+            }
+            assert!((imu.readout_ms.unwrap() as f64 - readout).abs() < 1e-3, "{name}: readout {:?}", imu.readout_ms);
+        }
+    }
+
+    /// A factory 8K clip still takes the original path: the 7680² window
+    /// binned 2×2 — `(c − 32)/2`, `fx/2`, the file's readout, no crop flag.
+    /// Skipped when not mounted.
+    #[test]
+    fn real_x6_stock_clip_is_unchanged() {
+        let p = std::path::Path::new("/Volumes/Database/x6/1106/VID_20261106_203704_00_015.insv");
+        if !p.exists() { return; }
+        let meta = vr180_fisheye::insta360::read_insta360_identity(p).expect("identity");
+        let g = meta.stream_geometry(3840, 3840, X6ViewChoice::Auto);
+        assert_eq!((g.mode, g.scale_x, g.origin_x, g.origin_y, g.readout_fraction, g.cropped),
+                   (vr180_fisheye::X6Mode::Stock, 0.5, 32.0, 32.0, 1.0, false));
+        // The view choice is ignored by a clip the file identifies.
+        assert_eq!(meta.stream_geometry(3840, 3840, X6ViewChoice::Crop), g);
+        let imu = insv_calib_only(&meta, 3840, 3840, X6ViewChoice::Auto);
+        let (a, e2) = (&imu.lens_a, &meta.lenses[1]);
+        assert!((a.cx.unwrap() - (e2.cx - 7744.0 - 32.0) / 2.0).abs() < 2e-3 && (a.cy.unwrap() - (e2.cy - 32.0) / 2.0).abs() < 2e-3);
+        assert!((a.omni.unwrap().fx - e2.fx / 2.0).abs() < 2e-3 && !a.frame_crop);
+        assert!((imu.readout_ms.unwrap() - 14.56).abs() < 1e-4);
+    }
+
     #[test]
     fn kb5_fit_reproduces_factory_curve() {
         let s = "2_2.455430_7216.620_7216.620_3855.460_3884.530_0.276_-0.042_89.578_0.000000_0.000000_0.000000_1.32059765_-1.38414502_4.43894196_5.25202703_0.00000000_-0.00032840_0.00113587_0.00412989_0.00653467_-0.00106616_-0.00235222_0.02084749_-0.01150168_15488_7744_193";
         let entry = &vr180_fisheye::insta360::parse_calib_string(s).unwrap()[0];
-        let c = stream_lens_calib(entry, None, 3840, 3840);
+        let c = stream_lens_calib(entry, &InsvStreamGeometry::scaled_window(&vr180_fisheye::insta360::X6_DEFAULT_WINDOW, 3840, 3840), 3840, 3840);
         let (f, k) = (c.fx.unwrap() as f64, [c.k1.unwrap() as f64, c.k2.unwrap() as f64, c.k3.unwrap() as f64, c.k4.unwrap() as f64, c.k5.unwrap() as f64]);
         let mut worst = 0f64;
         for i in 0..=1025 {

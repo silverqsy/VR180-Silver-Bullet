@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: **2.5.5 RELEASED 2026-11-07 — tag `v2.5.5` @ `90f11b7`, macOS live on the updater feed (item 27), Windows build PENDING — it ships everything since 2.5.2: X6 per-frame eye-exposure matching (item 15), GoPro exposure timing from SHUT (item 16), Kandao QooCam 3 Ultra (items 23/24), Blackmagic RAW rebuilt + on Windows (item 25), dropped-frame tables + pts-paced preview (item 26).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
+## ⚡ Status: **UNRELEASED on `main` (local, 2026-11-10): Insta360 X6 7.4K / 7.4K Crop / 10K / 10K Crop recording modes + Crop mask + the few-dropped-frames rate fix (item 28) — Windows needs a build + a look at the masked shaders.** **2.5.5 RELEASED 2026-11-07 — tag `v2.5.5` @ `90f11b7`, macOS live on the updater feed (item 27), Windows build PENDING — it ships everything since 2.5.2: X6 per-frame eye-exposure matching (item 15), GoPro exposure timing from SHUT (item 16), Kandao QooCam 3 Ultra (items 23/24), Blackmagic RAW rebuilt + on Windows (item 25), dropped-frame tables + pts-paced preview (item 26).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -1928,6 +1928,70 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    so a stale `helpers/bin/braw_helper` is not a hard failure — but rebuild
    it after any `helpers/braw/*` change; the release script hash-checks.
 
+
+28. **Insta360 X6 added recording modes (2026-11-10, Mac; UNRELEASED,
+   Windows not built)** — 7.4K (3712² @ 59.94), 7.4K Crop (3712²), 10K
+   (4864² @ 29.97), 10K Crop (4912²), plus the older 3808² crop / 4864²
+   "9.7K" signatures. Samples: `/Volumes/Database/x6/1110/` (11 clips, fw
+   v1.2.36; 004 + 009 in `drop frame/`).
+   - **Identification** (`vr180_fisheye::insta360`): `X6Mode::classify`
+     from the encoded eye size + the trailer's `window_crop_info.dst`
+     (7680² → 7.4K, 4912×3968 → 7.4K Crop, 7912² → 10K, 4912² → 10K Crop).
+     The two 3712² modes are indistinguishable without the record →
+     `Unconfirmed7K4` + `X6ViewChoice` (Settings `insv_view`, Source ▸ View;
+     a change evicts the cached IMU and reloads, like the eye-order
+     toggles). `Unknown` (e.g. 4928²) renders through the generic rule.
+   - **Geometry** = `InsvStreamGeometry { scale, origin, readout_fraction,
+     cropped }`, `stream = (native − origin)·scale`: wide modes keep the
+     scaled-window rule (7.4K: 3712/7680, origin 32; 10K: 4864/7912, origin
+     (−80, −84) from the record's (4, 0) offset); Crop modes are native
+     pixels centred on the sensor half (scale 1, origin 2016 / 1416 / 1968).
+     **The window `dst` is a signature, not a decode size or a crop rect.**
+     `insv_imu::stream_lens_calib` / `insv_calib_only` / `build_insv_imu`
+     take the geometry / the view choice now.
+   - **Timing**: nothing new — content time is the same centre-row
+     mid-exposure in every mode; readout = the file's
+     `rolling_shutter_time` × `readout_fraction` (7.4K Crop encodes 3712 of
+     the 3968 rows read). No constants were added.
+   - **Verified on footage** (scratch tools, not in the repo: gyro-predicted
+     vs tracked feature motion per stream; far-field shake of stabilized
+     exports): scale of every mode equals the stock mode's under the same
+     field selection (±0.2 %), time offset −0.5…−0.6 ms as stock, readout
+     14.0–14.3 / 14.6–15.5 / 31.2–31.7 / 21.0–21.5 ms vs the files' 14.56 /
+     15.00 (16.04 × 3712/3968) / 31.65 / 21.29; stabilized shake 0.05 px per
+     frame at 1024 px/eye in all four (1.2–2 px off), a V with its minimum
+     at 1.0 when `VR180_RS_SCALE` sweeps 0 … 2. Side finding, ALL modes
+     incl. stock: the factory lens model reads ~0.8 % small in the central
+     field and ~0.2 % large at the rim against the gyro — unexplained, not
+     acted on.
+   - **Crop frames** (`DjiLensCalib::frame_crop` → `FisheyeCalib::
+     with_frame_crop` → uniform `frame_mask`): rays that leave the frame
+     render black (edge antialiased over one output pixel) and the θ clamp
+     moves from the inscribed circle to the far corner, so corners keep
+     their image. Full-circle sources keep replicating the rim — the user
+     wants that (it hides stabilization gaps). **Crop mask** = a rounded
+     rectangle on the OUTPUT's equidistant angle plane, evaluated on the
+     output ray before the stab rotation (static window, same in both
+     eyes), `gpu::CropMask { amount, feather, round }` → `apply_frame_crop`
+     in BOTH resolvers (Settings `crop_mask`, export cfg `crop_mask`);
+     skipped in the reframed view.
+   - **Shaders**: all nine `fisheye_*.wgsl` now declare the SAME full
+     uniform struct (`FisheyeCalibUniforms` is 12 vec4 = 192 bytes: `_p9a`
+     became `frame_mask`, a new last row holds the mask) and share
+     `frame_cover` / `view_mask`. Exercised on Metal under
+     `VR180_WGPU_PANIC=1`: zero-copy P010 8/10-bit, the readback RGBA
+     8/16-bit kernels, equirect + fisheye output. **Windows TODO: build,
+     and check one Crop clip with a mask on DX12/Vulkan + the D3D11
+     zero-copy path** (no `#[cfg]` line was touched; struct literals and
+     call sites were audited textually).
+   - **Also fixed**: `decode::nominal_or_average_fps` — ANY dropped frame
+     now selects the nominal rate (a clip missing 2–8 frames sat inside the
+     0.5 % tolerance and exported at the average rate: 0.27 s of A/V drift
+     over a 61 s clip). The I-Log LUT follows `gamma_mode` (identity field
+     22), not the frame size. A trailer that cannot be read → generic X6
+     profile placed by the mode (calib-only IMU, no stab).
+   - Open: multi-segment `.insv`; this unit's lens A sits ~1° off the
+     shared IMU basis in roll (per-unit mount tolerance — not handled).
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

@@ -26,12 +26,54 @@ struct FisheyeCalibUniforms {
     fx: f32, fy: f32, cx: f32, cy: f32,
     k1: f32, k2: f32, k3: f32, k4: f32,
     theta_trans: f32, theta_max: f32, r_max: f32, k5: f32,
-    src_w: f32, src_h: f32, output_hfov_rad: f32, _pad2: f32,
+    src_w: f32, src_h: f32, output_hfov_rad: f32, src_x0: f32,
     p1: f32, p2: f32, xi: f32, src_proj: f32,     // xi > 0 selects the unified camera model; src_proj > 0.5 = half-equirect input (no lens model)
     ta: f32, tb: f32, tc: f32, te: f32,            // UCM tangential: (r²+2x²)(ta + tc r²) + 2xy(tb + te r²)
     s1: f32, s2: f32, s3: f32, s4: f32,            // UCM thin prism: x += s1 r² + s2 r⁴, y += s3 r² + s4 r⁴
+    proj_mode: f32, defish_k: f32, edge_x: f32, edge_y: f32,  // reframed-view output (proj_mode 1 → k-projection; 0 → half-equirect)
+    // Source sample range expansion (y_scale, y_off, c_scale, c_off) — read by the P010 kernels.
+    yuv_range: vec4<f32>,
+    // This eye's y offset in the plane (stacked top/bottom frames); frame_mask
+    // > 0.5 = the frame is a CROP of the image circle (see `frame_cover`).
+    src_y0: f32, frame_mask: f32, _p9b: f32, _p9c: f32,
+    // YCbCr→RGB coefficients (r_v, g_u, g_v, b_u) — read by the P010 kernels.
+    yuv_mat: vec4<f32>,
+    // View mask (see `view_mask`): half-extents (radians; 0 = off), corner radius, feather.
+    mask_hx: f32, mask_hy: f32, mask_round: f32, mask_feather: f32,
 }
 @group(0) @binding(4) var<uniform> cal: FisheyeCalibUniforms;
+
+// Coverage of a source tap for a frame that is a crop of the image circle
+// (`frame_mask`): 1 inside the frame, 0 outside it, 0 for a ray past the
+// lens' clamp angle — there is no data there. A full-circle source
+// (frame_mask = 0) keeps replicating its rim instead: always 1. `px_rad` is
+// one output pixel in radians (see `view_mask`).
+fn frame_cover(src: vec2<f32>, cos_theta: f32, px_rad: f32) -> f32 {
+    if (cal.frame_mask < 0.5) { return 1.0; }
+    if (acos(clamp(cos_theta, -1.0, 1.0)) > cal.theta_max) { return 0.0; }
+    let d = min(min(src.x, src.y), min(cal.src_w - src.x, cal.src_h - src.y));
+    // Soft edge one OUTPUT pixel wide: source pixels per output pixel at the
+    // lens centre (paraxial focal = fx / (1 + ξ); ξ = 0 for the KB model).
+    let edge = max(px_rad * cal.fx / (1.0 + max(cal.xi, 0.0)), 1.0);
+    return clamp(d / edge + 0.5, 0.0, 1.0);
+}
+
+// View mask: a rounded rectangle fixed in the OUTPUT, on the equidistant
+// angle plane θ·(cos φ, sin φ) around the output's forward axis. `dir` is the
+// output ray BEFORE the stabilization rotation, so the window stays put
+// while the stabilized image moves under it. `px_rad` is one output pixel in
+// radians: a hard edge is antialiased over it. Off in the reframed view.
+// CPU twin: `gpu::view_mask_cover`.
+fn view_mask(dir: vec3<f32>, px_rad: f32) -> f32 {
+    if (cal.mask_hx <= 0.0 || cal.proj_mode > 0.5) { return 1.0; }
+    let s = sqrt(max(dir.x * dir.x + dir.y * dir.y, 1e-12));
+    let th = acos(clamp(dir.z, -1.0, 1.0));
+    let p = abs(vec2<f32>(dir.x, dir.y) * (th / s));
+    let q = p - (vec2<f32>(cal.mask_hx, cal.mask_hy) - vec2<f32>(cal.mask_round));
+    let sd = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - cal.mask_round;
+    let f = max(cal.mask_feather, px_rad);
+    return 1.0 - smoothstep(-f, 0.0, sd);
+}
 
 struct RsRowR {
     r00: f32, r01: f32, r02: f32, _pad0: f32,
@@ -184,5 +226,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let uv = vec2<f32>(src.x / cal.src_w, src.y / cal.src_h);
     let color = textureSampleLevel(fisheye_tex, fisheye_smp, uv, 0.0);
-    textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), color);
+    let px_rad = cal.output_hfov_rad / max(half, 1.0);
+    let cover = frame_cover(vec2<f32>(src.x, src.y), rz, px_rad) * view_mask(dir, px_rad);
+    textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(color.rgb * cover, color.a));
 }

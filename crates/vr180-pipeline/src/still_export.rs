@@ -176,7 +176,8 @@ pub fn still_eye_calib(still: &X6Still, half: Half) -> Result<FisheyeCalib> {
         src_w: still.calib_frame.1, src_h: still.calib_frame.1,
         dst_w: half_w, dst_h: half_h, offset_x: 0, offset_y: 0,
     });
-    let lens = insv_imu::stream_lens_calib(entry, Some(&crop), half_w, half_h);
+    let lens = insv_imu::stream_lens_calib(
+        entry, &vr180_fisheye::InsvStreamGeometry::scaled_window(&crop, half_w, half_h), half_w, half_h);
     let omni = lens.omni.ok_or_else(|| Error::Ffmpeg("DNG: lens calibration has no UCM model".into()))?;
     let cx = lens.cx.unwrap_or(half_w as f32 * 0.5);
     let cy = lens.cy.unwrap_or(half_h as f32 * 0.5);

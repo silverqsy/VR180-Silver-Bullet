@@ -19,7 +19,7 @@ One self-contained binary per platform, **macOS (Apple Silicon)** and
 | Camera | File | Read from the file |
 |---|---|---|
 | **[OSMO VR180 Mod][osmo]** — DJI Osmo 360 and Osmo 360 II | `.osv` | Per-lens factory calibration, IMU, rolling-shutter timing |
-| **Insta360 X6 VR180 Mod** | `.insv` | Factory lens model, ~1 kHz gyro, per-sensor exposure timing |
+| **Insta360 X6 VR180 Mod** | `.insv` | Factory lens model, ~1 kHz gyro, per-sensor exposure timing; the 8K, 7.4K and 10K recording modes and their Crop variants, told apart from the file |
 | **Insta360 X6 VR180 Mod** — stills | `.dng` | Factory lens model, gain maps, DNG colour tags → PNG / JPEG / **linear DNG** |
 | **[GoPro Max 2 VR180 Mod][gopro]** | `.360` | EAC dual-fisheye, gyro, firmware rolling-shutter auto-detect |
 | **Kandao QooCam 3 Ultra VR180 Mod** | `.mp4` | Factory lens record (the stitcher's own model), 1 kHz gyro, per-frame exposure, HLG |

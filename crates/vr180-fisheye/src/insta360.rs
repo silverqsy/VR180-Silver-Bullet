@@ -211,6 +211,219 @@ pub struct InsvWindowCrop {
     pub offset_y: i32,
 }
 
+/// The X6 video window when the file omits `window_crop_info`: the 7744²
+/// sensor half minus a 32 px border.
+pub const X6_DEFAULT_WINDOW: InsvWindowCrop = InsvWindowCrop {
+    src_w: 7744, src_h: 7744, dst_w: 7680, dst_h: 7680, offset_x: 0, offset_y: 0,
+};
+/// The 10K mode's window (`7912²`, shifted 4 px in x) when a 4864² clip
+/// does not carry it.
+pub const X6_10K_WINDOW: InsvWindowCrop = InsvWindowCrop {
+    src_w: 7744, src_h: 7744, dst_w: 7912, dst_h: 7912, offset_x: 4, offset_y: 0,
+};
+/// Rows the sensor reads in the 4912 × 3968 native-pixel mode behind the
+/// 7.4K Crop (and the older 7.6K Crop); the encoded frame is the centred
+/// part of them.
+pub const X6_CROP_WINDOW_ROWS: u32 = 3968;
+
+/// The user's answer for a clip whose view the file does not state — a
+/// 3712² clip without a usable `window_crop_info` can be the wide 7.4K or
+/// the 7.4K Crop, and nothing else in the file tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum X6ViewChoice {
+    /// Follow the file; an unconfirmed clip renders as the wide mode.
+    #[default]
+    Auto,
+    Wide,
+    Crop,
+}
+
+/// Recording mode of an X6 dual-track clip, told from each eye's encoded
+/// size and the trailer's `window_crop_info` (its `dst` is the mode's
+/// signature — it is NOT a decode size or a crop rectangle).
+///
+/// | mode      | eye   | window `dst` | what the frame is |
+/// |-----------|-------|--------------|-------------------|
+/// | stock     | any   | 7680²        | the window scaled to the stream (8K: the 2×2 binning) |
+/// | 7.4K      | 3712² | 7680²        | the same binned window, scaled to 3712² |
+/// | 7.4K Crop | 3712² | 4912 × 3968  | native pixels: the centred 3712² of the sensor half |
+/// | 10K       | 4864² | 7912²        | the wide readout scaled to 4864² |
+/// | 10K Crop  | 4912² | 4912²        | native pixels: the centred 4912² |
+/// | 7.6K Crop | 3808² | (older)      | native pixels: the centred 3808² |
+///
+/// Scale, timing and row span of every mode were checked on footage by
+/// predicting feature motion from the gyro through the factory lens model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum X6Mode {
+    /// A factory mode: the 7680² window scaled to the stream.
+    #[default]
+    Stock,
+    Wide7K4,
+    Crop7K4,
+    Wide10K,
+    Crop10K,
+    /// The older 3808² native-pixel crop.
+    Crop7K6,
+    /// 3712² with a missing or contradictory window: wide or crop is the
+    /// user's call ([`X6ViewChoice`]); rendered as wide until they say.
+    Unconfirmed7K4,
+    /// A window this table does not know. Rendered with the generic
+    /// scaled-window rule so both tracks can be inspected; the geometry is
+    /// not verified.
+    Unknown,
+}
+
+impl X6Mode {
+    /// Identify the mode. `window` is the file's `window_crop_info`.
+    pub fn classify(window: Option<&InsvWindowCrop>, stream_w: u32, stream_h: u32) -> X6Mode {
+        let dst = window.map(|w| (w.dst_w, w.dst_h));
+        match (stream_w, stream_h) {
+            (3712, 3712) => match dst {
+                Some((7680, 7680)) => X6Mode::Wide7K4,
+                Some((4912, 3968)) => X6Mode::Crop7K4,
+                _ => X6Mode::Unconfirmed7K4,
+            },
+            // The older "9.7K" wrote the same 4864² frame.
+            (4864, 4864) => X6Mode::Wide10K,
+            (4912, 4912) => X6Mode::Crop10K,
+            (3808, 3808) => X6Mode::Crop7K6,
+            // Early 4928² test footage: not the 10K Crop, whatever it carries.
+            (4928, 4928) => X6Mode::Unknown,
+            _ => match dst {
+                None | Some((7680, 7680)) => X6Mode::Stock,
+                _ => X6Mode::Unknown,
+            },
+        }
+    }
+
+    /// Menu name of the mode; `None` for the factory modes.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            X6Mode::Stock => None,
+            X6Mode::Wide7K4 => Some("7.4K"),
+            X6Mode::Crop7K4 => Some("7.4K Crop"),
+            X6Mode::Wide10K => Some("10K"),
+            X6Mode::Crop10K => Some("10K Crop"),
+            X6Mode::Crop7K6 => Some("7.6K Crop"),
+            X6Mode::Unconfirmed7K4 => Some("7.4K60"),
+            X6Mode::Unknown => Some("X6"),
+        }
+    }
+
+    /// The frame holds a native-pixel crop of the image circle.
+    pub fn is_crop(self) -> bool {
+        matches!(self, X6Mode::Crop7K4 | X6Mode::Crop10K | X6Mode::Crop7K6)
+    }
+}
+
+/// How a stream's pixels sit in the factory calibration's native frame
+/// (one 7744² sensor half per lens): `stream = (native − origin) · scale`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InsvStreamGeometry {
+    /// The mode this geometry belongs to — after the user's choice, so
+    /// never [`X6Mode::Unconfirmed7K4`].
+    pub mode: X6Mode,
+    /// What the file alone says (may be `Unconfirmed7K4`).
+    pub detected: X6Mode,
+    /// Stream pixels per native pixel.
+    pub scale_x: f64,
+    pub scale_y: f64,
+    /// Native coordinates, within the lens' half, of the stream's origin.
+    pub origin_x: f64,
+    pub origin_y: f64,
+    /// Share of the file's `rolling_shutter_time` the encoded rows span:
+    /// 1 when the frame holds every row the sensor read, less when it is
+    /// the centred part of them (7.4K Crop: 3712 of 3968).
+    pub readout_fraction: f64,
+    /// The frame is a crop of the image circle: a ray that leaves the
+    /// frame has no data (the wide modes replicate the rim instead).
+    pub cropped: bool,
+}
+
+impl InsvStreamGeometry {
+    /// The generic rule (Insta360 Studio's): the `window` — centred in its
+    /// `src`, shifted by its offset — scaled to the stream.
+    pub fn scaled_window(window: &InsvWindowCrop, stream_w: u32, stream_h: u32) -> Self {
+        Self {
+            mode: X6Mode::Stock,
+            detected: X6Mode::Stock,
+            scale_x: stream_w as f64 / window.dst_w.max(1) as f64,
+            scale_y: stream_h as f64 / window.dst_h.max(1) as f64,
+            origin_x: (window.src_w as f64 - window.dst_w as f64) * 0.5 + window.offset_x as f64,
+            origin_y: (window.src_h as f64 - window.dst_h as f64) * 0.5 + window.offset_y as f64,
+            readout_fraction: 1.0,
+            cropped: false,
+        }
+    }
+
+    /// Native pixels, the stream centred in the sensor half (`src`) and
+    /// shifted by the window's offset; `window_rows` rows were read out.
+    fn native_crop(src_w: u32, src_h: u32, offset: (i32, i32), window_rows: u32, stream_w: u32, stream_h: u32) -> Self {
+        Self {
+            mode: X6Mode::Stock,
+            detected: X6Mode::Stock,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            origin_x: (src_w as f64 - stream_w as f64) * 0.5 + offset.0 as f64,
+            origin_y: (src_h as f64 - stream_h as f64) * 0.5 + offset.1 as f64,
+            readout_fraction: if window_rows >= stream_h && window_rows > 0 {
+                stream_h as f64 / window_rows as f64
+            } else {
+                1.0
+            },
+            cropped: true,
+        }
+    }
+
+    /// Geometry of an X6 video stream. `window` is the file's
+    /// `window_crop_info`; `choice` settles a clip the file leaves
+    /// unconfirmed (and is ignored otherwise).
+    pub fn resolve(window: Option<&InsvWindowCrop>, stream_w: u32, stream_h: u32, choice: X6ViewChoice) -> Self {
+        let detected = X6Mode::classify(window, stream_w, stream_h);
+        let mode = match (detected, choice) {
+            (X6Mode::Unconfirmed7K4, X6ViewChoice::Crop) => X6Mode::Crop7K4,
+            (X6Mode::Unconfirmed7K4, _) => X6Mode::Wide7K4,
+            (m, _) => m,
+        };
+        // The sensor half the calibration is expressed in.
+        let (src_w, src_h) = window.map(|w| (w.src_w, w.src_h)).filter(|s| s.0 > 0 && s.1 > 0)
+            .unwrap_or((X6_DEFAULT_WINDOW.src_w, X6_DEFAULT_WINDOW.src_h));
+        // The record contributes to a mode only when it carries that mode's
+        // own signature: a window that contradicts the mode (or an
+        // unconfirmed clip's) lends it neither its rows nor its offset.
+        let signed = |dst: (u32, u32)| window.copied().filter(|w| (w.dst_w, w.dst_h) == dst);
+        let native = |w: Option<InsvWindowCrop>, rows_default: u32| {
+            Self::native_crop(
+                src_w, src_h,
+                w.map(|w| (w.offset_x, w.offset_y)).unwrap_or((0, 0)),
+                w.map(|w| w.dst_h).unwrap_or(rows_default),
+                stream_w, stream_h,
+            )
+        };
+        let mut g = match mode {
+            X6Mode::Crop7K4 | X6Mode::Crop7K6 => native(signed((4912, X6_CROP_WINDOW_ROWS)), X6_CROP_WINDOW_ROWS),
+            X6Mode::Crop10K => native(signed((stream_w, stream_h)), stream_h),
+            X6Mode::Wide10K => Self::scaled_window(
+                &signed((X6_10K_WINDOW.dst_w, X6_10K_WINDOW.dst_h)).unwrap_or(X6_10K_WINDOW), stream_w, stream_h),
+            X6Mode::Wide7K4 => Self::scaled_window(
+                &signed((X6_DEFAULT_WINDOW.dst_w, X6_DEFAULT_WINDOW.dst_h)).unwrap_or(X6_DEFAULT_WINDOW), stream_w, stream_h),
+            X6Mode::Stock | X6Mode::Unknown | X6Mode::Unconfirmed7K4 => Self::scaled_window(
+                &window.copied().unwrap_or(X6_DEFAULT_WINDOW), stream_w, stream_h),
+        };
+        g.mode = mode;
+        g.detected = detected;
+        g
+    }
+
+    /// Principal point of a factory entry in stream coordinates.
+    pub fn principal_point(&self, entry: &InsvLensCalib) -> (f64, f64) {
+        (
+            (entry.cx as f64 - entry.half_origin_x() as f64 - self.origin_x) * self.scale_x,
+            (entry.cy as f64 - self.origin_y) * self.scale_y,
+        )
+    }
+}
+
 /// One raw IMU sample, converted to physical units.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InsvImuSample {
@@ -263,6 +476,13 @@ pub struct Insta360Meta {
     pub window_crop: Option<InsvWindowCrop>,
     /// Recorded frame size (`dimension`), e.g. `(3840, 3840)`.
     pub dimension: Option<(u32, u32)>,
+    /// Nominal frame rate (`frame_rate`), e.g. 30 / 50 / 60.
+    pub frame_rate: Option<u32>,
+    /// Picture profile (`gamma_mode`), e.g. `"I_Log"`. The log LUT follows
+    /// this, never the frame size.
+    pub gamma_mode: Option<String>,
+    /// `pano_record_type` (2 = both lenses on their own tracks).
+    pub pano_record_type: Option<u32>,
     /// `Some(true)` when the file says its two video tracks are in reverse
     /// lens order (track 0 = calibration entry 2). X6 dual-stream clips set
     /// this; `None` when the file doesn't say.
@@ -291,6 +511,17 @@ impl Insta360Meta {
     /// True for the Insta360 X6 (the only model calibrated so far).
     pub fn is_x6(&self) -> bool {
         self.model.to_ascii_lowercase().contains("x6")
+    }
+
+    /// Geometry of this clip's video streams (see [`InsvStreamGeometry`]).
+    pub fn stream_geometry(&self, stream_w: u32, stream_h: u32, choice: X6ViewChoice) -> InsvStreamGeometry {
+        InsvStreamGeometry::resolve(self.window_crop.as_ref(), stream_w, stream_h, choice)
+    }
+
+    /// The clip was recorded in I-Log (`gamma_mode`). `None` when the file
+    /// does not say.
+    pub fn is_ilog(&self) -> Option<bool> {
+        self.gamma_mode.as_deref().map(|g| g.eq_ignore_ascii_case("I_Log") || g.eq_ignore_ascii_case("ILog"))
     }
 }
 
@@ -437,6 +668,7 @@ fn read_meta(path: &Path, with_motion: bool) -> Result<Insta360Meta> {
 
 /// The identity record is Insta360's `ExtraMetadata` protobuf. Fields used:
 /// 1 serial, 2 model, 3 firmware (strings); 19 `dimension {w, h}`;
+/// 20 `frame_rate`; 22 `gamma_mode` (string); 79 `pano_record_type`;
 /// 25 `rolling_shutter_time` (f64 ms); 27 `window_crop_info {src_w, src_h,
 /// dst_w, dst_h, crop_offset_x, crop_offset_y}`; 28 `gyro_timestamp` (f64
 /// ms); 65 `gyro_cfg_info {acc_range, gyro_range}`; 80
@@ -466,6 +698,15 @@ fn parse_identity(bytes: &[u8], meta: &mut Insta360Meta) {
                     meta.dimension = Some((*w as u32, *h as u32));
                 }
             }
+            (20, Wire::Varint(v)) => meta.frame_rate = Some(v as u32).filter(|v| *v > 0),
+            (22, Wire::Len(payload)) => {
+                if let Ok(g) = std::str::from_utf8(payload) {
+                    if !g.is_empty() && g.chars().all(|c| !c.is_control()) {
+                        meta.gamma_mode = Some(g.to_string());
+                    }
+                }
+            }
+            (79, Wire::Varint(v)) => meta.pano_record_type = Some(v as u32),
             (27, Wire::Len(payload)) => {
                 let v = varint_fields(payload);
                 let g = |k: u64| v.get(&k).copied().unwrap_or(0);
@@ -775,5 +1016,142 @@ mod tests {
             assert!((u - want.0).abs() < 2e-3 && (v - want.1).abs() < 2e-3, "{dir:?} → ({u}, {v}) want {want:?}");
         }
         assert!(e.project([0.0, 0.0, -1.0]).is_none());
+    }
+
+    fn win(dst_w: u32, dst_h: u32, offset_x: i32, offset_y: i32) -> InsvWindowCrop {
+        InsvWindowCrop { src_w: 7744, src_h: 7744, dst_w, dst_h, offset_x, offset_y }
+    }
+
+    #[test]
+    fn x6_modes_are_told_apart_by_size_and_window() {
+        let c = |w: Option<InsvWindowCrop>, side: u32| X6Mode::classify(w.as_ref(), side, side);
+        assert_eq!(c(Some(win(7680, 7680, 0, 0)), 3840), X6Mode::Stock);
+        assert_eq!(c(None, 3840), X6Mode::Stock);
+        assert_eq!(c(Some(win(7680, 7680, 0, 0)), 3712), X6Mode::Wide7K4);
+        assert_eq!(c(Some(win(4912, 3968, 0, 0)), 3712), X6Mode::Crop7K4);
+        // The two 3712² modes share size and rate: without the window (or
+        // with one that fits neither) the file cannot say which it is.
+        assert_eq!(c(None, 3712), X6Mode::Unconfirmed7K4);
+        assert_eq!(c(Some(win(4912, 4912, 0, 0)), 3712), X6Mode::Unconfirmed7K4);
+        assert_eq!(c(Some(win(7912, 7912, 4, 0)), 4864), X6Mode::Wide10K);
+        assert_eq!(c(None, 4864), X6Mode::Wide10K);               // the older 9.7K
+        assert_eq!(c(Some(win(4912, 4912, 0, 0)), 4912), X6Mode::Crop10K);
+        assert_eq!(c(None, 3808), X6Mode::Crop7K6);
+        // The 4928² test footage is not the 10K Crop — with or without a window.
+        assert_eq!(c(Some(win(4928, 4928, 0, 0)), 4928), X6Mode::Unknown);
+        assert_eq!(c(None, 4928), X6Mode::Unknown);
+        // Any other window the table does not know.
+        assert_eq!(c(Some(win(6000, 6000, 0, 0)), 3000), X6Mode::Unknown);
+        assert!(X6Mode::Crop7K4.is_crop() && X6Mode::Crop10K.is_crop() && !X6Mode::Wide10K.is_crop());
+        assert_eq!(X6Mode::Stock.label(), None);
+        assert_eq!(X6Mode::Crop10K.label(), Some("10K Crop"));
+    }
+
+    #[test]
+    fn x6_mode_geometry() {
+        let r = |w: Option<InsvWindowCrop>, side: u32, ch| InsvStreamGeometry::resolve(w.as_ref(), side, side, ch);
+        // Stock 8K: the 7680² window binned 2×2.
+        let g = r(Some(win(7680, 7680, 0, 0)), 3840, X6ViewChoice::Auto);
+        assert_eq!((g.mode, g.scale_x, g.scale_y, g.origin_x, g.origin_y), (X6Mode::Stock, 0.5, 0.5, 32.0, 32.0));
+        assert!(!g.cropped && g.readout_fraction == 1.0);
+        // 7.4K: the same window scaled to 3712².
+        let g = r(Some(win(7680, 7680, 0, 0)), 3712, X6ViewChoice::Auto);
+        assert_eq!(g.mode, X6Mode::Wide7K4);
+        assert!((g.scale_x - 3712.0 / 7680.0).abs() < 1e-12 && g.origin_x == 32.0 && !g.cropped);
+        // 7.4K Crop: (128,128,3712,3712) of the central 3968² of the
+        // 4912 × 3968 readout = the centred 3712² of the sensor half, 1:1,
+        // 3712 of the 3968 rows that were read.
+        let g = r(Some(win(4912, 3968, 0, 0)), 3712, X6ViewChoice::Auto);
+        assert_eq!((g.mode, g.scale_x, g.origin_x, g.origin_y), (X6Mode::Crop7K4, 1.0, 2016.0, 2016.0));
+        assert_eq!((7744 - 4912) / 2 + (4912 - 3968) / 2 + 128, 2016);
+        assert_eq!((7744 - 3968) / 2 + 128, 2016);
+        assert!(g.cropped && (g.readout_fraction - 3712.0 / 3968.0).abs() < 1e-12);
+        // 10K: the 7912² window (wider than the calibration frame, 4 px
+        // right of centre) scaled to 4864².
+        let g = r(Some(win(7912, 7912, 4, 0)), 4864, X6ViewChoice::Auto);
+        assert_eq!((g.mode, g.origin_x, g.origin_y), (X6Mode::Wide10K, -80.0, -84.0));
+        assert!((g.scale_x - 4864.0 / 7912.0).abs() < 1e-12 && !g.cropped && g.readout_fraction == 1.0);
+        // … and the same without the record (an older 9.7K file).
+        assert_eq!(r(None, 4864, X6ViewChoice::Auto), g);
+        // 10K Crop: the centred 4912², every row.
+        let g = r(Some(win(4912, 4912, 0, 0)), 4912, X6ViewChoice::Auto);
+        assert_eq!((g.mode, g.scale_x, g.origin_x, g.origin_y, g.readout_fraction), (X6Mode::Crop10K, 1.0, 1416.0, 1416.0, 1.0));
+        assert!(g.cropped);
+        // … and a window that is not its own lends it nothing.
+        assert_eq!(r(Some(win(7680, 7680, 9, 9)), 4912, X6ViewChoice::Auto), g);
+        assert_eq!(r(None, 4912, X6ViewChoice::Auto), g);
+        // Older 7.6K Crop: offset 80 inside the 3968² square.
+        let g = r(None, 3808, X6ViewChoice::Auto);
+        assert_eq!((g.mode, g.origin_x, g.origin_y), (X6Mode::Crop7K6, 1968.0, 1968.0));
+        assert_eq!((7744 - 3968) / 2 + 80, 1968);
+        assert!((g.readout_fraction - 3808.0 / 3968.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unconfirmed_7k4_follows_the_users_choice() {
+        let r = |w: Option<InsvWindowCrop>, ch| InsvStreamGeometry::resolve(w.as_ref(), 3712, 3712, ch);
+        let wide = r(Some(win(7680, 7680, 0, 0)), X6ViewChoice::Auto);
+        let crop = r(Some(win(4912, 3968, 0, 0)), X6ViewChoice::Auto);
+        for missing in [None, Some(win(4912, 4912, 9, 9))] {
+            let auto = r(missing, X6ViewChoice::Auto);
+            assert_eq!((auto.detected, auto.mode), (X6Mode::Unconfirmed7K4, X6Mode::Wide7K4));
+            assert_eq!((auto.scale_x, auto.origin_x, auto.cropped), (wide.scale_x, wide.origin_x, false));
+            let c = r(missing, X6ViewChoice::Crop);
+            assert_eq!((c.detected, c.mode), (X6Mode::Unconfirmed7K4, X6Mode::Crop7K4));
+            // A contradictory window contributes nothing — not its offset either.
+            assert_eq!((c.scale_x, c.origin_x, c.origin_y, c.readout_fraction), (1.0, crop.origin_x, crop.origin_y, crop.readout_fraction));
+            assert_eq!(r(missing, X6ViewChoice::Wide).mode, X6Mode::Wide7K4);
+        }
+        // A clip the file does identify ignores the choice.
+        assert_eq!(r(Some(win(7680, 7680, 0, 0)), X6ViewChoice::Crop), wide);
+        assert_eq!(r(Some(win(4912, 3968, 0, 0)), X6ViewChoice::Wide), crop);
+    }
+
+    #[test]
+    fn principal_point_in_stream_coordinates() {
+        let lenses = parse_calib_string(X6_STRING).unwrap();
+        // Stock: (c − 32)/2 per lens, entry 2 relative to its own half.
+        let g = InsvStreamGeometry::resolve(Some(&win(7680, 7680, 0, 0)), 3840, 3840, X6ViewChoice::Auto);
+        let (x, y) = g.principal_point(&lenses[0]);
+        assert!((x - (3855.46 - 32.0) / 2.0).abs() < 1e-3 && (y - (3884.53 - 32.0) / 2.0).abs() < 1e-3, "({x}, {y})");
+        let (x2, _) = g.principal_point(&lenses[1]);
+        assert!((x2 - (11569.1 - 7744.0 - 32.0) / 2.0).abs() < 1e-3, "{x2}");
+        // 10K Crop: native pixels, 1416 in from the half's corner.
+        let g = InsvStreamGeometry::resolve(Some(&win(4912, 4912, 0, 0)), 4912, 4912, X6ViewChoice::Auto);
+        let (x, y) = g.principal_point(&lenses[0]);
+        assert!((x - (3855.46 - 1416.0)).abs() < 1e-3 && (y - (3884.53 - 1416.0)).abs() < 1e-3);
+    }
+
+    /// The four new modes on the real samples — skipped when not mounted.
+    #[test]
+    fn real_x6_mode_samples() {
+        let dir = Path::new("/Volumes/Database/x6/1110");
+        let cases: [(&str, u32, X6Mode, f64, u32); 4] = [
+            ("VID_20261110_144736_00_003.insv", 3712, X6Mode::Wide7K4, 14.56, 60),
+            ("drop frame/VID_20261110_144829_00_004.insv", 3712, X6Mode::Crop7K4, 16.037333, 60),
+            ("VID_20261110_145518_00_008.insv", 4864, X6Mode::Wide10K, 31.648, 30),
+            ("VID_20261110_145135_00_006.insv", 4912, X6Mode::Crop10K, 21.285333, 30),
+        ];
+        for (name, side, mode, readout, fps) in cases {
+            let p = dir.join(name);
+            if !p.exists() { continue; }
+            let m = read_insta360_identity(&p).expect("read");
+            assert_eq!(m.dimension, Some((side, side)), "{name}");
+            let g = m.stream_geometry(side, side, X6ViewChoice::Auto);
+            assert_eq!((g.mode, g.detected), (mode, mode), "{name}");
+            assert!((m.readout_ms.unwrap() - readout).abs() < 1e-5, "{name}");
+            assert_eq!(m.frame_rate, Some(fps), "{name}");
+            assert_eq!(m.gamma_mode.as_deref(), Some("I_Log"), "{name}");
+            assert_eq!(m.is_ilog(), Some(true));
+            assert_eq!((m.pano_record_type, m.track_order_reversed), (Some(2), Some(true)), "{name}");
+            // The same file without its window record: the 3712² clip can
+            // no longer be told apart, the others still can.
+            let stripped = InsvStreamGeometry::resolve(None, side, side, X6ViewChoice::Auto);
+            if side == 3712 {
+                assert_eq!(stripped.detected, X6Mode::Unconfirmed7K4, "{name}");
+            } else {
+                assert_eq!((stripped.mode, stripped.scale_x, stripped.origin_x), (g.mode, g.scale_x, g.origin_x), "{name}");
+            }
+        }
     }
 }

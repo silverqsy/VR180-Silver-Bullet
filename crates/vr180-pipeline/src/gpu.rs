@@ -2082,7 +2082,7 @@ impl EacLensUniforms {
 // ── Fisheye → half-equirect uniforms ───────────────────────────────
 
 /// std140 layout for the fisheye→equirect shader's calibration uniform.
-/// 36 scalars (9 × vec4 = 144 bytes). Matches the WGSL
+/// 48 scalars (12 × vec4 = 192 bytes). Matches the WGSL
 /// `FisheyeCalibUniforms` struct field-by-field. See
 /// `fisheye_to_hequirect.wgsl` for the per-pixel use of each value.
 #[repr(C)]
@@ -2117,11 +2117,17 @@ struct FisheyeCalibUniforms {
     yuv_range: [f32; 4],
     // vec4 #9 — this eye's y offset in the source plane (a stacked
     // top/bottom frame: the bottom eye starts at `src_h`), padded.
-    src_y0: f32, _p9a: f32, _p9b: f32, _p9c: f32,
+    // `frame_mask` > 0.5: the frame is a crop of the image circle — a ray
+    // that projects outside it renders black (`frame_cover` in the shaders).
+    src_y0: f32, frame_mask: f32, _p9b: f32, _p9c: f32,
     // vec4 #10 — YCbCr→RGB matrix coefficients (r_v, g_u, g_v, b_u), see
     // `yuv_matrix_constants`: BT.709 for every camera file except the
     // QooCam's HLG BT.2020 stream.
     yuv_mat: [f32; 4],
+    // vec4 #11 — view mask (`view_mask` in the shaders): half-extents of a
+    // rounded rectangle on the output's equidistant angle plane (radians;
+    // 0 = off), its corner radius and its feather.
+    mask_hx: f32, mask_hy: f32, mask_round: f32, mask_feather: f32,
 }
 
 /// Range expansion for 10-bit samples stored in the top 10 bits of a
@@ -2258,6 +2264,94 @@ pub struct FisheyeCalib {
     /// and look the rotated ray up by (lon, lat). See
     /// [`FisheyeCalib::with_equirect_input`].
     pub src_proj: f32,
+    /// `> 0.5`: the frame is a CROP of the image circle (the Insta360 X6
+    /// Crop modes) — a ray that projects outside it has no data and renders
+    /// black, where a full-circle source replicates its rim (which hides
+    /// the gaps stabilization can open at the edge). Set by
+    /// [`with_frame_crop`](Self::with_frame_crop).
+    pub frame_mask: f32,
+    /// View mask: a rounded rectangle fixed in the OUTPUT, on the
+    /// equidistant angle plane `θ·(cos φ, sin φ)` around the output's
+    /// forward axis — half-extents in radians, `[0, 0]` = off. Evaluated on
+    /// the output ray before the stabilization rotation, so the window
+    /// stays put while the stabilized image moves under it. See
+    /// [`with_view_mask`](Self::with_view_mask).
+    pub mask_half: [f32; 2],
+    /// View mask corner radius, radians (0 = rectangle).
+    pub mask_round: f32,
+    /// View mask feather, radians: the image fades to black over this
+    /// distance inside the mask edge (0 = hard edge).
+    pub mask_feather: f32,
+}
+
+/// The crop-mask controls of a source whose frame is a crop of the image
+/// circle: how much of the frame's coverage a black window hides, how round
+/// its corners are and how softly it ends. All-zero = no window (the frame
+/// edge itself is the only boundary and nothing recorded is hidden).
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CropMask {
+    /// Share of the coverage the window hides on every side, 0..=0.9.
+    pub amount: f32,
+    /// Feather width as a share of the coverage's smaller half-extent, 0..=1.
+    pub feather: f32,
+    /// Corner roundness: 0 = rectangle, 1 = ellipse (a circle on a square frame).
+    pub round: f32,
+}
+
+impl CropMask {
+    pub fn is_off(&self) -> bool {
+        self.amount <= 0.0 && self.feather <= 0.0 && self.round <= 0.0
+    }
+
+    /// The window for a frame covering `cover` (half-angles along x and y,
+    /// radians): `(half-extents, corner radius, feather)` in radians, or
+    /// `None` when the controls are off.
+    pub fn window(&self, cover: [f32; 2]) -> Option<([f32; 2], f32, f32)> {
+        if self.is_off() || !(cover[0] > 0.0 && cover[1] > 0.0) {
+            return None;
+        }
+        let keep = 1.0 - self.amount.clamp(0.0, 0.9);
+        let half = [cover[0] * keep, cover[1] * keep];
+        let m = half[0].min(half[1]);
+        let round = self.round.clamp(0.0, 1.0) * m;
+        let feather = (self.feather.clamp(0.0, 1.0) * cover[0].min(cover[1])).min(m);
+        Some((half, round, feather))
+    }
+}
+
+/// Finish a resolved per-eye pair for a source whose frame is a crop of the
+/// image circle (`DjiLensCalib::frame_crop`, the X6 Crop modes): both frames
+/// are marked cropped (rays that leave them render black, corners kept) and
+/// both eyes get the SAME view-mask window, sized from their mean coverage,
+/// so the window has no disparity of its own. Shared by the preview and the
+/// export resolvers so they cannot drift apart.
+pub fn apply_frame_crop(calib_l: FisheyeCalib, calib_r: FisheyeCalib, mask: CropMask) -> (FisheyeCalib, FisheyeCalib) {
+    let (l, r) = (calib_l.with_frame_crop(), calib_r.with_frame_crop());
+    let (cl, cr) = (l.frame_half_angles(), r.frame_half_angles());
+    let cover = [0.5 * (cl[0] + cr[0]), 0.5 * (cl[1] + cr[1])];
+    match mask.window(cover) {
+        Some((half, round, feather)) => (l.with_view_mask(half, round, feather), r.with_view_mask(half, round, feather)),
+        None => (l, r),
+    }
+}
+
+/// CPU twin of the shaders' `view_mask`: how much of the image the window
+/// lets through (1 inside … 0 outside) for the output ray `dir` (x right,
+/// y up, z forward; before the stabilization rotation). `px_rad` is one
+/// output pixel in radians — a hard edge is antialiased over it.
+pub fn view_mask_cover(dir: [f32; 3], half: [f32; 2], round: f32, feather: f32, px_rad: f32) -> f32 {
+    if half[0] <= 0.0 {
+        return 1.0;
+    }
+    let s = (dir[0] * dir[0] + dir[1] * dir[1]).max(1e-12).sqrt();
+    let th = dir[2].clamp(-1.0, 1.0).acos();
+    let p = [(dir[0] * th / s).abs(), (dir[1] * th / s).abs()];
+    let q = [p[0] - (half[0] - round), p[1] - (half[1] - round)];
+    let sd = (q[0].max(0.0).powi(2) + q[1].max(0.0).powi(2)).sqrt() + q[0].max(q[1]).min(0.0) - round;
+    let f = feather.max(px_rad).max(1e-9);
+    let t = ((sd + f) / f).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
 }
 
 /// Defish amount (0..=1) → `k` of the k-projection `r = k·tan(θ/k)`:
@@ -2317,6 +2411,7 @@ impl FisheyeCalib {
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
             src_proj: 0.0, src_x0: 0.0, src_y0: 0.0,
             yuv_range: YUV_RANGE_P010_LIMITED, yuv_mat: YUV_MAT_BT709,
+            frame_mask: 0.0, mask_half: [0.0; 2], mask_round: 0.0, mask_feather: 0.0,
         }
     }
 
@@ -2356,6 +2451,7 @@ impl FisheyeCalib {
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
             src_proj: 0.0, src_x0: 0.0, src_y0: 0.0,
             yuv_range: YUV_RANGE_P010_LIMITED, yuv_mat: YUV_MAT_BT709,
+            frame_mask: 0.0, mask_half: [0.0; 2], mask_round: 0.0, mask_feather: 0.0,
         }
     }
 
@@ -2404,6 +2500,7 @@ impl FisheyeCalib {
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
             src_proj: 0.0, src_x0: 0.0, src_y0: 0.0,
             yuv_range: YUV_RANGE_P010_LIMITED, yuv_mat: YUV_MAT_BT709,
+            frame_mask: 0.0, mask_half: [0.0; 2], mask_round: 0.0, mask_feather: 0.0,
         }
     }
 
@@ -2430,6 +2527,95 @@ impl FisheyeCalib {
         self.defish_k = k;
         self.edge_x = ex;
         self.edge_y = ex / aspect_w_over_h.max(0.05);
+        self
+    }
+
+    /// Radial part of the lens model itself, without the rim extension:
+    /// image radius (px from the principal point, along x) of a ray `theta`
+    /// radians off the axis — the UCM curve when `xi > 0`, else the KB
+    /// polynomial.
+    pub fn radius_pure(&self, theta: f32) -> f32 {
+        if self.xi > 0.0 {
+            let n = theta.sin() / (self.xi + theta.cos());
+            let n2 = n * n;
+            let d = 1.0 + n2 * (self.k[0] + n2 * (self.k[1] + n2 * (self.k[2] + n2 * (self.k[3] + n2 * self.k5))));
+            self.fx * n * d
+        } else {
+            let t2 = theta * theta;
+            self.fx * theta * (1.0 + t2 * (self.k[0] + t2 * (self.k[1] + t2 * (self.k[2] + t2 * (self.k[3] + t2 * self.k5)))))
+        }
+    }
+
+    /// Angle (radians) at which [`radius_pure`](Self::radius_pure) first
+    /// reaches `r` px. Stops where the curve folds (a KB polynomial past its
+    /// range) or at `limit`, whichever comes first, and returns that angle.
+    pub fn theta_at_radius(&self, r: f32, limit: f32) -> f32 {
+        let step = 0.25_f32.to_radians();
+        let (mut lo, mut r_lo) = (0.0_f32, 0.0_f32);
+        let mut t = step;
+        while t <= limit + 1e-6 {
+            let r_t = self.radius_pure(t);
+            if r_t >= r {
+                let (mut a, mut b) = (lo, t);
+                for _ in 0..32 {
+                    let m = 0.5 * (a + b);
+                    if self.radius_pure(m) < r { a = m } else { b = m }
+                }
+                return 0.5 * (a + b);
+            }
+            if r_t < r_lo {
+                return lo; // folded: nothing past here is usable
+            }
+            lo = t;
+            r_lo = r_t;
+            t += step;
+        }
+        limit
+    }
+
+    /// Mark the frame as a CROP of the image circle (the Insta360 X6 Crop
+    /// modes): rays that project outside the frame render black instead of
+    /// replicating the edge, and the θ clamp moves out to the frame's far
+    /// corner so the corners keep their image (the default clamp sits on
+    /// the circle inscribed in the frame, which would cut them off). Uses
+    /// the lens model without a rim extension.
+    pub fn with_frame_crop(mut self) -> Self {
+        let corner = [(0.0, 0.0), (self.src_w, 0.0), (0.0, self.src_h), (self.src_w, self.src_h)]
+            .iter()
+            .map(|&(x, y)| ((x - self.cx).powi(2) + ((y - self.cy) * self.fx / self.fy.max(1e-6)).powi(2)).sqrt())
+            .fold(1.0_f32, f32::max);
+        // Past the far corner nothing is in the frame, so the clamp only has
+        // to reach it (the X6's UCM radius is monotonic out to ~114°).
+        let theta_max = self.theta_at_radius(corner, 110.0_f32.to_radians());
+        self.frame_mask = 1.0;
+        self.theta_max = theta_max;
+        self.theta_trans = theta_max + 0.1;
+        self.r_max = corner;
+        self
+    }
+
+    /// Angular half-extents (radians) of the frame around the lens axis,
+    /// measured from the frame's centre along x and y — what a cropped
+    /// frame covers.
+    pub fn frame_half_angles(&self) -> [f32; 2] {
+        let limit = 110.0_f32.to_radians();
+        [
+            self.theta_at_radius(self.src_w * 0.5, limit),
+            self.theta_at_radius(self.src_h * 0.5 * self.fx / self.fy.max(1e-6), limit),
+        ]
+    }
+
+    /// View mask: black outside a rounded rectangle of half-extents `half`
+    /// (radians, on the output's equidistant angle plane), corner radius
+    /// `round` and feather `feather` (radians; the image fades to black over
+    /// `feather` inside the edge). Fixed in the output — see
+    /// [`mask_half`](Self::mask_half). `half = [0, 0]` switches it off.
+    pub fn with_view_mask(mut self, half: [f32; 2], round: f32, feather: f32) -> Self {
+        let half = [half[0].max(0.0), half[1].max(0.0)];
+        let m = half[0].min(half[1]);
+        self.mask_half = if m > 0.0 { half } else { [0.0; 2] };
+        self.mask_round = round.clamp(0.0, m);
+        self.mask_feather = feather.clamp(0.0, m);
         self
     }
 
@@ -2461,8 +2647,10 @@ impl FisheyeCalibUniforms {
             s1: c.prism[0], s2: c.prism[1], s3: c.prism[2], s4: c.prism[3],
             proj_mode: c.proj_mode, defish_k: c.defish_k, edge_x: c.edge_x, edge_y: c.edge_y,
             yuv_range: c.yuv_range,
-            src_y0: c.src_y0, _p9a: 0.0, _p9b: 0.0, _p9c: 0.0,
+            src_y0: c.src_y0, frame_mask: c.frame_mask, _p9b: 0.0, _p9c: 0.0,
             yuv_mat: c.yuv_mat,
+            mask_hx: c.mask_half[0], mask_hy: c.mask_half[1],
+            mask_round: c.mask_round, mask_feather: c.mask_feather,
         }
     }
 }
@@ -9185,14 +9373,109 @@ mod reframe_tests {
         assert!((u.defish_k - 2.0).abs() < 1e-6);
         assert!((u.edge_x - 2.0 * (45.0f32.to_radians() / 2.0).tan()).abs() < 1e-5);
         assert!((u.edge_y - u.edge_x * 9.0 / 16.0).abs() < 1e-5);
-        // 11 vec4s: the nine the shaders always read plus the stacked
-        // y-offset row and the YCbCr matrix row (P010 kernels only).
-        assert_eq!(std::mem::size_of::<FisheyeCalibUniforms>(), 44 * 4);
+        // 12 vec4s: the nine the shaders always read, the stacked y-offset /
+        // frame-mask row, the YCbCr matrix row and the view-mask row.
+        assert_eq!(std::mem::size_of::<FisheyeCalibUniforms>(), 48 * 4);
+        assert_eq!((u.frame_mask, u.mask_hx, u.mask_feather), (0.0, 0.0, 0.0));
         let plain = FisheyeCalibUniforms::from_public(FisheyeCalib::new(1000.0, 1000.0, 960.0, 960.0, [0.0; 4], 1920.0, 1920.0, 900.0));
         assert_eq!(plain.proj_mode, 0.0);
         assert_eq!((plain.src_x0, plain.src_y0), (0.0, 0.0));
         assert_eq!(plain.yuv_mat, YUV_MAT_BT709);
         assert_eq!(yuv_matrix_constants(true), YUV_MAT_BT2020);
+    }
+
+    /// An X6 factory entry at native scale on the 10K Crop's 4912² frame.
+    fn x6_crop_calib() -> FisheyeCalib {
+        FisheyeCalib::new_omni(
+            7222.06, 7222.06, 3859.7 - 1416.0, 3880.16 - 1416.0, 2.45543,
+            [1.28201866, -0.80810684, 1.14986908, 12.02910519, 0.0], [0.0; 4], [0.0; 4],
+            4912.0, 4912.0,
+        )
+    }
+
+    #[test]
+    fn a_cropped_frame_keeps_its_corners() {
+        let full = x6_crop_calib();
+        // Default clamp: where the curve reaches the farthest frame EDGE —
+        // the circle inscribed in the frame, about 63° on this crop.
+        assert_eq!(full.frame_mask, 0.0);
+        assert!(full.theta_max.to_degrees() > 60.0 && full.theta_max.to_degrees() < 67.0, "{}", full.theta_max.to_degrees());
+        let crop = full.with_frame_crop();
+        assert_eq!(crop.frame_mask, 1.0);
+        // Cropped: the clamp reaches the far corner (~88°), so every pixel
+        // of the frame — corners included — is reachable.
+        let th = crop.theta_max.to_degrees();
+        assert!(th > 85.0 && th < 92.0, "{th}");
+        let corner = ((4912.0f32 - crop.cx).max(crop.cx).powi(2) + (4912.0f32 - crop.cy).max(crop.cy).powi(2)).sqrt();
+        assert!((crop.radius_pure(crop.theta_max) - corner).abs() < 0.5);
+        assert!(crop.theta_trans > crop.theta_max);
+        let u = FisheyeCalibUniforms::from_public(crop);
+        assert_eq!(u.frame_mask, 1.0);
+        // The frame covers ~±63° along each axis from its centre.
+        let c = crop.frame_half_angles();
+        assert!((c[0].to_degrees() - 62.7).abs() < 1.0 && (c[1] - c[0]).abs() < 1e-6, "{:?}", c);
+    }
+
+    #[test]
+    fn theta_at_radius_stops_at_a_fold() {
+        // A KB polynomial that folds near 60°: the search returns the fold
+        // instead of running on to the limit.
+        let c = FisheyeCalib::new_pure_kb(1000.0, 1000.0, 960.0, 960.0, [-0.3, 0.0, 0.0, 0.0], 1920.0, 1920.0);
+        let fold = (1.0f32 / 0.9).sqrt(); // d/dθ (θ − 0.3θ³) = 0
+        let t = c.theta_at_radius(5000.0, 110.0f32.to_radians());
+        assert!((t - fold).abs() < 0.01, "{t} vs {fold}");
+        // Inside the valid range it inverts the curve.
+        let r = c.radius_pure(0.5);
+        assert!((c.theta_at_radius(r, 2.0) - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn crop_mask_window() {
+        let cover = [1.0f32, 0.8];
+        assert!(CropMask::default().is_off());
+        assert_eq!(CropMask::default().window(cover), None);
+        // Feather alone: the window sits on the coverage edge.
+        let (half, round, feather) = CropMask { amount: 0.0, feather: 0.1, round: 0.0 }.window(cover).unwrap();
+        assert_eq!((half, round), (cover, 0.0));
+        assert!((feather - 0.08).abs() < 1e-6);
+        // 25 % hidden, fully round: an ellipse of the smaller half-extent's radius.
+        let (half, round, _) = CropMask { amount: 0.25, feather: 0.0, round: 1.0 }.window(cover).unwrap();
+        assert!((half[0] - 0.75).abs() < 1e-6 && (half[1] - 0.6).abs() < 1e-6 && (round - 0.6).abs() < 1e-6);
+        // The feather never exceeds the window.
+        let (half, _, feather) = CropMask { amount: 0.9, feather: 1.0, round: 0.0 }.window(cover).unwrap();
+        assert!(feather <= half[0].min(half[1]) + 1e-6);
+        let c = FisheyeCalib::new(1000.0, 1000.0, 960.0, 960.0, [0.0; 4], 1920.0, 1920.0, 900.0)
+            .with_view_mask([0.5, 0.4], 9.0, 9.0);
+        assert_eq!((c.mask_half, c.mask_round, c.mask_feather), ([0.5, 0.4], 0.4, 0.4));
+        assert_eq!(c.with_view_mask([0.0, 0.4], 0.1, 0.1).mask_half, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn view_mask_cover_shape() {
+        let ray = |x_deg: f32, y_deg: f32| -> [f32; 3] {
+            // a point of the equidistant angle plane → unit ray
+            let (x, y) = (x_deg.to_radians(), y_deg.to_radians());
+            let th = (x * x + y * y).sqrt();
+            if th < 1e-9 { return [0.0, 0.0, 1.0]; }
+            [th.sin() * x / th, th.sin() * y / th, th.cos()]
+        };
+        let (half, px) = ([40f32.to_radians(), 30f32.to_radians()], 1e-4);
+        let m = |x, y, round: f32, feather: f32| view_mask_cover(ray(x, y), half, round.to_radians(), feather.to_radians(), px);
+        // Off without half-extents.
+        assert_eq!(view_mask_cover(ray(80.0, 0.0), [0.0; 2], 0.0, 0.0, px), 1.0);
+        // Hard rectangle.
+        assert_eq!(m(0.0, 0.0, 0.0, 0.0), 1.0);
+        assert_eq!(m(39.0, 29.0, 0.0, 0.0), 1.0);
+        assert_eq!(m(41.0, 0.0, 0.0, 0.0), 0.0);
+        assert_eq!(m(0.0, -31.0, 0.0, 0.0), 0.0);
+        // Rounded corners cut the rectangle's corner but not its edge midpoints.
+        assert_eq!(m(39.0, 29.0, 30.0, 0.0), 0.0);
+        assert_eq!(m(39.0, 0.0, 30.0, 0.0), 1.0);
+        // Feather: full 10° inside the edge, half-way at 5°, gone at the edge.
+        assert_eq!(m(29.9, 0.0, 0.0, 10.0), 1.0);
+        assert!((m(35.0, 0.0, 0.0, 10.0) - 0.5).abs() < 1e-3);
+        assert!(m(40.0, 0.0, 0.0, 10.0) < 1e-6);
+        assert!(m(32.0, 0.0, 0.0, 10.0) > m(38.0, 0.0, 0.0, 10.0));
     }
 }
 

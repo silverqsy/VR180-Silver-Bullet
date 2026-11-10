@@ -63,6 +63,9 @@ pub struct App {
     /// a change triggers an automatic clip reload (the dual-stream
     /// iterators bind eye order at open).
     eye_orientation_applied: (bool, bool),
+    /// The X6 view choice the running decoder was started with (see the
+    /// reload in `update`): it binds at decoder start like the eye order.
+    insv_view_applied: vr180_fisheye::X6ViewChoice,
     clip: Option<ClipInfo>,
     /// Playing means the decoder thread is alive AND not paused.
     /// Paused-but-not-stopped (decoder thread parked) is `playing=false`
@@ -890,6 +893,28 @@ fn tr(en: &'static str) -> &'static str {
         "Meet in the middle" => "两眼折中",
         "Match to left eye" => "以左眼为准",
         "Match to right eye" => "以右眼为准",
+        "Mode" => "档位",
+        "view to be confirmed" => "视角待确认",
+        "unrecognized X6 mode" => "未识别的 X6 档位",
+        "View" => "视角",
+        "Wide" => "广角",
+        "This 3712 × 3712 clip has no usable window record, so the file cannot say whether it is the wide 7.4K or the 7.4K Crop. Pick the one it was shot in: the lens calibration and the rolling-shutter timing follow it."
+            => "这条 3712 × 3712 素材没有可用的窗口记录，文件本身无法区分广角 7.4K 和 7.4K Crop。请选拍摄时的档位：镜头标定和果冻校正时序会随之切换。",
+        "The lens geometry of this recording mode is not verified: both eyes are shown through the generic rule so the clip can be inspected."
+            => "该档位的镜头几何未经验证：两眼按通用规则显示，便于检查素材。",
+        "Crop mask" => "Crop 遮罩",
+        "Mask size (%)" => "遮罩范围 (%)",
+        "Feather (%)" => "羽化 (%)",
+        "Corner roundness (%)" => "圆角 (%)",
+        "Reset mask" => "重置遮罩",
+        "How much of the recorded view the black mask hides on every side. 0 hides nothing."
+            => "黑色遮罩在每一边遮住多少画面。0 表示不遮。",
+        "Soft edge: the picture fades to black over this width inside the mask edge. 0 = hard edge."
+            => "软边：画面在遮罩边缘内侧这段宽度上渐隐到黑。0 = 硬边。",
+        "0 = rectangle, 100 = ellipse."
+            => "0 = 矩形，100 = 椭圆。",
+        "A Crop clip holds part of the lens' view: outside the recorded frame the output is black. The mask is fixed in the output, so it stays still under stabilization. The reframed view does not use it."
+            => "Crop 素材只记录了镜头视野的一部分：画面以外输出为黑。遮罩固定在输出画面上，开启防抖时不会跟着晃。重构视图不使用遮罩。",
         "Measured L−R" => "实测 左−右",
         "applied" => "已施加",
         "Measuring…" => "测量中…",
@@ -1108,6 +1133,24 @@ struct PendingImport {
     first: PathBuf,
 }
 
+/// What an Insta360 X6 clip's trailer says about how it was recorded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct X6ClipInfo {
+    /// The file's `window_crop_info` — the recording mode's signature
+    /// (`None`: no record, or no readable trailer).
+    window: Option<vr180_fisheye::InsvWindowCrop>,
+    /// `gamma_mode` is I-Log (`None`: the file does not say).
+    ilog: Option<bool>,
+}
+
+impl X6ClipInfo {
+    /// The clip's stream geometry under a view choice (which only an
+    /// unconfirmed 3712² clip listens to).
+    fn geometry(&self, eye_w: u32, eye_h: u32, view: vr180_fisheye::X6ViewChoice) -> vr180_fisheye::InsvStreamGeometry {
+        vr180_fisheye::InsvStreamGeometry::resolve(self.window.as_ref(), eye_w, eye_h, view)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ClipInfo {
     width: u32,
@@ -1147,6 +1190,16 @@ struct ClipInfo {
     /// Blackmagic RAW: the clip's embedded display LUT written out as a
     /// `.cube` (auto-applied; switched off under a non-Film gamma).
     braw_lut: Option<String>,
+    /// Insta360 X6 video: the trailer's recording-mode signature and
+    /// picture profile.
+    x6: Option<X6ClipInfo>,
+}
+
+impl ClipInfo {
+    /// Stream geometry of an X6 clip under `view` (`None` for other sources).
+    fn x6_geometry(&self, view: vr180_fisheye::X6ViewChoice) -> Option<vr180_fisheye::InsvStreamGeometry> {
+        self.x6.map(|x| x.geometry(self.fisheye_eye_w, self.fisheye_eye_h, view))
+    }
 }
 
 /// An async clip load in flight (see `App::load_pending`). The worker
@@ -1206,6 +1259,8 @@ struct LoadedMeta {
     /// Blackmagic RAW: the SDK's colour processing as shot (the probe's
     /// `color` block), for the Color panel.
     braw_color: Option<vr180_braw::BrawColorInfo>,
+    /// Insta360 X6 video: recording-mode signature + picture profile.
+    x6: Option<X6ClipInfo>,
 }
 
 impl App {
@@ -1290,6 +1345,7 @@ impl App {
             pending_open: std::env::args_os().skip(1).map(PathBuf::from)
                 .filter(|p| p.is_file()).collect(),
             eye_orientation_applied: (defaults.fisheye_swap_eyes, defaults.camera_upside_down),
+            insv_view_applied: defaults.insv_view,
             clip: None,
             playing: false,
             decoder_alive: false,
@@ -1764,6 +1820,8 @@ impl App {
             fisheye_cy_norm_right: settings.fisheye_cy_norm_right,
             // Effective swap: manual toggle XOR upside-down mount.
             fisheye_swap_eyes: settings.effective_swap_eyes(),
+            insv_view: settings.insv_view,
+            crop_mask: settings.crop_mask,
             braw_color: settings.braw_color.clone(),
             trim_in_s: settings.trim_in_s,
             trim_out_s: settings.trim_out_s,
@@ -3328,6 +3386,26 @@ impl App {
         let quad_audio = source_kind == vr180_pipeline::SourceKind::KandaoQoocam
             && vr180_pipeline::audio::probe_foa_aac(&path).ok().flatten().is_some();
         if quad_audio { tracing::info!("load: QooCam 4-channel microphone track detected"); }
+        // Insta360 X6: the trailer's window record (the recording mode's
+        // signature — 7.4K / 10K and their Crop variants share nothing else
+        // that tells them apart) and the picture profile. A clip whose
+        // trailer cannot be read still gets an entry: its mode then follows
+        // the frame size alone. A few KB from the end of the file.
+        let x6 = (source_kind == vr180_pipeline::SourceKind::Insta360Insv).then(|| {
+            let id = vr180_fisheye::insta360::read_insta360_identity(&path).ok();
+            let info = X6ClipInfo {
+                window: id.as_ref().and_then(|m| m.window_crop),
+                ilog: id.as_ref().and_then(|m| m.is_ilog()),
+            };
+            let g = info.geometry(probe.width, probe.height, vr180_fisheye::X6ViewChoice::Auto);
+            tracing::info!(
+                "load: X6 recording mode {:?} ({} × {}, window {:?}, gamma {:?})",
+                g.detected, probe.width, probe.height,
+                info.window.map(|w| (w.dst_w, w.dst_h, w.offset_x, w.offset_y)),
+                id.as_ref().and_then(|m| m.gamma_mode.clone()),
+            );
+            info
+        });
         if probe.hlg { tracing::info!("load: HLG (ARIB STD-B67) transfer — HDR clip"); }
         // Blackmagic RAW: the clip's own display LUT ("Gen 5 Film to
         // Extended Video"), written out by the helper for the LUT stage.
@@ -3352,7 +3430,7 @@ impl App {
             duration_sec, frame_count, segments,
             cori_count, grav_count, srot_ms,
             detected_rs_mode, fisheye_eye_w, fisheye_eye_h,
-            eac_cal_dim, foa_audio, quad_audio, hlg: probe.hlg, braw_lut, braw_color,
+            eac_cal_dim, foa_audio, quad_audio, hlg: probe.hlg, braw_lut, braw_color, x6,
         })
     }
 
@@ -3421,7 +3499,12 @@ impl App {
             let wanted = match source_kind {
                 vr180_pipeline::SourceKind::DjiOsv        => Some(BUILTIN_OSMO_LUT_PATH),
                 vr180_pipeline::SourceKind::GoProEac      => Some(BUILTIN_GPLOG_LUT_PATH),
-                vr180_pipeline::SourceKind::Insta360Insv  => Some(BUILTIN_X6_LUT_PATH),
+                // The I-Log LUT follows the file's picture profile
+                // (`gamma_mode`), never the frame size: every recording
+                // mode can be shot in another profile. A file that does not
+                // state one is taken as I-Log, as before.
+                vr180_pipeline::SourceKind::Insta360Insv
+                    if meta.x6.map_or(true, |x| x.ilog != Some(false)) => Some(BUILTIN_X6_LUT_PATH),
                 // The QooCam's HDR mode records HLG; its SDR mode is plain
                 // Rec.709 and needs nothing.
                 vr180_pipeline::SourceKind::KandaoQoocam if meta.hlg => Some(BUILTIN_HLG_LUT_PATH),
@@ -3493,8 +3576,11 @@ impl App {
             quad_audio: meta.quad_audio,
             braw_color: meta.braw_color.map(std::sync::Arc::new),
             braw_lut: meta.braw_lut.clone(),
+            x6: meta.x6,
         });
         self.loaded_path = Some(meta.path);
+        // The decoder about to start is built for the current view choice.
+        self.insv_view_applied = self.settings.insv_view;
 
         // Kick off the decoder. Paused by default so the first frame paints
         // without the user pressing Play — unless they DID press Play during the
@@ -4482,6 +4568,21 @@ impl eframe::App for App {
                 self.load_file_inner(p, true);
             }
         }
+        // The X6 view choice (an unconfirmed 7.4K60 clip: wide or Crop)
+        // binds at decoder start too — the lens calibration and the readout
+        // are built from it — so a change rebuilds the clip's cached IMU and
+        // reloads. A clip the file identifies ignores the choice: no reload.
+        if self.settings.insv_view != self.insv_view_applied {
+            self.insv_view_applied = self.settings.insv_view;
+            let unconfirmed = self.clip.as_ref()
+                .and_then(|c| c.x6_geometry(self.settings.insv_view))
+                .map_or(false, |g| g.detected == vr180_fisheye::X6Mode::Unconfirmed7K4);
+            if let (true, Some(p)) = (unconfirmed, self.loaded_path.clone()) {
+                tracing::info!("X6 view choice → {:?} — rebuilding the lens calibration, reloading clip", self.settings.insv_view);
+                crate::decoder::uncache_dji_imu(&p);
+                self.load_file_inner(p, true);
+            }
+        }
         // Drain export-job progress + check for completion.
         self.poll_export_job();
         // Auto-update: drain events + periodic re-check + popover.
@@ -4900,9 +5001,14 @@ impl eframe::App for App {
                     }
                 }
                 if let Some(clip) = &self.clip {
+                    // An X6 clip in one of the added recording modes leads
+                    // with the mode's menu name.
+                    let mode = clip.x6_geometry(self.settings.insv_view)
+                        .and_then(|g| x6_mode_label(&g))
+                        .map(|m| format!("{m} · ")).unwrap_or_default();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(format!(
-                            "{} × {} @ {:.2} fps · {} frames",
+                            "{mode}{} × {} @ {:.2} fps · {} frames",
                             clip.width, clip.height, clip.fps, clip.frame_count,
                         )).small().color(Color32::GRAY));
                     });
@@ -5717,6 +5823,31 @@ impl App {
                     .on_hover_text(tr("On: each half is a raw fisheye image — dewarp it with the Fisheye lens settings. Off (default): the file is already VR180 side-by-side half-equirect and is used as-is."));
             });
         }
+
+        // Insta360 X6, 3712² without a usable window record: the wide 7.4K
+        // and the 7.4K Crop encode the same size at the same rate, so the
+        // file cannot say which it is — the user does. (The clip decodes
+        // either way; it renders as the wide mode until told otherwise.)
+        // An unrecognized signature only gets the note.
+        match self.clip.as_ref().and_then(|c| c.x6_geometry(self.settings.insv_view)).map(|g| g.detected) {
+            Some(vr180_fisheye::X6Mode::Unconfirmed7K4) => {
+                use vr180_fisheye::X6ViewChoice as V;
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr("View"));
+                    let v = &mut self.settings.insv_view;
+                    let crop = *v == V::Crop;
+                    // Auto already renders as wide: only a real change is stored.
+                    if ui.selectable_label(!crop, tr("Wide")).clicked() && crop { *v = V::Wide; }
+                    if ui.selectable_label(crop, "Crop").clicked() { *v = V::Crop; }
+                }).response.on_hover_text(tr("This 3712 × 3712 clip has no usable window record, so the file cannot say whether it is the wide 7.4K or the 7.4K Crop. Pick the one it was shot in: the lens calibration and the rolling-shutter timing follow it."));
+            }
+            Some(vr180_fisheye::X6Mode::Unknown) => {
+                ui.label(RichText::new(tr("The lens geometry of this recording mode is not verified: both eyes are shown through the generic rule so the clip can be inspected."))
+                    .small().color(Color32::GRAY));
+            }
+            _ => {}
+        }
     }
 
     /// Remove a clip from the list, keeping `active_clip` /
@@ -5817,6 +5948,18 @@ impl App {
                         ui.label(RichText::new(tr("Eye dims")).color(Color32::GRAY).small());
                         ui.label(format!("{} × {}", c.fisheye_eye_w, c.fisheye_eye_h));
                     });
+                }
+                // Insta360 X6 in one of the added recording modes: its menu
+                // name (amber while the view is unconfirmed / unrecognized).
+                if let Some(g) = c.x6_geometry(self.settings.insv_view) {
+                    if let Some(label) = x6_mode_label(&g) {
+                        let open = matches!(g.detected, vr180_fisheye::X6Mode::Unconfirmed7K4 | vr180_fisheye::X6Mode::Unknown);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr("Mode")).color(Color32::GRAY).small());
+                            let text = RichText::new(label);
+                            ui.label(if open { text.color(Color32::from_rgb(255, 200, 120)) } else { text });
+                        });
+                    }
                 }
                 if c.segments.len() > 1 {
                     ui.label(RichText::new(format!(
@@ -6535,6 +6678,10 @@ impl App {
                 | Some(vr180_pipeline::SourceKind::BlackmagicRaw)
         );
         let mode_before = self.settings.fisheye_output_mode;
+        // The frame is a crop of the image circle (the X6 Crop modes).
+        let frame_crop = self.clip.as_ref()
+            .and_then(|c| c.x6_geometry(self.settings.insv_view))
+            .map_or(false, |g| g.cropped);
         let s = &mut self.settings;
 
         ui.horizontal(|ui| {
@@ -6600,6 +6747,29 @@ impl App {
             // 180° output rotation + implicit eye swap (flipping the rig
             // mirrors the eye positions). Toggling reloads the clip.
             ui.checkbox(&mut s.camera_upside_down, tr("Upside-down mount (180°)"));
+        }
+
+        // ── Crop mask — sources whose frame is a crop of the image circle.
+        // Outside the recorded frame the output is black regardless; these
+        // set a black window on top: how much it hides, how round, how soft.
+        if frame_crop {
+            ui.add_space(6.0);
+            ui.label(RichText::new(tr("Crop mask")).small().color(Color32::GRAY))
+                .on_hover_text(tr("A Crop clip holds part of the lens' view: outside the recorded frame the output is black. The mask is fixed in the output, so it stays still under stabilization. The reframed view does not use it."));
+            let m = &mut s.crop_mask;
+            let (mut amount, mut feather, mut round) = (m.amount * 100.0, m.feather * 100.0, m.round * 100.0);
+            fine_slider(ui, 1.0, &mut amount, 0.0..=60.0, tr("Mask size (%)"), 1, 1.0, 0.5)
+                .on_hover_text(tr("How much of the recorded view the black mask hides on every side. 0 hides nothing."));
+            fine_slider(ui, 1.0, &mut feather, 0.0..=50.0, tr("Feather (%)"), 1, 1.0, 0.5)
+                .on_hover_text(tr("Soft edge: the picture fades to black over this width inside the mask edge. 0 = hard edge."));
+            fine_slider(ui, 1.0, &mut round, 0.0..=100.0, tr("Corner roundness (%)"), 0, 1.0, 1.0)
+                .on_hover_text(tr("0 = rectangle, 100 = ellipse."));
+            m.amount = (amount / 100.0).clamp(0.0, 0.6);
+            m.feather = (feather / 100.0).clamp(0.0, 0.5);
+            m.round = (round / 100.0).clamp(0.0, 1.0);
+            if !m.is_off() && ui.small_button(tr("Reset mask")).clicked() {
+                *m = vr180_pipeline::gpu::CropMask::default();
+            }
         }
 
         // A BRAW preview decodes at a size chosen for the output mode when
@@ -7169,6 +7339,18 @@ fn seed_tone_curve(p: &mut vr180_braw::BrawColorParams, base: vr180_braw::TonePr
     p.black_level.get_or_insert(base.black_level);
     p.white_level.get_or_insert(base.white_level);
     p.video_black_level.get_or_insert(base.video_black_level);
+}
+
+/// Menu name of an X6 clip's recording mode for the UI: `None` for the
+/// factory modes; an unconfirmed 3712² clip says so until the user picks.
+fn x6_mode_label(g: &vr180_fisheye::InsvStreamGeometry) -> Option<String> {
+    use vr180_fisheye::X6Mode as M;
+    match g.detected {
+        M::Stock => None,
+        M::Unconfirmed7K4 => Some(format!("7.4K60 · {}", tr("view to be confirmed"))),
+        M::Unknown => Some(tr("unrecognized X6 mode").to_string()),
+        m => m.label().map(str::to_string),
+    }
 }
 
 fn fine_slider(

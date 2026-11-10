@@ -149,7 +149,7 @@ pub fn measure_stereo_align(
             let (w, h) = crate::decode::probe_video(&cfg.source_path)
                 .map(|p| (p.width, p.height)).unwrap_or((3840, 3840));
             vr180_fisheye::insta360::read_insta360_identity(&cfg.source_path).ok()
-                .map(|m| crate::insv_imu::insv_calib_only(&m, w, h))
+                .map(|m| crate::insv_imu::insv_calib_only(&m, w, h, cfg.insv_view))
         } else if cfg.source_kind == crate::SourceKind::KandaoQoocam {
             // The stacked stream: one eye is half the frame height.
             let (w, h) = crate::decode::probe_video(&cfg.source_path)

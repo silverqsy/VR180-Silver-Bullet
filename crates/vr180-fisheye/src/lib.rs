@@ -45,7 +45,7 @@ pub mod projection;
 
 pub use calib::{FisheyeCalibration, GyroflowLensProfile};
 pub use dji_osv::{DjiLensCalib, DjiOsvImu, OmniLensModel, SampleAnchor};
-pub use insta360::{Insta360Meta, InsvLensCalib, InsvWindowCrop};
+pub use insta360::{Insta360Meta, InsvLensCalib, InsvStreamGeometry, InsvWindowCrop, X6Mode, X6ViewChoice};
 pub use kandao::{KandaoLens, KandaoMeta};
 pub use presets::{CameraPreset, presets};
 

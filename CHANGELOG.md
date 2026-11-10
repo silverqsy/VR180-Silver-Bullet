@@ -1,5 +1,70 @@
 # Changelog
 
+## Unreleased
+
+### Insta360 X6: 7.4K, 10K and their Crop recording modes
+
+Four more dual-fisheye recording modes of the X6 open like the 8K one: the
+factory lens model from the file, the same gyro stabilizer, and each mode's
+own rolling-shutter time.
+
+| Mode | Each eye | Rate | What the frame holds |
+|---|---|---|---|
+| 7.4K | 3712 × 3712 | 59.94 | the whole lens view — the 8K mode's sensor window, scaled |
+| 7.4K Crop | 3712 × 3712 | 59.94 | native sensor pixels from the centre of the lens, about 97° across |
+| 10K | 4864 × 4864 | 29.97 | the whole lens view from the higher-resolution readout |
+| 10K Crop | 4912 × 4912 | 29.97 | native sensor pixels, about 125° across (88° off axis in the corners) |
+
+- **The mode is read from the file**: each eye's encoded size plus the
+  trailer's sensor-window record. The clip header and the Source panel show
+  its name. The two 3712² modes encode the same size at the same rate, so a
+  clip whose window record is missing (stripped by a re-mux) cannot say
+  which it is: it opens as "7.4K60 · view to be confirmed" with a **View:
+  Wide / Crop** choice under Source. The older 3808² crop and 4864² "9.7K"
+  signatures are recognized too; an unknown one opens through the generic
+  rule and says so.
+- **Each mode has its own geometry.** The wide modes scale their sensor
+  window to the frame; the Crop modes are native pixels cut from the centre
+  of the sensor, so the lens model applies unscaled and only shifted. The
+  window record is a signature, not a decode size or a crop rectangle —
+  reading it as one put the 7.4K Crop 24 % off in scale.
+- **Checked on footage, per mode and per eye**: feature motion predicted
+  from the gyro through the lens model agrees with the tracked motion to the
+  same scale as the 8K mode (within 0.2 %), at the same time offset, with
+  the readout the file states. Stabilized exports leave about 0.05 px of
+  frame-to-frame shake at 1024 px per eye in all four modes (1.2 – 2 px
+  without), and scaling the rolling-shutter correction away from the file's
+  value in either direction makes it worse.
+- **Rolling shutter per mode**: the file's readout is used as recorded
+  (14.56 / 16.04 / 31.65 / 21.29 ms). The 7.4K Crop encodes 3712 of the
+  3968 rows the sensor reads, so its frame spans that share of the readout.
+- **A Crop frame keeps every pixel it recorded.** It holds part of the
+  lens' view, so directions outside it are black in the output — corners
+  included, where the frame reaches furthest. (The full-view modes still
+  repeat their rim past the image circle; that hides the gaps stabilization
+  can open at the edge.)
+- **Crop mask** (Output panel, Crop clips): a black window over the picture
+  with **Mask size**, **Feather** and **Corner roundness** — from the
+  recorded frame's own outline through a rounded rectangle to an ellipse,
+  hard-edged or faded. It is fixed in the output and identical in both
+  eyes, so it stays still while the stabilized picture moves under it. Off
+  by default; the reframed view does not use it.
+- **The I-Log LUT follows the file's picture profile**, not the frame size:
+  it is applied when the clip says I-Log (or says nothing, as before).
+- Native export sizes follow the mode: 7424 × 3712, 9728 × 4864 and
+  9824 × 4912.
+
+### Fixes
+
+- **A clip that lost only a few frames exported slightly slow.** The
+  nominal frame rate replaced the average only when the two differed by more
+  than 0.5 %; a clip missing 8 frames in a minute sits inside that, so its
+  export ran 0.4 % slow and ended a quarter of a second behind its audio.
+  Any missing frame now selects the nominal rate.
+- An `.insv` whose trailer cannot be read still opens with the generic X6
+  lens profile placed for its recording mode (no gyro, so no stabilization)
+  instead of being stretched to the full lens.
+
 ## 2.5.5 — 2026-11-07
 
 ### Footage with dropped frames (Insta360 X6)

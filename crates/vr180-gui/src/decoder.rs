@@ -309,6 +309,16 @@ pub struct Settings {
     /// (the rig flip mirrors the eye positions) — see
     /// [`Settings::effective_swap_eyes`].
     pub camera_upside_down: bool,
+    /// Insta360 X6: the answer for a clip whose view the file does not
+    /// state — a 3712² clip without its window record can be the wide 7.4K
+    /// or the 7.4K Crop. Binds at decoder start (it changes the lens
+    /// calibration and the readout), so a change reloads the clip. Ignored
+    /// by a clip the file identifies.
+    pub insv_view: vr180_fisheye::X6ViewChoice,
+    /// Crop-mask controls for a source whose frame is a crop of the image
+    /// circle (the X6 Crop modes): the black window's size, corner
+    /// roundness and feather. All-zero = nothing recorded is hidden.
+    pub crop_mask: vr180_pipeline::gpu::CropMask,
     /// Output projection. `HalfEquirect` is the standard VR180 output
     /// (left-right hemisphere). `Fisheye` skips the projection entirely
     /// and writes the raw fisheye eyes as SBS — useful for VFX or
@@ -476,6 +486,8 @@ impl Default for Settings {
             fisheye_cy_norm_right: 0.5,
             fisheye_swap_eyes: false,
             camera_upside_down: false,
+            insv_view: vr180_fisheye::X6ViewChoice::Auto,
+            crop_mask: vr180_pipeline::gpu::CropMask::default(),
             fisheye_output_mode: FisheyeOutputMode::HalfEquirect,
             reframe_hfov_deg: 90.0,
             reframe_defish: 0.0,
@@ -1210,25 +1222,37 @@ fn load_insv_imu(
     src_w: u32,
     src_h: u32,
 ) -> Option<vr180_fisheye::DjiOsvImu> {
-    if let Some(arc) = cached_dji_imu(&cfg.path).filter(|a| !a.frame_quats.is_empty()) {
+    // A cached copy is only good for the view choice it was built under (it
+    // decides the calibration and the readout of an unconfirmed 3712² clip).
+    if let Some(arc) = cached_dji_imu(&cfg.path)
+        .filter(|a| !a.frame_quats.is_empty() && a.insv_view == cfg.settings.insv_view)
+    {
         tracing::info!("decoder (fisheye/insv): reusing cached IMU for {}", cfg.path.display());
         seed_detected_calib(control, &arc, src_w, src_h);
         return Some((*arc).clone());
     }
-    let meta = match vr180_fisheye::insta360::read_insta360_meta(&cfg.path) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!("insv trailer failed: {e} — using preset calib, no stabilization");
-            return None;
-        }
-    };
+    let view = cfg.settings.insv_view;
     let probe = vr180_pipeline::decode::probe_video(&cfg.path).ok();
     let fps = probe.as_ref().map(|p| p.fps).filter(|f| *f > 0.0).unwrap_or(30.0);
     let (w, h) = probe.as_ref().map(|p| (p.width, p.height)).unwrap_or((src_w, src_h));
+    let meta = match vr180_fisheye::insta360::read_insta360_meta(&cfg.path) {
+        Ok(m) => m,
+        Err(e) => {
+            // No trailer (stripped by a re-mux): the clip still decodes.
+            // The generic X6 profile is placed by the recording mode the
+            // frame size — and, for 3712², the user's view choice — names,
+            // so a Crop clip is not stretched to the full lens. No gyro:
+            // stabilization stays off.
+            tracing::warn!("insv trailer failed: {e} — generic X6 lens profile, no stabilization");
+            let imu = vr180_pipeline::insv_imu::insv_calib_only(&vr180_fisheye::Insta360Meta::default(), w, h, view);
+            seed_detected_calib(control, &imu, src_w, src_h);
+            return Some(imu);
+        }
+    };
     // Frames in the track (one exposure stamp each), not duration × fps —
     // a clip with dropped frames has fewer rows than slots.
     let total = timeline_frames_or(cached_timeline(&cfg.path).as_deref(), segments_total_frames(&cfg.segments)).max(1);
-    let imu = vr180_pipeline::insv_imu::build_insv_imu(&meta, fps, total, w, h);
+    let imu = vr180_pipeline::insv_imu::build_insv_imu(&meta, fps, total, w, h, view);
     tracing::info!(
         "decoder (fisheye/insv): {} fw {} — {} imu samples @ {:.0} Hz, {} frame stamps, {} frame quats",
         meta.model, meta.firmware, meta.imu.len(), meta.imu_rate_hz(), meta.frames.len(),
@@ -3895,8 +3919,9 @@ fn still_lens_calibs(
         src_w: still.calib_frame.1, src_h: still.calib_frame.1,
         dst_w: half_w, dst_h: half_h, offset_x: 0, offset_y: 0,
     });
+    let geom = vr180_fisheye::InsvStreamGeometry::scaled_window(&crop, stream_w, stream_h);
     let lens = |i: usize| vr180_pipeline::insv_imu::stream_lens_calib(
-        &still.lenses[i], Some(&crop), stream_w, stream_h);
+        &still.lenses[i], &geom, stream_w, stream_h);
     (lens(0), lens(1))
 }
 
@@ -4376,14 +4401,22 @@ pub(crate) fn resolve_fisheye_calib_pair(
             } else {
                 (&imu.lens_b, &imu.lens_a)
             };
-            (
+            let pair = (
                 eye(0, lens_l, s.fisheye_override_left, s.fisheye_fov_deg_left,
                     s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left,
                     s.fisheye_k5_left, s.fisheye_p_left),
                 eye(1, lens_r, s.fisheye_override_right, s.fisheye_fov_deg_right,
                     s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right,
                     s.fisheye_k5_right, s.fisheye_p_right),
-            )
+            );
+            // A frame that is a crop of the image circle (the X6 Crop
+            // modes): black outside the frame, corners kept, plus the
+            // user's mask window. Same call as the export resolver.
+            if lens_l.frame_crop || lens_r.frame_crop {
+                vr180_pipeline::gpu::apply_frame_crop(pair.0, pair.1, s.crop_mask)
+            } else {
+                pair
+            }
         }
         _ => {
             // Non-OSV: Hermite-default constructor, per-eye. No protobuf,
@@ -5604,6 +5637,13 @@ pub(crate) fn cache_dji_imu(path: &std::path::Path, imu: std::sync::Arc<vr180_fi
     c.push((path.to_path_buf(), imu));
     let n = c.len();
     if n > 8 { c.drain(0..n - 8); } // keep the 8 most recent
+}
+
+/// Drop a clip's cached IMU so the next decoder start rebuilds it — for a
+/// setting that changes what is built (the X6 view choice: lens calibration
+/// and readout).
+pub(crate) fn uncache_dji_imu(path: &std::path::Path) {
+    dji_imu_cache().lock().retain(|(p, _)| p != path);
 }
 
 pub(crate) fn cached_dji_imu(path: &std::path::Path) -> Option<std::sync::Arc<vr180_fisheye::DjiOsvImu>> {

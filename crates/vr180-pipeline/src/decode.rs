@@ -405,6 +405,30 @@ fn read_ranges_concurrent(f: &std::fs::File, ranges: &[(u64, usize)], progress: 
 }
 
 #[cfg(test)]
+mod nominal_rate_tests {
+    /// A clip that lost only a few frames still probes at its NOMINAL rate:
+    /// the average of these reads 0.1 – 0.4 % low, inside the tolerance a
+    /// constant-rate file is given, and an export at that rate drifts off
+    /// its audio. Skipped when the samples are not mounted.
+    #[test]
+    fn a_few_dropped_frames_still_probe_nominal() {
+        for (path, nominal) in [
+            // 2 of 1893 frames missing — average 59.877
+            ("/Volumes/Database/x6/1110/drop frame/VID_20261110_144829_00_004.insv", 60000.0_f32 / 1001.0),
+            // 8 of 1835 missing — average 29.839
+            ("/Volumes/Database/x6/1110/drop frame/VID_20261110_145620_00_009.insv", 30000.0 / 1001.0),
+            // no holes
+            ("/Volumes/Database/x6/1110/VID_20261110_144736_00_003.insv", 60000.0 / 1001.0),
+        ] {
+            let p = std::path::Path::new(path);
+            if !p.exists() { eprintln!("skip: {path} not present"); continue; }
+            let probe = super::probe_video(p).expect("probe");
+            assert!((probe.fps - nominal).abs() < 1e-3, "{path}: probed {} fps, nominal {nominal}", probe.fps);
+        }
+    }
+}
+
+#[cfg(test)]
 mod gpmf_fast_tests {
     use super::*;
     /// The sample-table read must be byte-identical to demuxing, and far
@@ -904,20 +928,24 @@ pub fn probe_video_duration_via_moov(path: &Path) -> Result<f64> {
 /// for a constant-rate file, LOWER for one with dropped frames (an Insta360
 /// X6 clip with 52 holes in 28 s reads 48.16 fps for its 50 fps mode), where
 /// it would mis-size the frame period, every frame-indexed table and the
-/// export rate alike. The average stands when the two agree within 0.5 % (a
-/// constant-rate file — nothing changes for it) and when the container has
-/// no readable sample table (not MP4, fragmented).
+/// export rate alike. ANY missing frame selects the nominal rate, however
+/// few: the export fills each hole at the nominal period, so writing those
+/// frames at the average rate would run the picture slow against its audio
+/// (8 frames missing from a 61 s 29.97 fps clip is 0.44 % — 0.27 s by the
+/// end). A track without holes keeps the average when the two agree within
+/// 0.5 % (a constant-rate file — nothing changes for it), and so does a
+/// container with no readable sample table (not MP4, fragmented).
 fn nominal_or_average_fps(path: &Path, avg_fps: f32) -> f32 {
-    match crate::frame_timeline::FrameTimeline::nominal_rate(path) {
-        Ok(rate) if rate.fps() > 0.0 => {
-            let nominal = rate.fps();
-            if avg_fps > 0.0 && ((nominal - avg_fps) / nominal).abs() <= 0.005 {
+    match crate::frame_timeline::FrameTimeline::from_mp4(path) {
+        Ok(tl) if tl.nominal_fps() > 0.0 => {
+            let nominal = tl.nominal_fps() as f32;
+            let dropped = tl.dropped_frames();
+            if dropped == 0 && avg_fps > 0.0 && ((nominal - avg_fps) / nominal).abs() <= 0.005 {
                 avg_fps
             } else {
                 tracing::debug!(
-                    "probe: {} — nominal {:.3} fps (sample delta {}/{}) vs average {:.3}: \
-                     frames are missing from the track; using the nominal rate",
-                    path.display(), nominal, rate.delta_ticks, rate.timescale, avg_fps
+                    "probe: {} — nominal {:.3} fps vs average {:.3} ({} frames missing from the track); using the nominal rate",
+                    path.display(), nominal, avg_fps, dropped
                 );
                 nominal
             }

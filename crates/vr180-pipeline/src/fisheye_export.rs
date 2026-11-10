@@ -185,6 +185,14 @@ pub struct FisheyeExportConfig {
     pub fisheye_cx_norm_right: f32,
     pub fisheye_cy_norm_right: f32,
     pub fisheye_swap_eyes: bool,
+    /// Insta360 X6: the user's answer for a clip whose view the file does
+    /// not state — a 3712² clip without its window record can be the wide
+    /// 7.4K or the 7.4K Crop. `Auto` everywhere else.
+    pub insv_view: vr180_fisheye::X6ViewChoice,
+    /// Crop-mask controls for a source whose frame is a crop of the image
+    /// circle (the X6 Crop modes): the black window's size, corner
+    /// roundness and feather. Ignored by every other source.
+    pub crop_mask: crate::gpu::CropMask,
     /// Blackmagic RAW: the SDK's colour processing overrides (colour science,
     /// gamma/gamut, white balance, exposure/ISO, tone curve); as shot by
     /// default. Mirrors `Settings.braw_color`; other sources ignore it.
@@ -921,17 +929,26 @@ fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsv
 /// it has what we need, else read the trailer and fuse the raw gyro here.
 fn resolve_export_insv_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
     if let Some(arc) = &cfg.preloaded_imu {
-        if !cfg.stabilize || !arc.frame_quats.is_empty() {
+        // …built for the SAME view choice: a 3712² clip without its window
+        // record is calibrated (and timed) by it, so a copy cached under
+        // another choice would export the other mode's geometry.
+        if arc.insv_view == cfg.insv_view && (!cfg.stabilize || !arc.frame_quats.is_empty()) {
             return Some((**arc).clone());
         }
     }
     let path = cfg.segments.first().unwrap_or(&cfg.source_path);
-    let meta = match vr180_fisheye::insta360::read_insta360_meta(path) {
-        Ok(m) => m,
-        Err(e) => { tracing::warn!("insv trailer: {e}"); return None; }
-    };
     let probe = crate::decode::probe_video(path).ok();
     let (w, h) = probe.as_ref().map(|p| (p.width, p.height)).unwrap_or((3840, 3840));
+    let meta = match vr180_fisheye::insta360::read_insta360_meta(path) {
+        Ok(m) => m,
+        Err(e) => {
+            // No trailer: the generic X6 profile, placed by the recording
+            // mode the frame size (and the view choice) names — as the
+            // preview does. No gyro, so no stabilization.
+            tracing::warn!("insv trailer: {e} — generic X6 lens profile, no stabilization");
+            return Some(crate::insv_imu::insv_calib_only(&vr180_fisheye::Insta360Meta::default(), w, h, cfg.insv_view));
+        }
+    };
     // Frames in the track (its sample table), not duration × fps: a clip
     // with dropped frames has fewer rows than slots.
     let n_frames = crate::frame_timeline::FrameTimeline::nominal_rate(path).ok()
@@ -939,9 +956,9 @@ fn resolve_export_insv_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::D
         .or_else(|| probe.as_ref().map(|p| (p.duration_sec * p.fps as f64).round() as usize))
         .unwrap_or(0);
     Some(if cfg.stabilize {
-        crate::insv_imu::build_insv_imu(&meta, cfg.fps, n_frames, w, h)
+        crate::insv_imu::build_insv_imu(&meta, cfg.fps, n_frames, w, h, cfg.insv_view)
     } else {
-        crate::insv_imu::insv_calib_only(&meta, w, h)
+        crate::insv_imu::insv_calib_only(&meta, w, h, cfg.insv_view)
     })
 }
 
@@ -4271,14 +4288,22 @@ pub(crate) fn resolve_calib_pair(
             } else {
                 (&imu.lens_b, &imu.lens_a)
             };
-            (
+            let pair = (
                 eye(0, lens_l, cfg.fisheye_override_left, cfg.fisheye_fov_deg_left,
                     cfg.fisheye_cx_norm_left, cfg.fisheye_cy_norm_left, cfg.fisheye_k_left,
                     cfg.fisheye_k5_left, cfg.fisheye_p_left),
                 eye(1, lens_r, cfg.fisheye_override_right, cfg.fisheye_fov_deg_right,
                     cfg.fisheye_cx_norm_right, cfg.fisheye_cy_norm_right, cfg.fisheye_k_right,
                     cfg.fisheye_k5_right, cfg.fisheye_p_right),
-            )
+            );
+            // A frame that is a crop of the image circle (the X6 Crop
+            // modes): black outside the frame, corners kept, plus the
+            // user's mask window. Must match the GUI resolver.
+            if lens_l.frame_crop || lens_r.frame_crop {
+                crate::gpu::apply_frame_crop(pair.0, pair.1, cfg.crop_mask)
+            } else {
+                pair
+            }
         }
         _ => {
             // Non-OSV: Hermite-default constructor, per-eye.

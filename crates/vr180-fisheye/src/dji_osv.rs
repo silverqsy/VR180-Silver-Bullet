@@ -97,6 +97,12 @@ pub struct DjiLensCalib {
     /// above then hold a Kannala-Brandt fit of its radial curve for the
     /// override UI and CPU consumers; the renderers prefer this model.
     pub omni: Option<OmniLensModel>,
+    /// The frame is a crop of the lens' image circle (the Insta360 X6 Crop
+    /// modes): a ray that projects outside it has no data and renders
+    /// black, corners included. `false` for every full-circle source, where
+    /// the renderers replicate the rim instead (that hides the gaps the
+    /// stabilizer occasionally opens at the edge).
+    pub frame_crop: bool,
 }
 
 /// Unified camera model (Mei/Geyer `ξ` + even radial polynomial + tangential
@@ -171,6 +177,11 @@ pub struct DjiOsvImu {
     /// frame timing (DJI). Consumers stabilize the eye that shows lens B
     /// from this timeline and everything else from `self`.
     pub lens_b_timeline: Option<Box<DjiOsvImu>>,
+    /// Insta360 X6: the view choice this calibration and readout were built
+    /// for (it decides both for a 3712² clip without its window record). A
+    /// cached copy built for another choice must be rebuilt, not reused.
+    /// `Auto` for every other source.
+    pub insv_view: crate::insta360::X6ViewChoice,
     /// Per-frame exposure (shutter) time in ms, from the frame's exposure
     /// record (`[2.4.1]`: a `{numerator, denominator}` fraction of a second —
     /// `[1, 520]` = 1/520 s on the OSMO 360, `[100000, 79298304]` on the
