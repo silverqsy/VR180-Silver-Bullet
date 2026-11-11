@@ -108,7 +108,10 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    offsets, per-row RS and the lens override all still apply. Export
    (`FisheyeExportProjection::Reframe { hfov_deg, defish }`)
    writes the exact viewport at a per-eye size (1080/1440/2160 lines ×
-   aspect → 2:1 or 32:9 SBS) and never tags VR180 metadata. Since
+   aspect → 2:1 or 32:9 SBS; since 2026-11-10 also 3840 lines for the 1:1
+   view only — 3840² per eye, 7680×3840 SBS; `ReframeSize::clamped` drops a
+   size the view does not offer to the largest one below it) and never
+   tags VR180 metadata. Since
    2026-11-10 the same view also exports as an Apple spatial video
    (MV-HEVC, macOS) — item 29.
    Preview follows the aspect
@@ -2072,7 +2075,9 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      `SpatialVideo` to `AVAssetPlaybackAssistant` and to
      `PFMetadataMovie.isSpatialMedia`, keeps `lhvC`, and VideoToolbox
      decodes both eyes of every sample. M5 Max, 7.4K Crop 59.94 fps
-     stabilized: 46 fps at 2160² per eye, 32 fps at 3840×2160 per eye.
+     stabilized: 46 fps at 2160² per eye, 32 fps at 3840×2160 per eye;
+     10K Crop 29.97 fps: 20 fps at 3840² per eye. The MV-HEVC session
+     itself opened at every size tried, up to 8192² per eye.
      **Not yet seen on the headset** and the export-format UI was not
      visually checked.
    - Open: a source whose audio is APAC (a finished VR180 export re-opened)

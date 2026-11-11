@@ -402,35 +402,45 @@ impl ExportResolution {
 }
 
 /// Per-eye size of a reframed export (the side-by-side frame is twice as
-/// wide): 1080 / 1440 / 2160 lines for video; a STILL may also pick 3240
-/// (16:9 → 5760×3240 per eye) or, for the 1:1 view, 4320 (4320² per eye) —
-/// a photo renders from the native lens half, so the only cost is the file.
-/// The width follows the view's aspect.
+/// wide): 1080 / 1440 / 2160 lines for video, and for the 1:1 view also 3840
+/// (3840² per eye → a 7680×3840 side-by-side frame, or a spatial video of
+/// that size); a STILL may also pick 3240 (16:9 → 5760×3240 per eye) or,
+/// for the 1:1 view, 4320 (4320² per eye) — a photo renders from the native
+/// lens half, so the only cost is the file. The width follows the view's
+/// aspect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReframeSize { P1080, P1440, P2160, P3240, P4320 }
+enum ReframeSize { P1080, P1440, P2160, P3240, P3840, P4320 }
 
 impl ReframeSize {
     fn height(self) -> u32 {
         match self {
             Self::P1080 => 1080, Self::P1440 => 1440, Self::P2160 => 2160,
-            Self::P3240 => 3240, Self::P4320 => 4320,
+            Self::P3240 => 3240, Self::P3840 => 3840, Self::P4320 => 4320,
         }
     }
-    /// The sizes offered for a source: video stops at 2160 lines; a still
-    /// adds 3240 for both aspects and 4320 for the 1:1 view only (16:9 at
-    /// 4320 would be 7680×4320 per eye).
+    /// The sizes offered for a source. Video stops at 2160 lines in 16:9
+    /// (3840×2160 per eye) and at 3840 in the 1:1 view (16:9 at 3840 lines
+    /// would be 6826×3840 per eye — a side-by-side frame no hardware
+    /// encoder takes). A still adds 3240 for both aspects and 4320 for the
+    /// 1:1 view only (16:9 at 4320 would be 7680×4320 per eye).
     fn choices(is_still: bool, aspect: crate::decoder::ReframeAspect) -> &'static [ReframeSize] {
+        use crate::decoder::ReframeAspect::{Square, Wide};
         match (is_still, aspect) {
-            (false, _) => &[Self::P1080, Self::P1440, Self::P2160],
-            (true, crate::decoder::ReframeAspect::Wide) => &[Self::P1080, Self::P1440, Self::P2160, Self::P3240],
-            (true, crate::decoder::ReframeAspect::Square) => &[Self::P1080, Self::P1440, Self::P2160, Self::P3240, Self::P4320],
+            (false, Wide) => &[Self::P1080, Self::P1440, Self::P2160],
+            (false, Square) => &[Self::P1080, Self::P1440, Self::P2160, Self::P3840],
+            (true, Wide) => &[Self::P1080, Self::P1440, Self::P2160, Self::P3240],
+            (true, Square) => &[Self::P1080, Self::P1440, Self::P2160, Self::P3240, Self::P3840, Self::P4320],
         }
     }
-    /// The size clamped to what `choices` offers for the source — a
-    /// still-only pick remembered from a photo must not size a video.
+    /// The size clamped to what `choices` offers for the source: the size
+    /// itself when offered, else the largest offered one below it — a
+    /// still-only pick remembered from a photo must not size a video, and
+    /// the 1:1 view's 3840 must not carry into 16:9.
     fn clamped(self, is_still: bool, aspect: crate::decoder::ReframeAspect) -> Self {
         let allowed = Self::choices(is_still, aspect);
-        if allowed.contains(&self) { self } else { *allowed.last().unwrap_or(&Self::P2160) }
+        allowed.iter().rev().copied()
+            .find(|s| s.height() <= self.height())
+            .unwrap_or(allowed[0])
     }
     fn eye_dims(self, aspect: crate::decoder::ReframeAspect) -> (u32, u32) {
         let h = self.height();
@@ -691,6 +701,31 @@ mod reframe_bitrate_tests {
     use crate::decoder::ReframeAspect;
 
     #[test]
+    fn size_follows_what_the_view_offers() {
+        use ReframeAspect::{Square, Wide};
+        use ReframeSize::*;
+        // The 1:1 view's 3840² per eye, for video and stills.
+        assert_eq!(P3840.eye_dims(Square), (3840, 3840));
+        assert!(ReframeSize::choices(false, Square).contains(&P3840));
+        assert!(!ReframeSize::choices(false, Wide).contains(&P3840));
+        assert_eq!(P3840.clamped(false, Square), P3840);
+        assert_eq!(P3840.clamped(true, Square), P3840);
+        // A size the view does not offer drops to the largest one below it.
+        assert_eq!(P3840.clamped(false, Wide), P2160);
+        assert_eq!(P3840.clamped(true, Wide), P3240);
+        assert_eq!(P4320.clamped(false, Square), P3840);
+        assert_eq!(P4320.clamped(true, Wide), P3240);
+        assert_eq!(P3240.clamped(false, Square), P2160);
+        assert_eq!(P3240.clamped(false, Wide), P2160);
+        // Offered sizes stay as they are.
+        for &(still, aspect) in &[(false, Square), (false, Wide), (true, Square), (true, Wide)] {
+            for &sz in ReframeSize::choices(still, aspect) {
+                assert_eq!(sz.clamped(still, aspect), sz);
+            }
+        }
+    }
+
+    #[test]
     fn recommended_rates_match_the_table() {
         let cases = [
             (ReframeSize::P1080, ReframeAspect::Square, 30.0, 20),
@@ -702,12 +737,14 @@ mod reframe_bitrate_tests {
             (ReframeSize::P1080, ReframeAspect::Wide,   60.0, 50),
             (ReframeSize::P2160, ReframeAspect::Wide,   60.0, 210),
             (ReframeSize::P1080, ReframeAspect::Square, 24.0, 20), // flat below 30 fps
+            (ReframeSize::P3840, ReframeAspect::Square, 30.0, 250),
+            (ReframeSize::P3840, ReframeAspect::Square, 60.0, 300), // the slider's ceiling
         ];
         for (sz, aspect, fps, want) in cases {
             assert_eq!(sz.recommended_bitrate_mbps(aspect, fps), want, "{sz:?} {aspect:?} @ {fps}");
         }
         // Always inside the slider's range.
-        for sz in [ReframeSize::P1080, ReframeSize::P1440, ReframeSize::P2160] {
+        for sz in [ReframeSize::P1080, ReframeSize::P1440, ReframeSize::P2160, ReframeSize::P3840] {
             for fps in [23.976_f32, 30.0, 50.0, 59.94, 120.0] {
                 let r = sz.recommended_bitrate_mbps(ReframeAspect::Wide, fps);
                 assert!((10..=300).contains(&r) && r % 5 == 0, "{sz:?} @ {fps}: {r}");

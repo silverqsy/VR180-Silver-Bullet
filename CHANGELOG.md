@@ -79,7 +79,8 @@ the immersive view) instead of a flat 3D one. Other players show the left
 eye in 2D.
 
 - **The field of view written is the view you framed**: the reframed
-  view's own horizontal angle, at 1:1 or 16:9, up to 3840 × 2160 per eye. A
+  view's own horizontal angle, at 1:1 (up to 3840 × 3840 per eye) or 16:9
+  (up to 3840 × 2160 per eye). A
   Crop-mode clip becomes a spatial video camera whose field of view you
   choose afterwards.
 - **Camera baseline** (65 mm by default) and **Disparity adjustment** (2 %
@@ -94,13 +95,21 @@ eye in 2D.
   side by side instead; the Codec choice stays for the clips that can use
   it.
 - Measured on an M5 Max from a 7.4K Crop clip (59.94 fps, stabilized):
-  2160 × 2160 per eye at 46 fps, 3840 × 2160 per eye at 32 fps.
+  2160 × 2160 per eye at 46 fps, 3840 × 2160 per eye at 32 fps; from a 10K
+  Crop clip (29.97 fps), 3840 × 3840 per eye at 20 fps.
 - Checked with the system's own tests on macOS 27: the files read as
   spatial video to AVFoundation and to Photos, and VideoToolbox decodes both
   eyes of every frame. A side-by-side file with the same metadata does not
   qualify, on the Mac or in the headset, which is why this is MV-HEVC.
 - Needs macOS 14.4 or later. Not on Windows: there is no MV-HEVC encoder
   there.
+
+### Reframed (Flat 3D): 3840 × 3840 per eye
+
+The 1:1 view has a larger video size: **3840 × 3840 per eye**, a 7680 × 3840
+side-by-side frame (or a spatial video of that size). The 16:9 view stays at
+3840 × 2160 per eye; a size the current view does not offer drops to the
+largest one below it.
 
 ### File info: bit rate
 

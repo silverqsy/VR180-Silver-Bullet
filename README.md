@@ -38,8 +38,8 @@ Studio).
   projection matched to the lens) with Vision Pro (APMP) or YouTube
   metadata — or **Reframed (Flat 3D)**, a rectilinear side-by-side view for
   AR glasses and 3D displays with zoom, pan / tilt / roll and a Defish
-  blend. Drag the preview to pan, scroll to zoom; export 2:1 or 32:9 up to
-  7680×2160.
+  blend. Drag the preview to pan, scroll to zoom; export 2:1 up to
+  7680×3840 or 32:9 up to 7680×2160.
 - **Real-time preview** of the exact 10-bit stack the export uses. SBS,
   anaglyph, 50% overlay and single-eye views, a native-resolution
   magnifier, audio playback.
