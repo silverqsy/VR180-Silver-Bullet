@@ -53,6 +53,15 @@ own rolling-shutter time.
   it is applied when the clip says I-Log (or says nothing, as before).
 - Native export sizes follow the mode: 7424 × 3712, 9728 × 4864 and
   9824 × 4912.
+- **Native sharpness for Crop clips: 13120 × 6560.** A Crop frame is native
+  sensor pixels over part of the lens' view (36 pixels per degree at the
+  centre, twice the 8K mode), so a 180° canvas of the frame's own size
+  scales it down — the 10K Crop by a quarter, the 7.4K Crop by almost half.
+  The Resolution list of a Crop clip gains an entry that renders the canvas
+  at the frame's centre density, taken from the file's lens calibration
+  (6560 pixels per eye). H.265 encodes it in hardware on Apple Silicon
+  (about 10 fps on an M5 Max); it is beyond HEVC Level 6.2, so most players
+  will not decode it, and ProRes at this size uses the software encoder.
 
 ### File info: bit rate
 

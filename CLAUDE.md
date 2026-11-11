@@ -1990,6 +1990,20 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      over a 61 s clip). The I-Log LUT follows `gamma_mode` (identity field
      22), not the frame size. A trailer that cannot be read → generic X6
      profile placed by the mode (calib-only IMU, no stab).
+   - **Native-sharpness export size** (`ExportResolution::Sharp`, Crop
+     clips only): the 180° canvas at the frame's centre density,
+     `insv_imu::native_sharpness_side(π·f)` from the file's lenses → 6560²
+     per eye = 13120 × 6560 for both Crop modes (36.4 px/° vs 18.2 on the
+     8K mode). Offered in the Resolution list only when the active clip's
+     geometry is `cropped` (`ClipInfo::sharp_eye` / `BatchItem::sharp_eye`,
+     passed into `build_export_cfg`); any other clip in a batch takes 8K.
+     Mac: VideoToolbox HEVC takes it on the zero-copy path (10 fps, level
+     7.0; its ceiling is 16384 × 8192), hardware ProRes does not (software
+     fallback, as for a 12K BRAW). **Windows: NVENC HEVC stops at 8192
+     wide — this size will fall back to libx265 there; untested.**
+   - **File info shows the bit rate** (`VideoProbe::video_bitrates_bps`,
+     the first two streams of the largest frame size; file size ÷ duration
+     marked ≈ where the container states none).
    - Open: multi-segment `.insv`; this unit's lens A sits ~1° off the
      shared IMU basis in roll (per-unit mount tolerance — not handled).
 

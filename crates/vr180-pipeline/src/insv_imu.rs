@@ -178,6 +178,34 @@ pub fn x6_profile_lens_calib(scale: f64, cropped: bool, stream_w: u32, stream_h:
     }
 }
 
+/// Side (px) of a per-eye 180° half-equirect canvas that keeps a lens'
+/// centre sharpness: such a canvas has `W/π` pixels per radian and the lens
+/// `paraxial_px_per_rad` there, so `W = π·f`, rounded up to a multiple of 16.
+pub fn native_sharpness_side(paraxial_px_per_rad: f64) -> u32 {
+    ((std::f64::consts::PI * paraxial_px_per_rad / 16.0).ceil().max(1.0) as u32) * 16
+}
+
+/// Mean centre scale of a clip's two lenses in NATIVE pixels per radian —
+/// the factory entries' `fx / (1 + ξ)` (≈ 2087 on the X6), or the generic
+/// profile's when the file carries no calibration string.
+pub fn x6_paraxial_native(meta: &Insta360Meta) -> f64 {
+    if meta.lenses.is_empty() {
+        INSV_X6_FX as f64 * 2.0 // the profile was measured on the ½-scale 3840² stream
+    } else {
+        meta.lenses.iter().map(|l| l.paraxial_focal()).sum::<f64>() / meta.lenses.len() as f64
+    }
+}
+
+/// Per-eye side of the 180° canvas at a Crop clip's native sharpness: its
+/// frame is native sensor pixels covering part of the lens (126° on the 10K
+/// Crop), so the 4912² frame put on a 180° canvas of its own size would be
+/// scaled down by a quarter. `None` unless the clip's frame is a crop of the
+/// image circle — a full-view frame already spans more than 180°.
+pub fn crop_native_side(meta: &Insta360Meta, stream_w: u32, stream_h: u32, view: X6ViewChoice) -> Option<u32> {
+    let geom = meta.stream_geometry(stream_w, stream_h, view);
+    geom.cropped.then(|| native_sharpness_side(x6_paraxial_native(meta) * geom.scale_x))
+}
+
 /// Per-file lens calibration for one video stream, in stream coordinates.
 ///
 /// - Frame: `geom` places the stream in the calibration's native frame —
@@ -705,6 +733,36 @@ mod tests {
         assert!((a.cx.unwrap() - (e2.cx - 7744.0 - 32.0) / 2.0).abs() < 2e-3 && (a.cy.unwrap() - (e2.cy - 32.0) / 2.0).abs() < 2e-3);
         assert!((a.omni.unwrap().fx - e2.fx / 2.0).abs() < 2e-3 && !a.frame_crop);
         assert!((imu.readout_ms.unwrap() - 14.56).abs() < 1e-4);
+    }
+
+    #[test]
+    fn native_sharpness_canvas() {
+        // π·f rounded up to a multiple of 16.
+        assert_eq!(native_sharpness_side(2087.0), 6560);
+        assert_eq!(native_sharpness_side(16.0 / std::f64::consts::PI), 16);
+        assert_eq!(native_sharpness_side(16.01 / std::f64::consts::PI), 32);
+        let lenses = vr180_fisheye::insta360::parse_calib_string(
+            "2_2.455430_7222.060_7222.060_3859.700_3880.160_0.268_0.029_89.599_0.000000_0.000000_0.000000_1.28201866_-0.80810684_1.14986908_12.02910519_0.00000000_0.00083911_0.00081532_-0.00902508_0.00378748_-0.00103918_-0.00197197_0.00374385_-0.03644488_15488_7744_193_2.455430_7200.680_7200.680_11623.400_3877.740_0.077_-0.047_89.595_-0.000117_0.000083_-0.032567_1.27704287_-0.69810301_-0.66506159_19.39754486_0.00000000_0.00045809_0.00208752_0.00392174_0.00178436_0.00026127_-0.00205885_-0.01210092_-0.01896361_15488_7744_193_394240").unwrap();
+        let win = |dw, dh| vr180_fisheye::InsvWindowCrop { src_w: 7744, src_h: 7744, dst_w: dw, dst_h: dh, offset_x: 0, offset_y: 0 };
+        let mut meta = Insta360Meta { lenses, ..Default::default() };
+        assert!((x6_paraxial_native(&meta) - 2086.97).abs() < 0.05);
+        // Both Crop modes are native pixels: the same density, the same canvas.
+        meta.window_crop = Some(win(4912, 4912));
+        assert_eq!(crop_native_side(&meta, 4912, 4912, X6ViewChoice::Auto), Some(6560));
+        meta.window_crop = Some(win(4912, 3968));
+        assert_eq!(crop_native_side(&meta, 3712, 3712, X6ViewChoice::Auto), Some(6560));
+        // A full-view frame has no such size …
+        meta.window_crop = Some(win(7680, 7680));
+        assert_eq!(crop_native_side(&meta, 3712, 3712, X6ViewChoice::Auto), None);
+        assert_eq!(crop_native_side(&meta, 3840, 3840, X6ViewChoice::Auto), None);
+        // … and an unconfirmed 3712² clip gets it only once the user says Crop.
+        meta.window_crop = None;
+        assert_eq!(crop_native_side(&meta, 3712, 3712, X6ViewChoice::Auto), None);
+        assert_eq!(crop_native_side(&meta, 3712, 3712, X6ViewChoice::Crop), Some(6560));
+        // No calibration string: the generic profile's centre scale (2088.8 px/rad).
+        let bare = Insta360Meta::default();
+        assert!((x6_paraxial_native(&bare) - 2088.78).abs() < 0.05);
+        assert_eq!(crop_native_side(&bare, 4912, 4912, X6ViewChoice::Auto), Some(6576));
     }
 
     #[test]

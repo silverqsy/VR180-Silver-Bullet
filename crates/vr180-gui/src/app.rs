@@ -367,14 +367,22 @@ impl StillFormatChoice {
 /// native-res source directly into the 4096 grid (one resample,
 /// end-to-end at output res; sharpen / color / encode all run at 4096),
 /// NOT a finished-frame upscale.
+///
+/// `Sharp` exists for a source whose frame is a CROP of the lens' view (the
+/// X6 Crop modes): there the frame is native sensor pixels covering ~97° or
+/// ~126°, so a 180° canvas of the frame's own size scales it down. `Sharp`
+/// renders the 180° canvas at the pixel density of the frame's centre
+/// (`π × the lens' centre focal`: 6560² per eye → 13120 × 6560 on the X6).
+/// Offered only for such a clip; on any other it falls back to `R8k`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExportResolution { Native, R8k }
+enum ExportResolution { Native, R8k, Sharp }
 
 impl ExportResolution {
     fn label(self) -> &'static str {
         match self {
             ExportResolution::Native => "7680 × 3840",
             ExportResolution::R8k    => "8192 × 4096",
+            ExportResolution::Sharp  => "13120 × 6560",
         }
     }
 }
@@ -473,7 +481,7 @@ struct ExportOptions {
     codec: ExportCodec,
     /// Still-photo container (used only when the source is a still).
     still_format: StillFormatChoice,
-    /// Output resolution target (Native / 8192×4096).
+    /// Output resolution target (Native / 8192×4096 / a Crop clip's native sharpness).
     resolution: ExportResolution,
     /// H.265 average bitrate in Mbps for VR180 output. Range 20..=1000
     /// (a native 12K export wants the top of it; the slider is logarithmic
@@ -531,6 +539,50 @@ mod file_info_tests {
         assert_eq!(bitrate_label(&[], Some(1_234_560_000), true).as_deref(), Some("≈ 1234.6 Mbps"));
         // Nothing known (a still).
         assert_eq!(bitrate_label(&[], None, true), None);
+    }
+}
+
+#[cfg(test)]
+mod export_size_tests {
+    use super::{App, ExportOptions, ExportResolution, X6ClipInfo};
+    use vr180_fisheye::{InsvWindowCrop, X6ViewChoice};
+
+    fn eye_dims(resolution: ExportResolution, eye: u32, sharp_eye: Option<u32>) -> (u32, u32) {
+        let opts = ExportOptions { resolution, ..Default::default() };
+        let cfg = App::build_export_cfg(
+            std::path::Path::new("/nonexistent/in.insv"), std::path::Path::new("/nonexistent/out.mp4"),
+            29.97, vr180_pipeline::SourceKind::Insta360Insv,
+            eye, eye, eye, eye, sharp_eye,
+            &crate::decoder::Settings::default(), &opts, Vec::new(),
+        );
+        (cfg.eye_w, cfg.eye_h)
+    }
+
+    #[test]
+    fn native_sharpness_size_is_for_crop_clips() {
+        // A 10K Crop clip: its own size, 8K, or the canvas at its centre density.
+        assert_eq!(eye_dims(ExportResolution::Native, 4912, Some(6560)), (4912, 4912));
+        assert_eq!(eye_dims(ExportResolution::R8k, 4912, Some(6560)), (4096, 4096));
+        assert_eq!(eye_dims(ExportResolution::Sharp, 4912, Some(6560)), (6560, 6560));
+        // Any other clip has no such size: the choice means 8K there.
+        assert_eq!(eye_dims(ExportResolution::Sharp, 3840, None), (4096, 4096));
+        assert_eq!(eye_dims(ExportResolution::Native, 3840, None), (3840, 3840));
+    }
+
+    #[test]
+    fn sharp_eye_follows_the_recording_mode() {
+        let win = |dw, dh| InsvWindowCrop { src_w: 7744, src_h: 7744, dst_w: dw, dst_h: dh, offset_x: 0, offset_y: 0 };
+        let info = |window| X6ClipInfo { window, ilog: Some(true), paraxial_native: 2086.97 };
+        // Both Crop modes are native pixels: 36.4 px/° → 6560 px per 180°.
+        assert_eq!(info(Some(win(4912, 4912))).sharp_eye(4912, 4912, X6ViewChoice::Auto), Some(6560));
+        assert_eq!(info(Some(win(4912, 3968))).sharp_eye(3712, 3712, X6ViewChoice::Auto), Some(6560));
+        // Full-view modes cover more than 180° at their own size.
+        assert_eq!(info(Some(win(7680, 7680))).sharp_eye(3712, 3712, X6ViewChoice::Auto), None);
+        assert_eq!(info(Some(win(7912, 7912))).sharp_eye(4864, 4864, X6ViewChoice::Auto), None);
+        assert_eq!(info(Some(win(7680, 7680))).sharp_eye(3840, 3840, X6ViewChoice::Auto), None);
+        // An unconfirmed 3712² clip: only once the user says it is the Crop.
+        assert_eq!(info(None).sharp_eye(3712, 3712, X6ViewChoice::Auto), None);
+        assert_eq!(info(None).sharp_eye(3712, 3712, X6ViewChoice::Crop), Some(6560));
     }
 }
 
@@ -632,6 +684,18 @@ struct BatchItem {
     status: BatchStatus,
     /// Ticked in the Source list to include in "Export selected".
     selected: bool,
+    /// Insta360 X6 video: the trailer's recording-mode signature (the
+    /// native-sharpness export size of a Crop clip follows from it).
+    x6: Option<X6ClipInfo>,
+}
+
+impl BatchItem {
+    /// Per-eye side of the native-sharpness canvas for this entry, under
+    /// its own view choice (`None` unless its frame is a crop of the lens'
+    /// view — see `ExportResolution::Sharp`).
+    fn sharp_eye(&self) -> Option<u32> {
+        self.x6.and_then(|x| x.sharp_eye(self.fisheye_eye_w, self.fisheye_eye_h, self.settings.insv_view))
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -914,6 +978,9 @@ fn tr(en: &'static str) -> &'static str {
         "Match to right eye" => "以右眼为准",
         "Mode" => "档位",
         "Bitrate" => "比特率",
+        "native sharpness" => "原生清晰度",
+        "Native sharpness: the 180° canvas at the pixel density of the Crop frame's centre, so nothing recorded is scaled down. The clip's own size puts the same frame on a smaller canvas."
+            => "原生清晰度：按 Crop 画面中心的像素密度铺 180° 画布，录到的细节不被缩小。选素材自身尺寸时，同一画面会铺在更小的画布上。",
         "Video bit rate from the file. Two numbers in brackets are the two eyes' streams. ≈ means the whole file's size over its duration."
             => "文件里的视频比特率。括号里的两个数是两眼各自的码流。≈ 表示按整个文件大小除以时长估算。",
         "view to be confirmed" => "视角待确认",
@@ -1163,9 +1230,36 @@ struct X6ClipInfo {
     window: Option<vr180_fisheye::InsvWindowCrop>,
     /// `gamma_mode` is I-Log (`None`: the file does not say).
     ilog: Option<bool>,
+    /// Mean centre scale of the two lenses, native pixels per radian (from
+    /// the file's calibration, else the generic profile).
+    paraxial_native: f64,
 }
 
 impl X6ClipInfo {
+    /// Read it from a clip's trailer (a few KB from the end of the file).
+    /// A clip whose trailer cannot be read still gets an entry: its mode
+    /// then follows the frame size alone.
+    fn read(path: &std::path::Path) -> (Self, Option<String>) {
+        let id = vr180_fisheye::insta360::read_insta360_identity(path).ok();
+        let bare = vr180_fisheye::Insta360Meta::default();
+        (
+            Self {
+                window: id.as_ref().and_then(|m| m.window_crop),
+                ilog: id.as_ref().and_then(|m| m.is_ilog()),
+                paraxial_native: vr180_pipeline::insv_imu::x6_paraxial_native(id.as_ref().unwrap_or(&bare)),
+            },
+            id.and_then(|m| m.gamma_mode),
+        )
+    }
+
+    /// Per-eye side of the 180° canvas at the frame's native sharpness —
+    /// `Some` only when the frame is a crop of the lens' view under `view`
+    /// (see `ExportResolution::Sharp`).
+    fn sharp_eye(&self, eye_w: u32, eye_h: u32, view: vr180_fisheye::X6ViewChoice) -> Option<u32> {
+        let g = self.geometry(eye_w, eye_h, view);
+        g.cropped.then(|| vr180_pipeline::insv_imu::native_sharpness_side(self.paraxial_native * g.scale_x))
+    }
+
     /// The clip's stream geometry under a view choice (which only an
     /// unconfirmed 3712² clip listens to).
     fn geometry(&self, eye_w: u32, eye_h: u32, view: vr180_fisheye::X6ViewChoice) -> vr180_fisheye::InsvStreamGeometry {
@@ -1229,6 +1323,12 @@ impl ClipInfo {
     /// Stream geometry of an X6 clip under `view` (`None` for other sources).
     fn x6_geometry(&self, view: vr180_fisheye::X6ViewChoice) -> Option<vr180_fisheye::InsvStreamGeometry> {
         self.x6.map(|x| x.geometry(self.fisheye_eye_w, self.fisheye_eye_h, view))
+    }
+
+    /// Per-eye side of the native-sharpness canvas (`None` unless the clip's
+    /// frame is a crop of the lens' view — see `ExportResolution::Sharp`).
+    fn sharp_eye(&self, view: vr180_fisheye::X6ViewChoice) -> Option<u32> {
+        self.x6.and_then(|x| x.sharp_eye(self.fisheye_eye_w, self.fisheye_eye_h, view))
     }
 }
 
@@ -1676,6 +1776,7 @@ impl App {
         fisheye_eye_h: u32,
         width: u32,
         height: u32,
+        sharp_eye: Option<u32>,
         settings: &crate::decoder::Settings,
         opts: &ExportOptions,
         segments: Vec<PathBuf>,
@@ -1717,9 +1818,13 @@ impl App {
         // (8192×4096 SBS). The projection samples the native source
         // directly into the 4096 grid — full resolution end-to-end,
         // not a last-step upscale.
-        if opts.resolution == ExportResolution::R8k {
-            eye_w = 4096;
-            eye_h = 4096;
+        // Native sharpness (`sharp_eye`: a clip whose frame is a crop of
+        // the lens' view): the 180° canvas at the frame's own centre
+        // density. Any other clip takes the 8K target instead.
+        match (opts.resolution, sharp_eye) {
+            (ExportResolution::Sharp, Some(side)) => { eye_w = side; eye_h = side; }
+            (ExportResolution::R8k | ExportResolution::Sharp, _) => { eye_w = 4096; eye_h = 4096; }
+            (ExportResolution::Native, _) => {}
         }
 
         let projection = match settings.fisheye_output_mode {
@@ -2502,6 +2607,9 @@ impl App {
                 settings.trim_in_s = None;
                 settings.trim_out_s = None;
             }
+            // Insta360 X6: the recording-mode signature (a few KB from the
+            // file's end) — a Crop clip's native-sharpness size follows from it.
+            let x6 = (source_kind == vr180_pipeline::SourceKind::Insta360Insv).then(|| X6ClipInfo::read(&path).0);
             self.batch.push(BatchItem {
                 path,
                 fps: probe.fps,
@@ -2512,6 +2620,7 @@ impl App {
                 settings,
                 status: BatchStatus::Idle,
                 selected: false,
+                x6,
             });
             if is_loaded_clip {
                 // The loaded clip just joined the list — link it up.
@@ -2634,6 +2743,7 @@ impl App {
                     &item.path, &output,
                     item.fps, item.source_kind,
                     item.fisheye_eye_w, item.fisheye_eye_h, item.width, item.height,
+                    item.sharp_eye(),
                     &item.settings, &opts,
                     segments,
                 ),
@@ -3437,17 +3547,12 @@ impl App {
         // trailer cannot be read still gets an entry: its mode then follows
         // the frame size alone. A few KB from the end of the file.
         let x6 = (source_kind == vr180_pipeline::SourceKind::Insta360Insv).then(|| {
-            let id = vr180_fisheye::insta360::read_insta360_identity(&path).ok();
-            let info = X6ClipInfo {
-                window: id.as_ref().and_then(|m| m.window_crop),
-                ilog: id.as_ref().and_then(|m| m.is_ilog()),
-            };
+            let (info, gamma) = X6ClipInfo::read(&path);
             let g = info.geometry(probe.width, probe.height, vr180_fisheye::X6ViewChoice::Auto);
             tracing::info!(
                 "load: X6 recording mode {:?} ({} × {}, window {:?}, gamma {:?})",
                 g.detected, probe.width, probe.height,
-                info.window.map(|w| (w.dst_w, w.dst_h, w.offset_x, w.offset_y)),
-                id.as_ref().and_then(|m| m.gamma_mode.clone()),
+                info.window.map(|w| (w.dst_w, w.dst_h, w.offset_x, w.offset_y)), gamma,
             );
             info
         });
@@ -4151,6 +4256,13 @@ impl App {
                     None => self.export_opts.resolution.label().to_string(),
                 }
             }
+            // A Crop clip's native-sharpness canvas; any other clip exports 8K.
+            None if self.export_opts.resolution == ExportResolution::Sharp => {
+                match self.clip.as_ref().and_then(|c| c.sharp_eye(self.settings.insv_view)) {
+                    Some(side) => format!("{} × {side}", side * 2),
+                    None => ExportResolution::R8k.label().to_string(),
+                }
+            }
             None => self.export_opts.resolution.label().to_string(),
         };
         let h265_mbps = self.export_opts.effective_h265_mbps(
@@ -4306,6 +4418,9 @@ impl App {
             let clip_fps = self.clip.as_ref().map(|c| c.fps).unwrap_or(30.0);
             let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
             let native_dims = self.native_sbs_dims();
+            // A Crop clip's native-sharpness canvas (side by side), if it has one.
+            let sharp_dims = self.clip.as_ref()
+                .and_then(|c| c.sharp_eye(self.settings.insv_view)).map(|side| (side * 2, side));
             egui::Window::new(tr("Export format"))
                 .collapsible(false)
                 .resizable(false)
@@ -4314,7 +4429,7 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_min_width(360.0);
                     Self::export_options_ui(ui, &mut self.export_opts, "export",
-                        self.settings.reframe_aspect_if_active(), clip_fps, is_still, native_dims);
+                        self.settings.reframe_aspect_if_active(), clip_fps, is_still, native_dims, sharp_dims);
                 });
             self.show_export_settings = open;
         }
@@ -4329,6 +4444,7 @@ impl App {
         fps: f32,
         is_still: bool,
         native_dims: Option<(u32, u32)>,
+        sharp_dims: Option<(u32, u32)>,
     ) {
         if let Some(aspect) = reframe {
             // Reframed view: the exact viewport at a per-eye size.
@@ -4353,21 +4469,45 @@ impl App {
                 None if is_still => "native (full)".to_string(),
                 None => ExportResolution::Native.label().to_string(),
             };
-            let sel_label: &str = if opts.resolution == ExportResolution::Native { &native_label } else { ExportResolution::R8k.label() };
+            // Native sharpness — only a clip whose frame is a crop of the
+            // lens' view has it (the X6 Crop modes). The choice sticks while
+            // such clips are open; on any other clip it means 8K, and shows so.
+            let sharp_label: Option<String> = sharp_dims.filter(|_| !is_still)
+                .map(|(w, h)| format!("{w} × {h} ({})", tr("native sharpness")));
+            if opts.resolution == ExportResolution::Sharp && sharp_label.is_none() {
+                opts.resolution = ExportResolution::R8k;
+            }
+            let sel_label: &str = match (opts.resolution, sharp_label.as_deref()) {
+                (ExportResolution::Native, _) => &native_label,
+                (ExportResolution::Sharp, Some(l)) => l,
+                _ => ExportResolution::R8k.label(),
+            };
             egui::ComboBox::from_id_source(format!("{id_prefix}_resolution"))
                 .selected_text(sel_label)
-                .width(220.0)
+                .width(260.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut opts.resolution,
                         ExportResolution::Native, native_label.clone());
                     ui.selectable_value(&mut opts.resolution,
                         ExportResolution::R8k, ExportResolution::R8k.label());
+                    if let Some(l) = &sharp_label {
+                        ui.selectable_value(&mut opts.resolution, ExportResolution::Sharp, l.clone());
+                    }
                 });
+            if sharp_label.is_some() {
+                ui.label(RichText::new(tr("Native sharpness: the 180° canvas at the pixel density of the Crop frame's centre, so nothing recorded is scaled down. The clip's own size puts the same frame on a smaller canvas."))
+                    .small().color(Color32::GRAY));
+            }
             // Beyond 8192×4096 (a 12K BRAW): Apple's hardware ProRes engine
             // refuses the frame, so ProRes goes to the software encoder; HEVC
             // encodes in hardware but exceeds Level 6.2 for most players.
-            if !is_still && opts.resolution == ExportResolution::Native {
-                if let Some((w, h)) = native_dims {
+            let out_dims = match opts.resolution {
+                ExportResolution::Native => native_dims,
+                ExportResolution::Sharp => sharp_dims,
+                ExportResolution::R8k => None,
+            };
+            if !is_still {
+                if let Some((w, h)) = out_dims {
                     if w > 8192 || h > 4096 {
                         ui.label(RichText::new(match opts.codec {
                             ExportCodec::ProRes => tr("Above 8192 × 4096 the Mac's hardware ProRes encoder refuses the frame — the software encoder takes over (several times slower)."),
@@ -5618,9 +5758,11 @@ impl App {
         } else {
             (clip.width.max(512), clip.height.max(512))
         };
-        if self.export_opts.resolution == ExportResolution::R8k {
-            ew = 4096;
-            eh = 4096;
+        // Same rule as `build_export_cfg`.
+        match (self.export_opts.resolution, clip.sharp_eye(self.settings.insv_view)) {
+            (ExportResolution::Sharp, Some(side)) => { ew = side; eh = side; }
+            (ExportResolution::R8k | ExportResolution::Sharp, _) => { ew = 4096; eh = 4096; }
+            (ExportResolution::Native, _) => {}
         }
         match self.settings.fisheye_output_mode {
             crate::decoder::FisheyeOutputMode::Reframe =>
@@ -6561,6 +6703,7 @@ impl App {
             item.fisheye_eye_h,
             item.width,
             item.height,
+            item.sharp_eye(),
             &self.settings,
             &self.export_opts,
             segments,
