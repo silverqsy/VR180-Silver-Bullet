@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: **UNRELEASED on `main` (local, 2026-11-10): Insta360 X6 7.4K / 7.4K Crop / 10K / 10K Crop recording modes + Crop mask + the few-dropped-frames rate fix (item 28) — Windows needs a build + a look at the masked shaders.** **2.5.5 RELEASED 2026-11-07 — tag `v2.5.5` @ `90f11b7`, macOS live on the updater feed (item 27), Windows build PENDING — it ships everything since 2.5.2: X6 per-frame eye-exposure matching (item 15), GoPro exposure timing from SHUT (item 16), Kandao QooCam 3 Ultra (items 23/24), Blackmagic RAW rebuilt + on Windows (item 25), dropped-frame tables + pts-paced preview (item 26).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
+## ⚡ Status: **UNRELEASED on `main` (local, 2026-11-10): Insta360 X6 7.4K / 7.4K Crop / 10K / 10K Crop recording modes + Crop mask + the few-dropped-frames rate fix (item 28) — Windows needs a build + a look at the masked shaders; spatial video export of the reframed view, macOS only (item 29) — Windows needs only a build (the change adds a codec choice that is never offered there).** **2.5.5 RELEASED 2026-11-07 — tag `v2.5.5` @ `90f11b7`, macOS live on the updater feed (item 27), Windows build PENDING — it ships everything since 2.5.2: X6 per-frame eye-exposure matching (item 15), GoPro exposure timing from SHUT (item 16), Kandao QooCam 3 Ultra (items 23/24), Blackmagic RAW rebuilt + on Windows (item 25), dropped-frame tables + pts-paced preview (item 26).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -106,10 +106,11 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    unit-tested). The pan reuses the view adjust's global angles
    (`Settings::output_view_adjust`, tilt-up = negative pitch); stab, stereo
    offsets, per-row RS and the lens override all still apply. Export
-   (`FisheyeExportProjection::Reframe { hfov_deg, defish, spatial }`)
+   (`FisheyeExportProjection::Reframe { hfov_deg, defish }`)
    writes the exact viewport at a per-eye size (1080/1440/2160 lines ×
-   aspect → 2:1 or 32:9 SBS) and never tags VR180 metadata (no spatial-
-   video side output: Vision Pro viewers watch the VR180 export instead).
+   aspect → 2:1 or 32:9 SBS) and never tags VR180 metadata. Since
+   2026-11-10 the same view also exports as an Apple spatial video
+   (MV-HEVC, macOS) — item 29.
    Preview follows the aspect
    via `preview_out_dims`; in this mode dragging the preview pans the view,
    scroll / pinch zooms the FOV and double-click recenters (the alignment
@@ -2011,6 +2012,74 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      marked ≈ where the container states none).
    - Open: multi-segment `.insv`; this unit's lens A sits ~1° off the
      shared IMU basis in roll (per-unit mount tolerance — not handled).
+
+29. **Spatial video export of the reframed view (2026-11-10, Mac only;
+   UNRELEASED)** — `ExportCodec::Spatial` ("Spatial video (MV-HEVC)" in the
+   export format's Codec list) writes `<stem>_Spatial.mov`: one MV-HEVC
+   Main10 stream (left eye = layer 0 = hero) with `vexu` (eyes / stri /
+   hero / cams·blin / cmfy·dadj / proj·rect) + `hfov` = the reframed
+   viewport's horizontal angle.
+   - **Why MV-HEVC**: a side-by-side file with the full spatial metadata is
+     only "stereo" to the system. Two system tests exist (disassembled on
+     macOS 27.2): AVFoundation's `AVAssetPlaybackAssistant` skips the
+     multiview test as soon as `ViewPackingKind` is side-by-side and needs
+     real left/right layers; Photos' `PFVideoMetadata videoTrackIsSpatial`
+     wants three track characteristics, and although a `tagc` atom can
+     declare the missing one, the user's headset (visionOS 27) still did not
+     show such a file as spatial.
+   - **Flow**: `FisheyeExportConfig::spatial: Option<SpatialVideo {
+     baseline_mm, disparity }>` → `prepare_spatial` at both export entries
+     (needs `Reframe` with `defish` 0 and even eye sides; pins VideoToolbox
+     + 10-bit so every Mac loop takes its zero-copy P010 encode branch) →
+     `open_spatial_encoder` returns `encode::ExportEncoder::MvHevc`
+     (`mvhevc.rs`), which the three Mac loops feed through the same
+     `encode_pixel_buffer_p010` call as the ffmpeg encoder
+     (`export_fisheye_inner`, `export_fisheye_osv_zerocopy_p010`,
+     `export_eac_zerocopy_vt`). `MvHevcEncoder` writes the composed
+     side-by-side P010 surface's two planes (read-locked,
+     `RetainedIOSurface::with_plane_bytes`) to the `mvhevc_encode` helper's
+     stdin; the helper splits each frame into two pool buffers and calls
+     `VTCompressionSessionEncodeMultiImageFrame`. No colour conversion and
+     no intermediate file: one encode of the rendered frames. The pipe is
+     the back-pressure.
+   - **Audio**: never one-pass (`one_pass_audio_eligible` is false); the
+     helper's video-only `.mov` goes through the usual finalize (ffmpeg
+     stream-copy mux, or the APAC helper's passthrough).
+     **`audio::mux_video_with_audio_stream` must carry
+     `AV_DISPOSITION_MULTILAYER` to the output stream**: the MOV muxer
+     writes the second view's `lhvC` box only for a stream with that flag,
+     and without the box the right eye does not decode while every
+     metadata check still says "spatial". The ffmpeg CLI copies
+     dispositions; our mux copies only that bit.
+   - **GUI**: the choice is offered when the reframed view is active on
+     macOS (`spatial_video_available`: + Defish 0, not a still);
+     `ExportOptions::codec_for(settings, is_still)` is the codec an item
+     really exports with — a clip the choice cannot apply to runs as H.265
+     and the choice itself stays put (batch of mixed clips). Baseline
+     shares `apmp_baseline_mm`; `spatial_disparity_pct` defaults to 2.
+   - **Helper**: rewritten around P010 input (was BGR48 + a pixel-transfer
+     session, from the Python app, never called from Rust); exact frame
+     rate as `--fps-num/--fps-den`; counts samples in = out or fails; built
+     with `-target …macosx14.0` (`min_macos_for` in `build_swift.sh`) and
+     availability-guarded (the field-of-view key is 14.4+). **The other two
+     Swift helpers are still built for the build machine's own macOS** —
+     open.
+   - **Verified** (headless, the gitignored `x6_mode_export` /
+     `eac_spatial_check` examples): X6 7.4K Crop, Osmo `.osv`, a finished
+     VR180 SBS file (zero-copy and portable loop), GoPro `.360`; 1:1 and
+     16:9; stereo / ambisonic + SA3D / APAC audio. Each output reads as
+     `SpatialVideo` to `AVAssetPlaybackAssistant` and to
+     `PFMetadataMovie.isSpatialMedia`, keeps `lhvC`, and VideoToolbox
+     decodes both eyes of every sample. M5 Max, 7.4K Crop 59.94 fps
+     stabilized: 46 fps at 2160² per eye, 32 fps at 3840×2160 per eye.
+     **Not yet seen on the headset** and the export-format UI was not
+     visually checked.
+   - Open: a source whose audio is APAC (a finished VR180 export re-opened)
+     fails ANY export at the audio mux (`write_header: Invalid argument`,
+     ffmpeg cannot stream-copy the unknown codec) — pre-existing, not
+     spatial-specific. The VR180 APMP writer's baseline box is misplaced and
+     malformed (`inject_apmp_vr180`: `cams` directly under `vexu`, `blin`
+     without version/flags) — Apple's reader ignores it; not fixed.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

@@ -10,7 +10,7 @@
 //! in this MVP — they're queued for follow-up phases. The output is
 //! a single H.265 `.mp4` / `.mov` file with no audio.
 
-use crate::encode::{EncoderBackend, H265Encoder};
+use crate::encode::{EncoderBackend, ExportEncoder, H265Encoder};
 use crate::fisheye_decode::{
     BrawFisheyeIter, DualStreamFisheyeIter, FisheyePair, FisheyePairIter,
     SbsFisheyeIter, SegmentedFisheyeIter,
@@ -84,6 +84,23 @@ pub enum AudioTrack {
     /// Re-encode the ambisonic to Apple Positional Audio Codec (Vision
     /// Pro head-tracked spatial). macOS-only; needs the apac_encode helper.
     Apac,
+}
+
+/// Apple spatial video for a reframed export: the two eye views go into one
+/// MV-HEVC stream with the spatial metadata (eye views, camera baseline,
+/// horizontal field of view, disparity adjustment, rectilinear projection),
+/// which a Vision Pro presents as a spatial video rather than a flat 3D one.
+/// The field of view is the reframed viewport's own. macOS only (the
+/// encoder is VideoToolbox's); the frame must be rectilinear — a reframed
+/// view with `defish` at 0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpatialVideo {
+    /// Distance between the two lenses, millimetres.
+    pub baseline_mm: f32,
+    /// Horizontal disparity adjustment as a fraction of the frame width
+    /// (0.02 = 2 %). Positive moves the whole scene away from the viewer,
+    /// so that what the lenses saw at infinity sits behind the window.
+    pub disparity: f32,
 }
 
 /// Complete export configuration. The fields mirror the GUI's
@@ -163,6 +180,11 @@ pub struct FisheyeExportConfig {
     /// Output projection. `HalfEquirect` = standard VR180 (default).
     /// `Fisheye` = raw fisheye pass-through SBS, no equirect projection.
     pub projection: FisheyeExportProjection,
+    /// `Some` → write an Apple spatial video (MV-HEVC `.mov`) instead of a
+    /// side-by-side frame. Needs a rectilinear reframed `projection` and
+    /// macOS; `encoder` / `bit_depth` are then fixed by the export
+    /// (VideoToolbox, 10-bit) whatever they say here.
+    pub spatial: Option<SpatialVideo>,
 
     // ── Per-eye calibration overrides (mirror Settings) ───────────
     pub fisheye_preset: String,
@@ -344,6 +366,70 @@ fn video_only_temp_path(final_out: &std::path::Path) -> std::path::PathBuf {
         return tmp_dir.join(format!("{stem}.{:x}.video.tmp.{ext}", h.finish()));
     }
     video_tmp_next_to_output(final_out)
+}
+
+/// A spatial video export: check what it needs and pin the encode route.
+/// The frame must be a rectilinear reframed view (the metadata says so, and
+/// carries its horizontal field of view) with even sides; the route is the
+/// VideoToolbox zero-copy 10-bit one, whose composed P010 surface is what
+/// the MV-HEVC encoder is fed. No-op for every other export.
+fn prepare_spatial(cfg: &mut FisheyeExportConfig) -> Result<()> {
+    if cfg.spatial.is_none() { return Ok(()); }
+    if !cfg!(target_os = "macos") {
+        return Err(Error::Ffmpeg("spatial video (MV-HEVC) export is macOS-only".into()));
+    }
+    spatial_frame_hfov(cfg.projection, cfg.eye_w, cfg.eye_h)?;
+    cfg.encoder = EncoderBackend::VideoToolbox;
+    cfg.bit_depth = 10;
+    Ok(())
+}
+
+/// The horizontal field of view (degrees) a spatial video of this frame
+/// declares — the reframed viewport's own — or why the frame cannot be one:
+/// it must be the reframed view, rectilinear (`defish` 0), with even sides
+/// (4:2:0, and the seam between the eyes must fall between chroma samples).
+fn spatial_frame_hfov(projection: FisheyeExportProjection, eye_w: u32, eye_h: u32) -> Result<f32> {
+    let hfov_deg = match projection {
+        FisheyeExportProjection::Reframe { hfov_deg, defish } if defish.abs() < 1e-4 => hfov_deg,
+        FisheyeExportProjection::Reframe { .. } => return Err(Error::Ffmpeg(
+            "spatial video needs a rectilinear frame — set the reframed view's Defish to 0".into())),
+        _ => return Err(Error::Ffmpeg(
+            "spatial video is an export of the reframed (Flat 3D) view".into())),
+    };
+    if eye_w == 0 || eye_h == 0 || eye_w % 2 != 0 || eye_h % 2 != 0 {
+        return Err(Error::Ffmpeg(format!(
+            "spatial video needs an even per-eye frame, got {eye_w}×{eye_h}")));
+    }
+    Ok(hfov_deg)
+}
+
+/// The MV-HEVC encoder of a spatial video export writing its video-only
+/// movie to `video_out`; `None` for every other export (the caller then
+/// opens the ffmpeg encoder as usual).
+fn open_spatial_encoder(
+    cfg: &FisheyeExportConfig,
+    video_out: &std::path::Path,
+) -> Result<Option<ExportEncoder>> {
+    let Some(spatial) = cfg.spatial else { return Ok(None) };
+    #[cfg(target_os = "macos")]
+    {
+        let hfov_deg = spatial_frame_hfov(cfg.projection, cfg.eye_w, cfg.eye_h)?;
+        let enc = crate::mvhevc::MvHevcEncoder::create(video_out, &crate::mvhevc::MvHevcParams {
+            eye_w: cfg.eye_w,
+            eye_h: cfg.eye_h,
+            fps: cfg.fps,
+            bitrate_kbps: cfg.bitrate_kbps,
+            hfov_deg,
+            baseline_mm: spatial.baseline_mm,
+            disparity: spatial.disparity,
+        })?;
+        Ok(Some(ExportEncoder::MvHevc(enc)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (spatial, video_out);
+        Err(Error::Ffmpeg("spatial video (MV-HEVC) export is macOS-only".into()))
+    }
 }
 
 /// Open the H.265 encoder, transparently falling back from the NVIDIA
@@ -647,6 +733,9 @@ fn finalize_with_audio(
 /// stereo passthrough; the `.360` ambisonic + APAC formats need post-encode
 /// steps (SA3D atom / APAC re-encode) so they keep the temp+finalize path.
 fn one_pass_audio_eligible(cfg: &FisheyeExportConfig) -> bool {
+    // A spatial video's movie is written by the MV-HEVC helper, video-only:
+    // its audio is always muxed on afterwards.
+    if cfg.spatial.is_some() { return false; }
     match cfg.source_kind {
         // Sources with a 4-channel spatial track: SA3D / APAC need the
         // post-encode steps; their Stereo export muxes inline (the X6's
@@ -1046,6 +1135,7 @@ pub fn export_fisheye(
         cfg.inject_apmp = false;
         cfg.inject_youtube_vr180 = false;
     }
+    prepare_spatial(&mut cfg)?;
     export_fisheye_inner(pipeline, cfg, progress_cb, cancel)
 }
 
@@ -1457,7 +1547,12 @@ fn export_fisheye_inner(
     let one_pass = one_pass_audio_eligible(&cfg);
     let video_tmp = if one_pass { cfg.output_path.clone() }
                     else { video_only_temp_path(&cfg.output_path) };
-    let mut encoder = if use_zero_copy_bgra {
+    // A spatial video export: the MV-HEVC encoder takes the composed P010
+    // surfaces instead (`prepare_spatial` pinned VideoToolbox + 10-bit, so
+    // the loop below runs its zero-copy P010 branch).
+    let spatial_encoder = open_spatial_encoder(&cfg, &video_tmp)?;
+    let mut encoder: ExportEncoder = if let Some(enc) = spatial_encoder { enc } else {
+    let ffmpeg_encoder: H265Encoder = if use_zero_copy_bgra {
         // macOS/VideoToolbox-only zero-copy BGRA path. `use_zero_copy_bgra`
         // is always `false` on non-macOS targets, so this arm is dead there
         // — gate the VT-only ctor and supply `unreachable!()` where the
@@ -1511,6 +1606,8 @@ fn export_fisheye_inner(
             cfg.encoder, cfg.bit_depth, cfg.prores_profile,
         )?
     };
+    ExportEncoder::Ffmpeg(ffmpeg_encoder)
+    };
     // Tag the file as VR180 SBS so VLC / Quest / Vision Pro pick up
     // the stereo layout. Best-effort — older ffmpeg builds may not
     // expose the side-data field.
@@ -1521,7 +1618,9 @@ fn export_fisheye_inner(
     // VR180 and conflicts between the two metadata flavours have to
     // be resolved by stripping anyway. Keep the codecpar header
     // unmodified here.
-    if use_zero_copy_p010 {
+    if cfg.spatial.is_some() {
+        tracing::info!("fisheye_export: P010 IOSurface → MV-HEVC (spatial video)");
+    } else if use_zero_copy_p010 {
         tracing::info!("fisheye_export: zero-copy P010 IOSurface → VT (Main10)");
     } else if use_zero_copy_bgra {
         tracing::info!("fisheye_export: zero-copy BGRA IOSurface → VT (Main)");
@@ -1925,6 +2024,7 @@ pub fn export_eac(
         cfg.inject_apmp = false;
         cfg.inject_youtube_vr180 = false;
     }
+    prepare_spatial(&mut cfg)?;
     export_eac_inner(pipeline, cfg, per_eye, progress_cb, cancel)
 }
 
@@ -2290,15 +2390,19 @@ fn export_eac_zerocopy_vt(
 
     let is_prores_vt = matches!(cfg.encoder, EncoderBackend::ProResVideoToolbox);
     let ten_bit = cfg.bit_depth == 10 || is_prores_vt;
-    let mut encoder = if is_prores_vt {
+    // A spatial video export feeds the same P010 surfaces to the MV-HEVC
+    // encoder (`prepare_spatial` pinned 10-bit HEVC, so `ten_bit` holds).
+    let mut encoder: ExportEncoder = if let Some(enc) = open_spatial_encoder(&cfg, &video_tmp)? {
+        enc
+    } else if is_prores_vt {
         H265Encoder::create_zero_copy_vt_prores(
-            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.prores_profile)?
+            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.prores_profile)?.into()
     } else if ten_bit {
         H265Encoder::create_zero_copy_vt_p010(
-            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps)?
+            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps)?.into()
     } else {
         H265Encoder::create_zero_copy_vt(
-            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps)?
+            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps)?.into()
     };
     // Inline audio passthrough (must be attached before the first frame).
     // The audio window is clipped to the video's expected length: per_eye
@@ -2327,7 +2431,8 @@ fn export_eac_zerocopy_vt(
     } else { None };
     tracing::info!(
         "export_eac (zc): VT zero-copy ENGAGED — {} ({}x{}, trim {}..{}, audio {})",
-        if is_prores_vt { "ProRes-VT P210 (4:2:2)" } else if ten_bit { "HEVC Main10 P010" } else { "HEVC Main BGRA" },
+        if cfg.spatial.is_some() { "MV-HEVC Main10 P010 (spatial video)" }
+        else if is_prores_vt { "ProRes-VT P210 (4:2:2)" } else if ten_bit { "HEVC Main10 P010" } else { "HEVC Main BGRA" },
         sbs_w, sbs_h, trim_in_frame,
         trim_out_frame.map(|f| f.to_string()).unwrap_or_else(|| "end".into()),
         if one_pass { "one-pass inline" } else { "two-pass finalize" },
@@ -3030,18 +3135,22 @@ fn export_fisheye_osv_zerocopy_p010(
     // `ten_bit` keeps the P010 encode-buffer branch in the frame loop.
     let is_prores = cfg.encoder == EncoderBackend::ProResVideoToolbox;
     let ten_bit = cfg.bit_depth == 10 || is_prores;
-    let mut encoder = if is_prores {
+    // A spatial video export feeds the same P010 surfaces to the MV-HEVC
+    // encoder (`prepare_spatial` pinned 10-bit HEVC, so `ten_bit` holds).
+    let mut encoder: ExportEncoder = if let Some(enc) = open_spatial_encoder(&cfg, &enc_out)? {
+        enc
+    } else if is_prores {
         H265Encoder::create_zero_copy_vt_prores(
             &enc_out, sbs_w, sbs_h, cfg.fps, cfg.prores_profile,
-        )?
+        )?.into()
     } else if ten_bit {
         H265Encoder::create_zero_copy_vt_p010(
             &enc_out, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
-        )?
+        )?.into()
     } else {
         H265Encoder::create_zero_copy_vt(
             &enc_out, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
-        )?
+        )?.into()
     };
     // Inline audio passthrough (must be attached before the first frame).
     let one_pass_audio_tmp = if one_pass {
@@ -3075,7 +3184,8 @@ fn export_fisheye_osv_zerocopy_p010(
     tracing::info!(
         "fisheye_export (zero-copy): P010 IOSurface decode → {} encode, \
          no CPU bounce on the decode side; per-row RS = {}",
-        if is_prores { "P210 IOSurface (4:2:2) → ProRes-VT (HW)" }
+        if cfg.spatial.is_some() { "P010 IOSurface → MV-HEVC (spatial video)" }
+        else if is_prores { "P210 IOSurface (4:2:2) → ProRes-VT (HW)" }
         else if cfg.bit_depth == 10 { "P010 IOSurface (Main10)" }
         else { "BGRA IOSurface (Main, 8-bit)" },
         if rs_enabled { format!("on (readout {:.1}ms)", readout_s * 1000.0) }
@@ -4647,4 +4757,25 @@ fn apply_color_stack_rgb8_sbs(
         out[o + half..o + row].copy_from_slice(&r[y * half..(y + 1) * half]);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod spatial_tests {
+    use super::{spatial_frame_hfov, FisheyeExportProjection};
+
+    #[test]
+    fn spatial_video_is_a_rectilinear_reframed_view() {
+        let flat = FisheyeExportProjection::Reframe { hfov_deg: 92.5, defish: 0.0 };
+        // The declared field of view is the viewport's own, square or 16:9.
+        assert_eq!(spatial_frame_hfov(flat, 2160, 2160).unwrap(), 92.5);
+        assert_eq!(spatial_frame_hfov(flat, 3840, 2160).unwrap(), 92.5);
+        // Not rectilinear, not reframed, or a frame 4:2:0 cannot split: refused.
+        let defished = FisheyeExportProjection::Reframe { hfov_deg: 92.5, defish: 0.3 };
+        assert!(spatial_frame_hfov(defished, 2160, 2160).is_err());
+        assert!(spatial_frame_hfov(FisheyeExportProjection::HalfEquirect, 4096, 4096).is_err());
+        assert!(spatial_frame_hfov(FisheyeExportProjection::Fisheye, 4096, 4096).is_err());
+        assert!(spatial_frame_hfov(flat, 1081, 1080).is_err());
+        assert!(spatial_frame_hfov(flat, 1080, 1081).is_err());
+        assert!(spatial_frame_hfov(flat, 0, 1080).is_err());
+    }
 }

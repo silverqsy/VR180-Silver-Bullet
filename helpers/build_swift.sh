@@ -31,10 +31,20 @@ HELPERS=(mvhevc_encode vt_denoise apac_encode)
 
 frameworks_for() {
     case "$1" in
-        mvhevc_encode) echo AVFoundation VideoToolbox CoreMedia CoreVideo Accelerate ;;
+        mvhevc_encode) echo AVFoundation VideoToolbox CoreMedia CoreVideo ;;
         vt_denoise)    echo AVFoundation VideoToolbox CoreMedia CoreVideo ;;
         apac_encode)   echo AVFoundation CoreMedia AudioToolbox ;;
         *) echo "unknown helper: $1" >&2; return 1 ;;
+    esac
+}
+
+# Oldest macOS a helper must start on. A helper without one is built for the
+# build machine's own macOS: its `#available` checks compile away and symbols
+# newer than the user's system are bound at launch, so it cannot start there.
+min_macos_for() {
+    case "$1" in
+        mvhevc_encode) echo 14.0 ;;
+        *) echo "" ;;
     esac
 }
 
@@ -54,8 +64,13 @@ build_helper() {
     printf 'let HELPER_SOURCE_HASH = "%s"\n' "$hash" > "$tmp/version.swift"
     local fw_args=()
     for fw in $(frameworks_for "$name"); do fw_args+=("-framework" "$fw"); done
+    local target_args=()
+    local min_macos; min_macos="$(min_macos_for "$name")"
+    [[ -n "$min_macos" ]] && target_args=(-target "$(uname -m)-apple-macosx$min_macos")
     echo "→ building $name ($hash)"
-    swiftc -O -D HELPER_VERSION_EMBEDDED -o "$out" "$tmp/main.swift" "$tmp/version.swift" "${fw_args[@]}"
+    # (`${a[@]+…}`: an empty array is "unbound" to the system bash 3.2 under `set -u`.)
+    swiftc -O -D HELPER_VERSION_EMBEDDED ${target_args[@]+"${target_args[@]}"} \
+        -o "$out" "$tmp/main.swift" "$tmp/version.swift" "${fw_args[@]}"
     local reported; reported="$("$out" --version | awk '{print $2}')"
     [[ "$reported" == "$hash" ]] || { echo "✗ $name reports $reported, expected $hash" >&2; return 1; }
     echo "  ✓ $out"

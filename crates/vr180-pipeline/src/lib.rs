@@ -47,6 +47,11 @@ pub use interop_macos::{
 #[cfg(target_os = "macos")]
 pub mod vt_denoise;
 
+// MV-HEVC spatial video encode through the bundled `mvhevc_encode` helper
+// (VideoToolbox). macOS-only; `encode::ExportEncoder` carries the gated arm.
+#[cfg(target_os = "macos")]
+pub mod mvhevc;
+
 #[cfg(target_os = "windows")]
 pub mod interop_windows;
 

@@ -69,6 +69,39 @@ own rolling-shutter time.
   (about 10 fps on an M5 Max); it is beyond HEVC Level 6.2, so most players
   will not decode it, and ProRes at this size uses the software encoder.
 
+### Spatial video export (macOS)
+
+The reframed (Flat 3D) view can be exported as an **Apple spatial video**:
+choose **Spatial video (MV-HEVC)** under Codec in the export format. The
+two eyes go into one MV-HEVC Main10 stream in a `.mov`, with the metadata
+that makes a Vision Pro show it as a spatial video (the soft-edged window,
+the immersive view) instead of a flat 3D one. Other players show the left
+eye in 2D.
+
+- **The field of view written is the view you framed**: the reframed
+  view's own horizontal angle, at 1:1 or 16:9, up to 3840 × 2160 per eye. A
+  Crop-mode clip becomes a spatial video camera whose field of view you
+  choose afterwards.
+- **Camera baseline** (the same value the VR180 metadata uses, 65 mm by
+  default) and **Disparity adjustment** (2 % by default: the far background
+  sits just behind the window) are in the export format.
+- **One encode, from the rendered frames.** The frame the GPU composed for
+  the encoder is what the MV-HEVC encoder gets — no side-by-side
+  intermediate, no second generation. Stabilization, colour, trims and the
+  audio formats (stereo, ambisonic, APAC) work as in any other export.
+- **A spatial video is rectilinear**, so the option needs Defish at 0. With
+  Defish above 0, or on a VR180 frame, a clip in the queue exports as H.265
+  side by side instead; the Codec choice stays for the clips that can use
+  it.
+- Measured on an M5 Max from a 7.4K Crop clip (59.94 fps, stabilized):
+  2160 × 2160 per eye at 46 fps, 3840 × 2160 per eye at 32 fps.
+- Checked with the system's own tests on macOS 27: the files read as
+  spatial video to AVFoundation and to Photos, and VideoToolbox decodes both
+  eyes of every frame. A side-by-side file with the same metadata does not
+  qualify, on the Mac or in the headset, which is why this is MV-HEVC.
+- Needs macOS 14.4 or later. Not on Windows: there is no MV-HEVC encoder
+  there.
+
 ### File info: bit rate
 
 The file info (Source panel) and the clip header show the video bit rate

@@ -61,6 +61,8 @@ Studio).
   Windows). Audio is muxed inline — stereo, ambisonic, or APAC spatial on
   macOS. Multi-segment recordings join frame-exact. Optional BeyondVR hack
   for headset clarity.
+- **Spatial video** (macOS): export the reframed view as an Apple spatial
+  video — MV-HEVC with the field of view you framed — for Vision Pro.
 - **Batch**: load many clips, tune each (or apply one setup to all), and
   export from one queue with progress, ETA and a completion notification.
 - **English / 简体中文**, live toggle.

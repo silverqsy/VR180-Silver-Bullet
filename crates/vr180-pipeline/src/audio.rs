@@ -1372,6 +1372,16 @@ pub fn mux_video_with_audio_stream(
             .map_err(|e| Error::Ffmpeg(format!("add video stream: {e}")))?;
         s.set_parameters(v_src_params);
         s.set_time_base(v_src_tb);
+        // An MV-HEVC stream (a spatial video) keeps its second view's
+        // parameter sets in an `lhvC` box, and the MOV muxer writes that
+        // box only for a stream flagged multilayer. Carry the flag over,
+        // or the copy loses the box and the second view no longer decodes.
+        // (Only that flag: every other export stays byte-for-byte as it was.)
+        unsafe {
+            let src_disposition = (*v_in.stream(v_idx).unwrap().as_ptr()).disposition;
+            (*s.as_mut_ptr()).disposition |=
+                src_disposition & ffmpeg::ffi::AV_DISPOSITION_MULTILAYER as i32;
+        }
         s.index()
     };
 

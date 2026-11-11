@@ -1353,6 +1353,91 @@ impl H265Encoder {
     }
 }
 
+/// What an export loop feeds its frames to: the ffmpeg encoder, or — for a
+/// spatial video export, macOS only — the MV-HEVC helper
+/// ([`crate::mvhevc::MvHevcEncoder`]). The methods are the ones the loops
+/// that can run a spatial export call, forwarded.
+pub enum ExportEncoder {
+    Ffmpeg(H265Encoder),
+    #[cfg(target_os = "macos")]
+    MvHevc(crate::mvhevc::MvHevcEncoder),
+}
+
+impl From<H265Encoder> for ExportEncoder {
+    fn from(e: H265Encoder) -> Self { Self::Ffmpeg(e) }
+}
+
+/// The MV-HEVC encoder takes the composed P010 surface only: a spatial
+/// export always renders through the zero-copy encode branch.
+#[cfg(target_os = "macos")]
+fn mvhevc_wrong_feed(what: &str) -> Error {
+    Error::Ffmpeg(format!("the MV-HEVC encoder takes P010 surfaces only ({what} was offered)"))
+}
+
+impl ExportEncoder {
+    /// See [`H265Encoder::attach_audio_passthrough`]. The MV-HEVC movie is
+    /// video-only; its audio is muxed on afterwards.
+    pub fn attach_audio_passthrough(
+        &mut self,
+        audio_src: &std::path::Path,
+        offset_s: f64,
+        dur_s: f64,
+    ) -> Result<bool> {
+        match self {
+            Self::Ffmpeg(e) => e.attach_audio_passthrough(audio_src, offset_s, dur_s),
+            #[cfg(target_os = "macos")]
+            Self::MvHevc(_) => Err(mvhevc_wrong_feed("inline audio")),
+        }
+    }
+
+    pub fn encode_frame(&mut self, rgb8: &[u8]) -> Result<()> {
+        match self {
+            Self::Ffmpeg(e) => e.encode_frame(rgb8),
+            #[cfg(target_os = "macos")]
+            Self::MvHevc(_) => Err(mvhevc_wrong_feed("an RGB8 frame")),
+        }
+    }
+
+    pub fn encode_frame_rgb48(&mut self, rgb48le: &[u8]) -> Result<()> {
+        match self {
+            Self::Ffmpeg(e) => e.encode_frame_rgb48(rgb48le),
+            #[cfg(target_os = "macos")]
+            Self::MvHevc(_) => Err(mvhevc_wrong_feed("an RGB48 frame")),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn encode_pixel_buffer(
+        &mut self,
+        pb: &crate::interop_macos::EncodePixelBuffer,
+    ) -> Result<()> {
+        match self {
+            Self::Ffmpeg(e) => e.encode_pixel_buffer(pb),
+            Self::MvHevc(_) => Err(mvhevc_wrong_feed("a BGRA surface")),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn encode_pixel_buffer_p010(
+        &mut self,
+        pb: &crate::interop_macos::EncodePixelBufferP010,
+    ) -> Result<()> {
+        match self {
+            Self::Ffmpeg(e) => e.encode_pixel_buffer_p010(pb),
+            Self::MvHevc(e) => e.encode_pixel_buffer_p010(pb),
+        }
+    }
+
+    /// Flush and close the output.
+    pub fn finish(self) -> Result<()> {
+        match self {
+            Self::Ffmpeg(e) => e.finish(),
+            #[cfg(target_os = "macos")]
+            Self::MvHevc(e) => e.finish(),
+        }
+    }
+}
+
 // ===== Phase 0.8.6: AVSphericalMapping (re-declared) =====
 //
 // `AVSphericalMapping` is defined in `libavutil/spherical.h` but
@@ -1863,7 +1948,7 @@ unsafe fn set_opt(
 
 /// Approximate an f32 fps as a rational (num/den).
 /// 29.97 → 30000/1001, 59.94 → 60000/1001, integer fps → fps/1.
-fn approx_rational(fps: f32) -> (i32, i32) {
+pub(crate) fn approx_rational(fps: f32) -> (i32, i32) {
     let candidates = [
         (24000, 1001), (24, 1),
         (25, 1),

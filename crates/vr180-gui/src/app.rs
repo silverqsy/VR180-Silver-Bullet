@@ -329,9 +329,23 @@ pub struct App {
     suppress_reseed_once: bool,
 }
 
-/// Codec choice for the export pipeline.
+/// Codec choice for the export pipeline. `Spatial` is Apple spatial video:
+/// the two eyes of a reframed view as one MV-HEVC stream with the spatial
+/// metadata. It exists only where [`spatial_video_available`] says so; any
+/// other export it is selected for runs as `H265`
+/// ([`ExportOptions::codec_for`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExportCodec { H265, ProRes }
+enum ExportCodec { H265, ProRes, Spatial }
+
+/// Whether a clip with these settings can be exported as spatial video:
+/// macOS (the MV-HEVC encoder is VideoToolbox's), the reframed view (a flat
+/// frame with a known field of view), and Defish at 0 (a spatial video is
+/// rectilinear).
+fn spatial_video_available(settings: &crate::decoder::Settings) -> bool {
+    cfg!(target_os = "macos")
+        && settings.reframe_aspect_if_active().is_some()
+        && settings.reframe_defish.abs() < 0.005
+}
 
 /// Output container for a STILL source (Insta360 X6 `.dng`). Videos
 /// use `ExportCodec`; stills use this.
@@ -448,6 +462,7 @@ impl ExportCodec {
         match self {
             ExportCodec::H265 => "H.265 (HEVC)",
             ExportCodec::ProRes => "ProRes",
+            ExportCodec::Spatial => tr("Spatial video (MV-HEVC)"),
         }
     }
 }
@@ -513,8 +528,12 @@ struct ExportOptions {
     inject_youtube: bool,
     /// Reframed exports: per-eye size (the aspect comes from the clip).
     reframe_size: ReframeSize,
-    /// Camera baseline in mm for APMP `cams/blin`. Typical 60..=70.
+    /// Camera baseline in mm: APMP `cams/blin`, and a spatial video's
+    /// baseline. Typical 60..=70.
     apmp_baseline_mm: f32,
+    /// Spatial video: horizontal disparity adjustment in percent of the
+    /// frame width. Positive moves the whole scene away from the viewer.
+    spatial_disparity_pct: f32,
     /// "BeyondVR Hack": at the final output stage, scale each eye of the
     /// SBS half-equirect frame about its own half-center, padding the
     /// border with black. No-op for fisheye output and in preview.
@@ -587,6 +606,85 @@ mod export_size_tests {
 }
 
 #[cfg(test)]
+mod spatial_export_tests {
+    use super::{App, ExportCodec, ExportOptions, ReframeSize};
+    use crate::decoder::{FisheyeOutputMode, ReframeAspect, Settings};
+    use vr180_pipeline::fisheye_export::FisheyeExportProjection;
+
+    fn reframed(aspect: ReframeAspect, hfov_deg: f32, defish: f32) -> Settings {
+        Settings {
+            fisheye_output_mode: FisheyeOutputMode::Reframe,
+            reframe_aspect: aspect,
+            reframe_hfov_deg: hfov_deg,
+            reframe_defish: defish,
+            ..Default::default()
+        }
+    }
+
+    fn cfg(settings: &Settings, opts: &ExportOptions, kind: vr180_pipeline::SourceKind)
+        -> vr180_pipeline::fisheye_export::FisheyeExportConfig
+    {
+        App::build_export_cfg(
+            std::path::Path::new("/nonexistent/in.insv"), std::path::Path::new("/nonexistent/out.mov"),
+            59.94, kind, 3712, 3712, 3712, 3712, None, settings, opts, Vec::new(),
+        )
+    }
+
+    #[test]
+    fn spatial_video_is_a_flat_rectilinear_export_on_macos() {
+        let opts = ExportOptions {
+            codec: ExportCodec::Spatial,
+            reframe_size: ReframeSize::P2160,
+            h265_bit_depth: 8,
+            apmp_baseline_mm: 63.0,
+            spatial_disparity_pct: 2.5,
+            ..Default::default()
+        };
+        let insv = vr180_pipeline::SourceKind::Insta360Insv;
+        let on_mac = cfg!(target_os = "macos");
+
+        // The reframed view, rectilinear: a spatial video (where the encoder exists).
+        let flat = reframed(ReframeAspect::Wide, 96.0, 0.0);
+        assert_eq!(opts.codec_for(&flat, false), if on_mac { ExportCodec::Spatial } else { ExportCodec::H265 });
+        let c = cfg(&flat, &opts, insv);
+        assert_eq!((c.eye_w, c.eye_h), (3840, 2160));
+        assert_eq!(c.projection, FisheyeExportProjection::Reframe { hfov_deg: 96.0, defish: 0.0 });
+        assert_eq!(c.spatial.is_some(), on_mac);
+        if let Some(sp) = c.spatial {
+            assert_eq!(sp.baseline_mm, 63.0);
+            assert!((sp.disparity - 0.025).abs() < 1e-6);
+            // Always Main10, whatever the H.265 depth choice says.
+            assert_eq!(c.bit_depth, 10);
+        }
+
+        // Anything else the choice is left on exports as H.265 side by side:
+        // a defished view, a VR180 frame, a still.
+        for settings in [reframed(ReframeAspect::Square, 96.0, 0.3), Settings::default()] {
+            assert_eq!(opts.codec_for(&settings, false), ExportCodec::H265);
+            let c = cfg(&settings, &opts, insv);
+            assert!(c.spatial.is_none());
+            assert_eq!(c.bit_depth, 8);
+        }
+        assert_eq!(opts.codec_for(&flat, true), ExportCodec::H265);
+
+        // H.265 and ProRes never turn into a spatial video.
+        for codec in [ExportCodec::H265, ExportCodec::ProRes] {
+            let o = ExportOptions { codec, ..opts };
+            assert_eq!(o.codec_for(&flat, false), codec);
+            assert!(cfg(&flat, &o, insv).spatial.is_none());
+        }
+    }
+
+    #[test]
+    fn spatial_video_gets_its_own_file_name() {
+        let src = std::path::Path::new("/clips/VID_0005.insv");
+        assert_eq!(App::default_output_for(src, ExportCodec::H265), std::path::Path::new("/clips/VID_0005_SBS.mp4"));
+        assert_eq!(App::default_output_for(src, ExportCodec::ProRes), std::path::Path::new("/clips/VID_0005_SBS.mov"));
+        assert_eq!(App::default_output_for(src, ExportCodec::Spatial), std::path::Path::new("/clips/VID_0005_Spatial.mov"));
+    }
+}
+
+#[cfg(test)]
 mod reframe_bitrate_tests {
     use super::ReframeSize;
     use crate::decoder::ReframeAspect;
@@ -618,6 +716,17 @@ mod reframe_bitrate_tests {
 }
 
 impl ExportOptions {
+    /// The codec an export of a clip with `settings` really uses: spatial
+    /// video only where it exists ([`spatial_video_available`], and never
+    /// for a still); everywhere else that choice runs as H.265. The choice
+    /// itself stays put, so a batch of mixed clips exports each as it can.
+    fn codec_for(&self, settings: &crate::decoder::Settings, is_still: bool) -> ExportCodec {
+        match self.codec {
+            ExportCodec::Spatial if is_still || !spatial_video_available(settings) => ExportCodec::H265,
+            c => c,
+        }
+    }
+
     /// The H.265 rate an export actually uses: the VR180 slider value, or
     /// in Reframed mode the reframed rate — the recommendation for this
     /// size / aspect / `fps` unless the user pinned a custom value.
@@ -647,6 +756,9 @@ impl Default for ExportOptions {
             inject_apmp: true,
             inject_youtube: false,
             apmp_baseline_mm: 65.0,
+            // Apple's own default: what the lenses saw at infinity lands a
+            // little behind the window instead of on its surface.
+            spatial_disparity_pct: 2.0,
             reframe_size: ReframeSize::P1080,
             beyondvr_hack: false,
             beyondvr_scale_pct: 85.0,
@@ -844,6 +956,17 @@ fn tr(en: &'static str) -> &'static str {
         "ProRes profile" => "ProRes 配置",
         "VR180 metadata" => "VR180 元数据",
         "H.265 bitrate" => "H.265 码率",
+        "Spatial video (MV-HEVC)" => "空间视频 (MV-HEVC)",
+        "per eye" => "每眼",
+        "Bitrate (both eyes)" => "码率（双眼合计）",
+        "Field of view written" => "写入的水平视角",
+        "Disparity adjustment" => "视差调整",
+        "Disparity adjustment moves the whole scene away from you (positive) or towards you. 2 % keeps the far background just behind the window."
+            => "视差调整把整个场景推远（正值）或拉近。2 % 可让远处背景刚好落在窗口后面。",
+        "A spatial video must be rectilinear: with Defish above 0 this clip exports as H.265 side by side instead. Set Defish to 0 in the reframed view."
+            => "空间视频必须是直线透视：去鱼眼大于 0 时，这个片段会改为导出 H.265 左右并排。请在重新取景视图里把去鱼眼设为 0。",
+        "Plays as a spatial video on Apple Vision Pro; other players show the left eye in 2D."
+            => "在 Apple Vision Pro 上按空间视频播放；其他播放器以 2D 显示左眼。",
         "Recommended" => "推荐",
         "Use recommended" => "使用推荐值",
         "Encoder" => "编码器",
@@ -1742,17 +1865,19 @@ impl App {
         Some((done_frames, total_frames, eta, item_pos + 1, self.batch_run_indices.len()))
     }
 
-    /// `<source_stem>_SBS.<ext-for-codec>` next to the source.
+    /// `<source_stem>_SBS.<ext-for-codec>` next to the source; a spatial
+    /// video (one stream, not a side-by-side frame) is `<stem>_Spatial.mov`.
     fn default_output_for(source: &std::path::Path, codec: ExportCodec) -> PathBuf {
         let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
-        let ext = match codec {
-            ExportCodec::H265 => "mp4",
-            ExportCodec::ProRes => "mov", // ProRes is conventional in MOV
+        let (tag, ext) = match codec {
+            ExportCodec::H265 => ("SBS", "mp4"),
+            ExportCodec::ProRes => ("SBS", "mov"), // ProRes is conventional in MOV
+            ExportCodec::Spatial => ("Spatial", "mov"), // Apple's movie profile
         };
         source.parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-            .join(format!("{stem}_SBS.{ext}"))
+            .join(format!("{stem}_{tag}.{ext}"))
     }
 
     /// `<source_stem>_SBS.<png|jpg|dng>` next to the source (stills).
@@ -1789,9 +1914,11 @@ impl App {
         // the options; either way `open_h265_encoder` falls back to libx265
         // if NVENC can't be opened. macOS always uses VideoToolbox.
         use vr180_pipeline::encode::EncoderBackend;
-        let backend = match (opts.codec, cfg!(target_os = "macos")) {
-            (ExportCodec::H265, true) => EncoderBackend::VideoToolbox,
-            (ExportCodec::H265, false) =>
+        // Spatial video where this clip can be one; H.265 where it cannot.
+        let codec = opts.codec_for(settings, source_kind.is_still());
+        let backend = match (codec, cfg!(target_os = "macos")) {
+            (ExportCodec::H265 | ExportCodec::Spatial, true) => EncoderBackend::VideoToolbox,
+            (ExportCodec::H265 | ExportCodec::Spatial, false) =>
                 if opts.h265_hardware {
                     EncoderBackend::HevcNvenc
                 } else {
@@ -1881,14 +2008,15 @@ impl App {
         // Bitrate / bit-depth come from the options window. ProRes
         // ignores the bitrate field (the profile picks the rate)
         // and is always 10-bit / 12-bit per profile.
-        let (bitrate_kbps, bit_depth) = match opts.codec {
-            ExportCodec::H265 => (
+        let (bitrate_kbps, bit_depth) = match codec {
+            ExportCodec::H265 | ExportCodec::Spatial => (
                 // Reframed exports take the (much lower) reframed rate,
                 // recommended per clip from its size / aspect / fps unless
                 // the user pinned one; VR180 takes the VR180 slider.
                 opts.effective_h265_mbps(settings.reframe_aspect_if_active(), fps)
                     .saturating_mul(1000),
-                opts.h265_bit_depth,
+                // A spatial video is always Main10.
+                if codec == ExportCodec::Spatial { 10 } else { opts.h265_bit_depth },
             ),
             ExportCodec::ProRes => {
                 // The encoder ignores bitrate for ProRes but the config
@@ -1932,6 +2060,10 @@ impl App {
             inject_apmp: opts.inject_apmp,
             inject_youtube_vr180: opts.inject_youtube,
             apmp_baseline_mm: opts.apmp_baseline_mm,
+            spatial: (codec == ExportCodec::Spatial).then(|| vr180_pipeline::fisheye_export::SpatialVideo {
+                baseline_mm: opts.apmp_baseline_mm,
+                disparity: opts.spatial_disparity_pct / 100.0,
+            }),
             stabilize: settings.stabilize,
             // Camera lock drives the pipeline's frame-0 lock via smooth_ms=0 and
             // drops the correction cap (0 → ∞ at the export sites): fully locked
@@ -2667,7 +2799,7 @@ impl App {
         let mut out = if item.source_kind.is_still() {
             Self::default_still_output_for(&item.path, opts.still_format)
         } else {
-            Self::default_output_for(&item.path, opts.codec)
+            Self::default_output_for(&item.path, opts.codec_for(&item.settings, false))
         };
         if let Some(dir) = &self.batch_out_dir {
             if let Some(name) = out.file_name() {
@@ -4269,16 +4401,30 @@ impl App {
         };
         let h265_mbps = self.export_opts.effective_h265_mbps(
             self.settings.reframe_aspect_if_active(), clip_fps);
+        // What this clip would really export as (spatial video only where
+        // it can be one).
+        let bar_codec = self.export_opts.codec_for(&self.settings, is_still);
+        // A spatial video is one stream of the eye's own size, not a
+        // side-by-side frame: label it by the eye.
+        let res_label = match (bar_codec, self.settings.reframe_aspect_if_active()) {
+            (ExportCodec::Spatial, Some(aspect)) => {
+                let (w, h) = self.export_opts.reframe_size.eye_dims(aspect);
+                format!("{w} × {h} {}", tr("per eye"))
+            }
+            _ => res_label,
+        };
         let fmt_label = if is_still {
             // A still has no codec / bitrate: container + size only.
             format!("{} · {}", self.export_opts.still_format.label(), res_label)
         } else { format!("{} · {}{}{}",
-            self.export_opts.codec.label(),
+            bar_codec.label(),
             res_label,
-            match self.export_opts.codec {
+            match bar_codec {
                 ExportCodec::H265 => format!(" · {} Mbps · {}-bit",
                     h265_mbps, self.export_opts.h265_bit_depth),
                 ExportCodec::ProRes => format!(" · {}", self.export_opts.prores_profile.label()),
+                ExportCodec::Spatial => format!(" · {} Mbps · {:.0}°",
+                    h265_mbps, self.settings.reframe_hfov_deg),
             },
             if self.export_opts.beyondvr_hack && self.settings.reframe_aspect_if_active().is_none() {
                 format!(" · BeyondVR {:.0}%", self.export_opts.beyondvr_scale_pct)
@@ -4431,7 +4577,9 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_min_width(360.0);
                     Self::export_options_ui(ui, &mut self.export_opts, "export",
-                        self.settings.reframe_aspect_if_active(), clip_fps, is_still, native_dims, sharp_dims);
+                        self.settings.reframe_aspect_if_active(),
+                        (self.settings.reframe_hfov_deg, self.settings.reframe_defish),
+                        clip_fps, is_still, native_dims, sharp_dims);
                 });
             self.show_export_settings = open;
         }
@@ -4440,14 +4588,28 @@ impl App {
     /// The export-output controls (resolution / codec / codec-specific /
     /// VR180 metadata) shown in the export bar's Format dropdown. `id_prefix`
     /// keeps the ComboBox ids distinct.
+    /// `reframe_view` = the reframed view's `(horizontal FOV °, Defish)`,
+    /// read only while `reframe` is `Some` (the spatial video controls).
+    #[allow(clippy::too_many_arguments)]
     fn export_options_ui(
         ui: &mut egui::Ui, opts: &mut ExportOptions, id_prefix: &str,
         reframe: Option<crate::decoder::ReframeAspect>,
+        reframe_view: (f32, f32),
         fps: f32,
         is_still: bool,
         native_dims: Option<(u32, u32)>,
         sharp_dims: Option<(u32, u32)>,
     ) {
+        // Spatial video is offered for the reframed view on macOS. Selected
+        // on a clip it does not exist for, the choice shows (and exports) as
+        // H.265 and stays put for the clips that can use it.
+        let spatial_offered = cfg!(target_os = "macos") && reframe.is_some() && !is_still;
+        let (reframe_hfov_deg, reframe_defish) = reframe_view;
+        let spatial_rectilinear = reframe_defish.abs() < 0.005;
+        let codec_shown = match opts.codec {
+            ExportCodec::Spatial if !spatial_offered => ExportCodec::H265,
+            c => c,
+        };
         if let Some(aspect) = reframe {
             // Reframed view: the exact viewport at a per-eye size.
             ui.label(RichText::new(tr("Per-eye size")).strong());
@@ -4460,8 +4622,10 @@ impl App {
                         ui.selectable_value(&mut opts.reframe_size, sz, sz.label(aspect));
                     }
                 });
-            ui.label(RichText::new(tr("Reframed output is not VR180 — no projection metadata is written."))
-                .small().color(Color32::GRAY));
+            if codec_shown != ExportCodec::Spatial {
+                ui.label(RichText::new(tr("Reframed output is not VR180 — no projection metadata is written."))
+                    .small().color(Color32::GRAY));
+            }
         } else {
             ui.label(RichText::new(tr("Resolution")).strong());
             // Native = the clip's own size (full resolution): 7680 × 3840 for
@@ -4511,9 +4675,9 @@ impl App {
             if !is_still {
                 if let Some((w, h)) = out_dims {
                     if w > 8192 || h > 4096 {
-                        ui.label(RichText::new(match opts.codec {
+                        ui.label(RichText::new(match codec_shown {
                             ExportCodec::ProRes => tr("Above 8192 × 4096 the Mac's hardware ProRes encoder refuses the frame — the software encoder takes over (several times slower)."),
-                            ExportCodec::H265 => tr("Above 8192 × 4096 the file exceeds HEVC Level 6.2 — it encodes in hardware, but most players cannot decode it."),
+                            ExportCodec::H265 | ExportCodec::Spatial => tr("Above 8192 × 4096 the file exceeds HEVC Level 6.2 — it encodes in hardware, but most players cannot decode it."),
                         }).small().color(Color32::GRAY));
                     }
                 }
@@ -4542,18 +4706,33 @@ impl App {
         }
 
         ui.label(RichText::new(tr("Codec")).strong());
+        let mut codec_pick = codec_shown;
         egui::ComboBox::from_id_source(format!("{id_prefix}_codec"))
-            .selected_text(opts.codec.label())
+            .selected_text(codec_shown.label())
             .width(220.0)
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut opts.codec, ExportCodec::H265,   ExportCodec::H265.label());
-                ui.selectable_value(&mut opts.codec, ExportCodec::ProRes, ExportCodec::ProRes.label());
+                ui.selectable_value(&mut codec_pick, ExportCodec::H265,   ExportCodec::H265.label());
+                ui.selectable_value(&mut codec_pick, ExportCodec::ProRes, ExportCodec::ProRes.label());
+                if spatial_offered {
+                    ui.selectable_value(&mut codec_pick, ExportCodec::Spatial, ExportCodec::Spatial.label());
+                }
             });
+        // Only an actual pick writes: showing H.265 for a clip that cannot
+        // be a spatial video must not drop the Spatial choice.
+        if codec_pick != codec_shown { opts.codec = codec_pick; }
+        let codec_shown = match opts.codec {
+            ExportCodec::Spatial if !spatial_offered => ExportCodec::H265,
+            c => c,
+        };
         ui.add_space(8.0);
 
-        match opts.codec {
-            ExportCodec::H265 => {
-                ui.label(RichText::new(tr("H.265 bitrate")).strong());
+        match codec_shown {
+            ExportCodec::H265 | ExportCodec::Spatial => {
+                ui.label(RichText::new(if codec_shown == ExportCodec::Spatial {
+                    tr("Bitrate (both eyes)")
+                } else {
+                    tr("H.265 bitrate")
+                }).strong());
                 if let Some(aspect) = reframe {
                     // Reframed: its own rate, seeded from the size / aspect /
                     // frame-rate recommendation until the user pins a value
@@ -4585,6 +4764,32 @@ impl App {
                         .text("Mbps"));
                 }
                 ui.add_space(4.0);
+                if codec_shown == ExportCodec::Spatial {
+                    // One MV-HEVC Main10 stream; the frame's own field of
+                    // view, the lens spacing and the disparity adjustment
+                    // are what makes a headset show it as a spatial video.
+                    ui.label(RichText::new(format!(
+                        "MV-HEVC Main10 · {}: {reframe_hfov_deg:.1}°", tr("Field of view written"),
+                    )).small().color(Color32::GRAY));
+                    ui.horizontal(|ui| {
+                        ui.label(tr("Camera baseline"));
+                        ui.add(egui::Slider::new(&mut opts.apmp_baseline_mm, 30.0..=120.0)
+                            .suffix(" mm").fixed_decimals(1));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(tr("Disparity adjustment"));
+                        ui.add(egui::Slider::new(&mut opts.spatial_disparity_pct, -5.0..=10.0)
+                            .suffix(" %").fixed_decimals(1).step_by(0.1));
+                    });
+                    ui.label(RichText::new(tr("Disparity adjustment moves the whole scene away from you (positive) or towards you. 2 % keeps the far background just behind the window."))
+                        .small().color(Color32::GRAY));
+                    if !spatial_rectilinear {
+                        ui.label(RichText::new(tr("A spatial video must be rectilinear: with Defish above 0 this clip exports as H.265 side by side instead. Set Defish to 0 in the reframed view."))
+                            .small().color(Color32::from_rgb(230, 160, 90)));
+                    }
+                    ui.label(RichText::new(tr("Plays as a spatial video on Apple Vision Pro; other players show the left eye in 2D."))
+                        .small().color(Color32::GRAY));
+                } else {
                 // 10-bit (Main10) is the default and stays 10-bit
                 // end-to-end; 8-bit (Main) is offered for users who
                 // need the wider-compatibility profile.
@@ -4607,6 +4812,7 @@ impl App {
                     } else {
                         "CPU HEVC — slow at VR180 resolutions, max software quality."
                     }).weak().size(11.0));
+                }
                 }
             }
             ExportCodec::ProRes => {

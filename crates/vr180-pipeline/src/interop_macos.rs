@@ -105,6 +105,7 @@ extern "C" {
     fn IOSurfaceLock(s: IOSurfaceRef, options: u32, seed: *mut u32) -> i32;
     fn IOSurfaceUnlock(s: IOSurfaceRef, options: u32, seed: *mut u32) -> i32;
     fn IOSurfaceGetBaseAddress(s: IOSurfaceRef) -> *mut c_void;
+    fn IOSurfaceGetBaseAddressOfPlane(s: IOSurfaceRef, plane: usize) -> *mut c_void;
     fn IOSurfaceGetWidth(s: IOSurfaceRef) -> usize;
     fn IOSurfaceGetHeight(s: IOSurfaceRef) -> usize;
     fn IOSurfaceGetBytesPerRow(s: IOSurfaceRef) -> usize;
@@ -166,6 +167,30 @@ impl RetainedIOSurface {
             IOSurfaceUnlock(self.as_raw(), READ_ONLY, std::ptr::null_mut());
         }
         out
+    }
+    /// Read one plane through the CPU: `f(bytes, bytes_per_row)` runs with the
+    /// surface locked for reading, `bytes` being the whole plane
+    /// (`bytes_per_row × rows`, row padding included). `None` when the
+    /// surface cannot be locked or has no such plane. The caller must have
+    /// let every GPU write to the surface finish first.
+    pub fn with_plane_bytes<R>(&self, plane: usize, f: impl FnOnce(&[u8], usize) -> R) -> Option<R> {
+        const READ_ONLY: u32 = 1;
+        if plane >= self.plane_count() { return None; }
+        unsafe {
+            if IOSurfaceLock(self.as_raw(), READ_ONLY, std::ptr::null_mut()) != 0 {
+                return None;
+            }
+            let base = IOSurfaceGetBaseAddressOfPlane(self.as_raw(), plane) as *const u8;
+            let stride = self.plane_bytes_per_row(plane);
+            let rows = self.plane_height(plane);
+            let out = if base.is_null() || stride == 0 || rows == 0 {
+                None
+            } else {
+                Some(f(std::slice::from_raw_parts(base, stride * rows), stride))
+            };
+            IOSurfaceUnlock(self.as_raw(), READ_ONLY, std::ptr::null_mut());
+            out
+        }
     }
     pub fn as_raw(&self) -> IOSurfaceRef { self.inner.as_ptr() }
     pub fn plane_count(&self) -> usize { unsafe { IOSurfaceGetPlaneCount(self.as_raw()) } }
