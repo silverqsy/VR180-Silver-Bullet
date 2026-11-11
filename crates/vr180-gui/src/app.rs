@@ -347,6 +347,62 @@ fn spatial_video_available(settings: &crate::decoder::Settings) -> bool {
         && settings.reframe_defish.abs() < 0.005
 }
 
+/// The widest and the tallest field of view at which Apple Vision Pro's
+/// immersive view shows a spatial video at life size. Checked on a headset
+/// (visionOS 27) with charts that differed only in the field of view written
+/// to the file: a 1:1 frame written as 80° and one written as 120° came out
+/// the same size, and so did 16:9 frames written as 90° and 120°.
+const SPATIAL_LIFE_SIZE_MAX_HFOV_DEG: f32 = 90.0;
+const SPATIAL_LIFE_SIZE_MAX_VFOV_DEG: f32 = 80.0;
+
+/// The widest horizontal field of view a rectilinear frame of this aspect
+/// keeps at life size: 90°, or less when its height reaches 80° first (a
+/// 1:1 frame: 80°).
+fn spatial_life_size_hfov_deg(aspect_w_over_h: f32) -> f32 {
+    let half_height = (SPATIAL_LIFE_SIZE_MAX_VFOV_DEG.to_radians() / 2.0).tan();
+    let by_height = 2.0 * (half_height * aspect_w_over_h).atan().to_degrees();
+    by_height.min(SPATIAL_LIFE_SIZE_MAX_HFOV_DEG)
+}
+
+/// What the headset's immersive view makes of a rectilinear spatial frame of
+/// `hfov_deg` and this aspect: `None` while the frame is inside the life-size
+/// limits, otherwise the `(horizontal, vertical)` field of view the whole
+/// frame is scaled down to. The frame keeps its shape, so the tighter of the
+/// two limits decides.
+fn spatial_view_shown_as(hfov_deg: f32, aspect_w_over_h: f32) -> Option<(f32, f32)> {
+    use vr180_pipeline::gpu::reframe_vfov_deg;
+    // Half of the tenth of a degree the panel prints: a frame that reads as
+    // 80.0° tall is at the limit, not past it.
+    const SLACK_DEG: f32 = 0.05;
+    let vfov_deg = reframe_vfov_deg(hfov_deg, 0.0, aspect_w_over_h);
+    if hfov_deg <= SPATIAL_LIFE_SIZE_MAX_HFOV_DEG + SLACK_DEG
+        && vfov_deg <= SPATIAL_LIFE_SIZE_MAX_VFOV_DEG + SLACK_DEG
+    {
+        return None;
+    }
+    let shown_hfov = spatial_life_size_hfov_deg(aspect_w_over_h);
+    Some((shown_hfov, reframe_vfov_deg(shown_hfov, 0.0, aspect_w_over_h)))
+}
+
+/// The export panel's note for a spatial video whose view is past the
+/// headset's limits. Placeholders: `{max_w}` / `{max_h}` the limits, `{view}`
+/// the frame's own field of view, `{shown}` what it is shown as, `{limit}`
+/// the widest Zoom that stays at life size.
+const SPATIAL_VIEW_SCALED_NOTE: &str = "In its immersive view Apple Vision Pro shows a spatial video at life size only up to {max_w}° wide and {max_h}° tall. This view ({view}) is scaled down to {shown}, so everything looks smaller. For life size, set Zoom to {limit}° or less.";
+
+/// [`SPATIAL_VIEW_SCALED_NOTE`] (or its translation) filled in for a view,
+/// `None` while the view is inside the limits.
+fn spatial_view_scaled_note(template: &str, hfov_deg: f32, aspect_w_over_h: f32) -> Option<String> {
+    let (shown_h, shown_v) = spatial_view_shown_as(hfov_deg, aspect_w_over_h)?;
+    let vfov_deg = vr180_pipeline::gpu::reframe_vfov_deg(hfov_deg, 0.0, aspect_w_over_h);
+    Some(template
+        .replace("{max_w}", &format!("{SPATIAL_LIFE_SIZE_MAX_HFOV_DEG:.0}"))
+        .replace("{max_h}", &format!("{SPATIAL_LIFE_SIZE_MAX_VFOV_DEG:.0}"))
+        .replace("{view}", &format!("{hfov_deg:.1}° × {vfov_deg:.1}°"))
+        .replace("{shown}", &format!("{shown_h:.1}° × {shown_v:.1}°"))
+        .replace("{limit}", &format!("{shown_h:.0}")))
+}
+
 /// Output container for a STILL source (Insta360 X6 `.dng`). Videos
 /// use `ExportCodec`; stills use this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -619,6 +675,7 @@ mod export_size_tests {
 #[cfg(test)]
 mod spatial_export_tests {
     use super::{App, ExportCodec, ExportOptions, ReframeSize};
+    use super::{spatial_life_size_hfov_deg, spatial_view_scaled_note, spatial_view_shown_as, tr_zh, SPATIAL_VIEW_SCALED_NOTE};
     use crate::decoder::{FisheyeOutputMode, ReframeAspect, Settings};
     use vr180_pipeline::fisheye_export::FisheyeExportProjection;
 
@@ -692,6 +749,106 @@ mod spatial_export_tests {
         assert_eq!(App::default_output_for(src, ExportCodec::H265), std::path::Path::new("/clips/VID_0005_SBS.mp4"));
         assert_eq!(App::default_output_for(src, ExportCodec::ProRes), std::path::Path::new("/clips/VID_0005_SBS.mov"));
         assert_eq!(App::default_output_for(src, ExportCodec::Spatial), std::path::Path::new("/clips/VID_0005_Spatial.mov"));
+    }
+
+    #[test]
+    fn a_view_past_the_headset_limits_is_shown_scaled_down() {
+        let near = |a: f32, b: f32| (a - b).abs() < 0.02;
+        let wide = 16.0 / 9.0;
+        // Inside both limits, and exactly at them: life size.
+        for (hfov, aspect) in [(60.0, 1.0), (80.0, 1.0), (70.0, wide), (86.0, wide), (90.0, wide)] {
+            assert_eq!(spatial_view_shown_as(hfov, aspect), None, "{hfov}° at {aspect}");
+        }
+        // 1:1: the height reaches 80° first, whatever the frame's own angle.
+        for hfov in [80.2, 90.0, 120.0, 150.0] {
+            let (h, v) = spatial_view_shown_as(hfov, 1.0).unwrap();
+            assert!(near(h, 80.0) && near(v, 80.0), "{hfov}°: {h} × {v}");
+        }
+        // 16:9: the width reaches 90° first; the height follows the shape.
+        for hfov in [90.2, 100.0, 120.0, 150.0] {
+            let (h, v) = spatial_view_shown_as(hfov, wide).unwrap();
+            assert!(near(h, 90.0) && near(v, 58.72), "{hfov}°: {h} × {v}");
+        }
+        assert!(near(spatial_life_size_hfov_deg(1.0), 80.0));
+        assert!(near(spatial_life_size_hfov_deg(wide), 90.0));
+        // The one shape that meets both limits at once.
+        let both = 45f32.to_radians().tan() / 40f32.to_radians().tan();
+        let (h, v) = spatial_view_shown_as(120.0, both).unwrap();
+        assert!(near(h, 90.0) && near(v, 80.0), "{h} × {v}");
+    }
+
+    #[test]
+    fn the_scaled_view_note_is_complete_in_both_languages() {
+        let zh = tr_zh(SPATIAL_VIEW_SCALED_NOTE);
+        assert_ne!(zh, SPATIAL_VIEW_SCALED_NOTE, "no translation in the table");
+        for template in [SPATIAL_VIEW_SCALED_NOTE, zh] {
+            for key in ["{max_w}", "{max_h}", "{view}", "{shown}", "{limit}"] {
+                assert!(template.contains(key), "{key} missing in: {template}");
+            }
+            let note = spatial_view_scaled_note(template, 120.0, 1.0).unwrap();
+            assert!(!note.contains('{') && !note.contains('}'), "{note}");
+            for part in ["90°", "120.0° × 120.0°", "80.0° × 80.0°"] {
+                assert!(note.contains(part), "{part} missing in: {note}");
+            }
+            assert_eq!(spatial_view_scaled_note(template, 80.0, 1.0), None);
+        }
+    }
+
+    /// Every piece of text the export panel paints for a reframed view.
+    fn panel_text(opts: &mut ExportOptions, aspect: ReframeAspect, hfov_deg: f32, defish: f32) -> String {
+        fn collect(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => { out.push_str(text.galley.text()); out.push('\n'); }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        // Two frames: a new context lays its first one out without sizes to go by.
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 3000.0))),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(input, |ui| {
+                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None);
+            });
+            text.clear();
+            out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
+        }
+        text
+    }
+
+    #[test]
+    fn the_export_panel_notes_a_view_the_headset_scales_down() {
+        // The spatial video choice exists on macOS only.
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let mut opts = ExportOptions { codec: ExportCodec::Spatial, ..Default::default() };
+        let scaled = "is scaled down to";
+
+        let text = panel_text(&mut opts, ReframeAspect::Square, 120.0, 0.0);
+        assert!(text.contains("Field of view written: 120.0°"), "{text}");
+        assert!(text.contains("This view (120.0° × 120.0°) is scaled down to 80.0° × 80.0°"), "{text}");
+        assert!(text.contains("set Zoom to 80° or less"), "{text}");
+        let text = panel_text(&mut opts, ReframeAspect::Wide, 120.0, 0.0);
+        assert!(text.contains("This view (120.0° × 88.5°) is scaled down to 90.0° × 58.7°"), "{text}");
+        assert!(text.contains("set Zoom to 90° or less"), "{text}");
+
+        // At the limits and inside them: nothing to note.
+        for (aspect, hfov) in [(ReframeAspect::Square, 80.0), (ReframeAspect::Square, 60.0), (ReframeAspect::Wide, 90.0)] {
+            let text = panel_text(&mut opts, aspect, hfov, 0.0);
+            assert!(text.contains("Field of view written"), "{text}");
+            assert!(!text.contains(scaled), "{text}");
+        }
+        // Defish above 0: the clip is not exported as spatial, and says so instead.
+        let text = panel_text(&mut opts, ReframeAspect::Square, 120.0, 0.3);
+        assert!(text.contains("must be rectilinear") && !text.contains(scaled), "{text}");
+        // Another codec has no spatial section.
+        let mut h265 = ExportOptions { codec: ExportCodec::H265, ..Default::default() };
+        assert!(!panel_text(&mut h265, ReframeAspect::Square, 120.0, 0.0).contains(scaled));
     }
 }
 
@@ -904,9 +1061,12 @@ fn set_cur_lang(l: Lang) {
 
 /// Translate a (static English) UI string for the current language.
 fn tr(en: &'static str) -> &'static str {
-    if cur_lang() == Lang::En {
-        return en;
-    }
+    if cur_lang() == Lang::En { en } else { tr_zh(en) }
+}
+
+/// The Chinese text of a UI string: the English literal for anything not in
+/// the table.
+fn tr_zh(en: &'static str) -> &'static str {
     match en {
         // Top bar
         "Load video…" => "加载视频…",
@@ -1005,6 +1165,8 @@ fn tr(en: &'static str) -> &'static str {
             => "空间视频必须是直线透视：去鱼眼大于 0 时，这个片段会改为导出 H.265 左右并排。请在重新取景视图里把去鱼眼设为 0。",
         "Plays as a spatial video on Apple Vision Pro; other players show the left eye in 2D."
             => "在 Apple Vision Pro 上按空间视频播放；其他播放器以 2D 显示左眼。",
+        SPATIAL_VIEW_SCALED_NOTE
+            => "Apple Vision Pro 的沉浸模式最多按 {max_w}° 宽、{max_h}° 高以真实大小显示空间视频。当前视角（{view}）会被缩小显示为 {shown}，画面里的东西都会变小。想保持真实大小，请把变焦设到 {limit}° 以内。",
         "Recommended" => "推荐",
         "Use recommended" => "使用推荐值",
         "Encoder" => "编码器",
@@ -4808,6 +4970,14 @@ impl App {
                     ui.label(RichText::new(format!(
                         "MV-HEVC Main10 · {}: {reframe_hfov_deg:.1}°", tr("Field of view written"),
                     )).small().color(Color32::GRAY));
+                    // A view past what the headset shows at life size: say
+                    // what it becomes there. (With Defish above 0 the clip
+                    // is not exported as spatial at all; that note is below.)
+                    if let Some(note) = reframe.filter(|_| spatial_rectilinear).and_then(|aspect| {
+                        spatial_view_scaled_note(tr(SPATIAL_VIEW_SCALED_NOTE), reframe_hfov_deg, aspect.ratio())
+                    }) {
+                        ui.label(RichText::new(note).small().color(Color32::from_rgb(230, 160, 90)));
+                    }
                     ui.horizontal(|ui| {
                         ui.label(tr("Camera baseline"));
                         ui.add(egui::Slider::new(&mut opts.spatial_baseline_mm, 30.0..=120.0)

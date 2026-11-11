@@ -83,6 +83,14 @@ eye in 2D.
   (up to 3840 × 2160 per eye). A
   Crop-mode clip becomes a spatial video camera whose field of view you
   choose afterwards.
+- **Life size has a ceiling in the headset.** In its immersive view a
+  Vision Pro shows a spatial video at life size only up to 90° wide and 80°
+  tall. A wider frame is scaled down whole to fit, so everything in it
+  looks smaller: that is past 80° for a 1:1 view and past 90° for 16:9. The
+  export format says so when the view is past the limit, with the field of
+  view it will be shown at and the Zoom that stays at life size. Checked on
+  a headset (visionOS 27) with charts that differed only in the field of
+  view written to the file.
 - **Camera baseline** (65 mm by default) and **Disparity adjustment** (2 %
   by default: the far background sits just behind the window) are in the
   export format.

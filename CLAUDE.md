@@ -2078,8 +2078,37 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      stabilized: 46 fps at 2160² per eye, 32 fps at 3840×2160 per eye;
      10K Crop 29.97 fps: 20 fps at 3840² per eye. The MV-HEVC session
      itself opened at every size tried, up to 8192² per eye.
-     **Not yet seen on the headset** and the export-format UI was not
-     visually checked.
+     Watched by the user in the headset's immersive view (visionOS 27,
+     2026-11-11). **The export-format UI was not visually checked.**
+   - **The headset's life-size limits (2026-11-11)**: in its immersive view
+     visionOS sizes a spatial video from the `hfov` written, after limiting
+     the view to 90° horizontally and 80° vertically with the shape kept
+     (the window view does not use the field of view at all). A wider
+     frame is scaled down whole, never cropped: 1:1 at 90° or at 120° is
+     shown as 80° × 80°, 16:9 at 120° as 90° × 58.7°. Confirmed by the user
+     on the headset with charts that differed only in the `hfov` written
+     (1:1 at 60 / 80 / 120, 16:9 at 70 / 90 / 120: the last two of each set
+     came out the same size). So life size ends at 80° for a 1:1 view and
+     at 90° for 16:9, and the reframed view's default (90°, 1:1) is
+     already shown 16 % small.
+     GUI (`app.rs`): `spatial_life_size_hfov_deg(aspect)`,
+     `spatial_view_shown_as(hfov, aspect)` and `SPATIAL_VIEW_SCALED_NOTE` /
+     `spatial_view_scaled_note`; the spatial section of the export format
+     prints an orange note (what the view is shown as, the Zoom that stays
+     at life size) under "Field of view written" while the view is past a
+     limit and Defish is 0. `tr` now forwards to `tr_zh` (the Chinese
+     table on its own) so a test can read a translation without switching
+     the process-wide UI language. Tests in `spatial_export_tests`: the
+     limits, the note's placeholders in both languages, and the text the
+     panel really paints (a headless `egui::Context::run_ui` of
+     `export_options_ui`). Platform-neutral code, no `#[cfg]`; the section
+     is never reached on Windows.
+     Also read in the system's renderer and NOT acted on: in the immersive
+     view the file's disparity adjustment gives way to a value derived
+     from the (limited) field of view, and the baseline does not enter
+     the picture's size. A lower limit of 40° is in that code too, but
+     the headset check did not cover it, so there is no note for narrow
+     views.
    - Open: a source whose audio is APAC (a finished VR180 export re-opened)
      fails ANY export at the audio mux (`write_header: Invalid argument`,
      ffmpeg cannot stream-copy the unknown codec) — pre-existing, not
