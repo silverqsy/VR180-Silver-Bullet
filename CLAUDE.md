@@ -1974,7 +1974,12 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      output ray before the stab rotation (static window, same in both
      eyes), `gpu::CropMask { amount, feather, round }` → `apply_frame_crop`
      in BOTH resolvers (Settings `crop_mask`, export cfg `crop_mask`);
-     skipped in the reframed view.
+     skipped in the reframed view. **The reframed (flat) view does not
+     black out a Crop frame either** — `frame_cover` returns 1 when
+     `proj_mode > 0.5`, so the frame's edge is repeated there exactly as on
+     a full-circle source (user request: flat 3D is the practical output
+     for Crop clips and a repeated edge hides the stabilization border;
+     measured 81/180 frames with black → 0 on a stabilized 92° view).
    - **Shaders**: all nine `fisheye_*.wgsl` now declare the SAME full
      uniform struct (`FisheyeCalibUniforms` is 12 vec4 = 192 bytes: `_p9a`
      became `frame_mask`, a new last row holds the mask) and share

@@ -2267,7 +2267,9 @@ pub struct FisheyeCalib {
     /// `> 0.5`: the frame is a CROP of the image circle (the Insta360 X6
     /// Crop modes) — a ray that projects outside it has no data and renders
     /// black, where a full-circle source replicates its rim (which hides
-    /// the gaps stabilization can open at the edge). Set by
+    /// the gaps stabilization can open at the edge). The reframed (flat)
+    /// view replicates the edge for a crop too: black there is exactly the
+    /// stabilization border one wants covered. Set by
     /// [`with_frame_crop`](Self::with_frame_crop).
     pub frame_mask: f32,
     /// View mask: a rounded rectangle fixed in the OUTPUT, on the
@@ -2575,7 +2577,8 @@ impl FisheyeCalib {
 
     /// Mark the frame as a CROP of the image circle (the Insta360 X6 Crop
     /// modes): rays that project outside the frame render black instead of
-    /// replicating the edge, and the θ clamp moves out to the frame's far
+    /// replicating the edge — except in the reframed (flat) view, which
+    /// keeps the replication — and the θ clamp moves out to the frame's far
     /// corner so the corners keep their image (the default clamp sits on
     /// the circle inscribed in the frame, which would cut them off). Uses
     /// the lens model without a rim extension.

@@ -992,6 +992,8 @@ fn tr(en: &'static str) -> &'static str {
         "The lens geometry of this recording mode is not verified: both eyes are shown through the generic rule so the clip can be inspected."
             => "该档位的镜头几何未经验证：两眼按通用规则显示，便于检查素材。",
         "Crop mask" => "Crop 遮罩",
+        "Reframed view: no mask — the frame's edge is repeated past the recorded picture, so a stabilization border does not show black."
+            => "重构视图：不使用遮罩——画面以外重复边缘像素，防抖露出的边不会是黑的。",
         "Mask size (%)" => "遮罩范围 (%)",
         "Feather (%)" => "羽化 (%)",
         "Corner roundness (%)" => "圆角 (%)",
@@ -6949,12 +6951,21 @@ impl App {
         }
 
         // ── Crop mask — sources whose frame is a crop of the image circle.
-        // Outside the recorded frame the output is black regardless; these
-        // set a black window on top: how much it hides, how round, how soft.
+        // In the VR180 and fisheye outputs the directions outside the
+        // recorded frame are black regardless; these set a black window on
+        // top: how much it hides, how round, how soft. The reframed (flat)
+        // view has neither: there the frame's edge is repeated, which
+        // covers the border stabilization exposes — the sliders gray out.
         if frame_crop {
+            let flat = matches!(s.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Reframe);
             ui.add_space(6.0);
             ui.label(RichText::new(tr("Crop mask")).small().color(Color32::GRAY))
                 .on_hover_text(tr("A Crop clip holds part of the lens' view: outside the recorded frame the output is black. The mask is fixed in the output, so it stays still under stabilization. The reframed view does not use it."));
+            if flat {
+                ui.label(RichText::new(tr("Reframed view: no mask — the frame's edge is repeated past the recorded picture, so a stabilization border does not show black."))
+                    .small().color(Color32::from_rgb(130, 150, 175)));
+            }
+            ui.add_enabled_ui(!flat, |ui| {
             let m = &mut s.crop_mask;
             let (mut amount, mut feather, mut round) = (m.amount * 100.0, m.feather * 100.0, m.round * 100.0);
             fine_slider(ui, 1.0, &mut amount, 0.0..=60.0, tr("Mask size (%)"), 1, 1.0, 0.5)
@@ -6969,6 +6980,7 @@ impl App {
             if !m.is_off() && ui.small_button(tr("Reset mask")).clicked() {
                 *m = vr180_pipeline::gpu::CropMask::default();
             }
+            });
         }
 
         // A BRAW preview decodes at a size chosen for the output mode when

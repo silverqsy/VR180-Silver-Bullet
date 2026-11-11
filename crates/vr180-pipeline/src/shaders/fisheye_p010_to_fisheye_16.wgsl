@@ -42,10 +42,13 @@ struct FisheyeCalibUniforms {
 // Coverage of a source tap for a frame that is a crop of the image circle
 // (`frame_mask`): 1 inside the frame, 0 outside it, 0 for a ray past the
 // lens' clamp angle — there is no data there. A full-circle source
-// (frame_mask = 0) keeps replicating its rim instead: always 1. `px_rad` is
-// one output pixel in radians (see `view_mask`).
+// (frame_mask = 0) keeps replicating its rim instead: always 1. So does a
+// crop in the reframed (flat) view: its viewport sits inside the recorded
+// view, and the repeated edge is what covers the border the stabilizer
+// exposes when it runs out of picture. `px_rad` is one output pixel in
+// radians (see `view_mask`).
 fn frame_cover(src: vec2<f32>, cos_theta: f32, px_rad: f32) -> f32 {
-    if (cal.frame_mask < 0.5) { return 1.0; }
+    if (cal.frame_mask < 0.5 || cal.proj_mode > 0.5) { return 1.0; }
     if (acos(clamp(cos_theta, -1.0, 1.0)) > cal.theta_max) { return 0.0; }
     let d = min(min(src.x, src.y), min(cal.src_w - src.x, cal.src_h - src.y));
     // Soft edge one OUTPUT pixel wide: source pixels per output pixel at the

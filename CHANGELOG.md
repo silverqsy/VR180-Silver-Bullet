@@ -39,16 +39,22 @@ own rolling-shutter time.
   (14.56 / 16.04 / 31.65 / 21.29 ms). The 7.4K Crop encodes 3712 of the
   3968 rows the sensor reads, so its frame spans that share of the readout.
 - **A Crop frame keeps every pixel it recorded.** It holds part of the
-  lens' view, so directions outside it are black in the output — corners
-  included, where the frame reaches furthest. (The full-view modes still
-  repeat their rim past the image circle; that hides the gaps stabilization
-  can open at the edge.)
+  lens' view, so in the VR180 and fisheye outputs the directions outside it
+  are black — corners included, where the frame reaches furthest. (The
+  full-view modes still repeat their rim past the image circle; that hides
+  the gaps stabilization can open at the edge.)
+- **The reframed (Flat 3D) view repeats a Crop frame's edge** past the
+  recorded picture, like the full-view modes do at their rim: the viewport
+  sits inside the recorded view, so what shows there is the border the
+  stabilizer exposes, and a repeated edge covers it where black would not.
+  On a stabilized 92° flat view of a 7.4K Crop clip, 81 of 180 frames
+  showed a black border before; none do now.
 - **Crop mask** (Output panel, Crop clips): a black window over the picture
   with **Mask size**, **Feather** and **Corner roundness** — from the
   recorded frame's own outline through a rounded rectangle to an ellipse,
   hard-edged or faded. It is fixed in the output and identical in both
   eyes, so it stays still while the stabilized picture moves under it. Off
-  by default; the reframed view does not use it.
+  by default; the reframed view does not use it (its sliders gray out).
 - **The I-Log LUT follows the file's picture profile**, not the frame size:
   it is applied when the clip says I-Log (or says nothing, as before).
 - Native export sizes follow the mode: 7424 × 3712, 9728 × 4864 and
