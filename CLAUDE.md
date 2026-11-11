@@ -2055,8 +2055,9 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      macOS (`spatial_video_available`: + Defish 0, not a still);
      `ExportOptions::codec_for(settings, is_still)` is the codec an item
      really exports with — a clip the choice cannot apply to runs as H.265
-     and the choice itself stays put (batch of mixed clips). Baseline
-     shares `apmp_baseline_mm`; `spatial_disparity_pct` defaults to 2.
+     and the choice itself stays put (batch of mixed clips).
+     `spatial_baseline_mm` (65) and `spatial_disparity_pct` (2) are its
+     two parameters.
    - **Helper**: rewritten around P010 input (was BGR48 + a pixel-transfer
      session, from the Python app, never called from Rust); exact frame
      rate as `--fps-num/--fps-den`; counts samples in = out or fails; built
@@ -2077,9 +2078,22 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    - Open: a source whose audio is APAC (a finished VR180 export re-opened)
      fails ANY export at the audio mux (`write_header: Invalid argument`,
      ffmpeg cannot stream-copy the unknown codec) — pre-existing, not
-     spatial-specific. The VR180 APMP writer's baseline box is misplaced and
-     malformed (`inject_apmp_vr180`: `cams` directly under `vexu`, `blin`
-     without version/flags) — Apple's reader ignores it; not fixed.
+     spatial-specific; the user ruled it an edge case, not to be fixed.
+   - **VR180 (APMP) metadata no longer writes a baseline** (same day): the
+     old `cams/blin` was directly under `vexu` (the spec — "QuickTime and
+     ISO Base Media File Formats and Spatial and Immersive Media" v1.9.8,
+     2025-06-09 — puts `cams` inside `eyes`) and `blin` was 12 bytes of
+     mm × 65536 (the spec: a FullBox with a u32 in micrometres), so
+     Apple's reader skipped it. The baseline is optional for projected
+     media, "no default interpretation when absent", and the rendering core
+     does not read it (no reference in CoreRE / RealityFoundation / AVKit),
+     so the box is simply gone: `spherical_inject::apmp_vr180_atoms` =
+     `vexu { eyes{stri} proj{prji hequ} pack{pkin side} }` + `hfov`, pinned
+     byte for byte by a test. `FisheyeExportConfig::apmp_baseline_mm`, the
+     fourth `finalize_metadata` argument (all seven call sites, three of
+     them in Windows-only functions — edited without a Windows compile) and
+     the slider under the Vision Pro metadata option are removed. What
+     AVFoundation reads from an export is identical before and after.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

@@ -142,9 +142,6 @@ pub struct FisheyeExportConfig {
     /// Inject Spatial Media V2 metadata (st3d + sv3d) for YouTube
     /// VR180 playback. Default true for fisheye SBS.
     pub inject_youtube_vr180: bool,
-    /// Camera baseline in mm — written into APMP's `cams/blin` atom
-    /// (16.16 fixed-point). Typical 60..=70 mm; 65 mm matches human IPD.
-    pub apmp_baseline_mm: f32,
     /// Stabilization on/off. Calibration / preset come from below.
     pub stabilize: bool,
     /// OSV stabilization soft-cap on correction angle. `0.0` = no
@@ -475,19 +472,18 @@ fn finalize_metadata(
     final_out: &std::path::Path,
     inject_youtube: bool,
     inject_apmp: bool,
-    apmp_baseline_mm: f32,
 ) -> Result<()> {
     use crate::spherical_inject::{inject_youtube_vr180, inject_apmp_vr180};
     match (inject_youtube, inject_apmp) {
         (false, false) => Ok(()),
         (true, false)  => inject_youtube_vr180(final_out),
-        (false, true)  => inject_apmp_vr180(final_out, apmp_baseline_mm),
+        (false, true)  => inject_apmp_vr180(final_out),
         (true,  true)  => {
             tracing::warn!(
                 "fisheye_export: both YouTube and APMP metadata requested — \
                  they conflict in the same atoms; injecting APMP only"
             );
-            inject_apmp_vr180(final_out, apmp_baseline_mm)
+            inject_apmp_vr180(final_out)
         }
     }
 }
@@ -1917,7 +1913,6 @@ fn export_fisheye_inner(
         &cfg.output_path,
         cfg.inject_youtube_vr180,
         cfg.inject_apmp,
-        cfg.apmp_baseline_mm,
     )?;
     tracing::info!(
         "fisheye_export: done, {} frames in {:.2?}",
@@ -2312,7 +2307,7 @@ fn export_eac_inner(
         )?;
     }
     finalize_metadata(
-        &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm,
+        &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp,
     )?;
     tracing::info!("export_eac: done, {} frames in {:.2?}", written, t_start.elapsed());
     Ok(())
@@ -2571,7 +2566,7 @@ fn export_eac_zerocopy_vt(
         )?;
     }
     finalize_metadata(
-        &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm,
+        &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp,
     )?;
     tracing::info!("export_eac (zc): done, {} frames in {:.2?}", written, t_start.elapsed());
     Ok(())
@@ -2985,7 +2980,7 @@ fn export_eac_gpu_resident(
         finalize_eac_audio(&cfg, &video_tmp, trim_in_frame as f64 * dt, written as f64 * dt)?;
     }
     finalize_metadata(
-        &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm,
+        &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp,
     )?;
     tracing::info!(
         "export_eac (GPU-resident): done, {} frames in {:.2?} ({:.1} fps)",
@@ -3429,7 +3424,6 @@ fn export_fisheye_osv_zerocopy_p010(
         &cfg.output_path,
         cfg.inject_youtube_vr180,
         cfg.inject_apmp,
-        cfg.apmp_baseline_mm,
     )?;
     tracing::info!(
         "fisheye_export (zero-copy): done, {} frames in {:.2?}",
@@ -3922,7 +3916,6 @@ fn export_fisheye_osv_zerocopy_d3d11(
         &cfg.output_path,
         cfg.inject_youtube_vr180,
         cfg.inject_apmp,
-        cfg.apmp_baseline_mm,
     )?;
     tracing::info!(
         "fisheye_export (zero-copy d3d11, pipelined): done, {} frames in {:.2?}",
@@ -4275,7 +4268,7 @@ fn export_fisheye_osv_gpu_resident(
         // Multi-segment: ffconcat playlist keeps a merged recording's FULL audio.
         finalize_fisheye_audio(&cfg, &video_tmp, t_in, frame_idx as f64 * dt)?;
     }
-    finalize_metadata(&cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp, cfg.apmp_baseline_mm)?;
+    finalize_metadata(&cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp)?;
     tracing::info!(
         "fisheye_export (GPU-resident): done, {} frames in {:.2?} ({:.1} fps)",
         frame_idx, t_start.elapsed(), frame_idx as f32 / t_start.elapsed().as_secs_f32().max(1e-3)

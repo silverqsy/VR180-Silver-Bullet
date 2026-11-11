@@ -528,9 +528,10 @@ struct ExportOptions {
     inject_youtube: bool,
     /// Reframed exports: per-eye size (the aspect comes from the clip).
     reframe_size: ReframeSize,
-    /// Camera baseline in mm: APMP `cams/blin`, and a spatial video's
-    /// baseline. Typical 60..=70.
-    apmp_baseline_mm: f32,
+    /// Spatial video: distance between the two lenses in mm. Typical
+    /// 60..=70. (VR180 metadata carries no baseline: it is optional there
+    /// and the player does not use it.)
+    spatial_baseline_mm: f32,
     /// Spatial video: horizontal disparity adjustment in percent of the
     /// frame width. Positive moves the whole scene away from the viewer.
     spatial_disparity_pct: f32,
@@ -636,7 +637,7 @@ mod spatial_export_tests {
             codec: ExportCodec::Spatial,
             reframe_size: ReframeSize::P2160,
             h265_bit_depth: 8,
-            apmp_baseline_mm: 63.0,
+            spatial_baseline_mm: 63.0,
             spatial_disparity_pct: 2.5,
             ..Default::default()
         };
@@ -755,7 +756,7 @@ impl Default for ExportOptions {
             // mutually exclusive; the dialog enforces it.
             inject_apmp: true,
             inject_youtube: false,
-            apmp_baseline_mm: 65.0,
+            spatial_baseline_mm: 65.0,
             // Apple's own default: what the lenses saw at infinity lands a
             // little behind the window instead of on its surface.
             spatial_disparity_pct: 2.0,
@@ -2059,9 +2060,8 @@ impl App {
             prores_profile: opts.prores_profile as i32,
             inject_apmp: opts.inject_apmp,
             inject_youtube_vr180: opts.inject_youtube,
-            apmp_baseline_mm: opts.apmp_baseline_mm,
             spatial: (codec == ExportCodec::Spatial).then(|| vr180_pipeline::fisheye_export::SpatialVideo {
-                baseline_mm: opts.apmp_baseline_mm,
+                baseline_mm: opts.spatial_baseline_mm,
                 disparity: opts.spatial_disparity_pct / 100.0,
             }),
             stabilize: settings.stabilize,
@@ -4773,7 +4773,7 @@ impl App {
                     )).small().color(Color32::GRAY));
                     ui.horizontal(|ui| {
                         ui.label(tr("Camera baseline"));
-                        ui.add(egui::Slider::new(&mut opts.apmp_baseline_mm, 30.0..=120.0)
+                        ui.add(egui::Slider::new(&mut opts.spatial_baseline_mm, 30.0..=120.0)
                             .suffix(" mm").fixed_decimals(1));
                     });
                     ui.horizontal(|ui| {
@@ -4845,14 +4845,6 @@ impl App {
         };
         ui.radio_value(&mut target, MetaTarget::Apmp,
             tr("Apple Vision Pro (APMP — vexu + hfov)"));
-        if matches!(target, MetaTarget::Apmp) {
-            ui.horizontal(|ui| {
-                ui.add_space(20.0);
-                ui.label(tr("Camera baseline"));
-                ui.add(egui::Slider::new(&mut opts.apmp_baseline_mm, 30.0..=120.0)
-                    .suffix(" mm").fixed_decimals(1));
-            });
-        }
         ui.radio_value(&mut target, MetaTarget::Youtube,
             tr("YouTube (Spherical V2 — st3d + sv3d)"));
         ui.radio_value(&mut target, MetaTarget::None,

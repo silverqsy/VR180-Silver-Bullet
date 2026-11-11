@@ -103,81 +103,45 @@ pub fn inject_youtube_vr180(path: &Path) -> Result<()> {
 
 /// Inject Apple Projected Media Profile (VR180 APMP) — `vexu` + `hfov`.
 ///
-/// `baseline_mm` is the inter-pupillary distance the camera shot at —
-/// typically 63 – 65 mm. Modifies `path` in place.
-pub fn inject_apmp_vr180(path: &Path, baseline_mm: f32) -> Result<()> {
-    // eyes/stri: stereo indication = 0x03 (side-by-side)
-    let mut stri = Vec::with_capacity(13);
-    stri.extend_from_slice(&13u32.to_be_bytes());
-    stri.extend_from_slice(b"stri");
-    stri.extend_from_slice(&[0, 0, 0, 0]);
-    stri.push(0x03);
+/// What a Vision Pro needs to play the file as VR180: both eye views, their
+/// side-by-side packing, the half-equirectangular projection and the 180°
+/// horizontal field of view. The camera baseline is optional for projected
+/// media and the player does not use it, so none is written. (Up to 2.5.5
+/// a `cams/blin` box was written here, but directly under `vexu` and not in
+/// Apple's format, so readers skipped it.)
+pub fn inject_apmp_vr180(path: &Path) -> Result<()> {
+    inject_atoms_into_visual_sample_entry(path, &apmp_vr180_atoms())
+}
 
-    let eyes_size = (8 + stri.len()) as u32;
-    let mut eyes = Vec::with_capacity(eyes_size as usize);
-    eyes.extend_from_slice(&eyes_size.to_be_bytes());
-    eyes.extend_from_slice(b"eyes");
-    eyes.extend_from_slice(&stri);
+/// The `vexu` and `hfov` boxes of a side-by-side VR180 file, laid out as in
+/// Apple's "QuickTime and ISO Base Media File Formats and Spatial and
+/// Immersive Media" (the same bytes Apple's own writer produces).
+fn apmp_vr180_atoms() -> Vec<u8> {
+    /// A box holding `payload`.
+    fn atom(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(8 + payload.len());
+        b.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+        b.extend_from_slice(tag);
+        b.extend_from_slice(payload);
+        b
+    }
+    /// A full box (version 0, no flags) holding `payload`.
+    fn full_atom(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut body = vec![0u8; 4];
+        body.extend_from_slice(payload);
+        atom(tag, &body)
+    }
 
-    // proj/prji: projection = halfEquirectangular (`hequ`)
-    let mut prji = Vec::with_capacity(16);
-    prji.extend_from_slice(&16u32.to_be_bytes());
-    prji.extend_from_slice(b"prji");
-    prji.extend_from_slice(&[0, 0, 0, 0]);
-    prji.extend_from_slice(b"hequ");
-
-    let proj_size = (8 + prji.len()) as u32;
-    let mut proj = Vec::with_capacity(proj_size as usize);
-    proj.extend_from_slice(&proj_size.to_be_bytes());
-    proj.extend_from_slice(b"proj");
-    proj.extend_from_slice(&prji);
-
-    // pack/pkin: view packing = `side` (side-by-side)
-    let mut pkin = Vec::with_capacity(16);
-    pkin.extend_from_slice(&16u32.to_be_bytes());
-    pkin.extend_from_slice(b"pkin");
-    pkin.extend_from_slice(&[0, 0, 0, 0]);
-    pkin.extend_from_slice(b"side");
-
-    let pack_size = (8 + pkin.len()) as u32;
-    let mut pack = Vec::with_capacity(pack_size as usize);
-    pack.extend_from_slice(&pack_size.to_be_bytes());
-    pack.extend_from_slice(b"pack");
-    pack.extend_from_slice(&pkin);
-
-    // cams/blin: baseline in mm × 65536 (16.16 fixed-point)
-    let blin_val = (baseline_mm * 65536.0).round() as u32;
-    let mut blin = Vec::with_capacity(12);
-    blin.extend_from_slice(&12u32.to_be_bytes());
-    blin.extend_from_slice(b"blin");
-    blin.extend_from_slice(&blin_val.to_be_bytes());
-
-    let cams_size = (8 + blin.len()) as u32;
-    let mut cams = Vec::with_capacity(cams_size as usize);
-    cams.extend_from_slice(&cams_size.to_be_bytes());
-    cams.extend_from_slice(b"cams");
-    cams.extend_from_slice(&blin);
-
-    let vexu_size = (8 + eyes.len() + proj.len() + pack.len() + cams.len()) as u32;
-    let mut vexu = Vec::with_capacity(vexu_size as usize);
-    vexu.extend_from_slice(&vexu_size.to_be_bytes());
-    vexu.extend_from_slice(b"vexu");
-    vexu.extend_from_slice(&eyes);
-    vexu.extend_from_slice(&proj);
-    vexu.extend_from_slice(&pack);
-    vexu.extend_from_slice(&cams);
-
-    // hfov: horizontal field of view = 180° (stored as 180000 = 180.000°)
-    let mut hfov = Vec::with_capacity(12);
-    hfov.extend_from_slice(&12u32.to_be_bytes());
-    hfov.extend_from_slice(b"hfov");
-    hfov.extend_from_slice(&180_000u32.to_be_bytes());
-
-    let mut inject = Vec::with_capacity(vexu.len() + hfov.len());
-    inject.extend_from_slice(&vexu);
-    inject.extend_from_slice(&hfov);
-
-    inject_atoms_into_visual_sample_entry(path, &inject)
+    // eyes ▷ stri: the frame holds a left and a right eye view (0x03).
+    let eyes = atom(b"eyes", &full_atom(b"stri", &[0x03]));
+    // proj ▷ prji: half-equirectangular.
+    let proj = atom(b"proj", &full_atom(b"prji", b"hequ"));
+    // pack ▷ pkin: the two views sit side by side.
+    let pack = atom(b"pack", &full_atom(b"pkin", b"side"));
+    let mut out = atom(b"vexu", &[eyes, proj, pack].concat());
+    // hfov: 180° in thousandths of a degree (a plain box, no version/flags).
+    out.extend_from_slice(&atom(b"hfov", &180_000u32.to_be_bytes()));
+    out
 }
 
 /// Find an atom with the given tag in `buf[start..end]`. Returns
@@ -576,4 +540,33 @@ fn inject_atoms_into_visual_sample_entry(path: &Path, inject_data: &[u8]) -> Res
         "VR180 metadata injected"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod apmp_tests {
+    use super::apmp_vr180_atoms;
+
+    /// The exact bytes: what Apple's reader takes as stereo, side by side,
+    /// half-equirectangular, 180° (checked with AVFoundation on a real file).
+    #[test]
+    fn vr180_boxes_are_laid_out_as_apple_reads_them() {
+        let got = apmp_vr180_atoms();
+        let mut want: Vec<u8> = Vec::new();
+        want.extend_from_slice(&[0, 0, 0, 77]); want.extend_from_slice(b"vexu");
+        want.extend_from_slice(&[0, 0, 0, 21]); want.extend_from_slice(b"eyes");
+        want.extend_from_slice(&[0, 0, 0, 13]); want.extend_from_slice(b"stri");
+        want.extend_from_slice(&[0, 0, 0, 0, 0x03]);
+        want.extend_from_slice(&[0, 0, 0, 24]); want.extend_from_slice(b"proj");
+        want.extend_from_slice(&[0, 0, 0, 16]); want.extend_from_slice(b"prji");
+        want.extend_from_slice(&[0, 0, 0, 0]); want.extend_from_slice(b"hequ");
+        want.extend_from_slice(&[0, 0, 0, 24]); want.extend_from_slice(b"pack");
+        want.extend_from_slice(&[0, 0, 0, 16]); want.extend_from_slice(b"pkin");
+        want.extend_from_slice(&[0, 0, 0, 0]); want.extend_from_slice(b"side");
+        want.extend_from_slice(&[0, 0, 0, 12]); want.extend_from_slice(b"hfov");
+        want.extend_from_slice(&180_000u32.to_be_bytes());
+        assert_eq!(got, want);
+        // No camera baseline: optional for projected media, and a box that
+        // is not in Apple's format is worse than none.
+        assert!(!got.windows(4).any(|w| w == b"cams" || w == b"blin"));
+    }
 }

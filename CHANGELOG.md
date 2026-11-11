@@ -82,9 +82,9 @@ eye in 2D.
   view's own horizontal angle, at 1:1 or 16:9, up to 3840 × 2160 per eye. A
   Crop-mode clip becomes a spatial video camera whose field of view you
   choose afterwards.
-- **Camera baseline** (the same value the VR180 metadata uses, 65 mm by
-  default) and **Disparity adjustment** (2 % by default: the far background
-  sits just behind the window) are in the export format.
+- **Camera baseline** (65 mm by default) and **Disparity adjustment** (2 %
+  by default: the far background sits just behind the window) are in the
+  export format.
 - **One encode, from the rendered frames.** The frame the GPU composed for
   the encoder is what the MV-HEVC encoder gets — no side-by-side
   intermediate, no second generation. Stabilization, colour, trims and the
@@ -119,6 +119,14 @@ the total (`252.7 Mbps (126.6 + 126.0)`); where the container states none
 - An `.insv` whose trailer cannot be read still opens with the generic X6
   lens profile placed for its recording mode (no gyro, so no stabilization)
   instead of being stretched to the full lens.
+- **VR180 metadata no longer carries a camera baseline**, and its slider
+  is gone from the Vision Pro option. The box the app wrote was not where
+  Apple's format puts it nor in its layout, so readers skipped it: the
+  slider never reached the file. The baseline is optional for VR180 and the
+  player does not use it, so files play exactly as before — what a Vision
+  Pro reads from them (both eyes, side by side, half-equirectangular, 180°)
+  is unchanged. The baseline setting now belongs to the spatial video
+  export, where it is required and written by the encoder.
 
 ## 2.5.5 — 2026-11-07
 
