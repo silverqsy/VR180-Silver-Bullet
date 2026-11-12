@@ -658,7 +658,7 @@ mod export_size_tests {
     #[test]
     fn sharp_eye_follows_the_recording_mode() {
         let win = |dw, dh| InsvWindowCrop { src_w: 7744, src_h: 7744, dst_w: dw, dst_h: dh, offset_x: 0, offset_y: 0 };
-        let info = |window| X6ClipInfo { window, ilog: Some(true), paraxial_native: 2086.97 };
+        let info = |window| X6ClipInfo { window, ilog: Some(true), paraxial_native: 2086.97, single_lens: false };
         // Both Crop modes are native pixels: 36.4 px/° → 6560 px per 180°.
         assert_eq!(info(Some(win(4912, 4912))).sharp_eye(4912, 4912, X6ViewChoice::Auto), Some(6560));
         assert_eq!(info(Some(win(4912, 3968))).sharp_eye(3712, 3712, X6ViewChoice::Auto), Some(6560));
@@ -1558,6 +1558,7 @@ struct X6ClipInfo {
     /// Mean centre scale of the two lenses, native pixels per radian (from
     /// the file's calibration, else the generic profile).
     paraxial_native: f64,
+    single_lens: bool,
 }
 
 impl X6ClipInfo {
@@ -1565,13 +1566,14 @@ impl X6ClipInfo {
     /// A clip whose trailer cannot be read still gets an entry: its mode
     /// then follows the frame size alone.
     fn read(path: &std::path::Path) -> (Self, Option<String>) {
-        let id = vr180_fisheye::insta360::read_insta360_identity(path).ok();
+        let id = vr180_pipeline::x6_pair::read_identity(path).ok();
         let bare = vr180_fisheye::Insta360Meta::default();
         (
             Self {
                 window: id.as_ref().and_then(|m| m.window_crop),
                 ilog: id.as_ref().and_then(|m| m.is_ilog()),
                 paraxial_native: vr180_pipeline::insv_imu::x6_paraxial_native(id.as_ref().unwrap_or(&bare)),
+                single_lens: id.as_ref().is_some_and(|m| m.single_lens),
             },
             id.and_then(|m| m.gamma_mode),
         )
@@ -1588,6 +1590,9 @@ impl X6ClipInfo {
     /// The clip's stream geometry under a view choice (which only an
     /// unconfirmed 3712² clip listens to).
     fn geometry(&self, eye_w: u32, eye_h: u32, view: vr180_fisheye::X6ViewChoice) -> vr180_fisheye::InsvStreamGeometry {
+        if self.single_lens {
+            return vr180_fisheye::InsvStreamGeometry::resolve_single_lens(self.window.as_ref(), eye_w, eye_h);
+        }
         vr180_fisheye::InsvStreamGeometry::resolve(self.window.as_ref(), eye_w, eye_h, view)
     }
 }
@@ -2872,6 +2877,11 @@ impl App {
             if self.batch.iter().any(|b| b.path == path) {
                 continue; // already in the list
             }
+            if vr180_pipeline::x6_pair::plan_for(&path)
+                .is_some_and(|take| self.batch.iter().any(|b| take.paths.contains(&b.path)))
+            {
+                continue;
+            }
             let source_kind = vr180_pipeline::source_kind::detect(&path)
                 .unwrap_or(vr180_pipeline::SourceKind::Unknown);
             if !source_kind.is_exportable() {
@@ -3867,7 +3877,7 @@ impl App {
         // X6 "360° Audio": a 4-channel AmbiX AAC instead of stereo. Header
         // read only; the worker is off the UI thread.
         let foa_audio = source_kind == vr180_pipeline::SourceKind::Insta360Insv
-            && vr180_pipeline::audio::probe_foa_aac(&path).ok().flatten().is_some();
+            && vr180_pipeline::audio::probe_foa_aac(&vr180_pipeline::x6_pair::audio_source(&path).0).ok().flatten().is_some();
         if foa_audio { tracing::info!("load: X6 360° Audio track (4-ch AmbiX) detected"); }
         // Kandao QooCam: a 4-channel AAC of its microphone capsules (not a
         // sound field) — mixed to stereo by the player and the export.
@@ -4264,8 +4274,9 @@ impl App {
                 else if c.quad_audio { Some(vr180_pipeline::audio::StereoMix::Quad) }
                 else { None }
             });
-            self.audio_player = match crate::audio_player::AudioPlayer::open_with_mix(
-                audio_path, start_paused, mix,
+            let (audio_path, audio_base_s) = vr180_pipeline::x6_pair::audio_source(&audio_path);
+            self.audio_player = match crate::audio_player::AudioPlayer::open_at(
+                audio_path, start_paused, mix, audio_base_s,
             ) {
                 Ok(Some(player)) => Some(player),
                 Ok(None) => None,

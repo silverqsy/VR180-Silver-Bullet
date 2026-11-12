@@ -31,6 +31,7 @@ pub mod render;
 pub mod source_kind;
 pub mod spherical_inject;
 pub mod still_export;
+pub mod x6_pair;
 
 pub use source_kind::SourceKind;
 

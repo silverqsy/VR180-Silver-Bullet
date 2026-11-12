@@ -80,6 +80,8 @@ struct DualPacketPump {
     /// Learned stream-0 frame step in pts ticks (for the pairing tolerance).
     step: Option<i64>,
     last_pts0: Option<i64>,
+    split_eof: [bool; 2],
+    kept: Option<(usize, ffmpeg_next::frame::Video)>,
 }
 
 impl DualPacketPump {
@@ -90,6 +92,8 @@ impl DualPacketPump {
         self.eof = false;
         self.drained = [false; 2];
         self.last_pts0 = None;
+        self.split_eof = [false; 2];
+        self.kept = None;
     }
 
     /// Next packet for decoder slot `pos`, reading (and staging the other
@@ -128,6 +132,7 @@ impl DualPacketPump {
 
     /// Decode the next frame of slot `pos` into `out`. `Some(pts)` on success,
     /// `None` once the stream is exhausted (after draining the decoder).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn next_frame(
         &mut self,
         ictx: &mut ffmpeg_next::format::context::Input,
@@ -136,11 +141,21 @@ impl DualPacketPump {
         pos: usize,
         out: &mut ffmpeg_next::frame::Video,
     ) -> Option<i64> {
+        self.frame_with(decoder, pos, out, |pump| pump.next_packet(ictx, video_indices, pos))
+    }
+
+    fn frame_with(
+        &mut self,
+        decoder: &mut ffmpeg_next::codec::decoder::Video,
+        pos: usize,
+        out: &mut ffmpeg_next::frame::Video,
+        mut packet: impl FnMut(&mut Self) -> Option<ffmpeg_next::codec::packet::Packet>,
+    ) -> Option<i64> {
         loop {
             if decoder.receive_frame(out).is_ok() {
                 return Some(out.pts().unwrap_or(0));
             }
-            match self.next_packet(ictx, video_indices, pos) {
+            match packet(self) {
                 Some(pkt) => {
                     // The output queue was just drained, so this can't be
                     // EAGAIN; a decode error on a damaged packet is skipped and
@@ -164,25 +179,36 @@ impl DualPacketPump {
     /// Next PTS-matched frame pair `([stream0, stream1], pts0)`. When the two
     /// streams disagree, the one that trails is advanced (a frame lost on one
     /// stream costs one pair, never a permanent eye offset). `None` at EOF.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn next_pair(
         &mut self,
         ictx: &mut ffmpeg_next::format::context::Input,
         video_indices: &[usize; 2],
         decoders: &mut [ffmpeg_next::codec::decoder::Video],
     ) -> Option<([ffmpeg_next::frame::Video; 2], i64)> {
+        self.pts_pair_with(decoders, |pump, decoder, pos, out| pump.next_frame(ictx, video_indices, decoder, pos, out))
+    }
+
+    fn pts_pair_with(
+        &mut self,
+        decoders: &mut [ffmpeg_next::codec::decoder::Video],
+        mut frame: impl FnMut(
+            &mut Self, &mut ffmpeg_next::codec::decoder::Video, usize, &mut ffmpeg_next::frame::Video,
+        ) -> Option<i64>,
+    ) -> Option<([ffmpeg_next::frame::Video; 2], i64)> {
         let (d0, d1) = decoders.split_at_mut(1);
         let mut f0 = ffmpeg_next::frame::Video::empty();
         let mut f1 = ffmpeg_next::frame::Video::empty();
-        let mut pts0 = self.next_frame(ictx, video_indices, &mut d0[0], 0, &mut f0)?;
-        let mut pts1 = self.next_frame(ictx, video_indices, &mut d1[0], 1, &mut f1)?;
+        let mut pts0 = frame(self, &mut d0[0], 0, &mut f0)?;
+        let mut pts1 = frame(self, &mut d1[0], 1, &mut f1)?;
         let tol = self.step.map(|st| st / 2).unwrap_or(i64::MAX / 4);
         let mut guard = 0;
         while (pts0 - pts1).abs() > tol && guard < 256 {
             guard += 1;
             if pts0 < pts1 {
-                pts0 = self.next_frame(ictx, video_indices, &mut d0[0], 0, &mut f0)?;
+                pts0 = frame(self, &mut d0[0], 0, &mut f0)?;
             } else {
-                pts1 = self.next_frame(ictx, video_indices, &mut d1[0], 1, &mut f1)?;
+                pts1 = frame(self, &mut d1[0], 1, &mut f1)?;
             }
         }
         if guard > 0 {
@@ -195,6 +221,179 @@ impl DualPacketPump {
         }
         self.last_pts0 = Some(pts0);
         Some(([f0, f1], pts0))
+    }
+
+    fn packet_for(&mut self, demux: &mut DualDemux, pos: usize) -> Option<ffmpeg_next::codec::packet::Packet> {
+        if demux.inputs.len() == 1 {
+            let indices = [demux.slots[0].1, demux.slots[1].1];
+            return self.next_packet(&mut demux.inputs[0], &indices, pos);
+        }
+        let (input, index) = demux.slots[pos];
+        loop {
+            if self.split_eof[pos] {
+                return None;
+            }
+            match demux.inputs[input].packets().next() {
+                Some((stream, packet)) => {
+                    if stream.index() == index {
+                        return Some(packet);
+                    }
+                }
+                None => {
+                    self.split_eof[pos] = true;
+                    if let Err(e) = demux_eof_or_error(&demux.inputs[input], "dual-stream demux") {
+                        tracing::warn!("{e} — treated as end of stream");
+                    }
+                }
+            }
+        }
+    }
+
+    fn frame_for(
+        &mut self,
+        demux: &mut DualDemux,
+        decoder: &mut ffmpeg_next::codec::decoder::Video,
+        pos: usize,
+        out: &mut ffmpeg_next::frame::Video,
+    ) -> Option<i64> {
+        self.frame_with(decoder, pos, out, |pump| pump.packet_for(demux, pos))
+    }
+
+    fn pair_for(
+        &mut self,
+        demux: &mut DualDemux,
+        decoders: &mut [ffmpeg_next::codec::decoder::Video],
+    ) -> Option<([ffmpeg_next::frame::Video; 2], f64)> {
+        if demux.take.is_some() {
+            return self.take_pair(demux, decoders);
+        }
+        let time_base_s = demux.time_base_s(0);
+        let (frames, pts0) = self.pts_pair_with(decoders, |pump, decoder, pos, out| pump.frame_for(demux, decoder, pos, out))?;
+        Some((frames, pts0 as f64 * time_base_s))
+    }
+
+    fn take_pair(
+        &mut self,
+        demux: &mut DualDemux,
+        decoders: &mut [ffmpeg_next::codec::decoder::Video],
+    ) -> Option<([ffmpeg_next::frame::Video; 2], f64)> {
+        let take = demux.take.clone()?;
+        let time_base_s = [demux.time_base_s(0), demux.time_base_s(1)];
+        let (d0, d1) = decoders.split_at_mut(1);
+        loop {
+            let mut f0 = ffmpeg_next::frame::Video::empty();
+            let pts0 = self.frame_for(demux, &mut d0[0], 0, &mut f0)?;
+            let frame0 = take.clip_timelines[0].row(pts0 as f64 * time_base_s[0]);
+            if frame0 < take.range.start {
+                continue;
+            }
+            if frame0 >= take.range.end {
+                return None;
+            }
+            let row = frame0 - take.range.start;
+            let want = *take.partner.get(row)? as usize;
+            let ahead = loop {
+                match &self.kept {
+                    Some((frame1, _)) if *frame1 == want => break false,
+                    Some((frame1, _)) if *frame1 > want => break true,
+                    _ => {}
+                }
+                let mut f1 = ffmpeg_next::frame::Video::empty();
+                let pts1 = self.frame_for(demux, &mut d1[0], 1, &mut f1)?;
+                self.kept = Some((take.clip_timelines[1].row(pts1 as f64 * time_base_s[1]), f1));
+            };
+            if ahead {
+                continue;
+            }
+            let again = take.partner.get(row + 1).is_some_and(|&next| next as usize == want);
+            let f1 = match (again, self.kept.take()) {
+                (true, Some((frame1, kept))) => {
+                    let handle = ref_frame(&kept);
+                    self.kept = Some((frame1, kept));
+                    handle
+                }
+                (_, Some((_, kept))) => kept,
+                (_, None) => return None,
+            };
+            return Some(([f0, f1], take.timeline.pts(row).unwrap_or(0.0)));
+        }
+    }
+}
+
+fn ref_frame(src: &ffmpeg_next::frame::Video) -> ffmpeg_next::frame::Video {
+    let mut dst = ffmpeg_next::frame::Video::empty();
+    unsafe {
+        ffmpeg_next::ffi::av_frame_ref(dst.as_mut_ptr(), src.as_ptr());
+    }
+    dst
+}
+
+struct DualDemux {
+    inputs: Vec<ffmpeg_next::format::context::Input>,
+    slots: [(usize, usize); 2],
+    take: Option<std::sync::Arc<crate::x6_pair::PairPlan>>,
+}
+
+impl DualDemux {
+    fn open(path: &Path) -> Result<Self> {
+        ffmpeg_init();
+        let open = |p: &Path| {
+            ffmpeg_next::format::input(p).map_err(|e| Error::Ffmpeg(format!("open {p:?}: {e}")))
+        };
+        let video_streams = |ictx: &ffmpeg_next::format::context::Input| -> Vec<usize> {
+            ictx.streams()
+                .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+                .map(|s| s.index())
+                .collect()
+        };
+        if let Some(take) = crate::x6_pair::plan_for(path) {
+            let inputs = vec![open(&take.paths[0])?, open(&take.paths[1])?];
+            let mut slots = [(0, 0), (1, 0)];
+            for (slot, ictx) in inputs.iter().enumerate() {
+                slots[slot].1 = *video_streams(ictx).first().ok_or_else(|| {
+                    Error::Ffmpeg(format!("{:?}: no video stream", take.paths[slot]))
+                })?;
+            }
+            let mut demux = Self { inputs, slots, take: Some(take) };
+            if let Err(e) = demux.seek(0.0) {
+                tracing::warn!("{e} — reading from the start");
+            }
+            return Ok(demux);
+        }
+        let ictx = open(path)?;
+        let video = video_streams(&ictx);
+        if video.len() < 2 {
+            return Err(Error::Ffmpeg(format!(
+                "expected 2 video streams (OSV / dual-camera), found {}",
+                video.len()
+            )));
+        }
+        Ok(Self { inputs: vec![ictx], slots: [(0, video[0]), (0, video[1])], take: None })
+    }
+
+    fn stream(&self, slot: usize) -> ffmpeg_next::format::stream::Stream<'_> {
+        let (input, index) = self.slots[slot];
+        self.inputs[input].stream(index).expect("a stream index taken from this container")
+    }
+
+    fn time_base_s(&self, slot: usize) -> f64 {
+        let tb = self.stream(slot).time_base();
+        tb.numerator() as f64 / tb.denominator().max(1) as f64
+    }
+
+    fn seek(&mut self, target_s: f64) -> Result<()> {
+        let target_s = target_s.max(0.0);
+        for input in 0..self.inputs.len() {
+            let clip_s = match &self.take {
+                Some(take) => take.clip_time(input, target_s),
+                None => target_s,
+            };
+            let ts = (clip_s * 1_000_000.0) as i64;
+            self.inputs[input]
+                .seek(ts, ..ts)
+                .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        }
+        Ok(())
     }
 }
 
@@ -922,8 +1121,7 @@ impl SbsFisheyeIter {
 /// scaled-down to at most `MAX_DECODE_SIDE` per axis to keep the
 /// CPU→GPU upload bounded.
 pub struct DualStreamFisheyeIter {
-    ictx: ffmpeg_next::format::context::Input,
-    video_indices: [usize; 2],
+    demux: DualDemux,
     decoders: Vec<ffmpeg_next::codec::decoder::Video>,
     scalers: Vec<Option<ffmpeg_next::software::scaling::Context>>,
     /// Per-stream: true if VideoToolbox decode is active for this
@@ -1004,7 +1202,7 @@ fn clamp_decode_dim_to(w: u32, h: u32, max_side: u32) -> (u32, u32) {
 impl std::fmt::Debug for DualStreamFisheyeIter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DualStreamFisheyeIter")
-            .field("video_indices", &self.video_indices)
+            .field("streams", &self.demux.slots)
             .field("eye_w", &self.eye_w)
             .field("eye_h", &self.eye_h)
             .field("swap_eyes", &self.swap_eyes)
@@ -1044,26 +1242,11 @@ impl DualStreamFisheyeIter {
                 "DualStreamFisheyeIter: bit_depth must be 8 or 16, got {output_bit_depth}"
             )));
         }
-        ffmpeg_init();
-        let ictx = ffmpeg_next::format::input(path)
-            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
-        let video_indices: Vec<usize> = ictx
-            .streams()
-            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
-            .map(|s| s.index())
-            .take(2)
-            .collect();
-        if video_indices.len() < 2 {
-            return Err(Error::Ffmpeg(format!(
-                "expected 2 video streams (OSV / dual-camera), found {}",
-                video_indices.len()
-            )));
-        }
-        let video_indices = [video_indices[0], video_indices[1]];
+        let demux = DualDemux::open(path)?;
         let mut decoders = Vec::with_capacity(2);
         let mut hw_active = [false, false];
-        for (i, &idx) in video_indices.iter().enumerate() {
-            let stream = ictx.stream(idx).unwrap();
+        for i in 0..2 {
+            let stream = demux.stream(i);
             let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
                 .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
             // VideoToolbox decode is critical at OSV resolution (3840×3840
@@ -1128,11 +1311,10 @@ impl DualStreamFisheyeIter {
             if max_decode_side == 0 { "off".into() } else { max_decode_side.to_string() }
         );
 
-        let time_base = ictx.stream(video_indices[0]).unwrap().time_base();
-        let time_base_s = time_base.numerator() as f64 / time_base.denominator() as f64;
+        let time_base_s = demux.time_base_s(0);
 
         Ok(Self {
-            ictx, video_indices, decoders,
+            demux, decoders,
             scalers: vec![None, None],
             hw_active,
             eye_w, eye_h,
@@ -1155,14 +1337,12 @@ impl FisheyePairIter for DualStreamFisheyeIter {
         }
         let mut sw_storage = ffmpeg_next::frame::Video::empty();
         // Per-stream staged packets + PTS-matched pairing (see DualPacketPump).
-        let Some(([mut d0, mut d1], pts0)) =
-            self.pump.next_pair(&mut self.ictx, &self.video_indices, &mut self.decoders)
+        let Some(([mut d0, mut d1], pts_s)) = self.pump.pair_for(&mut self.demux, &mut self.decoders)
         else {
             return Ok(None);
         };
         let f0 = self.scale_one(0, &mut d0, &mut sw_storage)?;
         let f1 = self.scale_one(1, &mut d1, &mut sw_storage)?;
-        let pts_s = pts0 as f64 * self.time_base_s;
         let (left, right) = if self.swap_eyes { (f1, f0) } else { (f0, f1) };
         self.frames_yielded += 1;
         Ok(Some(FisheyePair {
@@ -1185,13 +1365,34 @@ impl FisheyePairIter for DualStreamFisheyeIter {
         let mut result: [Option<(Vec<u8>, i64)>; 2] = [None, None];
         let mut decoded = ffmpeg_next::frame::Video::empty();
         let mut sw_storage = ffmpeg_next::frame::Video::empty();
+        if self.demux.take.is_some() {
+            loop {
+                let Some(([mut d0, mut d1], pts_s)) = self.pump.pair_for(&mut self.demux, &mut self.decoders)
+                else {
+                    return Ok(None);
+                };
+                if pts_s < cutoff {
+                    continue;
+                }
+                let f0 = self.scale_one(0, &mut d0, &mut sw_storage)?;
+                let f1 = self.scale_one(1, &mut d1, &mut sw_storage)?;
+                let (left, right) = if self.swap_eyes { (f1, f0) } else { (f0, f1) };
+                self.frames_yielded += 1;
+                return Ok(Some(FisheyePair {
+                    left, right,
+                    eye_w: self.eye_w, eye_h: self.eye_h,
+                    bit_depth: self.output_bit_depth,
+                    pts_s, gpu: None,
+                }));
+            }
+        }
         // Each stream is fed from its own staged queue (DualPacketPump), so a
         // chunk-interleaved file can't lose packets while one decoder runs
         // ahead of the other.
         for pos in 0..2 {
             for _ in 0..8000 {
-                let Some(pts) = self.pump.next_frame(
-                    &mut self.ictx, &self.video_indices, &mut self.decoders[pos], pos, &mut decoded,
+                let Some(pts) = self.pump.frame_for(
+                    &mut self.demux, &mut self.decoders[pos], pos, &mut decoded,
                 ) else { break };
                 if (pts as f64 * self.time_base_s) >= cutoff {
                     let rgba = self.scale_one(pos, &mut decoded, &mut sw_storage)?;
@@ -1217,9 +1418,7 @@ impl FisheyePairIter for DualStreamFisheyeIter {
     }
 
     fn seek(&mut self, target_s: f64) -> Result<()> {
-        let ts = (target_s.max(0.0) * 1_000_000.0) as i64;
-        self.ictx.seek(ts, ..ts)
-            .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        self.demux.seek(target_s)?;
         for d in &mut self.decoders {
             d.flush();
         }
@@ -1580,8 +1779,7 @@ pub struct VtSharedFisheyePair {
 /// stay on the CPU path for now.
 #[cfg(target_os = "macos")]
 pub struct VtSharedDualStreamIter {
-    ictx: ffmpeg_next::format::context::Input,
-    video_indices: [usize; 2],
+    demux: DualDemux,
     decoders: Vec<ffmpeg_next::codec::decoder::Video>,
     native_w: u32,
     native_h: u32,
@@ -1589,7 +1787,6 @@ pub struct VtSharedDualStreamIter {
     /// convention; the caller XORs in the user swap, same as
     /// [`DualStreamFisheyeIter`]).
     swap_eyes: bool,
-    time_base_s: f64,
     /// Nominal frame duration (1/fps) for the precise-seek run-in window.
     dt_s: f64,
     frames_yielded: u32,
@@ -1617,28 +1814,15 @@ impl VtSharedDualStreamIter {
     /// Returns an error (so the caller can fall back to the CPU path) if there
     /// aren't two matching video streams or VT can't attach to either.
     pub fn new(path: &Path, swap_eyes: bool) -> Result<Self> {
-        ffmpeg_init();
-        let ictx = ffmpeg_next::format::input(path)
-            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
-        let video_indices: Vec<usize> = ictx.streams()
-            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
-            .map(|s| s.index())
-            .take(2)
-            .collect();
-        if video_indices.len() < 2 {
-            return Err(Error::Ffmpeg(format!(
-                "expected 2 video streams (OSV), found {}", video_indices.len()
-            )));
-        }
-        let video_indices = [video_indices[0], video_indices[1]];
+        let demux = DualDemux::open(path)?;
         let mut decoders = Vec::with_capacity(2);
-        for &idx in video_indices.iter() {
-            let stream = ictx.stream(idx).unwrap();
+        for slot in 0..2 {
+            let stream = demux.stream(slot);
             let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
                 .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
             if !crate::decode::try_enable_videotoolbox_decode(&mut codec_ctx) {
                 return Err(Error::Ffmpeg(format!(
-                    "VT zero-copy OSV path requires VideoToolbox — setup failed on stream {idx}"
+                    "VT zero-copy OSV path requires VideoToolbox — setup failed on stream {slot}"
                 )));
             }
             decoders.push(codec_ctx.decoder().video()
@@ -1651,17 +1835,14 @@ impl VtSharedDualStreamIter {
                 "OSV VT streams disagree on dims: {w0}x{h0} vs {w1}x{h1}"
             )));
         }
-        let s0 = ictx.stream(video_indices[0]).unwrap();
-        let tb = s0.time_base();
-        let time_base_s = tb.numerator() as f64 / tb.denominator().max(1) as f64;
-        let fr = s0.avg_frame_rate();
+        let fr = demux.stream(0).avg_frame_rate();
         let dt_s = if fr.numerator() > 0 {
             fr.denominator() as f64 / fr.numerator() as f64
         } else { 1.0 / 30.0 };
         Ok(Self {
-            ictx, video_indices, decoders,
+            demux, decoders,
             native_w: w0, native_h: h0,
-            swap_eyes, time_base_s, dt_s,
+            swap_eyes, dt_s,
             frames_yielded: 0, skip_until_s: None,
             pump: DualPacketPump::default(),
         })
@@ -1672,9 +1853,7 @@ impl VtSharedDualStreamIter {
 
     pub fn seek(&mut self, target_s: f64) -> Result<()> {
         let target_s = target_s.max(0.0);
-        let ts = (target_s * 1_000_000.0) as i64;
-        self.ictx.seek(ts, ..ts)
-            .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        self.demux.seek(target_s)?;
         for d in &mut self.decoders { d.flush(); }
         self.pump.reset();
         self.frames_yielded = 0;
@@ -1716,22 +1895,19 @@ impl VtSharedDualStreamIter {
         -> Result<Option<VtSharedFisheyePair>>
     {
         // Per-stream staged packets + PTS-matched pairing (see DualPacketPump).
-        let (f0, f1) = loop {
-            let Some(([f0, f1], pts0)) =
-                self.pump.next_pair(&mut self.ictx, &self.video_indices, &mut self.decoders)
+        let (f0, f1, pts_s) = loop {
+            let Some(([f0, f1], pts_s)) = self.pump.pair_for(&mut self.demux, &mut self.decoders)
             else {
                 return Ok(None);
             };
             // Precise-seek run-in: discard pairs before the target frame.
             if let Some(target) = self.skip_until_s {
-                let t = pts0 as f64 * self.time_base_s;
-                if t < target - 0.5 * self.dt_s { continue; }
+                if pts_s < target - 0.5 * self.dt_s { continue; }
                 self.skip_until_s = None;
             }
-            break (f0, f1);
+            break (f0, f1, pts_s);
         };
 
-        let pts_s = f0.pts().unwrap_or(0) as f64 * self.time_base_s;
         let (s0_y, s0_uv) = Self::wrap_p010_planes(device, &f0)?;
         let (s1_y, s1_uv) = Self::wrap_p010_planes(device, &f1)?;
         self.frames_yielded += 1;
@@ -3213,8 +3389,7 @@ pub struct ZeroCopyFisheyePair {
 
 #[cfg(target_os = "macos")]
 pub struct ZeroCopyDualStreamFisheyeIter {
-    ictx: ffmpeg_next::format::context::Input,
-    video_indices: [usize; 2],
+    demux: DualDemux,
     decoders: Vec<ffmpeg_next::codec::decoder::Video>,
     /// Native per-stream dimensions (decoder.width()/height()) — also
     /// the Y plane dims of the IOSurface we surface to the consumer.
@@ -3222,7 +3397,6 @@ pub struct ZeroCopyDualStreamFisheyeIter {
     eye_h: u32,
     frame_limit: u32,
     frames_yielded: u32,
-    time_base_s: f64,
     /// If true, output left = stream[1], right = stream[0] (matches
     /// DJI OSV convention: stream 0 = Lens A = right eye after the
     /// yaw-mod-equivalent ordering in the protobuf).
@@ -3242,36 +3416,20 @@ pub struct ZeroCopyDualStreamFisheyeIter {
 /// single-file and segmented constructors and by the segment roll-over.
 #[cfg(target_os = "macos")]
 fn open_dual_stream_vt(path: &Path) -> Result<(
-    ffmpeg_next::format::context::Input,
-    [usize; 2],
+    DualDemux,
     Vec<ffmpeg_next::codec::decoder::Video>,
-    u32, u32, f64,
+    u32, u32,
 )> {
-    ffmpeg_init();
-    let ictx = ffmpeg_next::format::input(path)
-        .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
-    let video_indices: Vec<usize> = ictx
-        .streams()
-        .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
-        .map(|s| s.index())
-        .take(2)
-        .collect();
-    if video_indices.len() < 2 {
-        return Err(Error::Ffmpeg(format!(
-            "expected 2 video streams (OSV / dual-camera), found {}",
-            video_indices.len()
-        )));
-    }
-    let video_indices = [video_indices[0], video_indices[1]];
+    let demux = DualDemux::open(path)?;
     let mut decoders = Vec::with_capacity(2);
-    for &idx in video_indices.iter() {
-        let stream = ictx.stream(idx).unwrap();
+    for slot in 0..2 {
+        let stream = demux.stream(slot);
         let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
         if !crate::decode::try_enable_videotoolbox_decode(&mut codec_ctx) {
             return Err(Error::Ffmpeg(format!(
                 "zero-copy fisheye path requires VideoToolbox hwaccel \
-                 — VT setup failed on stream {idx}"
+                 — VT setup failed on stream {slot}"
             )));
         }
         decoders.push(codec_ctx.decoder().video()
@@ -3284,24 +3442,21 @@ fn open_dual_stream_vt(path: &Path) -> Result<(
             "OSV zero-copy streams disagree on dims: {w0}x{h0} vs {w1}x{h1}"
         )));
     }
-    let time_base = ictx.stream(video_indices[0]).unwrap().time_base();
-    let time_base_s = time_base.numerator() as f64 / time_base.denominator() as f64;
-    Ok((ictx, video_indices, decoders, w0, h0, time_base_s))
+    Ok((demux, decoders, w0, h0))
 }
 
 #[cfg(target_os = "macos")]
 impl ZeroCopyDualStreamFisheyeIter {
     pub fn new(path: &Path, frame_limit: u32, swap_eyes: bool) -> Result<Self> {
-        let (ictx, video_indices, decoders, eye_w, eye_h, time_base_s) = open_dual_stream_vt(path)?;
+        let (demux, decoders, eye_w, eye_h) = open_dual_stream_vt(path)?;
         tracing::info!(
             "ZeroCopyDualStreamFisheyeIter: native {}x{}, swap_eyes={}",
             eye_w, eye_h, swap_eyes
         );
         Ok(Self {
-            ictx, video_indices, decoders,
+            demux, decoders,
             eye_w, eye_h,
             frame_limit, frames_yielded: 0,
-            time_base_s,
             swap_eyes,
             seg_paths: vec![path.to_path_buf()],
             seg_start_s: vec![0.0],
@@ -3320,8 +3475,7 @@ impl ZeroCopyDualStreamFisheyeIter {
         swap_eyes: bool,
     ) -> Result<Self> {
         assert!(!segments.is_empty(), "segments must be non-empty");
-        let (ictx, video_indices, decoders, eye_w, eye_h, time_base_s) =
-            open_dual_stream_vt(&segments[0])?;
+        let (demux, decoders, eye_w, eye_h) = open_dual_stream_vt(&segments[0])?;
         let mut seg_start_s = Vec::with_capacity(segments.len());
         let mut acc = 0.0_f64;
         for i in 0..segments.len() {
@@ -3333,10 +3487,9 @@ impl ZeroCopyDualStreamFisheyeIter {
             segments.len(), acc, eye_w, eye_h, swap_eyes
         );
         Ok(Self {
-            ictx, video_indices, decoders,
+            demux, decoders,
             eye_w, eye_h,
             frame_limit, frames_yielded: 0,
-            time_base_s,
             swap_eyes,
             seg_paths: segments.to_vec(),
             seg_start_s,
@@ -3348,17 +3501,15 @@ impl ZeroCopyDualStreamFisheyeIter {
     /// Re-open the decoder onto `path` (a segment roll-over or a cross-segment
     /// seek). Keeps the recording's eye dims (warns if a segment disagrees).
     fn reopen(&mut self, path: &Path) -> Result<()> {
-        let (ictx, video_indices, decoders, w, h, time_base_s) = open_dual_stream_vt(path)?;
+        let (demux, decoders, w, h) = open_dual_stream_vt(path)?;
         if (w, h) != (self.eye_w, self.eye_h) {
             tracing::warn!(
                 "ZeroCopy segment {path:?} dims {w}x{h} != first {}x{} — keeping first",
                 self.eye_w, self.eye_h
             );
         }
-        self.ictx = ictx;
-        self.video_indices = video_indices;
+        self.demux = demux;
         self.decoders = decoders;
-        self.time_base_s = time_base_s;
         self.pump.reset();
         Ok(())
     }
@@ -3375,9 +3526,7 @@ impl ZeroCopyDualStreamFisheyeIter {
             self.cur_idx = idx;
         }
         let local = (t - self.seg_start_s.get(idx).copied().unwrap_or(0.0)).max(0.0);
-        let ts = (local * 1_000_000.0) as i64;
-        self.ictx.seek(ts, ..ts)
-            .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        self.demux.seek(local)?;
         for d in &mut self.decoders {
             d.flush();
         }
@@ -3431,12 +3580,10 @@ impl ZeroCopyDualStreamFisheyeIter {
             return Ok(None);
         }
         // Per-stream staged packets + PTS-matched pairing (see DualPacketPump).
-        let Some(([f0, f1], pts0)) =
-            self.pump.next_pair(&mut self.ictx, &self.video_indices, &mut self.decoders)
+        let Some(([f0, f1], pts_s)) = self.pump.pair_for(&mut self.demux, &mut self.decoders)
         else {
             return Ok(None);
         };
-        let pts_s = pts0 as f64 * self.time_base_s;
         self.frames_yielded += 1;
         Ok(Some(([f0, f1], pts_s)))
     }

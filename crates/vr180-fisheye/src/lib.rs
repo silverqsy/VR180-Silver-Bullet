@@ -42,6 +42,7 @@ pub mod insta360;
 pub mod kandao;
 pub mod presets;
 pub mod projection;
+pub mod x6_pair;
 
 pub use calib::{FisheyeCalibration, GyroflowLensProfile};
 pub use dji_osv::{DjiLensCalib, DjiOsvImu, OmniLensModel, SampleAnchor};

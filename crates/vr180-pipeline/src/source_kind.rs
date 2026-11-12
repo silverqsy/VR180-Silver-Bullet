@@ -265,6 +265,9 @@ pub fn detect(path: &Path) -> Result<SourceKind> {
             if kind == SourceKind::DjiOsv && vr180_fisheye::insta360::has_insv_trailer(path) {
                 return Ok(SourceKind::Insta360Insv);
             }
+            if kind != SourceKind::DjiOsv && crate::x6_pair::plan_for(path).is_some() {
+                return Ok(SourceKind::Insta360Insv);
+            }
             return Ok(kind);
         }
         _ => {}

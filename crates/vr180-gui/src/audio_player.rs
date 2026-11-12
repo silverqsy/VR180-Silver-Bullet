@@ -46,6 +46,7 @@ pub struct AudioPlayer {
     /// Set true when the worker exits (EOF / error / stop command).
     worker_done: Arc<AtomicBool>,
     worker_handle: Option<std::thread::JoinHandle<()>>,
+    base_s: f64,
 }
 
 impl std::fmt::Debug for AudioPlayer {
@@ -71,7 +72,12 @@ impl AudioPlayer {
     /// codec does not say which it is. `None` leaves a 4-channel track to
     /// swresample's layout downmix.
     pub fn open_with_mix(path: PathBuf, start_paused: bool, mix: Option<StereoMix>) -> Result<Option<Self>> {
+        Self::open_at(path, start_paused, mix, 0.0)
+    }
+
+    pub fn open_at(path: PathBuf, start_paused: bool, mix: Option<StereoMix>, base_s: f64) -> Result<Option<Self>> {
         vr180_pipeline::decode::init();
+        let base_s = if base_s.is_finite() { base_s.max(0.0) } else { 0.0 };
 
         // Probe the source for an audio stream before allocating anything.
         let info = match vr180_pipeline::audio::probe_any_audio(&path) {
@@ -174,12 +180,17 @@ impl AudioPlayer {
             worker_done_for_thread.store(true, Ordering::SeqCst);
         });
 
-        Ok(Some(AudioPlayer {
+        let player = AudioPlayer {
             cmd_tx,
             _stream: stream,
             worker_done,
             worker_handle: Some(handle),
-        }))
+            base_s,
+        };
+        if base_s > 0.0 {
+            player.seek_to(0.0);
+        }
+        Ok(Some(player))
     }
 
     /// Flip between playing (cpal `play()`) and paused (cpal `pause()`).
@@ -197,7 +208,7 @@ impl AudioPlayer {
 
     /// Drain pending samples and re-seek the decoder to `seconds`.
     pub fn seek_to(&self, seconds: f64) {
-        let _ = self.cmd_tx.send(AudioCmd::Seek(seconds.max(0.0)));
+        let _ = self.cmd_tx.send(AudioCmd::Seek(seconds.max(0.0) + self.base_s));
     }
 
     /// True after the worker thread reports EOF / error / stop.

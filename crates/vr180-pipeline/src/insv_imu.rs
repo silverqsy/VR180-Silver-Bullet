@@ -78,6 +78,15 @@ pub const INSV_X6_IMU_TO_CAM: [[f32; 3]; 3] = [
     [-0.0084, 1.0000, 0.0044],
 ];
 
+pub fn insv_x6_lens_imu_to_cam(second_lens: bool) -> [[f32; 3]; 3] {
+    let m = insv_x6_imu_to_cam();
+    if second_lens {
+        [[-m[0][0], -m[0][1], -m[0][2]], m[1], [-m[2][0], -m[2][1], -m[2][2]]]
+    } else {
+        m
+    }
+}
+
 /// Fallback centre-row content time relative to `t_end_of_exposure −
 /// exposure/2` (ms), used when the file has no `gyro_timestamp`. Best-fit
 /// sync of image motion vs gyro (R² plateau 1.0–2.5 ms); the X6 files
@@ -329,7 +338,10 @@ pub fn insv_calib_only(meta: &Insta360Meta, stream_w: u32, stream_h: u32, view: 
         lens_a,
         lens_b,
         camera_model: Some(if meta.model.is_empty() { "Insta360".to_string() } else { meta.model.clone() }),
-        imu_to_cam: Some(insv_x6_imu_to_cam()),
+        imu_to_cam: Some(match meta.lenses.get(i0) {
+            Some(lens) if meta.single_lens => insv_x6_lens_imu_to_cam(lens.is_second_lens()),
+            _ => insv_x6_imu_to_cam(),
+        }),
         // The file's readout covers every row the sensor read; a frame that
         // is the centred part of them spans that share of it.
         readout_ms: meta.readout_ms.map(|v| (v * geom.readout_fraction) as f32).filter(|v| *v > 0.0),

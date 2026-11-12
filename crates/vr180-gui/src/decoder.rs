@@ -1235,7 +1235,7 @@ fn load_insv_imu(
     let probe = vr180_pipeline::decode::probe_video(&cfg.path).ok();
     let fps = probe.as_ref().map(|p| p.fps).filter(|f| *f > 0.0).unwrap_or(30.0);
     let (w, h) = probe.as_ref().map(|p| (p.width, p.height)).unwrap_or((src_w, src_h));
-    let meta = match vr180_fisheye::insta360::read_insta360_meta(&cfg.path) {
+    let meta = match vr180_pipeline::x6_pair::read_meta(&cfg.path) {
         Ok(m) => m,
         Err(e) => {
             // No trailer (stripped by a re-mux): the clip still decodes.

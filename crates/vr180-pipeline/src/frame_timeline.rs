@@ -72,6 +72,13 @@ impl FrameTimeline {
     /// `.osv`, `.insv`, `.360`): `stts` (+ `ctts`, + the edit list's start)
     /// → one presentation time per frame, in seconds from the track start.
     pub fn from_mp4(path: &Path) -> Result<Self> {
+        if let Some(take) = crate::x6_pair::plan_for(path) {
+            return Ok(take.timeline.clone());
+        }
+        Self::from_mp4_file(path)
+    }
+
+    pub fn from_mp4_file(path: &Path) -> Result<Self> {
         let moov = read_moov(path)?;
         let (track, _) = largest_video_track(&moov)?;
         Ok(Self::from_pts(track.pts_s, track.rate.delta_ticks as f64 / track.rate.timescale as f64))
@@ -81,7 +88,11 @@ impl FrameTimeline {
     /// sample delta — without building the per-frame list.
     pub fn nominal_rate(path: &Path) -> Result<NominalRate> {
         let moov = read_moov(path)?;
-        Ok(largest_video_track(&moov)?.0.rate)
+        let mut rate = largest_video_track(&moov)?.0.rate;
+        if let Some(take) = crate::x6_pair::plan_for(path) {
+            rate.frames = take.timeline.len();
+        }
+        Ok(rate)
     }
 
     /// Timeline of a chapter chain: each segment's frames rebased onto the

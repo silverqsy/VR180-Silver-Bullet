@@ -151,6 +151,10 @@ impl InsvLensCalib {
         if half > 0.0 && self.cx >= half { (self.cx / half).floor() * half } else { 0.0 }
     }
 
+    pub fn is_second_lens(&self) -> bool {
+        self.extra[2].abs() > 0.01
+    }
+
     /// Radial polynomial `[k1, k2, k3, k4, k5]` (`k5` is the first tail term).
     pub fn radial5(&self) -> [f32; 5] {
         [self.radial[0], self.radial[1], self.radial[2], self.radial[3], self.tail[0]]
@@ -271,6 +275,7 @@ pub enum X6Mode {
     /// scaled-window rule so both tracks can be inspected; the geometry is
     /// not verified.
     Unknown,
+    SingleLens,
 }
 
 impl X6Mode {
@@ -307,6 +312,7 @@ impl X6Mode {
             X6Mode::Crop7K6 => Some("7.6K Crop"),
             X6Mode::Unconfirmed7K4 => Some("7.4K60"),
             X6Mode::Unknown => Some("X6"),
+            X6Mode::SingleLens => None,
         }
     }
 
@@ -407,11 +413,27 @@ impl InsvStreamGeometry {
                 &signed((X6_10K_WINDOW.dst_w, X6_10K_WINDOW.dst_h)).unwrap_or(X6_10K_WINDOW), stream_w, stream_h),
             X6Mode::Wide7K4 => Self::scaled_window(
                 &signed((X6_DEFAULT_WINDOW.dst_w, X6_DEFAULT_WINDOW.dst_h)).unwrap_or(X6_DEFAULT_WINDOW), stream_w, stream_h),
-            X6Mode::Stock | X6Mode::Unknown | X6Mode::Unconfirmed7K4 => Self::scaled_window(
+            X6Mode::Stock | X6Mode::Unknown | X6Mode::Unconfirmed7K4 | X6Mode::SingleLens => Self::scaled_window(
                 &window.copied().unwrap_or(X6_DEFAULT_WINDOW), stream_w, stream_h),
         };
         g.mode = mode;
         g.detected = detected;
+        g
+    }
+
+    pub fn resolve_single_lens(window: Option<&InsvWindowCrop>, stream_w: u32, stream_h: u32) -> Self {
+        let w = window.copied().filter(|w| w.src_w > 0 && w.src_h > 0 && w.dst_w > 0 && w.dst_h > 0).unwrap_or(X6_DEFAULT_WINDOW);
+        let scaled = Self::scaled_window(&w, stream_w, stream_h);
+        let mut g = if (scaled.scale_x / scaled.scale_y - 1.0).abs() <= 0.005 {
+            scaled
+        } else {
+            Self::native_crop(w.src_w, w.src_h, (w.offset_x, w.offset_y), stream_h, stream_w, stream_h)
+        };
+        let covered = (stream_w as f64 / g.scale_x, stream_h as f64 / g.scale_y);
+        g.cropped = covered.0 < X6_DEFAULT_WINDOW.dst_w as f64 - 1.0 || covered.1 < X6_DEFAULT_WINDOW.dst_h as f64 - 1.0;
+        g.readout_fraction = 1.0;
+        g.mode = X6Mode::SingleLens;
+        g.detected = X6Mode::SingleLens;
         g
     }
 
@@ -490,6 +512,7 @@ pub struct Insta360Meta {
     /// IMU full-scale ranges from `gyro_cfg_info` (°/s, g).
     pub gyro_range_dps: Option<u32>,
     pub acc_range_g: Option<u32>,
+    pub single_lens: bool,
 }
 
 impl Insta360Meta {
@@ -515,6 +538,9 @@ impl Insta360Meta {
 
     /// Geometry of this clip's video streams (see [`InsvStreamGeometry`]).
     pub fn stream_geometry(&self, stream_w: u32, stream_h: u32, choice: X6ViewChoice) -> InsvStreamGeometry {
+        if self.single_lens {
+            return InsvStreamGeometry::resolve_single_lens(self.window_crop.as_ref(), stream_w, stream_h);
+        }
         InsvStreamGeometry::resolve(self.window_crop.as_ref(), stream_w, stream_h, choice)
     }
 
@@ -741,6 +767,7 @@ fn parse_identity(bytes: &[u8], meta: &mut Insta360Meta) {
         _ => None,
     };
     if let Some((s, lenses)) = find_calib_string(bytes) {
+        meta.single_lens = lenses.len() == 1;
         meta.calib_string = s;
         meta.lenses = lenses;
     }
@@ -826,7 +853,7 @@ fn find_calib_string(bytes: &[u8]) -> Option<(String, Vec<InsvLensCalib>)> {
     let n = bytes.len();
     let mut i = 0usize;
     while i + 2 < n {
-        let starts_here = bytes[i] == b'2' && bytes[i + 1] == b'_'
+        let starts_here = (bytes[i] == b'2' || bytes[i] == b'1') && bytes[i + 1] == b'_'
             && (i == 0 || !is_token_byte(bytes[i - 1]));
         if !starts_here {
             i += 1;
@@ -849,12 +876,17 @@ fn find_calib_string(bytes: &[u8]) -> Option<(String, Vec<InsvLensCalib>)> {
 pub fn parse_calib_string(s: &str) -> Option<Vec<InsvLensCalib>> {
     const PER_LENS: usize = 27;
     let tokens: Vec<&str> = s.split('_').collect();
-    if tokens.len() < 1 + PER_LENS || tokens[0] != "2" {
+    let single = match tokens.first().copied() {
+        Some("2") => false,
+        Some("1") => true,
+        _ => return None,
+    };
+    if tokens.len() < 1 + PER_LENS {
         return None;
     }
     let mut lenses = Vec::new();
     let mut idx = 1usize;
-    while idx + PER_LENS <= tokens.len() {
+    while !(single && !lenses.is_empty()) && idx + PER_LENS <= tokens.len() {
         let t = &tokens[idx..idx + PER_LENS];
         let f = |k: usize| t[k].parse::<f32>().ok();
         let u = |k: usize| t[k].parse::<f32>().ok().map(|v| v.round() as u32);
@@ -914,6 +946,60 @@ fn parse_frame_stamps(bytes: &[u8]) -> Vec<InsvFrameStamp> {
         out.push(InsvFrameStamp { t_us, exposure_s });
     }
     out
+}
+
+#[cfg(test)]
+mod single_lens_tests {
+    use super::*;
+
+    const ONE: &str = "1_2.455430_7210.770_7210.770_3842.500_3888.000_-0.238_0.648_89.528_0.000008_0.000037_-0.032565_1.31257319_-1.43961596_5.81072283_1.02178836_0.00000000_-0.00140078_0.00028172_0.00813601_0.00814091_0.00125338_-0.00011608_0.02256637_-0.03505852_7744_7744_193_393472";
+
+    #[test]
+    fn a_single_lens_string_is_one_lens() {
+        let lenses = parse_calib_string(ONE).unwrap();
+        assert_eq!(lenses.len(), 1);
+        let l = &lenses[0];
+        assert_eq!((l.fx, l.cx, l.cy, l.sensor_w, l.sensor_h, l.tag), (7210.77, 3842.5, 3888.0, 7744, 7744, 193));
+        assert_eq!(l.tail[8], -0.03505852);
+        assert_eq!(l.half_origin_x(), 0.0);
+        assert!(l.is_second_lens());
+        let mut bytes = b"\x08\x01junk ".to_vec();
+        bytes.extend_from_slice(ONE.as_bytes());
+        bytes.extend_from_slice(b"\x00more");
+        let mut meta = Insta360Meta::default();
+        parse_identity(&bytes, &mut meta);
+        assert!(meta.single_lens && meta.lenses.len() == 1);
+        assert!(parse_calib_string("1_2.4_7210").is_none());
+        assert!(parse_calib_string(&ONE.replacen("1_", "3_", 1)).is_none());
+    }
+
+    #[test]
+    fn a_single_lens_frame_follows_its_window() {
+        let window = |dst_w, dst_h| InsvWindowCrop { src_w: 7744, src_h: 7744, dst_w, dst_h, offset_x: 0, offset_y: 0 };
+        let geom = |dst: (u32, u32), w, h| InsvStreamGeometry::resolve_single_lens(Some(&window(dst.0, dst.1)), w, h);
+        let cases: [((u32, u32), (u32, u32), (f64, f64, f64, f64, bool)); 8] = [
+            ((7680, 7680), (7680, 7680), (1.0, 1.0, 32.0, 32.0, false)),
+            ((7680, 7680), (7296, 7296), (0.95, 0.95, 32.0, 32.0, false)),
+            ((7680, 7680), (6656, 6656), (13.0 / 15.0, 13.0 / 15.0, 32.0, 32.0, false)),
+            ((7680, 7680), (3840, 3840), (0.5, 0.5, 32.0, 32.0, false)),
+            ((6912, 6912), (6016, 6016), (6016.0 / 6912.0, 6016.0 / 6912.0, 416.0, 416.0, true)),
+            ((4912, 4912), (4912, 4912), (1.0, 1.0, 1416.0, 1416.0, true)),
+            ((7680, 6016), (3840, 3008), (0.5, 0.5, 32.0, 864.0, true)),
+            ((7680, 7680), (6000, 3968), (1.0, 1.0, 872.0, 1888.0, true)),
+        ];
+        for (dst, (w, h), (sx, sy, ox, oy, cropped)) in cases {
+            let g = geom(dst, w, h);
+            assert!((g.scale_x - sx).abs() < 1e-9 && (g.scale_y - sy).abs() < 1e-9, "{w}x{h}: scale {} {}", g.scale_x, g.scale_y);
+            assert_eq!((g.origin_x, g.origin_y, g.cropped), (ox, oy, cropped), "{w}x{h}");
+            assert_eq!((g.readout_fraction, g.mode, g.detected), (1.0, X6Mode::SingleLens, X6Mode::SingleLens));
+        }
+        let g = InsvStreamGeometry::resolve_single_lens(None, 3840, 3840);
+        assert_eq!((g.scale_x, g.origin_x, g.cropped), (0.5, 32.0, false));
+        let meta = Insta360Meta { single_lens: true, window_crop: Some(window(4912, 4912)), ..Default::default() };
+        assert_eq!(meta.stream_geometry(4912, 4912, X6ViewChoice::Wide).mode, X6Mode::SingleLens);
+        let dual = Insta360Meta { window_crop: Some(window(4912, 4912)), ..Default::default() };
+        assert_eq!(dual.stream_geometry(4912, 4912, X6ViewChoice::Auto).mode, X6Mode::Crop10K);
+    }
 }
 
 #[cfg(test)]

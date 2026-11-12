@@ -496,12 +496,19 @@ fn finalize_metadata(
 /// the segment chain (multi-segment) or the lone source file. The
 /// returned temp (when `Some`) must be deleted after the mux.
 fn eac_audio_source(cfg: &FisheyeExportConfig) -> (PathBuf, Option<PathBuf>) {
+    if let Some(take) = crate::x6_pair::plan_for(&cfg.source_path) {
+        return (take.audio_source().0.to_path_buf(), None);
+    }
     let tag = cfg.output_path.file_stem().and_then(|s| s.to_str())
         .unwrap_or("eac").to_string();
     match crate::audio::build_segment_playlist(&cfg.segments, &tag) {
         Some(pl) => (pl.clone(), Some(pl)),
         None => (cfg.source_path.clone(), None),
     }
+}
+
+fn source_audio_start_s(cfg: &FisheyeExportConfig) -> f64 {
+    crate::x6_pair::plan_for(&cfg.source_path).map_or(0.0, |take| take.audio_source().1)
 }
 
 /// Finalize the audio of a source with a 4-channel ambisonic track (GoPro
@@ -526,6 +533,7 @@ fn finalize_eac_audio(
     let (audio_src, audio_tmp) = eac_audio_source(cfg);
     let drop_tmp = |t: &Option<PathBuf>| { if let Some(p) = t { std::fs::remove_file(p).ok(); } };
     let out = &cfg.output_path;
+    let src_offset_s = offset_s + source_audio_start_s(cfg);
 
     let stereo = |audio_tmp: &Option<PathBuf>| -> Result<()> {
         // (The X6's 360° Audio is decoded to a stereo temp here.)
@@ -543,7 +551,7 @@ fn finalize_eac_audio(
         AudioTrack::Ambisonic => match crate::audio::probe_spatial_4ch(&audio_src) {
             Ok(Some(info)) => {
                 let n = crate::audio::mux_video_with_audio_stream(
-                    &audio_src, video_tmp, out, offset_s, Some(dur_s),
+                    &audio_src, video_tmp, out, src_offset_s, Some(dur_s),
                     Some(info.stream_index))?;
                 drop_tmp(&audio_tmp);
                 if n > 0 {
@@ -568,7 +576,7 @@ fn finalize_eac_audio(
             {
                 let wav = video_tmp.with_extension("ambi.wav");
                 match crate::audio::extract_ambisonic_to_wav_window(
-                    &audio_src, &wav, offset_s, Some(dur_s)) {
+                    &audio_src, &wav, src_offset_s, Some(dur_s)) {
                     Ok(_) => {
                         let r = crate::helpers::spawn_apac_encode(
                             &wav, Some(video_tmp), out, 256_000);
@@ -792,6 +800,7 @@ fn finalize_braw_audio(
 /// the rendered temp.
 fn stereo_audio_source(cfg: &FisheyeExportConfig, t_in: f64, dur_s: f64) -> (PathBuf, Option<PathBuf>, f64) {
     let (src, tmp) = eac_audio_source(cfg);
+    let t_in = t_in + source_audio_start_s(cfg);
     if cfg.source_kind == SourceKind::KandaoQoocam {
         // Four raw microphone channels (`audio::QuadEncoder::stereo`)
         // → a stereo AAC temp for the export window, like the X6 below.
@@ -1024,7 +1033,7 @@ fn resolve_export_insv_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::D
     let path = cfg.segments.first().unwrap_or(&cfg.source_path);
     let probe = crate::decode::probe_video(path).ok();
     let (w, h) = probe.as_ref().map(|p| (p.width, p.height)).unwrap_or((3840, 3840));
-    let meta = match vr180_fisheye::insta360::read_insta360_meta(path) {
+    let meta = match crate::x6_pair::read_meta(path) {
         Ok(m) => m,
         Err(e) => {
             // No trailer: the generic X6 profile, placed by the recording

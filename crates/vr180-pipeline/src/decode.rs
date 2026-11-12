@@ -801,6 +801,9 @@ pub struct VideoProbe {
 /// [`probe_video`] on a parse miss.
 pub fn probe_duration_via_moov(path: &Path) -> Result<f64> {
     use std::io::{Read, Seek, SeekFrom};
+    if let Some(take) = crate::x6_pair::plan_for(path) {
+        return Ok(take.timeline.duration_s());
+    }
     let mut f = std::fs::File::open(path)?;
     let fsize = f.metadata()?.len();
     // Locate `moov` reading box headers only (seeks past the multi-GB `mdat`).
@@ -869,6 +872,9 @@ pub fn probe_duration_via_moov(path: &Path) -> Result<f64> {
 /// for DISPLAY duration; this is the right answer for MATH.
 pub fn probe_video_duration_via_moov(path: &Path) -> Result<f64> {
     use std::io::{Read, Seek, SeekFrom};
+    if let Some(take) = crate::x6_pair::plan_for(path) {
+        return Ok(take.timeline.duration_s());
+    }
     let mut f = std::fs::File::open(path)?;
     let fsize = f.metadata()?.len();
     // Locate `moov` reading box headers only (seek past the huge mdat).
@@ -977,6 +983,13 @@ fn nominal_or_average_fps(path: &Path, avg_fps: f32) -> f32 {
 }
 
 pub fn probe_video(path: &Path) -> Result<VideoProbe> {
+    if let Some(take) = crate::x6_pair::plan_for(path) {
+        return Ok(take.probe);
+    }
+    probe_video_file(path)
+}
+
+pub fn probe_video_file(path: &Path) -> Result<VideoProbe> {
     // Blackmagic RAW: not an ffmpeg format (ffprobe opens some files with
     // padded dimensions and fails on others) — the SDK helper's metadata is
     // the truth for size, rate and frame count, so every caller that sizes
