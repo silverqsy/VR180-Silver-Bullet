@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: **UNRELEASED on `main` (pushed 2026-11-11): Insta360 X6 7.4K / 7.4K Crop / 10K / 10K Crop recording modes + Crop mask + the few-dropped-frames rate fix (item 28) — Windows needs a build + a look at the masked shaders; spatial video export of the reframed view, macOS only (item 29) — Windows needs only a build (the change adds a codec choice that is never offered there).** **2.5.5 RELEASED 2026-11-07 on BOTH platforms — tag `v2.5.5` @ `90f11b7`, macOS and Windows live on the updater feed (item 27) — it ships everything since 2.5.2: X6 per-frame eye-exposure matching (item 15), GoPro exposure timing from SHUT (item 16), Kandao QooCam 3 Ultra (items 23/24), Blackmagic RAW rebuilt + on Windows (item 25), dropped-frame tables + pts-paced preview (item 26).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
+## ⚡ Status: **UNRELEASED on `main`: Insta360 X6 7.4K / 7.4K Crop / 10K / 10K Crop recording modes + Crop mask + the few-dropped-frames rate fix (item 28) — Windows BUILT + VERIFIED 2026-11-12 (every mode on every arm, the masked shaders on Vulkan / D3D11 zero-copy / DX12; an oversize-export note fixed there); spatial video export of the reframed view, macOS only (item 29) — builds on Windows, never offered there.** **2.5.5 RELEASED 2026-11-07 on BOTH platforms — tag `v2.5.5` @ `90f11b7`, macOS and Windows live on the updater feed (item 27) — it ships everything since 2.5.2: X6 per-frame eye-exposure matching (item 15), GoPro exposure timing from SHUT (item 16), Kandao QooCam 3 Ultra (items 23/24), Blackmagic RAW rebuilt + on Windows (item 25), dropped-frame tables + pts-paced preview (item 26).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -2015,6 +2015,68 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      marked ≈ where the container states none).
    - Open: multi-segment `.insv`; this unit's lens A sits ~1° off the
      shared IMU basis in roll (per-unit mount tolerance — not handled).
+   - **WINDOWS VERIFIED (2026-11-12, Windows box, RTX 4090, at `834094a`).**
+     Built clean first try — no compile error from the blind edits (the
+     12-vec4 uniform, `finalize_metadata`'s dropped argument in the three
+     Windows-only functions); tests braw 6 / core
+     57 / fisheye 61 / pipeline 103 / gui 14 (+ the two GPU-only zoom-still
+     tests of `834094a`, run with `--ignored`: both pass on the Vulkan
+     device). REGRESSION: the export matrix (OSV cpu / zc readback /
+     GPU-resident NVENC, `.360` NVENC, QooCam zc, the dropped-frame X6 017
+     on three arms) is byte-identical PER STREAM before and after the pull
+     (`scratchpad/vhash.py`: ffprobe packet pos + size → md5 of the bytes;
+     the bundled ffmpeg has no `md5` muxer), so the shared uniform struct
+     and the mask functions are a no-op for full-circle sources on every
+     Windows arm. MODES on the mac's samples (`W:\x6\1110`, fw v1.2.36;
+     gitignored `examples/x6_mode_probe`): 001–003 7.4K, 005 + 004 7.4K
+     Crop, 008 / 010 / 009 10K, 006 / 007 / 011 10K Crop — scale, origin,
+     readout fraction and the 6560 native-sharpness side read as documented.
+     Each mode through the portable loop, the D3D11 zero-copy readback arm
+     and the GPU-resident NVENC arm (`export_smoke`, 0.5 s, stab on): all
+     engage; cpu-vs-zc 1.224 (7.4K) / 0.347 (7.4K Crop) / 0.863 (10K) /
+     0.591 (10K Crop) per 255; NVENC 21 fps from 3712² sources, 9.5 fps from
+     4864² / 4912² (d3d11va budgets 11.6 GB for two 4912² streams — a 12 GB
+     card takes the item-11 software fallback). CROP FRAME + MASK
+     (`VR180_CROP_MASK=0.15,0.35,0.6` on 005 and 006): black outside the
+     frame with the corners kept; the mask's bounding box is the SAME in
+     both eyes (x 422..1114, y 432..1101 of 1536 on the 7.4K Crop) while the
+     unmasked frame edge differs by eye with the stabilizer; portable Vulkan
+     vs portable **DX12** (`VR180_BACKEND=dx12`, adapter "RTX 4090 [Dx12]")
+     0.206 / 0.250 per 255, portable vs zero-copy 0.214 / 0.271, zero-copy
+     vs GPU-resident 0.259 / 0.379 — naga → HLSL renders the masked kernels
+     the same. Fisheye output: masked identically in both eyes; reframed
+     view: 0 % black (edge repeated, mask skipped) on all three arms.
+     DROPPED FRAMES: 004 (2 missing) and 009 (8 missing = 0.44 %, inside the
+     old tolerance) probe at 59.940 / 29.970 and export 60 / 76 frames at
+     60000/1001 / 30000/1001 with ONE pts delta on all three arms. PREVIEW:
+     the app on 006 with a mask in the settings — "X6 recording mode
+     Crop10K", zero-copy d3d11 preview, the Mode / Bitrate rows and the Crop
+     mask sliders shown, the mask still while the picture plays under it at
+     30.0 fps (window captured with `PrintWindow` flag 2, which works on the
+     Vulkan swapchain even when occluded).
+     **NATIVE SHARPNESS 13120 × 6560 on Windows:** the GPU-resident arm
+     opens, NVENC refuses the frame (`avcodec_open2 … -40`), the readback
+     arm's `hevc_nvenc` refuses it too and `open_h265_encoder` lands on
+     libx265 — correct picture, Main10, ~0.5 fps. ProRes takes the size on
+     the GPU (`prores_ks_vulkan` ENGAGED, 3.7 fps). Two gaps FIXED there
+     (the same two also cover a 12K BRAW at its native size on Windows):
+     the NVENC → libx265 fallback only logged — it now appends an export-bar
+     note (`append_export_path_note`: "frame larger than the NVIDIA encoder
+     takes (8192 px) — CPU H.265 encode", or "NVENC unavailable — CPU H.265
+     encode"; a normal NVENC export still has no note and is byte-identical);
+     and the note under the Resolution list was the Mac's text on every
+     platform ("encodes in hardware" / "the Mac's hardware ProRes encoder
+     refuses the frame") — `app.rs::oversize_export_hint(codec, w, h)`
+     answers per platform now (Windows H.265 above 8192 a side: NVENC
+     refuses, libx265 takes over; Windows ProRes: no note; ≤ 8192 wide but
+     > 4096 lines: the Level 6.2 note), pinned by
+     `export_size_tests::oversize_hint_follows_the_platform_encoder` on both
+     platforms. TRAP: `export_smoke`'s own device has wgpu's DEFAULT limits
+     (8192 px textures), so a 13120-wide run "succeeds" with an invalid
+     compose texture and a 38 KB black file — set `VR180_USE_DEDICATED=1`
+     (the app's export device, 16384) for anything above 8192; the app is
+     not affected, but a GPU whose own limit is 8192 would be (the Sharp
+     size is offered regardless — open).
 
 29. **Spatial video export of the reframed view (2026-11-10, Mac only;
    UNRELEASED)** — `ExportCodec::Spatial` ("Spatial video (MV-HEVC)" in the
@@ -2128,6 +2190,11 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      them in Windows-only functions — edited without a Windows compile) and
      the slider under the Vision Pro metadata option are removed. What
      AVFoundation reads from an export is identical before and after.
+   - **WINDOWS (2026-11-12):** builds as is (the three `finalize_metadata`
+     call sites in Windows-only functions compile); the Spatial codec is
+     never offered (`spatial_video_available` is `cfg!(macos)`) and a
+     Spatial choice carried in settings runs as H.265 —
+     `spatial_export_tests` passes on Windows with the non-Mac expectations.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
