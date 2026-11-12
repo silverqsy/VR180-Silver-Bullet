@@ -337,6 +337,32 @@ pub struct App {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportCodec { H265, ProRes, Spatial }
 
+/// The note under the Resolution list for a video larger than 8192 × 4096:
+/// what the encoder that really runs on this platform does with the frame.
+///
+/// macOS: VideoToolbox HEVC encodes it in hardware (beyond Level 6.2), the
+/// hardware ProRes engine refuses it. Windows (measured on an RTX 4090 at
+/// 13120 × 6560): NVENC refuses a frame above 8192 a side, so H.265 lands on
+/// libx265 (~0.5 fps there); ProRes keeps its GPU encoder (`prores_ks_vulkan`,
+/// ~3.7 fps), so there is nothing to warn about.
+fn oversize_export_hint(codec: ExportCodec, w: u32, h: u32) -> Option<&'static str> {
+    const LEVEL: &str = "Above 8192 × 4096 the file exceeds HEVC Level 6.2 — it encodes in hardware, but most players cannot decode it.";
+    if w <= 8192 && h <= 4096 {
+        return None;
+    }
+    if cfg!(target_os = "macos") {
+        return Some(match codec {
+            ExportCodec::ProRes => "Above 8192 × 4096 the Mac's hardware ProRes encoder refuses the frame — the software encoder takes over (several times slower).",
+            ExportCodec::H265 | ExportCodec::Spatial => LEVEL,
+        });
+    }
+    match codec {
+        ExportCodec::ProRes => None,
+        ExportCodec::H265 | ExportCodec::Spatial if w > 8192 || h > 8192 => Some("Above 8192 pixels a side the NVIDIA hardware encoder (NVENC) refuses the frame — the software encoder (libx265) takes over, many times slower. The file also exceeds HEVC Level 6.2: most players cannot decode it."),
+        ExportCodec::H265 | ExportCodec::Spatial => Some(LEVEL),
+    }
+}
+
 /// Whether a clip with these settings can be exported as spatial video:
 /// macOS (the MV-HEVC encoder is VideoToolbox's), the reframed view (a flat
 /// frame with a known field of view), and Defish at 0 (a spatial video is
@@ -631,6 +657,37 @@ mod file_info_tests {
 #[cfg(test)]
 mod export_size_tests {
     use super::{App, ExportOptions, ExportResolution, X6ClipInfo};
+    use super::{oversize_export_hint, tr_zh, ExportCodec};
+
+    /// The note for an oversize video names the encoder that runs on this
+    /// platform: VideoToolbox takes the frame in hardware on a Mac, NVENC
+    /// refuses anything above 8192 a side, and Windows' GPU ProRes encoder
+    /// has no such limit.
+    #[test]
+    fn oversize_hint_follows_the_platform_encoder() {
+        for codec in [ExportCodec::H265, ExportCodec::ProRes] {
+            assert_eq!(oversize_export_hint(codec, 8192, 4096), None);
+            assert_eq!(oversize_export_hint(codec, 7680, 3840), None);
+        }
+        // A Crop clip's native-sharpness canvas and a 12K BRAW at its own size.
+        for (w, h) in [(13120, 6560), (12288, 6144)] {
+            let h265 = oversize_export_hint(ExportCodec::H265, w, h).expect("a note above 8192 wide");
+            let prores = oversize_export_hint(ExportCodec::ProRes, w, h);
+            if cfg!(target_os = "macos") {
+                assert!(h265.contains("encodes in hardware"), "{h265}");
+                assert!(prores.is_some_and(|s| s.contains("software encoder")));
+            } else {
+                assert!(h265.contains("NVENC") && h265.contains("libx265"), "{h265}");
+                assert_eq!(prores, None);
+            }
+            for note in [Some(h265), prores].into_iter().flatten() {
+                assert_ne!(tr_zh(note), note, "no Chinese text for: {note}");
+            }
+        }
+        // Taller than Level 6.2 allows but within every hardware encoder's frame.
+        let tall = oversize_export_hint(ExportCodec::H265, 8192, 4320).expect("a note above 4096 lines");
+        assert!(tall.contains("Level 6.2") && tall.contains("encodes in hardware"), "{tall}");
+    }
     use vr180_fisheye::{InsvWindowCrop, X6ViewChoice};
 
     fn eye_dims(resolution: ExportResolution, eye: u32, sharp_eye: Option<u32>) -> (u32, u32) {
@@ -1282,6 +1339,8 @@ fn tr_zh(en: &'static str) -> &'static str {
             => "超过 8192 × 4096 时 Mac 的硬件 ProRes 编码器不接受该画幅——改用软件编码器（慢数倍）。",
         "Above 8192 × 4096 the file exceeds HEVC Level 6.2 — it encodes in hardware, but most players cannot decode it."
             => "超过 8192 × 4096 时文件超出 HEVC Level 6.2——可用硬件编码，但多数播放器无法解码。",
+        "Above 8192 pixels a side the NVIDIA hardware encoder (NVENC) refuses the frame — the software encoder (libx265) takes over, many times slower. The file also exceeds HEVC Level 6.2: most players cannot decode it."
+            => "任一边超过 8192 像素时 NVIDIA 硬件编码器（NVENC）不接受该画幅——改用软件编码器（libx265），慢很多倍。文件同时超出 HEVC Level 6.2，多数播放器无法解码。",
         "Blackmagic RAW colour controls need the clip probe's colour block — rebuild the helper (helpers/braw/build_braw.sh)."
             => "Blackmagic RAW 调色控件需要探测结果中的颜色信息——请重新编译 helper（helpers/braw/build_braw.sh）。",
         // Matching Eyes (inter-eye trim)
@@ -4874,22 +4933,17 @@ impl App {
                 ui.label(RichText::new(tr("Native sharpness: the 180° canvas at the pixel density of the Crop frame's centre, so nothing recorded is scaled down. The clip's own size puts the same frame on a smaller canvas."))
                     .small().color(Color32::GRAY));
             }
-            // Beyond 8192×4096 (a 12K BRAW): Apple's hardware ProRes engine
-            // refuses the frame, so ProRes goes to the software encoder; HEVC
-            // encodes in hardware but exceeds Level 6.2 for most players.
+            // Beyond 8192×4096 (a 12K BRAW, a Crop clip's native-sharpness
+            // canvas): what the platform's encoder does with the frame —
+            // see `oversize_export_hint`.
             let out_dims = match opts.resolution {
                 ExportResolution::Native => native_dims,
                 ExportResolution::Sharp => sharp_dims,
                 ExportResolution::R8k => None,
             };
             if !is_still {
-                if let Some((w, h)) = out_dims {
-                    if w > 8192 || h > 4096 {
-                        ui.label(RichText::new(match codec_shown {
-                            ExportCodec::ProRes => tr("Above 8192 × 4096 the Mac's hardware ProRes encoder refuses the frame — the software encoder takes over (several times slower)."),
-                            ExportCodec::H265 | ExportCodec::Spatial => tr("Above 8192 × 4096 the file exceeds HEVC Level 6.2 — it encodes in hardware, but most players cannot decode it."),
-                        }).small().color(Color32::GRAY));
-                    }
+                if let Some(hint) = out_dims.and_then(|(w, h)| oversize_export_hint(codec_shown, w, h)) {
+                    ui.label(RichText::new(tr(hint)).small().color(Color32::GRAY));
                 }
             }
         }

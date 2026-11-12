@@ -68,6 +68,10 @@ own rolling-shutter time.
   (6560 pixels per eye). H.265 encodes it in hardware on Apple Silicon
   (about 10 fps on an M5 Max); it is beyond HEVC Level 6.2, so most players
   will not decode it, and ProRes at this size uses the software encoder.
+  On Windows it is the other way round: NVIDIA's encoder stops at 8192
+  pixels a side, so H.265 at this size is encoded in software (about half a
+  frame per second on a fast desktop), while ProRes stays on the GPU (about
+  4 fps on an RTX 4090).
 
 ### Spatial video export (macOS)
 
@@ -128,6 +132,14 @@ the total (`252.7 Mbps (126.6 + 126.0)`); where the container states none
 
 ### Fixes
 
+- **Windows: an export too large for the NVIDIA encoder says so.** Above
+  8192 pixels a side (a Crop clip's 13120 × 6560 canvas, a 12K Blackmagic
+  RAW clip at its own size) NVENC refuses the frame and the software H.265
+  encoder takes over, many times slower. That used to happen silently: the
+  note under the Resolution list was the Mac's ("encodes in hardware") and
+  the export bar showed nothing. The note now describes what the encoder
+  on this platform does, and the export bar names the fallback while it
+  runs.
 - **A clip that lost only a few frames exported slightly slow.** The
   nominal frame rate replaced the average only when the two differed by more
   than 0.5 %; a clip missing 8 frames in a minute sits inside that, so its

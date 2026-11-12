@@ -453,6 +453,16 @@ fn open_h265_encoder(
             tracing::warn!(
                 "fisheye_export: hevc_nvenc unavailable ({e}); falling back to libx265 (CPU)"
             );
+            // Users shouldn't need the log to know why the export is slow:
+            // say so in the export bar. On a machine that has the encoder the
+            // usual cause is the frame size — NVENC's HEVC encoder stops at
+            // 8192 pixels a side (a 13120 × 6560 Crop-clip canvas, a 12K BRAW
+            // at its native size).
+            append_export_path_note(if sbs_w > 8192 || sbs_h > 8192 {
+                "frame larger than the NVIDIA encoder takes (8192 px) — CPU H.265 encode"
+            } else {
+                "NVENC unavailable — CPU H.265 encode"
+            });
             H265Encoder::create_with_bit_depth(
                 video_tmp, sbs_w, sbs_h, fps, bitrate_kbps,
                 EncoderBackend::Libx265, bit_depth, prores_profile,
