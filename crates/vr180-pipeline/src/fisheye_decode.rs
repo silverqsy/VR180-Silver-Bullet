@@ -130,20 +130,6 @@ impl DualPacketPump {
         }
     }
 
-    /// Decode the next frame of slot `pos` into `out`. `Some(pts)` on success,
-    /// `None` once the stream is exhausted (after draining the decoder).
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    fn next_frame(
-        &mut self,
-        ictx: &mut ffmpeg_next::format::context::Input,
-        video_indices: &[usize; 2],
-        decoder: &mut ffmpeg_next::codec::decoder::Video,
-        pos: usize,
-        out: &mut ffmpeg_next::frame::Video,
-    ) -> Option<i64> {
-        self.frame_with(decoder, pos, out, |pump| pump.next_packet(ictx, video_indices, pos))
-    }
-
     fn frame_with(
         &mut self,
         decoder: &mut ffmpeg_next::codec::decoder::Video,
@@ -174,19 +160,6 @@ impl DualPacketPump {
                 }
             }
         }
-    }
-
-    /// Next PTS-matched frame pair `([stream0, stream1], pts0)`. When the two
-    /// streams disagree, the one that trails is advanced (a frame lost on one
-    /// stream costs one pair, never a permanent eye offset). `None` at EOF.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    fn next_pair(
-        &mut self,
-        ictx: &mut ffmpeg_next::format::context::Input,
-        video_indices: &[usize; 2],
-        decoders: &mut [ffmpeg_next::codec::decoder::Video],
-    ) -> Option<([ffmpeg_next::frame::Video; 2], i64)> {
-        self.pts_pair_with(decoders, |pump, decoder, pos, out| pump.next_frame(ictx, video_indices, decoder, pos, out))
     }
 
     fn pts_pair_with(
@@ -1594,8 +1567,7 @@ impl std::fmt::Debug for SharedFisheyePair {
 /// importer a single-plane RGBA16 instead. No CPU download, no swscale.
 #[cfg(target_os = "windows")]
 pub struct D3d11SharedDualStreamIter {
-    ictx: ffmpeg_next::format::context::Input,
-    video_indices: [usize; 2],
+    demux: DualDemux,
     decoders: Vec<ffmpeg_next::codec::decoder::Video>,
     /// Native decoded fisheye dims.
     native_w: u32,
@@ -1607,7 +1579,6 @@ pub struct D3d11SharedDualStreamIter {
     /// device), built lazily on the first frame.
     converters: [Option<crate::interop_windows::P010Converter>; 2],
     frames_yielded: u32,
-    time_base_s: f64,
     /// If true, output left = stream[1], right = stream[0] (DJI OSV
     /// convention; see `DualStreamFisheyeIter`).
     swap_eyes: bool,
@@ -1618,7 +1589,7 @@ pub struct D3d11SharedDualStreamIter {
 impl std::fmt::Debug for D3d11SharedDualStreamIter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("D3d11SharedDualStreamIter")
-            .field("video_indices", &self.video_indices)
+            .field("slots", &self.demux.slots)
             .field("native", &(self.native_w, self.native_h))
             .field("work", &(self.work_w, self.work_h))
             .field("swap_eyes", &self.swap_eyes)
@@ -1635,25 +1606,10 @@ impl D3d11SharedDualStreamIter {
     /// (so the caller can fall back to the CPU path) if there aren't two video
     /// streams or `d3d11va` can't attach to either stream.
     pub fn new(path: &Path, swap_eyes: bool, work_w: u32, work_h: u32, adapter_luid: Option<[u8; 8]>) -> Result<Self> {
-        ffmpeg_init();
-        let ictx = ffmpeg_next::format::input(path)
-            .map_err(|e| Error::Ffmpeg(format!("open {path:?}: {e}")))?;
-        let video_indices: Vec<usize> = ictx
-            .streams()
-            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
-            .map(|s| s.index())
-            .take(2)
-            .collect();
-        if video_indices.len() < 2 {
-            return Err(Error::Ffmpeg(format!(
-                "expected 2 video streams (OSV / dual-camera), found {}",
-                video_indices.len()
-            )));
-        }
-        let video_indices = [video_indices[0], video_indices[1]];
+        let demux = DualDemux::open(path)?;
         let mut decoders = Vec::with_capacity(2);
-        for &idx in video_indices.iter() {
-            let stream = ictx.stream(idx).unwrap();
+        for slot in 0..2 {
+            let stream = demux.stream(slot);
             let mut codec_ctx =
                 ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
                     .map_err(|e| Error::Ffmpeg(format!("codec ctx: {e}")))?;
@@ -1670,8 +1626,6 @@ impl D3d11SharedDualStreamIter {
                 "OSV zero-copy streams disagree on dims: {w0}x{h0} vs {w1}x{h1}"
             )));
         }
-        let time_base = ictx.stream(video_indices[0]).unwrap().time_base();
-        let time_base_s = time_base.numerator() as f64 / time_base.denominator() as f64;
         let work_w = work_w.clamp(2, w0);
         let work_h = work_h.clamp(2, h0);
         tracing::info!(
@@ -1679,12 +1633,11 @@ impl D3d11SharedDualStreamIter {
             w0, h0, work_w, work_h, swap_eyes
         );
         Ok(Self {
-            ictx, video_indices, decoders,
+            demux, decoders,
             native_w: w0, native_h: h0,
             work_w, work_h,
             converters: [None, None],
             frames_yielded: 0,
-            time_base_s,
             swap_eyes,
             pump: DualPacketPump::default(),
         })
@@ -1696,9 +1649,7 @@ impl D3d11SharedDualStreamIter {
     pub fn native_dims(&self) -> (u32, u32) { (self.native_w, self.native_h) }
 
     pub fn seek(&mut self, target_s: f64) -> Result<()> {
-        let ts = (target_s.max(0.0) * 1_000_000.0) as i64;
-        self.ictx.seek(ts, ..ts)
-            .map_err(|e| Error::Ffmpeg(format!("seek {target_s:.3}s: {e}")))?;
+        self.demux.seek(target_s)?;
         for d in &mut self.decoders {
             d.flush();
         }
@@ -1713,12 +1664,10 @@ impl D3d11SharedDualStreamIter {
     /// at EOF.
     pub fn next_pair(&mut self) -> Result<Option<SharedFisheyePair>> {
         // Per-stream staged packets + PTS-matched pairing (see DualPacketPump).
-        let Some(([f0, f1], pts0)) =
-            self.pump.next_pair(&mut self.ictx, &self.video_indices, &mut self.decoders)
+        let Some(([f0, f1], pts_s)) = self.pump.pair_for(&mut self.demux, &mut self.decoders)
         else {
             return Ok(None);
         };
-        let pts_s = pts0 as f64 * self.time_base_s;
 
         // Convert each eye P010 → shareable RGBA16 (D3D11-side YCbCr→RGB +
         // downscale, then NT-handle share). After this the source frames can
