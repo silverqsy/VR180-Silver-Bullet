@@ -136,6 +136,16 @@ the total (`252.7 Mbps (126.6 + 126.0)`); where the container states none
 - An `.insv` whose trailer cannot be read still opens with the generic X6
   lens profile placed for its recording mode (no gyro, so no stabilization)
   instead of being stretched to the full lens.
+- **The zoomed-in still of a source whose eyes are not square.** It was
+  projected at the source frame's own shape, and the preview is laid out
+  from the picture it is given. A side-by-side file of 8192 × 4320 (two
+  4096 × 4320 eyes) changed proportions when the still replaced the live
+  preview. A single-lens 12K Blackmagic RAW clip (one 12288 × 6480 eye)
+  asked for a 24576-pixel-wide picture, more than the GPU holds, so its
+  still never appeared in the side-by-side view. Each eye of the still is
+  square now, like the preview and the export, and no larger than two can
+  sit side by side on the GPU (8192 pixels on current hardware). Stereo
+  Blackmagic RAW clips were not affected: their eyes are already square.
 - **VR180 metadata no longer carries a camera baseline**, and its slider
   is gone from the Vision Pro option. The box the app wrote was not where
   Apple's format puts it nor in its layout, so readers skipped it: the

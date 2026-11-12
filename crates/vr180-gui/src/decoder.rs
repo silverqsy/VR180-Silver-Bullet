@@ -872,12 +872,16 @@ impl ReframeAspect {
 /// Minimum per-eye width of a reframed live preview (see `preview_out_dims`).
 pub(crate) const REFRAME_PREVIEW_MIN_W: u32 = 1920;
 
-/// Per-eye preview dimensions for an output mode, from the worker's
-/// square working size: half-equirect keeps it, the fisheye disk is
-/// square, a reframed view keeps the width and follows its aspect.
+/// Per-eye preview dimensions for an output mode, from a working size (the
+/// worker's square one, or a source frame's own for a still): half-equirect
+/// and the fisheye disk are square, a reframed view keeps the width and
+/// follows its aspect.
 pub(crate) fn preview_out_dims(mode: FisheyeOutputMode, aspect: ReframeAspect, eye_w: u32, eye_h: u32) -> (u32, u32) {
     match mode {
-        FisheyeOutputMode::HalfEquirect => (eye_w, eye_h),
+        // 180° × 180° per eye: square whatever the shape of the source
+        // frame (a still projected at the source's own size would otherwise
+        // take a 3:2 frame's shape, and the preview is laid out from it).
+        FisheyeOutputMode::HalfEquirect => { let side = eye_w.max(eye_h); (side, side) }
         FisheyeOutputMode::Fisheye => { let side = eye_w.min(eye_h); (side, side) }
         FisheyeOutputMode::Reframe => {
             // A viewport of a few tens of degrees needs more output pixels
@@ -6005,6 +6009,28 @@ fn compute_stab_for(
 /// Project + compose ONE already-decoded native fisheye pair into an SBS
 /// texture using the current settings. Re-runs the same calib / stab /
 /// RS / view-adjust / color path as the live preview, at native res.
+/// The widest eye a still may have: the composed picture holds two eyes
+/// side by side in ONE texture, so half the device's texture limit (8192
+/// where the limit is 16384).
+fn still_eye_limit(pipeline: &Device) -> u32 {
+    (pipeline.device.limits().max_texture_dimension_2d / 2).max(16)
+}
+
+/// Size of a still projected from a `src_w × src_h` source frame, before
+/// the output mode shapes it (`preview_out_dims`): `(equirect eye w, h,
+/// fisheye disk side)`. `out_cap` bounds the longer side (`0` = the
+/// source's own size) and `eye_limit` bounds it in any case: a single-lens
+/// 12K frame is 12288 across, and two such eyes side by side are more than
+/// a texture can hold — that still was never drawn.
+fn still_base_dims(src_w: u32, src_h: u32, out_cap: u32, eye_limit: u32) -> (u32, u32, u32) {
+    let cap = if out_cap == 0 { eye_limit } else { out_cap.min(eye_limit) };
+    let proj_scale = (cap as f32 / src_w.max(src_h).max(1) as f32).min(1.0);
+    let oeq_w = ((src_w as f32 * proj_scale).round() as u32).max(16);
+    let oeq_h = ((src_h as f32 * proj_scale).round() as u32).max(16);
+    let oside = ((src_w.min(src_h) as f32 * proj_scale).round() as u32).max(16);
+    (oeq_w, oeq_h, oside)
+}
+
 fn render_still_from_pair(
     pipeline: &Device,
     kind: vr180_pipeline::SourceKind,
@@ -6028,11 +6054,7 @@ fn render_still_from_pair(
     // full-detail. Because both come from THIS same projection of the same
     // cached frame, the low-res and full-res stills are pixel-aligned and
     // never jump when one replaces the other.
-    let cap = if out_cap == 0 { u32::MAX } else { out_cap };
-    let proj_scale = (cap as f32 / src_w.max(src_h).max(1) as f32).min(1.0);
-    let oeq_w = ((src_w as f32 * proj_scale).round() as u32).max(16);
-    let oeq_h = ((src_h as f32 * proj_scale).round() as u32).max(16);
-    let oside = (((src_w.min(src_h)) as f32 * proj_scale).round() as u32).max(16);
+    let (oeq_w, oeq_h, oside) = still_base_dims(src_w, src_h, out_cap, still_eye_limit(pipeline));
 
     let dt = 1.0 / fps as f64;
     let stab_idx = vr180_pipeline::frame_timeline::stab_row(timeline, pair.pts_s, dt, 0);
@@ -6494,3 +6516,93 @@ pub(crate) fn build_per_eye_frames_multi(
     }).collect())
 }
 
+#[cfg(test)]
+mod preview_dims_tests {
+    use super::*;
+
+    /// The preview is laid out from the composed texture's shape, so an eye
+    /// projected at a source frame's own size must still come out in the
+    /// output's shape: square for 180° × 180°, the chosen aspect when
+    /// reframed, never the 3:2 of the frame it was decoded from.
+    #[test]
+    fn output_shape_does_not_follow_the_source_frame() {
+        for (w, h) in [(6000, 4000), (4096, 4320), (6144, 6480), (896, 592), (1536, 1536)] {
+            let side = w.max(h);
+            assert_eq!(preview_out_dims(FisheyeOutputMode::HalfEquirect, ReframeAspect::Square, w, h), (side, side));
+            let (fw, fh) = preview_out_dims(FisheyeOutputMode::Fisheye, ReframeAspect::Square, w, h);
+            assert_eq!((fw, fh), (w.min(h), w.min(h)));
+            let (rw, rh) = preview_out_dims(FisheyeOutputMode::Reframe, ReframeAspect::Square, w, h);
+            assert_eq!(rw, rh);
+            let (ww, wh) = preview_out_dims(FisheyeOutputMode::Reframe, ReframeAspect::Wide, w, h);
+            assert!((ww as f32 / wh as f32 - 16.0 / 9.0).abs() < 0.01, "{ww}x{wh}");
+        }
+    }
+
+    /// A still keeps its source's own size up to what two eyes side by side
+    /// can occupy in one texture, and is scaled down as a whole beyond it.
+    #[test]
+    fn still_size_stops_at_what_the_gpu_can_compose() {
+        let limit = 8192;
+        // (source eye, expected half-equirect eye side)
+        for ((w, h), side) in [((6144, 6144), 6144), ((7680, 7680), 7680), ((8160, 8160), 8160),
+                               ((4096, 4320), 4320), ((12288, 6480), 8192), ((12288, 5112), 8192)] {
+            let (ew, eh, disk) = still_base_dims(w, h, 0, limit);
+            assert!(ew <= limit && eh <= limit, "{w}x{h} -> {ew}x{eh}");
+            assert_eq!(preview_out_dims(FisheyeOutputMode::HalfEquirect, ReframeAspect::Square, ew, eh), (side, side));
+            assert_eq!(disk, ew.min(eh));
+            // The frame's own proportions survive the scaling.
+            assert!((ew as f32 / eh as f32 - w as f32 / h as f32).abs() < 0.01);
+            let (rw, _) = preview_out_dims(FisheyeOutputMode::Reframe, ReframeAspect::Wide, ew, eh);
+            assert!(rw <= limit);
+        }
+        // An explicit cap (the quick still while dragging) still applies below the limit.
+        assert_eq!(still_base_dims(7680, 7680, 2048, limit), (2048, 2048, 2048));
+        assert_eq!(still_base_dims(12288, 6480, 20000, limit).0, 8192);
+    }
+
+    /// A single-lens 12K frame (12288 × 6480, one eye) at full size, side by
+    /// side: the composed still must fit the device and raise no GPU error.
+    /// Needs a GPU and about 2 GB.
+    #[test]
+    #[ignore]
+    fn zoom_still_of_a_single_lens_12k_frame_fits_the_device() {
+        let pipeline = Device::new().expect("a GPU device");
+        vr180_pipeline::gpu::clear_gpu_error();
+        let (w, h) = (12288u32, 6480u32);
+        let pair = vr180_pipeline::fisheye_decode::FisheyePair {
+            left: vec![128u8; (w * h * 4) as usize], right: vec![128u8; (w * h * 4) as usize],
+            eye_w: w, eye_h: h, bit_depth: 8, pts_s: 0.0, gpu: None,
+        };
+        let mut s = Settings::default();
+        s.fisheye_output_mode = FisheyeOutputMode::HalfEquirect;
+        s.preview_mode = PreviewMode::Sbs;
+        let out = render_still_from_pair(
+            &pipeline, vr180_pipeline::SourceKind::SbsFisheye, &s, 30.0, &pair, None, None, 0, None, None);
+        let _ = pipeline.device.poll(wgpu::PollType::wait_indefinitely());
+        assert_eq!(vr180_pipeline::gpu::last_gpu_error(), None, "GPU error while rendering the still");
+        let (_tex, ow, oh) = out.expect("render").expect("a still");
+        let max = pipeline.device.limits().max_texture_dimension_2d;
+        assert!(ow <= max && oh <= max, "{ow}x{oh} against a limit of {max}");
+        assert_eq!(ow, 2 * oh, "two square eyes");
+    }
+
+    /// The zoom still of a 3:2 source frame, through the real projection and
+    /// compose passes: two square eyes side by side. Needs a GPU.
+    #[test]
+    #[ignore]
+    fn zoom_still_of_a_non_square_frame_is_two_square_eyes() {
+        let pipeline = Device::new().expect("a GPU device");
+        let (w, h) = (600u32, 400u32);
+        let pair = vr180_pipeline::fisheye_decode::FisheyePair {
+            left: vec![128u8; (w * h * 4) as usize], right: vec![128u8; (w * h * 4) as usize],
+            eye_w: w, eye_h: h, bit_depth: 8, pts_s: 0.0, gpu: None,
+        };
+        let mut s = Settings::default();
+        s.fisheye_output_mode = FisheyeOutputMode::HalfEquirect;
+        s.preview_mode = PreviewMode::Sbs;
+        let (_tex, ow, oh) = render_still_from_pair(
+            &pipeline, vr180_pipeline::SourceKind::Insta360Insv, &s, 30.0, &pair, None, None, 0, None, None,
+        ).expect("render").expect("a still");
+        assert_eq!((ow, oh), (2 * w, w), "side by side: 2:1, each eye square");
+    }
+}
