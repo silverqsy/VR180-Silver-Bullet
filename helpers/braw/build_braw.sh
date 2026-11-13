@@ -34,20 +34,25 @@ HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN_DIR="$HELPERS_DIR/bin"
 mkdir -p "$BIN_DIR"
 
+# Oldest macOS the helper must start on: the floor the app's bundled
+# libraries already set. Without it the helper is built for this machine's
+# own macOS and cannot start on an older one.
+MIN_MACOS=26.0
+
 echo "Compiling braw_helper..."
 OBJ="$(mktemp -d)"
 # The helper itself is plain C++ (the SDK dispatch source is included into
 # this one translation unit only); the zero-copy pool is Objective-C++
 # (Metal + IOSurface) under ARC.
-clang++ -std=c++17 -O2 -c \
+clang++ -std=c++17 -O2 -mmacosx-version-min="$MIN_MACOS" -c \
     "$SCRIPT_DIR/braw_helper.cpp" \
     -I"$SDK_INCLUDE" \
     -include "$SDK_INCLUDE/BlackmagicRawAPIDispatch.cpp" \
     -o "$OBJ/braw_helper.o"
-clang++ -std=c++17 -O2 -fobjc-arc -c \
+clang++ -std=c++17 -O2 -fobjc-arc -mmacosx-version-min="$MIN_MACOS" -c \
     "$SCRIPT_DIR/braw_zc.mm" \
     -o "$OBJ/braw_zc.o"
-clang++ "$OBJ/braw_helper.o" "$OBJ/braw_zc.o" \
+clang++ -mmacosx-version-min="$MIN_MACOS" "$OBJ/braw_helper.o" "$OBJ/braw_zc.o" \
     -F"$SDK_LIBS" \
     -rpath "$SDK_LIBS" \
     -framework BlackmagicRawAPI \

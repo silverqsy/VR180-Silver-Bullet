@@ -43,7 +43,7 @@ frameworks_for() {
 # newer than the user's system are bound at launch, so it cannot start there.
 min_macos_for() {
     case "$1" in
-        mvhevc_encode) echo 14.0 ;;
+        mvhevc_encode|apac_encode) echo 14.0 ;;
         *) echo "" ;;
     esac
 }
