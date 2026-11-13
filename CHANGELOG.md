@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.5.6 — 2026-11-13
 
 ### Insta360 X6: 7.4K, 10K and their Crop recording modes
 
