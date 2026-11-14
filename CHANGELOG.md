@@ -64,11 +64,18 @@ sensor recorded, ahead of the tone controls and the LUT.
   scale, and uses FFmpeg's exact arithmetic on a threaded context. Flat
   test colours come back code for code through every 10-bit path and
   through the 8-bit software one, and the software exports are faster for
-  it (10-bit H.265 in software: 1.8×). The default paths on macOS
-  (VideoToolbox, decode and encode on the GPU) never went through any of
-  this. What remains: an 8-bit export through VideoToolbox is 0.4 of a
-  code low, in Apple's own RGB conversion; and the working-size preview of
-  a CPU-decoded source still uses the fast conversion.
+  it (10-bit H.265 in software: 1.8×).
+
+  On macOS the live preview and the VideoToolbox exports decode and encode
+  on the GPU and never went through any of this. The **paused
+  full-resolution still** did (the magnifier's picture, and what Snapshot
+  saves): it is decoded on the CPU for every camera, and for a 10-bit
+  source it was 1.8 of 255 darker than the live preview of the same
+  moment. The two now agree to 0.02.
+
+  What remains: an 8-bit export through VideoToolbox is 0.4 of a code low,
+  in Apple's own RGB conversion; and the working-size preview of a
+  CPU-decoded source still uses the fast conversion.
 - **A queued export waited for the window to be seen.** With the app's
   window minimised, or completely covered by another one, the clip being
   exported finished, but the next one in the queue did not start, and the
