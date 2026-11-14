@@ -513,6 +513,7 @@ pub struct Insta360Meta {
     pub gyro_range_dps: Option<u32>,
     pub acc_range_g: Option<u32>,
     pub single_lens: bool,
+    pub back_to_back: bool,
 }
 
 impl Insta360Meta {
@@ -969,6 +970,7 @@ mod single_lens_tests {
         let mut meta = Insta360Meta::default();
         parse_identity(&bytes, &mut meta);
         assert!(meta.single_lens && meta.lenses.len() == 1);
+        assert!(!meta.back_to_back);
         assert!(parse_calib_string("1_2.4_7210").is_none());
         assert!(parse_calib_string(&ONE.replacen("1_", "3_", 1)).is_none());
     }
