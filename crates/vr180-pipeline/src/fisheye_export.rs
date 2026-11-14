@@ -541,6 +541,72 @@ fn grade_eyes_16(
     Ok((l.unwrap_or_else(|| left.clone()), r.unwrap_or_else(|| right.clone())))
 }
 
+/// A frame's two eyes into the hardware encoder as a 10-bit surface (macOS):
+/// composed into a new one of the encoder's layout (P210, true 4:2:2, for
+/// ProRes; P010 for HEVC Main10) and handed over `copies` times. `mono`:
+/// the left eye alone is the frame. Returns once the surface is written.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_wide_surface(
+    pipeline: &Device,
+    encoder: &mut ExportEncoder,
+    left: &wgpu::Texture,
+    right: &wgpu::Texture,
+    eye_w: u32, eye_h: u32,
+    sbs_w: u32, sbs_h: u32,
+    mono: bool,
+    p210: bool,
+    copies: u64,
+) -> Result<()> {
+    let surface = if p210 {
+        crate::interop_macos::create_p210_encode_buffer(&pipeline.device, sbs_w, sbs_h)?
+    } else {
+        crate::interop_macos::create_p010_encode_buffer(&pipeline.device, sbs_w, sbs_h)?
+    };
+    match (mono, p210) {
+        (true, true) => pipeline.compose_eye_to_p210(left, &surface, eye_w, eye_h)?,
+        (true, false) => pipeline.compose_eye_to_p010(left, &surface, eye_w, eye_h)?,
+        (false, true) => pipeline.compose_sbs_to_p210(left, right, &surface, eye_w, eye_h)?,
+        (false, false) => pipeline.compose_sbs_to_p010(left, right, &surface, eye_w, eye_h)?,
+    }
+    for _ in 0..copies {
+        encoder.encode_pixel_buffer_p010(&surface)?;
+    }
+    Ok(())
+}
+
+/// A frame's two eyes into the hardware encoder as an 8-bit BGRA surface
+/// (macOS), `copies` times. The colour stack of `plan` runs fused with the
+/// store (an identity plan when the eyes are graded already), with the
+/// automatic eye-exposure match when `eye_match` carries its state. `mono`:
+/// the left eye alone is the frame, and nothing is matched.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_bgra_surface(
+    pipeline: &Device,
+    encoder: &mut ExportEncoder,
+    left: &wgpu::Texture,
+    right: &wgpu::Texture,
+    eye_w: u32, eye_h: u32,
+    sbs_w: u32, sbs_h: u32,
+    mono: bool,
+    plan: &ColorStackPlan,
+    eye_match: Option<(&crate::gpu::EyeMatchState, EyeMatchFrame)>,
+    copies: u64,
+) -> Result<()> {
+    let surface = crate::interop_macos::create_bgra_encode_buffer(&pipeline.device, sbs_w, sbs_h)?;
+    if mono {
+        pipeline.apply_color_stack_to_eye_bgra(left, &surface.wgpu_tex, eye_w, eye_h, plan)?;
+    } else {
+        pipeline.apply_color_stack_to_sbs_bgra_matched(
+            left, right, &surface.wgpu_tex, eye_w, eye_h, plan, eye_match)?;
+    }
+    for _ in 0..copies {
+        encoder.encode_pixel_buffer(&surface)?;
+    }
+    Ok(())
+}
+
 /// After the encoder closes the temp video file, mux the source's
 /// audio track onto it. When the source has no audio we just rename
 /// the temp into place. Caller already passed `final_out` to the GUI;
@@ -1827,19 +1893,10 @@ fn export_fisheye_inner(
             #[cfg(target_os = "macos")]
             {
                 let (left_tex, right_tex) = project_8((rs_rows_l.as_deref(), rs_rows_r.as_deref()))?;
-                let encode_pb = crate::interop_macos::create_bgra_encode_buffer(
-                    &pipeline.device, sbs_w, sbs_h,
+                encode_bgra_surface(
+                    &pipeline, &mut encoder, &left_tex, &right_tex, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
+                    mono, &color_plan, eye_match(), fill.copies(),
                 )?;
-                if mono {
-                    pipeline.apply_color_stack_to_eye_bgra(
-                        &left_tex, &encode_pb.wgpu_tex, cfg.eye_w, cfg.eye_h, &color_plan)?;
-                } else {
-                    pipeline.apply_color_stack_to_sbs_bgra_matched(
-                        &left_tex, &right_tex, &encode_pb.wgpu_tex,
-                        cfg.eye_w, cfg.eye_h, &color_plan, eye_match(),
-                    )?;
-                }
-                for _ in 0..fill.copies() { encoder.encode_pixel_buffer(&encode_pb)?; }
             }
             #[cfg(not(target_os = "macos"))]
             { let _ = identity_plan; unreachable!(); }
@@ -1857,24 +1914,10 @@ fn export_fisheye_inner(
                 let (l_final, r_final) = grade_eyes_16(
                     &pipeline, &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan, eye_match(), mono,
                 )?;
-                let (l_final, r_final) = (&l_final, &r_final);
-                // ProRes gets a P210 (true 4:2:2) surface; HEVC Main10 P010.
-                let encode_pb = if is_prores_vt {
-                    crate::interop_macos::create_p210_encode_buffer(
-                        &pipeline.device, sbs_w, sbs_h)?
-                } else {
-                    crate::interop_macos::create_p010_encode_buffer(
-                        &pipeline.device, sbs_w, sbs_h)?
-                };
-                match (mono, is_prores_vt) {
-                    (true, true) => pipeline.compose_eye_to_p210(l_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
-                    (true, false) => pipeline.compose_eye_to_p010(l_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
-                    (false, true) => pipeline.compose_sbs_to_p210(
-                        l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
-                    (false, false) => pipeline.compose_sbs_to_p010(
-                        l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
-                }
-                for _ in 0..fill.copies() { encoder.encode_pixel_buffer_p010(&encode_pb)?; }
+                encode_wide_surface(
+                    &pipeline, &mut encoder, &l_final, &r_final, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
+                    mono, is_prores_vt, fill.copies(),
+                )?;
             }
             #[cfg(not(target_os = "macos"))]
             { let _ = identity_plan; unreachable!(); }
@@ -2557,29 +2600,16 @@ fn export_eac_zerocopy_vt(
                 &right, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false))?;
             let l_final = left_g.as_ref().unwrap_or(&left);
             let r_final = right_g.as_ref().unwrap_or(&right);
-            let encode_pb = if is_prores_vt {
-                crate::interop_macos::create_p210_encode_buffer(
-                    &pipeline.device, sbs_w, sbs_h)?
-            } else {
-                crate::interop_macos::create_p010_encode_buffer(
-                    &pipeline.device, sbs_w, sbs_h)?
-            };
-            if is_prores_vt {
-                pipeline.compose_sbs_to_p210(
-                    l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
-            } else {
-                pipeline.compose_sbs_to_p010(
-                    l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
-            }
-            encoder.encode_pixel_buffer_p010(&encode_pb)?;
+            encode_wide_surface(
+                &pipeline, &mut encoder, l_final, r_final, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
+                false, is_prores_vt, 1,
+            )?;
         } else {
             // Color stack fused into the BGRA compose.
-            let encode_pb = crate::interop_macos::create_bgra_encode_buffer(
-                &pipeline.device, sbs_w, sbs_h)?;
-            pipeline.apply_color_stack_to_sbs_bgra(
-                &left, &right, &encode_pb.wgpu_tex,
-                cfg.eye_w, cfg.eye_h, &color_plan)?;
-            encoder.encode_pixel_buffer(&encode_pb)?;
+            encode_bgra_surface(
+                &pipeline, &mut encoder, &left, &right, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
+                false, &color_plan, None, 1,
+            )?;
         }
 
         drop(pair);
@@ -3339,36 +3369,15 @@ fn export_fisheye_osv_zerocopy_p010(
         // plan (no re-grade — the 16→8 downconvert happens in the
         // compose), then Main encode.
         if ten_bit {
-            let encode_pb = if is_prores {
-                crate::interop_macos::create_p210_encode_buffer(
-                    &pipeline.device, sbs_w, sbs_h)?
-            } else {
-                crate::interop_macos::create_p010_encode_buffer(
-                    &pipeline.device, sbs_w, sbs_h)?
-            };
-            match (mono, is_prores) {
-                (true, true) => pipeline.compose_eye_to_p210(l_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
-                (true, false) => pipeline.compose_eye_to_p010(l_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
-                (false, true) => pipeline.compose_sbs_to_p210(
-                    l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
-                (false, false) => pipeline.compose_sbs_to_p010(
-                    l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
-            }
-            for _ in 0..fill.copies() { encoder.encode_pixel_buffer_p010(&encode_pb)?; }
-        } else {
-            let encode_pb = crate::interop_macos::create_bgra_encode_buffer(
-                &pipeline.device, sbs_w, sbs_h,
+            encode_wide_surface(
+                &pipeline, &mut encoder, l_final, r_final, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
+                mono, is_prores, fill.copies(),
             )?;
-            if mono {
-                pipeline.apply_color_stack_to_eye_bgra(
-                    l_final, &encode_pb.wgpu_tex, cfg.eye_w, cfg.eye_h, &ColorStackPlan::default())?;
-            } else {
-                pipeline.apply_color_stack_to_sbs_bgra(
-                    l_final, r_final, &encode_pb.wgpu_tex,
-                    cfg.eye_w, cfg.eye_h, &ColorStackPlan::default(),
-                )?;
-            }
-            for _ in 0..fill.copies() { encoder.encode_pixel_buffer(&encode_pb)?; }
+        } else {
+            encode_bgra_surface(
+                &pipeline, &mut encoder, l_final, r_final, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
+                mono, &ColorStackPlan::default(), None, fill.copies(),
+            )?;
         }
 
         // Drop decode + compose textures so the IOSurface retains
