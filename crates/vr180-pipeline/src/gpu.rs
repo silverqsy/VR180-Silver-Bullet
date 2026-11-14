@@ -1121,7 +1121,7 @@ impl FisheyeToHequirectPipeline {
     fn create(device: &wgpu::Device) -> Self {
         Self::create_for_format_with_wgsl(
             device, wgpu::TextureFormat::Rgba8Unorm,
-            "fisheye_to_hequirect_8bit", FISHEYE_TO_HEQUIRECT_WGSL,
+            "fisheye_to_hequirect_8bit", &FisheyeKernel::new(false, false, false).wgsl(),
         )
     }
 
@@ -1131,7 +1131,7 @@ impl FisheyeToHequirectPipeline {
     fn create_16bit(device: &wgpu::Device) -> Self {
         Self::create_for_format_with_wgsl(
             device, wgpu::TextureFormat::Rgba16Unorm,
-            "fisheye_to_hequirect_16bit", FISHEYE_TO_HEQUIRECT_WGSL,
+            "fisheye_to_hequirect_16bit", &FisheyeKernel::new(false, false, false).wgsl(),
         )
     }
 
@@ -1142,7 +1142,7 @@ impl FisheyeToHequirectPipeline {
     fn create_fisheye_out(device: &wgpu::Device) -> Self {
         Self::create_for_format_with_wgsl(
             device, wgpu::TextureFormat::Rgba8Unorm,
-            "fisheye_to_fisheye_8bit", FISHEYE_TO_FISHEYE_WGSL,
+            "fisheye_to_fisheye_8bit", &FisheyeKernel::new(false, false, true).wgsl(),
         )
     }
 
@@ -1151,7 +1151,7 @@ impl FisheyeToHequirectPipeline {
     fn create_fisheye_out_16(device: &wgpu::Device) -> Self {
         Self::create_for_format_with_wgsl(
             device, wgpu::TextureFormat::Rgba16Unorm,
-            "fisheye_to_fisheye_16bit", FISHEYE_TO_FISHEYE_16_WGSL,
+            "fisheye_to_fisheye_16bit", &FisheyeKernel::new(false, false, true).wgsl(),
         )
     }
 
@@ -1161,11 +1161,8 @@ impl FisheyeToHequirectPipeline {
         label_suffix: &str,
         wgsl_src: &str,
     ) -> Self {
-        // For the legacy "rgba8unorm" → "rgba16unorm" auto-swap path
-        // (used by `create_16bit`) we templated the storage-texture
-        // format at runtime. The shader_out variants ship already-typed
-        // WGSL files, so the swap is a no-op for them but kept inline
-        // for consistency.
+        // An RGBA build of the kernel stores `rgba8unorm`; the 16-bit
+        // pipelines swap the storage-texture format in the composed text.
         let wgsl = if out_format == wgpu::TextureFormat::Rgba16Unorm {
             wgsl_src.replace("rgba8unorm, write", "rgba16unorm, write")
         } else {
@@ -1268,7 +1265,7 @@ impl FisheyeP010ToHequirectPipeline {
     /// per-frame rotation, per-eye KB calib.
     fn create(device: &wgpu::Device) -> Self {
         Self::create_with_shader(
-            device, "fisheye_p010_to_hequirect", FISHEYE_P010_TO_HEQUIRECT_WGSL,
+            device, "fisheye_p010_to_hequirect", &FisheyeKernel::new(true, false, false).wgsl(),
         )
     }
 
@@ -1276,7 +1273,7 @@ impl FisheyeP010ToHequirectPipeline {
     /// Equidistant output, KB source projection.
     fn create_fisheye_out(device: &wgpu::Device) -> Self {
         Self::create_with_shader(
-            device, "fisheye_p010_to_fisheye_16", FISHEYE_P010_TO_FISHEYE_16_WGSL,
+            device, "fisheye_p010_to_fisheye_16", &FisheyeKernel::new(true, false, true).wgsl(),
         )
     }
 
@@ -1481,14 +1478,14 @@ impl FisheyeToHequirectRsPipeline {
     /// uniform, per-row R storage buffer.
     fn create(device: &wgpu::Device) -> Self {
         Self::create_with_shader(
-            device, "fisheye_to_hequirect_rs", FISHEYE_TO_HEQUIRECT_RS_WGSL,
+            device, "fisheye_to_hequirect_rs", &FisheyeKernel::new(false, true, false).wgsl(),
         )
     }
 
     /// RS-aware RGBA fisheye → stabilized fisheye output (preview).
     fn create_fisheye_out(device: &wgpu::Device) -> Self {
         Self::create_with_shader(
-            device, "fisheye_to_fisheye_rs", FISHEYE_TO_FISHEYE_RS_WGSL,
+            device, "fisheye_to_fisheye_rs", &FisheyeKernel::new(false, true, true).wgsl(),
         )
     }
 
@@ -1497,7 +1494,7 @@ impl FisheyeToHequirectRsPipeline {
     /// storage format swapped to `rgba16unorm` at runtime (the `create_16bit`
     /// trick), so the RS-corrected fisheye eye stays 16-bit through compose.
     fn create_fisheye_out_16bit(device: &wgpu::Device) -> Self {
-        let wgsl = FISHEYE_TO_FISHEYE_RS_WGSL.replace("rgba8unorm, write", "rgba16unorm, write");
+        let wgsl = FisheyeKernel::new(false, true, true).wgsl().replace("rgba8unorm, write", "rgba16unorm, write");
         Self::create_with_shader_fmt(
             device, "fisheye_to_fisheye_rs_16", &wgsl, wgpu::TextureFormat::Rgba16Unorm,
         )
@@ -1508,7 +1505,7 @@ impl FisheyeToHequirectRsPipeline {
     /// `rgba16unorm` at runtime (matches the `create_16bit` trick used by the
     /// non-RS pipeline), so the RS-corrected eye stays 16-bit through compose.
     fn create_16bit(device: &wgpu::Device) -> Self {
-        let wgsl = FISHEYE_TO_HEQUIRECT_RS_WGSL.replace("rgba8unorm, write", "rgba16unorm, write");
+        let wgsl = FisheyeKernel::new(false, true, false).wgsl().replace("rgba8unorm, write", "rgba16unorm, write");
         Self::create_with_shader_fmt(
             device, "fisheye_to_hequirect_rs_16", &wgsl, wgpu::TextureFormat::Rgba16Unorm,
         )
@@ -1632,14 +1629,14 @@ impl FisheyeP010ToHequirectRsPipeline {
     /// uniform, and per-row R storage buffer.
     fn create(device: &wgpu::Device) -> Self {
         Self::create_with_shader(
-            device, "fisheye_p010_to_hequirect_rs", FISHEYE_P010_TO_HEQUIRECT_RS_WGSL,
+            device, "fisheye_p010_to_hequirect_rs", &FisheyeKernel::new(true, true, false).wgsl(),
         )
     }
 
     /// RS-aware P010 → stabilized fisheye output (Rgba16Unorm), zero-copy.
     fn create_fisheye_out(device: &wgpu::Device) -> Self {
         Self::create_with_shader(
-            device, "fisheye_p010_to_fisheye_rs_16", FISHEYE_P010_TO_FISHEYE_RS_16_WGSL,
+            device, "fisheye_p010_to_fisheye_rs_16", &FisheyeKernel::new(true, true, true).wgsl(),
         )
     }
 
@@ -1765,20 +1762,47 @@ impl FisheyeP010ToHequirectRsPipeline {
 /// Ported from `FrameExtractor.build_cross_remap` in `vr180_gui.py`.
 const EAC_TO_EQUIRECT_WGSL: &str = include_str!("shaders/eac_to_equirect.wgsl");
 
-/// WGSL kernel: Kannala-Brandt fisheye → half-equirect for the
-/// non-GoPro input families (DJI OSV, SBS fisheye, Blackmagic BRAW).
-/// Ported from the Metal kernel at `vr180_gui.py:1350-1480`. CPU
-/// reference for testing lives in
+/// WGSL source of the fisheye projection kernel — every build of it: one
+/// eye of a fisheye source (DJI OSV, Insta360, SBS fisheye, Blackmagic RAW,
+/// Kandao) to one eye of the output, with the per-frame rotation and,
+/// optionally, the per-row rolling-shutter correction. The lens models, the
+/// masks and the ray generators live here once; [`FisheyeKernel::wgsl`]
+/// composes a build. CPU reference for testing:
 /// `crates/vr180-fisheye/src/projection.rs`.
-const FISHEYE_TO_HEQUIRECT_WGSL: &str =
-    include_str!("shaders/fisheye_to_hequirect.wgsl");
+const FISHEYE_PROJECT_WGSL: &str = include_str!("shaders/fisheye_project.wgsl");
 
-/// WGSL kernel: P010 (10-bit YCbCr planes) → half-equirect, used when
-/// the source IOSurface is directly available (macOS OSV export). Does
-/// YCbCr→RGB Rec.709 expansion in the same dispatch as the KB projection,
-/// avoiding the FFmpeg P010LE→RGBA64LE swscale and the CPU→GPU upload.
-const FISHEYE_P010_TO_HEQUIRECT_WGSL: &str =
-    include_str!("shaders/fisheye_p010_to_hequirect.wgsl");
+/// One build of the fisheye projection kernel (the flags of
+/// `shaders/fisheye_project.wgsl`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FisheyeKernel {
+    /// The source is a Y plane + a CbCr plane (a decoded surface sampled in
+    /// place, converted to RGB in the kernel) instead of an RGBA texture.
+    /// Such a build stores `Rgba16Unorm`; an RGBA build stores `Rgba8Unorm`
+    /// until its pipeline swaps the format in the text.
+    yuv: bool,
+    /// Per-row rolling-shutter correction (one more binding: the rows).
+    rs: bool,
+    /// Equidistant fisheye output instead of half-equirect / reframed.
+    fisheye_out: bool,
+}
+
+impl FisheyeKernel {
+    const fn new(yuv: bool, rs: bool, fisheye_out: bool) -> Self {
+        Self { yuv, rs, fisheye_out }
+    }
+
+    /// The composed WGSL of this build.
+    fn wgsl(self) -> String {
+        let mut flags: Vec<&str> = Vec::with_capacity(4);
+        if self.yuv { flags.push("YUV"); }
+        if self.rs { flags.push("RS"); }
+        if self.fisheye_out { flags.push("FISHEYE_OUT"); }
+        // As the builds were written: only this one hands the corrected ray
+        // on to the frame-cover test.
+        if self.yuv && self.rs && !self.fisheye_out { flags.push("RS_UPDATES_RAY"); }
+        crate::shader_compose::compose(FISHEYE_PROJECT_WGSL, &flags)
+    }
+}
 
 /// WGSL kernel: P010 (Y/UV planes) → RGBA16 resolve + box downscale.
 /// Upsamples chroma to full-res RGB then box-averages down to the working
@@ -1786,19 +1810,6 @@ const FISHEYE_P010_TO_HEQUIRECT_WGSL: &str =
 /// doesn't produce chroma moiré. See `p010_resolve_rgba16.wgsl`.
 const P010_RESOLVE_RGBA16_WGSL: &str =
     include_str!("shaders/p010_resolve_rgba16.wgsl");
-
-/// WGSL kernel: P010 → half-equirect with fused stab + per-row rolling
-/// shutter correction. Same math as `fisheye_p010_to_hequirect.wgsl`
-/// plus a per-scanline re-projection step that cancels intra-frame
-/// shear from the sensor's row-by-row readout.
-const FISHEYE_P010_TO_HEQUIRECT_RS_WGSL: &str =
-    include_str!("shaders/fisheye_p010_to_hequirect_rs.wgsl");
-
-/// WGSL kernel: RGBA fisheye → half-equirect with fused stab + per-row
-/// rolling-shutter correction. Used by the GUI preview when DJI OSV
-/// per-row matrices are available.
-const FISHEYE_TO_HEQUIRECT_RS_WGSL: &str =
-    include_str!("shaders/fisheye_to_hequirect_rs.wgsl");
 
 /// std140 layout for the EAC→equirect shader's R matrix uniform.
 /// 12-scalar layout (3 rows × 3 floats + 1 pad per row) — used in
@@ -2658,11 +2669,6 @@ impl FisheyeCalibUniforms {
     }
 }
 
-const FISHEYE_TO_FISHEYE_WGSL: &str = include_str!("shaders/fisheye_to_fisheye.wgsl");
-const FISHEYE_TO_FISHEYE_16_WGSL: &str = include_str!("shaders/fisheye_to_fisheye_16.wgsl");
-const FISHEYE_TO_FISHEYE_RS_WGSL: &str = include_str!("shaders/fisheye_to_fisheye_rs.wgsl");
-const FISHEYE_P010_TO_FISHEYE_16_WGSL: &str = include_str!("shaders/fisheye_p010_to_fisheye_16.wgsl");
-const FISHEYE_P010_TO_FISHEYE_RS_16_WGSL: &str = include_str!("shaders/fisheye_p010_to_fisheye_rs_16.wgsl");
 const LUT3D_WGSL: &str = include_str!("shaders/lut3d.wgsl");
 const LUT3D_16_WGSL: &str = include_str!("shaders/lut3d_16.wgsl");
 const NV12_TO_EAC_WGSL: &str = include_str!("shaders/nv12_to_eac_cross.wgsl");
@@ -9473,6 +9479,81 @@ mod single_eye_tests {
         assert_eq!(plan.cdl.gain, 1.2);
         // Nothing left that differs per eye.
         assert!(matches!(plan.for_eye(true), std::borrow::Cow::Borrowed(_)));
+    }
+}
+
+#[cfg(test)]
+mod fisheye_kernel_tests {
+    use super::FisheyeKernel;
+
+    /// The top-level items of a WGSL source (functions, structs, constants,
+    /// bindings) with comments and all whitespace removed, sorted: two
+    /// sources with the same items are the same shader to a compiler,
+    /// whatever their order and layout.
+    fn items(wgsl: &str) -> Vec<String> {
+        let mut text = String::new();
+        for line in wgsl.lines() {
+            let code = line.split("//").next().unwrap_or("");
+            text.extend(code.chars().filter(|c| !c.is_whitespace()));
+        }
+        let (mut out, mut item, mut depth) = (Vec::new(), String::new(), 0usize);
+        for c in text.chars() {
+            item.push(c);
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 { out.push(std::mem::take(&mut item)); }
+                }
+                ';' if depth == 0 => out.push(std::mem::take(&mut item)),
+                _ => {}
+            }
+        }
+        assert!(item.is_empty() && depth == 0, "unbalanced source");
+        // A constant none of the files used.
+        out.retain(|i| !i.starts_with("constHALF_PI:"));
+        out.sort();
+        out
+    }
+
+    /// Each build composed from the one source is, item for item, the file
+    /// that build used to be.
+    #[test]
+    fn composed_builds_are_the_files_they_replace() {
+        let cases: [(FisheyeKernel, &str, &str); 8] = [
+            (FisheyeKernel::new(false, false, false), "fisheye_to_hequirect", include_str!("shaders/fisheye_to_hequirect.wgsl")),
+            (FisheyeKernel::new(false, true, false), "fisheye_to_hequirect_rs", include_str!("shaders/fisheye_to_hequirect_rs.wgsl")),
+            (FisheyeKernel::new(true, false, false), "fisheye_p010_to_hequirect", include_str!("shaders/fisheye_p010_to_hequirect.wgsl")),
+            (FisheyeKernel::new(true, true, false), "fisheye_p010_to_hequirect_rs", include_str!("shaders/fisheye_p010_to_hequirect_rs.wgsl")),
+            (FisheyeKernel::new(false, false, true), "fisheye_to_fisheye", include_str!("shaders/fisheye_to_fisheye.wgsl")),
+            (FisheyeKernel::new(false, true, true), "fisheye_to_fisheye_rs", include_str!("shaders/fisheye_to_fisheye_rs.wgsl")),
+            (FisheyeKernel::new(true, false, true), "fisheye_p010_to_fisheye_16", include_str!("shaders/fisheye_p010_to_fisheye_16.wgsl")),
+            (FisheyeKernel::new(true, true, true), "fisheye_p010_to_fisheye_rs_16", include_str!("shaders/fisheye_p010_to_fisheye_rs_16.wgsl")),
+        ];
+        for (kernel, name, file) in cases {
+            assert_eq!(items(&kernel.wgsl()), items(file), "{name}");
+        }
+        // The 16-bit RGBA fisheye-output file is that build with the storage format swapped.
+        let swapped = FisheyeKernel::new(false, false, true).wgsl().replace("rgba8unorm, write", "rgba16unorm, write");
+        assert_eq!(items(&swapped), items(include_str!("shaders/fisheye_to_fisheye_16.wgsl")), "fisheye_to_fisheye_16");
+    }
+
+    /// Every build parses and validates as WGSL on its own.
+    #[test]
+    fn every_build_is_valid_wgsl() {
+        for yuv in [false, true] {
+            for rs in [false, true] {
+                for fisheye_out in [false, true] {
+                    let kernel = FisheyeKernel::new(yuv, rs, fisheye_out);
+                    let module = wgpu::naga::front::wgsl::parse_str(&kernel.wgsl())
+                        .unwrap_or_else(|e| panic!("{kernel:?}: {e}"));
+                    wgpu::naga::valid::Validator::new(
+                        wgpu::naga::valid::ValidationFlags::all(),
+                        wgpu::naga::valid::Capabilities::all(),
+                    ).validate(&module).unwrap_or_else(|e| panic!("{kernel:?}: {e:?}"));
+                }
+            }
+        }
     }
 }
 

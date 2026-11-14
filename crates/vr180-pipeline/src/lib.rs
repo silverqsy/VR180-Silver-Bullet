@@ -28,6 +28,7 @@ pub mod insv_imu;
 pub mod kandao_imu;
 pub mod panomap;
 pub mod render;
+mod shader_compose;
 pub mod source_kind;
 pub mod spherical_inject;
 pub mod still_export;
