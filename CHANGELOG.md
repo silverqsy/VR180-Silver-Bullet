@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **A queued export waited for the window to be seen.** With the app's
+  window minimised, or completely covered by another one, the clip being
+  exported finished, but the next one in the queue did not start, and the
+  finished notification did not come, until the window was shown again: an
+  unattended batch sat idle for as long as the window stayed covered. The
+  hand-over to the next clip now runs whether or not the window is visible.
+
 ## 2.5.6 — 2026-11-13
 
 ### Insta360 X6: 7.4K, 10K and their Crop recording modes

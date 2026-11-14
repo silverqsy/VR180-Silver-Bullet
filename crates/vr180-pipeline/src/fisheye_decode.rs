@@ -3488,6 +3488,9 @@ impl ZeroCopyDualStreamFisheyeIter {
 
     pub fn eye_dims(&self) -> (u32, u32) { (self.eye_w, self.eye_h) }
 
+    /// The source holds one eye: both eyes of every pair are the same picture.
+    pub fn single_eye(&self) -> bool { self.demux.solo }
+
     pub fn seek(&mut self, target_s: f64) -> Result<()> {
         // Map the global target to (segment, local time) across the chain.
         let t = target_s.max(0.0);
@@ -3656,7 +3659,8 @@ impl ZeroCopyDualStreamFisheyeIter {
 #[cfg(target_os = "macos")]
 fn epb_pair_to_zerocopy(
     left: crate::interop_macos::EncodePixelBufferP010,
-    right: crate::interop_macos::EncodePixelBufferP010,
+    // `None`: a single-eye source — the right planes are the left's.
+    right: Option<crate::interop_macos::EncodePixelBufferP010>,
     eye_w: u32,
     eye_h: u32,
     pts_s: f64,
@@ -3681,7 +3685,17 @@ fn epb_pair_to_zerocopy(
         (y, uv)
     }
     let (left_y, left_uv) = split(left);
-    let (right_y, right_uv) = split(right);
+    let again = |p: &IOSurfacePlaneTexture| IOSurfacePlaneTexture {
+        surface: p.surface.clone(),
+        texture: p.texture.clone(),
+        width: p.width,
+        height: p.height,
+        format: p.format,
+    };
+    let (right_y, right_uv) = match right {
+        Some(right) => split(right),
+        None => (again(&left_y), again(&left_uv)),
+    };
     ZeroCopyFisheyePair { left_y, left_uv, right_y, right_uv, eye_w, eye_h, pts_s }
 }
 
@@ -3696,7 +3710,9 @@ fn epb_pair_to_zerocopy(
 pub struct DenoisingZeroCopyIter {
     inner: ZeroCopyDualStreamFisheyeIter,
     left: crate::vt_denoise::P010Denoiser,
-    right: crate::vt_denoise::P010Denoiser,
+    /// `None` for a single-eye source: its one picture arrives as both eyes,
+    /// and filtering it twice would be the same work twice.
+    right: Option<crate::vt_denoise::P010Denoiser>,
     eye_w: u32,
     eye_h: u32,
     strength: f32,
@@ -3717,7 +3733,9 @@ impl DenoisingZeroCopyIter {
     pub fn new(inner: ZeroCopyDualStreamFisheyeIter, strength: f32) -> Result<Self> {
         let (eye_w, eye_h) = inner.eye_dims();
         let left = crate::vt_denoise::P010Denoiser::new(eye_w, eye_h, strength)?;
-        let right = crate::vt_denoise::P010Denoiser::new(eye_w, eye_h, strength)?;
+        let right = if inner.single_eye() { None } else {
+            Some(crate::vt_denoise::P010Denoiser::new(eye_w, eye_h, strength)?)
+        };
         Ok(Self {
             inner,
             left,
@@ -3742,7 +3760,9 @@ impl DenoisingZeroCopyIter {
         // Temporal window is meaningless across a seek — rebuild the
         // denoisers so the next frame restarts the filter cleanly.
         self.left = crate::vt_denoise::P010Denoiser::new(self.eye_w, self.eye_h, self.strength)?;
-        self.right = crate::vt_denoise::P010Denoiser::new(self.eye_w, self.eye_h, self.strength)?;
+        if self.right.is_some() {
+            self.right = Some(crate::vt_denoise::P010Denoiser::new(self.eye_w, self.eye_h, self.strength)?);
+        }
         self.pending_pts.clear();
         self.ready.clear();
         self.inner_done = false;
@@ -3751,6 +3771,28 @@ impl DenoisingZeroCopyIter {
         self.skip_until_pts = target_s;
         self.n_skipped = 0;
         Ok(())
+    }
+
+    /// Pair up what the filters released (frame by frame, in order) with the
+    /// pts waiting for them; without a right filter the left's frame serves
+    /// both eyes.
+    fn queue_denoised(
+        &mut self,
+        left: Vec<crate::interop_macos::EncodePixelBufferP010>,
+        right: Option<Vec<crate::interop_macos::EncodePixelBufferP010>>,
+    ) {
+        let mut right = right.map(|r| r.into_iter());
+        for lo in left {
+            let ro = match &mut right {
+                Some(r) => match r.next() {
+                    Some(ro) => Some(ro),
+                    None => break,
+                },
+                None => None,
+            };
+            let pts = self.pending_pts.pop_front().unwrap_or(0.0);
+            self.ready.push_back(epb_pair_to_zerocopy(lo, ro, self.eye_w, self.eye_h, pts));
+        }
     }
 
     pub fn next_pair(
@@ -3784,27 +3826,23 @@ impl DenoisingZeroCopyIter {
                     }
                     self.pending_pts.push_back(pts);
                     let louts = self.left.push(device, l_src.as_raw())?;
-                    let routs = self.right.push(device, r_src.as_raw())?;
+                    let routs = match &mut self.right {
+                        Some(right) => Some(right.push(device, r_src.as_raw())?),
+                        None => None,
+                    };
                     // Source P010 buffers are now converted into the windows.
                     drop(l_src);
                     drop(r_src);
-                    for (lo, ro) in louts.into_iter().zip(routs.into_iter()) {
-                        let pts = self.pending_pts.pop_front().unwrap_or(0.0);
-                        self.ready.push_back(epb_pair_to_zerocopy(
-                            lo, ro, self.eye_w, self.eye_h, pts,
-                        ));
-                    }
+                    self.queue_denoised(louts, routs);
                 }
                 None => {
                     self.inner_done = true;
                     let louts = self.left.finish(device)?;
-                    let routs = self.right.finish(device)?;
-                    for (lo, ro) in louts.into_iter().zip(routs.into_iter()) {
-                        let pts = self.pending_pts.pop_front().unwrap_or(0.0);
-                        self.ready.push_back(epb_pair_to_zerocopy(
-                            lo, ro, self.eye_w, self.eye_h, pts,
-                        ));
-                    }
+                    let routs = match &mut self.right {
+                        Some(right) => Some(right.finish(device)?),
+                        None => None,
+                    };
+                    self.queue_denoised(louts, routs);
                 }
             }
         }
