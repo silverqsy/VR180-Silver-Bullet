@@ -230,6 +230,47 @@ pub struct FisheyeExportConfig {
     pub trim_out_s: Option<f64>,
 }
 
+impl FisheyeExportConfig {
+    /// What decides this export's two lens models (see [`crate::lens_model`]).
+    /// A reframed view's shape is the eye frame's.
+    pub fn lens_request(&self) -> crate::lens_model::LensRequest<'_> {
+        use crate::lens_model::{EyeLensOverride, LensOutput, LensRequest};
+        LensRequest {
+            kind: self.source_kind,
+            preset: &self.fisheye_preset,
+            swap_eyes: self.fisheye_swap_eyes,
+            left: EyeLensOverride {
+                on: self.fisheye_override_left,
+                fov_deg: self.fisheye_fov_deg_left,
+                cx_norm: self.fisheye_cx_norm_left,
+                cy_norm: self.fisheye_cy_norm_left,
+                k: self.fisheye_k_left,
+                k5: self.fisheye_k5_left,
+                p: self.fisheye_p_left,
+            },
+            right: EyeLensOverride {
+                on: self.fisheye_override_right,
+                fov_deg: self.fisheye_fov_deg_right,
+                cx_norm: self.fisheye_cx_norm_right,
+                cy_norm: self.fisheye_cy_norm_right,
+                k: self.fisheye_k_right,
+                k5: self.fisheye_k5_right,
+                p: self.fisheye_p_right,
+            },
+            crop_mask: self.crop_mask,
+            sbs_dewarp_fisheye: self.sbs_dewarp_fisheye,
+            output: match self.projection {
+                FisheyeExportProjection::HalfEquirect => LensOutput::HalfEquirect,
+                FisheyeExportProjection::Fisheye => LensOutput::Fisheye,
+                FisheyeExportProjection::Reframe { hfov_deg, defish } => LensOutput::Reframe {
+                    hfov_deg, defish,
+                    aspect: self.eye_w as f32 / self.eye_h.max(1) as f32,
+                },
+            },
+        }
+    }
+}
+
 /// Progress update emitted via the caller's callback after each
 /// rendered frame.
 #[derive(Debug, Clone, Copy)]
@@ -4327,188 +4368,22 @@ fn export_fisheye_osv_gpu_resident(
 // (Old CPU SBS compose removed — replaced by
 // Device::compose_sbs_textures + read_texture_rgb8 on the GPU.)
 
-/// Per-eye calibration resolver. Same logic as
-/// `vr180-gui::decoder::resolve_fisheye_calib_pair`, lifted here so the
-/// CLI / headless export doesn't pull in the GUI crate.
+/// An export's per-eye lens models: [`crate::lens_model::resolve_lens_pair`]
+/// for this configuration, the same resolver the preview asks.
 pub(crate) fn resolve_calib_pair(
     cfg: &FisheyeExportConfig,
     src_w: u32,
     src_h: u32,
     osv: Option<&vr180_fisheye::DjiOsvImu>,
 ) -> (FisheyeCalib, FisheyeCalib) {
-    use vr180_fisheye::presets;
-
-    let preset = if !cfg.fisheye_preset.is_empty() && cfg.fisheye_preset != "Auto" {
-        presets::find(&cfg.fisheye_preset)
-    } else {
-        None
-    }.unwrap_or_else(|| {
-        let auto_name = match cfg.source_kind {
-            SourceKind::DjiOsv        => "DJI Osmo 360",
-            SourceKind::Insta360Insv
-            | SourceKind::Insta360Dng => "Insta360 X6",
-            SourceKind::KandaoQoocam
-            | SourceKind::KandaoDng   => crate::kandao_imu::KANDAO_PRESET_NAME,
-            SourceKind::BlackmagicRaw => crate::braw_imu::BRAW_PRESET_NAME,
-            _                         => "Custom",
-        };
-        presets::find(auto_name).unwrap_or(&presets::presets()[7])
-    });
-
-    // Preset-derived auto fx (override off / protobuf missing fx).
-    let fx_auto = if preset.calib.fx > 0.0 && preset.calib.calib_w > 0 {
-        (preset.calib.fx as f32) * (src_w as f32) / (preset.calib.calib_w as f32)
-    } else {
-        let half = (preset.default_fov_deg as f32).to_radians() * 0.5;
-        (src_w as f32) / (2.0 * half)
-    };
-    let preset_k = [preset.calib.k[0] as f32, preset.calib.k[1] as f32,
-                    preset.calib.k[2] as f32, preset.calib.k[3] as f32];
-    let fx_from_fov = |fov_deg: f32| -> f32 {
-        let half = fov_deg.max(1.0).to_radians() * 0.5;
-        (src_w as f32) / (2.0 * half)
-    };
-
-    // For OSV, prefer the per-lens protobuf calibration. After the DJI
-    // iter's default swap: left = Lens B, right = Lens A.
-    let (calib_l, calib_r) = match (cfg.source_kind, osv) {
-        (SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam | SourceKind::BlackmagicRaw, Some(imu)) => {
-            let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
-            let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
-            let eye = |output: usize, lens: &vr180_fisheye::DjiLensCalib,
-                       ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4], km5: f32,
-                       km_p: [f32; 2]|
-                -> FisheyeCalib
-            {
-                // Auto + an exact factory model (Insta360): use it as is —
-                // the KB fields only seed the override UI. Override drops
-                // to KB (the manual fields describe a KB lens).
-                if !ov {
-                    if let Some(o) = lens.omni {
-                        let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
-                        let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
-                        return FisheyeCalib::new_omni(
-                            o.fx * scale_x, o.fy * scale_y, cx, cy, o.xi,
-                            o.radial, o.tangential, o.prism, src_w as f32, src_h as f32,
-                        );
-                    }
-                }
-                let (fx, fy, cx, cy, k, k5) = if ov {
-                    let fx = fx_from_fov(fov);
-                    let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
-                    (fx, fx, cxn * src_w as f32, cyn * src_h as f32, k, km5)
-                } else {
-                    // Auto: full per-lens factory calibration from the OSV
-                    // protobuf — fx/fy (→FOV), cx/cy, the KB k1–k4 AND the 5th
-                    // radial coeff k5 (field 15). Must match the GUI's
-                    // resolve_fisheye_calib_pair exactly so export == preview.
-                    // k is dimensionless (no scale); missing → preset / 0.
-                    let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
-                    let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
-                    let fx = lens.fx.map(|v| v * scale_x).unwrap_or(fx_auto);
-                    let fy = lens.fy.map(|v| v * scale_y).unwrap_or(fx);
-                    let k = match (lens.k1, lens.k2, lens.k3, lens.k4) {
-                        (Some(a), Some(b), Some(c), Some(d)) => [a, b, c, d],
-                        _ => preset_k,
-                    };
-                    // Blackmagic: the seed is the image circle + the DEFAULT
-                    // preset's FOV / k; the Camera combo's choice re-scales the
-                    // focal to its FOV and takes its k (same in the GUI resolver).
-                    let (fx, fy, cx, cy, k) = if cfg.source_kind == SourceKind::BlackmagicRaw {
-                        let (sx, sk) = crate::braw_imu::preset_rescale(preset, src_w, src_h);
-                        let (cx, cy) = crate::braw_imu::preset_principal_point(preset, output, cfg.fisheye_swap_eyes, src_w as f32, src_h as f32)
-                            .unwrap_or((cx, cy));
-                        (fx * sx, fy * sx, cx, cy, sk.unwrap_or(k))
-                    } else { (fx, fy, cx, cy, k) };
-                    (fx, fy, cx, cy, k, lens.k5.unwrap_or(0.0))
-                };
-                let mut calib =
-                    FisheyeCalib::new_pure_kb(fx, fy, cx, cy, k, src_w as f32, src_h as f32);
-                calib.k5 = k5;
-                // Tangential: Auto from file, override uses the manual [p1,p2]
-                // (km_p, GUI-seeded from the file). Must match the preview path.
-                calib.p1 = if ov { km_p[0] } else { lens.p1.unwrap_or(0.0) };
-                calib.p2 = if ov { km_p[1] } else { lens.p2.unwrap_or(0.0) };
-                calib
-            };
-            // Calib follows the STREAM: with the user swap on, the left
-            // output carries Lens A → use Lens A's calib (matches the
-            // GUI resolver so export == preview).
-            let (lens_l, lens_r) = if cfg.fisheye_swap_eyes {
-                (&imu.lens_a, &imu.lens_b)
-            } else {
-                (&imu.lens_b, &imu.lens_a)
-            };
-            let pair = (
-                eye(0, lens_l, cfg.fisheye_override_left, cfg.fisheye_fov_deg_left,
-                    cfg.fisheye_cx_norm_left, cfg.fisheye_cy_norm_left, cfg.fisheye_k_left,
-                    cfg.fisheye_k5_left, cfg.fisheye_p_left),
-                eye(1, lens_r, cfg.fisheye_override_right, cfg.fisheye_fov_deg_right,
-                    cfg.fisheye_cx_norm_right, cfg.fisheye_cy_norm_right, cfg.fisheye_k_right,
-                    cfg.fisheye_k5_right, cfg.fisheye_p_right),
-            );
-            // A frame that is a crop of the image circle (the X6 Crop
-            // modes): black outside the frame, corners kept, plus the
-            // user's mask window. Must match the GUI resolver.
-            if lens_l.frame_crop || lens_r.frame_crop {
-                crate::gpu::apply_frame_crop(pair.0, pair.1, cfg.crop_mask)
-            } else {
-                pair
-            }
-        }
-        _ => {
-            // Non-OSV: Hermite-default constructor, per-eye.
-            let r_max = (src_w.min(src_h) as f32) * 0.5;
-            let eye = |ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4]| -> FisheyeCalib {
-                let (fx, cx, cy, k) = if ov {
-                    let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
-                    (fx_from_fov(fov), cxn * src_w as f32, cyn * src_h as f32, k)
-                } else {
-                    (fx_auto, src_w as f32 * 0.5, src_h as f32 * 0.5, preset_k)
-                };
-                FisheyeCalib::new(fx, fx, cx, cy, k, src_w as f32, src_h as f32, r_max)
-            };
-            (
-                eye(cfg.fisheye_override_left, cfg.fisheye_fov_deg_left,
-                    cfg.fisheye_cx_norm_left, cfg.fisheye_cy_norm_left, cfg.fisheye_k_left),
-                eye(cfg.fisheye_override_right, cfg.fisheye_fov_deg_right,
-                    cfg.fisheye_cx_norm_right, cfg.fisheye_cy_norm_right, cfg.fisheye_k_right),
-            )
-        }
-    };
-
+    let (calib_l, calib_r) = crate::lens_model::resolve_lens_pair(&cfg.lens_request(), src_w, src_h, osv);
     // Same line the GUI prints at load (`decoder (fisheye): initial calib`),
     // so an export's per-eye lens assignment can be checked from the log.
     tracing::info!(
         "fisheye_export: resolved calib L fx={:.1}, cx={:.1}, cy={:.1} | R fx={:.1}, cx={:.1}, cy={:.1} (swap={})",
         calib_l.fx, calib_l.cx, calib_l.cy, calib_r.fx, calib_r.cx, calib_r.cy, cfg.fisheye_swap_eyes
     );
-    // Generic SBS with the fisheye dewarp off: the halves are already
-    // half-equirect — bypass the lens model (identity resample for the
-    // default output, a correct (lon, lat) lookup for the reframed view).
-    let (calib_l, calib_r) = if cfg.source_kind == SourceKind::SbsFisheye && !cfg.sbs_dewarp_fisheye {
-        (calib_l.with_equirect_input(), calib_r.with_equirect_input())
-    } else {
-        (calib_l, calib_r)
-    };
-
-    // Equidistant FISHEYE output target: set the output half-FOV so the
-    // shaders map the inscribed circle of the square frame to a clean
-    // FISHEYE_OUT_FULL_FOV_DEG fisheye. (The equirect target keeps the
-    // default 90° horizontal half-FOV.)
-    if cfg.projection == FisheyeExportProjection::Fisheye {
-        let hfov = (FISHEYE_OUT_FULL_FOV_DEG * 0.5).to_radians();
-        (calib_l.with_output_hfov(hfov), calib_r.with_output_hfov(hfov))
-    } else if let Some((hfov_deg, defish)) = cfg.projection.reframe() {
-        // Reframed view: the viewport's aspect is the eye frame's.
-        let aspect = cfg.eye_w as f32 / cfg.eye_h.max(1) as f32;
-        (
-            calib_l.with_reframe(hfov_deg, defish, aspect),
-            calib_r.with_reframe(hfov_deg, defish, aspect),
-        )
-    } else {
-        (calib_l, calib_r)
-    }
+    (calib_l, calib_r)
 }
 
 // (CPU compose test removed — GPU compose has no per-byte invariants

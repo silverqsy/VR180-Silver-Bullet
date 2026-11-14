@@ -26,6 +26,7 @@ pub mod helpers;
 pub mod imu;
 pub mod insv_imu;
 pub mod kandao_imu;
+pub mod lens_model;
 pub mod panomap;
 pub mod render;
 mod shader_compose;

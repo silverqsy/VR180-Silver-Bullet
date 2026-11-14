@@ -671,6 +671,47 @@ impl Settings {
         s
     }
 
+    /// What decides the lens models of a `kind` clip under these settings
+    /// (see [`vr180_pipeline::lens_model`]). A reframed view's shape is the
+    /// chosen aspect.
+    pub fn lens_request(&self, kind: vr180_pipeline::SourceKind) -> vr180_pipeline::lens_model::LensRequest<'_> {
+        use vr180_pipeline::lens_model::{EyeLensOverride, LensOutput, LensRequest};
+        LensRequest {
+            kind,
+            preset: &self.fisheye_preset,
+            swap_eyes: self.effective_swap_eyes(),
+            left: EyeLensOverride {
+                on: self.fisheye_override_left,
+                fov_deg: self.fisheye_fov_deg_left,
+                cx_norm: self.fisheye_cx_norm_left,
+                cy_norm: self.fisheye_cy_norm_left,
+                k: self.fisheye_k_left,
+                k5: self.fisheye_k5_left,
+                p: self.fisheye_p_left,
+            },
+            right: EyeLensOverride {
+                on: self.fisheye_override_right,
+                fov_deg: self.fisheye_fov_deg_right,
+                cx_norm: self.fisheye_cx_norm_right,
+                cy_norm: self.fisheye_cy_norm_right,
+                k: self.fisheye_k_right,
+                k5: self.fisheye_k5_right,
+                p: self.fisheye_p_right,
+            },
+            crop_mask: self.crop_mask,
+            sbs_dewarp_fisheye: self.sbs_dewarp_fisheye,
+            output: match self.fisheye_output_mode {
+                FisheyeOutputMode::HalfEquirect => LensOutput::HalfEquirect,
+                FisheyeOutputMode::Fisheye => LensOutput::Fisheye,
+                FisheyeOutputMode::Reframe => LensOutput::Reframe {
+                    hfov_deg: self.reframe_hfov_deg,
+                    defish: self.reframe_defish,
+                    aspect: self.reframe_aspect.ratio(),
+                },
+            },
+        }
+    }
+
     /// The L↔R eye swap that should actually be applied: the manual
     /// "Swap L↔R" toggle XOR the upside-down mount (flipping the rig
     /// 180° mirrors the physical eye positions, so upside-down implies
@@ -4237,23 +4278,19 @@ fn _check_pair_dims(
     }
 }
 
-/// Build per-eye `FisheyeCalib`s for the current settings + source +
-/// working resolution. Called once at decoder start, and again on
-/// every `settings_generation` bump.
+/// Per-eye lens models for the current settings, source and working
+/// resolution: [`vr180_pipeline::lens_model::resolve_lens_pair`], the
+/// resolver an export asks too, so the preview and the export of a clip
+/// cannot disagree about its lens. Called at decoder start and again on
+/// every `settings_generation` bump. Returns `(left, right)`.
 ///
-/// Returns `(calib_left, calib_right)`. For non-DJI sources both are
-/// identical. For DJI OSV, when a parsed protobuf is supplied, each
-/// eye gets its FULL per-lens factory calibration from the protobuf:
-/// fx/fy (→FOV), principal point (cx/cy), AND the KB k1–k4 distortion.
-/// The file's KB polynomial folds past ~89°, so it is valid only out
-/// to the 180°-VR180 edge (max sampled θ = 90°); for full-FOV output
-/// past 180° prefer the preset/override. Anything the file omits
-/// falls back to the preset.
-///
-/// Eye→lens mapping: DJI's stream-to-lens layout is stream 0 = Lens A
-/// = right eye, stream 1 = Lens B = left eye, AND we swap_eyes at
-/// the iter (see DualStreamFisheyeIter::new_with_swap). So after the
-/// swap: left output = Lens B, right output = Lens A.
+/// For a source whose file carries a per-lens calibration (`osv`), each
+/// eye gets the full factory model of its lens, scaled to the working
+/// size. A dual-stream camera's stream 0 is lens A = the RIGHT eye and the
+/// iterator swaps by default, so left output = lens B, right = lens A; the
+/// user's swap exchanges them and the calibration follows the stream.
+/// Anything the file omits falls back to the preset; Override replaces the
+/// file's model with the manual fields.
 pub(crate) fn resolve_fisheye_calib_pair(
     s: &Settings,
     kind: vr180_pipeline::SourceKind,
@@ -4261,212 +4298,7 @@ pub(crate) fn resolve_fisheye_calib_pair(
     src_h: u32,
     osv: Option<&vr180_fisheye::DjiOsvImu>,
 ) -> (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib) {
-    use vr180_fisheye::presets;
-
-    // Pick a preset. Explicit name wins; else fall back to the
-    // source-kind default.
-    let preset = if !s.fisheye_preset.is_empty() && s.fisheye_preset != "Auto" {
-        presets::find(&s.fisheye_preset)
-    } else {
-        None
-    }
-    .unwrap_or_else(|| {
-        let auto_name = match kind {
-            vr180_pipeline::SourceKind::DjiOsv         => "DJI Osmo 360",
-            vr180_pipeline::SourceKind::Insta360Insv
-            | vr180_pipeline::SourceKind::Insta360Dng  => "Insta360 X6",
-            vr180_pipeline::SourceKind::KandaoQoocam
-            | vr180_pipeline::SourceKind::KandaoDng    => vr180_pipeline::kandao_imu::KANDAO_PRESET_NAME,
-            vr180_pipeline::SourceKind::BlackmagicRaw  => vr180_pipeline::braw_imu::BRAW_PRESET_NAME,
-            _                                          => "Custom",
-        };
-        presets::find(auto_name).unwrap_or(&presets::presets()[7])
-    });
-
-    // Preset-derived auto fx (used when override is off and the
-    // protobuf doesn't supply fx, or for non-OSV sources).
-    let fx_auto = if preset.calib.fx > 0.0 && preset.calib.calib_w > 0 {
-        (preset.calib.fx as f32) * (src_w as f32) / (preset.calib.calib_w as f32)
-    } else {
-        let half = (preset.default_fov_deg as f32).to_radians() * 0.5;
-        (src_w as f32) / (2.0 * half)
-    };
-    let preset_k = [preset.calib.k[0] as f32, preset.calib.k[1] as f32,
-                    preset.calib.k[2] as f32, preset.calib.k[3] as f32];
-    // Manual fx from a per-eye FOV (degrees). fx = w / (2·half_fov).
-    let fx_from_fov = |fov_deg: f32| -> f32 {
-        let half = fov_deg.max(1.0).to_radians() * 0.5;
-        (src_w as f32) / (2.0 * half)
-    };
-
-    // For OSV: per-lens protobuf fx/fy/cx/cy + pure-KB projection. After
-    // the DJI iter's default swap: left = Lens B, right = Lens A.
-    // The X6 STILL takes this arm too: `run_still` hands in a calib-only
-    // carrier (lens_b = left half, lens_a = right half) built from the
-    // DNG's factory lens strings at the preview size.
-    let (calib_l, calib_r) = match (kind, osv) {
-        (vr180_pipeline::SourceKind::DjiOsv
-         | vr180_pipeline::SourceKind::Insta360Insv
-         | vr180_pipeline::SourceKind::Insta360Dng
-         | vr180_pipeline::SourceKind::KandaoQoocam
-         | vr180_pipeline::SourceKind::KandaoDng
-         | vr180_pipeline::SourceKind::BlackmagicRaw, Some(imu)) => {
-            let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
-            let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
-            let eye = |output: usize, lens: &vr180_fisheye::DjiLensCalib,
-                       ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4], km5: f32,
-                       km_p: [f32; 2]|
-                -> vr180_pipeline::gpu::FisheyeCalib
-            {
-                // Auto + an exact factory model (Insta360): use it as is —
-                // the KB fields only seed the override UI. Override drops
-                // to KB (the manual fields describe a KB lens). Must match
-                // the export resolver exactly so preview == export.
-                if !ov {
-                    if let Some(o) = lens.omni {
-                        let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
-                        let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
-                        return vr180_pipeline::gpu::FisheyeCalib::new_omni(
-                            o.fx * scale_x, o.fy * scale_y, cx, cy, o.xi,
-                            o.radial, o.tangential, o.prism, src_w as f32, src_h as f32,
-                        );
-                    }
-                }
-                let (fx, fy, cx, cy, k, k5) = if ov {
-                    // Manual: fx from FOV, absolute cx/cy from normalized,
-                    // manual k1–k4 (preset if all-zero) + manual k5 (km5).
-                    let fx = fx_from_fov(fov);
-                    let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
-                    (fx, fx, cxn * src_w as f32, cyn * src_h as f32, k, km5)
-                } else {
-                    // Auto: load the per-lens FACTORY calibration from the
-                    // OSV protobuf — principal point (cx/cy), focal length
-                    // (fx/fy → FOV) AND the KB k1–k4 distortion. fx/fy/cx/cy
-                    // are stored at the calib resolution (lens.width/height),
-                    // so scale to the working res. k is dimensionless (no
-                    // scale). Anything the file omits falls back to the
-                    // preset (fx_auto / preset_k).
-                    //
-                    // FOV note: the optical FOV is implied by fx (theta_max =
-                    // max_r/fx in new_pure_kb), NOT by the file's nominal
-                    // "half_fov" field — that reads ~90° and does NOT match
-                    // fx·image-circle (~106° half). So loading fx loads FOV.
-                    //
-                    // k-fold note: this lens's KB polynomial peaks near θ≈89°
-                    // then folds, so it is valid only out to ~88°. For 180°
-                    // VR180 output (max sampled θ = 90°) we sit right at that
-                    // edge, where the factory k is both safe and more accurate
-                    // than the smoothed preset. Output past 180° would sample
-                    // the folded region — use the preset/override there.
-                    let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
-                    let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
-                    let fx = lens.fx.map(|v| v * scale_x).unwrap_or(fx_auto);
-                    let fy = lens.fy.map(|v| v * scale_y).unwrap_or(fx);
-                    let k = match (lens.k1, lens.k2, lens.k3, lens.k4) {
-                        (Some(a), Some(b), Some(c), Some(d)) => [a, b, c, d],
-                        _ => preset_k,
-                    };
-                    // Blackmagic: the seed is the image circle + the DEFAULT
-                    // preset's FOV / k; the Camera combo's choice re-scales the
-                    // focal to its FOV and takes its k (same as the export).
-                    let (fx, fy, cx, cy, k) = if kind == vr180_pipeline::SourceKind::BlackmagicRaw {
-                        let (sx, sk) = vr180_pipeline::braw_imu::preset_rescale(preset, src_w, src_h);
-                        let (cx, cy) = vr180_pipeline::braw_imu::preset_principal_point(
-                            preset, output, s.effective_swap_eyes(), src_w as f32, src_h as f32).unwrap_or((cx, cy));
-                        (fx * sx, fy * sx, cx, cy, sk.unwrap_or(k))
-                    } else { (fx, fy, cx, cy, k) };
-                    // k5 (protobuf field 15) — DJI's 5th radial KB coeff.
-                    // Keeps the projection monotonic past ~90° out to the full
-                    // lens FOV. 0 when the file omits it (4-coeff fallback).
-                    (fx, fy, cx, cy, k, lens.k5.unwrap_or(0.0))
-                };
-                let mut calib = vr180_pipeline::gpu::FisheyeCalib::new_pure_kb(
-                    fx, fy, cx, cy, k, src_w as f32, src_h as f32,
-                );
-                calib.k5 = k5;
-                // Brown-Conrady tangential (field 20). Auto loads it per-lens
-                // from the file; override uses the manual [p1, p2] (km_p),
-                // seeded from the file so toggling override doesn't drop it.
-                calib.p1 = if ov { km_p[0] } else { lens.p1.unwrap_or(0.0) };
-                calib.p2 = if ov { km_p[1] } else { lens.p2.unwrap_or(0.0) };
-                calib
-            };
-            // The factory calib must follow the STREAM, not the output
-            // slot: with the user swap on, the left output carries Lens A,
-            // so it must be dewarped with Lens A's calib (and vice versa).
-            let (lens_l, lens_r) = if s.effective_swap_eyes() {
-                (&imu.lens_a, &imu.lens_b)
-            } else {
-                (&imu.lens_b, &imu.lens_a)
-            };
-            let pair = (
-                eye(0, lens_l, s.fisheye_override_left, s.fisheye_fov_deg_left,
-                    s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left,
-                    s.fisheye_k5_left, s.fisheye_p_left),
-                eye(1, lens_r, s.fisheye_override_right, s.fisheye_fov_deg_right,
-                    s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right,
-                    s.fisheye_k5_right, s.fisheye_p_right),
-            );
-            // A frame that is a crop of the image circle (the X6 Crop
-            // modes): black outside the frame, corners kept, plus the
-            // user's mask window. Same call as the export resolver.
-            if lens_l.frame_crop || lens_r.frame_crop {
-                vr180_pipeline::gpu::apply_frame_crop(pair.0, pair.1, s.crop_mask)
-            } else {
-                pair
-            }
-        }
-        _ => {
-            // Non-OSV: Hermite-default constructor, per-eye. No protobuf,
-            // so "auto" = preset; override = manual fov/cx/cy/k.
-            let r_max = (src_w.min(src_h) as f32) * 0.5;
-            let eye = |ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4]|
-                -> vr180_pipeline::gpu::FisheyeCalib
-            {
-                let (fx, cx, cy, k) = if ov {
-                    let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
-                    (fx_from_fov(fov), cxn * src_w as f32, cyn * src_h as f32, k)
-                } else {
-                    (fx_auto, src_w as f32 * 0.5, src_h as f32 * 0.5, preset_k)
-                };
-                vr180_pipeline::gpu::FisheyeCalib::new(
-                    fx, fx, cx, cy, k, src_w as f32, src_h as f32, r_max,
-                )
-            };
-            (
-                eye(s.fisheye_override_left, s.fisheye_fov_deg_left,
-                    s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left),
-                eye(s.fisheye_override_right, s.fisheye_fov_deg_right,
-                    s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right),
-            )
-        }
-    };
-
-    // Generic SBS with the fisheye dewarp off: the halves are already
-    // half-equirect — bypass the lens model (mirrors the export resolver).
-    let (calib_l, calib_r) = if kind == vr180_pipeline::SourceKind::SbsFisheye && !s.sbs_dewarp_fisheye {
-        (calib_l.with_equirect_input(), calib_r.with_equirect_input())
-    } else {
-        (calib_l, calib_r)
-    };
-
-    // Equidistant FISHEYE output target: set the output half-FOV so the
-    // fisheye shaders map the inscribed circle to a clean normalized
-    // fisheye (matches the export path). Equirect keeps the default 90°.
-    if matches!(s.fisheye_output_mode, FisheyeOutputMode::Fisheye) {
-        let hfov = (vr180_pipeline::fisheye_export::FISHEYE_OUT_FULL_FOV_DEG * 0.5).to_radians();
-        (calib_l.with_output_hfov(hfov), calib_r.with_output_hfov(hfov))
-    } else if matches!(s.fisheye_output_mode, FisheyeOutputMode::Reframe) {
-        // Reframed view — same parameters the export uses (aspect from the
-        // per-eye frame choice; the preview frame honours it).
-        let a = s.reframe_aspect.ratio();
-        (
-            calib_l.with_reframe(s.reframe_hfov_deg, s.reframe_defish, a),
-            calib_r.with_reframe(s.reframe_hfov_deg, s.reframe_defish, a),
-        )
-    } else {
-        (calib_l, calib_r)
-    }
+    vr180_pipeline::lens_model::resolve_lens_pair(&s.lens_request(kind), src_w, src_h, osv)
 }
 
 /// Per-eye ".360 Lens calibration" Override → shader re-dewarp params.
@@ -6513,6 +6345,46 @@ pub(crate) fn build_per_eye_frames_multi(
             .unwrap_or((EquirectRsParams::DISABLED, EquirectRsParams::DISABLED));
         ((rl, sl), (rr, sr))
     }).collect())
+}
+
+#[cfg(test)]
+mod lens_request_tests {
+    use super::*;
+    use vr180_pipeline::lens_model::LensOutput;
+
+    #[test]
+    fn the_settings_reach_the_resolver_field_for_field() {
+        let mut s = Settings::default();
+        s.fisheye_preset = "Custom".into();
+        s.fisheye_override_left = true;
+        s.fisheye_override_right = false;
+        (s.fisheye_fov_deg_left, s.fisheye_fov_deg_right) = (181.0, 182.0);
+        (s.fisheye_cx_norm_left, s.fisheye_cx_norm_right) = (0.41, 0.42);
+        (s.fisheye_cy_norm_left, s.fisheye_cy_norm_right) = (0.51, 0.52);
+        (s.fisheye_k_left, s.fisheye_k_right) = ([1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]);
+        (s.fisheye_k5_left, s.fisheye_k5_right) = (0.1, 0.2);
+        (s.fisheye_p_left, s.fisheye_p_right) = ([0.3, 0.4], [0.5, 0.6]);
+        s.sbs_dewarp_fisheye = true;
+        s.fisheye_output_mode = FisheyeOutputMode::Reframe;
+        s.reframe_hfov_deg = 77.0;
+        s.reframe_defish = 0.25;
+        s.reframe_aspect = ReframeAspect::Wide;
+        let r = s.lens_request(vr180_pipeline::SourceKind::DjiOsv);
+        assert_eq!((r.kind, r.preset, r.sbs_dewarp_fisheye), (vr180_pipeline::SourceKind::DjiOsv, "Custom", true));
+        assert_eq!((r.left.on, r.left.fov_deg, r.left.cx_norm, r.left.cy_norm, r.left.k, r.left.k5, r.left.p),
+                   (true, 181.0, 0.41, 0.51, [1.0, 2.0, 3.0, 4.0], 0.1, [0.3, 0.4]));
+        assert_eq!((r.right.on, r.right.fov_deg, r.right.cx_norm, r.right.cy_norm, r.right.k, r.right.k5, r.right.p),
+                   (false, 182.0, 0.42, 0.52, [5.0, 6.0, 7.0, 8.0], 0.2, [0.5, 0.6]));
+        assert_eq!(r.output, LensOutput::Reframe { hfov_deg: 77.0, defish: 0.25, aspect: ReframeAspect::Wide.ratio() });
+        // The swap the resolver sees is the effective one.
+        assert!(!r.swap_eyes);
+        s.camera_upside_down = true;
+        assert!(s.lens_request(vr180_pipeline::SourceKind::DjiOsv).swap_eyes);
+        s.fisheye_swap_eyes = true;
+        assert!(!s.lens_request(vr180_pipeline::SourceKind::DjiOsv).swap_eyes);
+        s.fisheye_output_mode = FisheyeOutputMode::Fisheye;
+        assert_eq!(s.lens_request(vr180_pipeline::SourceKind::DjiOsv).output, LensOutput::Fisheye);
+    }
 }
 
 #[cfg(test)]
