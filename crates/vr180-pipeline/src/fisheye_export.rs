@@ -483,19 +483,62 @@ fn finalize_metadata(
     inject_youtube: bool,
     inject_apmp: bool,
 ) -> Result<()> {
-    use crate::spherical_inject::{inject_youtube_vr180, inject_apmp_vr180};
+    finalize_metadata_for(final_out, inject_youtube, inject_apmp, false)
+}
+
+/// [`finalize_metadata`] for a frame that is two eyes side by side, or ONE
+/// eye (`single_eye`: the same 180° projection, declared monoscopic).
+fn finalize_metadata_for(
+    final_out: &std::path::Path,
+    inject_youtube: bool,
+    inject_apmp: bool,
+    single_eye: bool,
+) -> Result<()> {
+    use crate::spherical_inject::{
+        inject_apmp_vr180, inject_apmp_vr180_mono, inject_youtube_vr180, inject_youtube_vr180_mono,
+    };
+    let youtube = if single_eye { inject_youtube_vr180_mono } else { inject_youtube_vr180 };
+    let apmp = if single_eye { inject_apmp_vr180_mono } else { inject_apmp_vr180 };
     match (inject_youtube, inject_apmp) {
         (false, false) => Ok(()),
-        (true, false)  => inject_youtube_vr180(final_out),
-        (false, true)  => inject_apmp_vr180(final_out),
+        (true, false)  => youtube(final_out),
+        (false, true)  => apmp(final_out),
         (true,  true)  => {
             tracing::warn!(
                 "fisheye_export: both YouTube and APMP metadata requested — \
                  they conflict in the same atoms; injecting APMP only"
             );
-            inject_apmp_vr180(final_out)
+            apmp(final_out)
         }
     }
+}
+
+/// The source holds one eye: the export writes that eye as the whole frame
+/// (`eye_w × eye_h`) instead of two side by side.
+fn single_eye_source(cfg: &FisheyeExportConfig) -> bool {
+    crate::source_kind::is_single_eye(cfg.source_kind, &cfg.source_path)
+}
+
+/// Both eyes after the 16-bit colour stack. A single-eye frame grades its
+/// one eye once and returns it for both.
+#[allow(clippy::too_many_arguments)]
+fn grade_eyes_16(
+    pipeline: &Device,
+    left: &wgpu::Texture,
+    right: &wgpu::Texture,
+    eye_w: u32,
+    eye_h: u32,
+    plan: &ColorStackPlan,
+    eye_match: Option<(&crate::gpu::EyeMatchState, EyeMatchFrame)>,
+    single_eye: bool,
+) -> Result<(wgpu::Texture, wgpu::Texture)> {
+    if single_eye {
+        let eye = pipeline.apply_color_stack_per_eye_16(left, eye_w, eye_h, plan)?
+            .unwrap_or_else(|| left.clone());
+        return Ok((eye.clone(), eye));
+    }
+    let (l, r) = pipeline.apply_color_stack_pair_16(left, right, eye_w, eye_h, plan, eye_match)?;
+    Ok((l.unwrap_or_else(|| left.clone()), r.unwrap_or_else(|| right.clone())))
 }
 
 /// After the encoder closes the temp video file, mux the source's
@@ -1150,6 +1193,14 @@ pub fn export_fisheye(
         cfg.inject_apmp = false;
         cfg.inject_youtube_vr180 = false;
     }
+    if single_eye_source(&cfg) {
+        if cfg.spatial.is_some() {
+            return Err(Error::Ffmpeg("spatial video needs two eye views — this source holds one".into()));
+        }
+        // Nothing that sets the eyes against each other applies to one eye.
+        cfg.view_adjust = cfg.view_adjust.single_eye();
+        cfg.color_stack = cfg.color_stack.single_eye();
+    }
     prepare_spatial(&mut cfg)?;
     export_fisheye_inner(pipeline, cfg, progress_cb, cancel)
 }
@@ -1160,10 +1211,12 @@ fn export_fisheye_inner(
     mut progress_cb: impl FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
+    let mono = single_eye_source(&cfg);
     tracing::info!(
-        "fisheye_export: {} → {} ({}x{} @ {:.2} fps, {} kbps, {}-bit)",
+        "fisheye_export: {} → {} ({}x{}{} @ {:.2} fps, {} kbps, {}-bit)",
         cfg.source_path.display(), cfg.output_path.display(),
-        cfg.eye_w * 2, cfg.eye_h, cfg.fps, cfg.bitrate_kbps, cfg.bit_depth,
+        if mono { cfg.eye_w } else { cfg.eye_w * 2 }, cfg.eye_h,
+        if mono { ", one eye" } else { "" }, cfg.fps, cfg.bitrate_kbps, cfg.bit_depth,
     );
 
     // ── Fast path: zero-copy OSV → P010 → VT (macOS, 10-bit) ──────
@@ -1254,6 +1307,7 @@ fn export_fisheye_inner(
     {
         let try_gpu_resident = std::env::var_os("VR180_NO_GPU_RESIDENT").is_none()
             && std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
+            && !mono
             && cfg.source_kind.is_dual_stream()
             && matches!(cfg.encoder, EncoderBackend::HevcNvenc)
             && cfg.bit_depth == 10
@@ -1326,6 +1380,7 @@ fn export_fisheye_inner(
         let src_ok = cfg.source_kind.is_dual_stream()
             || (cfg.source_kind.is_single_stream_pair() && cfg.segments.len() <= 1);
         let can_try = std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none()
+            && !mono
             && src_ok
             && matches!(cfg.encoder,
                 EncoderBackend::Libx265 | EncoderBackend::HevcNvenc
@@ -1384,7 +1439,9 @@ fn export_fisheye_inner(
         } else if std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none() {
             // Landed on the portable serial loop — say WHY (the user-visible
             // symptom is just "export is slow with the GPU idle").
-            let reason = if !cfg.source_kind.is_dual_stream()
+            let reason = if mono {
+                "a single-eye source has no GPU fast path yet"
+            } else if !cfg.source_kind.is_dual_stream()
                 && !cfg.source_kind.is_single_stream_pair()
             {
                 "no GPU fast path for this source type"
@@ -1528,7 +1585,8 @@ fn export_fisheye_inner(
     );
 
     // ── Open the encoder ─────────────────────────────────────────
-    let sbs_w = cfg.eye_w * 2;
+    // The frame: two eyes side by side, or the one eye of a single-eye source.
+    let sbs_w = if mono { cfg.eye_w } else { cfg.eye_w * 2 };
     let sbs_h = cfg.eye_h;
     // Three encode paths on macOS / VT:
     //   HEVC bit_depth == 8  → BGRA IOSurface zero-copy (Main profile)
@@ -1762,48 +1820,31 @@ fn export_fisheye_inner(
         // (projection, rs) four-way matches every zero-copy path, so the
         // portable path now keeps per-row RS too.
         let project_8 = |rs: (Option<&[f32]>, Option<&[f32]>)| -> Result<(wgpu::Texture, wgpu::Texture)> {
-            Ok(match (projection, rs.0, rs.1) {
-                (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, Some(rs_l), Some(rs_r)) => (
-                    pipeline.project_fisheye_to_equirect_rs_texture(
-                        &pair.left, src_w, src_h, cfg.eye_w, cfg.eye_h,
-                        rot_left, calib_left, rs_l, 10,
-                    )?,
-                    pipeline.project_fisheye_to_equirect_rs_texture(
-                        &pair.right, src_w, src_h, cfg.eye_w, cfg.eye_h,
-                        rot_right, calib_right, rs_r, 11,
-                    )?,
-                ),
-                (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, _, _) => (
-                    pipeline.project_fisheye_to_equirect_texture(
-                        &pair.left, src_w, src_h, cfg.eye_w, cfg.eye_h,
-                        rot_left, calib_left, 10,
-                    )?,
-                    pipeline.project_fisheye_to_equirect_texture(
-                        &pair.right, src_w, src_h, cfg.eye_w, cfg.eye_h,
-                        rot_right, calib_right, 11,
-                    )?,
-                ),
-                (FisheyeExportProjection::Fisheye, Some(rs_l), Some(rs_r)) => (
-                    pipeline.project_fisheye_to_fisheye_rs_texture(
-                        &pair.left, src_w, src_h, cfg.eye_w, cfg.eye_h,
-                        rot_left, calib_left, rs_l,
-                    )?,
-                    pipeline.project_fisheye_to_fisheye_rs_texture(
-                        &pair.right, src_w, src_h, cfg.eye_w, cfg.eye_h,
-                        rot_right, calib_right, rs_r,
-                    )?,
-                ),
-                (FisheyeExportProjection::Fisheye, _, _) => (
-                    pipeline.project_fisheye_to_fisheye_texture(
-                        &pair.left, src_w, src_h, cfg.eye_w, cfg.eye_h,
-                        rot_left, calib_left,
-                    )?,
-                    pipeline.project_fisheye_to_fisheye_texture(
-                        &pair.right, src_w, src_h, cfg.eye_w, cfg.eye_h,
-                        rot_right, calib_right,
-                    )?,
-                ),
-            })
+            // One eye of the pair (`slot`: the projection cache slot).
+            let eye = |bytes: &[u8], rot: EquirectRotation, calib: FisheyeCalib, rows: Option<&[f32]>, slot: u32| -> Result<wgpu::Texture> {
+                match (projection, rows) {
+                    (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, Some(rows)) =>
+                        pipeline.project_fisheye_to_equirect_rs_texture(
+                            bytes, src_w, src_h, cfg.eye_w, cfg.eye_h, rot, calib, rows, slot),
+                    (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, None) =>
+                        pipeline.project_fisheye_to_equirect_texture(
+                            bytes, src_w, src_h, cfg.eye_w, cfg.eye_h, rot, calib, slot),
+                    (FisheyeExportProjection::Fisheye, Some(rows)) =>
+                        pipeline.project_fisheye_to_fisheye_rs_texture(
+                            bytes, src_w, src_h, cfg.eye_w, cfg.eye_h, rot, calib, rows),
+                    (FisheyeExportProjection::Fisheye, None) =>
+                        pipeline.project_fisheye_to_fisheye_texture(
+                            bytes, src_w, src_h, cfg.eye_w, cfg.eye_h, rot, calib),
+                }
+            };
+            // Per-row RS needs both eyes' rows, as before.
+            let (rs_l, rs_r) = match rs { (Some(l), Some(r)) => (Some(l), Some(r)), _ => (None, None) };
+            let left = eye(&pair.left, rot_left, calib_left, rs_l, 10)?;
+            if pair.single_eye() {
+                return Ok((left.clone(), left));
+            }
+            let right = eye(&pair.right, rot_right, calib_right, rs_r, 11)?;
+            Ok((left, right))
         };
 
         if use_zero_copy_bgra {
@@ -1816,10 +1857,15 @@ fn export_fisheye_inner(
                 let encode_pb = crate::interop_macos::create_bgra_encode_buffer(
                     &pipeline.device, sbs_w, sbs_h,
                 )?;
-                pipeline.apply_color_stack_to_sbs_bgra_matched(
-                    &left_tex, &right_tex, &encode_pb.wgpu_tex,
-                    cfg.eye_w, cfg.eye_h, &color_plan, eye_match(),
-                )?;
+                if mono {
+                    pipeline.apply_color_stack_to_eye_bgra(
+                        &left_tex, &encode_pb.wgpu_tex, cfg.eye_w, cfg.eye_h, &color_plan)?;
+                } else {
+                    pipeline.apply_color_stack_to_sbs_bgra_matched(
+                        &left_tex, &right_tex, &encode_pb.wgpu_tex,
+                        cfg.eye_w, cfg.eye_h, &color_plan, eye_match(),
+                    )?;
+                }
                 for _ in 0..fill.copies() { encoder.encode_pixel_buffer(&encode_pb)?; }
             }
             #[cfg(not(target_os = "macos"))]
@@ -1835,11 +1881,10 @@ fn export_fisheye_inner(
                     rot_left, rot_right, calib_left, calib_right,
                     projection, (rs_rows_l.as_deref(), rs_rows_r.as_deref()),
                 )?;
-                let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
-                    &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan, eye_match(),
+                let (l_final, r_final) = grade_eyes_16(
+                    &pipeline, &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan, eye_match(), mono,
                 )?;
-                let l_final = left_g .as_ref().unwrap_or(&left_tex_16);
-                let r_final = right_g.as_ref().unwrap_or(&right_tex_16);
+                let (l_final, r_final) = (&l_final, &r_final);
                 // ProRes gets a P210 (true 4:2:2) surface; HEVC Main10 P010.
                 let encode_pb = if is_prores_vt {
                     crate::interop_macos::create_p210_encode_buffer(
@@ -1848,12 +1893,13 @@ fn export_fisheye_inner(
                     crate::interop_macos::create_p010_encode_buffer(
                         &pipeline.device, sbs_w, sbs_h)?
                 };
-                if is_prores_vt {
-                    pipeline.compose_sbs_to_p210(
-                        l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
-                } else {
-                    pipeline.compose_sbs_to_p010(
-                        l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
+                match (mono, is_prores_vt) {
+                    (true, true) => pipeline.compose_eye_to_p210(l_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
+                    (true, false) => pipeline.compose_eye_to_p010(l_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
+                    (false, true) => pipeline.compose_sbs_to_p210(
+                        l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
+                    (false, false) => pipeline.compose_sbs_to_p010(
+                        l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
                 }
                 for _ in 0..fill.copies() { encoder.encode_pixel_buffer_p010(&encode_pb)?; }
             }
@@ -1869,14 +1915,13 @@ fn export_fisheye_inner(
                 rot_left, rot_right, calib_left, calib_right,
                 projection, (rs_rows_l.as_deref(), rs_rows_r.as_deref()),
             )?;
-            let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
-                &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan, eye_match(),
+            let (l_final, r_final) = grade_eyes_16(
+                &pipeline, &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan, eye_match(), mono,
             )?;
-            let l_final = left_g .as_ref().unwrap_or(&left_tex_16);
-            let r_final = right_g.as_ref().unwrap_or(&right_tex_16);
-            let sbs_tex_16 = pipeline.compose_sbs_textures_16(
-                l_final, r_final, cfg.eye_w, cfg.eye_h,
-            )?;
+            // One eye is the frame itself; two are composed side by side.
+            let sbs_tex_16 = if mono { l_final } else {
+                pipeline.compose_sbs_textures_16(&l_final, &r_final, cfg.eye_w, cfg.eye_h)?
+            };
             let sbs_rgb48 = pipeline.read_texture_rgb48(&sbs_tex_16, sbs_w, sbs_h)?;
             for _ in 0..fill.copies() { encoder.encode_frame_rgb48(&sbs_rgb48)?; }
         } else {
@@ -1886,12 +1931,12 @@ fn export_fisheye_inner(
             let (left_tex, right_tex) = project_8((rs_rows_l.as_deref(), rs_rows_r.as_deref()))?;
             // Automatic eye-exposure offset on the GPU first (8-bit), then the
             // rest of the grade on the CPU as before.
-            let (left_tex, right_tex) = pipeline
-                .match_eyes_8(&left_tex, &right_tex, cfg.eye_w, cfg.eye_h, &color_plan, eye_match())?
-                .unwrap_or((left_tex, right_tex));
-            let sbs_tex = pipeline.compose_sbs_textures(
-                &left_tex, &right_tex, cfg.eye_w, cfg.eye_h,
-            )?;
+            let sbs_tex = if mono { left_tex } else {
+                let (left_tex, right_tex) = pipeline
+                    .match_eyes_8(&left_tex, &right_tex, cfg.eye_w, cfg.eye_h, &color_plan, eye_match())?
+                    .unwrap_or((left_tex, right_tex));
+                pipeline.compose_sbs_textures(&left_tex, &right_tex, cfg.eye_w, cfg.eye_h)?
+            };
             let sbs_rgb8 = pipeline.read_texture_rgb8(&sbs_tex, sbs_w, sbs_h)?;
             let mut graded = if color_any_cpu {
                 apply_color_stack_rgb8_sbs(
@@ -1928,10 +1973,11 @@ fn export_fisheye_inner(
         // file muxes its own. (`eac_audio_source` is segment-generic.)
         finalize_fisheye_audio(&cfg, &video_tmp, t_in, frame_idx as f64 * dt)?;
     }
-    finalize_metadata(
+    finalize_metadata_for(
         &cfg.output_path,
         cfg.inject_youtube_vr180,
         cfg.inject_apmp,
+        mono,
     )?;
     tracing::info!(
         "fisheye_export: done, {} frames in {:.2?}",
@@ -3050,6 +3096,7 @@ fn export_fisheye_osv_zerocopy_p010(
             .collect()
     } else { Vec::new() };
 
+    let mono = single_eye_source(&cfg);
     let mut decoder = if let Some(it) = sbs_iter {
         // Generic SBS: one VT stream, no chaining, no denoise (gated out at
         // the caller). `eye_dims()` is PER-EYE, so `resolve_calib_pair` below
@@ -3134,7 +3181,8 @@ fn export_fisheye_osv_zerocopy_p010(
         total_frames_to_write, cfg.trim_in_s, cfg.trim_out_s
     );
 
-    let sbs_w = cfg.eye_w * 2;
+    // The frame: two eyes side by side, or the one eye of a single-eye source.
+    let sbs_w = if mono { cfg.eye_w } else { cfg.eye_w * 2 };
     let sbs_h = cfg.eye_h;
     // One-pass: encode STRAIGHT to the final file and mux the source's
     // audio inline (no temp + re-mux). Otherwise encode to a local-scratch
@@ -3270,52 +3318,37 @@ fn export_fisheye_osv_zerocopy_p010(
         let (left_eq, right_eq) = match &frame {
             // Dual-stream: project each eye straight from its P010 planes
             // (no resolve, no split) — unchanged.
-            ZcMacFrame::Pair(pair) => match (cfg.projection, rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-            (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, Some(rs_l), Some(rs_r)) => {
-                let l = pipeline.project_fisheye_p010_to_equirect_rs_texture_16(
-                    &pair.left_y.texture, &pair.left_uv.texture,
-                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l,
-                )?;
-                let r = pipeline.project_fisheye_p010_to_equirect_rs_texture_16(
-                    &pair.right_y.texture, &pair.right_uv.texture,
-                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r,
-                )?;
+            ZcMacFrame::Pair(pair) => {
+                // One eye from its planes.
+                let eye = |y: &wgpu::Texture, uv: &wgpu::Texture, rot: crate::gpu::EquirectRotation,
+                           calib: FisheyeCalib, rows: Option<&[f32]>| -> Result<wgpu::Texture> {
+                    match (cfg.projection, rows) {
+                        (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, Some(rows)) =>
+                            pipeline.project_fisheye_p010_to_equirect_rs_texture_16(
+                                y, uv, src_w, src_h, cfg.eye_w, cfg.eye_h, rot, calib, rows),
+                        (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, None) =>
+                            pipeline.project_fisheye_p010_to_equirect_texture_16(
+                                y, uv, src_w, src_h, cfg.eye_w, cfg.eye_h, rot, calib),
+                        (FisheyeExportProjection::Fisheye, Some(rows)) =>
+                            pipeline.project_fisheye_p010_to_fisheye_rs_texture_16(
+                                y, uv, src_w, src_h, cfg.eye_w, cfg.eye_h, rot, calib, rows),
+                        (FisheyeExportProjection::Fisheye, None) =>
+                            pipeline.project_fisheye_p010_to_fisheye_texture_16(
+                                y, uv, src_w, src_h, cfg.eye_w, cfg.eye_h, rot, calib),
+                    }
+                };
+                // Per-row RS needs both eyes' rows, as before.
+                let (rs_l, rs_r) = match (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
+                    (Some(l), Some(r)) => (Some(l), Some(r)),
+                    _ => (None, None),
+                };
+                let l = eye(&pair.left_y.texture, &pair.left_uv.texture, rot_left, calib_left, rs_l)?;
+                // A single-eye source: the one eye is the frame.
+                let r = if mono { l.clone() } else {
+                    eye(&pair.right_y.texture, &pair.right_uv.texture, rot_right, calib_right, rs_r)?
+                };
                 (l, r)
             }
-            (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, _, _) => {
-                let l = pipeline.project_fisheye_p010_to_equirect_texture_16(
-                    &pair.left_y.texture, &pair.left_uv.texture,
-                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left,
-                )?;
-                let r = pipeline.project_fisheye_p010_to_equirect_texture_16(
-                    &pair.right_y.texture, &pair.right_uv.texture,
-                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right,
-                )?;
-                (l, r)
-            }
-            (FisheyeExportProjection::Fisheye, Some(rs_l), Some(rs_r)) => {
-                let l = pipeline.project_fisheye_p010_to_fisheye_rs_texture_16(
-                    &pair.left_y.texture, &pair.left_uv.texture,
-                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l,
-                )?;
-                let r = pipeline.project_fisheye_p010_to_fisheye_rs_texture_16(
-                    &pair.right_y.texture, &pair.right_uv.texture,
-                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r,
-                )?;
-                (l, r)
-            }
-            (FisheyeExportProjection::Fisheye, _, _) => {
-                let l = pipeline.project_fisheye_p010_to_fisheye_texture_16(
-                    &pair.left_y.texture, &pair.left_uv.texture,
-                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left,
-                )?;
-                let r = pipeline.project_fisheye_p010_to_fisheye_texture_16(
-                    &pair.right_y.texture, &pair.right_uv.texture,
-                    src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right,
-                )?;
-                (l, r)
-            }
-            },
             // Generic SBS: the P010 kernels sample each eye straight from the
             // whole-frame planes (see the arm). NO eye swap: the halves are
             // already in L|R frame order, matching the CPU `SbsFisheyeIter`
@@ -3374,12 +3407,11 @@ fn export_fisheye_osv_zerocopy_p010(
         // 16-bit color stack — runs only when active. Stays Rgba16Unorm
         // so VT sees full 10-bit precision when the user has added a
         // grade.
-        let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
-            &left_eq, &right_eq, cfg.eye_w, cfg.eye_h, &cfg.color_stack,
-            Some((&eye_match_state, EyeMatchFrame::default())),
+        let (l_final, r_final) = grade_eyes_16(
+            &pipeline, &left_eq, &right_eq, cfg.eye_w, cfg.eye_h, &cfg.color_stack,
+            Some((&eye_match_state, EyeMatchFrame::default())), mono,
         )?;
-        let l_final = left_g .as_ref().unwrap_or(&left_eq);
-        let r_final = right_g.as_ref().unwrap_or(&right_eq);
+        let (l_final, r_final) = (&l_final, &r_final);
 
         // Compose the (already-graded, 16-bit) eyes into the encode
         // IOSurface and hand off to VT. ProRes → P210 (true 4:2:2);
@@ -3394,22 +3426,28 @@ fn export_fisheye_osv_zerocopy_p010(
                 crate::interop_macos::create_p010_encode_buffer(
                     &pipeline.device, sbs_w, sbs_h)?
             };
-            if is_prores {
-                pipeline.compose_sbs_to_p210(
-                    l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
-            } else {
-                pipeline.compose_sbs_to_p010(
-                    l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?;
+            match (mono, is_prores) {
+                (true, true) => pipeline.compose_eye_to_p210(l_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
+                (true, false) => pipeline.compose_eye_to_p010(l_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
+                (false, true) => pipeline.compose_sbs_to_p210(
+                    l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
+                (false, false) => pipeline.compose_sbs_to_p010(
+                    l_final, r_final, &encode_pb, cfg.eye_w, cfg.eye_h)?,
             }
             for _ in 0..fill.copies() { encoder.encode_pixel_buffer_p010(&encode_pb)?; }
         } else {
             let encode_pb = crate::interop_macos::create_bgra_encode_buffer(
                 &pipeline.device, sbs_w, sbs_h,
             )?;
-            pipeline.apply_color_stack_to_sbs_bgra(
-                l_final, r_final, &encode_pb.wgpu_tex,
-                cfg.eye_w, cfg.eye_h, &ColorStackPlan::default(),
-            )?;
+            if mono {
+                pipeline.apply_color_stack_to_eye_bgra(
+                    l_final, &encode_pb.wgpu_tex, cfg.eye_w, cfg.eye_h, &ColorStackPlan::default())?;
+            } else {
+                pipeline.apply_color_stack_to_sbs_bgra(
+                    l_final, r_final, &encode_pb.wgpu_tex,
+                    cfg.eye_w, cfg.eye_h, &ColorStackPlan::default(),
+                )?;
+            }
             for _ in 0..fill.copies() { encoder.encode_pixel_buffer(&encode_pb)?; }
         }
 
@@ -3439,10 +3477,11 @@ fn export_fisheye_osv_zerocopy_p010(
     } else {
         finalize_fisheye_audio(&cfg, &enc_out, t_in, frame_idx as f64 * dt)?;
     }
-    finalize_metadata(
+    finalize_metadata_for(
         &cfg.output_path,
         cfg.inject_youtube_vr180,
         cfg.inject_apmp,
+        mono,
     )?;
     tracing::info!(
         "fisheye_export (zero-copy): done, {} frames in {:.2?}",
@@ -4511,53 +4550,40 @@ fn build_eye_eq_16(
     projection: FisheyeExportProjection,
     rs: (Option<&[f32]>, Option<&[f32]>),
 ) -> Result<(wgpu::Texture, wgpu::Texture)> {
-    if let (Some(rs_l), Some(rs_r)) = rs {
-        let l_tex = upload_eye_rgba16(pipeline, &pair.left, pair.bit_depth, src_w, src_h);
-        let r_tex = upload_eye_rgba16(pipeline, &pair.right, pair.bit_depth, src_w, src_h);
-        return Ok(match projection {
-            FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. } => (
-                pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                    &l_tex, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_l, 30,
-                )?,
-                pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                    &r_tex, src_w, src_h, eye_w, eye_h, rot_right, calib_right, rs_r, 31,
-                )?,
-            ),
-            FisheyeExportProjection::Fisheye => (
-                pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                    &l_tex, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_l, 30,
-                )?,
-                pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                    &r_tex, src_w, src_h, eye_w, eye_h, rot_right, calib_right, rs_r, 31,
-                )?,
-            ),
-        });
-    }
-    match projection {
-        FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. } => {
-            let l = pipeline.project_fisheye_to_equirect_texture_16(
-                &pair.left, src_w, src_h, eye_w, eye_h, rot_left, calib_left,
-            )?;
-            let r = pipeline.project_fisheye_to_equirect_texture_16(
-                &pair.right, src_w, src_h, eye_w, eye_h, rot_right, calib_right,
-            )?;
-            Ok((l, r))
+    // One eye of the pair (`slot`: the projection cache slot of the RS
+    // kernels). A single-eye pair projects its one eye and returns it twice.
+    let eye = |bytes: &[u8], rot: EquirectRotation, calib: FisheyeCalib, rows: Option<&[f32]>, slot: u32| -> Result<wgpu::Texture> {
+        if let Some(rows) = rows {
+            let tex = upload_eye_rgba16(pipeline, bytes, pair.bit_depth, src_w, src_h);
+            return match projection {
+                FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. } =>
+                    pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                        &tex, src_w, src_h, eye_w, eye_h, rot, calib, rows, slot),
+                FisheyeExportProjection::Fisheye =>
+                    pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
+                        &tex, src_w, src_h, eye_w, eye_h, rot, calib, rows, slot),
+            };
         }
-        FisheyeExportProjection::Fisheye => {
+        match projection {
+            FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. } =>
+                pipeline.project_fisheye_to_equirect_texture_16(
+                    bytes, src_w, src_h, eye_w, eye_h, rot, calib),
             // 16-bit stabilized fisheye output. The projection helper
             // auto-widens 8-bit source bytes to 16-bit storage; 16-bit
             // sources copy verbatim.
-            let l = pipeline.project_fisheye_to_fisheye_texture_16(
-                &pair.left, pair.bit_depth, src_w, src_h, eye_w, eye_h,
-                rot_left, calib_left,
-            )?;
-            let r = pipeline.project_fisheye_to_fisheye_texture_16(
-                &pair.right, pair.bit_depth, src_w, src_h, eye_w, eye_h,
-                rot_right, calib_right,
-            )?;
-            Ok((l, r))
+            FisheyeExportProjection::Fisheye =>
+                pipeline.project_fisheye_to_fisheye_texture_16(
+                    bytes, pair.bit_depth, src_w, src_h, eye_w, eye_h, rot, calib),
         }
+    };
+    // Per-row RS needs both eyes' rows, as before.
+    let (rs_l, rs_r) = match rs { (Some(l), Some(r)) => (Some(l), Some(r)), _ => (None, None) };
+    let left = eye(&pair.left, rot_left, calib_left, rs_l, 30)?;
+    if pair.single_eye() {
+        return Ok((left.clone(), left));
     }
+    let right = eye(&pair.right, rot_right, calib_right, rs_r, 31)?;
+    Ok((left, right))
 }
 
 /// Upload one decoded eye as an `Rgba16Unorm` texture for the RS-capable

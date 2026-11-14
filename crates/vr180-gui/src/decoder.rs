@@ -407,6 +407,11 @@ pub struct Settings {
     /// In Single-eye mode, which eye to show: false = left, true = right.
     /// The "switch eye" toggle flips this; the viewpoint (zoom/pan) is kept.
     pub preview_eye_right: bool,
+    /// The source holds ONE eye: the preview shows it alone and nothing is
+    /// rendered for a second one. Only ever set on the copy a worker gets
+    /// ([`Settings::for_single_eye`]); never persisted.
+    #[serde(skip)]
+    pub single_eye: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,6 +519,7 @@ impl Default for Settings {
             braw_color: Default::default(),
             preview_mode: PreviewMode::Sbs,
             preview_eye_right: false,
+            single_eye: false,
         }
     }
 }
@@ -626,6 +632,25 @@ pub fn restrict_to_dng_metadata(plan: &mut vr180_pipeline::gpu::ColorStackPlan) 
 }
 
 impl Settings {
+    /// These settings as a source that holds ONE eye takes them: nothing
+    /// that sets two eyes against each other applies (stereo offset, the
+    /// "Matching Eyes" trims, the automatic exposure match), and the
+    /// preview shows that eye alone.
+    pub fn for_single_eye(&self) -> Settings {
+        let mut s = self.clone();
+        s.single_eye = true;
+        s.stereo_yaw_deg = 0.0;
+        s.stereo_pitch_deg = 0.0;
+        s.stereo_roll_deg = 0.0;
+        s.eye_match_ct = 0.0;
+        s.eye_match_tint = 0.0;
+        s.eye_match_exposure = 0.0;
+        s.auto_eye_match = false;
+        s.preview_mode = PreviewMode::SingleEye;
+        s.preview_eye_right = false;
+        s
+    }
+
     /// The L↔R eye swap that should actually be applied: the manual
     /// "Swap L↔R" toggle XOR the upside-down mount (flipping the rig
     /// 180° mirrors the physical eye positions, so upside-down implies
@@ -847,6 +872,17 @@ impl FisheyeOutputMode {
             Self::HalfEquirect => "Half-equirect (VR180)",
             Self::Fisheye      => "Fisheye SBS (equidist.)",
             Self::Reframe      => "Reframed (Flat 3D)",
+        }
+    }
+
+    /// The name shown in the Format list: [`Self::as_str`], or for a
+    /// single-eye source what the same output is with one eye in the frame.
+    pub fn label(&self, single_eye: bool) -> &'static str {
+        match (self, single_eye) {
+            (Self::HalfEquirect, true) => "Half-equirect (VR180 mono)",
+            (Self::Fisheye, true)      => "Fisheye (equidist.)",
+            (Self::Reframe, true)      => "Reframed (flat)",
+            (m, false) => m.as_str(),
         }
     }
 }
@@ -2624,6 +2660,8 @@ fn run_fisheye(
             let s = control.settings.read();
             let mode = s.fisheye_output_mode;
             let aspect = s.reframe_aspect;
+            // A single-eye source: the left projection serves as both.
+            let one_eye = s.single_eye || pair.single_eye();
             drop(s);
             match mode {
                 FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => {
@@ -2633,24 +2671,24 @@ fn run_fisheye(
                         // Zero-copy source: the eyes are textures already.
                         let l = pipeline.project_fisheye_from_texture(
                             &g.left, eye_w, eye_h, rot_left, calib_left, rs_rows_l.as_deref(), false)?;
-                        let r = pipeline.project_fisheye_from_texture(
-                            &g.right, eye_w, eye_h, rot_right, calib_right, rs_rows_r.as_deref(), false)?;
+                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_from_texture(
+                            &g.right, eye_w, eye_h, rot_right, calib_right, rs_rows_r.as_deref(), false)? };
                         (l, r)
                     } else if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_to_equirect_rs_texture(
                             &pair.left, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_l, 0,
                         )?;
-                        let r = pipeline.project_fisheye_to_equirect_rs_texture(
+                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_to_equirect_rs_texture(
                             &pair.right, src_w, src_h, eye_w, eye_h, rot_right, calib_right, rs_r, 1,
-                        )?;
+                        )? };
                         (l, r)
                     } else {
                         let l = pipeline.project_fisheye_to_equirect_texture(
                             &pair.left, src_w, src_h, eye_w, eye_h, rot_left, calib_left, 0,
                         )?;
-                        let r = pipeline.project_fisheye_to_equirect_texture(
+                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_to_equirect_texture(
                             &pair.right, src_w, src_h, eye_w, eye_h, rot_right, calib_right, 1,
-                        )?;
+                        )? };
                         (l, r)
                     }
                 }
@@ -2662,8 +2700,8 @@ fn run_fisheye(
                     if let Some(g) = pair.gpu.as_deref() {
                         let l = pipeline.project_fisheye_from_texture(
                             &g.left, side, side, rot_left, calib_left, rs_rows_l.as_deref(), true)?;
-                        let r = pipeline.project_fisheye_from_texture(
-                            &g.right, side, side, rot_right, calib_right, rs_rows_r.as_deref(), true)?;
+                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_from_texture(
+                            &g.right, side, side, rot_right, calib_right, rs_rows_r.as_deref(), true)? };
                         (l, r)
                     } else if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         // Per-row rolling-shutter correction, same as the
@@ -2673,17 +2711,17 @@ fn run_fisheye(
                         let l = pipeline.project_fisheye_to_fisheye_rs_texture(
                             &pair.left, src_w, src_h, side, side, rot_left, calib_left, rs_l,
                         )?;
-                        let r = pipeline.project_fisheye_to_fisheye_rs_texture(
+                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_to_fisheye_rs_texture(
                             &pair.right, src_w, src_h, side, side, rot_right, calib_right, rs_r,
-                        )?;
+                        )? };
                         (l, r)
                     } else {
                         let l = pipeline.project_fisheye_to_fisheye_texture(
                             &pair.left, src_w, src_h, side, side, rot_left, calib_left,
                         )?;
-                        let r = pipeline.project_fisheye_to_fisheye_texture(
+                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_to_fisheye_texture(
                             &pair.right, src_w, src_h, side, side, rot_right, calib_right,
-                        )?;
+                        )? };
                         (l, r)
                     }
                 }
@@ -3662,19 +3700,23 @@ fn run_fisheye_vt_zerocopy(
 
         // ── Resolve P010 planes → working-res RGBA16 (GPU, zero host hop) ──
         let phase_t0 = std::time::Instant::now();
+        // A single-eye source: the left eye is the picture, nothing is
+        // resolved or projected for a second one.
+        let one_eye = control.settings.read().single_eye;
         let (l_tex, r_tex) = match pair {
             // Dual-stream: one resolve per eye. Slots 0/1 MUST differ — the
             // resolve caches its output per slot and both eyes share dims.
-            VtZcFisheyeFrame::Pair(p) => (
-                pipeline.resolve_p010_planes_to_rgba16(
+            VtZcFisheyeFrame::Pair(p) => {
+                let l = pipeline.resolve_p010_planes_to_rgba16(
                     &p.left_y.texture, &p.left_uv.texture,
                     native_w, native_h, 0, 0, vr180_pipeline::gpu::YUV_RANGE_P010_LIMITED,
-                    vr180_pipeline::gpu::YUV_MAT_BT709, src_w, src_h, 0)?,
-                pipeline.resolve_p010_planes_to_rgba16(
+                    vr180_pipeline::gpu::YUV_MAT_BT709, src_w, src_h, 0)?;
+                let r = if one_eye { l.clone() } else { pipeline.resolve_p010_planes_to_rgba16(
                     &p.right_y.texture, &p.right_uv.texture,
                     native_w, native_h, 0, 0, vr180_pipeline::gpu::YUV_RANGE_P010_LIMITED,
-                    vr180_pipeline::gpu::YUV_MAT_BT709, src_w, src_h, 1)?,
-            ),
+                    vr180_pipeline::gpu::YUV_MAT_BT709, src_w, src_h, 1)? };
+                (l, r)
+            }
             // Generic SBS: one resolve PER EYE straight from its sub-rect of the
             // whole-frame planes (`src_x0` = 0 / eye_w), into the same slots
             // the dual-stream arm uses — no whole-frame texture, no split.
@@ -3744,14 +3786,14 @@ fn run_fisheye_vt_zerocopy(
                     if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
                             &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs_l, 0)?;
-                        let r = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs_r, 1)?;
+                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
+                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs_r, 1)? };
                         (l, r)
                     } else {
                         let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
                             &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, 0)?;
-                        let r = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1)?;
+                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
+                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1)? };
                         (l, r)
                     }
                 }
@@ -3759,14 +3801,14 @@ fn run_fisheye_vt_zerocopy(
                     if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
                             &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs_l, 0)?;
-                        let r = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs_r, 1)?;
+                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs_r, 1)? };
                         (l, r)
                     } else {
                         let l = pipeline.project_fisheye_rgba16_texture_to_equirect_16(
                             &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, 0)?;
-                        let r = pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1)?;
+                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_rgba16_texture_to_equirect_16(
+                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1)? };
                         (l, r)
                     }
                 }
@@ -5524,6 +5566,16 @@ fn compose_with_color_and_mode(
     if eye_match.is_none() {
         color_plan.auto_eye_match = None;
     }
+    // A single-eye source: its one eye (the left input), graded once.
+    if s.single_eye {
+        let plan = color_plan.single_eye();
+        let graded = pipeline.apply_color_stack_per_eye_16(left_tex, eye_w, eye_h, &plan)?;
+        let eye = graded.as_ref().unwrap_or(left_tex);
+        let mode = vr180_pipeline::gpu::PreviewMode::SingleEye;
+        let out = pipeline.compose_preview(eye, eye, eye_w, eye_h, mode)?;
+        let (out_w, out_h) = mode.output_dims(eye_w, eye_h);
+        return Ok((out, out_w, out_h));
+    }
     let preview_mode = s.preview_mode.to_pipeline();
     // Single-eye: the compose shader (mode 3) outputs the LEFT input. To show
     // the RIGHT eye, swap the bindings so the right eye lands in that slot.
@@ -6054,7 +6106,11 @@ fn render_still_from_pair(
     // full-detail. Because both come from THIS same projection of the same
     // cached frame, the low-res and full-res stills are pixel-aligned and
     // never jump when one replaces the other.
-    let (oeq_w, oeq_h, oside) = still_base_dims(src_w, src_h, out_cap, still_eye_limit(pipeline));
+    // A single-eye source: the still is one eye wide, so that eye may take
+    // the whole texture, and nothing is projected for a second one.
+    let one_eye = s.single_eye || pair.single_eye();
+    let eye_limit = if one_eye { still_eye_limit(pipeline).saturating_mul(2) } else { still_eye_limit(pipeline) };
+    let (oeq_w, oeq_h, oside) = still_base_dims(src_w, src_h, out_cap, eye_limit);
 
     let dt = 1.0 / fps as f64;
     let stab_idx = vr180_pipeline::frame_timeline::stab_row(timeline, pair.pts_s, dt, 0);
@@ -6086,21 +6142,29 @@ fn render_still_from_pair(
             let (oeq_w, oeq_h) = out_eye.unwrap_or_else(||
                 preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, oeq_w, oeq_h));
             if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                (pipeline.project_fisheye_to_equirect_rs_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, rs_l, 20)?,
-                 pipeline.project_fisheye_to_equirect_rs_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, rs_r, 21)?)
+                let l = pipeline.project_fisheye_to_equirect_rs_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, rs_l, 20)?;
+                let r = if one_eye { l.clone() } else {
+                    pipeline.project_fisheye_to_equirect_rs_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, rs_r, 21)? };
+                (l, r)
             } else {
-                (pipeline.project_fisheye_to_equirect_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, 20)?,
-                 pipeline.project_fisheye_to_equirect_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, 21)?)
+                let l = pipeline.project_fisheye_to_equirect_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, 20)?;
+                let r = if one_eye { l.clone() } else {
+                    pipeline.project_fisheye_to_equirect_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, 21)? };
+                (l, r)
             }
         }
         FisheyeOutputMode::Fisheye => {
             let oside = out_eye.map(|(w, h)| w.min(h)).unwrap_or(oside);
             if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                (pipeline.project_fisheye_to_fisheye_rs_texture(&pair.left, src_w, src_h, oside, oside, rot_left, calib_left, rs_l)?,
-                 pipeline.project_fisheye_to_fisheye_rs_texture(&pair.right, src_w, src_h, oside, oside, rot_right, calib_right, rs_r)?)
+                let l = pipeline.project_fisheye_to_fisheye_rs_texture(&pair.left, src_w, src_h, oside, oside, rot_left, calib_left, rs_l)?;
+                let r = if one_eye { l.clone() } else {
+                    pipeline.project_fisheye_to_fisheye_rs_texture(&pair.right, src_w, src_h, oside, oside, rot_right, calib_right, rs_r)? };
+                (l, r)
             } else {
-                (pipeline.project_fisheye_to_fisheye_texture(&pair.left, src_w, src_h, oside, oside, rot_left, calib_left)?,
-                 pipeline.project_fisheye_to_fisheye_texture(&pair.right, src_w, src_h, oside, oside, rot_right, calib_right)?)
+                let l = pipeline.project_fisheye_to_fisheye_texture(&pair.left, src_w, src_h, oside, oside, rot_left, calib_left)?;
+                let r = if one_eye { l.clone() } else {
+                    pipeline.project_fisheye_to_fisheye_texture(&pair.right, src_w, src_h, oside, oside, rot_right, calib_right)? };
+                (l, r)
             }
         }
     };

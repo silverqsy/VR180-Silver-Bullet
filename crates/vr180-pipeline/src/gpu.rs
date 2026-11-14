@@ -5385,6 +5385,18 @@ impl ColorStackPlan {
             || self.eye_scale != 1.0
     }
 
+    /// This plan for a source that holds ONE eye: everything that sets the two
+    /// eyes against each other (the "Matching Eyes" trims, the automatic
+    /// exposure match) and the per-eye output scale are dropped.
+    pub fn single_eye(mut self) -> Self {
+        self.eye_match_ct = 0.0;
+        self.eye_match_tint = 0.0;
+        self.eye_match_exposure = 0.0;
+        self.auto_eye_match = None;
+        self.eye_scale = 1.0;
+        self
+    }
+
     /// This plan specialized for one eye: the "Matching Eyes" trims are applied
     /// in OPPOSITE directions (left `+`, right `−`) — CT/tint on top of the
     /// global temperature/tint, exposure as a multiply on the CDL gain. Cheap
@@ -7225,6 +7237,29 @@ impl Device {
         self.compose_sbs_to_biplanar(left_16, right_16, target, eye_w, eye_h, true)
     }
 
+    /// One eye as the WHOLE frame (a single-eye source): `target` is
+    /// `eye_w × eye_h`, 4:2:0 like [`Self::compose_sbs_to_p010`].
+    #[cfg(target_os = "macos")]
+    pub fn compose_eye_to_p010(
+        &self,
+        eye_16: &wgpu::Texture,
+        target: &crate::interop_macos::EncodePixelBufferP010,
+        eye_w: u32, eye_h: u32,
+    ) -> Result<()> {
+        self.compose_sbs_to_biplanar(eye_16, eye_16, target, eye_w, eye_h, false)
+    }
+
+    /// 4:2:2 variant of [`Self::compose_eye_to_p010`] (the ProRes feed).
+    #[cfg(target_os = "macos")]
+    pub fn compose_eye_to_p210(
+        &self,
+        eye_16: &wgpu::Texture,
+        target: &crate::interop_macos::EncodePixelBufferP010,
+        eye_w: u32, eye_h: u32,
+    ) -> Result<()> {
+        self.compose_sbs_to_biplanar(eye_16, eye_16, target, eye_w, eye_h, true)
+    }
+
     #[cfg(target_os = "macos")]
     fn compose_sbs_to_biplanar(
         &self,
@@ -7240,7 +7275,9 @@ impl Device {
         let uv_v = target.uv_tex.create_view(&Default::default());
         let uni = self.write_uniform("p010_compose_u",
             &ComposeSbsUniforms { eye_w, _pad0: 0, _pad1: 0, _pad2: 0 });
-        let out_w = eye_w * 2;
+        // The frame is as wide as the target: two eyes, or one
+        // (`compose_eye_to_p010`), whose columns all fall left of `eye_w`.
+        let out_w = target.width;
         let out_h = eye_h;
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -8309,36 +8346,78 @@ impl Device {
         };
 
         // Final pass: compose to SBS BGRA.
-        let uni = self.write_uniform("compose_sbs_u",
-            &ComposeSbsUniforms { eye_w, _pad0: 0, _pad1: 0, _pad2: 0 });
-        {
-            let l_v = left_final.create_view(&Default::default());
-            let r_v = right_final.create_view(&Default::default());
-            let d_v = dst_bgra.create_view(&Default::default());
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("compose_sbs_bg"),
-                layout: &self.compose_sbs.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&l_v) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r_v) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&d_v) },
-                    wgpu::BindGroupEntry { binding: 3, resource: uni.as_entire_binding() },
-                ],
-            });
-            let out_w = eye_w * 2;
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("compose_sbs_pass"), timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.compose_sbs.pipeline);
-            pass.set_bind_group(0, Some(&bg), &[]);
-            pass.dispatch_workgroups((out_w + 7) / 8, (eye_h + 7) / 8, 1);
-        }
+        self.record_compose_bgra(&mut encoder, left_final, right_final, dst_bgra, eye_w, eye_h);
         // Submit and wait so the IOSurface is fully written before
         // VideoToolbox starts reading. `Maintain::Wait` blocks the calling
         // thread until the GPU has completed every submitted command.
         self.queue.submit(Some(encoder.finish()));
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         tracing::debug!(elapsed=?t_total.elapsed(), "apply_color_stack_to_sbs_bgra");
+        Ok(())
+    }
+
+    /// The compose pass into a BGRA target: columns left of `eye_w` come from
+    /// `left`, the rest from `right`. The target sets the frame width — two
+    /// eyes, or one (then every column is `left`'s).
+    fn record_compose_bgra(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        left: &wgpu::Texture,
+        right: &wgpu::Texture,
+        dst_bgra: &wgpu::Texture,
+        eye_w: u32, eye_h: u32,
+    ) {
+        let uni = self.write_uniform("compose_sbs_u",
+            &ComposeSbsUniforms { eye_w, _pad0: 0, _pad1: 0, _pad2: 0 });
+        let l_v = left.create_view(&Default::default());
+        let r_v = right.create_view(&Default::default());
+        let d_v = dst_bgra.create_view(&Default::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("compose_sbs_bg"),
+            layout: &self.compose_sbs.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&l_v) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r_v) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&d_v) },
+                wgpu::BindGroupEntry { binding: 3, resource: uni.as_entire_binding() },
+            ],
+        });
+        let out_w = dst_bgra.width();
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("compose_sbs_pass"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.compose_sbs.pipeline);
+        pass.set_bind_group(0, Some(&bg), &[]);
+        pass.dispatch_workgroups((out_w + 7) / 8, (eye_h + 7) / 8, 1);
+    }
+
+    /// One eye as the WHOLE frame (a single-eye source): its colour stack,
+    /// then the BGRA store into `dst_bgra` (`eye_w × eye_h`). The single-eye
+    /// counterpart of [`Self::apply_color_stack_to_sbs_bgra`]; blocks until
+    /// the target is written, like it.
+    pub fn apply_color_stack_to_eye_bgra(
+        &self,
+        eye: &wgpu::Texture,
+        dst_bgra: &wgpu::Texture,
+        eye_w: u32, eye_h: u32,
+        plan: &ColorStackPlan,
+    ) -> Result<()> {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("color_stack_eye_enc"),
+        });
+        let lut_resources = if let Some((ref lut, _)) = plan.lut {
+            Some(self.upload_lut3d_resources(lut))
+        } else { None };
+        let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(8);
+        let idx = self.record_color_stack(
+            &mut encoder, eye, eye_w, eye_h, plan, &lut_resources, &mut intermediates, "stack_eye", None);
+        let graded = match idx {
+            Some(i) => &intermediates[i],
+            None => eye,
+        };
+        self.record_compose_bgra(&mut encoder, graded, graded, dst_bgra, eye_w, eye_h);
+        self.queue.submit(Some(encoder.finish()));
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         Ok(())
     }
 
@@ -9316,6 +9395,84 @@ mod eac_assembly_regression {
         let (r, _g, b) = px(&buf, cw, tw + cn + tw / 2, tw + cw / 4);
         assert!(r as i32 > b as i32 + 30,
             "Lens B RIGHT should be reddish (from s0); got R={r} B={b}");
+    }
+}
+
+#[cfg(test)]
+mod single_eye_tests {
+    use super::*;
+
+    /// A `w × h` texture whose pixel `(x, y)` is `(x·4 + base, y·8, 200)`.
+    fn ramp(dev: &Device, w: u32, h: u32, base: u8) -> wgpu::Texture {
+        let tex = make_rw_texture(&dev.device, "ramp", w, h,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC);
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                px.extend_from_slice(&[(x * 4) as u8 + base, (y * 8) as u8, 200, 255]);
+            }
+        }
+        dev.queue.write_texture(
+            tex.as_image_copy(), &px,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        tex
+    }
+
+    fn target(dev: &Device, w: u32, h: u32) -> wgpu::Texture {
+        make_rw_texture(&dev.device, "frame", w, h,
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC)
+    }
+
+    /// The frame of a single-eye source is that eye, edge to edge; two eyes
+    /// still land side by side (the stored bytes are B, G, R).
+    #[test]
+    fn one_eye_fills_the_whole_frame() {
+        let dev = Device::new().expect("device");
+        let (w, h) = (24u32, 16u32);
+        let (left, right) = (ramp(&dev, w, h, 0), ramp(&dev, w, h, 100));
+        let plan = ColorStackPlan::default();
+
+        let frame = target(&dev, w, h);
+        dev.apply_color_stack_to_eye_bgra(&left, &frame, w, h, &plan).expect("one eye");
+        let got = dev.read_texture_rgb8(&frame, w, h).expect("readback");
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 3) as usize;
+                assert_eq!(got[i..i + 3], [200, (y * 8) as u8, (x * 4) as u8], "pixel ({x}, {y})");
+            }
+        }
+
+        let pair = target(&dev, w * 2, h);
+        dev.apply_color_stack_to_sbs_bgra(&left, &right, &pair, w, h, &plan).expect("two eyes");
+        let got = dev.read_texture_rgb8(&pair, w * 2, h).expect("readback");
+        for y in 0..h {
+            for x in 0..w * 2 {
+                let i = ((y * w * 2 + x) * 3) as usize;
+                let red = if x < w { (x * 4) as u8 } else { ((x - w) * 4) as u8 + 100 };
+                assert_eq!(got[i..i + 3], [200, (y * 8) as u8, red], "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    /// One eye has nothing to be matched against and no per-eye scale.
+    #[test]
+    fn a_single_eye_plan_keeps_the_grade_and_drops_the_pair_stages() {
+        let plan = ColorStackPlan {
+            cdl: CdlParams { gain: 1.2, ..Default::default() },
+            eye_match_ct: 0.1,
+            eye_match_tint: -0.2,
+            eye_match_exposure: 0.3,
+            auto_eye_match: Some(EyeMatchMode::Average),
+            eye_scale: 0.85,
+            ..Default::default()
+        }.single_eye();
+        assert_eq!((plan.eye_match_ct, plan.eye_match_tint, plan.eye_match_exposure), (0.0, 0.0, 0.0));
+        assert!(plan.auto_eye_match.is_none() && plan.eye_scale == 1.0);
+        assert_eq!(plan.cdl.gain, 1.2);
+        // Nothing left that differs per eye.
+        assert!(matches!(plan.for_eye(true), std::borrow::Cow::Borrowed(_)));
     }
 }
 

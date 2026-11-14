@@ -100,6 +100,29 @@ pub fn forget(path: &Path) {
             plans.remove(clip);
         }
     }
+    single_eye_cache().lock().unwrap_or_else(|e| e.into_inner()).remove(path);
+}
+
+fn single_eye_cache() -> &'static Mutex<HashMap<PathBuf, bool>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+pub fn single_eye(path: &Path) -> bool {
+    if BUILDING.with(|b| b.get()) {
+        return false;
+    }
+    if let Some(known) = single_eye_cache().lock().unwrap_or_else(|e| e.into_inner()).get(path) {
+        return *known;
+    }
+    let single = vr180_fisheye::insta360::has_insv_trailer(path)
+        && read_identity(path).is_ok_and(|meta| meta.single_lens && meta.lenses.len() == 1);
+    let mut known = single_eye_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if known.len() > 256 {
+        known.clear();
+    }
+    known.insert(path.to_path_buf(), single);
+    single
 }
 
 pub fn audio_source(path: &Path) -> (PathBuf, f64) {

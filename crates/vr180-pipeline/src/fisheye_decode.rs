@@ -241,6 +241,12 @@ impl DualPacketPump {
             return self.take_pair(demux, decoders);
         }
         let time_base_s = demux.time_base_s(0);
+        if demux.solo {
+            let mut f0 = ffmpeg_next::frame::Video::empty();
+            let pts0 = self.frame_for(demux, &mut decoders[0], 0, &mut f0)?;
+            let f1 = ref_frame(&f0);
+            return Some(([f0, f1], pts0 as f64 * time_base_s));
+        }
         let (frames, pts0) = self.pts_pair_with(decoders, |pump, decoder, pos, out| pump.frame_for(demux, decoder, pos, out))?;
         Some((frames, pts0 as f64 * time_base_s))
     }
@@ -305,6 +311,7 @@ struct DualDemux {
     inputs: Vec<ffmpeg_next::format::context::Input>,
     slots: [(usize, usize); 2],
     take: Option<std::sync::Arc<crate::x6_pair::PairPlan>>,
+    solo: bool,
 }
 
 impl DualDemux {
@@ -327,7 +334,7 @@ impl DualDemux {
                     Error::Ffmpeg(format!("{:?}: no video stream", take.paths[slot]))
                 })?;
             }
-            let mut demux = Self { inputs, slots, take: Some(take) };
+            let mut demux = Self { inputs, slots, take: Some(take), solo: false };
             if let Err(e) = demux.seek(0.0) {
                 tracing::warn!("{e} — reading from the start");
             }
@@ -335,13 +342,16 @@ impl DualDemux {
         }
         let ictx = open(path)?;
         let video = video_streams(&ictx);
+        if video.len() == 1 && crate::x6_pair::single_eye(path) {
+            return Ok(Self { inputs: vec![ictx], slots: [(0, video[0]), (0, video[0])], take: None, solo: true });
+        }
         if video.len() < 2 {
             return Err(Error::Ffmpeg(format!(
                 "expected 2 video streams (OSV / dual-camera), found {}",
                 video.len()
             )));
         }
-        Ok(Self { inputs: vec![ictx], slots: [(0, video[0]), (0, video[1])], take: None })
+        Ok(Self { inputs: vec![ictx], slots: [(0, video[0]), (0, video[1])], take: None, solo: false })
     }
 
     fn stream(&self, slot: usize) -> ffmpeg_next::format::stream::Stream<'_> {
@@ -381,6 +391,7 @@ impl DualDemux {
 #[derive(Debug, Clone)]
 pub struct FisheyePair {
     pub left: Vec<u8>,
+    /// Empty when the source holds one eye only ([`Self::single_eye`]).
     pub right: Vec<u8>,
     pub eye_w: u32,
     pub eye_h: u32,
@@ -392,6 +403,13 @@ pub struct FisheyePair {
     /// source. A consumer that renders from textures takes these; the
     /// export and the CPU consumers only ever see `None`.
     pub gpu: Option<std::sync::Arc<GpuPair>>,
+}
+
+impl FisheyePair {
+    /// One eye only: `left` is the picture and there is no `right`.
+    pub fn single_eye(&self) -> bool {
+        self.gpu.is_none() && self.right.is_empty() && !self.left.is_empty()
+    }
 }
 
 /// A pair of eyes resident on the GPU — `eye_w × eye_h` RGBA8 textures
@@ -1314,16 +1332,7 @@ impl FisheyePairIter for DualStreamFisheyeIter {
         else {
             return Ok(None);
         };
-        let f0 = self.scale_one(0, &mut d0, &mut sw_storage)?;
-        let f1 = self.scale_one(1, &mut d1, &mut sw_storage)?;
-        let (left, right) = if self.swap_eyes { (f1, f0) } else { (f0, f1) };
-        self.frames_yielded += 1;
-        Ok(Some(FisheyePair {
-            left, right,
-            eye_w: self.eye_w, eye_h: self.eye_h,
-            bit_depth: self.output_bit_depth,
-            pts_s, gpu: None,
-        }))
+        self.pair_from(&mut d0, &mut d1, &mut sw_storage, pts_s).map(Some)
     }
 
     fn decode_forward_to(&mut self, target_pts_s: f64, dt: f64)
@@ -1338,7 +1347,7 @@ impl FisheyePairIter for DualStreamFisheyeIter {
         let mut result: [Option<(Vec<u8>, i64)>; 2] = [None, None];
         let mut decoded = ffmpeg_next::frame::Video::empty();
         let mut sw_storage = ffmpeg_next::frame::Video::empty();
-        if self.demux.take.is_some() {
+        if self.demux.take.is_some() || self.demux.solo {
             loop {
                 let Some(([mut d0, mut d1], pts_s)) = self.pump.pair_for(&mut self.demux, &mut self.decoders)
                 else {
@@ -1347,16 +1356,7 @@ impl FisheyePairIter for DualStreamFisheyeIter {
                 if pts_s < cutoff {
                     continue;
                 }
-                let f0 = self.scale_one(0, &mut d0, &mut sw_storage)?;
-                let f1 = self.scale_one(1, &mut d1, &mut sw_storage)?;
-                let (left, right) = if self.swap_eyes { (f1, f0) } else { (f0, f1) };
-                self.frames_yielded += 1;
-                return Ok(Some(FisheyePair {
-                    left, right,
-                    eye_w: self.eye_w, eye_h: self.eye_h,
-                    bit_depth: self.output_bit_depth,
-                    pts_s, gpu: None,
-                }));
+                return self.pair_from(&mut d0, &mut d1, &mut sw_storage, pts_s).map(Some);
             }
         }
         // Each stream is fed from its own staged queue (DualPacketPump), so a
@@ -1406,6 +1406,29 @@ impl FisheyePairIter for DualStreamFisheyeIter {
 }
 
 impl DualStreamFisheyeIter {
+    fn pair_from(
+        &mut self,
+        d0: &mut ffmpeg_next::frame::Video,
+        d1: &mut ffmpeg_next::frame::Video,
+        sw_storage: &mut ffmpeg_next::frame::Video,
+        pts_s: f64,
+    ) -> Result<FisheyePair> {
+        let f0 = self.scale_one(0, d0, sw_storage)?;
+        let (left, right) = if self.demux.solo {
+            (f0, Vec::new())
+        } else {
+            let f1 = self.scale_one(1, d1, sw_storage)?;
+            if self.swap_eyes { (f1, f0) } else { (f0, f1) }
+        };
+        self.frames_yielded += 1;
+        Ok(FisheyePair {
+            left, right,
+            eye_w: self.eye_w, eye_h: self.eye_h,
+            bit_depth: self.output_bit_depth,
+            pts_s, gpu: None,
+        })
+    }
+
     /// Download HW frame (if VT-active), build/reuse the lazy scaler
     /// (sized at self.eye_w × self.eye_h — the clamped working
     /// dims), and pack the result as RGBA8. Shared between the

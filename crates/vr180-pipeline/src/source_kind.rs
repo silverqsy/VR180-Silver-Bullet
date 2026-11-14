@@ -176,6 +176,13 @@ impl SourceKind {
     }
 }
 
+/// The source holds ONE eye (a single fisheye per frame): the preview shows
+/// that eye and an export writes it as the whole frame instead of side by
+/// side.
+pub fn is_single_eye(kind: SourceKind, path: &Path) -> bool {
+    kind == SourceKind::Insta360Insv && crate::x6_pair::single_eye(path)
+}
+
 /// How one video stream packs its two fisheye eyes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EyeLayout {
@@ -265,7 +272,9 @@ pub fn detect(path: &Path) -> Result<SourceKind> {
             if kind == SourceKind::DjiOsv && vr180_fisheye::insta360::has_insv_trailer(path) {
                 return Ok(SourceKind::Insta360Insv);
             }
-            if kind != SourceKind::DjiOsv && crate::x6_pair::plan_for(path).is_some() {
+            if kind != SourceKind::DjiOsv
+                && (crate::x6_pair::plan_for(path).is_some() || crate::x6_pair::single_eye(path))
+            {
                 return Ok(SourceKind::Insta360Insv);
             }
             return Ok(kind);

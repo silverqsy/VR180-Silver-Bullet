@@ -79,6 +79,15 @@ impl ViewAdjust {
         upside_down: false,
     };
 
+    /// The adjustment for a source that holds ONE eye: there is no second
+    /// eye to offset it against, so the stereo angles do not apply.
+    pub fn single_eye(mut self) -> Self {
+        self.stereo_yaw_deg = 0.0;
+        self.stereo_pitch_deg = 0.0;
+        self.stereo_roll_deg = 0.0;
+        self
+    }
+
     /// Fast path: when every slider is at 0 the view matrix is
     /// identity and callers can skip the matrix multiply entirely.
     pub fn is_identity(&self) -> bool {

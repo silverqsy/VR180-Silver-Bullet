@@ -67,6 +67,10 @@ pub fn measure_stereo_align(
     cfg: &FisheyeExportConfig,
     cancel: Arc<AtomicBool>,
 ) -> Result<StereoAlignResult> {
+    // The measurement is the disparity BETWEEN the eyes.
+    if crate::source_kind::is_single_eye(cfg.source_kind, &cfg.source_path) {
+        return Err(crate::Error::Ffmpeg("auto align needs two eyes — this source holds one".into()));
+    }
     let total_dur: f64 = cfg.segments.iter()
         .map(|p| crate::decode::probe_video(p).map(|pr| pr.duration_sec).unwrap_or(0.0))
         .sum();

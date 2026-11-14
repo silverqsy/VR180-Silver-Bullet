@@ -48,12 +48,24 @@ const STRIP_TAGS: &[&[u8; 4]] = &[b"st3d", b"sv3d", b"vexu", b"hfov"];
 /// Modifies `path` in place. After this call YouTube + Quest Browser
 /// recognise the file as VR180 stereo.
 pub fn inject_youtube_vr180(path: &Path) -> Result<()> {
-    // st3d: stereo_mode = 2 (leftRight / side-by-side)
+    inject_atoms_into_visual_sample_entry(path, &youtube_vr180_atoms(true))
+}
+
+/// [`inject_youtube_vr180`] for a frame that holds ONE eye: the same 180°
+/// equirectangular bounds, declared monoscopic.
+pub fn inject_youtube_vr180_mono(path: &Path) -> Result<()> {
+    inject_atoms_into_visual_sample_entry(path, &youtube_vr180_atoms(false))
+}
+
+/// The `st3d` + `sv3d` boxes of a 180° half-equirect file — two eyes side by
+/// side (`stereo`), or one eye as the whole frame.
+fn youtube_vr180_atoms(stereo: bool) -> Vec<u8> {
+    // st3d: stereo_mode = 2 (leftRight / side-by-side) or 0 (monoscopic)
     let mut st3d = Vec::with_capacity(13);
     st3d.extend_from_slice(&13u32.to_be_bytes());
     st3d.extend_from_slice(b"st3d");
     st3d.extend_from_slice(&[0, 0, 0, 0]); // version + flags
-    st3d.push(2);                          // stereo_mode = leftRight
+    st3d.push(if stereo { 2 } else { 0 });
 
     // svhd: SphericalVideoHeader (one null-terminated metadata source byte = 0)
     let mut svhd = Vec::with_capacity(13);
@@ -97,8 +109,7 @@ pub fn inject_youtube_vr180(path: &Path) -> Result<()> {
     let mut inject = Vec::with_capacity(st3d.len() + sv3d.len());
     inject.extend_from_slice(&st3d);
     inject.extend_from_slice(&sv3d);
-
-    inject_atoms_into_visual_sample_entry(path, &inject)
+    inject
 }
 
 /// Inject Apple Projected Media Profile (VR180 APMP) — `vexu` + `hfov`.
@@ -110,13 +121,21 @@ pub fn inject_youtube_vr180(path: &Path) -> Result<()> {
 /// a `cams/blin` box was written here, but directly under `vexu` and not in
 /// Apple's format, so readers skipped it.)
 pub fn inject_apmp_vr180(path: &Path) -> Result<()> {
-    inject_atoms_into_visual_sample_entry(path, &apmp_vr180_atoms())
+    inject_atoms_into_visual_sample_entry(path, &apmp_vr180_atoms(true))
 }
 
-/// The `vexu` and `hfov` boxes of a side-by-side VR180 file, laid out as in
+/// [`inject_apmp_vr180`] for a frame that holds ONE eye: the projection and
+/// the 180° field of view, with no eye views and no packing (monoscopic
+/// projected media).
+pub fn inject_apmp_vr180_mono(path: &Path) -> Result<()> {
+    inject_atoms_into_visual_sample_entry(path, &apmp_vr180_atoms(false))
+}
+
+/// The `vexu` and `hfov` boxes of a VR180 file — two eyes side by side
+/// (`stereo`), or one eye as the whole frame — laid out as in
 /// Apple's "QuickTime and ISO Base Media File Formats and Spatial and
 /// Immersive Media" (the same bytes Apple's own writer produces).
-fn apmp_vr180_atoms() -> Vec<u8> {
+fn apmp_vr180_atoms(stereo: bool) -> Vec<u8> {
     /// A box holding `payload`.
     fn atom(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut b = Vec::with_capacity(8 + payload.len());
@@ -138,7 +157,8 @@ fn apmp_vr180_atoms() -> Vec<u8> {
     let proj = atom(b"proj", &full_atom(b"prji", b"hequ"));
     // pack ▷ pkin: the two views sit side by side.
     let pack = atom(b"pack", &full_atom(b"pkin", b"side"));
-    let mut out = atom(b"vexu", &[eyes, proj, pack].concat());
+    let boxes = if stereo { [eyes, proj, pack].concat() } else { proj };
+    let mut out = atom(b"vexu", &boxes);
     // hfov: 180° in thousandths of a degree (a plain box, no version/flags).
     out.extend_from_slice(&atom(b"hfov", &180_000u32.to_be_bytes()));
     out
@@ -550,7 +570,7 @@ mod apmp_tests {
     /// half-equirectangular, 180° (checked with AVFoundation on a real file).
     #[test]
     fn vr180_boxes_are_laid_out_as_apple_reads_them() {
-        let got = apmp_vr180_atoms();
+        let got = apmp_vr180_atoms(true);
         let mut want: Vec<u8> = Vec::new();
         want.extend_from_slice(&[0, 0, 0, 77]); want.extend_from_slice(b"vexu");
         want.extend_from_slice(&[0, 0, 0, 21]); want.extend_from_slice(b"eyes");
@@ -568,5 +588,24 @@ mod apmp_tests {
         // No camera baseline: optional for projected media, and a box that
         // is not in Apple's format is worse than none.
         assert!(!got.windows(4).any(|w| w == b"cams" || w == b"blin"));
+    }
+
+    /// One eye as the whole frame: the projection and the field of view
+    /// alone — no eye views, no packing.
+    #[test]
+    fn a_single_eye_frame_declares_no_views_and_no_packing() {
+        let got = apmp_vr180_atoms(false);
+        let mut want: Vec<u8> = Vec::new();
+        want.extend_from_slice(&[0, 0, 0, 32]); want.extend_from_slice(b"vexu");
+        want.extend_from_slice(&[0, 0, 0, 24]); want.extend_from_slice(b"proj");
+        want.extend_from_slice(&[0, 0, 0, 16]); want.extend_from_slice(b"prji");
+        want.extend_from_slice(&[0, 0, 0, 0]); want.extend_from_slice(b"hequ");
+        want.extend_from_slice(&[0, 0, 0, 12]); want.extend_from_slice(b"hfov");
+        want.extend_from_slice(&180_000u32.to_be_bytes());
+        assert_eq!(got, want);
+        // The Spherical Video boxes differ in the stereo mode byte alone.
+        let (two, one) = (super::youtube_vr180_atoms(true), super::youtube_vr180_atoms(false));
+        assert_eq!((two.len(), two[12], one[12]), (one.len(), 2, 0));
+        assert_eq!(two[13..], one[13..]);
     }
 }

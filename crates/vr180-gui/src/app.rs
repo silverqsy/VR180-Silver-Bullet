@@ -369,6 +369,8 @@ fn oversize_export_hint(codec: ExportCodec, w: u32, h: u32) -> Option<&'static s
 /// rectilinear).
 fn spatial_video_available(settings: &crate::decoder::Settings) -> bool {
     cfg!(target_os = "macos")
+        // Two eye views: a single-eye source has one.
+        && !settings.single_eye
         && settings.reframe_aspect_if_active().is_some()
         && settings.reframe_defish.abs() < 0.005
 }
@@ -481,6 +483,17 @@ impl ExportResolution {
             ExportResolution::Sharp  => "13120 × 6560",
         }
     }
+
+    /// [`Self::label`] for the frame a source exports: side by side, or one
+    /// eye wide for a single-eye source (the same size per eye).
+    fn frame_label(self, single_eye: bool) -> &'static str {
+        match (self, single_eye) {
+            (ExportResolution::Native, true) => "3840 × 3840",
+            (ExportResolution::R8k, true)    => "4096 × 4096",
+            (ExportResolution::Sharp, true)  => "6560 × 6560",
+            (r, false) => r.label(),
+        }
+    }
 }
 
 /// Per-eye size of a reframed export (the side-by-side frame is twice as
@@ -533,6 +546,13 @@ impl ReframeSize {
         let (w, h) = self.eye_dims(aspect);
         format!("{} × {}  ({w} × {h} per eye)", 2 * w, h)
     }
+    /// [`Self::label`] for the frame a source exports: a single-eye source's
+    /// frame is the one eye.
+    fn frame_label(self, aspect: crate::decoder::ReframeAspect, single_eye: bool) -> String {
+        if !single_eye { return self.label(aspect); }
+        let (w, h) = self.eye_dims(aspect);
+        format!("{w} × {h}")
+    }
     /// Recommended H.265 average bitrate (Mbps) for a reframed export of
     /// this size: ~0.28 bits per pixel per frame over the side-by-side
     /// frame at 30 fps, ×1.5 at 60 fps (linear between, flat below 30),
@@ -541,8 +561,13 @@ impl ReframeSize {
     /// are stretched — so it needs a fraction of the VR180 rate:
     /// 3840×1080 → 35, 5120×1440 → 60, 7680×2160 → 140 Mbps at 30 fps.
     fn recommended_bitrate_mbps(self, aspect: crate::decoder::ReframeAspect, fps: f32) -> u32 {
+        self.recommended_bitrate_mbps_for(aspect, fps, false)
+    }
+    /// [`Self::recommended_bitrate_mbps`] by the pixels of the frame really
+    /// written: a single-eye source's frame holds one eye, half as many.
+    fn recommended_bitrate_mbps_for(self, aspect: crate::decoder::ReframeAspect, fps: f32, single_eye: bool) -> u32 {
         let (w, h) = self.eye_dims(aspect);
-        let pixels = (2 * w * h) as f32;
+        let pixels = (if single_eye { w * h } else { 2 * w * h }) as f32;
         let fps_factor = 1.0 + 0.5 * ((fps - 30.0) / 30.0).clamp(0.0, 1.0);
         let mbps = pixels * 30.0 * 0.28 * fps_factor / 1.0e6;
         (((mbps / 5.0).round() as u32) * 5).clamp(10, 300)
@@ -715,7 +740,7 @@ mod export_size_tests {
     #[test]
     fn sharp_eye_follows_the_recording_mode() {
         let win = |dw, dh| InsvWindowCrop { src_w: 7744, src_h: 7744, dst_w: dw, dst_h: dh, offset_x: 0, offset_y: 0 };
-        let info = |window| X6ClipInfo { window, ilog: Some(true), paraxial_native: 2086.97, single_lens: false };
+        let info = |window| X6ClipInfo { window, ilog: Some(true), paraxial_native: 2086.97, single_lens: false, single_eye: false };
         // Both Crop modes are native pixels: 36.4 px/° → 6560 px per 180°.
         assert_eq!(info(Some(win(4912, 4912))).sharp_eye(4912, 4912, X6ViewChoice::Auto), Some(6560));
         assert_eq!(info(Some(win(4912, 3968))).sharp_eye(3712, 3712, X6ViewChoice::Auto), Some(6560));
@@ -800,12 +825,75 @@ mod spatial_export_tests {
         }
     }
 
+    /// A clip that holds ONE eye: the settings it renders with carry nothing
+    /// that sets two eyes against each other, its frame is one eye wide, and
+    /// it is never a spatial video.
+    #[test]
+    fn a_single_eye_clip_exports_its_one_eye() {
+        use crate::decoder::PreviewMode;
+        let insv = vr180_pipeline::SourceKind::Insta360Insv;
+        let mut s = reframed(ReframeAspect::Wide, 96.0, 0.0);
+        s.stereo_yaw_deg = 0.4;
+        s.stereo_pitch_deg = -0.2;
+        s.stereo_roll_deg = 0.1;
+        s.eye_match_ct = 0.1;
+        s.eye_match_exposure = 0.2;
+        s.auto_eye_match = true;
+        s.preview_mode = PreviewMode::Anaglyph;
+        s.preview_eye_right = true;
+        s.reframe_yaw_deg = 12.0;
+        let one = s.for_single_eye();
+        assert!(one.single_eye && !s.single_eye);
+        assert_eq!((one.preview_mode, one.preview_eye_right), (PreviewMode::SingleEye, false));
+        // The view keeps its aim and loses the stereo offset.
+        let va = one.output_view_adjust();
+        assert_eq!((va.stereo_yaw_deg, va.stereo_pitch_deg, va.stereo_roll_deg), (0.0, 0.0, 0.0));
+        assert_eq!(va.pano_yaw_deg, s.output_view_adjust().pano_yaw_deg);
+        let plan = one.build_color_stack();
+        assert!(plan.auto_eye_match.is_none() && plan.eye_match_ct == 0.0 && plan.eye_match_exposure == 0.0);
+        // Everything else is the user's own setting.
+        assert_eq!((one.reframe_hfov_deg, one.reframe_aspect, one.fisheye_output_mode),
+                   (s.reframe_hfov_deg, s.reframe_aspect, s.fisheye_output_mode));
+
+        // Spatial video needs two eye views: the choice runs as H.265.
+        let opts = ExportOptions {
+            codec: ExportCodec::Spatial, reframe_size: ReframeSize::P2160, beyondvr_hack: true, ..Default::default()
+        };
+        assert_eq!(opts.codec_for(&one, false), ExportCodec::H265);
+        let c = cfg(&one, &opts, insv);
+        assert!(c.spatial.is_none());
+        assert_eq!((c.eye_w, c.eye_h), (3840, 2160));
+        assert_eq!(c.view_adjust.stereo_yaw_deg, 0.0);
+        // The rate follows the pixels of the frame written: one eye, not two.
+        let two = cfg(&s, &ExportOptions { codec: ExportCodec::H265, ..opts }, insv);
+        assert_eq!(two.bitrate_kbps, 210_000);
+        assert_eq!(c.bitrate_kbps, 105_000);
+        assert_eq!(ReframeSize::P2160.frame_label(ReframeAspect::Wide, true), "3840 × 2160");
+        assert_eq!(ReframeSize::P2160.frame_label(ReframeAspect::Wide, false), ReframeSize::P2160.label(ReframeAspect::Wide));
+
+        // VR180: the same per-eye sizes, and no per-eye scale on one eye.
+        let vr = Settings::default().for_single_eye();
+        let c = cfg(&vr, &ExportOptions { beyondvr_hack: true, ..Default::default() }, insv);
+        assert_eq!((c.eye_w, c.eye_h, c.color_stack.eye_scale), (4096, 4096, 1.0));
+        assert!(cfg(&Settings::default(), &ExportOptions { beyondvr_hack: true, ..Default::default() }, insv).color_stack.eye_scale < 1.0);
+        assert_eq!(super::ExportResolution::R8k.frame_label(true), "4096 × 4096");
+        assert_eq!(super::ExportResolution::R8k.frame_label(false), "8192 × 4096");
+
+        // It keeps a setup of its own, apart from the camera's two-eye one.
+        assert_ne!(App::settings_class_key(insv, true), App::settings_class_key(insv, false));
+        assert_eq!(App::settings_class_key(vr180_pipeline::SourceKind::DjiOsv, true), "osv");
+        assert_eq!(FisheyeOutputMode::Reframe.label(false), FisheyeOutputMode::Reframe.as_str());
+        assert_ne!(FisheyeOutputMode::Fisheye.label(true), FisheyeOutputMode::Fisheye.as_str());
+    }
+
     #[test]
     fn spatial_video_gets_its_own_file_name() {
         let src = std::path::Path::new("/clips/VID_0005.insv");
-        assert_eq!(App::default_output_for(src, ExportCodec::H265), std::path::Path::new("/clips/VID_0005_SBS.mp4"));
-        assert_eq!(App::default_output_for(src, ExportCodec::ProRes), std::path::Path::new("/clips/VID_0005_SBS.mov"));
-        assert_eq!(App::default_output_for(src, ExportCodec::Spatial), std::path::Path::new("/clips/VID_0005_Spatial.mov"));
+        assert_eq!(App::default_output_for(src, ExportCodec::H265, false), std::path::Path::new("/clips/VID_0005_SBS.mp4"));
+        assert_eq!(App::default_output_for(src, ExportCodec::ProRes, false), std::path::Path::new("/clips/VID_0005_SBS.mov"));
+        assert_eq!(App::default_output_for(src, ExportCodec::Spatial, false), std::path::Path::new("/clips/VID_0005_Spatial.mov"));
+        assert_eq!(App::default_output_for(src, ExportCodec::H265, true), std::path::Path::new("/clips/VID_0005_Mono.mp4"));
+        assert_eq!(App::default_output_for(src, ExportCodec::ProRes, true), std::path::Path::new("/clips/VID_0005_Mono.mov"));
     }
 
     #[test]
@@ -869,7 +957,7 @@ mod spatial_export_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None);
+                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, false);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -982,10 +1070,10 @@ impl ExportOptions {
     /// The H.265 rate an export actually uses: the VR180 slider value, or
     /// in Reframed mode the reframed rate — the recommendation for this
     /// size / aspect / `fps` unless the user pinned a custom value.
-    fn effective_h265_mbps(&self, reframe: Option<crate::decoder::ReframeAspect>, fps: f32) -> u32 {
+    fn effective_h265_mbps(&self, reframe: Option<crate::decoder::ReframeAspect>, fps: f32, single_eye: bool) -> u32 {
         match reframe {
             Some(_) if self.reframe_bitrate_custom => self.reframe_bitrate_mbps,
-            Some(aspect) => self.reframe_size.recommended_bitrate_mbps(aspect, fps),
+            Some(aspect) => self.reframe_size.recommended_bitrate_mbps_for(aspect, fps, single_eye),
             None => self.h265_bitrate_mbps,
         }
     }
@@ -1054,6 +1142,17 @@ struct BatchItem {
 }
 
 impl BatchItem {
+    /// The source holds ONE eye (see `ClipInfo::single_eye`).
+    fn single_eye(&self) -> bool {
+        self.x6.is_some_and(|x| x.single_eye)
+    }
+
+    /// The settings this entry exports with: its own, taken as a single-eye
+    /// source takes them when it is one.
+    fn export_settings(&self) -> crate::decoder::Settings {
+        if self.single_eye() { self.settings.for_single_eye() } else { self.settings.clone() }
+    }
+
     /// Per-eye side of the native-sharpness canvas for this entry, under
     /// its own view choice (`None` unless its frame is a crop of the lens'
     /// view — see `ExportResolution::Sharp`).
@@ -1269,6 +1368,7 @@ fn tr_zh(en: &'static str) -> &'static str {
         "tilt" => "俯仰",
         "drag = pan, scroll / pinch = zoom, dbl-click = recenter" => "拖动 = 平移，滚轮 / 捏合 = 缩放，双击 = 回中",
         "Per-eye size" => "单眼尺寸",
+        "Size" => "尺寸",
         "Reframed output is not VR180 — no projection metadata is written." => "重新取景输出不是 VR180 —— 不写入投影元数据。",
         "Reframed mode aims the view with the Reframed view pan; these angles apply to VR180 output only."
             => "重新取景模式下由“重新取景视图”的平移控制朝向；这些角度仅作用于 VR180 输出。",
@@ -1618,6 +1718,7 @@ struct X6ClipInfo {
     /// the file's calibration, else the generic profile).
     paraxial_native: f64,
     single_lens: bool,
+    single_eye: bool,
 }
 
 impl X6ClipInfo {
@@ -1633,6 +1734,7 @@ impl X6ClipInfo {
                 ilog: id.as_ref().and_then(|m| m.is_ilog()),
                 paraxial_native: vr180_pipeline::insv_imu::x6_paraxial_native(id.as_ref().unwrap_or(&bare)),
                 single_lens: id.as_ref().is_some_and(|m| m.single_lens),
+                single_eye: vr180_pipeline::x6_pair::single_eye(path),
             },
             id.and_then(|m| m.gamma_mode),
         )
@@ -1709,6 +1811,12 @@ struct ClipInfo {
 }
 
 impl ClipInfo {
+    /// The source holds ONE eye: the preview shows it alone and an export
+    /// writes it as the whole frame.
+    fn single_eye(&self) -> bool {
+        self.x6.is_some_and(|x| x.single_eye)
+    }
+
     /// Stream geometry of an X6 clip under `view` (`None` for other sources).
     fn x6_geometry(&self, view: vr180_fisheye::X6ViewChoice) -> Option<vr180_fisheye::InsvStreamGeometry> {
         self.x6.map(|x| x.geometry(self.fisheye_eye_w, self.fisheye_eye_h, view))
@@ -2131,11 +2239,13 @@ impl App {
 
     /// `<source_stem>_SBS.<ext-for-codec>` next to the source; a spatial
     /// video (one stream, not a side-by-side frame) is `<stem>_Spatial.mov`.
-    fn default_output_for(source: &std::path::Path, codec: ExportCodec) -> PathBuf {
+    fn default_output_for(source: &std::path::Path, codec: ExportCodec, single_eye: bool) -> PathBuf {
         let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+        // A single-eye source's frame is not side by side.
+        let frame = if single_eye { "Mono" } else { "SBS" };
         let (tag, ext) = match codec {
-            ExportCodec::H265 => ("SBS", "mp4"),
-            ExportCodec::ProRes => ("SBS", "mov"), // ProRes is conventional in MOV
+            ExportCodec::H265 => (frame, "mp4"),
+            ExportCodec::ProRes => (frame, "mov"), // ProRes is conventional in MOV
             ExportCodec::Spatial => ("Spatial", "mov"), // Apple's movie profile
         };
         source.parent()
@@ -2264,6 +2374,7 @@ impl App {
         // "BeyondVR Hack" — final-stage per-eye scale. Half-equirect SBS
         // output only; the preview plan (built separately) never sets it.
         if opts.beyondvr_hack
+            && !settings.single_eye
             && projection == vr180_pipeline::fisheye_export::FisheyeExportProjection::HalfEquirect
         {
             color_stack.eye_scale = (opts.beyondvr_scale_pct / 100.0).clamp(0.25, 1.0);
@@ -2277,7 +2388,7 @@ impl App {
                 // Reframed exports take the (much lower) reframed rate,
                 // recommended per clip from its size / aspect / fps unless
                 // the user pinned one; VR180 takes the VR180 slider.
-                opts.effective_h265_mbps(settings.reframe_aspect_if_active(), fps)
+                opts.effective_h265_mbps(settings.reframe_aspect_if_active(), fps, settings.single_eye)
                     .saturating_mul(1000),
                 // A spatial video is always Main10.
                 if codec == ExportCodec::Spatial { 10 } else { opts.h265_bit_depth },
@@ -2812,10 +2923,13 @@ impl App {
     /// aren't lost (the sidebar edits `self.settings`, not the entry).
     /// Persisted-settings bucket for a source kind. OSV / EAC / SBS / BRAW
     /// each keep an independent setup; anything else shares `"other"`.
-    fn settings_class_key(kind: vr180_pipeline::SourceKind) -> &'static str {
+    fn settings_class_key(kind: vr180_pipeline::SourceKind, single_eye: bool) -> &'static str {
         use vr180_pipeline::SourceKind as K;
         match kind {
             K::DjiOsv         => "osv",
+            // A single-eye clip keeps its own setup: what is tuned for the
+            // camera's two eyes (their alignment above all) is not its.
+            K::Insta360Insv if single_eye => "insv_single_eye",
             K::Insta360Insv   => "insv",
             K::GoProEac       => "eac",
             K::SbsFisheye     => "sbs",
@@ -2831,10 +2945,10 @@ impl App {
     /// A kind with a video/still sibling (X6, QooCam) takes the camera's
     /// shared stereo offset (see `shared_stereo`) over whatever its own
     /// template remembers.
-    fn kind_template(&self, kind: vr180_pipeline::SourceKind) -> Settings {
-        let mut s = self.kind_settings.get(Self::settings_class_key(kind))
+    fn kind_template(&self, kind: vr180_pipeline::SourceKind, single_eye: bool) -> Settings {
+        let mut s = self.kind_settings.get(Self::settings_class_key(kind, single_eye))
             .cloned().unwrap_or_default();
-        self.apply_shared_stereo(kind, &mut s);
+        self.apply_shared_stereo(kind, single_eye, &mut s);
         s
     }
 
@@ -2845,7 +2959,7 @@ impl App {
     fn stereo_shared_keys(kind: vr180_pipeline::SourceKind) -> Option<[&'static str; 2]> {
         let sib = kind.stereo_sibling()?;
         let (video, still) = if kind.is_still() { (sib, kind) } else { (kind, sib) };
-        Some([Self::settings_class_key(video), Self::settings_class_key(still)])
+        Some([Self::settings_class_key(video, false), Self::settings_class_key(still, false)])
     }
 
     /// The camera's shared stereo offset `(yaw, pitch, roll)`: both templates
@@ -2856,7 +2970,9 @@ impl App {
             .map(|s| (s.stereo_yaw_deg, s.stereo_pitch_deg, s.stereo_roll_deg)))
     }
 
-    fn apply_shared_stereo(&self, kind: vr180_pipeline::SourceKind, s: &mut Settings) {
+    fn apply_shared_stereo(&self, kind: vr180_pipeline::SourceKind, single_eye: bool, s: &mut Settings) {
+        // One eye has no alignment to share.
+        if single_eye { return; }
         if let Some((yaw, pitch, roll)) = self.shared_stereo(kind) {
             s.stereo_yaw_deg = yaw;
             s.stereo_pitch_deg = pitch;
@@ -2868,10 +2984,10 @@ impl App {
     /// next same-kind clip inherits them (kept independent across kinds —
     /// except a camera's shared stereo offset, written to both its templates).
     fn save_active_kind_template(&mut self) {
-        if let Some(kind) = self.clip.as_ref().map(|c| c.source_kind) {
+        if let Some((kind, single_eye)) = self.clip.as_ref().map(|c| (c.source_kind, c.single_eye())) {
             self.kind_settings.insert(
-                Self::settings_class_key(kind).to_string(), self.settings.clone());
-            if let Some(keys) = Self::stereo_shared_keys(kind) {
+                Self::settings_class_key(kind, single_eye).to_string(), self.settings.clone());
+            if let Some(keys) = Self::stereo_shared_keys(kind).filter(|_| !single_eye) {
                 let (yaw, pitch, roll) = (self.settings.stereo_yaw_deg,
                     self.settings.stereo_pitch_deg, self.settings.stereo_roll_deg);
                 for key in keys {
@@ -2906,9 +3022,9 @@ impl App {
         self.settings = self.batch[idx].settings.clone();
         // An X6 clip (video or still) takes the camera's shared stereo
         // offset — the latest edit on either kind — over its own snapshot.
-        let kind = self.batch[idx].source_kind;
+        let (kind, single_eye) = (self.batch[idx].source_kind, self.batch[idx].single_eye());
         let mut restored = std::mem::take(&mut self.settings);
-        self.apply_shared_stereo(kind, &mut restored);
+        self.apply_shared_stereo(kind, single_eye, &mut restored);
         self.settings = restored;
         tracing::info!("RESEED-DBG select_clip {idx}: restored cx_l={:.4} cy_l={:.4} fov_l={:.2} ov_l={}",
             self.settings.fisheye_cx_norm_left, self.settings.fisheye_cy_norm_left,
@@ -2974,12 +3090,15 @@ impl App {
                 _ => (0, 0),
             };
             let is_loaded_clip = self.loaded_path.as_deref() == Some(path.as_path());
+            // Insta360 X6: the recording-mode signature (a few KB from the
+            // file's end) — a Crop clip's native-sharpness size follows from it.
+            let x6 = (source_kind == vr180_pipeline::SourceKind::Insta360Insv).then(|| X6ClipInfo::read(&path).0);
             // A NEW clip inherits ITS kind's template (OSV / .360 / … kept
             // independent); the already-loaded clip keeps its live edits.
             let mut settings = if is_loaded_clip {
                 self.settings.clone()
             } else {
-                self.kind_template(source_kind)
+                self.kind_template(source_kind, x6.is_some_and(|x| x.single_eye))
             };
             if !is_loaded_clip {
                 // RS mode + readout are per-clip — auto-detect firmware vs
@@ -3009,9 +3128,6 @@ impl App {
                 settings.trim_in_s = None;
                 settings.trim_out_s = None;
             }
-            // Insta360 X6: the recording-mode signature (a few KB from the
-            // file's end) — a Crop clip's native-sharpness size follows from it.
-            let x6 = (source_kind == vr180_pipeline::SourceKind::Insta360Insv).then(|| X6ClipInfo::read(&path).0);
             self.batch.push(BatchItem {
                 path,
                 fps: probe.fps,
@@ -3067,7 +3183,7 @@ impl App {
         let mut out = if item.source_kind.is_still() {
             Self::default_still_output_for(&item.path, opts.still_format)
         } else {
-            Self::default_output_for(&item.path, opts.codec_for(&item.settings, false))
+            Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye())
         };
         if let Some(dir) = &self.batch_out_dir {
             if let Some(name) = out.file_name() {
@@ -3146,7 +3262,7 @@ impl App {
                     item.fps, item.source_kind,
                     item.fisheye_eye_w, item.fisheye_eye_h, item.width, item.height,
                     item.sharp_eye(),
-                    &item.settings, &opts,
+                    &item.export_settings(), &opts,
                     segments,
                 ),
                 eac_stab,
@@ -3325,7 +3441,7 @@ impl App {
         // wait). This also means a transient decode failure simply retries
         // instead of latching "no still".
         let pipeline = self.pipeline.clone(); // Arc — avoids borrowing self twice
-        let settings = self.settings.clone();
+        let settings = self.worker_settings();
         let rendered = self.detail_cache.as_mut().unwrap()
             .render(&pipeline, ts, &settings, 0, snap_out);
         if rendered.is_none() {
@@ -4134,6 +4250,10 @@ impl App {
             file_bitrate_bps: meta.file_bitrate_bps,
         });
         self.loaded_path = Some(meta.path);
+        // A single-eye clip has nothing to put on a 3D display.
+        if self.clip_single_eye() && self.three_d.enabled {
+            self.disable_3d_display();
+        }
         // The decoder about to start is built for the current view choice.
         self.insv_view_applied = self.settings.insv_view;
 
@@ -4247,10 +4367,11 @@ impl App {
             .map(|c| c.segments.clone())
             .filter(|segs| !segs.is_empty())
             .unwrap_or_else(|| vec![path.clone()]);
+        let worker_settings = self.worker_settings();
         let cfg = DecoderConfig {
             path,
             segments,
-            settings: self.settings.clone(),
+            settings: worker_settings.clone(),
             eye_w: self.settings.preview_eye_w,
         };
         let (frame_tx, frame_rx) = crossbeam_channel::bounded(2);
@@ -4261,7 +4382,7 @@ impl App {
         let control = Arc::new(DecoderControl {
             paused: std::sync::atomic::AtomicBool::new(start_paused),
             ui_ctx: Some(self.egui_ctx.clone()),
-            settings: parking_lot::RwLock::new(self.settings.clone()),
+            settings: parking_lot::RwLock::new(worker_settings),
             settings_generation: std::sync::atomic::AtomicU64::new(0),
             detected_calib: parking_lot::Mutex::new(None),
             want_detail: std::sync::atomic::AtomicBool::new(false),
@@ -4576,6 +4697,25 @@ impl App {
             || self.snapshot_pending.is_some()
     }
 
+    /// The loaded clip holds ONE eye (see `ClipInfo::single_eye`).
+    fn clip_single_eye(&self) -> bool {
+        self.clip.as_ref().is_some_and(|c| c.single_eye())
+    }
+
+    /// The preview on screen is two eyes side by side (a single-eye clip
+    /// always shows its one eye, whatever view mode is remembered).
+    fn preview_shows_sbs(&self) -> bool {
+        self.settings.preview_mode == crate::decoder::PreviewMode::Sbs && !self.clip_single_eye()
+    }
+
+    /// The settings a renderer of the loaded clip works from (the preview
+    /// decoder, the zoom still): the sidebar's, taken as a single-eye source
+    /// takes them when the clip is one. `self.settings` itself never carries
+    /// that — it is what gets saved and handed to the next clip.
+    fn worker_settings(&self) -> Settings {
+        if self.clip_single_eye() { self.settings.for_single_eye() } else { self.settings.clone() }
+    }
+
     /// Diff `self.settings` against `last_pushed_settings`; if changed,
     /// push to the shared control and bump the generation counter so
     /// the decoder rebuilds per-eye bundles on its next iteration.
@@ -4584,7 +4724,7 @@ impl App {
             return;
         }
         if let Some(ctl) = &self.control {
-            *ctl.settings.write() = self.settings.clone();
+            *ctl.settings.write() = self.worker_settings();
             ctl.settings_generation.fetch_add(1, Ordering::SeqCst);
             tracing::debug!("settings changed → generation bumped");
         } else if !self.no_decoder_warned && self.loaded_path.is_some() && self.load_pending.is_none() {
@@ -4650,29 +4790,31 @@ impl App {
         let has_out_dir = self.batch_out_dir.is_some();
         let clip_fps = self.clip.as_ref().map(|c| c.fps).unwrap_or(30.0);
         let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
+        // A single-eye clip's frame is its one eye, not two side by side.
+        let single_eye = self.clip_single_eye();
         let res_label = match self.settings.reframe_aspect_if_active() {
-            Some(aspect) => self.export_opts.reframe_size.label(aspect),
+            Some(aspect) => self.export_opts.reframe_size.frame_label(aspect, single_eye),
             // Native = the clip's own size (a 12K BRAW: 12288 × 6144).
             None if self.export_opts.resolution == ExportResolution::Native => {
                 match self.native_sbs_dims() {
                     Some((w, h)) => format!("{w} × {h}"),
-                    None => self.export_opts.resolution.label().to_string(),
+                    None => self.export_opts.resolution.frame_label(single_eye).to_string(),
                 }
             }
             // A Crop clip's native-sharpness canvas; any other clip exports 8K.
             None if self.export_opts.resolution == ExportResolution::Sharp => {
                 match self.clip.as_ref().and_then(|c| c.sharp_eye(self.settings.insv_view)) {
-                    Some(side) => format!("{} × {side}", side * 2),
-                    None => ExportResolution::R8k.label().to_string(),
+                    Some(side) => format!("{} × {side}", if single_eye { side } else { side * 2 }),
+                    None => ExportResolution::R8k.frame_label(single_eye).to_string(),
                 }
             }
-            None => self.export_opts.resolution.label().to_string(),
+            None => self.export_opts.resolution.frame_label(single_eye).to_string(),
         };
         let h265_mbps = self.export_opts.effective_h265_mbps(
-            self.settings.reframe_aspect_if_active(), clip_fps);
+            self.settings.reframe_aspect_if_active(), clip_fps, single_eye);
         // What this clip would really export as (spatial video only where
         // it can be one).
-        let bar_codec = self.export_opts.codec_for(&self.settings, is_still);
+        let bar_codec = self.export_opts.codec_for(&self.worker_settings(), is_still);
         // A spatial video is one stream of the eye's own size, not a
         // side-by-side frame: label it by the eye.
         let res_label = match (bar_codec, self.settings.reframe_aspect_if_active()) {
@@ -4695,7 +4837,7 @@ impl App {
                 ExportCodec::Spatial => format!(" · {} Mbps · {:.0}°",
                     h265_mbps, self.settings.reframe_hfov_deg),
             },
-            if self.export_opts.beyondvr_hack && self.settings.reframe_aspect_if_active().is_none() {
+            if self.export_opts.beyondvr_hack && !single_eye && self.settings.reframe_aspect_if_active().is_none() {
                 format!(" · BeyondVR {:.0}%", self.export_opts.beyondvr_scale_pct)
             } else { String::new() }) };
         let summary = self.last_batch_summary.as_ref().map(|s| {
@@ -4835,9 +4977,12 @@ impl App {
             let clip_fps = self.clip.as_ref().map(|c| c.fps).unwrap_or(30.0);
             let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
             let native_dims = self.native_sbs_dims();
-            // A Crop clip's native-sharpness canvas (side by side), if it has one.
+            let single_eye = self.clip_single_eye();
+            // A Crop clip's native-sharpness canvas (side by side, or the one
+            // eye of a single-eye clip), if it has one.
             let sharp_dims = self.clip.as_ref()
-                .and_then(|c| c.sharp_eye(self.settings.insv_view)).map(|side| (side * 2, side));
+                .and_then(|c| c.sharp_eye(self.settings.insv_view))
+                .map(|side| (if single_eye { side } else { side * 2 }, side));
             egui::Window::new(tr("Export format"))
                 .collapsible(false)
                 .resizable(false)
@@ -4848,7 +4993,7 @@ impl App {
                     Self::export_options_ui(ui, &mut self.export_opts, "export",
                         self.settings.reframe_aspect_if_active(),
                         (self.settings.reframe_hfov_deg, self.settings.reframe_defish),
-                        clip_fps, is_still, native_dims, sharp_dims);
+                        clip_fps, is_still, native_dims, sharp_dims, single_eye);
                 });
             self.show_export_settings = open;
         }
@@ -4868,11 +5013,14 @@ impl App {
         is_still: bool,
         native_dims: Option<(u32, u32)>,
         sharp_dims: Option<(u32, u32)>,
+        // The clip holds ONE eye: its frame is that eye (sizes and rates
+        // follow), and nothing that needs two eyes is offered.
+        single_eye: bool,
     ) {
         // Spatial video is offered for the reframed view on macOS. Selected
         // on a clip it does not exist for, the choice shows (and exports) as
         // H.265 and stays put for the clips that can use it.
-        let spatial_offered = cfg!(target_os = "macos") && reframe.is_some() && !is_still;
+        let spatial_offered = cfg!(target_os = "macos") && reframe.is_some() && !is_still && !single_eye;
         let (reframe_hfov_deg, reframe_defish) = reframe_view;
         let spatial_rectilinear = reframe_defish.abs() < 0.005;
         let codec_shown = match opts.codec {
@@ -4881,14 +5029,14 @@ impl App {
         };
         if let Some(aspect) = reframe {
             // Reframed view: the exact viewport at a per-eye size.
-            ui.label(RichText::new(tr("Per-eye size")).strong());
+            ui.label(RichText::new(tr(if single_eye { "Size" } else { "Per-eye size" })).strong());
             opts.reframe_size = opts.reframe_size.clamped(is_still, aspect);
             egui::ComboBox::from_id_source(format!("{id_prefix}_reframe_size"))
-                .selected_text(opts.reframe_size.label(aspect))
+                .selected_text(opts.reframe_size.frame_label(aspect, single_eye))
                 .width(260.0)
                 .show_ui(ui, |ui| {
                     for &sz in ReframeSize::choices(is_still, aspect) {
-                        ui.selectable_value(&mut opts.reframe_size, sz, sz.label(aspect));
+                        ui.selectable_value(&mut opts.reframe_size, sz, sz.frame_label(aspect, single_eye));
                     }
                 });
             if codec_shown != ExportCodec::Spatial {
@@ -4902,7 +5050,7 @@ impl App {
             let native_label: String = match native_dims {
                 Some((w, h)) => format!("{w} × {h} ({})", if is_still { tr("full") } else { tr("native") }),
                 None if is_still => "native (full)".to_string(),
-                None => ExportResolution::Native.label().to_string(),
+                None => ExportResolution::Native.frame_label(single_eye).to_string(),
             };
             // Native sharpness — only a clip whose frame is a crop of the
             // lens' view has it (the X6 Crop modes). The choice sticks while
@@ -4915,7 +5063,7 @@ impl App {
             let sel_label: &str = match (opts.resolution, sharp_label.as_deref()) {
                 (ExportResolution::Native, _) => &native_label,
                 (ExportResolution::Sharp, Some(l)) => l,
-                _ => ExportResolution::R8k.label(),
+                _ => ExportResolution::R8k.frame_label(single_eye),
             };
             egui::ComboBox::from_id_source(format!("{id_prefix}_resolution"))
                 .selected_text(sel_label)
@@ -4924,7 +5072,7 @@ impl App {
                     ui.selectable_value(&mut opts.resolution,
                         ExportResolution::Native, native_label.clone());
                     ui.selectable_value(&mut opts.resolution,
-                        ExportResolution::R8k, ExportResolution::R8k.label());
+                        ExportResolution::R8k, ExportResolution::R8k.frame_label(single_eye));
                     if let Some(l) = &sharp_label {
                         ui.selectable_value(&mut opts.resolution, ExportResolution::Sharp, l.clone());
                     }
@@ -5001,7 +5149,7 @@ impl App {
                     // Reframed: its own rate, seeded from the size / aspect /
                     // frame-rate recommendation until the user pins a value
                     // (dragging back onto the recommendation un-pins it).
-                    let rec = opts.reframe_size.recommended_bitrate_mbps(aspect, fps);
+                    let rec = opts.reframe_size.recommended_bitrate_mbps_for(aspect, fps, single_eye);
                     if !opts.reframe_bitrate_custom {
                         opts.reframe_bitrate_mbps = rec;
                     }
@@ -5013,7 +5161,8 @@ impl App {
                     let (w, h) = opts.reframe_size.eye_dims(aspect);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!(
-                            "{}: {rec} Mbps · {} × {h} @ {fps:.0} fps", tr("Recommended"), 2 * w,
+                            "{}: {rec} Mbps · {} × {h} @ {fps:.0} fps", tr("Recommended"),
+                            if single_eye { w } else { 2 * w },
                         )).small().color(Color32::GRAY));
                         if opts.reframe_bitrate_custom
                             && ui.small_button(tr("Use recommended")).clicked()
@@ -5130,9 +5279,10 @@ impl App {
         )).small().color(Color32::GRAY));
         }
 
-        // The BeyondVR eye-scale hack is a half-equirect (VR180) fix-up —
-        // a reframed view neither shows nor applies it.
-        if reframe.is_some() {
+        // The BeyondVR eye-scale hack is a half-equirect (VR180) fix-up of
+        // the side-by-side frame — a reframed view and a single-eye frame
+        // neither show nor apply it.
+        if reframe.is_some() || single_eye {
             return;
         }
         ui.add_space(10.0);
@@ -5396,6 +5546,9 @@ impl eframe::App for App {
                             });
                     }
 
+                    // A single-eye clip shows its one eye: no view mode to
+                    // pick, no eye to switch, nothing for a 3D display.
+                    if !self.clip_single_eye() {
                     ui.separator();
                     ui.label(RichText::new(tr("View")).color(Color32::GRAY));
                     let three_d_on = self.three_d.enabled;
@@ -5438,6 +5591,7 @@ impl eframe::App for App {
                     {
                         if three_d { self.enable_3d_display(); } else { self.disable_3d_display(); }
                     }
+                    } // two-eye clips only
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // (Version lives ONLY in the top-left brand label,
@@ -5813,7 +5967,7 @@ impl eframe::App for App {
                 // half width (7760 / 2 on the X6). The reframed view aims
                 // with the FOV instead and always gets the native source.
                 if let Some(c) = self.clip.as_ref().filter(|c| c.source_kind.is_still()) {
-                    let eye_disp = if self.settings.preview_mode == crate::decoder::PreviewMode::Sbs { w * 0.5 } else { w };
+                    let eye_disp = if self.preview_shows_sbs() { w * 0.5 } else { w };
                     let eye_phys = eye_disp * ui.ctx().pixels_per_point();
                     let binned_eye = (c.fisheye_eye_w / 2).max(1) as f32;
                     self.still_native_wanted = self.preview_zoom * eye_phys > binned_eye * 0.95;
@@ -5823,6 +5977,8 @@ impl eframe::App for App {
                 let center = &mut self.preview_center;
                 let reframe = matches!(self.settings.fisheye_output_mode,
                     crate::decoder::FisheyeOutputMode::Reframe);
+                let shows_sbs = self.settings.preview_mode == crate::decoder::PreviewMode::Sbs
+                    && !self.clip.as_ref().is_some_and(|c| c.single_eye());
 
                 if reframe {
                     // Reframed view: the gestures aim the viewport itself —
@@ -5843,7 +5999,7 @@ impl eframe::App for App {
                         let d = resp.drag_delta();
                         // Displayed width of ONE eye: the SBS preview shows two
                         // side by side, the other modes one eye full-width.
-                        let eye_disp_w = if s.preview_mode == crate::decoder::PreviewMode::Sbs {
+                        let eye_disp_w = if shows_sbs {
                             w * 0.5
                         } else {
                             w
@@ -6213,9 +6369,11 @@ impl App {
         } else {
             (clip.width.max(512), clip.height.max(512))
         };
+        // Two eyes side by side, or the one eye of a single-eye clip.
+        let eyes = if clip.single_eye() { 1 } else { 2 };
         Some(match self.settings.fisheye_output_mode {
-            crate::decoder::FisheyeOutputMode::Fisheye => { let side = ew.min(eh); (side * 2, side) }
-            _ => (ew * 2, eh),
+            crate::decoder::FisheyeOutputMode::Fisheye => { let side = ew.min(eh); (side * eyes, side) }
+            _ => (ew * eyes, eh),
         })
     }
 
@@ -6283,9 +6441,11 @@ impl App {
     fn poll_snapshot(&mut self, ctx: &egui::Context) {
         let Some((out, since)) = self.snapshot_pending.as_ref().map(|r| (r.out, r.since)) else { return; };
         let cur = self.current_display.as_ref().map(|d| (d.timestamp_s, d.frame_idx));
+        // The still is two eyes side by side, or the one eye of a single-eye clip.
+        let still_w = if self.clip_single_eye() { out.0 } else { out.0 * 2 };
         let ready = match (&self.full_res_display, cur) {
             (Some(f), Some((ts, _))) =>
-                (f.timestamp_s - ts).abs() < 0.02 && f.width == out.0 * 2 && f.height == out.1,
+                (f.timestamp_s - ts).abs() < 0.02 && f.width == still_w && f.height == out.1,
             _ => false,
         };
         let timed_out = since.elapsed().as_secs_f32() > 15.0;
@@ -6581,7 +6741,9 @@ impl App {
                 } else {
                     Color32::GRAY
                 };
-                ui.label(RichText::new(c.source_kind.display()).color(kind_color).small());
+                // A single-eye clip is no pair of streams: say what it is.
+                let kind_name = if c.single_eye() { "Insta360 (single fisheye)" } else { c.source_kind.display() };
+                ui.label(RichText::new(kind_name).color(kind_color).small());
 
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(tr("Stream")).color(Color32::GRAY).small());
@@ -6613,7 +6775,8 @@ impl App {
                         ui.label(RichText::new(tr("EAC tile")).color(Color32::GRAY).small());
                         ui.label(format!("{} px", c.eac_tile_w));
                     });
-                } else if c.source_kind.is_fisheye() && c.fisheye_eye_w > 0 {
+                } else if c.source_kind.is_fisheye() && c.fisheye_eye_w > 0 && !c.single_eye() {
+                    // (A single-eye clip's eye is the stream above.)
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(tr("Eye dims")).color(Color32::GRAY).small());
                         ui.label(format!("{} × {}", c.fisheye_eye_w, c.fisheye_eye_h));
@@ -6809,6 +6972,8 @@ impl App {
             self.control.as_ref().and_then(|c| *c.eye_match_readout.lock())
         } else { None };
         let is_still = matches!(kind, Some(k) if k.is_still());
+        // A single-eye clip has no second eye to match.
+        let single_eye = self.clip_single_eye();
         // Still + DNG: only what the DNG carries as metadata is offered.
         let dng_mode = is_still && self.export_opts.still_format == StillFormatChoice::LinearDng;
         // Blackmagic RAW: the SDK develops the sensor data — its colour
@@ -6859,6 +7024,7 @@ impl App {
             }
         }
 
+        if !single_eye {
         ui.separator();
 
         // ── Matching Eyes — inter-eye trim. Every knob here applies
@@ -6925,6 +7091,7 @@ impl App {
                 }
             }
         }
+        } // Matching Eyes: two-eye clips only
 
         ui.separator();
 
@@ -7094,8 +7261,13 @@ impl App {
         let align_status = self.align_status.clone();
         let is_still = self.clip.as_ref().map_or(false, |c| c.source_kind.is_still());
         let stereo_shared = self.clip.as_ref().map_or(false, |c| c.source_kind.stereo_sibling().is_some());
+        // A single-eye clip: the global angles only — no second eye to
+        // offset it against, nothing for Auto align to measure.
+        let single_eye = self.clip_single_eye();
         let s = &mut self.settings;
-        ui.label(RichText::new(tr("Global (both eyes)")).small().color(Color32::GRAY));
+        if !single_eye {
+            ui.label(RichText::new(tr("Global (both eyes)")).small().color(Color32::GRAY));
+        }
         if matches!(s.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Reframe) {
             ui.label(RichText::new(tr(
                 "Reframed mode aims the view with the Reframed view pan; these angles apply to VR180 output only."
@@ -7110,6 +7282,7 @@ impl App {
         fine_slider(ui, zoom, &mut s.pano_pitch_deg, -90.0..=90.0, tr("Pitch (°)"), 3, rot_fine, pano_key_step);
         fine_slider(ui, zoom, &mut s.pano_roll_deg, -45.0..=45.0, tr("Roll (°)"), 3, rot_fine, pano_key_step);
         ui.add_space(4.0);
+        if !single_eye {
         ui.label(RichText::new(tr("Stereo offset (right = +, left = −)"))
             .small().color(Color32::GRAY));
         if stereo_shared {
@@ -7121,6 +7294,7 @@ impl App {
         fine_slider(ui, zoom, &mut s.stereo_yaw_deg, -10.0..=10.0, tr("Yaw (°)"), 3, rot_fine, stereo_key_step);
         fine_slider(ui, zoom, &mut s.stereo_pitch_deg, -10.0..=10.0, tr("Pitch (°)"), 3, rot_fine, stereo_key_step);
         fine_slider(ui, zoom, &mut s.stereo_roll_deg, -10.0..=10.0, tr("Roll (°)"), 3, rot_fine, stereo_key_step);
+        } // stereo offset: two-eye clips only
         ui.label(RichText::new(tr("Tip: select a field and press ↑ / ↓ to step its value precisely."))
             .small().color(Color32::from_rgb(130, 150, 175)));
         ui.add_space(4.0);
@@ -7137,8 +7311,9 @@ impl App {
             // Auto align: measure the inter-eye disparity field on a few
             // frames and ADD the fitted pitch/roll (and gated yaw)
             // correction to the stereo sliders. Fisheye-family sources.
-            if is_still {
-                // Auto align measures disparity over several frames — not for a still.
+            if is_still || single_eye {
+                // Auto align measures disparity between the eyes over several
+                // frames — not for a still, not for one eye.
             } else if align_running {
                 ui.spinner();
                 ui.label(RichText::new(tr("Aligning…")).small());
@@ -7162,6 +7337,7 @@ impl App {
 
     /// Spawn the one-shot Auto align worker for the active clip.
     fn start_auto_align(&mut self) {
+        if self.clip_single_eye() { return; }
         let Some(idx) = self.active_clip else { return };
         let Some(item) = self.batch.get(idx) else { return };
         let segments = self.clip_segments(&item.path);
@@ -7353,20 +7529,19 @@ impl App {
         let frame_crop = self.clip.as_ref()
             .and_then(|c| c.x6_geometry(self.settings.insv_view))
             .map_or(false, |g| g.cropped);
+        // A single-eye clip: the same three outputs, one eye wide.
+        let single_eye = self.clip_single_eye();
         let s = &mut self.settings;
 
         ui.horizontal(|ui| {
             ui.label(tr("Format"));
             egui::ComboBox::from_id_source("fisheye_output_mode")
-                .selected_text(s.fisheye_output_mode.as_str())
+                .selected_text(tr(s.fisheye_output_mode.label(single_eye)))
                 .show_ui(ui, |ui| {
                     use crate::decoder::FisheyeOutputMode as M;
-                    ui.selectable_value(&mut s.fisheye_output_mode,
-                        M::HalfEquirect, M::HalfEquirect.as_str());
-                    ui.selectable_value(&mut s.fisheye_output_mode,
-                        M::Fisheye, M::Fisheye.as_str());
-                    ui.selectable_value(&mut s.fisheye_output_mode,
-                        M::Reframe, M::Reframe.as_str());
+                    for m in [M::HalfEquirect, M::Fisheye, M::Reframe] {
+                        ui.selectable_value(&mut s.fisheye_output_mode, m, tr(m.label(single_eye)));
+                    }
                 });
         });
 
@@ -7414,7 +7589,9 @@ impl App {
 
         if is_osv {
             ui.add_space(4.0);
-            ui.checkbox(&mut s.fisheye_swap_eyes, tr("Swap L↔R eyes"));
+            if !single_eye {
+                ui.checkbox(&mut s.fisheye_swap_eyes, tr("Swap L↔R eyes"));
+            }
             // 180° output rotation + implicit eye swap (flipping the rig
             // mirrors the eye positions). Toggling reloads the clip.
             ui.checkbox(&mut s.camera_upside_down, tr("Upside-down mount (180°)"));
@@ -7569,6 +7746,7 @@ impl App {
         let sbs_no_dewarp = matches!(self.clip.as_ref().map(|c| c.source_kind),
                                      Some(vr180_pipeline::SourceKind::SbsFisheye))
             && !self.settings.sbs_dewarp_fisheye;
+        let single_eye = self.clip_single_eye();
         if sbs_no_dewarp {
             ui.label(RichText::new(tr("Fisheye dewarp is off for this side-by-side file (Source ▸ Input) — the lens settings below are not applied."))
                 .small().color(Color32::from_rgb(130, 150, 175)));
@@ -7617,8 +7795,9 @@ impl App {
             .unwrap_or([0.0; 4]);
 
         ui.add_space(4.0);
+        // A single-eye clip has one lens: its settings are the left eye's.
         draw_eye_lens(
-            ui, "L", "Left eye", native_w, native_h, zoom,
+            ui, "L", if single_eye { "Lens" } else { "Left eye" }, native_w, native_h, zoom,
             detected.map(|d| d.left),
             &mut s.fisheye_override_left,
             &mut s.fisheye_fov_deg_left,
@@ -7628,6 +7807,7 @@ impl App {
             &mut s.fisheye_k5_left, &mut s.fisheye_p_left, is_osv,
             preset_default_fov, preset_k,
         );
+        if !single_eye {
         ui.separator();
         draw_eye_lens(
             ui, "R", "Right eye", native_w, native_h, zoom,
@@ -7640,6 +7820,7 @@ impl App {
             &mut s.fisheye_k5_right, &mut s.fisheye_p_right, is_osv,
             preset_default_fov, preset_k,
         );
+        }
 
         // ── Load Gyroflow lens profile (applies to BOTH eyes; enables
         //    override on both so the loaded values take effect). Hidden for

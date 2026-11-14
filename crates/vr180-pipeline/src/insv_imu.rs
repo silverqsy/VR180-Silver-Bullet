@@ -329,6 +329,9 @@ pub fn insv_calib_only(meta: &Insta360Meta, stream_w: u32, stream_h: u32, view: 
     let (lens_a, lens_b) = if meta.lenses.len() >= 2 {
         (stream_lens_calib(&meta.lenses[i0], &geom, stream_w, stream_h),
          stream_lens_calib(&meta.lenses[i1], &geom, stream_w, stream_h))
+    } else if let [only] = meta.lenses.as_slice() {
+        let c = stream_lens_calib(only, &geom, stream_w, stream_h);
+        (c.clone(), c)
     } else {
         tracing::warn!("insv: no per-lens calibration string — using the generic X6 profile");
         let c = x6_profile_lens_calib(geom.scale_x, geom.cropped, stream_w, stream_h);
@@ -338,7 +341,7 @@ pub fn insv_calib_only(meta: &Insta360Meta, stream_w: u32, stream_h: u32, view: 
         lens_a,
         lens_b,
         camera_model: Some(if meta.model.is_empty() { "Insta360".to_string() } else { meta.model.clone() }),
-        imu_to_cam: Some(match meta.lenses.get(i0) {
+        imu_to_cam: Some(match meta.lenses.get(i0).or(meta.lenses.first()) {
             Some(lens) if meta.single_lens => insv_x6_lens_imu_to_cam(lens.is_second_lens()),
             _ => insv_x6_imu_to_cam(),
         }),
