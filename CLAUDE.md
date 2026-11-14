@@ -2267,7 +2267,10 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      decode × encode paths): every 10-bit path and the 8-bit software one
      return the codes that went in. Software vs hardware export of the
      same real frame, in 8-bit codes: X6 8-bit −1.82 → +0.32, GoPro 10-bit
-     −0.72 → +0.02. Software exports got faster (X6 10-bit ×1.8).
+     −0.72 → +0.02. Software exports got faster (X6 10-bit ×1.8). **The
+     paused native-resolution still** (magnifier, Snapshot) decodes on the
+     CPU on every platform: for X6 / OSV it was 1.75 – 1.89 of 255 darker
+     than the live preview of the same moment, now within 0.02.
    - **Left as they are**: 8-bit through VideoToolbox is 0.4 of a code low
      (its own BGRA conversion; an NV12 compose on the GPU would replace
      it); a conversion that also scales (the working-size CPU preview)
