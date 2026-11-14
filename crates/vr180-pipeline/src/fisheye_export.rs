@@ -3356,7 +3356,7 @@ fn export_fisheye_osv_zerocopy_p010(
             ZcMacFrame::Sbs(f) => {
                 // Sample the whole-frame P010 planes IN PLACE, one eye per
                 // dispatch: `src_x0` selects the eye's sub-rect and the kernels
-                // clamp every tap to it (see fisheye_p010_to_hequirect.wgsl),
+                // clamp every tap to it (see fisheye_project.wgsl),
                 // so nothing bleeds across the seam. No resolve, no split —
                 // at 8K that was a 268 MB whole-frame RGBA16 plus two 134 MB
                 // halves per frame, and two full-frame passes. These are the

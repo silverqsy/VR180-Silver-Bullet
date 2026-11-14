@@ -246,7 +246,7 @@ struct FisheyeToHequirectPipeline {
 
 /// RS-aware sibling of `FisheyeToHequirectPipeline` for the RGBA
 /// preview path. Adds a 6th binding for the per-scanline R-matrix
-/// storage buffer used by `fisheye_to_hequirect_rs.wgsl`. Fuses
+/// storage buffer used by the RS builds of `fisheye_project.wgsl`. Fuses
 /// per-row rolling-shutter stabilization into the projection
 /// for OSV live preview.
 #[derive(Debug)]
@@ -271,7 +271,7 @@ struct FisheyeP010ToHequirectPipeline {
 
 /// RS-aware sibling of `FisheyeP010ToHequirectPipeline`. Adds a 7th
 /// binding for the per-scanline R-matrix storage buffer used by the
-/// rolling-shutter correction in `fisheye_p010_to_hequirect_rs.wgsl`.
+/// rolling-shutter correction in `fisheye_project.wgsl`.
 #[derive(Debug)]
 struct FisheyeP010ToHequirectRsPipeline {
     pipeline: wgpu::ComputePipeline,
@@ -2095,7 +2095,7 @@ impl EacLensUniforms {
 /// std140 layout for the fisheye→equirect shader's calibration uniform.
 /// 48 scalars (12 × vec4 = 192 bytes). Matches the WGSL
 /// `FisheyeCalibUniforms` struct field-by-field. See
-/// `fisheye_to_hequirect.wgsl` for the per-pixel use of each value.
+/// `fisheye_project.wgsl` for the per-pixel use of each value.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct FisheyeCalibUniforms {
@@ -9485,58 +9485,6 @@ mod single_eye_tests {
 #[cfg(test)]
 mod fisheye_kernel_tests {
     use super::FisheyeKernel;
-
-    /// The top-level items of a WGSL source (functions, structs, constants,
-    /// bindings) with comments and all whitespace removed, sorted: two
-    /// sources with the same items are the same shader to a compiler,
-    /// whatever their order and layout.
-    fn items(wgsl: &str) -> Vec<String> {
-        let mut text = String::new();
-        for line in wgsl.lines() {
-            let code = line.split("//").next().unwrap_or("");
-            text.extend(code.chars().filter(|c| !c.is_whitespace()));
-        }
-        let (mut out, mut item, mut depth) = (Vec::new(), String::new(), 0usize);
-        for c in text.chars() {
-            item.push(c);
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 { out.push(std::mem::take(&mut item)); }
-                }
-                ';' if depth == 0 => out.push(std::mem::take(&mut item)),
-                _ => {}
-            }
-        }
-        assert!(item.is_empty() && depth == 0, "unbalanced source");
-        // A constant none of the files used.
-        out.retain(|i| !i.starts_with("constHALF_PI:"));
-        out.sort();
-        out
-    }
-
-    /// Each build composed from the one source is, item for item, the file
-    /// that build used to be.
-    #[test]
-    fn composed_builds_are_the_files_they_replace() {
-        let cases: [(FisheyeKernel, &str, &str); 8] = [
-            (FisheyeKernel::new(false, false, false), "fisheye_to_hequirect", include_str!("shaders/fisheye_to_hequirect.wgsl")),
-            (FisheyeKernel::new(false, true, false), "fisheye_to_hequirect_rs", include_str!("shaders/fisheye_to_hequirect_rs.wgsl")),
-            (FisheyeKernel::new(true, false, false), "fisheye_p010_to_hequirect", include_str!("shaders/fisheye_p010_to_hequirect.wgsl")),
-            (FisheyeKernel::new(true, true, false), "fisheye_p010_to_hequirect_rs", include_str!("shaders/fisheye_p010_to_hequirect_rs.wgsl")),
-            (FisheyeKernel::new(false, false, true), "fisheye_to_fisheye", include_str!("shaders/fisheye_to_fisheye.wgsl")),
-            (FisheyeKernel::new(false, true, true), "fisheye_to_fisheye_rs", include_str!("shaders/fisheye_to_fisheye_rs.wgsl")),
-            (FisheyeKernel::new(true, false, true), "fisheye_p010_to_fisheye_16", include_str!("shaders/fisheye_p010_to_fisheye_16.wgsl")),
-            (FisheyeKernel::new(true, true, true), "fisheye_p010_to_fisheye_rs_16", include_str!("shaders/fisheye_p010_to_fisheye_rs_16.wgsl")),
-        ];
-        for (kernel, name, file) in cases {
-            assert_eq!(items(&kernel.wgsl()), items(file), "{name}");
-        }
-        // The 16-bit RGBA fisheye-output file is that build with the storage format swapped.
-        let swapped = FisheyeKernel::new(false, false, true).wgsl().replace("rgba8unorm, write", "rgba16unorm, write");
-        assert_eq!(items(&swapped), items(include_str!("shaders/fisheye_to_fisheye_16.wgsl")), "fisheye_to_fisheye_16");
-    }
 
     /// Every build parses and validates as WGSL on its own.
     #[test]
