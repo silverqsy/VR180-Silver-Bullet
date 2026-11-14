@@ -32,6 +32,8 @@ use vr180_pipeline::gpu::{
 use vr180_pipeline::gpu::ColorStackPlan;
 use vr180_pipeline::gpu::{EyePicture, EyeProjection};
 
+pub(crate) mod preview_probe;
+
 #[cfg(target_os = "macos")]
 use vr180_pipeline::{decode::ZeroCopyStreamPairIter, gpu::Lens};
 // `run_cpu_assemble` (the cross-platform CPU EAC fallback) is compiled on

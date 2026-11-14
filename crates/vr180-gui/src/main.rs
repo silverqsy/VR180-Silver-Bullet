@@ -44,6 +44,15 @@ fn load_app_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // The preview worker without a window, for comparing builds (see
+    // `decoder::preview_probe`). Before anything that touches the log file.
+    if let Some(clip) = std::env::var_os("VR180_PREVIEW_PROBE") {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
+            .with_writer(std::io::stderr)
+            .try_init();
+        return decoder::preview_probe::run(std::path::Path::new(&clip));
+    }
     // Logs go to `<data dir>/vr180-gui.log` (the previous launch's copy is
     // kept as `vr180-gui.prev.log`) so the
     // release GUI-subsystem build — which has no console — still leaves a
