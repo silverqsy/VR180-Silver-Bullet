@@ -2911,18 +2911,6 @@ impl Device {
         self.dispatch_blur_1d_with(&self.gaussian_blur, encoder, label, src, dst, uni, w, h);
     }
 
-    fn dispatch_blur_1d_16(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        label: &str,
-        src: &wgpu::Texture,
-        dst: &wgpu::Texture,
-        uni: &wgpu::Buffer,
-        w: u32, h: u32,
-    ) {
-        self.dispatch_blur_1d_with(&self.gaussian_blur_16, encoder, label, src, dst, uni, w, h);
-    }
-
     fn dispatch_blur_1d_with(
         &self,
         pipeline: &GaussianBlur1dPipeline,
@@ -4827,7 +4815,7 @@ impl Device {
                     | wgpu::TextureUsages::STORAGE_BINDING
                     | wgpu::TextureUsages::COPY_SRC);
             let prev = intermediates.last().unwrap_or(equirect_tex);
-            self.record_cdl(&mut encoder, prev, &next, plan.cdl);
+            self.record_cdl(&mut encoder, prev, &next, plan.cdl, false);
             intermediates.push(next);
         }
 
@@ -4838,7 +4826,7 @@ impl Device {
                     | wgpu::TextureUsages::STORAGE_BINDING
                     | wgpu::TextureUsages::COPY_SRC);
             let prev = intermediates.last().unwrap_or(equirect_tex);
-            self.record_lut3d(&mut encoder, prev, &next, lr, *intensity, w, h);
+            self.record_lut3d(&mut encoder, prev, &next, lr, *intensity, w, h, false);
             intermediates.push(next);
         }
 
@@ -4858,7 +4846,7 @@ impl Device {
             let blur_v = make_rw_texture(&self.device, "stack_sharp_blur_v", w, h,
                 wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
             self.record_sharpen(&mut encoder, prev, &blur_h, &blur_v, &next,
-                w, h, plan.sharpen);
+                w, h, plan.sharpen, false);
             intermediates.push(blur_h);   // keep alive
             intermediates.push(blur_v);   // keep alive
             intermediates.push(next);
@@ -4872,7 +4860,7 @@ impl Device {
                     | wgpu::TextureUsages::STORAGE_BINDING
                     | wgpu::TextureUsages::COPY_SRC);
             let prev = intermediates.last().unwrap_or(equirect_tex);
-            self.record_color_grade(&mut encoder, prev, &next, plan.color_grade.white_balance_only());
+            self.record_color_grade(&mut encoder, prev, &next, plan.color_grade.white_balance_only(), false);
             intermediates.push(next);
         }
 
@@ -4893,7 +4881,7 @@ impl Device {
                 wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
             self.record_mid_detail(&mut encoder, prev,
                 &small, &small_h, &small_v, &next,
-                w, h, sw, sh, plan.mid_detail);
+                w, h, sw, sh, plan.mid_detail, false);
             intermediates.push(small);
             intermediates.push(small_h);
             intermediates.push(small_v);
@@ -4908,7 +4896,7 @@ impl Device {
                     | wgpu::TextureUsages::STORAGE_BINDING
                     | wgpu::TextureUsages::COPY_SRC);
             let prev = intermediates.last().unwrap_or(equirect_tex);
-            self.record_color_grade(&mut encoder, prev, &next, plan.color_grade.saturation_only());
+            self.record_color_grade(&mut encoder, prev, &next, plan.color_grade.saturation_only(), false);
             intermediates.push(next);
         }
 
@@ -5752,12 +5740,16 @@ impl Device {
         self.record_per_pixel(encoder, "log_exposure", pipeline, src, dst, &uni, dims);
     }
 
+    // The stage recorders below write `dst` at the stack's depth: `wide`
+    // picks the Rgba16Unorm build of each pipeline, the arithmetic is the same.
+
     fn record_cdl(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         src: &wgpu::Texture,
         dst: &wgpu::Texture,
         params: CdlParams,
+        wide: bool,
     ) {
         let uniforms = CdlUniforms {
             lift: params.lift, gamma: params.gamma, gain: params.gain,
@@ -5766,7 +5758,8 @@ impl Device {
         };
         let uni = self.write_uniform("cdl_chain_u", &uniforms);
         let dims = (dst.width(), dst.height());
-        self.record_per_pixel(encoder, "cdl_chain", &self.cdl, src, dst, &uni, dims);
+        let pipeline = if wide { &self.cdl_16 } else { &self.cdl };
+        self.record_per_pixel(encoder, "cdl_chain", pipeline, src, dst, &uni, dims);
     }
 
     fn record_color_grade(
@@ -5775,6 +5768,7 @@ impl Device {
         src: &wgpu::Texture,
         dst: &wgpu::Texture,
         params: ColorGradeParams,
+        wide: bool,
     ) {
         let uniforms = ColorGradeUniforms {
             temperature: params.temperature,
@@ -5784,7 +5778,8 @@ impl Device {
         };
         let uni = self.write_uniform("grade_chain_u", &uniforms);
         let dims = (dst.width(), dst.height());
-        self.record_per_pixel(encoder, "grade_chain", &self.color_grade, src, dst, &uni, dims);
+        let pipeline = if wide { &self.color_grade_16 } else { &self.color_grade };
+        self.record_per_pixel(encoder, "grade_chain", pipeline, src, dst, &uni, dims);
     }
 
     /// "BeyondVR Hack" stage on a PER-EYE texture: eye_w = full texture
@@ -5795,12 +5790,14 @@ impl Device {
         src: &wgpu::Texture,
         dst: &wgpu::Texture,
         scale: f32,
+        wide: bool,
     ) {
         let uni = self.write_uniform("eye_scale_chain_u", &EyeScaleUniforms {
             scale, eye_w: dst.width() as f32, _pad0: 0.0, _pad1: 0.0,
         });
         let dims = (dst.width(), dst.height());
-        self.record_per_pixel(encoder, "eye_scale_chain", &self.eye_scale, src, dst, &uni, dims);
+        let pipeline = if wide { &self.eye_scale_16 } else { &self.eye_scale };
+        self.record_per_pixel(encoder, "eye_scale_chain", pipeline, src, dst, &uni, dims);
     }
 
     fn record_per_pixel(
@@ -5843,7 +5840,13 @@ impl Device {
         dst: &wgpu::Texture,
         w: u32, h: u32,
         params: SharpenParams,
+        wide: bool,
     ) {
+        let (blur, combine) = if wide {
+            (&self.gaussian_blur_16, &self.sharpen_combine_16)
+        } else {
+            (&self.gaussian_blur, &self.sharpen_combine)
+        };
         let blur_h_u = self.write_uniform("sharp_chain_h_u",
             &GaussianBlur1dUniforms { sigma: params.sigma, direction: 0, _pad0: 0, _pad1: 0 });
         let blur_v_u = self.write_uniform("sharp_chain_v_u",
@@ -5854,14 +5857,14 @@ impl Device {
                 apply_lat_weight: if params.apply_lat_weight { 1 } else { 0 },
                 _pad0: 0, _pad1: 0,
             });
-        self.dispatch_blur_1d(encoder, "sharp_chain_h", src,   blur_h, &blur_h_u, w, h);
-        self.dispatch_blur_1d(encoder, "sharp_chain_v", blur_h, blur_v, &blur_v_u, w, h);
+        self.dispatch_blur_1d_with(blur, encoder, "sharp_chain_h", src, blur_h, &blur_h_u, w, h);
+        self.dispatch_blur_1d_with(blur, encoder, "sharp_chain_v", blur_h, blur_v, &blur_v_u, w, h);
         let src_v   = src.create_view(&Default::default());
         let blur_vv = blur_v.create_view(&Default::default());
         let dst_v   = dst.create_view(&Default::default());
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sharp_chain_combine_bg"),
-            layout: &self.sharpen_combine.bind_group_layout,
+            layout: &combine.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&blur_vv) },
@@ -5872,7 +5875,7 @@ impl Device {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("sharp_chain_combine_pass"), timestamp_writes: None,
         });
-        pass.set_pipeline(&self.sharpen_combine.pipeline);
+        pass.set_pipeline(&combine.pipeline);
         pass.set_bind_group(0, Some(&bg), &[]);
         pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
     }
@@ -5887,7 +5890,13 @@ impl Device {
         dst: &wgpu::Texture,
         w: u32, h: u32, sw: u32, sh: u32,
         params: MidDetailParams,
+        wide: bool,
     ) {
+        let (downsample, blur, combine) = if wide {
+            (&self.downsample_4x_16, &self.gaussian_blur_16, &self.mid_detail_combine_16)
+        } else {
+            (&self.downsample_4x, &self.gaussian_blur, &self.mid_detail_combine)
+        };
         let blur_h_u = self.write_uniform("mid_chain_h_u",
             &GaussianBlur1dUniforms { sigma: params.sigma, direction: 0, _pad0: 0, _pad1: 0 });
         let blur_v_u = self.write_uniform("mid_chain_v_u",
@@ -5901,7 +5910,7 @@ impl Device {
             let small_v = small.create_view(&Default::default());
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("mid_chain_ds_bg"),
-                layout: &self.downsample_4x.bind_group_layout,
+                layout: &downsample.bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&small_v) },
@@ -5910,13 +5919,13 @@ impl Device {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("mid_chain_ds_pass"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.downsample_4x.pipeline);
+            pass.set_pipeline(&downsample.pipeline);
             pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((sw + 7) / 8, (sh + 7) / 8, 1);
         }
         // Passes 2 + 3: blur the small image.
-        self.dispatch_blur_1d(encoder, "mid_chain_h", small,   small_h, &blur_h_u, sw, sh);
-        self.dispatch_blur_1d(encoder, "mid_chain_v", small_h, small_v, &blur_v_u, sw, sh);
+        self.dispatch_blur_1d_with(blur, encoder, "mid_chain_h", small, small_h, &blur_h_u, sw, sh);
+        self.dispatch_blur_1d_with(blur, encoder, "mid_chain_v", small_h, small_v, &blur_v_u, sw, sh);
         // Pass 4: upsample-combine to full-res output.
         {
             let src_v       = src.create_view(&Default::default());
@@ -5924,7 +5933,7 @@ impl Device {
             let dst_v       = dst.create_view(&Default::default());
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("mid_chain_combine_bg"),
-                layout: &self.mid_detail_combine.bind_group_layout,
+                layout: &combine.bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&smallv_view) },
@@ -5936,111 +5945,7 @@ impl Device {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("mid_chain_combine_pass"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.mid_detail_combine.pipeline);
-            pass.set_bind_group(0, Some(&bg), &[]);
-            pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
-        }
-    }
-
-    fn record_sharpen_16(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        src: &wgpu::Texture,
-        blur_h: &wgpu::Texture,
-        blur_v: &wgpu::Texture,
-        dst: &wgpu::Texture,
-        w: u32, h: u32,
-        params: SharpenParams,
-    ) {
-        let blur_h_u = self.write_uniform("sharp16_h_u",
-            &GaussianBlur1dUniforms { sigma: params.sigma, direction: 0, _pad0: 0, _pad1: 0 });
-        let blur_v_u = self.write_uniform("sharp16_v_u",
-            &GaussianBlur1dUniforms { sigma: params.sigma, direction: 1, _pad0: 0, _pad1: 0 });
-        let combine_u = self.write_uniform("sharp16_c_u",
-            &SharpenCombineUniforms {
-                amount: params.amount,
-                apply_lat_weight: if params.apply_lat_weight { 1 } else { 0 },
-                _pad0: 0, _pad1: 0,
-            });
-        self.dispatch_blur_1d_16(encoder, "sharp16_h", src,    blur_h, &blur_h_u, w, h);
-        self.dispatch_blur_1d_16(encoder, "sharp16_v", blur_h, blur_v, &blur_v_u, w, h);
-        let src_v   = src.create_view(&Default::default());
-        let blur_vv = blur_v.create_view(&Default::default());
-        let dst_v   = dst.create_view(&Default::default());
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sharp16_combine_bg"),
-            layout: &self.sharpen_combine_16.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&blur_vv) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_v) },
-                wgpu::BindGroupEntry { binding: 3, resource: combine_u.as_entire_binding() },
-            ],
-        });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("sharp16_combine_pass"), timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.sharpen_combine_16.pipeline);
-        pass.set_bind_group(0, Some(&bg), &[]);
-        pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
-    }
-
-    fn record_mid_detail_16(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        src: &wgpu::Texture,
-        small: &wgpu::Texture,
-        small_h: &wgpu::Texture,
-        small_v: &wgpu::Texture,
-        dst: &wgpu::Texture,
-        w: u32, h: u32, sw: u32, sh: u32,
-        params: MidDetailParams,
-    ) {
-        let blur_h_u = self.write_uniform("mid16_h_u",
-            &GaussianBlur1dUniforms { sigma: params.sigma, direction: 0, _pad0: 0, _pad1: 0 });
-        let blur_v_u = self.write_uniform("mid16_v_u",
-            &GaussianBlur1dUniforms { sigma: params.sigma, direction: 1, _pad0: 0, _pad1: 0 });
-        let combine_u = self.write_uniform("mid16_c_u",
-            &MidDetailCombineUniforms { amount: params.amount, _pad0: 0.0, _pad1: 0.0, _pad2: 0.0 });
-        {
-            let src_v   = src.create_view(&Default::default());
-            let small_v = small.create_view(&Default::default());
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("mid16_ds_bg"),
-                layout: &self.downsample_4x_16.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&small_v) },
-                ],
-            });
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("mid16_ds_pass"), timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.downsample_4x_16.pipeline);
-            pass.set_bind_group(0, Some(&bg), &[]);
-            pass.dispatch_workgroups((sw + 7) / 8, (sh + 7) / 8, 1);
-        }
-        self.dispatch_blur_1d_16(encoder, "mid16_h", small,   small_h, &blur_h_u, sw, sh);
-        self.dispatch_blur_1d_16(encoder, "mid16_v", small_h, small_v, &blur_v_u, sw, sh);
-        {
-            let src_v       = src.create_view(&Default::default());
-            let smallv_view = small_v.create_view(&Default::default());
-            let dst_v       = dst.create_view(&Default::default());
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("mid16_combine_bg"),
-                layout: &self.mid_detail_combine_16.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&smallv_view) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.bilinear_sampler) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dst_v) },
-                    wgpu::BindGroupEntry { binding: 4, resource: combine_u.as_entire_binding() },
-                ],
-            });
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("mid16_combine_pass"), timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.mid_detail_combine_16.pipeline);
+            pass.set_pipeline(&combine.pipeline);
             pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
         }
@@ -6088,7 +5993,9 @@ impl Device {
         lut_res: &Lut3DResources,
         intensity: f32,
         w: u32, h: u32,
+        wide: bool,
     ) {
+        let pipeline = if wide { &self.lut3d_16 } else { &self.lut3d };
         let uniforms = Lut3DUniforms {
             size: lut_res.size,
             intensity,
@@ -6100,11 +6007,11 @@ impl Device {
         let dst_v = dst.create_view(&Default::default());
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lut3d_chain_bg"),
-            layout: &self.lut3d.bind_group_layout,
+            layout: &pipeline.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&lut_v) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.lut3d.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&pipeline.sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dst_v) },
                 wgpu::BindGroupEntry { binding: 4, resource: uni.as_entire_binding() },
             ],
@@ -6112,7 +6019,7 @@ impl Device {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("lut3d_chain_pass"), timestamp_writes: None,
         });
-        pass.set_pipeline(&self.lut3d.pipeline);
+        pass.set_pipeline(&pipeline.pipeline);
         pass.set_bind_group(0, Some(&bg), &[]);
         pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
     }
@@ -6289,11 +6196,11 @@ impl Device {
         // `lut_resources` apply to both eyes.
         let left_idx = self.record_color_stack(
             &mut encoder, left_eq, eye_w, eye_h, &plan.for_eye(true), &lut_resources, &mut intermediates,
-            "stack_l", matching.map(|s| (s, 0)),
+            false, "stack_l", matching.map(|s| (s, 0)),
         );
         let right_idx = self.record_color_stack(
             &mut encoder, right_eq, eye_w, eye_h, &plan.for_eye(false), &lut_resources, &mut intermediates,
-            "stack_r", matching.map(|s| (s, 1)),
+            false, "stack_r", matching.map(|s| (s, 1)),
         );
         let left_final = match left_idx {
             Some(i) => &intermediates[i],
@@ -6369,7 +6276,7 @@ impl Device {
         } else { None };
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(8);
         let idx = self.record_color_stack(
-            &mut encoder, eye, eye_w, eye_h, plan, &lut_resources, &mut intermediates, "stack_eye", None);
+            &mut encoder, eye, eye_w, eye_h, plan, &lut_resources, &mut intermediates, false, "stack_eye", None);
         let graded = match idx {
             Some(i) => &intermediates[i],
             None => eye,
@@ -6378,275 +6285,6 @@ impl Device {
         self.queue.submit(Some(encoder.finish()));
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         Ok(())
-    }
-
-    /// Run one eye's worth of the color stack into the encoder.
-    /// Returns the index into `intermediates` of the final per-eye
-    /// texture, or `None` if every stage was identity (in which case
-    /// the caller should use `src` directly).
-    ///
-    /// Helper for `apply_color_stack_to_sbs_bgra` — same recipe as the
-    /// body of `apply_color_stack_texture` but factored out so both
-    /// eyes share one encoder + one intermediates Vec.
-    fn record_color_stack(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        src: &wgpu::Texture,
-        w: u32, h: u32,
-        plan: &ColorStackPlan,
-        lut_resources: &Option<Lut3DResources>,
-        intermediates: &mut Vec<wgpu::Texture>,
-        eye_label: &str,
-        eye_offset: Option<(&EyeMatchState, u32)>,
-    ) -> Option<usize> {
-        let mut current_idx: Option<usize> = None;
-
-        // Stage 0: automatic eye-exposure offset. A sensor-side correction
-        // (an exposure gain, additive on log footage), so it goes before
-        // every creative stage — the same place the static trim acts.
-        if let Some((state, eye)) = eye_offset {
-            let next = make_rw_texture(&self.device,
-                &format!("{eye_label}_eyeoff"), w, h,
-                wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::STORAGE_BINDING);
-            self.record_eye_offset_apply(encoder, src, &next, state, eye, false);
-            intermediates.push(next);
-            current_idx = Some(intermediates.len() - 1);
-        }
-
-        // Stage 0b: exposure change on log footage, in scene-linear light.
-        // After the eye offset (measured on the source's own codes), before
-        // every creative stage.
-        if let Some(exposure) = plan.log_exposure {
-            let next = make_rw_texture(&self.device,
-                &format!("{eye_label}_logexp"), w, h,
-                wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::STORAGE_BINDING);
-            let prev = match current_idx {
-                Some(i) => &intermediates[i],
-                None => src,
-            };
-            self.record_log_exposure(encoder, prev, &next, exposure, false);
-            intermediates.push(next);
-            current_idx = Some(intermediates.len() - 1);
-        }
-
-        // Stage 1: CDL.
-        if !plan.cdl.is_identity() {
-            let next = make_rw_texture(&self.device,
-                &format!("{eye_label}_cdl"), w, h,
-                wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::STORAGE_BINDING);
-            let prev = match current_idx {
-                Some(i) => &intermediates[i],
-                None => src,
-            };
-            self.record_cdl(encoder, prev, &next, plan.cdl);
-            intermediates.push(next);
-            current_idx = Some(intermediates.len() - 1);
-        }
-        // Stage 2: 3D LUT.
-        if let (Some((_, intensity)), Some(ref lr)) = (&plan.lut, lut_resources) {
-            let next = make_rw_texture(&self.device,
-                &format!("{eye_label}_lut"), w, h,
-                wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::STORAGE_BINDING);
-            let prev = match current_idx {
-                Some(i) => &intermediates[i],
-                None => src,
-            };
-            self.record_lut3d(encoder, prev, &next, lr, *intensity, w, h);
-            intermediates.push(next);
-            current_idx = Some(intermediates.len() - 1);
-        }
-        // Stage 3: sharpen.
-        if !plan.sharpen.is_identity() {
-            let next = make_rw_texture(&self.device,
-                &format!("{eye_label}_sharp"), w, h,
-                wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::STORAGE_BINDING);
-            let blur_h = make_rw_texture(&self.device,
-                &format!("{eye_label}_sharp_bh"), w, h,
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
-            let blur_v = make_rw_texture(&self.device,
-                &format!("{eye_label}_sharp_bv"), w, h,
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
-            let prev = match current_idx {
-                Some(i) => &intermediates[i],
-                None => src,
-            };
-            self.record_sharpen(encoder, prev, &blur_h, &blur_v, &next, w, h, plan.sharpen);
-            intermediates.push(blur_h);
-            intermediates.push(blur_v);
-            intermediates.push(next);
-            current_idx = Some(intermediates.len() - 1);
-        }
-        // Stage 3b: white balance (temperature / tint) — POST-LUT, matching
-        // the Python app's order (CDL → LUT → sharpen → temp/tint → mid →
-        // saturation). On log footage this is essential: temp/tint must act
-        // on the LUT's Rec.709 output, not the log input.
-        if plan.color_grade.has_white_balance() {
-            let next = make_rw_texture(&self.device,
-                &format!("{eye_label}_wb"), w, h,
-                wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::STORAGE_BINDING);
-            let prev = match current_idx {
-                Some(i) => &intermediates[i],
-                None => src,
-            };
-            self.record_color_grade(encoder, prev, &next, plan.color_grade.white_balance_only());
-            intermediates.push(next);
-            current_idx = Some(intermediates.len() - 1);
-        }
-        // Stage 4: mid-detail.
-        if !plan.mid_detail.is_identity() {
-            let next = make_rw_texture(&self.device,
-                &format!("{eye_label}_mid"), w, h,
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
-            let sw = (w + 3) / 4;
-            let sh = (h + 3) / 4;
-            let small = make_rw_texture(&self.device,
-                &format!("{eye_label}_mid_s"), sw, sh,
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
-            let small_h = make_rw_texture(&self.device,
-                &format!("{eye_label}_mid_sh"), sw, sh,
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
-            let small_v = make_rw_texture(&self.device,
-                &format!("{eye_label}_mid_sv"), sw, sh,
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
-            let prev = match current_idx {
-                Some(i) => &intermediates[i],
-                None => src,
-            };
-            self.record_mid_detail(encoder, prev,
-                &small, &small_h, &small_v, &next, w, h, sw, sh, plan.mid_detail);
-            intermediates.push(small);
-            intermediates.push(small_h);
-            intermediates.push(small_v);
-            intermediates.push(next);
-            current_idx = Some(intermediates.len() - 1);
-        }
-        // Stage 5: saturation — POST-LUT (the only color adjustment applied
-        // after the LUT). Temperature/tint were handled pre-LUT above.
-        if plan.color_grade.has_saturation() {
-            let next = make_rw_texture(&self.device,
-                &format!("{eye_label}_sat"), w, h,
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
-            let prev = match current_idx {
-                Some(i) => &intermediates[i],
-                None => src,
-            };
-            self.record_color_grade(encoder, prev, &next, plan.color_grade.saturation_only());
-            intermediates.push(next);
-            current_idx = Some(intermediates.len() - 1);
-        }
-        // Stage 6: "BeyondVR Hack" per-eye scale — MUST stay the final
-        // stage so the black padding is written after grading (a LUT or
-        // lift would otherwise tint it).
-        if plan.eye_scale != 1.0 {
-            let next = make_rw_texture(&self.device,
-                &format!("{eye_label}_escale"), w, h,
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
-            let prev = match current_idx {
-                Some(i) => &intermediates[i],
-                None => src,
-            };
-            self.record_eye_scale(encoder, prev, &next, plan.eye_scale);
-            intermediates.push(next);
-            current_idx = Some(intermediates.len() - 1);
-        }
-        // Index of the final stage's output texture, or None for
-        // "every stage was identity, caller should use src".
-        current_idx
-    }
-
-    // ----- 16-bit color stack ----- (10-bit end-to-end export path)
-
-    fn record_cdl_16(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        src: &wgpu::Texture,
-        dst: &wgpu::Texture,
-        params: CdlParams,
-    ) {
-        let uniforms = CdlUniforms {
-            lift: params.lift, gamma: params.gamma, gain: params.gain,
-            shadow: params.shadow, highlight: params.highlight,
-            _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
-        };
-        let uni = self.write_uniform("cdl16_chain_u", &uniforms);
-        let dims = (dst.width(), dst.height());
-        self.record_per_pixel(encoder, "cdl16_chain", &self.cdl_16, src, dst, &uni, dims);
-    }
-
-    fn record_color_grade_16(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        src: &wgpu::Texture,
-        dst: &wgpu::Texture,
-        params: ColorGradeParams,
-    ) {
-        let uniforms = ColorGradeUniforms {
-            temperature: params.temperature,
-            tint: params.tint,
-            saturation: params.saturation,
-            _pad: 0.0,
-        };
-        let uni = self.write_uniform("grade16_chain_u", &uniforms);
-        let dims = (dst.width(), dst.height());
-        self.record_per_pixel(encoder, "grade16_chain", &self.color_grade_16, src, dst, &uni, dims);
-    }
-
-    /// 16-bit "BeyondVR Hack" stage (per-eye texture — see `record_eye_scale`).
-    fn record_eye_scale_16(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        src: &wgpu::Texture,
-        dst: &wgpu::Texture,
-        scale: f32,
-    ) {
-        let uni = self.write_uniform("eye_scale16_chain_u", &EyeScaleUniforms {
-            scale, eye_w: dst.width() as f32, _pad0: 0.0, _pad1: 0.0,
-        });
-        let dims = (dst.width(), dst.height());
-        self.record_per_pixel(encoder, "eye_scale16_chain", &self.eye_scale_16, src, dst, &uni, dims);
-    }
-
-    fn record_lut3d_16(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        src: &wgpu::Texture,
-        dst: &wgpu::Texture,
-        lut_res: &Lut3DResources,
-        intensity: f32,
-        w: u32, h: u32,
-    ) {
-        let uniforms = Lut3DUniforms {
-            size: lut_res.size,
-            intensity,
-            _pad0: 0, _pad1: 0,
-        };
-        let uni = self.write_uniform("lut3d16_chain_u", &uniforms);
-        let src_v = src.create_view(&Default::default());
-        let lut_v = lut_res.tex.create_view(&Default::default());
-        let dst_v = dst.create_view(&Default::default());
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lut3d16_chain_bg"),
-            layout: &self.lut3d_16.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_v) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&lut_v) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.lut3d_16.sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dst_v) },
-                wgpu::BindGroupEntry { binding: 4, resource: uni.as_entire_binding() },
-            ],
-        });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("lut3d16_chain_pass"), timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.lut3d_16.pipeline);
-        pass.set_bind_group(0, Some(&bg), &[]);
-        pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
     }
 
     /// 8-bit per-eye color stack — Rgba8Unorm in, owned Rgba8Unorm out.
@@ -6697,7 +6335,7 @@ impl Device {
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(4);
         let final_idx = self.record_color_stack(
             &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates,
-            "stack8_per_eye", None,
+            false, "stack8_per_eye", None,
         );
         let Some(final_idx) = final_idx else {
             // Only the automatic eye-exposure stage was requested; it needs
@@ -6712,14 +6350,18 @@ impl Device {
         Ok(result)
     }
 
-    /// One eye's worth of the 16-bit colour stack, recorded into `encoder`
-    /// (no submit, no readback). Returns the index into `intermediates` of
-    /// the final texture, or `None` when no stage ran. Order:
+    /// One eye's worth of the colour stack, recorded into `encoder` (no
+    /// submit, no readback), at 8 bits or, `wide`, at 16: the same stages in
+    /// the same order either way. Returns the index into `intermediates` of
+    /// the final texture, or `None` when no stage ran (the caller then uses
+    /// `src`). Order:
     ///   eye-exposure offset → log exposure → CDL → LUT3D → sharpen →
     ///   white balance → mid-detail → saturation → eye scale.
-    /// `eye_offset` = the automatic eye-exposure state and this eye's index
-    /// (0 = left, 1 = right); `None` skips that stage.
-    fn record_color_stack_16(
+    /// `label` names the working textures. `eye_offset` = the automatic
+    /// eye-exposure state and this eye's index (0 = left, 1 = right);
+    /// `None` skips that stage.
+    #[allow(clippy::too_many_arguments)]
+    fn record_color_stack(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         src: &wgpu::Texture,
@@ -6727,20 +6369,30 @@ impl Device {
         plan: &ColorStackPlan,
         lut_resources: &Option<Lut3DResources>,
         intermediates: &mut Vec<wgpu::Texture>,
+        wide: bool,
+        label: &str,
         eye_offset: Option<(&EyeMatchState, u32)>,
     ) -> Option<usize> {
-        let make_16 = |label: &str, w: u32, h: u32| {
-            self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba16Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::STORAGE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            })
+        // A working texture of the stack's depth. (Only the 16-bit ones
+        // are ever read back.)
+        let make = |stage: &str, w: u32, h: u32| -> wgpu::Texture {
+            let name = format!("{label}_{stage}");
+            if wide {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(&name),
+                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                })
+            } else {
+                make_rw_texture(&self.device, &name, w, h,
+                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING)
+            }
         };
 
         let mut current_idx: Option<usize> = None;
@@ -6748,8 +6400,8 @@ impl Device {
         // 0. Automatic eye-exposure offset — sensor-side, so before every
         //    creative stage (same place as the static exposure trim).
         if let Some((state, eye)) = eye_offset {
-            let next = make_16("stack16_eyeoff_out", w, h);
-            self.record_eye_offset_apply(encoder, src, &next, state, eye, true);
+            let next = make("eyeoff", w, h);
+            self.record_eye_offset_apply(encoder, src, &next, state, eye, wide);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
@@ -6758,48 +6410,48 @@ impl Device {
         //     the eye offset (measured on the source's own codes), before
         //     every creative stage.
         if let Some(exposure) = plan.log_exposure {
-            let next = make_16("stack16_logexp_out", w, h);
+            let next = make("logexp", w, h);
             let prev = match current_idx {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_log_exposure(encoder, prev, &next, exposure, true);
+            self.record_log_exposure(encoder, prev, &next, exposure, wide);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
 
         // 1. CDL.
         if !plan.cdl.is_identity() {
-            let next = make_16("stack16_cdl_out", w, h);
+            let next = make("cdl", w, h);
             let prev = match current_idx {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_cdl_16(encoder, prev, &next, plan.cdl);
+            self.record_cdl(encoder, prev, &next, plan.cdl, wide);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
         // 2. 3D LUT.
         if let (Some((_, intensity)), Some(ref lr)) = (&plan.lut, lut_resources) {
-            let next = make_16("stack16_lut_out", w, h);
+            let next = make("lut", w, h);
             let prev = match current_idx {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_lut3d_16(encoder, prev, &next, lr, *intensity, w, h);
+            self.record_lut3d(encoder, prev, &next, lr, *intensity, w, h, wide);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
         // 3. Sharpen (full-res, 3 internal dispatches).
         if !plan.sharpen.is_identity() {
-            let next = make_16("stack16_sharp_out", w, h);
-            let blur_h = make_16("stack16_sharp_bh", w, h);
-            let blur_v = make_16("stack16_sharp_bv", w, h);
+            let next = make("sharp", w, h);
+            let blur_h = make("sharp_bh", w, h);
+            let blur_v = make("sharp_bv", w, h);
             let prev = match current_idx {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_sharpen_16(encoder, prev, &blur_h, &blur_v, &next, w, h, plan.sharpen);
+            self.record_sharpen(encoder, prev, &blur_h, &blur_v, &next, w, h, plan.sharpen, wide);
             intermediates.push(blur_h);
             intermediates.push(blur_v);
             intermediates.push(next);
@@ -6808,12 +6460,12 @@ impl Device {
         // 3b. White balance (temperature / tint) — POST-LUT, matching the
         // Python order (CDL → LUT → sharpen → temp/tint → mid → saturation).
         if plan.color_grade.has_white_balance() {
-            let next = make_16("stack16_wb_out", w, h);
+            let next = make("wb", w, h);
             let prev = match current_idx {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_color_grade_16(encoder, prev, &next, plan.color_grade.white_balance_only());
+            self.record_color_grade(encoder, prev, &next, plan.color_grade.white_balance_only(), wide);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
@@ -6821,16 +6473,16 @@ impl Device {
         if !plan.mid_detail.is_identity() {
             let sw = (w + 3) / 4;
             let sh = (h + 3) / 4;
-            let next = make_16("stack16_mid_out", w, h);
-            let small   = make_16("stack16_mid_s",  sw, sh);
-            let small_h = make_16("stack16_mid_sh", sw, sh);
-            let small_v = make_16("stack16_mid_sv", sw, sh);
+            let next = make("mid", w, h);
+            let small   = make("mid_s", sw, sh);
+            let small_h = make("mid_sh", sw, sh);
+            let small_v = make("mid_sv", sw, sh);
             let prev = match current_idx {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_mid_detail_16(encoder, prev,
-                &small, &small_h, &small_v, &next, w, h, sw, sh, plan.mid_detail);
+            self.record_mid_detail(encoder, prev,
+                &small, &small_h, &small_v, &next, w, h, sw, sh, plan.mid_detail, wide);
             intermediates.push(small);
             intermediates.push(small_h);
             intermediates.push(small_v);
@@ -6840,24 +6492,24 @@ impl Device {
         // 5. Saturation — POST-LUT (the only color adjustment after the
         // LUT). Temperature/tint were applied pre-LUT above.
         if plan.color_grade.has_saturation() {
-            let next = make_16("stack16_sat_out", w, h);
+            let next = make("sat", w, h);
             let prev = match current_idx {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_color_grade_16(encoder, prev, &next, plan.color_grade.saturation_only());
+            self.record_color_grade(encoder, prev, &next, plan.color_grade.saturation_only(), wide);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
         // 6. "BeyondVR Hack" per-eye scale — MUST stay the final stage so
         // the black padding is written after grading.
         if plan.eye_scale != 1.0 {
-            let next = make_16("stack16_escale_out", w, h);
+            let next = make("escale", w, h);
             let prev = match current_idx {
                 Some(i) => &intermediates[i],
                 None => src,
             };
-            self.record_eye_scale_16(encoder, prev, &next, plan.eye_scale);
+            self.record_eye_scale(encoder, prev, &next, plan.eye_scale, wide);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
@@ -6892,8 +6544,8 @@ impl Device {
             Some(self.upload_lut3d_resources(lut))
         } else { None };
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(12);
-        let idx = self.record_color_stack_16(
-            &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates, None);
+        let idx = self.record_color_stack(
+            &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates, true, "stack16", None);
         self.queue.submit(Some(encoder.finish()));
         Ok(idx.map(|i| intermediates.swap_remove(i)))
     }
@@ -6926,12 +6578,12 @@ impl Device {
         let matching = self.record_eye_match_if_enabled(
             &mut encoder, left, right, w, h, plan, eye_match);
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(24);
-        let li = self.record_color_stack_16(
+        let li = self.record_color_stack(
             &mut encoder, left, w, h, &plan.for_eye(true), &lut_resources, &mut intermediates,
-            matching.map(|s| (s, 0)));
-        let ri = self.record_color_stack_16(
+            true, "stack16_l", matching.map(|s| (s, 0)));
+        let ri = self.record_color_stack(
             &mut encoder, right, w, h, &plan.for_eye(false), &lut_resources, &mut intermediates,
-            matching.map(|s| (s, 1)));
+            true, "stack16_r", matching.map(|s| (s, 1)));
         self.queue.submit(Some(encoder.finish()));
         // `wgpu::Texture` is a cheap handle clone; both indices may point into
         // the same Vec, so clone rather than swap_remove twice.
