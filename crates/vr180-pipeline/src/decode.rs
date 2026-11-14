@@ -1219,7 +1219,7 @@ pub fn extract_first_stream_pair_with(path: &Path, hw: HwDecode) -> Result<Strea
     // Lazy scaler per stream: built once we see the actual sw-frame
     // pixel format (which differs depending on hwaccel: NV12/P010 after
     // VT transfer, yuv420p/p010le from sw decode).
-    let mut scalers: Vec<Option<ffmpeg_next::software::scaling::Context>> = vec![None, None];
+    let mut scalers: Vec<Option<crate::swscale::YuvToRgb>> = vec![None, None];
 
     let mut frames: [Option<Vec<u8>>; 2] = [None, None];
     'outer: for (stream, packet) in ictx.packets() {
@@ -1246,22 +1246,12 @@ pub fn extract_first_stream_pair_with(path: &Path, hw: HwDecode) -> Result<Strea
             let scaler = match &mut scalers[pos] {
                 Some(s) => s,
                 None => {
-                    let s = ffmpeg_next::software::scaling::Context::get(
-                        frame_ref.format(),
-                        frame_ref.width(),
-                        frame_ref.height(),
-                        ffmpeg_next::format::Pixel::RGB24,
-                        frame_ref.width(),
-                        frame_ref.height(),
-                        ffmpeg_next::software::scaling::Flags::BILINEAR,
-                    ).map_err(|e| Error::Ffmpeg(format!("scaler: {e}")))?;
-                    scalers[pos] = Some(s);
+                    scalers[pos] = Some(eac_rgb_converter(frame_ref)?);
                     scalers[pos].as_mut().unwrap()
                 }
             };
             let mut rgb = ffmpeg_next::frame::Video::empty();
-            scaler.run(frame_ref, &mut rgb)
-                .map_err(|e| Error::Ffmpeg(format!("scaler run: {e}")))?;
+            scaler.run(frame_ref, &mut rgb)?;
             // swscale row stride may exceed width*3 (SIMD padding).
             let w = rgb.width() as usize;
             let h = rgb.height() as usize;
@@ -2238,7 +2228,7 @@ pub struct StreamPairIter {
     ictx: ffmpeg_next::format::context::Input,
     video_indices: Vec<usize>,
     decoders: Vec<ffmpeg_next::codec::decoder::Video>,
-    scalers: Vec<Option<ffmpeg_next::software::scaling::Context>>,
+    scalers: Vec<Option<crate::swscale::YuvToRgb>>,
     hw_active: [bool; 2],
     dims: vr180_core::eac::Dims,
     decode_path: DecodePath,
@@ -2537,13 +2527,35 @@ impl SegmentedStreamPairIter {
     }
 }
 
+/// The `.360` software decode's conversion to packed RGB8: Rec.709, the
+/// matrix the GPU kernels of the same source convert with, and exact
+/// (`swscale::YuvToRgb` at the frame's own size). A context left alone
+/// converts with swscale's default, the BT.601 matrix: every saturated
+/// colour comes out off, and whatever grades the picture after that works
+/// on the wrong RGB.
+///
+/// The RANGE is video range whatever the file says. GoPro tags both EAC
+/// tracks `pc` (full range) and no path of this app honours that: the GPU
+/// arms expand them as video range on both platforms, and so did this
+/// conversion (swscale reads the range off the pixel format, not the tag).
+/// Whether the tag is truthful is a decision for both platforms at once
+/// (see CLAUDE.md); until it is taken, this side must not move alone.
+fn eac_rgb_converter(frame: &ffmpeg_next::frame::Video) -> Result<crate::swscale::YuvToRgb> {
+    crate::swscale::YuvToRgb::new(
+        frame.format(), frame.width(), frame.height(),
+        ffmpeg_next::format::Pixel::RGB24, frame.width(), frame.height(),
+        ffmpeg_next::software::scaling::Flags::BILINEAR,
+        false, false,
+    )
+}
+
 /// Shared frame → packed-RGB8 conversion used by both single-frame and
 /// streaming code paths.
 fn repack_to_rgb8(
     decoded: &mut ffmpeg_next::frame::Video,
     sw_storage: &mut ffmpeg_next::frame::Video,
     hw_active: bool,
-    scaler: &mut Option<ffmpeg_next::software::scaling::Context>,
+    scaler: &mut Option<crate::swscale::YuvToRgb>,
 ) -> Result<Vec<u8>> {
     // HW-decoded surfaces (VideoToolbox on macOS, D3D11/NVDEC on Windows)
     // live in GPU memory — download to host before swscale. The downloaded
@@ -2562,18 +2574,12 @@ fn repack_to_rgb8(
     let s = match scaler {
         Some(s) => s,
         None => {
-            *scaler = Some(ffmpeg_next::software::scaling::Context::get(
-                frame_ref.format(),
-                frame_ref.width(), frame_ref.height(),
-                ffmpeg_next::format::Pixel::RGB24,
-                frame_ref.width(), frame_ref.height(),
-                ffmpeg_next::software::scaling::Flags::BILINEAR,
-            ).map_err(|e| Error::Ffmpeg(format!("scaler: {e}")))?);
+            *scaler = Some(eac_rgb_converter(frame_ref)?);
             scaler.as_mut().unwrap()
         }
     };
     let mut rgb = ffmpeg_next::frame::Video::empty();
-    s.run(frame_ref, &mut rgb).map_err(|e| Error::Ffmpeg(format!("scaler run: {e}")))?;
+    s.run(frame_ref, &mut rgb)?;
     let w = rgb.width() as usize;
     let h = rgb.height() as usize;
     let src = rgb.data(0);
@@ -2663,4 +2669,72 @@ pub fn bench_decode_throughput(
     let total = t_start.elapsed();
     let decode_path = if hw_active { DecodePath::VideoToolbox } else { DecodePath::Software };
     Ok(BenchResult { frames: count, total, decode_path })
+}
+
+#[cfg(test)]
+mod source_matrix_tests {
+    use super::*;
+    use ffmpeg_next::format::Pixel;
+
+    /// A flat 16 × 16 Y'CbCr 4:2:0 frame of one colour (8-bit planar, or
+    /// 10-bit planar with `wide`), tagged as given.
+    fn flat(wide: bool, y: u16, cb: u16, cr: u16, space: ffmpeg_next::ffi::AVColorSpace, range: ffmpeg_next::ffi::AVColorRange) -> ffmpeg_next::frame::Video {
+        let mut f = ffmpeg_next::frame::Video::new(if wide { Pixel::YUV420P10LE } else { Pixel::YUV420P }, 16, 16);
+        for (plane, v) in [(0usize, y), (1, cb), (2, cr)] {
+            let d = f.data_mut(plane);
+            if wide {
+                for px in d.chunks_exact_mut(2) { px.copy_from_slice(&v.to_le_bytes()); }
+            } else {
+                d.fill(v as u8);
+            }
+        }
+        unsafe {
+            (*f.as_mut_ptr()).colorspace = space;
+            (*f.as_mut_ptr()).color_range = range;
+        }
+        f
+    }
+
+    /// R'G'B' (0..1) of a video-range Y'CbCr triple under the luma weights
+    /// `kr`, `kb`; `k` = 1 for 8-bit codes, 4 for 10-bit.
+    fn rgb_of(y: f64, cb: f64, cr: f64, k: f64, kr: f64, kb: f64) -> [f64; 3] {
+        let (yn, pb, pr) = ((y - 16.0 * k) / (219.0 * k), (cb - 128.0 * k) / (224.0 * k), (cr - 128.0 * k) / (224.0 * k));
+        let r = yn + 2.0 * (1.0 - kr) * pr;
+        let b = yn + 2.0 * (1.0 - kb) * pb;
+        [r, (yn - kr * r - kb * b) / (1.0 - kr - kb), b]
+    }
+
+    /// The `.360` software decode is Rec.709 at video range, whatever the
+    /// frame is tagged: not swscale's BT.601 default, and not the full
+    /// range GoPro's files claim (which no path of the app honours).
+    #[test]
+    fn the_software_decode_is_rec709_at_video_range() {
+        init();
+        use ffmpeg_next::ffi::{AVColorRange::*, AVColorSpace::*};
+        // (Y, Cb, Cr) in 8-bit codes: a red, a green, a grey, a sky blue.
+        let colours = [(90u16, 100u16, 200u16), (150, 70, 60), (126, 128, 128), (200, 150, 110)];
+        for (space, range) in [(AVCOL_SPC_BT709, AVCOL_RANGE_MPEG), (AVCOL_SPC_UNSPECIFIED, AVCOL_RANGE_UNSPECIFIED), (AVCOL_SPC_BT709, AVCOL_RANGE_JPEG)] {
+            for wide in [false, true] {
+                let k = if wide { 4 } else { 1 };
+                let mut worst = 0.0f64;
+                for (y, cb, cr) in colours {
+                    let mut frame = flat(wide, y * k, cb * k, cr * k, space, range);
+                    let mut storage = ffmpeg_next::frame::Video::empty();
+                    let rgb = repack_to_rgb8(&mut frame, &mut storage, false, &mut None).expect("convert");
+                    let want = rgb_of((y * k) as f64, (cb * k) as f64, (cr * k) as f64, k as f64, 0.2126, 0.0722);
+                    // The middle pixel.
+                    let o = (8 * 16 + 8) * 3;
+                    for ch in 0..3 {
+                        worst = worst.max((rgb[o + ch] as f64 - want[ch].clamp(0.0, 1.0) * 255.0).abs());
+                    }
+                }
+                eprintln!("{space:?} {range:?}, {} bit: worst {worst:.2} of an 8-bit code", if wide { 10 } else { 8 });
+                // The rounding to a whole code. (The wrong matrix is 10 to 20
+                // codes off on these colours, the other range 16 at black, and
+                // swscale's fast converters 2 dark everywhere.)
+                assert!(worst <= 0.6, "{space:?} {range:?}: {worst:.2} codes from Rec.709 at video range");
+            }
+        }
+    }
+
 }

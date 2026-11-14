@@ -4529,7 +4529,7 @@ pub(crate) fn resolve_calib_pair(
 /// for the 10-bit export paths. Honors `projection`:
 ///   - HalfEquirect → run KB → equirect projection on the GPU.
 ///   - Fisheye → KB → normalized equidistant fisheye on the GPU (8-bit
-///     source widened to 16-bit by byte shift; no precision is gained,
+///     source widened to 16-bit (each byte twice: 255 is 65535); no precision is gained,
 ///     but the texture format matches the P010 compose path).
 ///
 /// `rs` = optional per-row rolling-shutter matrices for THIS frame
@@ -4588,7 +4588,7 @@ fn build_eye_eq_16(
 
 /// Upload one decoded eye as an `Rgba16Unorm` texture for the RS-capable
 /// rgba16 projection kernels. 16-bit sources (RGBA64LE) upload verbatim;
-/// 8-bit RGBA widens by byte shift (low byte zero — no fake precision),
+/// 8-bit RGBA widens by repeating each byte (255 is 65535, the same unorm value),
 /// matching `project_fisheye_to_fisheye_texture_16`'s convention.
 fn upload_eye_rgba16(
     pipeline: &Device,
@@ -4611,9 +4611,9 @@ fn upload_eye_rgba16(
         let n_pixels = (w as usize) * (h as usize);
         let mut out = Vec::with_capacity(n_pixels * 8);
         for px in bytes.chunks_exact(4) {
-            out.push(0x00); out.push(px[0]);
-            out.push(0x00); out.push(px[1]);
-            out.push(0x00); out.push(px[2]);
+            out.push(px[0]); out.push(px[0]);
+            out.push(px[1]); out.push(px[1]);
+            out.push(px[2]); out.push(px[2]);
             out.push(0xFF); out.push(0xFF);
         }
         std::borrow::Cow::Owned(out)
@@ -4672,7 +4672,7 @@ fn upload_rgba8_texture(
 }
 
 /// Upload an RGB(A) buffer as an `Rgba16Unorm` texture. Accepts source
-/// in 8-bit RGBA8 (widened by left-shift, low byte zero) or 16-bit
+/// in 8-bit RGBA8 (widened by repeating each byte) or 16-bit
 /// RGBA64LE (copied verbatim).
 fn upload_rgba_as_rgba16(
     pipeline: &Device,
@@ -4688,9 +4688,9 @@ fn upload_rgba_as_rgba16(
     } else {
         let mut out = Vec::with_capacity(n_pixels * 8);
         for px in src.chunks_exact(4) {
-            out.push(0x00); out.push(px[0]);
-            out.push(0x00); out.push(px[1]);
-            out.push(0x00); out.push(px[2]);
+            out.push(px[0]); out.push(px[0]);
+            out.push(px[1]); out.push(px[1]);
+            out.push(px[2]); out.push(px[2]);
             out.push(0xFF); out.push(0xFF);
         }
         std::borrow::Cow::Owned(out)

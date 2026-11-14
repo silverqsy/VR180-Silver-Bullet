@@ -6999,8 +6999,9 @@ impl Device {
         calib: FisheyeCalib,
     ) -> Result<wgpu::Texture> {
         // Source texture: Rgba16Unorm. If the source is 8-bit (RGBA8)
-        // we widen to 16-bit by left-shifting each byte 8 bits (low
-        // byte zero — no fake precision). 16-bit sources copy verbatim.
+        // we widen to 16-bit by repeating each byte: 255 becomes 65535,
+        // the same unorm value. (A plain shift leaves white at 65280,
+        // 0.39 % dark.) 16-bit sources copy verbatim.
         let src_tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("fish_out_src_16"),
             size: wgpu::Extent3d { width: src_w, height: src_h, depth_or_array_layers: 1 },
@@ -7016,9 +7017,9 @@ impl Device {
             let n_pixels = (src_w as usize) * (src_h as usize);
             let mut out = Vec::with_capacity(n_pixels * 8);
             for px in src_rgba_or_rgba64le.chunks_exact(4) {
-                out.push(0x00); out.push(px[0]);
-                out.push(0x00); out.push(px[1]);
-                out.push(0x00); out.push(px[2]);
+                out.push(px[0]); out.push(px[0]);
+                out.push(px[1]); out.push(px[1]);
+                out.push(px[2]); out.push(px[2]);
                 out.push(0xFF); out.push(0xFF);
             }
             std::borrow::Cow::Owned(out)

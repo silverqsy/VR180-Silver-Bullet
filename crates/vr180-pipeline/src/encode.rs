@@ -85,21 +85,52 @@ impl EncoderBackend {
 /// point (instead of `encode_frame`). The encoder context has
 /// `hw_device_ctx` + `hw_frames_ctx` set so it accepts AVFrames with
 /// `format = AV_PIX_FMT_VIDEOTOOLBOX` and `data[3] = CVPixelBufferRef`.
-/// Multi-threaded swscale context. `sws_getContext()` (what ffmpeg-next's
-/// `scaling::Context::get` wraps) has no threads parameter — libswscale
-/// threading (ffmpeg ≥5.0) is only reachable by building the context via
-/// AVOptions before init, which is what the ffmpeg CLI does. Slice
-/// threading splits the frame into row bands; the per-pixel conversion
-/// math is unchanged, so output matches the single-threaded context.
-/// Used for the CPU export path's RGB→YUV conversions, which are
-/// full-frame (up to 8192×4096 × 6 B/px) and were single-threaded.
-struct ThreadedScaler {
-    ctx: *mut ffmpeg::ffi::SwsContext,
+/// Copy a packed 16-bit RGB(A) picture (little-endian words, `row_bytes` a
+/// row, tightly packed) into a frame swscale will convert, moving every
+/// sample from the GPU's scale to swscale's. On the GPU white is 65535;
+/// swscale's 16-bit RGB is its 8-bit RGB shifted up, white = 255 << 8 =
+/// 65280, and it converts 65535 to a luma 0.39 % over (code 943 of a 10-bit
+/// 940). Each word is scaled by 65280 / 65535 on the way in; the conversion
+/// is then exact to the rounding. Rows are split across threads: at 8K this
+/// is over a hundred million words a frame.
+fn load_rgb16(frame: &mut ffmpeg::frame::Video, packed: &[u8], row_bytes: usize) {
+    let stride = frame.stride(0);
+    let rows = packed.len() / row_bytes;
+    let dst = &mut frame.data_mut(0)[..stride * rows];
+    let threads = std::thread::available_parallelism().map(|n| n.get().min(16)).unwrap_or(1);
+    let band = rows.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (dst_band, src_band) in dst.chunks_mut(stride * band).zip(packed.chunks(row_bytes * band)) {
+            scope.spawn(move || {
+                for (dst_row, src_row) in dst_band.chunks_mut(stride).zip(src_band.chunks_exact(row_bytes)) {
+                    for (d, s) in dst_row[..row_bytes].chunks_exact_mut(2).zip(src_row.chunks_exact(2)) {
+                        let v = u16::from_le_bytes([s[0], s[1]]) as u32;
+                        d.copy_from_slice(&(((v * 65280 + 32767) / 65535) as u16).to_le_bytes());
+                    }
+                }
+            });
+        }
+    });
 }
 
-// The context is only ever used from the one export thread that owns the
-// encoder; Send is needed because H265Encoder moves across threads.
-unsafe impl Send for ThreadedScaler {}
+/// A single-threaded swscale context from packed RGB to the encoder's
+/// Y'CbCr, same size, with the Rec.709 matrix (`swscale::set_rgb_to_rec709`).
+fn rgb_to_yuv_scaler(
+    src: ffmpeg::format::Pixel,
+    dst: ffmpeg::format::Pixel,
+    w: u32, h: u32,
+) -> Result<ffmpeg::software::scaling::Context> {
+    let mut scaler = ffmpeg::software::scaling::Context::get(
+        src, w, h, dst, w, h, ffmpeg::software::scaling::Flags::BICUBIC,
+    ).map_err(|e| Error::Ffmpeg(format!("{src:?} → {dst:?} scaler: {e}")))?;
+    unsafe { crate::swscale::set_rgb_to_rec709(scaler.as_mut_ptr()); }
+    Ok(scaler)
+}
+
+/// The slice-threaded context of the software feed: packed RGB to the
+/// encoder's Y'CbCr at the same size, Rec.709. Used for the CPU export
+/// path's conversions, which are full-frame (up to 8192×4096 × 6 B/px).
+struct ThreadedScaler(crate::swscale::ThreadedScaler);
 
 impl ThreadedScaler {
     fn new(
@@ -107,62 +138,16 @@ impl ThreadedScaler {
         dst: ffmpeg::format::Pixel,
         w: u32, h: u32,
     ) -> Option<Self> {
-        unsafe {
-            use ffmpeg::ffi::*;
-            let ctx = sws_alloc_context();
-            if ctx.is_null() {
-                return None;
-            }
-            let obj = ctx as *mut std::ffi::c_void;
-            let set = |name: &str, val: i64| -> bool {
-                let cname = CString::new(name).unwrap();
-                av_opt_set_int(obj, cname.as_ptr(), val, 0) >= 0
-            };
-            let threads = std::thread::available_parallelism()
-                .map(|n| n.get().min(16) as i64)
-                .unwrap_or(1);
-            let src_fmt: AVPixelFormat = src.into();
-            let dst_fmt: AVPixelFormat = dst.into();
-            let ok = set("srcw", w as i64)
-                && set("srch", h as i64)
-                && set("src_format", src_fmt as i64)
-                && set("dstw", w as i64)
-                && set("dsth", h as i64)
-                && set("dst_format", dst_fmt as i64)
-                // Same algorithm the single-threaded contexts use — for a
-                // 1:1 format conversion the flags barely matter, but keep
-                // them identical so output is unchanged. (4 = SWS_BICUBIC;
-                // the #define isn't re-exported by ffmpeg-sys-next.)
-                && set("sws_flags", 4)
-                && set("threads", threads);
-            if !ok || sws_init_context(ctx, std::ptr::null_mut(), std::ptr::null_mut()) < 0 {
-                sws_freeContext(ctx);
-                tracing::warn!("threaded swscale init failed — falling back to single-threaded");
-                return None;
-            }
-            tracing::info!("threaded swscale: {threads} threads for {src:?} → {dst:?} @ {w}×{h}");
-            Some(Self { ctx })
-        }
+        // 4 = SWS_BICUBIC, what the single-threaded contexts use.
+        let mut scaler = crate::swscale::ThreadedScaler::build(src, w, h, dst, w, h, 4)?;
+        unsafe { crate::swscale::set_rgb_to_rec709(scaler.as_mut_ptr()); }
+        Some(Self(scaler))
     }
 
     /// Returns false on failure (caller falls back to the single-threaded
     /// context).
     fn run(&mut self, src: &ffmpeg::frame::Video, dst: &mut ffmpeg::frame::Video) -> bool {
-        unsafe {
-            // MUST be sws_scale_frame(): the legacy sws_scale() entry point
-            // detects a threads>1 context and silently converts on
-            // slice_ctx[0] — single-threaded, defeating the whole point of
-            // this context. Only sws_scale_frame() dispatches slices across
-            // the thread pool (this is also what the ffmpeg CLI calls).
-            let ret = ffmpeg::ffi::sws_scale_frame(self.ctx, dst.as_mut_ptr(), src.as_ptr());
-            ret >= 0
-        }
-    }
-}
-
-impl Drop for ThreadedScaler {
-    fn drop(&mut self) {
-        unsafe { ffmpeg::ffi::sws_freeContext(self.ctx); }
+        self.0.run(src, dst)
     }
 }
 
@@ -666,13 +651,7 @@ impl H265Encoder {
         // swscale: packed RGB24 → encoder's pix_fmt (handles 8 → 10
         // bit expansion internally for the P010LE / YUV420P10LE
         // targets).
-        let scaler = ffmpeg::software::scaling::Context::get(
-            ffmpeg::format::Pixel::RGB24,
-            w, h,
-            enc_pix_fmt,
-            w, h,
-            ffmpeg::software::scaling::Flags::BICUBIC,
-        ).map_err(|e| Error::Ffmpeg(format!("rgb→yuv scaler: {e}")))?;
+        let scaler = rgb_to_yuv_scaler(ffmpeg::format::Pixel::RGB24, enc_pix_fmt, w, h)?;
 
         Ok(Self {
             octx, encoder, scaler, stream_index, time_base,
@@ -904,31 +883,14 @@ impl H265Encoder {
                 ffmpeg::format::Pixel::RGB48LE, self.enc_pix_fmt, self.w, self.h);
         }
         if self.mt_scalers.rgb48.is_none() && self.scaler_rgb48.is_none() {
-            self.scaler_rgb48 = Some(
-                ffmpeg::software::scaling::Context::get(
-                    ffmpeg::format::Pixel::RGB48LE,
-                    self.w, self.h,
-                    self.enc_pix_fmt,
-                    self.w, self.h,
-                    ffmpeg::software::scaling::Flags::BICUBIC,
-                ).map_err(|e| Error::Ffmpeg(format!("rgb48→yuv scaler: {e}")))?
-            );
+            self.scaler_rgb48 = Some(rgb_to_yuv_scaler(
+                ffmpeg::format::Pixel::RGB48LE, self.enc_pix_fmt, self.w, self.h)?);
         }
 
         let mut rgb_frame = ffmpeg::frame::Video::new(
             ffmpeg::format::Pixel::RGB48LE, self.w, self.h
         );
-        let stride = rgb_frame.stride(0);
-        {
-            let dst = rgb_frame.data_mut(0);
-            let row_bytes = (self.w as usize) * 6;
-            for y in 0..self.h as usize {
-                let dst_off = y * stride;
-                let src_off = y * row_bytes;
-                dst[dst_off..dst_off + row_bytes]
-                    .copy_from_slice(&rgb48le[src_off..src_off + row_bytes]);
-            }
-        }
+        load_rgb16(&mut rgb_frame, rgb48le, (self.w as usize) * 6);
 
         let mut yuv_frame = ffmpeg::frame::Video::new(
             self.enc_pix_fmt, self.w, self.h
@@ -938,15 +900,8 @@ impl H265Encoder {
             .unwrap_or(false);
         if !mt_ok {
             if self.scaler_rgb48.is_none() {
-                self.scaler_rgb48 = Some(
-                    ffmpeg::software::scaling::Context::get(
-                        ffmpeg::format::Pixel::RGB48LE,
-                        self.w, self.h,
-                        self.enc_pix_fmt,
-                        self.w, self.h,
-                        ffmpeg::software::scaling::Flags::BICUBIC,
-                    ).map_err(|e| Error::Ffmpeg(format!("rgb48→yuv scaler: {e}")))?
-                );
+                self.scaler_rgb48 = Some(rgb_to_yuv_scaler(
+                    ffmpeg::format::Pixel::RGB48LE, self.enc_pix_fmt, self.w, self.h)?);
             }
             self.scaler_rgb48.as_mut().unwrap().run(&rgb_frame, &mut yuv_frame)
                 .map_err(|e| Error::Ffmpeg(format!("rgb48 scaler run: {e}")))?;
@@ -983,17 +938,7 @@ impl H265Encoder {
         let mut rgba_frame = ffmpeg::frame::Video::new(
             ffmpeg::format::Pixel::RGBA64LE, self.w, self.h
         );
-        let stride = rgba_frame.stride(0);
-        {
-            let dst = rgba_frame.data_mut(0);
-            let row_bytes = (self.w as usize) * 8;
-            for y in 0..self.h as usize {
-                let dst_off = y * stride;
-                let src_off = y * row_bytes;
-                dst[dst_off..dst_off + row_bytes]
-                    .copy_from_slice(&rgba64le[src_off..src_off + row_bytes]);
-            }
-        }
+        load_rgb16(&mut rgba_frame, rgba64le, (self.w as usize) * 8);
 
         let mut yuv_frame = ffmpeg::frame::Video::new(
             self.enc_pix_fmt, self.w, self.h
@@ -1003,15 +948,8 @@ impl H265Encoder {
             .unwrap_or(false);
         if !mt_ok {
             if self.scaler_rgba64.is_none() {
-                self.scaler_rgba64 = Some(
-                    ffmpeg::software::scaling::Context::get(
-                        ffmpeg::format::Pixel::RGBA64LE,
-                        self.w, self.h,
-                        self.enc_pix_fmt,
-                        self.w, self.h,
-                        ffmpeg::software::scaling::Flags::BICUBIC,
-                    ).map_err(|e| Error::Ffmpeg(format!("rgba64→yuv scaler: {e}")))?
-                );
+                self.scaler_rgba64 = Some(rgb_to_yuv_scaler(
+                    ffmpeg::format::Pixel::RGBA64LE, self.enc_pix_fmt, self.w, self.h)?);
             }
             self.scaler_rgba64.as_mut().unwrap().run(&rgba_frame, &mut yuv_frame)
                 .map_err(|e| Error::Ffmpeg(format!("rgba64 scaler run: {e}")))?;
@@ -1962,4 +1900,155 @@ pub(crate) fn approx_rational(fps: f32) -> (i32, i32) {
     }
     // Fallback: scale by 1000 (lossy on weird fps but always positive).
     ((fps * 1000.0).round() as i32, 1000)
+}
+
+#[cfg(test)]
+mod rgb_to_yuv_tests {
+    use super::*;
+    use ffmpeg::format::Pixel;
+
+    const SIDE: usize = 64;
+    /// Pixels a side of one flat block: wide enough that a chroma filter of
+    /// a few taps sees one colour at the block's middle.
+    const BLOCK: usize = 16;
+
+    /// A `SIDE`² picture of flat blocks, as 16-bit RGB (greys first).
+    fn blocks() -> Vec<[u16; 3]> {
+        let mut x = 0x5eed_1234u32;
+        let mut next = || { x ^= x << 13; x ^= x >> 17; x ^= x << 5; (x >> 8) as u16 };
+        let n = (SIDE / BLOCK) * (SIDE / BLOCK);
+        (0..n).map(|i| if i < 6 { [[0, 13107, 26214, 39321, 52428, 65535][i]; 3] } else { [next(), next(), next()] }).collect()
+    }
+
+    /// Rec.709 at video range, exactly, in codes of `bits`.
+    fn exact(c: [f64; 3], bits: u32) -> [f64; 3] {
+        let k = (1u32 << (bits - 8)) as f64;
+        let [r, g, b] = c;
+        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        [16.0 * k + 219.0 * k * y, 128.0 * k + 224.0 * k * (b - y) / 1.8556, 128.0 * k + 224.0 * k * (r - y) / 1.5748]
+    }
+
+    /// The picture in `src`'s packing, loaded the way the feed loads it,
+    /// and each block's colour as that packing holds it (the 8-bit packing
+    /// rounds it).
+    fn source(src: Pixel, blocks: &[[u16; 3]]) -> (ffmpeg::frame::Video, Vec<[f64; 3]>) {
+        let mut frame = ffmpeg::frame::Video::new(src, SIDE as u32, SIDE as u32);
+        let held: Vec<[f64; 3]> = blocks.iter().map(|c| match src {
+            Pixel::RGB24 => c.map(|v| (v >> 8) as f64 / 255.0),
+            _ => c.map(|v| v as f64 / 65535.0),
+        }).collect();
+        let at = |x: usize, y: usize| blocks[(y / BLOCK) * (SIDE / BLOCK) + x / BLOCK];
+        match src {
+            Pixel::RGB24 => {
+                let stride = frame.stride(0);
+                let data = frame.data_mut(0);
+                for y in 0..SIDE {
+                    for x in 0..SIDE {
+                        let c = at(x, y);
+                        for ch in 0..3 { data[y * stride + x * 3 + ch] = (c[ch] >> 8) as u8; }
+                    }
+                }
+            }
+            Pixel::RGB48LE | Pixel::RGBA64LE => {
+                let bpp = if src == Pixel::RGB48LE { 6 } else { 8 };
+                let mut packed = Vec::with_capacity(SIDE * SIDE * bpp);
+                for y in 0..SIDE {
+                    for x in 0..SIDE {
+                        for v in at(x, y) { packed.extend_from_slice(&v.to_le_bytes()); }
+                        if bpp == 8 { packed.extend_from_slice(&u16::MAX.to_le_bytes()); }
+                    }
+                }
+                load_rgb16(&mut frame, &packed, SIDE * bpp);
+            }
+            other => panic!("no packing for {other:?}"),
+        }
+        (frame, held)
+    }
+
+    /// A converted frame against the exact matrix at the middle of every
+    /// block, in the output's own codes: (worst luma, worst chroma, mean
+    /// luma error).
+    fn errors(dst: Pixel, out: &ffmpeg::frame::Video, held: &[[f64; 3]]) -> (f64, f64, f64) {
+        let (bits, wide) = match dst { Pixel::YUV420P | Pixel::NV12 => (8, false), _ => (10, true) };
+        let rd = |plane: usize, off: usize| -> f64 {
+            let d = out.data(plane);
+            if wide { u16::from_le_bytes([d[off], d[off + 1]]) as f64 } else { d[off] as f64 }
+        };
+        let bps = if wide { 2 } else { 1 };
+        let p010 = dst == Pixel::P010LE;
+        let chroma_rows_halved = dst != Pixel::YUV422P10LE;
+        let (mut worst_y, mut worst_c, mut sum_y) = (0.0f64, 0.0f64, 0.0f64);
+        let per_row = SIDE / BLOCK;
+        for (i, colour) in held.iter().enumerate() {
+            let want = exact(*colour, bits);
+            // The block's middle pixel, and the chroma sample over it.
+            let (x, y) = ((i % per_row) * BLOCK + BLOCK / 2, (i / per_row) * BLOCK + BLOCK / 2);
+            let mut v = rd(0, y * out.stride(0) + x * bps);
+            if p010 { v /= 64.0; }
+            worst_y = worst_y.max((v - want[0]).abs());
+            sum_y += v - want[0];
+            let (cx, cy) = (x / 2, if chroma_rows_halved { y / 2 } else { y });
+            let (cb, cr) = if p010 {
+                let o = cy * out.stride(1) + cx * 4;
+                (rd(1, o) / 64.0, rd(1, o + 2) / 64.0)
+            } else if dst == Pixel::NV12 {
+                let o = cy * out.stride(1) + cx * 2;
+                (rd(1, o), rd(1, o + 1))
+            } else {
+                (rd(1, cy * out.stride(1) + cx * bps), rd(2, cy * out.stride(2) + cx * bps))
+            };
+            worst_c = worst_c.max((cb - want[1]).abs()).max((cr - want[2]).abs());
+        }
+        (worst_y, worst_c, sum_y / held.len() as f64)
+    }
+
+    /// Every (packed RGB, encoder layout) pair a feed can meet: 8-bit and
+    /// 10-bit H.265 in software (planar) and through NVENC (semi-planar),
+    /// and software ProRes (4:2:2).
+    const PAIRS: [(Pixel, Pixel); 9] = [
+        (Pixel::RGB24, Pixel::YUV420P),
+        (Pixel::RGB24, Pixel::NV12),
+        (Pixel::RGBA64LE, Pixel::NV12),
+        (Pixel::RGB48LE, Pixel::YUV422P10LE),
+        (Pixel::RGB48LE, Pixel::YUV420P10LE),
+        (Pixel::RGB48LE, Pixel::P010LE),
+        (Pixel::RGBA64LE, Pixel::YUV420P10LE),
+        (Pixel::RGBA64LE, Pixel::YUV422P10LE),
+        (Pixel::RGB24, Pixel::P010LE),
+    ];
+
+    /// Every RGB → Y'CbCr conversion the software feed does is Rec.709, as
+    /// the streams are tagged: the threaded context and the single-threaded
+    /// one, into each layout an encoder asks for.
+    #[test]
+    fn the_software_feed_converts_with_rec709() {
+        crate::decode::init();
+        let blocks = blocks();
+        for (src, dst) in PAIRS {
+            let (frame, held) = source(src, &blocks);
+            let mut single = rgb_to_yuv_scaler(src, dst, SIDE as u32, SIDE as u32).expect("scaler");
+            let mut out = ffmpeg::frame::Video::new(dst, SIDE as u32, SIDE as u32);
+            single.run(&frame, &mut out).expect("run");
+            let (y, c, mean) = errors(dst, &out, &held);
+            eprintln!("{src:?} → {dst:?}, single: worst luma {y:.2}, worst chroma {c:.2}, mean luma {mean:+.3}");
+            assert!(y <= SOFTWARE_FEED_TOLERANCE && c <= SOFTWARE_FEED_TOLERANCE, "{src:?} → {dst:?}: {y:.2} / {c:.2} codes from Rec.709");
+            if let Some(mut threaded) = ThreadedScaler::new(src, dst, SIDE as u32, SIDE as u32) {
+                let mut out = ffmpeg::frame::Video::new(dst, SIDE as u32, SIDE as u32);
+                assert!(threaded.run(&frame, &mut out), "threaded run");
+                let (y, c, mean) = errors(dst, &out, &held);
+                eprintln!("{src:?} → {dst:?}, threaded: worst luma {y:.2}, worst chroma {c:.2}, mean luma {mean:+.3}");
+                assert!(y <= SOFTWARE_FEED_TOLERANCE && c <= SOFTWARE_FEED_TOLERANCE, "{src:?} → {dst:?} (threaded): {y:.2} / {c:.2} codes from Rec.709");
+            }
+        }
+    }
+
+    /// Codes of the output a conversion may sit from the exact matrix: the
+    /// rounding to a whole code, and little else. (Left to its defaults
+    /// swscale converts with the BT.601 matrix, 20 codes off in an 8-bit
+    /// luma and 81 in a 10-bit one on these colours; and it reads 16-bit
+    /// RGB on a scale where white is 65280, 3 codes of a 10-bit luma over
+    /// at white.) The widest case is a 16-bit picture into an 8-bit layout,
+    /// which swscale does not round quite evenly (0.66, a mean of -0.28).
+    const SOFTWARE_FEED_TOLERANCE: f64 = 0.7;
+
 }

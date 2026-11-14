@@ -590,7 +590,7 @@ pub struct SbsFisheyeIter {
     ictx: ffmpeg_next::format::context::Input,
     video_idx: usize,
     decoder: ffmpeg_next::codec::decoder::Video,
-    scaler: Option<ffmpeg_next::software::scaling::Context>,
+    scaler: Option<crate::swscale::YuvToRgb>,
     /// `(pixel format, width, height)` the cached `scaler` was built for.
     /// Revalidated every frame — see `repack_split`.
     scaler_def: Option<(ffmpeg_next::format::Pixel, u32, u32)>,
@@ -974,9 +974,9 @@ impl SbsFisheyeIter {
             };
         let frame_w = decoded.width();
         let frame_h = decoded.height();
-        // Same scaler configuration as the dual-stream iterator: 16-bit
-        // output needs the full-accuracy swscale path (BICUBIC +
-        // FULL_CHR_H_INT); 8-bit keeps the fast bilinear one.
+        // The frame converts at its own size, so `YuvToRgb` uses its exact,
+        // threaded context whatever these flags say; they are what a
+        // scaling conversion would use.
         let is_16bit = self.output_bit_depth == 16;
         let target_pix_fmt = if is_16bit {
             ffmpeg_next::format::Pixel::RGBA64LE
@@ -1030,36 +1030,25 @@ impl SbsFisheyeIter {
         let scaler = match &mut self.scaler {
             Some(s) => s,
             None => {
-                self.scaler = Some(
-                    ffmpeg_next::software::scaling::Context::get(
-                        src_def.0,
-                        frame_w, frame_h,
-                        target_pix_fmt,
-                        frame_w, frame_h,
-                        scaler_flags,
-                    ).map_err(|e| Error::Ffmpeg(format!("scaler: {e}")))?
-                );
+                // The source's matrix and range go to swscale through the
+                // context (`sws_setColorspaceDetails`): it never sees the
+                // frame's tags, and left alone it converts with Rec.601
+                // coefficients while the GPU shaders, and every other source
+                // kind, use Rec.709. Zero error on neutrals, up to ~20/255
+                // on a saturated primary. Same size in and out, so this is
+                // the exact, threaded conversion (`swscale::YuvToRgb`).
+                self.scaler = Some(crate::swscale::YuvToRgb::new(
+                    src_def.0, frame_w, frame_h,
+                    target_pix_fmt, frame_w, frame_h,
+                    scaler_flags, self.full_range, self.bt2020,
+                )?);
                 self.scaler_def = Some(src_def);
-                // Tell swscale the exact source / destination colorimetry via
-                // sws_setColorspaceDetails. Without it `Context::run` (raw
-                // sws_scale, which never sees the frame's tags) falls back to
-                // SWS_CS_DEFAULT = Rec.601 coefficients — so every generic
-                // side-by-side frame was converted with a 601 matrix while the
-                // GPU shaders, and every other source kind including the
-                // dual-stream iterator at the identical call site above, use
-                // Rec.709. Zero error on neutrals, up to ~20/255 on a
-                // saturated primary. Measured on bt709-tagged 8K footage, this
-                // path sat much closer to a 601 reference (mean 0.45) than a
-                // 709 one (mean 1.51) before this line.
-                let s = self.scaler.as_mut().unwrap();
-                set_sws_colorspace_details_mat(s, is_16bit, self.full_range, self.bt2020);
-                s
+                self.scaler.as_mut().unwrap()
             }
         };
 
         let mut rgba_frame = ffmpeg_next::frame::Video::empty();
-        scaler.run(decoded, &mut rgba_frame)
-            .map_err(|e| Error::Ffmpeg(format!("scale: {e}")))?;
+        scaler.run(decoded, &mut rgba_frame)?;
 
         // Repack with stride → contiguous, then split L/R.
         let stride = rgba_frame.stride(0);
@@ -1114,7 +1103,7 @@ impl SbsFisheyeIter {
 pub struct DualStreamFisheyeIter {
     demux: DualDemux,
     decoders: Vec<ffmpeg_next::codec::decoder::Video>,
-    scalers: Vec<Option<ffmpeg_next::software::scaling::Context>>,
+    scalers: Vec<Option<crate::swscale::YuvToRgb>>,
     /// Per-stream: true if VideoToolbox decode is active for this
     /// stream (i.e. we need to download HW frames before scaling).
     hw_active: [bool; 2],
@@ -1481,10 +1470,11 @@ impl DualStreamFisheyeIter {
         } else {
             ffmpeg_next::format::Pixel::RGBA
         };
-        // For 16-bit color, use BICUBIC — swscale's RGB48/RGBA64 code
-        // path is less mature than the 8-bit one and tends to need
-        // the full color-conversion accuracy enabled. FAST_BILINEAR
-        // skips some intermediate precision steps for speed.
+        // The flags of a conversion that also SCALES (the working-size
+        // preview): BICUBIC with full chroma for 16-bit colour, the fast
+        // bilinear one for 8-bit, where speed is the point (and swscale's
+        // 8-bit output is about 2 of 255 dark: see `swscale`). At the
+        // source's own size `YuvToRgb` uses its exact, threaded context.
         let scaler_flags = if is_16bit {
             ffmpeg_next::software::scaling::Flags::BICUBIC
                 | ffmpeg_next::software::scaling::Flags::FULL_CHR_H_INT
@@ -1494,30 +1484,24 @@ impl DualStreamFisheyeIter {
         let scaler = match &mut self.scalers[pos] {
             Some(s) => s,
             None => {
-                self.scalers[pos] = Some(
-                    ffmpeg_next::software::scaling::Context::get(
-                        src_ref.format(),
-                        src_ref.width(), src_ref.height(),
-                        target_pix_fmt,
-                        self.eye_w, self.eye_h,
-                        scaler_flags,
-                    ).map_err(|e| Error::Ffmpeg(format!("scaler: {e}")))?
-                );
-                // Tell swscale the exact source / dest colorimetry
-                // via sws_setColorspaceDetails. The 16-bit RGB
-                // output path otherwise picks Rec.601 for input and
-                // arbitrary range for output.
-                let s = self.scalers[pos].as_mut().unwrap();
-                // Camera files are limited range; keeps OSV/X6 bit-identical.
-                set_sws_colorspace_details(s, is_16bit, false);
-                s
+                // Rec.709 at video range (camera files are; this keeps
+                // OSV / X6 as they were), told to swscale through the
+                // context. At the source's own size this is the exact,
+                // threaded conversion; a working-size preview scales with
+                // the flags above.
+                self.scalers[pos] = Some(crate::swscale::YuvToRgb::new(
+                    src_ref.format(), src_ref.width(), src_ref.height(),
+                    target_pix_fmt, self.eye_w, self.eye_h,
+                    scaler_flags, false, false,
+                )?);
+                self.scalers[pos].as_mut().unwrap()
             }
         };
         let mut rgba_frame = ffmpeg_next::frame::Video::empty();
         let t_scale = std::time::Instant::now();
         let run_res = scaler.run(src_ref, &mut rgba_frame);
         let scale_elapsed = t_scale.elapsed().as_secs_f64();
-        run_res.map_err(|e| Error::Ffmpeg(format!("scale: {e}")))?;
+        run_res?;
         self.dbg_scale_s += scale_elapsed;
         let bpp = if is_16bit { 8 } else { 4 };
         Ok(extract_packed_rgba_n(&rgba_frame, bpp))
@@ -3912,61 +3896,6 @@ impl ZcDecoder {
     }
 }
 
-/// Apply Rec.709 source / full-range RGB destination colorspace via
-/// `sws_setColorspaceDetails`. ffmpeg-next 8.1 doesn't wrap this so
-/// we go through raw FFI.
-fn set_sws_colorspace_details(
-    scaler: &mut ffmpeg_next::software::scaling::Context,
-    is_16bit: bool,
-    full_range: bool,
-) {
-    set_sws_colorspace_details_mat(scaler, is_16bit, full_range, false)
-}
-
-/// [`set_sws_colorspace_details`] with the source matrix chosen: BT.2020
-/// (NCL) for a stream tagged so (the Kandao QooCam's HLG), else Rec.709 —
-/// the same choice the zero-copy kernels make through
-/// `yuv_matrix_constants`.
-fn set_sws_colorspace_details_mat(
-    scaler: &mut ffmpeg_next::software::scaling::Context,
-    is_16bit: bool,
-    full_range: bool,
-    bt2020: bool,
-) {
-    use ffmpeg_next::ffi::*;
-    unsafe {
-        // sws_getCoefficients returns a [4]int32 with the Y'CbCr
-        // matrix coefficients for a given colorspace constant.
-        // SWS_CS_ITU709 (= 1) → Rec.709 coefficients; SWS_CS_BT2020 (= 9).
-        const SWS_CS_ITU709: std::os::raw::c_int = 1;
-        const SWS_CS_BT2020: std::os::raw::c_int = 9;
-        let src_coeffs = sws_getCoefficients(if bt2020 { SWS_CS_BT2020 } else { SWS_CS_ITU709 });
-        let dst_coeffs = sws_getCoefficients(SWS_CS_ITU709);
-        // sws_setColorspaceDetails(ctx, inv_table, src_range, table,
-        //                          dst_range, brightness, contrast,
-        //                          saturation). Ranges are 0=mpeg
-        //                          (video), 1=jpeg (full). Source is
-        //                          video range (matches OSV's HEVC
-        //                          encode); destination is full
-        //                          range for RGB output (RGBA64LE).
-        // Source range from the stream's tag (swscale cannot see the
-        // AVFrame's tag through `Context::run`, only what we pass here). Must
-        // match `yuv_range_constants` on the zero-copy path so a full-range
-        // clip renders the same in the preview, the paused still and every
-        // export. Camera files are all limited; generic SBS may be either.
-        let src_range = if full_range { 1 } else { 0 };
-        let dst_range = if is_16bit { 1 } else { 1 }; // full range RGB out
-        let _ = sws_setColorspaceDetails(
-            scaler.as_mut_ptr(),
-            src_coeffs, src_range,
-            dst_coeffs, dst_range,
-            0,                       // brightness offset (0)
-            1 << 16,                 // contrast = 1.0
-            1 << 16,                 // saturation = 1.0
-        );
-    }
-}
-
 // Helper: pull packed RGBA bytes out of an ffmpeg Video frame, honoring stride.
 fn extract_packed_rgba(frame: &ffmpeg_next::frame::Video) -> Vec<u8> {
     extract_packed_rgba_n(frame, 4)
@@ -4761,13 +4690,13 @@ mod tests {
             (*raw).color_primaries = AVColorPrimaries::AVCOL_PRI_BT709;
             (*raw).color_trc       = AVColorTransferCharacteristic::AVCOL_TRC_BT709;
         }
-        let mut sws = ffmpeg_next::software::scaling::Context::get(
+        let mut sws = crate::swscale::YuvToRgb::new(
             ffmpeg_next::format::Pixel::P010LE, w, h,
             ffmpeg_next::format::Pixel::RGBA64LE, w, h,
             ffmpeg_next::software::scaling::Flags::BICUBIC
                 | ffmpeg_next::software::scaling::Flags::FULL_CHR_H_INT,
+            false, false,
         ).expect("sws ctx");
-        set_sws_colorspace_details(&mut sws, true, false);
         let mut dst = ffmpeg_next::frame::Video::empty();
         sws.run(&src, &mut dst).expect("sws run");
         // Pixel (0, 0) = first 8 bytes (RGBA, 2 bytes per channel LE).
@@ -4779,45 +4708,38 @@ mod tests {
         (r, g, b, a)
     }
 
-    /// Color round-trip for the P010LE → RGBA64LE conversion. Each
-    /// test color is fed in as 10-bit video-range Y/Cb/Cr, the
-    /// resulting RGBA64LE is compared against the expected
-    /// full-range 16-bit RGB. Tolerance is ±2% of 65535 — swscale's
-    /// matrix has some rounding plus we're starting from quantized
-    /// 10-bit data, so exact equality isn't expected.
+    /// The P010LE → RGBA64LE conversion against Rec.709 at video range,
+    /// computed here from each test colour's own 10-bit codes, and on the
+    /// scale the GPU reads the result on (white = 65535).
     #[test]
     fn p010_to_rgba64_color_roundtrip() {
-        // (description, y10, cb10, cr10, expected_r, expected_g, expected_b)
-        // Computed from Rec.709 ITU-R BT.709 formulas, video-range Y in
-        // [64, 940], video-range Cb/Cr centred at 512 spanning [64, 960].
-        let cases: &[(&str, u16, u16, u16, u16, u16, u16)] = &[
-            // Pure black: Y=64, Cb=Cr=512 → RGB(0,0,0)
-            ("black", 64,  512, 512,  0,     0,     0),
-            // Pure white: Y=940, Cb=Cr=512 → RGB(65535,65535,65535)
-            ("white", 940, 512, 512,  65535, 65535, 65535),
-            // Mid-gray: Y=502 (≈midpoint), Cb=Cr=512 → ~32768
-            ("gray",  502, 512, 512,  32768, 32768, 32768),
-            // Pure red: Y=250, Cb=410, Cr=960 → RGB(65535, 0, 0)
-            ("red",   250, 410, 960,  65535, 0,     0),
-            // Pure green: Y=691, Cb=167, Cr=105 → RGB(0, 65535, 0)
-            ("green", 691, 167, 105,  0,     65535, 0),
-            // Pure blue: Y=127, Cb=960, Cr=471 → RGB(0, 0, 65535)
-            ("blue",  127, 960, 471,  0,     0,     65535),
+        // (description, y10, cb10, cr10): black, white, greys, and the codes
+        // nearest the primaries and a few colours inside the gamut.
+        let cases: &[(&str, u16, u16, u16)] = &[
+            ("black", 64, 512, 512),
+            ("white", 940, 512, 512),
+            ("gray", 502, 512, 512),
+            ("dark gray", 150, 512, 512),
+            ("red", 250, 410, 960),
+            ("green", 691, 167, 105),
+            ("blue", 127, 960, 471),
+            ("skin", 600, 450, 580),
+            ("teal", 400, 580, 400),
         ];
-        let tolerance = (65535.0 * 0.02) as i32;   // ±2%
-        for (name, y, cb, cr, er, eg, eb) in cases {
+        // Half a 10-bit code. (The bound used to be ±2 %, wide enough to
+        // hide swscale's own 16-bit scale: white came back as 65283.)
+        let tolerance = 32.0;
+        for (name, y, cb, cr) in cases {
             let (r, g, b, _a) = swscale_p010_to_rgba64(*y, *cb, *cr);
-            let dr = (r as i32 - *er as i32).abs();
-            let dg = (g as i32 - *eg as i32).abs();
-            let db = (b as i32 - *eb as i32).abs();
-            eprintln!(
-                "{name}: Y/Cb/Cr=({y},{cb},{cr}) → R/G/B=({r},{g},{b}) \
-                 expected ({er},{eg},{eb}) Δ=({dr},{dg},{db})"
-            );
-            assert!(
-                dr <= tolerance && dg <= tolerance && db <= tolerance,
-                "{name}: out=({r},{g},{b}) exp=({er},{eg},{eb}) Δ=({dr},{dg},{db}) tol=±{tolerance}"
-            );
+            let (yn, pb, pr) = ((*y as f64 - 64.0) / 876.0, (*cb as f64 - 512.0) / 896.0, (*cr as f64 - 512.0) / 896.0);
+            let er = yn + 1.5748 * pr;
+            let eb = yn + 1.8556 * pb;
+            let eg = (yn - 0.2126 * er - 0.0722 * eb) / 0.7152;
+            let want = [er, eg, eb].map(|v| v.clamp(0.0, 1.0) * 65535.0);
+            let d = [r as f64 - want[0], g as f64 - want[1], b as f64 - want[2]];
+            eprintln!("{name}: Y/Cb/Cr=({y},{cb},{cr}) → R/G/B=({r},{g},{b}), exact ({:.0},{:.0},{:.0}), Δ=({:+.0},{:+.0},{:+.0})",
+                want[0], want[1], want[2], d[0], d[1], d[2]);
+            assert!(d.iter().all(|v| v.abs() <= tolerance), "{name}: out=({r},{g},{b}) against ({:.0},{:.0},{:.0})", want[0], want[1], want[2]);
         }
     }
 

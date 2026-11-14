@@ -971,7 +971,7 @@ unsafe fn copy_slice_to_shader_texture(
 /// construction: reaching a refusal HERE is mid-stream, where no fallback is
 /// left. `bt2020` is the stream's `colorspace == BT.2020` tag (the QooCam's
 /// HLG stream); every other camera file is BT.709 — the CPU path makes the
-/// same choice through swscale (`set_sws_colorspace_details_mat`).
+/// same choice through swscale (`swscale::set_yuv_source`).
 ///
 /// # Safety
 /// `frame` must be a live `AV_PIX_FMT_D3D11` frame from a d3d11va decoder.
