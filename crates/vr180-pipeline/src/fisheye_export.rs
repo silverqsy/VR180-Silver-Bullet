@@ -1530,6 +1530,7 @@ fn export_fisheye_inner(
     // Export always passes max_decode_side=0 (no cap) so we get the
     // source's native fisheye resolution. The preview path is the
     // only consumer that caps to MAX_DECODE_SIDE for real-time fps.
+    #[allow(unused_mut)]
     let mut decoder: Box<dyn FisheyePairIter> = if cfg.segments.len() > 1 {
         // Merged recording: chain the segments into one continuous timeline
         // (the IMU is aggregated the same way below, so stab indexes by
@@ -1584,21 +1585,8 @@ fn export_fisheye_inner(
         }
     }
 
-    let (src_w, src_h) = decoder.eye_dims();
-
-    // ── DJI: extract protobuf for per-eye calib + (optional) stab ─
-    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = resolve_export_imu(&cfg);
-
-    // ── Resolve per-eye calibrations ─────────────────────────────
-    let (calib_left, calib_right) = resolve_calib_pair(
-        &cfg, src_w, src_h, dji_osv_imu.as_ref(),
-    );
-
-    // ── Stab rotations (one per source frame) ────────────────────
-    // `clip_slots` = duration × nominal fps (the OUTPUT frames, holes
-    // included); `total_clip_frames` = frames in the track (the per-frame
-    // table rows) — equal unless frames were dropped.
-    let timeline = export_timeline(&cfg);
+    // The clip's length in output frames (duration × nominal fps, holes
+    // included). A chain adds up its segments, each rounded on its own.
     let clip_slots = if cfg.segments.len() > 1 {
         cfg.segments.iter()
             .map(|p| chain_segment_frames(p, cfg.fps))
@@ -1608,6 +1596,410 @@ fn export_fisheye_inner(
             .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
             .unwrap_or(0).max(1)
     };
+    run_fisheye_frames(
+        &pipeline, &cfg, "fisheye_export", decoder, clip_slots,
+        |video_tmp, sbs_w, sbs_h, readout_s| open_portable_sink(&cfg, video_tmp, sbs_w, sbs_h, readout_s),
+        &mut progress_cb, &cancel,
+    )
+}
+
+// ── One frame loop for the fisheye exports ─────────────────────────────
+//
+// The arms differ in where a frame comes from (pictures in memory from the
+// portable decoders; decoded surfaces already on the GPU) and in where it
+// goes (a surface of the hardware encoder; a readback). What happens to a
+// frame between the two is the same, and is `run_fisheye_frames`.
+
+/// Where a fisheye export's frames go once both eyes are projected.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameSink {
+    /// An 8-bit BGRA surface of the hardware encoder (macOS).
+    BgraSurface,
+    /// A 10-bit surface of the hardware encoder (macOS): P210 (true 4:2:2)
+    /// for ProRes, P010 for HEVC Main10 and for the MV-HEVC encoder.
+    WideSurface { p210: bool },
+    /// Read back from the GPU and handed to the encoder as packed RGB, at
+    /// the export's bit depth.
+    Readback,
+}
+
+/// What projecting one frame's eyes takes besides the frame itself.
+struct EyeJob<'a> {
+    /// One eye's size in the source.
+    src_w: u32,
+    src_h: u32,
+    /// One eye's size in the output.
+    eye_w: u32,
+    eye_h: u32,
+    pose: &'a crate::render::FramePose,
+    calib_left: FisheyeCalib,
+    calib_right: FisheyeCalib,
+    projection: FisheyeExportProjection,
+    /// The source holds one eye: it is projected once and stands for both.
+    /// (A frame held as pictures knows it by its own missing right eye;
+    /// only the surface-backed frames, which are macOS's, read this.)
+    #[allow(dead_code)]
+    mono: bool,
+}
+
+impl EyeJob<'_> {
+    fn fisheye_out(&self) -> bool {
+        self.projection == FisheyeExportProjection::Fisheye
+    }
+
+    /// The per-row matrices of both eyes (rolling-shutter correction needs
+    /// both or none).
+    fn rows(&self) -> (Option<&[f32]>, Option<&[f32]>) {
+        crate::gpu::rows_for_both(self.pose.rows_left.as_deref(), self.pose.rows_right.as_deref())
+    }
+}
+
+/// One decoded frame of a fisheye source, however its eyes are held.
+trait EyeFrame {
+    fn pts_s(&self) -> f64;
+
+    /// Both eyes projected at 8 bits a channel, for a frame held as 8-bit
+    /// pictures. `None` for a frame that is not: its eyes come from
+    /// [`Self::project_16`] whatever the output's depth.
+    fn project_8(&self, pipeline: &Device, job: &EyeJob) -> Option<Result<(wgpu::Texture, wgpu::Texture)>>;
+
+    /// Both eyes projected at 16 bits a channel.
+    fn project_16(&self, pipeline: &Device, job: &EyeJob) -> Result<(wgpu::Texture, wgpu::Texture)>;
+}
+
+/// Where the frames of a fisheye export come from.
+trait FrameFeed {
+    type Frame: EyeFrame;
+
+    /// One eye's size in the source.
+    fn feed_dims(&self) -> (u32, u32);
+    fn feed_seek(&mut self, t_s: f64) -> Result<()>;
+    fn pull(&mut self, pipeline: &Device) -> Result<Option<Self::Frame>>;
+}
+
+/// The portable decoders: both eyes as pictures in memory.
+impl FrameFeed for Box<dyn FisheyePairIter> {
+    type Frame = FisheyePair;
+
+    fn feed_dims(&self) -> (u32, u32) { self.eye_dims() }
+    fn feed_seek(&mut self, t_s: f64) -> Result<()> { self.seek(t_s) }
+    fn pull(&mut self, _pipeline: &Device) -> Result<Option<FisheyePair>> { self.next_pair() }
+}
+
+impl EyeFrame for FisheyePair {
+    fn pts_s(&self) -> f64 { self.pts_s }
+
+    fn project_8(&self, pipeline: &Device, job: &EyeJob) -> Option<Result<(wgpu::Texture, wgpu::Texture)>> {
+        // One eye of the pair (`slot`: the upload slot).
+        let eye = |bytes: &[u8], rot: EquirectRotation, calib: FisheyeCalib, rows: Option<&[f32]>, slot: u32| -> Result<wgpu::Texture> {
+            pipeline.project_eye(&EyeProjection::new(
+                EyePicture::Bytes8 { rgba: bytes, w: job.src_w, h: job.src_h, slot },
+                job.eye_w, job.eye_h, rot, calib,
+            ).fisheye_out(job.fisheye_out()).rs_rows(rows))
+        };
+        let both = || -> Result<(wgpu::Texture, wgpu::Texture)> {
+            let (rs_l, rs_r) = job.rows();
+            let left = eye(&self.left, job.pose.rot_left, job.calib_left, rs_l, 10)?;
+            if self.single_eye() {
+                return Ok((left.clone(), left));
+            }
+            let right = eye(&self.right, job.pose.rot_right, job.calib_right, rs_r, 11)?;
+            Ok((left, right))
+        };
+        Some(both())
+    }
+
+    fn project_16(&self, pipeline: &Device, job: &EyeJob) -> Result<(wgpu::Texture, wgpu::Texture)> {
+        build_eye_eq_16(
+            pipeline, self, job.src_w, job.src_h, job.eye_w, job.eye_h,
+            job.pose.rot_left, job.pose.rot_right, job.calib_left, job.calib_right,
+            job.projection, (job.pose.rows_left.as_deref(), job.pose.rows_right.as_deref()),
+        )
+    }
+}
+
+/// The macOS zero-copy decoders: decoded surfaces, wrapped as textures.
+#[cfg(target_os = "macos")]
+impl FrameFeed for crate::fisheye_decode::ZcDecoder {
+    type Frame = crate::fisheye_decode::ZcMacFrame;
+
+    fn feed_dims(&self) -> (u32, u32) { self.eye_dims() }
+    fn feed_seek(&mut self, t_s: f64) -> Result<()> { self.seek(t_s) }
+    fn pull(&mut self, pipeline: &Device) -> Result<Option<Self::Frame>> { self.next_frame(&pipeline.device) }
+}
+
+#[cfg(target_os = "macos")]
+impl EyeFrame for crate::fisheye_decode::ZcMacFrame {
+    fn pts_s(&self) -> f64 { crate::fisheye_decode::ZcMacFrame::pts_s(self) }
+
+    fn project_8(&self, _pipeline: &Device, _job: &EyeJob) -> Option<Result<(wgpu::Texture, wgpu::Texture)>> {
+        None
+    }
+
+    /// Each eye straight from the planes of its decoded surface (the
+    /// Y'CbCr → RGB conversion is in the projection kernel): no resolve,
+    /// no upload. Per-row rolling-shutter correction works on the source
+    /// ray, so it is the same for both output projections.
+    fn project_16(&self, pipeline: &Device, job: &EyeJob) -> Result<(wgpu::Texture, wgpu::Texture)> {
+        use crate::fisheye_decode::ZcMacFrame;
+        let eye_from_planes = |y: &wgpu::Texture, uv: &wgpu::Texture, rot: EquirectRotation,
+                               calib: FisheyeCalib, rows: Option<&[f32]>| -> Result<wgpu::Texture> {
+            let (y, uv) = (y.create_view(&Default::default()), uv.create_view(&Default::default()));
+            pipeline.project_eye(&EyeProjection::new(
+                EyePicture::Planes { y: &y, uv: &uv }, job.eye_w, job.eye_h, rot, calib,
+            ).wide().fisheye_out(job.fisheye_out()).rs_rows(rows))
+        };
+        let (rs_l, rs_r) = job.rows();
+        match self {
+            // Dual-stream: each eye has its own surface.
+            ZcMacFrame::Pair(pair) => {
+                let l = eye_from_planes(&pair.left_y.texture, &pair.left_uv.texture, job.pose.rot_left, job.calib_left, rs_l)?;
+                // A single-eye source: the one eye is the frame.
+                let r = if job.mono { l.clone() } else {
+                    eye_from_planes(&pair.right_y.texture, &pair.right_uv.texture, job.pose.rot_right, job.calib_right, rs_r)?
+                };
+                Ok((l, r))
+            }
+            // Generic SBS: the kernels sample each eye IN PLACE from the
+            // whole-frame planes, one eye per dispatch. `src_x0` / `src_y0`
+            // select the eye's sub-rectangle and every tap is clamped to it
+            // (see fisheye_project.wgsl), so nothing bleeds across the
+            // seam. No resolve, no split: at 8K that was a 268 MB
+            // whole-frame RGBA16 plus two 134 MB halves per frame. NO eye
+            // swap: the halves are already in L|R frame order, matching the
+            // CPU `SbsFisheyeIter` and the Windows SBS arm.
+            ZcMacFrame::Sbs(f) => {
+                let (cal_l, cal_r) = {
+                    let (mut l, mut r) = (job.calib_left, job.calib_right);
+                    let (lx, ly) = f.eye_origin(0);
+                    let (rx, ry) = f.eye_origin(1);
+                    l.src_x0 = lx as f32; l.src_y0 = ly as f32;
+                    r.src_x0 = rx as f32; r.src_y0 = ry as f32;
+                    l.yuv_range = f.yuv_range;
+                    r.yuv_range = f.yuv_range;
+                    l.yuv_mat = f.yuv_mat;
+                    r.yuv_mat = f.yuv_mat;
+                    (l, r)
+                };
+                let (y, uv) = (&f.frame_y.texture, &f.frame_uv.texture);
+                Ok((
+                    eye_from_planes(y, uv, job.pose.rot_left, cal_l, rs_l)?,
+                    eye_from_planes(y, uv, job.pose.rot_right, cal_r, rs_r)?,
+                ))
+            }
+        }
+    }
+}
+
+/// The portable loop's encoder and where its frames go. On macOS with
+/// VideoToolbox the encoder takes surfaces the GPU writes (8-bit BGRA for
+/// HEVC Main, P010 for Main10 and for the MV-HEVC encoder of a spatial
+/// export, P210 for ProRes); everything else is a readback.
+///
+/// A frame size VideoToolbox refuses (Apple's hardware ProRes engine stops
+/// at 8192×4096, and a 12K BRAW's native SBS frame is 12288×6144, while
+/// its HEVC encoder takes 16384×8192) drops to the readback with the
+/// software encoder of the same codec (`prores_ks` / `libx265`).
+///
+/// `readout_s`: the sensor readout the per-row correction runs with, when
+/// it is on (for the log).
+fn open_portable_sink(
+    cfg: &FisheyeExportConfig,
+    video_tmp: &std::path::Path,
+    sbs_w: u32,
+    sbs_h: u32,
+    readout_s: Option<f32>,
+) -> Result<(ExportEncoder, FrameSink)> {
+    let on_macos_vt = cfg!(target_os = "macos")
+        && matches!(cfg.encoder,
+            EncoderBackend::VideoToolbox | EncoderBackend::ProResVideoToolbox);
+    // Mutable for the fallbacks; the arms that reassign are macOS-only.
+    #[allow(unused_mut)]
+    let mut is_prores_vt = cfg.encoder == EncoderBackend::ProResVideoToolbox;
+    #[allow(unused_mut)]
+    let mut use_zero_copy_bgra = on_macos_vt && cfg.bit_depth == 8 && !is_prores_vt;
+    #[allow(unused_mut)]
+    let mut use_zero_copy_p010 = on_macos_vt && (cfg.bit_depth == 10 || is_prores_vt);
+    #[allow(unused_mut)]
+    let mut encoder_backend = cfg.encoder;
+    // A spatial video export: the MV-HEVC encoder takes the composed P010
+    // surfaces instead (`prepare_spatial` pinned VideoToolbox + 10-bit, so
+    // the frames go the P010 surface way).
+    let spatial_encoder = open_spatial_encoder(cfg, video_tmp)?;
+    let encoder: ExportEncoder = if let Some(enc) = spatial_encoder { enc } else {
+    let ffmpeg_encoder: H265Encoder = if use_zero_copy_bgra {
+        // macOS/VideoToolbox-only zero-copy BGRA path. `use_zero_copy_bgra`
+        // is always `false` on non-macOS targets, so this arm is dead there
+        // — gate the VT-only ctor and supply `unreachable!()` where the
+        // value is needed (mirrors the `#[cfg]` blocks in the frame loop).
+        #[cfg(target_os = "macos")]
+        {
+            match H265Encoder::create_zero_copy_vt(video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    tracing::warn!("fisheye_export: VideoToolbox HEVC refused {sbs_w}×{sbs_h} ({e}) — libx265 on the readback path");
+                    use_zero_copy_bgra = false;
+                    encoder_backend = EncoderBackend::Libx265;
+                    open_h265_encoder(video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
+                        EncoderBackend::Libx265, cfg.bit_depth, cfg.prores_profile)?
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        { unreachable!("zero-copy BGRA encode is macOS/VideoToolbox-only") }
+    } else if use_zero_copy_p010 {
+        // macOS/VideoToolbox-only zero-copy P010 path (HEVC Main10 or
+        // ProRes-VT). Same gating. A frame VideoToolbox will not take
+        // (ProRes above 8192×4096: `-12903`, no session) goes to the
+        // software encoder of the same codec on the readback path.
+        #[cfg(target_os = "macos")]
+        {
+            let attempt = if is_prores_vt {
+                H265Encoder::create_zero_copy_vt_prores(video_tmp, sbs_w, sbs_h, cfg.fps, cfg.prores_profile)
+            } else {
+                H265Encoder::create_zero_copy_vt_p010(video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps)
+            };
+            match attempt {
+                Ok(enc) => enc,
+                Err(e) => {
+                    let fallback = if is_prores_vt { EncoderBackend::ProResKs } else { EncoderBackend::Libx265 };
+                    tracing::warn!("fisheye_export: VideoToolbox {} refused {sbs_w}×{sbs_h} ({e}) — {:?} on the readback path (slower)",
+                        if is_prores_vt { "ProRes" } else { "HEVC" }, fallback);
+                    use_zero_copy_p010 = false;
+                    is_prores_vt = false;
+                    encoder_backend = fallback;
+                    open_h265_encoder(video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
+                        fallback, cfg.bit_depth, cfg.prores_profile)?
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        { unreachable!("zero-copy P010 encode is macOS/VideoToolbox-only") }
+    } else {
+        open_h265_encoder(
+            video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
+            cfg.encoder, cfg.bit_depth, cfg.prores_profile,
+        )?
+    };
+    ExportEncoder::Ffmpeg(ffmpeg_encoder)
+    };
+    // APMP / YouTube metadata is injected as a post-process atom write on
+    // the final muxed file (see `finalize_with_audio` → `finalize_metadata`);
+    // the ffmpeg side-data path is not used because it can't set the
+    // equirect bounds correctly for VR180, and conflicts between the two
+    // metadata flavours have to be resolved by stripping anyway. The
+    // codecpar header stays unmodified here.
+    if cfg.spatial.is_some() {
+        tracing::info!("fisheye_export: P010 IOSurface → MV-HEVC (spatial video)");
+    } else if use_zero_copy_p010 {
+        tracing::info!("fisheye_export: zero-copy P010 IOSurface → VT (Main10)");
+    } else if use_zero_copy_bgra {
+        tracing::info!("fisheye_export: zero-copy BGRA IOSurface → VT (Main)");
+    } else {
+        tracing::info!(
+            "fisheye_export: readback + swscale path (bit_depth={}, backend={:?})",
+            cfg.bit_depth, encoder_backend
+        );
+    }
+    if cfg.color_stack.any_active() {
+        tracing::info!("fisheye_export: color stack active (CDL/LUT/grade)");
+    }
+    // Per-row rolling-shutter correction on the portable path too: it is
+    // what libx265-on-macOS and ProRes-on-both-platforms ride.
+    if let Some(readout_s) = readout_s {
+        tracing::info!("fisheye_export: per-row RS on (readout {:.1} ms)", readout_s * 1000.0);
+    }
+    let sink = if use_zero_copy_bgra {
+        FrameSink::BgraSurface
+    } else if use_zero_copy_p010 {
+        FrameSink::WideSurface { p210: is_prores_vt }
+    } else {
+        FrameSink::Readback
+    };
+    Ok((encoder, sink))
+}
+
+/// The macOS zero-copy arm's encoder: VideoToolbox, fed surfaces. ProRes →
+/// P210 straight into Apple's ProRes engine (always 10-bit: the GUI pins
+/// it); HEVC 10-bit → P010 (Main10); HEVC 8-bit → BGRA (Main); a spatial
+/// video export → the same P010 surfaces into the MV-HEVC encoder
+/// (`prepare_spatial` pinned 10-bit HEVC).
+#[cfg(target_os = "macos")]
+fn open_zero_copy_sink(
+    cfg: &FisheyeExportConfig,
+    enc_out: &std::path::Path,
+    sbs_w: u32,
+    sbs_h: u32,
+    readout_s: Option<f32>,
+) -> Result<(ExportEncoder, FrameSink)> {
+    let is_prores = cfg.encoder == EncoderBackend::ProResVideoToolbox;
+    let ten_bit = cfg.bit_depth == 10 || is_prores;
+    let encoder: ExportEncoder = if let Some(enc) = open_spatial_encoder(cfg, enc_out)? {
+        enc
+    } else if is_prores {
+        H265Encoder::create_zero_copy_vt_prores(
+            enc_out, sbs_w, sbs_h, cfg.fps, cfg.prores_profile,
+        )?.into()
+    } else if ten_bit {
+        H265Encoder::create_zero_copy_vt_p010(
+            enc_out, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
+        )?.into()
+    } else {
+        H265Encoder::create_zero_copy_vt(
+            enc_out, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
+        )?.into()
+    };
+    tracing::info!(
+        "fisheye_export (zero-copy): P010 IOSurface decode → {} encode, \
+         no CPU bounce on the decode side; per-row RS = {}",
+        if cfg.spatial.is_some() { "P010 IOSurface → MV-HEVC (spatial video)" }
+        else if is_prores { "P210 IOSurface (4:2:2) → ProRes-VT (HW)" }
+        else if cfg.bit_depth == 10 { "P010 IOSurface (Main10)" }
+        else { "BGRA IOSurface (Main, 8-bit)" },
+        match readout_s {
+            Some(readout_s) => format!("on (readout {:.1}ms)", readout_s * 1000.0),
+            None => "off".to_string(),
+        }
+    );
+    Ok((encoder, if ten_bit { FrameSink::WideSurface { p210: is_prores } } else { FrameSink::BgraSurface }))
+}
+
+/// The frame loop of a fisheye export, from the opened decoder to the
+/// finished file: calibration, stabilization, trim, the encoder, then for
+/// every frame its pose, both eyes projected, graded, composed and encoded,
+/// and at the end the audio and the VR180 metadata.
+///
+/// `tag` prefixes the log lines. `clip_slots`: the clip's length in output
+/// frames (duration × nominal rate, holes included), which the two arms
+/// work out differently for a chain of segments. `open_sink(video file,
+/// frame width, frame height, readout when the per-row correction is on)`
+/// opens the encoder once the frame count is known.
+#[allow(clippy::too_many_arguments)]
+fn run_fisheye_frames<F: FrameFeed>(
+    pipeline: &Device,
+    cfg: &FisheyeExportConfig,
+    tag: &'static str,
+    mut feed: F,
+    clip_slots: usize,
+    open_sink: impl FnOnce(&std::path::Path, u32, u32, Option<f32>) -> Result<(ExportEncoder, FrameSink)>,
+    progress_cb: &mut dyn FnMut(ExportProgress),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let mono = single_eye_source(cfg);
+    let (src_w, src_h) = feed.feed_dims();
+
+    // ── Per-eye calibration and (when stabilizing) the IMU ───────
+    let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = resolve_export_imu(cfg);
+    let (calib_left, calib_right) = resolve_calib_pair(
+        cfg, src_w, src_h, dji_osv_imu.as_ref(),
+    );
+
+    // ── Stab rotations (one per source frame) ────────────────────
+    // `clip_slots` counts the OUTPUT frames; `total_clip_frames` the
+    // frames in the track (the per-frame table rows). Equal unless frames
+    // were dropped. A chain indexes by absolute frame across its segments.
+    let timeline = export_timeline(cfg);
     let total_clip_frames = timeline_frames_or(timeline.as_ref(), clip_slots);
     let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
         match cfg.source_kind {
@@ -1628,14 +2020,14 @@ fn export_fisheye_inner(
         }
     } else { None };
     tracing::info!(
-        "fisheye_export: stab = {}",
+        "{tag}: stab = {}",
         if stab_rotations.is_some() { "engaged" } else { "off" }
     );
 
     // ── Initial trim seek (clamp negative / past-EOF) ────────────
     let t_in = cfg.trim_in_s.unwrap_or(0.0).max(0.0);
     if t_in > 0.001 {
-        decoder.seek(t_in)?;
+        feed.feed_seek(t_in)?;
     }
     let t_out = cfg.trim_out_s
         .map(|t| t.max(t_in + 1e-3))
@@ -1646,327 +2038,206 @@ fn export_fisheye_inner(
         (clip_slots as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
     };
     tracing::info!(
-        "fisheye_export: writing ~{} frames (trim {:?}..{:?})",
+        "{tag}: writing ~{} frames (trim {:?}..{:?})",
         total_frames_to_write, cfg.trim_in_s, cfg.trim_out_s
     );
+
+    // ── Per-row rolling-shutter correction ───────────────────────
+    // On whenever a source with a per-frame IMU is stabilized: per-frame
+    // stabilization alone cannot reach the shear inside a frame. The
+    // readout follows the frame rate (wrong readout → wrong phase → loose
+    // stabilization in fast motion).
+    let rs_enabled = cfg.stabilize
+        && cfg.source_kind.has_frame_imu()
+        && dji_osv_imu.is_some();
+    let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
 
     // ── Open the encoder ─────────────────────────────────────────
     // The frame: two eyes side by side, or the one eye of a single-eye source.
     let sbs_w = if mono { cfg.eye_w } else { cfg.eye_w * 2 };
     let sbs_h = cfg.eye_h;
-    // Three encode paths on macOS / VT:
-    //   HEVC bit_depth == 8  → BGRA IOSurface zero-copy (Main profile)
-    //   HEVC bit_depth == 10 → P010 IOSurface zero-copy (Main10 profile)
-    //   ProRes-VT            → P010 IOSurface zero-copy into Apple's
-    //                          hardware ProRes engine (same buffers).
-    //                     — GPU writes Y + UV planes directly into a
-    //                     P010 CVPixelBuffer, no swscale, no readback.
-    // Non-macOS / non-VT (libx265, prores_ks) → readback fallback.
-    let on_macos_vt = cfg!(target_os = "macos")
-        && matches!(cfg.encoder,
-            EncoderBackend::VideoToolbox | EncoderBackend::ProResVideoToolbox);
-    // Mutable: when VideoToolbox refuses the frame size (Apple's hardware
-    // ProRes engine stops at 8192×4096 — a 12K BRAW's native SBS frame is
-    // 12288×6144 — while its HEVC encoder takes 16384×8192), the encode
-    // drops to the readback path with the software encoder of the same
-    // codec (`prores_ks` / `libx265`). The arms that reassign are macOS-only.
-    #[allow(unused_mut)]
-    let mut is_prores_vt = cfg.encoder == EncoderBackend::ProResVideoToolbox;
-    #[allow(unused_mut)]
-    let mut use_zero_copy_bgra = on_macos_vt && cfg.bit_depth == 8 && !is_prores_vt;
-    #[allow(unused_mut)]
-    let mut use_zero_copy_p010 = on_macos_vt && (cfg.bit_depth == 10 || is_prores_vt);
-    #[allow(unused_mut)]
-    let mut encoder_backend = cfg.encoder;
     // One-pass: encode STRAIGHT to the final file and mux the source's
     // audio inline (no temp + re-mux). Otherwise write a local-scratch
     // video temp and mux audio onto it afterwards (ambisonic / APAC).
-    // `video_tmp` aliases the final file in the one-pass case, so the
-    // encoder ctors below need no change.
-    let one_pass = one_pass_audio_eligible(&cfg);
+    // `video_tmp` is the final file in the one-pass case.
+    let one_pass = one_pass_audio_eligible(cfg);
     let video_tmp = if one_pass { cfg.output_path.clone() }
                     else { video_only_temp_path(&cfg.output_path) };
-    // A spatial video export: the MV-HEVC encoder takes the composed P010
-    // surfaces instead (`prepare_spatial` pinned VideoToolbox + 10-bit, so
-    // the loop below runs its zero-copy P010 branch).
-    let spatial_encoder = open_spatial_encoder(&cfg, &video_tmp)?;
-    let mut encoder: ExportEncoder = if let Some(enc) = spatial_encoder { enc } else {
-    let ffmpeg_encoder: H265Encoder = if use_zero_copy_bgra {
-        // macOS/VideoToolbox-only zero-copy BGRA path. `use_zero_copy_bgra`
-        // is always `false` on non-macOS targets, so this arm is dead there
-        // — gate the VT-only ctor and supply `unreachable!()` where the
-        // value is needed (mirrors the `#[cfg]` blocks in the encode loop).
-        #[cfg(target_os = "macos")]
-        {
-            match H265Encoder::create_zero_copy_vt(&video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps) {
-                Ok(enc) => enc,
-                Err(e) => {
-                    tracing::warn!("fisheye_export: VideoToolbox HEVC refused {sbs_w}×{sbs_h} ({e}) — libx265 on the readback path");
-                    use_zero_copy_bgra = false;
-                    encoder_backend = EncoderBackend::Libx265;
-                    open_h265_encoder(&video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
-                        EncoderBackend::Libx265, cfg.bit_depth, cfg.prores_profile)?
-                }
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        { unreachable!("zero-copy BGRA encode is macOS/VideoToolbox-only") }
-    } else if use_zero_copy_p010 {
-        // macOS/VideoToolbox-only zero-copy P010 path (HEVC Main10 or
-        // ProRes-VT). Same gating. A frame VideoToolbox will not take
-        // (ProRes above 8192×4096: `-12903`, no session) goes to the
-        // software encoder of the same codec on the readback path below.
-        #[cfg(target_os = "macos")]
-        {
-            let attempt = if is_prores_vt {
-                H265Encoder::create_zero_copy_vt_prores(&video_tmp, sbs_w, sbs_h, cfg.fps, cfg.prores_profile)
-            } else {
-                H265Encoder::create_zero_copy_vt_p010(&video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps)
-            };
-            match attempt {
-                Ok(enc) => enc,
-                Err(e) => {
-                    let fallback = if is_prores_vt { EncoderBackend::ProResKs } else { EncoderBackend::Libx265 };
-                    tracing::warn!("fisheye_export: VideoToolbox {} refused {sbs_w}×{sbs_h} ({e}) — {:?} on the readback path (slower)",
-                        if is_prores_vt { "ProRes" } else { "HEVC" }, fallback);
-                    use_zero_copy_p010 = false;
-                    is_prores_vt = false;
-                    encoder_backend = fallback;
-                    open_h265_encoder(&video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
-                        fallback, cfg.bit_depth, cfg.prores_profile)?
-                }
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        { unreachable!("zero-copy P010 encode is macOS/VideoToolbox-only") }
-    } else {
-        open_h265_encoder(
-            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
-            cfg.encoder, cfg.bit_depth, cfg.prores_profile,
-        )?
-    };
-    ExportEncoder::Ffmpeg(ffmpeg_encoder)
-    };
-    // Tag the file as VR180 SBS so VLC / Quest / Vision Pro pick up
-    // the stereo layout. Best-effort — older ffmpeg builds may not
-    // expose the side-data field.
-    // APMP / YouTube metadata is now injected as a post-process atom
-    // write on the final muxed file (see `finalize_with_audio` →
-    // `finalize_metadata`); the ffmpeg side-data path is no longer
-    // used because it can't set the equirect bounds correctly for
-    // VR180 and conflicts between the two metadata flavours have to
-    // be resolved by stripping anyway. Keep the codecpar header
-    // unmodified here.
-    if cfg.spatial.is_some() {
-        tracing::info!("fisheye_export: P010 IOSurface → MV-HEVC (spatial video)");
-    } else if use_zero_copy_p010 {
-        tracing::info!("fisheye_export: zero-copy P010 IOSurface → VT (Main10)");
-    } else if use_zero_copy_bgra {
-        tracing::info!("fisheye_export: zero-copy BGRA IOSurface → VT (Main)");
-    } else {
-        tracing::info!(
-            "fisheye_export: readback + swscale path (bit_depth={}, backend={:?})",
-            cfg.bit_depth, encoder_backend
-        );
-    }
+    let (mut encoder, sink) = open_sink(&video_tmp, sbs_w, sbs_h, rs_enabled.then_some(readout_s))?;
 
     // Inline audio passthrough — must attach before the first frame.
     let one_pass_audio_tmp = if one_pass {
         let dur = total_frames_to_write as f64 / cfg.fps as f64;
-        let (asrc, atmp, aoff) = stereo_audio_source(&cfg, t_in, dur);
+        let (asrc, atmp, aoff) = stereo_audio_source(cfg, t_in, dur);
         if let Err(e) = encoder.attach_audio_passthrough(&asrc, aoff, dur) {
             tracing::warn!("one-pass audio attach failed: {e} — video-only output");
         }
         atmp
     } else { None };
 
-    // ── Encode loop ──────────────────────────────────────────────
+    // ── Frame loop ───────────────────────────────────────────────
     let dt = 1.0 / cfg.fps as f64;
     let t_start = std::time::Instant::now();
     let mut frame_idx: u64 = 0;
     // Output frames written (source frames + the copies that fill holes).
     let mut written: u64 = 0;
     let identity_plan = ColorStackPlan::default();
-    let color_plan = cfg.color_stack.clone();
-    let color_any = color_plan.any_active();
-    if color_any {
-        tracing::info!("fisheye_export: color stack active (CDL/LUT/grade)");
-    }
+    let color_plan = &cfg.color_stack;
     // Automatic eye-exposure matching: one GPU-resident state per export
     // stream (histograms + smoothed offsets), consumed by the pair stack APIs.
     let eye_match_state = pipeline.create_eye_match_state();
     let eye_match = || Some((&eye_match_state, EyeMatchFrame::default()));
-    // The 8-bit CPU fallback grades on the CPU after the offset was applied
+    // The 8-bit readback grades on the CPU after the offset was applied
     // on the GPU, so "anything left to grade?" must not count that stage.
     let color_any_cpu = {
         let mut p = color_plan.clone();
         p.auto_eye_match = None;
         p.any_active()
     };
-    let projection = cfg.projection;
-    // Per-row rolling-shutter for the PORTABLE path — parity with the
-    // zero-copy paths (macOS p010, Windows readback / GPU-resident). The
-    // portable path is what libx265-on-macOS and ProRes-on-both-platforms
-    // ride, so without this those exports kept jello under stabilization
-    // while every zero-copy path was RS-corrected.
-    let rs_enabled = cfg.stabilize
-        && cfg.source_kind.has_frame_imu()
-        && dji_osv_imu.is_some();
-    let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
-    if rs_enabled {
-        tracing::info!(
-            "fisheye_export: per-row RS on (readout {:.1} ms)",
-            readout_s * 1000.0
-        );
-    }
 
-    while let Some(pair) = decoder.next_pair()? {
+    while let Some(frame) = feed.pull(pipeline)? {
         // Cancellation check before doing any GPU work.
         if cancel.load(Ordering::SeqCst) {
-            tracing::info!("fisheye_export: cancelled at frame {}", frame_idx);
+            tracing::info!("{tag}: cancelled at frame {}", frame_idx);
             break;
         }
 
-        // Stop at trim_out (use the iterator's PTS rather than a counter
+        // Stop at trim_out (use the frame's PTS rather than a counter
         // so seek-aware sources land on the right frame).
-        if pair.pts_s.is_finite() && pair.pts_s >= t_out {
-            tracing::info!("fisheye_export: hit trim_out @ {:.3}s", pair.pts_s);
+        let pts_s = frame.pts_s();
+        if pts_s.is_finite() && pts_s >= t_out {
+            tracing::info!("{tag}: hit trim_out @ {:.3}s", pts_s);
             break;
         }
-        // Drop pre-trim frames: the iterators' seek lands on the keyframe
-        // AT/BEFORE trim_in (no decode-forward), so the first pairs can be
+        // Drop pre-trim frames: the decoders' seek lands on the keyframe
+        // AT/BEFORE trim_in (no decode-forward), so the first frames can be
         // up to a GOP early — without this the export gains pre-roll the
         // user trimmed away and drifts out of sync with the trimmed audio.
-        if pair.pts_s.is_finite() && pair.pts_s < t_in - 0.5 * dt {
+        if pts_s.is_finite() && pts_s < t_in - 0.5 * dt {
             continue;
         }
 
         // The frame's row in the per-frame tables — from the sample table
         // (exact across dropped frames), else round(pts / dt) as the
         // preview does — and the output slots it has to fill.
-        let stab_idx = crate::frame_timeline::stab_row(timeline.as_ref(), pair.pts_s, dt, frame_idx as usize);
+        let stab_idx = crate::frame_timeline::stab_row(timeline.as_ref(), pts_s, dt, frame_idx as usize);
         let fill = crate::frame_timeline::export_fill_plan(
-            timeline.as_ref(), stab_idx, pair.pts_s, t_in, written, total_frames_to_write);
+            timeline.as_ref(), stab_idx, pts_s, t_in, written, total_frames_to_write);
         let rot = stab_rotations
             .as_ref()
             .and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(EquirectRotation::IDENTITY);
 
         // Each eye's rotation (stab, then the view adjustment) and, when
-        // stabilizing a source with an IMU, its per-row matrices.
-        let crate::render::FramePose {
-            rot_left, rot_right, rows_left: rs_rows_l, rows_right: rs_rows_r,
-        } = crate::render::FramePose::new(
+        // stabilizing a source with an IMU, its per-row matrices (<200 KB
+        // at 3840 rows, built on the CPU).
+        let pose = crate::render::FramePose::new(
             rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes, &cfg.view_adjust,
             rs_enabled.then_some(crate::render::RowReadout { readout_s, src_h, fps: cfg.fps }),
         );
-
-        // 8-bit per-eye projection, built lazily — ONLY the arms that
-        // consume it call this (BGRA zero-copy + 8-bit readback). The
-        // 10-bit arms project at 16 bits inside `build_eye_eq_16`; the old
-        // code built these 8-bit textures unconditionally and threw them
-        // away there (two wasted full-res projections per frame). The
-        // (projection, rs) four-way matches every zero-copy path, so the
-        // portable path now keeps per-row RS too.
-        let project_8 = |rs: (Option<&[f32]>, Option<&[f32]>)| -> Result<(wgpu::Texture, wgpu::Texture)> {
-            // One eye of the pair (`slot`: the upload slot).
-            let eye = |bytes: &[u8], rot: EquirectRotation, calib: FisheyeCalib, rows: Option<&[f32]>, slot: u32| -> Result<wgpu::Texture> {
-                pipeline.project_eye(&EyeProjection::new(
-                    EyePicture::Bytes8 { rgba: bytes, w: src_w, h: src_h, slot },
-                    cfg.eye_w, cfg.eye_h, rot, calib,
-                ).fisheye_out(projection == FisheyeExportProjection::Fisheye).rs_rows(rows))
-            };
-            // Per-row RS needs both eyes' rows, as before.
-            let (rs_l, rs_r) = crate::gpu::rows_for_both(rs.0, rs.1);
-            let left = eye(&pair.left, rot_left, calib_left, rs_l, 10)?;
-            if pair.single_eye() {
-                return Ok((left.clone(), left));
-            }
-            let right = eye(&pair.right, rot_right, calib_right, rs_r, 11)?;
-            Ok((left, right))
+        let job = EyeJob {
+            src_w, src_h, eye_w: cfg.eye_w, eye_h: cfg.eye_h, pose: &pose,
+            calib_left, calib_right, projection: cfg.projection, mono,
         };
 
-        if use_zero_copy_bgra {
-            // 8-bit macOS zero-copy path. apply_color_stack_to_sbs_bgra
-            // already supports plan ≠ identity; pass it directly so the
-            // stack runs fused with the SBS compose into the IOSurface.
-            #[cfg(target_os = "macos")]
-            {
-                let (left_tex, right_tex) = project_8((rs_rows_l.as_deref(), rs_rows_r.as_deref()))?;
-                encode_bgra_surface(
-                    &pipeline, &mut encoder, &left_tex, &right_tex, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
-                    mono, &color_plan, eye_match(), fill.copies(),
-                )?;
+        match sink {
+            FrameSink::BgraSurface => {
+                // The hardware encoder's 8-bit surface (macOS). A frame held
+                // as 8-bit pictures is projected at 8 bits and graded fused
+                // with the store into the surface. One that is not is
+                // projected and graded at 16 bits, and the store only
+                // narrows it (an identity plan: no second grade).
+                #[cfg(target_os = "macos")]
+                {
+                    match frame.project_8(pipeline, &job) {
+                        Some(eyes) => {
+                            let (left, right) = eyes?;
+                            encode_bgra_surface(
+                                pipeline, &mut encoder, &left, &right, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
+                                mono, color_plan, eye_match(), fill.copies(),
+                            )?;
+                        }
+                        None => {
+                            let (left, right) = frame.project_16(pipeline, &job)?;
+                            let (left, right) = grade_eyes_16(
+                                pipeline, &left, &right, cfg.eye_w, cfg.eye_h, color_plan, eye_match(), mono,
+                            )?;
+                            encode_bgra_surface(
+                                pipeline, &mut encoder, &left, &right, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
+                                mono, &identity_plan, None, fill.copies(),
+                            )?;
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                { let _ = (&identity_plan, &job); unreachable!(); }
             }
-            #[cfg(not(target_os = "macos"))]
-            { let _ = identity_plan; unreachable!(); }
-        } else if use_zero_copy_p010 {
-            // 10-bit macOS zero-copy: project at 16-bit, GPU-write
-            // both planes of a P010 IOSurface, VT consumes directly.
-            #[cfg(target_os = "macos")]
-            {
-                let (left_tex_16, right_tex_16) = build_eye_eq_16(
-                    &pipeline, &pair, src_w, src_h,
-                    cfg.eye_w, cfg.eye_h,
-                    rot_left, rot_right, calib_left, calib_right,
-                    projection, (rs_rows_l.as_deref(), rs_rows_r.as_deref()),
-                )?;
-                let (l_final, r_final) = grade_eyes_16(
-                    &pipeline, &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan, eye_match(), mono,
-                )?;
-                encode_wide_surface(
-                    &pipeline, &mut encoder, &l_final, &r_final, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
-                    mono, is_prores_vt, fill.copies(),
-                )?;
+            FrameSink::WideSurface { p210 } => {
+                // The hardware encoder's 10-bit surface (macOS): projected
+                // and graded at 16 bits, both planes written by the GPU.
+                #[cfg(target_os = "macos")]
+                {
+                    let (left, right) = frame.project_16(pipeline, &job)?;
+                    let (left, right) = grade_eyes_16(
+                        pipeline, &left, &right, cfg.eye_w, cfg.eye_h, color_plan, eye_match(), mono,
+                    )?;
+                    encode_wide_surface(
+                        pipeline, &mut encoder, &left, &right, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
+                        mono, p210, fill.copies(),
+                    )?;
+                }
+                #[cfg(not(target_os = "macos"))]
+                { let _ = (&identity_plan, &job, p210); unreachable!(); }
             }
-            #[cfg(not(target_os = "macos"))]
-            { let _ = identity_plan; unreachable!(); }
-        } else if cfg.bit_depth == 10 {
-            // 10-bit non-zero-copy: texture-resident 16-bit projection +
-            // RGB48 readback. This is libx265 Main10 AND ProRes (both
-            // platforms) — per-row RS rides build_eye_eq_16's rs param.
-            let (left_tex_16, right_tex_16) = build_eye_eq_16(
-                &*pipeline, &pair, src_w, src_h,
-                cfg.eye_w, cfg.eye_h,
-                rot_left, rot_right, calib_left, calib_right,
-                projection, (rs_rows_l.as_deref(), rs_rows_r.as_deref()),
-            )?;
-            let (l_final, r_final) = grade_eyes_16(
-                &pipeline, &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan, eye_match(), mono,
-            )?;
-            // One eye is the frame itself; two are composed side by side.
-            let sbs_tex_16 = if mono { l_final } else {
-                pipeline.compose_sbs_textures_16(&l_final, &r_final, cfg.eye_w, cfg.eye_h)?
-            };
-            let sbs_rgb48 = pipeline.read_texture_rgb48(&sbs_tex_16, sbs_w, sbs_h)?;
-            for _ in 0..fill.copies() { encoder.encode_frame_rgb48(&sbs_rgb48)?; }
-        } else {
-            // 8-bit non-zero-copy fallback. Color stack happens via the
-            // legacy CPU roundtrip on the SBS readback below (acceptable
-            // since this path is already CPU-bound).
-            let (left_tex, right_tex) = project_8((rs_rows_l.as_deref(), rs_rows_r.as_deref()))?;
-            // Automatic eye-exposure offset on the GPU first (8-bit), then the
-            // rest of the grade on the CPU as before.
-            let sbs_tex = if mono { left_tex } else {
-                let (left_tex, right_tex) = pipeline
-                    .match_eyes_8(&left_tex, &right_tex, cfg.eye_w, cfg.eye_h, &color_plan, eye_match())?
-                    .unwrap_or((left_tex, right_tex));
-                pipeline.compose_sbs_textures(&left_tex, &right_tex, cfg.eye_w, cfg.eye_h)?
-            };
-            let sbs_rgb8 = pipeline.read_texture_rgb8(&sbs_tex, sbs_w, sbs_h)?;
-            let mut graded = if color_any_cpu {
-                apply_color_stack_rgb8_sbs(
-                    &*pipeline, &color_plan, sbs_rgb8, sbs_w, sbs_h, cfg.eye_w)?
-            } else {
-                sbs_rgb8
-            };
-            // "BeyondVR Hack" — last, on the graded SBS (padding stays black).
-            if color_plan.eye_scale != 1.0 {
-                graded = pipeline.apply_eye_scale_sbs_rgb8(
-                    &graded, sbs_w, sbs_h, cfg.eye_w, color_plan.eye_scale)?;
+            FrameSink::Readback if cfg.bit_depth == 10 => {
+                // 10-bit readback: 16-bit projection and grade on the GPU,
+                // then RGB48 to the encoder. libx265 Main10 and software
+                // ProRes on both platforms.
+                let (left, right) = frame.project_16(pipeline, &job)?;
+                let (left, right) = grade_eyes_16(
+                    pipeline, &left, &right, cfg.eye_w, cfg.eye_h, color_plan, eye_match(), mono,
+                )?;
+                // One eye is the frame itself; two are composed side by side.
+                let sbs_tex_16 = if mono { left } else {
+                    pipeline.compose_sbs_textures_16(&left, &right, cfg.eye_w, cfg.eye_h)?
+                };
+                let sbs_rgb48 = pipeline.read_texture_rgb48(&sbs_tex_16, sbs_w, sbs_h)?;
+                for _ in 0..fill.copies() { encoder.encode_frame_rgb48(&sbs_rgb48)?; }
             }
-            for _ in 0..fill.copies() { encoder.encode_frame(&graded)?; }
+            FrameSink::Readback => {
+                // 8-bit readback. The automatic eye-exposure offset runs on
+                // the GPU (8-bit), the rest of the grade on the CPU on the
+                // SBS readback (this path is CPU-bound already).
+                let (left_tex, right_tex) = frame.project_8(pipeline, &job)
+                    .ok_or_else(|| Error::Ffmpeg("8-bit readback of a frame that is not held as 8-bit pictures".into()))??;
+                let sbs_tex = if mono { left_tex } else {
+                    let (left_tex, right_tex) = pipeline
+                        .match_eyes_8(&left_tex, &right_tex, cfg.eye_w, cfg.eye_h, color_plan, eye_match())?
+                        .unwrap_or((left_tex, right_tex));
+                    pipeline.compose_sbs_textures(&left_tex, &right_tex, cfg.eye_w, cfg.eye_h)?
+                };
+                let sbs_rgb8 = pipeline.read_texture_rgb8(&sbs_tex, sbs_w, sbs_h)?;
+                let mut graded = if color_any_cpu {
+                    apply_color_stack_rgb8_sbs(
+                        pipeline, color_plan, sbs_rgb8, sbs_w, sbs_h, cfg.eye_w)?
+                } else {
+                    sbs_rgb8
+                };
+                // "BeyondVR Hack" — last, on the graded SBS (padding stays black).
+                if color_plan.eye_scale != 1.0 {
+                    graded = pipeline.apply_eye_scale_sbs_rgb8(
+                        &graded, sbs_w, sbs_h, cfg.eye_w, color_plan.eye_scale)?;
+                }
+                for _ in 0..fill.copies() { encoder.encode_frame(&graded)?; }
+            }
         }
+
+        // The frame is released here, after its encode: a decoded surface
+        // must outlive every GPU read of its planes, and those have
+        // COMPLETED by now, not merely been submitted (the projections
+        // submit inside their own calls, and the compose that follows polls
+        // the device to idle before returning).
+        drop(frame);
 
         frame_idx += 1;
         written += fill.copies();
@@ -1987,7 +2258,7 @@ fn export_fisheye_inner(
         // Multi-segment uses an ffconcat playlist so the merged recording's
         // audio is one continuous track the trim window cuts from; a lone
         // file muxes its own. (`eac_audio_source` is segment-generic.)
-        finalize_fisheye_audio(&cfg, &video_tmp, t_in, frame_idx as f64 * dt)?;
+        finalize_fisheye_audio(cfg, &video_tmp, t_in, frame_idx as f64 * dt)?;
     }
     finalize_metadata_for(
         &cfg.output_path,
@@ -1996,11 +2267,12 @@ fn export_fisheye_inner(
         mono,
     )?;
     tracing::info!(
-        "fisheye_export: done, {} frames in {:.2?}",
+        "{tag}: done, {} frames in {:.2?}",
         frame_idx, t_start.elapsed()
     );
     Ok(())
 }
+
 
 /// Per-eye stab/RS rotation pair for one frame, as the GUI's
 /// `build_per_eye_frames` produces it: `((left_rot, left_rs), (right_rot, right_rs))`.
@@ -3079,9 +3351,7 @@ fn export_fisheye_osv_zerocopy_p010(
     // source and the open succeeded. `None` for every dual-stream export.
     sbs_iter: Option<crate::fisheye_decode::VtSharedSbsIter>,
 ) -> Result<()> {
-    use crate::fisheye_decode::{
-        DenoisingZeroCopyIter, ZcDecoder, ZcMacFrame, ZeroCopyDualStreamFisheyeIter,
-    };
+    use crate::fisheye_decode::{DenoisingZeroCopyIter, ZcDecoder, ZeroCopyDualStreamFisheyeIter};
 
     // Per-segment durations (for a merged recording): chain the decoder, rebase
     // pts, and total the frame count. Fast moov probe (no find_stream_info).
@@ -3099,8 +3369,7 @@ fn export_fisheye_osv_zerocopy_p010(
             .collect()
     } else { Vec::new() };
 
-    let mono = single_eye_source(&cfg);
-    let mut decoder = if let Some(it) = sbs_iter {
+    let decoder = if let Some(it) = sbs_iter {
         // Generic SBS: one VT stream, no chaining, no denoise (gated out at
         // the caller). `eye_dims()` is PER-EYE, so `resolve_calib_pair` below
         // and the projections' src_w/src_h are unchanged.
@@ -3131,18 +3400,8 @@ fn export_fisheye_osv_zerocopy_p010(
             ZcDecoder::Raw(raw)
         }
     };
-    let (src_w, src_h) = decoder.eye_dims();
-
-    // Extract DJI protobuf for per-eye calibration (and stab data).
-    let dji_osv_imu = resolve_export_imu(&cfg);
-    let (calib_left, calib_right) = resolve_calib_pair(
-        &cfg, src_w, src_h, dji_osv_imu.as_ref(),
-    );
-
-    // Stab rotations span the whole chain (a merged recording indexes by
-    // absolute frame). `clip_slots` = chain duration × nominal fps (output
-    // frames, holes included); the table has one row per frame in the track.
-    let timeline = export_timeline(&cfg);
+    // The clip's length in output frames (duration × nominal fps, holes
+    // included). A chain rounds the sum of its segments' durations.
     let clip_slots = if cfg.segments.len() > 1 {
         (seg_durs.iter().sum::<f64>() * cfg.fps as f64).round() as usize
     } else {
@@ -3150,273 +3409,11 @@ fn export_fisheye_osv_zerocopy_p010(
             .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
             .unwrap_or(0)
     }.max(1);
-    let total_clip_frames = timeline_frames_or(timeline.as_ref(), clip_slots);
-    let stab_rotations: Option<Vec<crate::gpu::EquirectRotation>> = if cfg.stabilize {
-        dji_osv_imu.as_ref().and_then(|osv| {
-            let max_corr = if cfg.dji_max_corr_deg > 0.0 {
-                cfg.dji_max_corr_deg
-            } else { f32::INFINITY };
-            crate::dji_imu::compute_dji_stabilization(
-                osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness,
-            ).ok().map(|s| { let mut v = s.per_frame; crate::dji_imu::apply_lock_ref_diag(&mut v, cfg.dji_smooth_ms); v })
-        })
-    } else { None };
-    tracing::info!(
-        "fisheye_export (zero-copy): stab = {}",
-        if stab_rotations.is_some() { "engaged" } else { "off" }
-    );
-
-    // Trim seek + frame estimate.
-    let t_in = cfg.trim_in_s.unwrap_or(0.0).max(0.0);
-    if t_in > 0.001 {
-        decoder.seek(t_in)?;
-    }
-    let t_out = cfg.trim_out_s
-        .map(|t| t.max(t_in + 1e-3))
-        .unwrap_or(f64::INFINITY);
-    let total_frames_to_write = if t_out.is_finite() {
-        ((t_out - t_in) * cfg.fps as f64).round() as u64
-    } else {
-        (clip_slots as f64 - t_in * cfg.fps as f64).round().max(0.0) as u64
-    };
-    tracing::info!(
-        "fisheye_export (zero-copy): writing ~{} frames (trim {:?}..{:?})",
-        total_frames_to_write, cfg.trim_in_s, cfg.trim_out_s
-    );
-
-    // The frame: two eyes side by side, or the one eye of a single-eye source.
-    let sbs_w = if mono { cfg.eye_w } else { cfg.eye_w * 2 };
-    let sbs_h = cfg.eye_h;
-    // One-pass: encode STRAIGHT to the final file and mux the source's
-    // audio inline (no temp + re-mux). Otherwise encode to a local-scratch
-    // temp the finalize muxes audio onto (ambisonic / APAC).
-    let one_pass = one_pass_audio_eligible(&cfg);
-    let enc_out = if one_pass { cfg.output_path.clone() }
-                  else { video_only_temp_path(&cfg.output_path) };
-    // ProRes-VT → P010 IOSurface straight into Apple's ProRes engine;
-    // HEVC 10-bit → P010 IOSurface encode (Main10); HEVC 8-bit → BGRA
-    // IOSurface encode (Main). All consume the same zero-copy P010
-    // decode above. ProRes is always 10-bit here (the GUI pins it), so
-    // `ten_bit` keeps the P010 encode-buffer branch in the frame loop.
-    let is_prores = cfg.encoder == EncoderBackend::ProResVideoToolbox;
-    let ten_bit = cfg.bit_depth == 10 || is_prores;
-    // A spatial video export feeds the same P010 surfaces to the MV-HEVC
-    // encoder (`prepare_spatial` pinned 10-bit HEVC, so `ten_bit` holds).
-    let mut encoder: ExportEncoder = if let Some(enc) = open_spatial_encoder(&cfg, &enc_out)? {
-        enc
-    } else if is_prores {
-        H265Encoder::create_zero_copy_vt_prores(
-            &enc_out, sbs_w, sbs_h, cfg.fps, cfg.prores_profile,
-        )?.into()
-    } else if ten_bit {
-        H265Encoder::create_zero_copy_vt_p010(
-            &enc_out, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
-        )?.into()
-    } else {
-        H265Encoder::create_zero_copy_vt(
-            &enc_out, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
-        )?.into()
-    };
-    // Inline audio passthrough (must be attached before the first frame).
-    let one_pass_audio_tmp = if one_pass {
-        let dur = total_frames_to_write as f64 / cfg.fps as f64;
-        let (asrc, atmp, aoff) = stereo_audio_source(&cfg, t_in, dur);
-        if let Err(e) = encoder.attach_audio_passthrough(&asrc, aoff, dur) {
-            tracing::warn!("one-pass audio attach failed: {e} — video-only output");
-        }
-        atmp
-    } else { None };
-    // APMP / YouTube metadata is now injected as a post-process atom
-    // write on the final muxed file (see `finalize_with_audio` →
-    // `finalize_metadata`); the ffmpeg side-data path is no longer
-    // used because it can't set the equirect bounds correctly for
-    // VR180 and conflicts between the two metadata flavours have to
-    // be resolved by stripping anyway. Keep the codecpar header
-    // unmodified here.
-
-    // Per-row rolling-shutter correction is on by default for OSV
-    // — matches Python's behaviour when the user has the RS toggle
-    // enabled in `vr180_gui.py` (default OFF in Python, but every
-    // user-visible difference in OSV stab quality between Python and
-    // Rust traces back to it). The DJI Osmo OQ001 readout time is
-    // ~19 ms from `vr180_gui.py:500`; the per-row pass cancels the
-    // intra-frame shear that per-frame stab alone can't reach.
-    let rs_enabled = cfg.stabilize && dji_osv_imu.is_some();
-    // FPS-aware readout: OSMO 360 sensor at 50fps uses 16.23 ms vs
-    // 18.3 ms at 30fps. Wrong readout → wrong phase offset → "loose"
-    // stab at fast motion.
-    let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
-    tracing::info!(
-        "fisheye_export (zero-copy): P010 IOSurface decode → {} encode, \
-         no CPU bounce on the decode side; per-row RS = {}",
-        if cfg.spatial.is_some() { "P010 IOSurface → MV-HEVC (spatial video)" }
-        else if is_prores { "P210 IOSurface (4:2:2) → ProRes-VT (HW)" }
-        else if cfg.bit_depth == 10 { "P010 IOSurface (Main10)" }
-        else { "BGRA IOSurface (Main, 8-bit)" },
-        if rs_enabled { format!("on (readout {:.1}ms)", readout_s * 1000.0) }
-        else { "off".to_string() }
-    );
-
-    let dt = 1.0 / cfg.fps as f64;
-    let t_start = std::time::Instant::now();
-    let mut frame_idx: u64 = 0;
-    let mut written: u64 = 0;
-    // Automatic eye-exposure matching (X6): GPU-resident state for this stream.
-    let eye_match_state = pipeline.create_eye_match_state();
-
-    while let Some(frame) = decoder.next_frame(&pipeline.device)? {
-        if cancel.load(Ordering::SeqCst) {
-            tracing::info!("fisheye_export (zero-copy): cancelled at frame {}", frame_idx);
-            break;
-        }
-        let pts_s = frame.pts_s();
-        if pts_s.is_finite() && pts_s >= t_out {
-            tracing::info!("fisheye_export (zero-copy): hit trim_out @ {:.3}s", pts_s);
-            break;
-        }
-        // Drop pre-trim frames (keyframe-backward seek, no decode-forward).
-        if pts_s.is_finite() && pts_s < t_in - 0.5 * dt {
-            continue;
-        }
-
-        let stab_idx = crate::frame_timeline::stab_row(timeline.as_ref(), pts_s, dt, frame_idx as usize);
-        let fill = crate::frame_timeline::export_fill_plan(
-            timeline.as_ref(), stab_idx, pts_s, t_in, written, total_frames_to_write);
-        let rot = stab_rotations
-            .as_ref()
-            .and_then(|v| v.get(stab_idx).copied())
-            .unwrap_or(crate::gpu::EquirectRotation::IDENTITY);
-
-        // Each eye's rotation (stab, then the view adjustment) and its
-        // per-row matrices: <200 KB at 3840 rows, built on the CPU.
-        let crate::render::FramePose {
-            rot_left, rot_right, rows_left: rs_rows_l, rows_right: rs_rows_r,
-        } = crate::render::FramePose::new(
-            rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes, &cfg.view_adjust,
-            rs_enabled.then_some(crate::render::RowReadout { readout_s, src_h, fps: cfg.fps }),
-        );
-
-        // Project Y/UV → Rgba16Unorm output, per eye. Per-row rolling-
-        // shutter correction is wired for BOTH projections — the RS warp
-        // operates on the source-frame direction, independent of whether
-        // the output is half-equirect or fisheye.
-        // One eye straight from the planes of a decoded surface.
-        let eye_from_planes = |y: &wgpu::Texture, uv: &wgpu::Texture, rot: crate::gpu::EquirectRotation,
-                               calib: FisheyeCalib, rows: Option<&[f32]>| -> Result<wgpu::Texture> {
-            let (y, uv) = (y.create_view(&Default::default()), uv.create_view(&Default::default()));
-            pipeline.project_eye(&EyeProjection::new(
-                EyePicture::Planes { y: &y, uv: &uv }, cfg.eye_w, cfg.eye_h, rot, calib,
-            ).wide().fisheye_out(cfg.projection == FisheyeExportProjection::Fisheye).rs_rows(rows))
-        };
-        let (left_eq, right_eq) = match &frame {
-            // Dual-stream: project each eye straight from its P010 planes
-            // (no resolve, no split) — unchanged.
-            ZcMacFrame::Pair(pair) => {
-                let (rs_l, rs_r) = crate::gpu::rows_for_both(rs_rows_l.as_deref(), rs_rows_r.as_deref());
-                let l = eye_from_planes(&pair.left_y.texture, &pair.left_uv.texture, rot_left, calib_left, rs_l)?;
-                // A single-eye source: the one eye is the frame.
-                let r = if mono { l.clone() } else {
-                    eye_from_planes(&pair.right_y.texture, &pair.right_uv.texture, rot_right, calib_right, rs_r)?
-                };
-                (l, r)
-            }
-            // Generic SBS: the P010 kernels sample each eye straight from the
-            // whole-frame planes (see the arm). NO eye swap: the halves are
-            // already in L|R frame order, matching the CPU `SbsFisheyeIter`
-            // and the Windows SBS arm.
-            ZcMacFrame::Sbs(f) => {
-                // Sample the whole-frame P010 planes IN PLACE, one eye per
-                // dispatch: `src_x0` selects the eye's sub-rect and the kernels
-                // clamp every tap to it (see fisheye_project.wgsl),
-                // so nothing bleeds across the seam. No resolve, no split —
-                // at 8K that was a 268 MB whole-frame RGBA16 plus two 134 MB
-                // halves per frame, and two full-frame passes. These are the
-                // same kernels the dual-stream arm above uses, so generic SBS
-                // and OSV/X6 now render through identical code.
-                let (cal_l, cal_r) = {
-                    let (mut l, mut r) = (calib_left, calib_right);
-                    let (lx, ly) = f.eye_origin(0);
-                    let (rx, ry) = f.eye_origin(1);
-                    l.src_x0 = lx as f32; l.src_y0 = ly as f32;
-                    r.src_x0 = rx as f32; r.src_y0 = ry as f32;
-                    l.yuv_range = f.yuv_range;
-                    r.yuv_range = f.yuv_range;
-                    l.yuv_mat = f.yuv_mat;
-                    r.yuv_mat = f.yuv_mat;
-                    (l, r)
-                };
-                let (y, uv) = (&f.frame_y.texture, &f.frame_uv.texture);
-                let (rs_l, rs_r) = crate::gpu::rows_for_both(rs_rows_l.as_deref(), rs_rows_r.as_deref());
-                (
-                    eye_from_planes(y, uv, rot_left, cal_l, rs_l)?,
-                    eye_from_planes(y, uv, rot_right, cal_r, rs_r)?,
-                )
-            }
-        };
-
-        // 16-bit color stack — runs only when active. Stays Rgba16Unorm
-        // so VT sees full 10-bit precision when the user has added a
-        // grade.
-        let (l_final, r_final) = grade_eyes_16(
-            &pipeline, &left_eq, &right_eq, cfg.eye_w, cfg.eye_h, &cfg.color_stack,
-            Some((&eye_match_state, EyeMatchFrame::default())), mono,
-        )?;
-        let (l_final, r_final) = (&l_final, &r_final);
-
-        // Compose the (already-graded, 16-bit) eyes into the encode
-        // IOSurface and hand off to VT. ProRes → P210 (true 4:2:2);
-        // 10-bit HEVC → P010; 8-bit → BGRA, composed with an IDENTITY
-        // plan (no re-grade — the 16→8 downconvert happens in the
-        // compose), then Main encode.
-        if ten_bit {
-            encode_wide_surface(
-                &pipeline, &mut encoder, l_final, r_final, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
-                mono, is_prores, fill.copies(),
-            )?;
-        } else {
-            encode_bgra_surface(
-                &pipeline, &mut encoder, l_final, r_final, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
-                mono, &ColorStackPlan::default(), None, fill.copies(),
-            )?;
-        }
-
-        // Drop decode + compose textures so the IOSurface retains
-        // release before the next frame allocates new ones. Must stay AFTER
-        // encode_pixel_buffer*. Safe because every GPU read of the frame's
-        // planes has COMPLETED by now, not merely been submitted: both arms'
-        // projections submit inside their own calls, and the compose that
-        // follows polls the device to idle before returning.
-        drop(frame);
-
-        frame_idx += 1;
-        written += fill.copies();
-        let elapsed = t_start.elapsed().as_secs_f32().max(1e-3);
-        let fps_avg = frame_idx as f32 / elapsed;
-        progress_cb(ExportProgress {
-            frame_idx: written,
-            total_frames: total_frames_to_write,
-            fps_avg,
-        });
-    }
-
-    encoder.finish()?;
-    if one_pass {
-        // Audio already muxed inline — drop the playlist temp, if any.
-        if let Some(t) = one_pass_audio_tmp { std::fs::remove_file(t).ok(); }
-    } else {
-        finalize_fisheye_audio(&cfg, &enc_out, t_in, frame_idx as f64 * dt)?;
-    }
-    finalize_metadata_for(
-        &cfg.output_path,
-        cfg.inject_youtube_vr180,
-        cfg.inject_apmp,
-        mono,
-    )?;
-    tracing::info!(
-        "fisheye_export (zero-copy): done, {} frames in {:.2?}",
-        frame_idx, t_start.elapsed()
-    );
-    Ok(())
+    run_fisheye_frames(
+        &pipeline, &cfg, "fisheye_export (zero-copy)", decoder, clip_slots,
+        |enc_out, sbs_w, sbs_h, readout_s| open_zero_copy_sink(&cfg, enc_out, sbs_w, sbs_h, readout_s),
+        progress_cb, &cancel,
+    )
 }
 
 // ── Fast path: zero-copy OSV → d3d11va → Vulkan → libx265 (Windows) ────
