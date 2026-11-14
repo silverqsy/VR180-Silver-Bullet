@@ -342,7 +342,7 @@ pub fn insv_calib_only(meta: &Insta360Meta, stream_w: u32, stream_h: u32, view: 
         lens_b,
         camera_model: Some(if meta.model.is_empty() { "Insta360".to_string() } else { meta.model.clone() }),
         imu_to_cam: Some(match meta.lenses.get(i0).or(meta.lenses.first()) {
-            Some(lens) if meta.single_lens => insv_x6_lens_imu_to_cam(lens.is_second_lens()),
+            Some(lens) if meta.single_lens && meta.back_to_back => insv_x6_lens_imu_to_cam(lens.is_second_lens()),
             _ => insv_x6_imu_to_cam(),
         }),
         // The file's readout covers every row the sensor read; a frame that
@@ -748,6 +748,18 @@ mod tests {
         assert!((a.cx.unwrap() - (e2.cx - 7744.0 - 32.0) / 2.0).abs() < 2e-3 && (a.cy.unwrap() - (e2.cy - 32.0) / 2.0).abs() < 2e-3);
         assert!((a.omni.unwrap().fx - e2.fx / 2.0).abs() < 2e-3 && !a.frame_crop);
         assert!((imu.readout_ms.unwrap() - 14.56).abs() < 1e-4);
+    }
+
+    #[test]
+    fn lone_lens_basis() {
+        let lenses = vr180_fisheye::insta360::parse_calib_string(
+            "1_2.455430_7200_7200_3880_3878_0_0_89.5_0_0_-0.0326_1.3_-0.7_-0.7_19.4_0_0_0_0_0_0_0_0_0_7744_7744_193_1").unwrap();
+        assert!(lenses[0].is_second_lens());
+        let mut meta = Insta360Meta { lenses, single_lens: true, ..Default::default() };
+        assert_eq!(insv_calib_only(&meta, 7680, 7680, X6ViewChoice::Auto).imu_to_cam, Some(insv_x6_imu_to_cam()));
+        meta.back_to_back = true;
+        assert_eq!(insv_calib_only(&meta, 7680, 7680, X6ViewChoice::Auto).imu_to_cam, Some(insv_x6_lens_imu_to_cam(true)));
+        assert_ne!(insv_x6_lens_imu_to_cam(true), insv_x6_imu_to_cam());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vr180_fisheye::insta360::{read_insta360_identity, read_insta360_meta, InsvFrameStamp};
-use vr180_fisheye::x6_pair::{find_pair, fit_clocks, solve_pair_sync, ClockFit, PairSearch, PairSync, StampClock};
+use vr180_fisheye::x6_pair::{find_pair, fit_clocks, sidecar_path, solve_pair_sync, ClockFit, PairSearch, PairSync, StampClock};
 use vr180_fisheye::Insta360Meta;
 
 use crate::decode::VideoProbe;
@@ -135,10 +135,17 @@ pub fn audio_source(path: &Path) -> (PathBuf, f64) {
     }
 }
 
+fn lone(path: &Path, meta: vr180_fisheye::Result<Insta360Meta>) -> vr180_fisheye::Result<Insta360Meta> {
+    meta.map(|mut meta| {
+        meta.back_to_back = meta.single_lens && sidecar_path(path).is_file();
+        meta
+    })
+}
+
 pub fn read_meta(path: &Path) -> vr180_fisheye::Result<Insta360Meta> {
     match plan_for(path) {
         Some(plan) => Ok(plan.meta.clone()),
-        None => read_insta360_meta(path),
+        None => lone(path, read_insta360_meta(path)),
     }
 }
 
@@ -151,7 +158,7 @@ pub fn read_identity(path: &Path) -> vr180_fisheye::Result<Insta360Meta> {
             meta.frames_b.clear();
             Ok(meta)
         }
-        None => read_insta360_identity(path),
+        None => lone(path, read_insta360_identity(path)),
     }
 }
 
@@ -282,6 +289,7 @@ fn merged_meta(
         frames_b,
         track_order_reversed: Some(true),
         single_lens: true,
+        back_to_back: true,
         ..right
     }
 }
@@ -320,7 +328,7 @@ mod tests {
         let imu_len = right.imu.len();
         let m = merged_meta(right.clone(), &left, &range, &partner, &clocks);
         assert_eq!((m.lenses.len(), m.lenses[0].fx, m.lenses[1].fx), (2, 7210.0, 7221.0));
-        assert_eq!((m.track_order_reversed, m.single_lens), (Some(true), true));
+        assert_eq!((m.track_order_reversed, m.single_lens, m.back_to_back), (Some(true), true, true));
         assert_eq!((m.frames_b.len(), m.frames.len()), (1000, 1000));
         assert_eq!(m.frames_b[0], right.frames[900]);
         assert_eq!(m.frames_b[999], right.frames[1899]);
@@ -356,6 +364,19 @@ mod tests {
         assert!(near(plan.clip_time(1, 1000.0 * dt), 2000.0 * dt), "{}", plan.clip_time(1, 1000.0 * dt) / dt);
         assert!(near(plan.clip_time(0, -1.0), 900.0 * dt));
         assert_eq!(plan.audio_source(), (Path::new("l.mp4"), 1000.0 * dt));
+    }
+
+    #[test]
+    fn lone_meta() {
+        let dir = std::env::temp_dir().join(format!("vr180-lone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("one.mp4");
+        let read = |single_lens| lone(&clip, Ok(Insta360Meta { single_lens, ..Default::default() })).unwrap().back_to_back;
+        assert!(!read(true));
+        std::fs::write(sidecar_path(&clip), "{}").unwrap();
+        assert!(read(true));
+        assert!(!read(false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
