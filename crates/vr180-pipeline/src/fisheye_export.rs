@@ -2383,9 +2383,6 @@ fn export_eac_inner(
     mut progress_cb: impl FnMut(ExportProgress),
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
-    use std::sync::atomic::Ordering;
-    use vr180_core::eac::{assemble_lens_a, assemble_lens_b};
-
     tracing::info!(
         "export_eac: {} → {} ({}x{} @ {:.2} fps, {} kbps, {}-bit, {} stab frames)",
         cfg.source_path.display(), cfg.output_path.display(),
@@ -2508,39 +2505,232 @@ fn export_eac_inner(
         }
     }
 
-    let mut decoder = crate::decode::SegmentedStreamPairIter::new(
+    // The portable route: both streams decoded to memory, the 8-bit
+    // chain, a readback into whichever encoder was asked for.
+    let decoder = crate::decode::SegmentedStreamPairIter::new(
         &cfg.segments, crate::decode::HwDecode::Auto, 0)?;
-    let dims = decoder.dims();
+    run_eac_frames(
+        &pipeline, &cfg, "export_eac", decoder, &per_eye, (lens_l, lens_r),
+        |video_tmp, sbs_w, sbs_h, _span| {
+            let encoder = open_h265_encoder(
+                video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
+                cfg.encoder, cfg.bit_depth, cfg.prores_profile,
+            )?;
+            Ok((encoder.into(), FrameSink::Readback))
+        },
+        &mut progress_cb, &cancel,
+    )
+}
+
+// ── One frame loop for the GoPro `.360` exports ────────────────────────
+//
+// The same split as the fisheye exports above: the arms differ in how a
+// frame arrives (both streams decoded to memory; decoded surfaces on the
+// GPU) and in where it goes ([`FrameSink`]). A `.360` frame has its own
+// projection (two lens crosses assembled from the tile streams, then cross
+// → eye) and its stabilization arrives precomputed, per eye and per frame,
+// from the caller, so it has its own loop rather than a branch in the
+// fisheye one.
+
+/// What projecting one `.360` frame's eyes takes besides the frame itself.
+struct EacJob<'a> {
+    dims: vr180_core::eac::Dims,
+    /// One eye's size in the output.
+    eye_w: u32,
+    eye_h: u32,
+    fisheye_out: bool,
+    /// Each eye's rotation (stabilization, then the view adjustment) and
+    /// rolling-shutter parameters. Left eye = lens B, right eye = lens A.
+    left: (EquirectRotation, crate::gpu::EquirectRsParams),
+    right: (EquirectRotation, crate::gpu::EquirectRsParams),
+    lens_left: &'a crate::gpu::EacLensAdjust,
+    lens_right: &'a crate::gpu::EacLensAdjust,
+}
+
+/// One decoded `.360` frame, however its two streams are held.
+trait EacFrame {
+    /// What frames of this kind reuse from one frame to the next.
+    type Scratch: Default;
+
+    /// Both eyes projected at 8 bits a channel.
+    fn project_8(&self, pipeline: &Device, job: &EacJob, scratch: &mut Self::Scratch)
+        -> Result<(wgpu::Texture, wgpu::Texture)>;
+
+    /// Both eyes projected at 16 bits a channel, from a frame that holds
+    /// more than 8; `None` from one that does not.
+    #[allow(dead_code)]
+    fn project_16(&self, pipeline: &Device, job: &EacJob) -> Option<Result<(wgpu::Texture, wgpu::Texture)>>;
+}
+
+/// Where the frames of a `.360` export come from.
+trait EacFeed {
+    type Frame: EacFrame;
+
+    fn feed_dims(&self) -> vr180_core::eac::Dims;
+    fn feed_seek(&mut self, t_s: f64) -> Result<()>;
+    fn pull(&mut self, pipeline: &Device) -> Result<Option<Self::Frame>>;
+}
+
+/// The two lens crosses of a frame decoded to memory (packed RGB8), kept
+/// from frame to frame.
+#[derive(Default)]
+struct EacCrosses {
+    a: Vec<u8>,
+    b: Vec<u8>,
+}
+
+/// The portable decoder: both streams as RGB8 pictures in memory.
+impl EacFeed for crate::decode::SegmentedStreamPairIter {
+    type Frame = crate::decode::StreamPair;
+
+    fn feed_dims(&self) -> vr180_core::eac::Dims { self.dims() }
+    fn feed_seek(&mut self, t_s: f64) -> Result<()> { self.seek(t_s) }
+    fn pull(&mut self, _pipeline: &Device) -> Result<Option<Self::Frame>> { self.next_pair() }
+}
+
+impl EacFrame for crate::decode::StreamPair {
+    type Scratch = EacCrosses;
+
+    /// The crosses are assembled on the CPU and uploaded once each. GoPro
+    /// Max footage is 8-bit, so this is all a frame in memory offers.
+    fn project_8(&self, pipeline: &Device, job: &EacJob, crosses: &mut EacCrosses)
+        -> Result<(wgpu::Texture, wgpu::Texture)>
+    {
+        use vr180_core::eac::{assemble_lens_a, assemble_lens_b};
+        let cross_w = job.dims.cross_w();
+        let len = cross_w as usize * cross_w as usize * 3;
+        crosses.a.resize(len, 0);
+        crosses.b.resize(len, 0);
+        assemble_lens_a(&self.s0, &self.s4, job.dims, &mut crosses.a);
+        assemble_lens_b(&self.s0, &self.s4, job.dims, &mut crosses.b);
+        let ((rl, sl), (rr, sr)) = (job.left, job.right);
+        if job.fisheye_out {
+            Ok((pipeline.project_cross_to_fisheye_texture(
+                    &crosses.b, cross_w, job.eye_w, job.eye_h, rl, sl, job.lens_left)?,
+                pipeline.project_cross_to_fisheye_texture(
+                    &crosses.a, cross_w, job.eye_w, job.eye_h, rr, sr, job.lens_right)?))
+        } else {
+            Ok((pipeline.project_cross_to_equirect_texture(
+                    &crosses.b, cross_w, job.eye_w, job.eye_h, rl, sl, job.lens_left)?,
+                pipeline.project_cross_to_equirect_texture(
+                    &crosses.a, cross_w, job.eye_w, job.eye_h, rr, sr, job.lens_right)?))
+        }
+    }
+
+    fn project_16(&self, _pipeline: &Device, _job: &EacJob) -> Option<Result<(wgpu::Texture, wgpu::Texture)>> {
+        None
+    }
+}
+
+/// The macOS zero-copy decoders: both streams as decoded surfaces.
+#[cfg(target_os = "macos")]
+impl EacFeed for crate::decode::ZcEacDecoder {
+    type Frame = crate::decode::ZeroCopyStreamPair;
+
+    fn feed_dims(&self) -> vr180_core::eac::Dims { self.dims() }
+    fn feed_seek(&mut self, t_s: f64) -> Result<()> { self.seek(t_s) }
+    fn pull(&mut self, pipeline: &Device) -> Result<Option<Self::Frame>> { self.next_pair(&pipeline.device) }
+}
+
+/// The crosses are assembled on the GPU straight from the surfaces' planes,
+/// at 8 bits or (so the 10 bits of a 10-bit stream survive into the cross
+/// and the eye) at 16.
+#[cfg(target_os = "macos")]
+impl EacFrame for crate::decode::ZeroCopyStreamPair {
+    type Scratch = ();
+
+    fn project_8(&self, pipeline: &Device, job: &EacJob, _scratch: &mut ())
+        -> Result<(wgpu::Texture, wgpu::Texture)>
+    {
+        use crate::gpu::Lens;
+        let cross = |lens: Lens| pipeline.nv12_to_eac_cross(
+            &self.s0_y.texture, &self.s0_uv.texture,
+            &self.s4_y.texture, &self.s4_uv.texture, lens, job.dims);
+        let (cross_a, cross_b) = (cross(Lens::A)?, cross(Lens::B)?);
+        let ((rl, sl), (rr, sr)) = (job.left, job.right);
+        if job.fisheye_out {
+            Ok((pipeline.project_cross_texture_to_fisheye_texture(&cross_b, job.eye_w, job.eye_h, rl, sl, job.lens_left)?,
+                pipeline.project_cross_texture_to_fisheye_texture(&cross_a, job.eye_w, job.eye_h, rr, sr, job.lens_right)?))
+        } else {
+            Ok((pipeline.project_cross_texture_to_equirect_texture(&cross_b, job.eye_w, job.eye_h, rl, sl, job.lens_left)?,
+                pipeline.project_cross_texture_to_equirect_texture(&cross_a, job.eye_w, job.eye_h, rr, sr, job.lens_right)?))
+        }
+    }
+
+    fn project_16(&self, pipeline: &Device, job: &EacJob) -> Option<Result<(wgpu::Texture, wgpu::Texture)>> {
+        use crate::gpu::Lens;
+        let both = || -> Result<(wgpu::Texture, wgpu::Texture)> {
+            let cross = |lens: Lens| pipeline.nv12_to_eac_cross_16(
+                &self.s0_y.texture, &self.s0_uv.texture,
+                &self.s4_y.texture, &self.s4_uv.texture, lens, job.dims);
+            let (cross_a, cross_b) = (cross(Lens::A)?, cross(Lens::B)?);
+            let ((rl, sl), (rr, sr)) = (job.left, job.right);
+            if job.fisheye_out {
+                Ok((pipeline.project_cross_texture_to_fisheye_texture_16(&cross_b, job.eye_w, job.eye_h, rl, sl, job.lens_left)?,
+                    pipeline.project_cross_texture_to_fisheye_texture_16(&cross_a, job.eye_w, job.eye_h, rr, sr, job.lens_right)?))
+            } else {
+                Ok((pipeline.project_cross_texture_to_equirect_texture_16(&cross_b, job.eye_w, job.eye_h, rl, sl, job.lens_left)?,
+                    pipeline.project_cross_texture_to_equirect_texture_16(&cross_a, job.eye_w, job.eye_h, rr, sr, job.lens_right)?))
+            }
+        };
+        Some(both())
+    }
+}
+
+/// The part of a `.360` export an encoder opener may want to mention.
+#[allow(dead_code)]
+struct EacSpan {
+    trim_in_frame: u32,
+    trim_out_frame: Option<u32>,
+    /// The audio is muxed while encoding, straight into the final file.
+    one_pass: bool,
+}
+
+/// The frame loop of a `.360` export, from the opened decoder to the
+/// finished file. `per_eye[absolute frame]` carries each eye's stabilization
+/// rotation and rolling-shutter parameters, computed by the caller (it owns
+/// the GPMF parse and the settings); empty or short means none. Trim is by
+/// frame number: the decoders seek precisely, so the first frame delivered
+/// after a seek is the trim-in frame itself.
+#[allow(clippy::too_many_arguments)]
+fn run_eac_frames<F: EacFeed>(
+    pipeline: &Device,
+    cfg: &FisheyeExportConfig,
+    tag: &'static str,
+    mut feed: F,
+    per_eye: &[EacPerEyeFrame],
+    (lens_l, lens_r): (crate::gpu::EacLensAdjust, crate::gpu::EacLensAdjust),
+    open_sink: impl FnOnce(&std::path::Path, u32, u32, &EacSpan) -> Result<(ExportEncoder, FrameSink)>,
+    progress_cb: &mut dyn FnMut(ExportProgress),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let dims = feed.feed_dims();
     if !dims.is_valid() {
         return Err(Error::Ffmpeg(format!(
-            "export_eac: invalid EAC layout (stream w={})", dims.stream_w)));
+            "{tag}: invalid EAC layout (stream w={})", dims.stream_w)));
     }
-    let cross_w = dims.cross_w();
-    let cw = cross_w as usize;
 
     let sbs_w = cfg.eye_w * 2;
     let sbs_h = cfg.eye_h;
+    let dt = 1.0 / cfg.fps as f64;
+    let trim_in_frame = cfg.trim_in_s.map(|t| (t.max(0.0) * cfg.fps as f64).round() as u32).unwrap_or(0);
+    let trim_out_frame = cfg.trim_out_s.map(|t| (t * cfg.fps as f64).round() as u32);
     // One-pass: encode STRAIGHT to the final file and mux the source's
     // stereo audio inline — no `.video.tmp` + full re-mux copy (which at
     // ProRes bitrates dwarfed the encode itself). Ambisonic / APAC keep
     // the temp+finalize path (they need post-encode steps).
-    let one_pass = one_pass_audio_eligible(&cfg);
+    let one_pass = one_pass_audio_eligible(cfg);
     let video_tmp = if one_pass { cfg.output_path.clone() }
                     else { video_only_temp_path(&cfg.output_path) };
-    let mut encoder = open_h265_encoder(
-        &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps,
-        cfg.encoder, cfg.bit_depth, cfg.prores_profile,
-    )?;
+    let (mut encoder, sink) = open_sink(
+        &video_tmp, sbs_w, sbs_h, &EacSpan { trim_in_frame, trim_out_frame, one_pass })?;
 
-    // Trim via PRECISE seek: the iterator's seek decodes-and-discards
-    // the keyframe run-in internally, so the first delivered pair is
-    // exactly `trim_in_frame` (a late trim no longer decodes the whole
-    // preceding clip — a 300 s trim-in used to cost ~8 min of decode).
-    let dt = 1.0 / cfg.fps as f64;
-    let trim_in_frame = cfg.trim_in_s.map(|t| (t.max(0.0) * cfg.fps as f64).round() as u32).unwrap_or(0);
-    let trim_out_frame = cfg.trim_out_s.map(|t| (t * cfg.fps as f64).round() as u32);
+    // Trim via PRECISE seek: the decoder's seek decodes-and-discards the
+    // keyframe run-in internally, so the first delivered frame is exactly
+    // `trim_in_frame` (a late trim does not decode the whole preceding
+    // clip — a 300 s trim-in used to cost ~8 min of decode).
     if trim_in_frame > 0 {
-        decoder.seek(trim_in_frame as f64 * dt)?;
+        feed.feed_seek(trim_in_frame as f64 * dt)?;
     }
 
     // Inline audio passthrough (must be attached before the first frame).
@@ -2560,7 +2750,7 @@ fn export_eac_inner(
         let dur = trim_out_frame
             .map(|o| (o.saturating_sub(trim_in_frame)) as f64 * dt)
             .unwrap_or((total_video_frames.saturating_sub(trim_in_frame as usize)) as f64 * dt);
-        let (asrc, atmp, aoff) = stereo_audio_source(&cfg, trim_in_frame as f64 * dt, dur);
+        let (asrc, atmp, aoff) = stereo_audio_source(cfg, trim_in_frame as f64 * dt, dur);
         if let Err(e) = encoder.attach_audio_passthrough(
             &asrc, aoff, dur,
         ) {
@@ -2569,14 +2759,13 @@ fn export_eac_inner(
         atmp
     } else { None };
 
-    let color_plan = cfg.color_stack.clone();
+    let color_plan = &cfg.color_stack;
     let color_any = color_plan.any_active();
     let view = cfg.view_adjust;
     let view_active = !view.is_identity();
     let (v_l, v_r) = view.per_eye_matrices();
-
-    let mut cross_a = vec![0u8; cw * cw * 3];
-    let mut cross_b = vec![0u8; cw * cw * 3];
+    let fisheye_out = matches!(cfg.projection, FisheyeExportProjection::Fisheye);
+    let mut scratch = <F::Frame as EacFrame>::Scratch::default();
 
     let t_start = std::time::Instant::now();
     let mut frame_idx: u32 = trim_in_frame; // absolute source frame index (post-seek)
@@ -2585,17 +2774,14 @@ fn export_eac_inner(
         .map(|o| (o.saturating_sub(trim_in_frame)) as u64)
         .unwrap_or(per_eye.len() as u64);
 
-    while let Some(pair) = decoder.next_pair()? {
+    while let Some(frame) = feed.pull(pipeline)? {
         if cancel.load(Ordering::SeqCst) {
-            tracing::info!("export_eac: cancelled at frame {}", frame_idx);
+            tracing::info!("{tag}: cancelled at frame {}", frame_idx);
             break;
         }
         if let Some(out_f) = trim_out_frame {
             if frame_idx >= out_f { break; }
         }
-
-        assemble_lens_a(&pair.s0, &pair.s4, dims, &mut cross_a);
-        assemble_lens_b(&pair.s0, &pair.s4, dims, &mut cross_b);
 
         // Per-eye stab/RS for this absolute frame (identity past the end).
         let ((mut rl, sl), (mut rr, sr)) = per_eye.get(frame_idx as usize).copied()
@@ -2603,38 +2789,82 @@ fn export_eac_inner(
                 (EquirectRotation::IDENTITY, crate::gpu::EquirectRsParams::DISABLED),
                 (EquirectRotation::IDENTITY, crate::gpu::EquirectRsParams::DISABLED),
             ));
-        // Compose view-adjust (pano ± stereo) AFTER stab — same convention
-        // as the fisheye path. Left eye = Lens B, right eye = Lens A.
+        // The view adjustment (pano ± stereo) goes on AFTER the
+        // stabilization — the same convention as the fisheye path.
         if view_active {
             rl = EquirectRotation(crate::panomap::mat3_mul_row_major(&rl.0, &v_l));
             rr = EquirectRotation(crate::panomap::mat3_mul_row_major(&rr.0, &v_r));
         }
-
-        let (left, right) = if matches!(cfg.projection, FisheyeExportProjection::Fisheye) {
-            // Upload the RGB8 crosses once, then fisheye-project both eyes.
-            (pipeline.project_cross_to_fisheye_texture(
-                &cross_b, cross_w, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
-             pipeline.project_cross_to_fisheye_texture(
-                &cross_a, cross_w, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?)
-        } else {
-            (pipeline.project_cross_to_equirect_texture(
-                &cross_b, cross_w, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
-             pipeline.project_cross_to_equirect_texture(
-                &cross_a, cross_w, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?)
+        // The projection target follows cfg.projection: half-equirect
+        // (VR180) or equidistant fisheye (parity with the fisheye sources).
+        let job = EacJob {
+            dims, eye_w: cfg.eye_w, eye_h: cfg.eye_h, fisheye_out,
+            left: (rl, sl), right: (rr, sr), lens_left: &lens_l, lens_right: &lens_r,
         };
-        let sbs = pipeline.compose_sbs_textures(&left, &right, cfg.eye_w, cfg.eye_h)?;
-        let rgb = pipeline.read_texture_rgb8(&sbs, sbs_w, sbs_h)?;
-        let mut graded = if color_any {
-            apply_color_stack_rgb8_sbs(
-                &pipeline, &color_plan, rgb, sbs_w, sbs_h, cfg.eye_w)?
-        } else { rgb };
-        // "BeyondVR Hack" — last, on the graded SBS (padding stays black).
-        if color_plan.eye_scale != 1.0 {
-            graded = pipeline.apply_eye_scale_sbs_rgb8(
-                &graded, sbs_w, sbs_h, cfg.eye_w, color_plan.eye_scale)?;
-        }
-        encoder.encode_frame(&graded)?;
 
+        match sink {
+            FrameSink::BgraSurface => {
+                // The 8-bit chain, the colour stack fused into the store
+                // that writes the encoder's BGRA surface.
+                #[cfg(target_os = "macos")]
+                {
+                    let (left, right) = frame.project_8(pipeline, &job, &mut scratch)?;
+                    encode_bgra_surface(
+                        pipeline, &mut encoder, &left, &right, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
+                        false, color_plan, None, 1,
+                    )?;
+                }
+                #[cfg(not(target_os = "macos"))]
+                { let _ = &job; unreachable!(); }
+            }
+            FrameSink::WideSurface { p210 } => {
+                // The 16-bit chain end to end (a 10-bit stream's 10 bits
+                // survive into the cross and the eye), each eye graded (a
+                // no-op for an identity plan), then composed into the
+                // encoder's surface: P210 (true 4:2:2) for ProRes, P010 for
+                // HEVC Main10.
+                #[cfg(target_os = "macos")]
+                {
+                    let (left, right) = frame.project_16(pipeline, &job)
+                        .ok_or_else(|| Error::Ffmpeg("a 10-bit surface from a frame held at 8 bits".into()))??;
+                    let left_g = pipeline.apply_color_stack_per_eye_16(
+                        &left, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true))?;
+                    let right_g = pipeline.apply_color_stack_per_eye_16(
+                        &right, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false))?;
+                    let l_final = left_g.as_ref().unwrap_or(&left);
+                    let r_final = right_g.as_ref().unwrap_or(&right);
+                    encode_wide_surface(
+                        pipeline, &mut encoder, l_final, r_final, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
+                        false, p210, 1,
+                    )?;
+                }
+                #[cfg(not(target_os = "macos"))]
+                { let _ = (&job, p210); unreachable!(); }
+            }
+            FrameSink::Readback => {
+                // The 8-bit chain, read back; the colour stack runs on the
+                // SBS readback. The encoder still honours `cfg.bit_depth`
+                // (a 10-bit codec gets the 8-bit pixels widened: nothing is
+                // lost against the 8-bit source).
+                let (left, right) = frame.project_8(pipeline, &job, &mut scratch)?;
+                let sbs = pipeline.compose_sbs_textures(&left, &right, cfg.eye_w, cfg.eye_h)?;
+                let rgb = pipeline.read_texture_rgb8(&sbs, sbs_w, sbs_h)?;
+                let mut graded = if color_any {
+                    apply_color_stack_rgb8_sbs(
+                        pipeline, color_plan, rgb, sbs_w, sbs_h, cfg.eye_w)?
+                } else { rgb };
+                // "BeyondVR Hack" — last, on the graded SBS (padding stays black).
+                if color_plan.eye_scale != 1.0 {
+                    graded = pipeline.apply_eye_scale_sbs_rgb8(
+                        &graded, sbs_w, sbs_h, cfg.eye_w, color_plan.eye_scale)?;
+                }
+                encoder.encode_frame(&graded)?;
+            }
+        }
+
+        // Released after its encode: every GPU read of a decoded surface
+        // has completed by now.
+        drop(frame);
         frame_idx += 1;
         written += 1;
         let elapsed = t_start.elapsed().as_secs_f32().max(1e-3);
@@ -2655,16 +2885,17 @@ fn export_eac_inner(
         if let Some(t) = one_pass_audio_tmp { std::fs::remove_file(t).ok(); }
     } else {
         finalize_eac_audio(
-            &cfg, &video_tmp,
+            cfg, &video_tmp,
             trim_in_frame as f64 * dt, written as f64 * dt,
         )?;
     }
     finalize_metadata(
         &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp,
     )?;
-    tracing::info!("export_eac: done, {} frames in {:.2?}", written, t_start.elapsed());
+    tracing::info!("{tag}: done, {} frames in {:.2?}", written, t_start.elapsed());
     Ok(())
 }
+
 
 /// Zero-copy EAC → VT export (macOS). The hardware-accelerated arm of
 /// [`export_eac`] — mirrors `export_fisheye_osv_zerocopy_p010`:
@@ -2697,14 +2928,11 @@ fn export_eac_zerocopy_vt(
     progress_cb: &mut dyn FnMut(ExportProgress),
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
-    use std::sync::atomic::Ordering;
-    use crate::gpu::Lens;
-
     let raw = crate::decode::SegmentedZeroCopyPairIter::new(&cfg.segments, 0)?;
     // Temporal NR, if requested, denoises the s0/s4 P010 streams on the GPU
     // before EAC cross assembly (matches the Python app's source-stream
     // denoise) — no CPU readback.
-    let mut decoder = if cfg.denoise_strength > 0.0 && crate::vt_denoise::is_supported() {
+    let decoder = if cfg.denoise_strength > 0.0 && crate::vt_denoise::is_supported() {
         tracing::info!(
             "export_eac (zc): temporal NR ENGAGED on GPU (strength={:.2})",
             cfg.denoise_strength
@@ -2715,201 +2943,37 @@ fn export_eac_zerocopy_vt(
     } else {
         crate::decode::ZcEacDecoder::Raw(raw)
     };
-    let dims = decoder.dims();
-    if !dims.is_valid() {
-        return Err(Error::Ffmpeg(format!(
-            "export_eac (zc): invalid EAC layout (stream w={})", dims.stream_w)));
-    }
-
-    let sbs_w = cfg.eye_w * 2;
-    let sbs_h = cfg.eye_h;
-    let dt = 1.0 / cfg.fps as f64;
-    let trim_in_frame = cfg.trim_in_s.map(|t| (t.max(0.0) * cfg.fps as f64).round() as u32).unwrap_or(0);
-    let trim_out_frame = cfg.trim_out_s.map(|t| (t * cfg.fps as f64).round() as u32);
-    // One-pass: encode STRAIGHT to the final file and mux the source's
-    // stereo audio inline — no `.video.tmp` + full re-mux copy (which at
-    // ProRes bitrates dwarfed the encode itself). Ambisonic / APAC keep
-    // the temp+finalize path (they need post-encode steps). Same posture
-    // as the OSV VT arm and the portable EAC loop; this arm was the last
-    // stereo path still doing two passes.
-    let one_pass = one_pass_audio_eligible(&cfg);
-    let video_tmp = if one_pass { cfg.output_path.clone() }
-                    else { video_only_temp_path(&cfg.output_path) };
-
-    let is_prores_vt = matches!(cfg.encoder, EncoderBackend::ProResVideoToolbox);
-    let ten_bit = cfg.bit_depth == 10 || is_prores_vt;
-    // A spatial video export feeds the same P010 surfaces to the MV-HEVC
-    // encoder (`prepare_spatial` pinned 10-bit HEVC, so `ten_bit` holds).
-    let mut encoder: ExportEncoder = if let Some(enc) = open_spatial_encoder(&cfg, &video_tmp)? {
-        enc
-    } else if is_prores_vt {
-        H265Encoder::create_zero_copy_vt_prores(
-            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.prores_profile)?.into()
-    } else if ten_bit {
-        H265Encoder::create_zero_copy_vt_p010(
-            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps)?.into()
-    } else {
-        H265Encoder::create_zero_copy_vt(
-            &video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps)?.into()
-    };
-    // Inline audio passthrough (must be attached before the first frame).
-    // The audio window is clipped to the video's expected length: per_eye
-    // covers the whole chain when stabilizing; otherwise (empty per_eye)
-    // probe the chain — per_eye.len() would clip the audio to nothing.
-    let one_pass_audio_tmp = if one_pass {
-        let total_video_frames = if per_eye.is_empty() {
-            if cfg.segments.len() > 1 {
-                cfg.segments.iter().map(|s| chain_segment_frames(s, cfg.fps)).sum::<usize>()
+    run_eac_frames(
+        &pipeline, &cfg, "export_eac (zc)", decoder, &per_eye, (lens_l, lens_r),
+        |video_tmp, sbs_w, sbs_h, span| {
+            let is_prores_vt = matches!(cfg.encoder, EncoderBackend::ProResVideoToolbox);
+            let ten_bit = cfg.bit_depth == 10 || is_prores_vt;
+            // A spatial video export feeds the same P010 surfaces to the MV-HEVC
+            // encoder (`prepare_spatial` pinned 10-bit HEVC, so `ten_bit` holds).
+            let encoder: ExportEncoder = if let Some(enc) = open_spatial_encoder(&cfg, video_tmp)? {
+                enc
+            } else if is_prores_vt {
+                H265Encoder::create_zero_copy_vt_prores(
+                    video_tmp, sbs_w, sbs_h, cfg.fps, cfg.prores_profile)?.into()
+            } else if ten_bit {
+                H265Encoder::create_zero_copy_vt_p010(
+                    video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps)?.into()
             } else {
-                crate::decode::probe_video(&cfg.source_path)
-                    .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
-                    .unwrap_or(0)
-            }
-        } else { per_eye.len() };
-        let dur = trim_out_frame
-            .map(|o| (o.saturating_sub(trim_in_frame)) as f64 * dt)
-            .unwrap_or((total_video_frames.saturating_sub(trim_in_frame as usize)) as f64 * dt);
-        let (asrc, atmp, aoff) = stereo_audio_source(&cfg, trim_in_frame as f64 * dt, dur);
-        if let Err(e) = encoder.attach_audio_passthrough(
-            &asrc, aoff, dur,
-        ) {
-            tracing::warn!("one-pass audio attach failed: {e} — video-only output");
-        }
-        atmp
-    } else { None };
-    tracing::info!(
-        "export_eac (zc): VT zero-copy ENGAGED — {} ({}x{}, trim {}..{}, audio {})",
-        if cfg.spatial.is_some() { "MV-HEVC Main10 P010 (spatial video)" }
-        else if is_prores_vt { "ProRes-VT P210 (4:2:2)" } else if ten_bit { "HEVC Main10 P010" } else { "HEVC Main BGRA" },
-        sbs_w, sbs_h, trim_in_frame,
-        trim_out_frame.map(|f| f.to_string()).unwrap_or_else(|| "end".into()),
-        if one_pass { "one-pass inline" } else { "two-pass finalize" },
-    );
-
-    // Precise seek to trim-in (run-in discarded inside the iterator).
-    if trim_in_frame > 0 {
-        decoder.seek(trim_in_frame as f64 * dt)?;
-    }
-
-    let color_plan = cfg.color_stack.clone();
-    let view = cfg.view_adjust;
-    let view_active = !view.is_identity();
-    let (v_l, v_r) = view.per_eye_matrices();
-
-    let t_start = std::time::Instant::now();
-    let mut frame_idx: u32 = trim_in_frame;
-    let mut written: u64 = 0;
-    let total_est = trim_out_frame
-        .map(|o| (o.saturating_sub(trim_in_frame)) as u64)
-        .unwrap_or(per_eye.len() as u64);
-
-    while let Some(pair) = decoder.next_pair(&pipeline.device)? {
-        if cancel.load(Ordering::SeqCst) {
-            tracing::info!("export_eac (zc): cancelled at frame {}", frame_idx);
-            break;
-        }
-        if let Some(out_f) = trim_out_frame {
-            if frame_idx >= out_f { break; }
-        }
-
-        // 10-bit output → 16-bit chain end to end (P010's 10 bits
-        // survive into the cross + equirect instead of an 8-bit
-        // quantize); 8-bit output → 8-bit chain (cheaper, same result
-        // after the BGRA compose).
-        let (cross_a, cross_b) = if ten_bit {
-            (pipeline.nv12_to_eac_cross_16(
-                &pair.s0_y.texture, &pair.s0_uv.texture,
-                &pair.s4_y.texture, &pair.s4_uv.texture, Lens::A, dims)?,
-             pipeline.nv12_to_eac_cross_16(
-                &pair.s0_y.texture, &pair.s0_uv.texture,
-                &pair.s4_y.texture, &pair.s4_uv.texture, Lens::B, dims)?)
-        } else {
-            (pipeline.nv12_to_eac_cross(
-                &pair.s0_y.texture, &pair.s0_uv.texture,
-                &pair.s4_y.texture, &pair.s4_uv.texture, Lens::A, dims)?,
-             pipeline.nv12_to_eac_cross(
-                &pair.s0_y.texture, &pair.s0_uv.texture,
-                &pair.s4_y.texture, &pair.s4_uv.texture, Lens::B, dims)?)
-        };
-
-        // Per-eye stab/RS for this absolute frame (identity past the end).
-        let ((mut rl, sl), (mut rr, sr)) = per_eye.get(frame_idx as usize).copied()
-            .unwrap_or((
-                (EquirectRotation::IDENTITY, crate::gpu::EquirectRsParams::DISABLED),
-                (EquirectRotation::IDENTITY, crate::gpu::EquirectRsParams::DISABLED),
-            ));
-        if view_active {
-            rl = EquirectRotation(crate::panomap::mat3_mul_row_major(&rl.0, &v_l));
-            rr = EquirectRotation(crate::panomap::mat3_mul_row_major(&rr.0, &v_r));
-        }
-
-        // Left eye = Lens B, right eye = Lens A (same as preview + CPU
-        // path). Projection target follows cfg.projection — half-equirect
-        // (VR180) or equidistant fisheye (parity with the OSV output).
-        let fisheye_out = matches!(cfg.projection, FisheyeExportProjection::Fisheye);
-        let (left, right) = match (ten_bit, fisheye_out) {
-            (true, false) => (
-                pipeline.project_cross_texture_to_equirect_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
-                pipeline.project_cross_texture_to_equirect_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?),
-            (false, false) => (
-                pipeline.project_cross_texture_to_equirect_texture(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
-                pipeline.project_cross_texture_to_equirect_texture(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?),
-            (true, true) => (
-                pipeline.project_cross_texture_to_fisheye_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
-                pipeline.project_cross_texture_to_fisheye_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?),
-            (false, true) => (
-                pipeline.project_cross_texture_to_fisheye_texture(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
-                pipeline.project_cross_texture_to_fisheye_texture(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?),
-        };
-
-        if ten_bit {
-            // Per-eye color (no-op when the plan is identity), then
-            // compose into the encode IOSurface — P210 (true 4:2:2) for
-            // ProRes, P010 for HEVC Main10.
-            let left_g = pipeline.apply_color_stack_per_eye_16(
-                &left, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true))?;
-            let right_g = pipeline.apply_color_stack_per_eye_16(
-                &right, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false))?;
-            let l_final = left_g.as_ref().unwrap_or(&left);
-            let r_final = right_g.as_ref().unwrap_or(&right);
-            encode_wide_surface(
-                &pipeline, &mut encoder, l_final, r_final, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
-                false, is_prores_vt, 1,
-            )?;
-        } else {
-            // Color stack fused into the BGRA compose.
-            encode_bgra_surface(
-                &pipeline, &mut encoder, &left, &right, cfg.eye_w, cfg.eye_h, sbs_w, sbs_h,
-                false, &color_plan, None, 1,
-            )?;
-        }
-
-        drop(pair);
-        frame_idx += 1;
-        written += 1;
-        let elapsed = t_start.elapsed().as_secs_f32().max(1e-3);
-        progress_cb(ExportProgress {
-            frame_idx: written,
-            total_frames: total_est,
-            fps_avg: written as f32 / elapsed,
-        });
-    }
-
-    encoder.finish()?;
-    if one_pass {
-        // Audio already muxed inline — drop the playlist temp, if any.
-        if let Some(t) = one_pass_audio_tmp { std::fs::remove_file(t).ok(); }
-    } else {
-        finalize_eac_audio(
-            &cfg, &video_tmp,
-            trim_in_frame as f64 * dt, written as f64 * dt,
-        )?;
-    }
-    finalize_metadata(
-        &cfg.output_path, cfg.inject_youtube_vr180, cfg.inject_apmp,
-    )?;
-    tracing::info!("export_eac (zc): done, {} frames in {:.2?}", written, t_start.elapsed());
-    Ok(())
+                H265Encoder::create_zero_copy_vt(
+                    video_tmp, sbs_w, sbs_h, cfg.fps, cfg.bitrate_kbps)?.into()
+            };
+            tracing::info!(
+                "export_eac (zc): VT zero-copy ENGAGED — {} ({}x{}, trim {}..{}, audio {})",
+                if cfg.spatial.is_some() { "MV-HEVC Main10 P010 (spatial video)" }
+                else if is_prores_vt { "ProRes-VT P210 (4:2:2)" } else if ten_bit { "HEVC Main10 P010" } else { "HEVC Main BGRA" },
+                sbs_w, sbs_h, span.trim_in_frame,
+                span.trim_out_frame.map(|f| f.to_string()).unwrap_or_else(|| "end".into()),
+                if span.one_pass { "one-pass inline" } else { "two-pass finalize" },
+            );
+            Ok((encoder, if ten_bit { FrameSink::WideSurface { p210: is_prores_vt } } else { FrameSink::BgraSurface }))
+        },
+        progress_cb, &cancel,
+    )
 }
 
 /// Windows GPU-resident EAC export — the GoPro `.360` analog of
@@ -4493,95 +4557,6 @@ fn build_eye_eq_16(
     }
     let right = eye(&pair.right, rot_right, calib_right, rs_r, 31)?;
     Ok((left, right))
-}
-
-/// Upload a packed Rgba8 buffer as an `Rgba8Unorm` texture with
-/// TEXTURE_BINDING + COPY_SRC usage so it can flow downstream into the
-/// compose pipeline. Used by the Fisheye pass-through projection.
-fn upload_rgba8_texture(
-    pipeline: &Device,
-    rgba: &[u8],
-    w: u32, h: u32,
-    label: &str,
-) -> Result<wgpu::Texture> {
-    let tex = pipeline.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        mip_level_count: 1, sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::STORAGE_BINDING,
-        view_formats: &[],
-    });
-    pipeline.queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &tex, mip_level: 0,
-            origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
-        },
-        rgba,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(w * 4),
-            rows_per_image: Some(h),
-        },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-    );
-    Ok(tex)
-}
-
-/// Upload an RGB(A) buffer as an `Rgba16Unorm` texture. Accepts source
-/// in 8-bit RGBA8 (widened by repeating each byte) or 16-bit
-/// RGBA64LE (copied verbatim).
-fn upload_rgba_as_rgba16(
-    pipeline: &Device,
-    src: &[u8],
-    w: u32, h: u32,
-    src_bit_depth: u8,
-    label: &str,
-) -> Result<wgpu::Texture> {
-    let n_pixels = (w as usize) * (h as usize);
-    let bytes_per_row = w * 8;
-    let wide: std::borrow::Cow<[u8]> = if src_bit_depth >= 16 {
-        std::borrow::Cow::Borrowed(src)
-    } else {
-        let mut out = Vec::with_capacity(n_pixels * 8);
-        for px in src.chunks_exact(4) {
-            out.push(px[0]); out.push(px[0]);
-            out.push(px[1]); out.push(px[1]);
-            out.push(px[2]); out.push(px[2]);
-            out.push(0xFF); out.push(0xFF);
-        }
-        std::borrow::Cow::Owned(out)
-    };
-    let tex = pipeline.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        mip_level_count: 1, sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::STORAGE_BINDING,
-        view_formats: &[],
-    });
-    pipeline.queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &tex, mip_level: 0,
-            origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
-        },
-        &wide,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(bytes_per_row),
-            rows_per_image: Some(h),
-        },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-    );
-    Ok(tex)
 }
 
 /// Apply the color stack to an Rgba8 SBS readback buffer. Walks the
