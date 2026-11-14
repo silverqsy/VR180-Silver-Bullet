@@ -1786,31 +1786,14 @@ fn export_fisheye_inner(
             .and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(EquirectRotation::IDENTITY);
 
-        // Compose per-eye view adjustment (global pano-map + stereo
-        // offset) AFTER stab. `is_identity()` short-circuit means
-        // default-zero export is byte-identical to the pre-pano-map
-        // pipeline.
-        let (rot_l0, rot_r0) = crate::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes);
-        let (rot_left, rot_right) = if cfg.view_adjust.is_identity() {
-            (rot_l0, rot_r0)
-        } else {
-            let (v_l, v_r) = cfg.view_adjust.per_eye_matrices();
-            (
-                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
-                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
-            )
-        };
-
-        // Per-row RS matrices for this frame — identical CPU build to the
-        // zero-copy paths. None (= legacy projection, byte-identical) when
-        // not stabilizing or non-OSV.
-        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if rs_enabled {
-            dji_osv_imu.as_ref().map(|osv| crate::dji_imu::per_eye_rs_rows(
-                osv, stab_idx, readout_s, src_h, cfg.fps, cfg.fisheye_swap_eyes,
-            )).unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
+        // Each eye's rotation (stab, then the view adjustment) and, when
+        // stabilizing a source with an IMU, its per-row matrices.
+        let crate::render::FramePose {
+            rot_left, rot_right, rows_left: rs_rows_l, rows_right: rs_rows_r,
+        } = crate::render::FramePose::new(
+            rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes, &cfg.view_adjust,
+            rs_enabled.then_some(crate::render::RowReadout { readout_s, src_h, fps: cfg.fps }),
+        );
 
         // 8-bit per-eye projection, built lazily — ONLY the arms that
         // consume it call this (BGRA zero-copy + 8-bit readback). The
@@ -3274,32 +3257,14 @@ fn export_fisheye_osv_zerocopy_p010(
             .and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(crate::gpu::EquirectRotation::IDENTITY);
 
-        // Per-row RS matrices for this frame. Built lazily on the CPU;
-        // <200 KB at 3840 rows so the per-frame `queue.write_buffer`
-        // is negligible vs the 138 MB+ that the zero-copy path saved
-        // on the decode side.
-        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if rs_enabled {
-            dji_osv_imu.as_ref().map(|osv| crate::dji_imu::per_eye_rs_rows(
-                osv, stab_idx, readout_s, src_h, cfg.fps, cfg.fisheye_swap_eyes,
-            )).unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-
-        // Compose per-eye view adjustment AFTER stab. is_identity()
-        // short-circuit means default-zero export is byte-identical.
-        let (rot_l0, rot_r0) = crate::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes);
-        let (rot_left, rot_right) = if cfg.view_adjust.is_identity() {
-            (rot_l0, rot_r0)
-        } else {
-            let (v_l, v_r) = cfg.view_adjust.per_eye_matrices();
-            (
-                crate::gpu::EquirectRotation(
-                    crate::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
-                crate::gpu::EquirectRotation(
-                    crate::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
-            )
-        };
+        // Each eye's rotation (stab, then the view adjustment) and its
+        // per-row matrices: <200 KB at 3840 rows, built on the CPU.
+        let crate::render::FramePose {
+            rot_left, rot_right, rows_left: rs_rows_l, rows_right: rs_rows_r,
+        } = crate::render::FramePose::new(
+            rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes, &cfg.view_adjust,
+            rs_enabled.then_some(crate::render::RowReadout { readout_s, src_h, fps: cfg.fps }),
+        );
 
         // Project Y/UV → Rgba16Unorm output, per eye. Per-row rolling-
         // shutter correction is wired for BOTH projections — the RS warp

@@ -2642,19 +2642,11 @@ fn run_fisheye(
             let s = control.settings.read();
             s.output_view_adjust()
         };
-        let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(
-            rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes);
-        let (rot_left, rot_right) = if view_adjust.is_identity() {
-            (rot_l0, rot_r0)
-        } else {
-            let (v_l, v_r) = view_adjust.per_eye_matrices();
-            (
-                vr180_pipeline::gpu::EquirectRotation(
-                    vr180_pipeline::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
-                vr180_pipeline::gpu::EquirectRotation(
-                    vr180_pipeline::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
-            )
-        };
+        // (This arm builds its per-row matrices itself, above, beside the
+        // diagnostics that read them.)
+        let vr180_pipeline::render::FramePose { rot_left, rot_right, .. } =
+            vr180_pipeline::render::FramePose::new(
+                rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes, &view_adjust, None);
         // Decide projection target: half-equirect VR180 (default) or
         // stabilized fisheye output. Both paths apply the per-frame stab
         // matrix composed with the per-eye view-adjust (so panomap +
@@ -3724,31 +3716,19 @@ fn run_fisheye_vt_zerocopy(
 
         // Per-row rolling-shutter correction (OSV; gated on stabilize, like the
         // CPU/paused-still path). `src_h` is the working-res fisheye height.
-        let swapped_eyes = control.settings.read().effective_swap_eyes();
-        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if control.settings.read().stabilize {
-            dji_osv_imu.as_ref().map(|osv| vr180_pipeline::dji_imu::per_eye_rs_rows(
-                osv, stab_idx,
-                vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0,
-                src_h, fps, swapped_eyes,
-            )).unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-        let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes);
-
-        let view_adjust = {
+        let (swapped_eyes, stabilize, view_adjust) = {
             let s = control.settings.read();
-            s.output_view_adjust()
+            (s.effective_swap_eyes(), s.stabilize, s.output_view_adjust())
         };
-        let (rot_left, rot_right) = if view_adjust.is_identity() {
-            (rot_l0, rot_r0)
-        } else {
-            let (v_l, v_r) = view_adjust.per_eye_matrices();
-            (
-                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
-                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
-            )
-        };
+        let vr180_pipeline::render::FramePose {
+            rot_left, rot_right, rows_left: rs_rows_l, rows_right: rs_rows_r,
+        } = vr180_pipeline::render::FramePose::new(
+            rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes, &view_adjust,
+            stabilize.then(|| vr180_pipeline::render::RowReadout {
+                readout_s: vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0,
+                src_h, fps,
+            }),
+        );
 
         let (left_tex, right_tex) = {
             let (mode, aspect) = {
@@ -6065,22 +6045,15 @@ fn render_still_from_pair(
         .and_then(|v| v.get(stab_idx).copied())
         .unwrap_or(EquirectRotation::IDENTITY);
 
-    let view_adjust = s.output_view_adjust();
-    let swapped_eyes = s.effective_swap_eyes();
-    let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(rot, imu, stab_idx, swapped_eyes);
-    let (rot_left, rot_right) = if view_adjust.is_identity() { (rot_l0, rot_r0) } else {
-        let (vl, vr) = view_adjust.per_eye_matrices();
-        (EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_l0.0, &vl)),
-         EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_r0.0, &vr)))
-    };
-
-    let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if s.stabilize && stab_rotations.is_some() {
-        imu.map(|osv| vr180_pipeline::dji_imu::per_eye_rs_rows(
-            osv, stab_idx,
-            vr180_pipeline::dji_imu::readout_ms_for(kind, fps, imu) / 1000.0,
-            src_h, fps, swapped_eyes,
-        )).unwrap_or((None, None))
-    } else { (None, None) };
+    let vr180_pipeline::render::FramePose {
+        rot_left, rot_right, rows_left: rs_rows_l, rows_right: rs_rows_r,
+    } = vr180_pipeline::render::FramePose::new(
+        rot, imu, stab_idx, s.effective_swap_eyes(), &s.output_view_adjust(),
+        (s.stabilize && stab_rotations.is_some()).then(|| vr180_pipeline::render::RowReadout {
+            readout_s: vr180_pipeline::dji_imu::readout_ms_for(kind, fps, imu) / 1000.0,
+            src_h, fps,
+        }),
+    );
 
     let (left_tex, right_tex) = {
         let fisheye_out = s.fisheye_output_mode == FisheyeOutputMode::Fisheye;
