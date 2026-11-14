@@ -5332,6 +5332,20 @@ impl eframe::App for App {
         }
     }
 
+    /// eframe calls this before every frame, and it is the ONLY thing it
+    /// calls while the window is minimised or fully covered by another one:
+    /// `update()` is skipped then. A finished export has to hand over to
+    /// the next queued one with nobody looking, so that hand-over lives
+    /// here, together with the wake-up that brings this back while a run
+    /// is in flight.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Drain export-job progress + check for completion.
+        self.poll_export_job();
+        if self.batch_running || self.export_job.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
+
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Mirror the chosen language into the process global that `tr` reads.
@@ -5393,8 +5407,8 @@ impl eframe::App for App {
                 self.load_file_inner(p, true);
             }
         }
-        // Drain export-job progress + check for completion.
-        self.poll_export_job();
+        // (Export-job progress + completion are polled in `logic()`, which
+        // runs just before this and also while the window is hidden.)
         // Auto-update: drain events + periodic re-check + popover.
         self.poll_updater(ctx);
         self.poll_dialogs();
