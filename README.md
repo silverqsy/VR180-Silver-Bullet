@@ -42,7 +42,8 @@ Studio).
   7680×3840 or 32:9 up to 7680×2160.
 - **Real-time preview** of the exact 10-bit stack the export uses. SBS,
   anaglyph, 50% overlay and single-eye views, a native-resolution
-  magnifier, audio playback.
+  magnifier, audio playback. On macOS, **Match QuickTime** shows it with
+  the tone curve Apple's players give the exported file.
 - **Stabilization** from the camera's gyro, with timing derived from the
   file: velocity-dampened soft-stab with a Response slider, a Camera lock
   toggle, and per-scanline rolling-shutter correction.

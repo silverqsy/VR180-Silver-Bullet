@@ -2285,6 +2285,87 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      single-threaded fast ones for 10-bit sources and slower for 8-bit
      sources, 10 ms against 2.5 for a 3840² frame).
 
+32. **The preview as Apple's players show the export (2026-11-14, Mac;
+   UNRELEASED).** A toolbar switch, **Match QuickTime**: macOS only, off by
+   default, kept in `…/VR180SilverBullet2.0/preview_colour` (a view choice
+   of the app, like `lang`; not in `Settings`, which is per clip and per
+   camera). Module `crates/vr180-gui/src/display_colour.rs`: read its
+   header.
+   - **Why**: the exports are tagged Rec.709. The system's players read
+     that as `kCGColorSpaceCoreMedia709` (it is what
+     `CVImageBufferCreateColorSpaceFromAttachments` returns for a decoded
+     frame of one) and colour-match it to the display. The preview window
+     is colour-matched too, but as **sRGB**: a `CAMetalLayer` takes
+     `kCGColorSpaceSRGB` the moment its pixel format is set to an 8-bit one
+     (macOS 27.2: none before, sRGB after; wgpu-hal sets the format in
+     `configure` and never a colour space). Same primaries, another curve:
+     mid-tones about 10 of 255 apart, QuickTime the brighter. It was always
+     so, and nothing in the export is wrong: do not "fix" this by changing
+     the export's tags. **The window is NOT unmanaged**: the first version
+     of this work assumed it was, and its "off" removed the layer's colour
+     space, which made the whole window more saturated than it had ever
+     been on a wide-gamut display.
+   - **The curve is ColorSync's, read from the system**: the profile's TRC
+     is a `curv` gamma of 1.9609375 (502 / 256), and the parametric stages
+     ColorSync builds from it are `ParamCurve3 (1.960938, 1, 0, 0.0625,
+     0.05583828)`: that power above 0.0558, a straight toe of slope 1 / 16
+     below. Then the destination's encoding; to sRGB there is no matrix
+     between the two (same primaries), so the curve is the whole
+     conversion: `display_colour::rec709_video_to_srgb`, held by a test to
+     the codes CoreGraphics itself gives a grey ramp (within 0.08 of 255).
+     Not the Rec.709 camera curve turned around (`kCGColorSpaceITUR_709` is
+     that one, and video does not get it), not 2.4, and a bare power of
+     1.961 is 2.7 codes dark at code 7.
+   - **How**: with the switch on, the picture is drawn by `PreviewPainter`,
+     an `egui_wgpu` paint callback with its own small shader, in place of
+     egui's image widget, and a video frame goes through the curve on the
+     way (`PictureEncoding::Rec709Video`; a photo source is `Srgb`,
+     untouched). Both preview draws use it: the main view and the two
+     halves of the 3D display. Nothing upstream changes: the frame
+     textures, the zoom still, Snapshot and every export are identical with
+     the switch on or off. The interface around the picture does not change
+     either.
+   - **The window's layer**: the conversion rests on the layer being sRGB,
+     so while the switch is on `set_window_colour_matching` makes sure of
+     it (`NSApp.windows` → content view → its layer → the `CAMetalLayer`
+     wgpu adds as a sublayer; end of every `update`). A layer that is sRGB
+     already is never written, which on macOS 27 is every layer, always.
+     One that is not gets tagged and gets its own colour space back when
+     the switch goes off; the app logs either.
+   - **Off is the old path, untouched**: egui's image widget, no layer
+     written, no painter (it is built on first use). Windows and Linux never
+     run any of it: `display_colour::available()` is `cfg!(target_os =
+     "macos")`, the switch is not drawn, the layer routine is a stub. The
+     module compiles everywhere (plain wgpu + egui); its only gate is its
+     own `platform` module pair, and `app.rs` has none.
+   - **Checked against the compositor**: Core Animation's own renderer
+     (`CARenderer`, in-process, into a target in the display's colour
+     space) draws (a) a frame decoded from a Rec.709-tagged HEVC Main10
+     file as the video surface a player's layer holds and (b) the same
+     picture as an sRGB-tagged surface holding the app's matched values. 96
+     flat colours (greys from 0 to 255 with the toe sampled every 2 codes,
+     primaries, skin tones): worst 0.39 of 255 for the arithmetic, 0.62 for
+     the 8-bit values the window holds; with the switch off the two are up
+     to 11.4 apart (mean 5.2). Same result for the Studio Display's own
+     profile, Display P3 and sRGB.
+   - **Checked without a window**: `display_colour::tests` draw through a
+     real `egui_wgpu::Renderer` into an off-screen `Bgra8Unorm` target set
+     up as eframe sets up the window's pass. A video ramp comes out on the
+     curve (every code of every channel within the dither, mean +0.01); a
+     photo comes out code for code; and for a zoomed, off-grid rectangle on
+     a 2× screen the painter's picture is identical, pixel for pixel, to
+     the image widget's (egui snaps a filled rectangle to whole pixels, so
+     the painter sets that viewport itself instead of taking the one egui
+     cuts off at the screen's edge). The layer routine has a test on a bare
+     layer tree (three Metal layers: none / sRGB / Display P3).
+   - **On screen**: the user saw the preview get a little brighter with the
+     switch (2026-11-14); a side-by-side with QuickTime on the same graded
+     frame was still to be done when this was written.
+   - **Known gaps**: a Snapshot JPEG carries no profile, so Preview reads
+     it as sRGB and it looks like the preview with the switch off; the
+     conversion is 8-bit in, 8-bit out with egui's dither, like the image
+     path it replaces.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

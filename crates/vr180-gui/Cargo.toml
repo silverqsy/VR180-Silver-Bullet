@@ -72,6 +72,9 @@ winresource = "0.1"
 # Display enumeration for the 3D-display output (see src/displays.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.23"
+# The window layer's colour space (see src/display_colour.rs): plain message
+# sends, the same objc2 wgpu-hal already brings in.
+objc2 = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_HiDpi"] }
