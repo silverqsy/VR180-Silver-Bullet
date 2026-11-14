@@ -19,7 +19,9 @@
 //! | `VR180_PROBE_EYE` | working width of one eye, pixels | `1024` |
 //! | `VR180_PROBE_LUT` | a `.cube` file, applied at full strength | none |
 //! | `VR180_PROBE_AUTO_EYE` | `1` keeps the automatic eye match | off |
+//! | `VR180_PROBE_ETTR` | stops the clip was shot over (the ETTR recovery; I-Log clips only, as in the app) | `0` |
 //! | `VR180_PROBE_JPEG` | a folder to write each frame into | none |
+//! | `VR180_PROBE_RAW` | a folder to write each frame's bytes into (`<label>.rgb`: R, G, B per pixel, row by row) | none |
 //! | `VR180_PROBE_STILL` | `1` also renders each moment's zoom still (the magnifier's and the snapshot's picture) | off |
 //! | `VR180_PROBE_STILL_CAP` | width cap of that still's eye, `0` = native | `2048` |
 
@@ -66,7 +68,12 @@ fn settings_for(path: &Path) -> anyhow::Result<Settings> {
         s.lut_path = lut;
         s.lut_intensity = 1.0;
     }
+    if let Some(stops) = switch("VR180_PROBE_ETTR") {
+        s.ettr_stops = stops.parse()?;
+    }
     let kind = vr180_pipeline::source_kind::detect(path)?;
+    // What the app tells the copy of the settings its preview works from.
+    s.ilog_source = crate::app::file_takes_ilog(kind, path);
     Ok(if vr180_pipeline::source_kind::is_single_eye(kind, path) { s.for_single_eye() } else { s })
 }
 
@@ -114,7 +121,8 @@ pub(crate) fn run(clip: &Path) -> anyhow::Result<()> {
         .split(',').map(|t| t.trim().parse()).collect::<Result<_, _>>()?;
     let eye_w: u32 = switch("VR180_PROBE_EYE").map(|v| v.parse()).transpose()?.unwrap_or(1024);
     let jpeg_dir = switch("VR180_PROBE_JPEG").map(PathBuf::from);
-    if let Some(dir) = &jpeg_dir {
+    let raw_dir = switch("VR180_PROBE_RAW").map(PathBuf::from);
+    for dir in jpeg_dir.iter().chain(&raw_dir) {
         std::fs::create_dir_all(dir)?;
     }
 
@@ -143,10 +151,16 @@ pub(crate) fn run(clip: &Path) -> anyhow::Result<()> {
         let (w, h) = (frame.width, frame.height);
         let px = pipeline.read_texture_rgb8(&frame.texture, w, h)?;
         println!("{label} frame={:<5} ts={:<9.4} {w}x{h} {:016x}", frame.frame_idx, frame.timestamp_s, fnv(&px));
-        if let Some(dir) = &jpeg_dir {
+        if jpeg_dir.is_some() || raw_dir.is_some() {
             // The texture holds B, G, R.
             let rgb: Vec<u8> = px.chunks_exact(3).flat_map(|p| [p[2], p[1], p[0]]).collect();
-            image::save_buffer(dir.join(format!("{}.jpg", label.trim())), &rgb, w, h, image::ColorType::Rgb8)?;
+            let name = label.trim().replace(' ', "_");
+            if let Some(dir) = &jpeg_dir {
+                image::save_buffer(dir.join(format!("{name}.jpg")), &rgb, w, h, image::ColorType::Rgb8)?;
+            }
+            if let Some(dir) = &raw_dir {
+                std::fs::write(dir.join(format!("{name}.rgb")), &rgb)?;
+            }
         }
         Ok(())
     };
