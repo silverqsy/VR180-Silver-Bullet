@@ -4588,6 +4588,14 @@ fn apply_color_stack_rgb8(
     mut rgb: Vec<u8>,
     w: u32, h: u32,
 ) -> Result<Vec<u8>> {
+    // The exposure change on log footage comes first, as in the GPU stacks:
+    // per channel and on bytes here, so a table does it.
+    if let Some(exposure) = plan.log_exposure {
+        let table = exposure.table8();
+        for v in rgb.iter_mut() {
+            *v = table[*v as usize];
+        }
+    }
     // Python order: CDL → LUT → temp/tint → saturation (this fallback has
     // no sharpen / mid-detail stage).
     if !plan.cdl.is_identity() {

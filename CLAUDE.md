@@ -2196,6 +2196,46 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      Spatial choice carried in settings runs as H.265 —
      `spatial_export_tests` passes on Windows with the non-Mac expectations.
 
+30. **ETTR recovery for X6 I-Log clips (2026-11-14, Mac; UNRELEASED)** —
+   Color ▸ "ETTR recovery (I-Log)": `Settings::ettr_stops` (0 / +1 / +2 / +3
+   and a fine value, 0–4) is how far over a clip was shot; the stack takes
+   that much exposure back out in scene-linear light.
+   - **The curve**: `vr180_core::LogCurve` (straight toe + logarithm, f64
+     `encode` / `decode` / `expose`), `LogCurve::INSTA360_ILOG` = the
+     constants of Insta360's "I-Log White Paper" (June 2026, "Conversion
+     Specification"). Its code is the normalised R'G'B' the decoders already
+     produce: black 0.0906 (what the eye-match tuning measured as 0.091).
+   - **The stage**: `gpu::LogExposure { curve, stops }` in
+     `ColorStackPlan::log_exposure`, shader `log_exposure.wgsl`
+     (`u' = E(D(u) · 2^stops)` per channel, the curve as a uniform; 16-bit
+     variant by the usual storage-format replacement). Order in all three
+     GPU stacks (`apply_color_stack_texture`, `record_color_stack`,
+     `record_color_stack_16`): automatic eye offset → **log exposure** → CDL
+     → LUT → … The eye offset stays first because it is measured on the
+     source's own codes. The 8-bit host fallback
+     (`fisheye_export::apply_color_stack_rgb8`) does it with a 256-entry
+     table (`LogExposure::table8`).
+   - **Which clips**: `takes_ilog(kind, x6)` in `app.rs` (an X6 video whose
+     `gamma_mode` does not say otherwise), the same rule the built-in LUT
+     follows. The settings as stored carry only the amount; the copy a
+     renderer gets (`worker_settings`, `BatchItem::export_settings`) carries
+     `Settings::ilog_source` (`#[serde(skip)]`), and `build_color_stack`
+     emits the stage only with both. A new clip starts at 0
+     (`add_batch_files`); "Apply settings to all" copies the amount to
+     I-Log clips and zeroes it on the others; `finish_load` zeroes it on
+     anything that is not I-Log.
+   - **Verified**: `log_exposure_tests` (every 16-bit code against the f64
+     curve at −3 / −2 / −1 / +1 stops: worst 0.5 / 65535; both 8-bit stacks
+     against the table: ±1), `log_curve_tests`, `ettr_tests`; real exports
+     through every arm (zero-copy 10 / 8 bit, libx265 10 / 8 bit, ProRes)
+     with and without it: the recovered frame minus the curve applied to the
+     untouched one averages within 0.6 of a 10-bit code.
+   - **WINDOWS**: shared code only, no gates touched: pull + rebuild. The new
+     shader is compiled when the device is created, so
+     `cargo test -p vr180-pipeline --lib log_exposure` on the Windows GPU
+     checks it on that backend; the arms to try are the same as for any
+     colour stage (zero-copy D3D11, GPU-resident, portable).
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

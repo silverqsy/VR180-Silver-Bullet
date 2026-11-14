@@ -755,6 +755,92 @@ mod export_size_tests {
 }
 
 #[cfg(test)]
+mod ettr_tests {
+    use super::{takes_ilog, App, BatchItem, BatchStatus, ExportOptions, X6ClipInfo};
+    use crate::decoder::Settings;
+    use vr180_core::LogCurve;
+    use vr180_pipeline::SourceKind;
+
+    fn x6(ilog: Option<bool>) -> X6ClipInfo {
+        X6ClipInfo { window: None, ilog, paraxial_native: 2086.97, single_lens: false, single_eye: false }
+    }
+
+    fn item(source_kind: SourceKind, x6: Option<X6ClipInfo>, ettr_stops: f32) -> BatchItem {
+        BatchItem {
+            path: "/nonexistent/in.insv".into(),
+            fps: 29.97, duration_sec: 10.0, source_kind,
+            fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
+            settings: Settings { ettr_stops, ..Default::default() },
+            status: BatchStatus::Idle, selected: false, x6,
+        }
+    }
+
+    #[test]
+    fn which_clips_are_ilog() {
+        let insv = SourceKind::Insta360Insv;
+        assert!(takes_ilog(insv, Some(&x6(Some(true)))));
+        // A file that does not state its profile, or has no readable
+        // trailer at all, is taken as I-Log.
+        assert!(takes_ilog(insv, Some(&x6(None))));
+        assert!(takes_ilog(insv, None));
+        assert!(!takes_ilog(insv, Some(&x6(Some(false)))));
+        for other in [SourceKind::DjiOsv, SourceKind::GoProEac, SourceKind::SbsFisheye, SourceKind::Insta360Dng] {
+            assert!(!takes_ilog(other, None), "{other:?}");
+        }
+    }
+
+    /// The amount a clip was shot over comes back out as that many stops
+    /// down, in the I-Log curve, and only for a clip that is I-Log.
+    #[test]
+    fn the_recovery_reaches_the_export_of_an_ilog_clip_only() {
+        let insv = SourceKind::Insta360Insv;
+        for stops in [1.0_f32, 2.0, 3.0] {
+            let plan = item(insv, Some(x6(Some(true))), stops).export_settings().build_color_stack();
+            let e = plan.log_exposure.expect("the stage");
+            assert_eq!((e.stops, e.curve), (-stops, LogCurve::INSTA360_ILOG));
+            assert!(plan.any_active());
+        }
+        // Off is no stage at all.
+        assert!(item(insv, Some(x6(Some(true))), 0.0).export_settings().build_color_stack().log_exposure.is_none());
+        // A value that reached a clip of another profile or camera does nothing.
+        for it in [item(insv, Some(x6(Some(false))), 2.0), item(SourceKind::DjiOsv, None, 2.0)] {
+            assert!(it.export_settings().build_color_stack().log_exposure.is_none(), "{:?}", it.source_kind);
+        }
+        // A single-eye clip is graded the same way.
+        let one = BatchItem { x6: Some(X6ClipInfo { single_eye: true, ..x6(Some(true)) }), ..item(insv, None, 2.0) };
+        assert!(one.export_settings().single_eye);
+        assert_eq!(one.export_settings().build_color_stack().log_exposure.map(|e| e.stops), Some(-2.0));
+
+        // ...and the export itself carries it.
+        let it = item(insv, Some(x6(Some(true))), 2.0);
+        let cfg = App::build_export_cfg(
+            &it.path, std::path::Path::new("/nonexistent/out.mov"),
+            it.fps, it.source_kind, it.width, it.height, it.fisheye_eye_w, it.fisheye_eye_h, None,
+            &it.export_settings(), &ExportOptions::default(), Vec::new(),
+        );
+        assert_eq!(cfg.color_stack.log_exposure.map(|e| e.stops), Some(-2.0));
+    }
+
+    /// Whether the source is I-Log is told to the copy a renderer works
+    /// from; the settings as kept and saved never say so.
+    #[test]
+    fn the_stored_settings_carry_the_amount_and_not_the_source() {
+        let s = Settings { ettr_stops: 2.0, ..Default::default() };
+        assert!(s.build_color_stack().log_exposure.is_none());
+        let json = serde_json::to_string(&s).expect("json");
+        assert!(json.contains("\"ettr_stops\":2.0") && !json.contains("ilog_source"), "{json}");
+        let back: Settings = serde_json::from_str(&json).expect("parse");
+        assert_eq!((back.ettr_stops, back.ilog_source), (2.0, false));
+        // A file from before the setting existed: off.
+        let old: Settings = serde_json::from_str("{}").expect("parse");
+        assert_eq!(old.ettr_stops, 0.0);
+        // A linear DNG has no place for it.
+        let dng = Settings { ettr_stops: 2.0, ilog_source: true, still_dng_mode: true, ..Default::default() };
+        assert!(dng.build_color_stack().log_exposure.is_none());
+    }
+}
+
+#[cfg(test)]
 mod spatial_export_tests {
     use super::{App, ExportCodec, ExportOptions, ReframeSize};
     use super::{spatial_life_size_hfov_deg, spatial_view_scaled_note, spatial_view_shown_as, tr_zh, SPATIAL_VIEW_SCALED_NOTE};
@@ -1147,10 +1233,18 @@ impl BatchItem {
         self.x6.is_some_and(|x| x.single_eye)
     }
 
+    /// The clip is taken as Insta360 I-Log (see [`takes_ilog`]).
+    fn ilog(&self) -> bool {
+        takes_ilog(self.source_kind, self.x6.as_ref())
+    }
+
     /// The settings this entry exports with: its own, taken as a single-eye
-    /// source takes them when it is one.
+    /// source takes them when it is one, and told whether its picture is
+    /// I-Log.
     fn export_settings(&self) -> crate::decoder::Settings {
-        if self.single_eye() { self.settings.for_single_eye() } else { self.settings.clone() }
+        let mut s = if self.single_eye() { self.settings.for_single_eye() } else { self.settings.clone() };
+        s.ilog_source = self.ilog();
+        s
     }
 
     /// Per-eye side of the native-sharpness canvas for this entry, under
@@ -1498,6 +1592,11 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Use built-in Osmo 360 D-LogM→709" => "使用内置 Osmo 360 D-LogM→709",
         "Use built-in GoPro GP-Log→709" => "使用内置 GoPro GP-Log→709",
         "Use built-in Insta360 X6 I-Log→709" => "使用内置 Insta360 X6 I-Log→709",
+        "ETTR recovery (I-Log)" => "ETTR 还原（I-Log）",
+        "Shot over by" => "拍摄时多曝",
+        "stops" => "档",
+        "For a clip exposed brighter than normal on purpose (exposing to the right). The extra exposure is taken back out in linear light, ahead of the tone controls and the LUT. Clipped highlights stay clipped."
+            => "用于拍摄时有意多给曝光（向右曝光）的素材。多给的曝光在线性光下还原，再进入影调和 LUT。已经剪切的高光无法恢复。",
         "Reset detail" => "重置细节",
         // View adjust
         "Global (both eyes)" => "全局（双眼）",
@@ -1706,6 +1805,19 @@ struct PendingImport {
     first: PathBuf,
 }
 
+/// The most the ETTR recovery takes back, in stops. Four stops over, a 100 %
+/// white already sits at 16 of the 22 the I-Log scale reaches at code 1.0:
+/// nothing shot brighter than that on purpose has highlights left.
+const ETTR_MAX_STOPS: f32 = 4.0;
+
+/// A clip is taken as Insta360 I-Log when it is an X6 video whose picture
+/// profile (`gamma_mode`) does not say otherwise: every recording mode can be
+/// shot in another profile, and a file that states none is taken as I-Log.
+/// The built-in I-Log LUT and the ETTR recovery both go by this.
+fn takes_ilog(kind: vr180_pipeline::SourceKind, x6: Option<&X6ClipInfo>) -> bool {
+    kind == vr180_pipeline::SourceKind::Insta360Insv && x6.map_or(true, |x| x.ilog != Some(false))
+}
+
 /// What an Insta360 X6 clip's trailer says about how it was recorded.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct X6ClipInfo {
@@ -1815,6 +1927,11 @@ impl ClipInfo {
     /// writes it as the whole frame.
     fn single_eye(&self) -> bool {
         self.x6.is_some_and(|x| x.single_eye)
+    }
+
+    /// The clip is taken as Insta360 I-Log (see [`takes_ilog`]).
+    fn ilog(&self) -> bool {
+        takes_ilog(self.source_kind, self.x6.as_ref())
     }
 
     /// Stream geometry of an X6 clip under `view` (`None` for other sources).
@@ -3127,6 +3244,9 @@ impl App {
                 }
                 settings.trim_in_s = None;
                 settings.trim_out_s = None;
+                // How a clip was exposed is its own, and its file does not
+                // say: never inherited from the last clip's setup.
+                settings.ettr_stops = 0.0;
             }
             self.batch.push(BatchItem {
                 path,
@@ -3169,6 +3289,12 @@ impl App {
         // RS mode + readout are per-clip — keep this item's own, don't copy mine.
         item.settings.rs_mode = keep_rs.0;
         item.settings.rs_readout_ms = keep_rs.1;
+        // The ETTR recovery travels with the grade, to the clips it can
+        // apply to: anything that is not I-Log keeps none, so a value it
+        // could neither show nor use never rides along to the next copy.
+        if !item.ilog() {
+            item.settings.ettr_stops = 0.0;
+        }
         // Re-arm a previously finished item so the change exports on the
         // next Start.
         if !matches!(item.status, BatchStatus::Queued) {
@@ -3850,6 +3976,7 @@ impl App {
         if !preserve_clip_settings {
             self.settings.trim_in_s = None;
             self.settings.trim_out_s = None;
+            self.settings.ettr_stops = 0.0;
         }
         // 5. Drop ClipInfo + path: the sidebar shows "No file loaded." (or
         //    "Loading…" once a new load is queued behind this).
@@ -4173,7 +4300,7 @@ impl App {
                 // mode can be shot in another profile. A file that does not
                 // state one is taken as I-Log, as before.
                 vr180_pipeline::SourceKind::Insta360Insv
-                    if meta.x6.map_or(true, |x| x.ilog != Some(false)) => Some(BUILTIN_X6_LUT_PATH),
+                    if takes_ilog(source_kind, meta.x6.as_ref()) => Some(BUILTIN_X6_LUT_PATH),
                 // The QooCam's HDR mode records HLG; its SDR mode is plain
                 // Rec.709 and needs nothing.
                 vr180_pipeline::SourceKind::KandaoQoocam if meta.hlg => Some(BUILTIN_HLG_LUT_PATH),
@@ -4226,6 +4353,11 @@ impl App {
             if let (Some(info), Some(lut)) = (meta.braw_color.as_ref(), meta.braw_lut.as_deref()) {
                 if !vr180_braw::BrawColorInfo::is_film_gamma(s.braw_color.effective_gamma(info)) && s.lut_path == lut { s.lut_path.clear(); }
             }
+        }
+        // The ETTR recovery needs the source's log curve: a clip that is not
+        // I-Log holds none, whatever route its settings came by.
+        if !takes_ilog(source_kind, meta.x6.as_ref()) {
+            self.settings.ettr_stops = 0.0;
         }
         self.last_pushed_settings = self.settings.clone();
 
@@ -4713,7 +4845,9 @@ impl App {
     /// takes them when the clip is one. `self.settings` itself never carries
     /// that — it is what gets saved and handed to the next clip.
     fn worker_settings(&self) -> Settings {
-        if self.clip_single_eye() { self.settings.for_single_eye() } else { self.settings.clone() }
+        let mut s = if self.clip_single_eye() { self.settings.for_single_eye() } else { self.settings.clone() };
+        s.ilog_source = self.clip.as_ref().is_some_and(|c| c.ilog());
+        s
     }
 
     /// Diff `self.settings` against `last_pushed_settings`; if changed,
@@ -6995,6 +7129,8 @@ impl App {
         // replace the Tone and White balance stages for this camera (kept
         // neutral in `finish_load`), so those sections are not shown.
         let is_braw = matches!(kind, Some(vr180_pipeline::SourceKind::BlackmagicRaw));
+        // The ETTR recovery works in the source's log curve: I-Log clips only.
+        let ilog = self.clip.as_ref().is_some_and(|c| c.ilog());
         let braw_info = if is_braw { self.clip.as_ref().and_then(|c| c.braw_color.clone()) } else { None };
         let braw_lut = if is_braw { self.clip.as_ref().and_then(|c| c.braw_lut.clone()) } else { None };
         let s = &mut self.settings;
@@ -7118,6 +7254,30 @@ impl App {
                 "DNG output: the 3D LUT, sharpening and automatic eye matching cannot travel as DNG metadata — hidden, and not applied to the preview."
             )).small().color(Color32::GRAY));
         } else {
+            // ── ETTR recovery: a clip exposed brighter than normal on purpose
+            //    ("exposing to the right", for cleaner shadows) has that much
+            //    exposure taken back out in the light the sensor recorded,
+            //    ahead of the tone controls and the LUT. Which clip was shot
+            //    that way, and by how much, only the user knows. ──
+            if ilog {
+                ui.label(RichText::new(tr("ETTR recovery (I-Log)")).strong());
+                ui.horizontal(|ui| {
+                    ui.label(tr("Shot over by"));
+                    for stops in [0.0_f32, 1.0, 2.0, 3.0] {
+                        let text = if stops == 0.0 { "0".to_string() } else { format!("+{stops:.0}") };
+                        ui.selectable_value(&mut s.ettr_stops, stops, text);
+                    }
+                    // The same value, for an amount between the steps.
+                    ui.add(egui::DragValue::new(&mut s.ettr_stops)
+                        .range(0.0..=ETTR_MAX_STOPS).speed(0.01).fixed_decimals(1));
+                    ui.label(tr("stops"));
+                });
+                ui.label(RichText::new(tr(
+                    "For a clip exposed brighter than normal on purpose (exposing to the right). The extra exposure is taken back out in linear light, ahead of the tone controls and the LUT. Clipped highlights stay clipped."
+                )).small().color(Color32::GRAY));
+                ui.separator();
+            }
+
             // 3D LUT.
             ui.label(RichText::new(tr("3D LUT (.cube)")).strong());
             ui.horizontal(|ui| {

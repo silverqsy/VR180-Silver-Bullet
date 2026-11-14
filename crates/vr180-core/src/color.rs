@@ -152,6 +152,146 @@ impl Cube3DLut {
     }
 }
 
+/// A camera's log encoding of scene light, in the form most of them share:
+/// a straight toe joined to a logarithm. With `x` the scene-linear value of
+/// one channel (0.18 = an 18 % grey) and `u` its code (0..1):
+///
+/// ```text
+/// u = lin_slope · x + lin_offset                    x <= lin_cut
+/// u = log_offset + log_scale · log10(x + log_bias)  x >  lin_cut
+/// ```
+///
+/// Knowing the curve is what lets an exposure change be made in the light
+/// the sensor recorded ([`LogCurve::expose`]) instead of on the code values,
+/// where it is only right along the logarithmic part.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogCurve {
+    pub lin_slope: f64,
+    pub lin_offset: f64,
+    /// The scene value where the toe ends.
+    pub lin_cut: f64,
+    /// The code where the toe ends, as the curve's definition states it.
+    pub code_cut: f64,
+    pub log_scale: f64,
+    pub log_offset: f64,
+    pub log_bias: f64,
+}
+
+impl LogCurve {
+    /// Insta360 I-Log (10-bit), from Insta360's "I-Log White Paper" of June
+    /// 2026, section "Conversion Specification". Black is code 0.0906, an
+    /// 18 % grey 0.422, and code 1.0 is 22× the 100 % white; the primaries
+    /// are BT.2020. The code is the normalised R'G'B' a decoder arrives at
+    /// after the file's own matrix and range expansion.
+    pub const INSTA360_ILOG: LogCurve = LogCurve {
+        lin_slope: 5.77837328,
+        lin_offset: 0.09055934,
+        lin_cut: 0.01104854,
+        code_cut: 0.154402,
+        log_scale: 0.280055,
+        log_offset: 0.623992,
+        log_bias: 0.01,
+    };
+
+    /// Scene-linear value to code.
+    pub fn encode(&self, x: f64) -> f64 {
+        if x <= self.lin_cut {
+            self.lin_slope * x + self.lin_offset
+        } else {
+            self.log_offset + self.log_scale * (x + self.log_bias).log10()
+        }
+    }
+
+    /// Code to scene-linear value. Codes below black decode to negative
+    /// light, as the straight toe continues: noise around black keeps its
+    /// mean.
+    pub fn decode(&self, u: f64) -> f64 {
+        if u < self.code_cut {
+            (u - self.lin_offset) / self.lin_slope
+        } else {
+            10f64.powf((u - self.log_offset) / self.log_scale) - self.log_bias
+        }
+    }
+
+    /// The code the same scene would have had with `stops` more exposure
+    /// (negative: less). Black stays where it is.
+    pub fn expose(&self, u: f64, stops: f64) -> f64 {
+        self.encode(self.decode(u) * 2f64.powf(stops))
+    }
+}
+
+#[cfg(test)]
+mod log_curve_tests {
+    use super::LogCurve;
+
+    const C: LogCurve = LogCurve::INSTA360_ILOG;
+
+    /// The table of the white paper ("Mapping Between Scene Reflectance and
+    /// Digital Code Values"): 0 %, 18 % and 2200 %.
+    #[test]
+    fn ilog_reference_points() {
+        for (x, code, ten_bit) in [(0.0, 0.0905593, 93.0), (0.18, 0.422003, 432.0), (22.0, 1.0, 1023.0)] {
+            let u = C.encode(x);
+            assert!((u - code).abs() < 2e-6, "E({x}) = {u}, the paper says {code}");
+            assert_eq!((u * 1023.0).round(), ten_bit, "10-bit code of {x}");
+        }
+    }
+
+    /// The two pieces meet in value and in slope, on both sides of the
+    /// definition (the paper gives the cut once per direction).
+    #[test]
+    fn ilog_pieces_join() {
+        let below = C.encode(C.lin_cut);
+        let above = C.log_offset + C.log_scale * (C.lin_cut + C.log_bias).log10();
+        assert!((below - above).abs() < 1e-7, "{below} vs {above}");
+        assert!((below - C.code_cut).abs() < 1e-6, "{below} vs the stated {}", C.code_cut);
+        let log_slope = C.log_scale / (std::f64::consts::LN_10 * (C.lin_cut + C.log_bias));
+        assert!((log_slope / C.lin_slope - 1.0).abs() < 1e-6, "{log_slope} vs {}", C.lin_slope);
+    }
+
+    #[test]
+    fn decode_undoes_encode() {
+        for i in 0..=2000 {
+            let u = i as f64 / 2000.0;
+            let back = C.encode(C.decode(u));
+            assert!((back - u).abs() < 1e-6, "u = {u}: {back}");
+        }
+    }
+
+    #[test]
+    fn expose_moves_light_by_stops() {
+        // Zero is the identity.
+        for i in 0..=1000 {
+            let u = i as f64 / 1000.0;
+            assert!((C.expose(u, 0.0) - u).abs() < 1e-6, "u = {u}");
+        }
+        // Two stops down brings a 72 % patch to the 18 % grey...
+        assert!((C.expose(C.encode(0.72), -2.0) - C.encode(0.18)).abs() < 1e-9);
+        // ...and any number of stops leaves black where it is.
+        for stops in [-3.0, -2.0, -1.0, 1.0, 2.5] {
+            assert!((C.expose(C.encode(0.0), stops) - C.encode(0.0)).abs() < 1e-12, "{stops} stops");
+        }
+        // Along the logarithm a stop is a constant step of the code, less
+        // the pull of the bias: the reason an offset alone is not enough.
+        let step = C.expose(0.6, -1.0) - 0.6;
+        assert!((step + C.log_scale * 2f64.log10()).abs() < 2e-3, "step {step}");
+        let toe = C.expose(0.12, -1.0) - 0.12;
+        assert!(toe.abs() < step.abs() / 4.0, "the toe moves {toe}, the logarithm {step}");
+    }
+
+    #[test]
+    fn expose_keeps_the_order_of_codes() {
+        for stops in [-3.0, -2.0, -1.0, 1.0] {
+            let mut prev = f64::NEG_INFINITY;
+            for i in 0..=4095 {
+                let v = C.expose(i as f64 / 4095.0, stops);
+                assert!(v > prev, "{stops} stops, code {i}: {v} after {prev}");
+                prev = v;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -52,7 +52,9 @@ Studio).
   per-frame eye-exposure matching for the X6's independently exposing
   sensors.
 - **Color**, 10-bit end to end: CDL, 3D LUT, white balance, saturation,
-  sharpen, mid-detail. Temporal noise reduction on macOS (export only).
+  sharpen, mid-detail. ETTR recovery for X6 I-Log clips: the exposure a
+  clip was given beyond normal is taken back out in scene-linear light,
+  ahead of the LUT. Temporal noise reduction on macOS (export only).
 - **Stills** (X6 and QooCam `.dng`): the raw stage (gain maps, demosaic) feeds the
   same fisheye projection; export a VR180 still as 16-bit PNG, JPEG, or a
   linear DNG that raw developers open as the camera's own raw.
