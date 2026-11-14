@@ -24,10 +24,10 @@ fn sample_full(local_x: u32, y: u32, is_right: bool) -> vec4<f32> {
 }
 
 fn rgb_to_uv10_videorange(r: f32, g: f32, b: f32) -> vec2<f32> {
-    // Rec.709 chroma. Output in [0,1] then mapped to [64, 960] for
-    // 10-bit video range.
-    let cb_norm = -0.1146 * r - 0.3854 * g + 0.5 * b + 0.5;
-    let cr_norm =  0.5    * r - 0.4542 * g - 0.0458 * b + 0.5;
+    // Rec.709 chroma: Cb = (B' - Y') / 1.8556, Cr = (R' - Y') / 1.5748.
+    // Output in [0,1] then mapped to [64, 960] for 10-bit video range.
+    let cb_norm = -0.114572 * r - 0.385428 * g + 0.5 * b + 0.5;
+    let cr_norm =  0.5 * r - 0.454153 * g - 0.045847 * b + 0.5;
     if (u.full_range != 0u) {
         // Full range: [0,1] → [0, 1023], chroma centered at 512.
         return vec2<f32>(cb_norm * 1023.0, cr_norm * 1023.0);
@@ -60,7 +60,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         n = n + 1.0;
     }
     let avg = sum / max(n, 1.0);
-    let uv10 = rgb_to_uv10_videorange(avg.r, avg.g, avg.b);
+    // Whole codes: the encoder reads the top ten bits only (see the luma pass).
+    let uv10 = floor(rgb_to_uv10_videorange(avg.r, avg.g, avg.b) + vec2<f32>(0.5));
     textureStore(uv_out, vec2<i32>(i32(gid.x), i32(gid.y)),
         vec4<f32>(uv10.x * CHROMA_SCALE, uv10.y * CHROMA_SCALE, 0.0, 0.0));
 }

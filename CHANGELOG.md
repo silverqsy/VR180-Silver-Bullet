@@ -37,6 +37,13 @@ sensor recorded, ahead of the tone controls and the LUT.
   lattice cell to the next. The cube is now stored at 16 bits and
   interpolated exactly, within 0.02 of a 10-bit code. Every preview and
   export that uses a LUT changes by up to those two codes.
+- **10-bit exports through the hardware encoders were cut off, not
+  rounded.** The encoder is handed 16-bit words whose top ten bits are the
+  code, and it reads only those: the fraction the app left below them was
+  dropped, so luma and both chroma planes came out about 0.4 of a 10-bit
+  code low. The codes are rounded to the nearest one now, and the chroma
+  coefficients are written to six places (they were four). HEVC Main10 and
+  ProRes through VideoToolbox, and the Windows paths that share the compose.
 - **A queued export waited for the window to be seen.** With the app's
   window minimised, or completely covered by another one, the clip being
   exported finished, but the next one in the queue did not start, and the

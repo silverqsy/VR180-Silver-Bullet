@@ -9597,6 +9597,101 @@ mod single_eye_tests {
 }
 
 #[cfg(test)]
+mod ten_bit_plane_tests {
+    use super::*;
+
+    /// The 10-bit planes an encoder is handed carry their code in the top
+    /// ten bits of each 16-bit word, and the encoder reads only those: the
+    /// compose has to put the NEAREST code there, with nothing below it.
+    #[test]
+    fn the_planes_hold_the_nearest_ten_bit_code() {
+        let dev = Device::new().expect("device");
+        if !dev.device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+            eprintln!("skip: adapter lacks TEXTURE_FORMAT_16BIT_NORM");
+            return;
+        }
+        // Two 64 × 64 eyes of 2 × 2 blocks of one colour each (so a chroma
+        // sample covers one colour): greys on the left, colours on the right.
+        let (w, h) = (64u32, 64u32);
+        let mut x = 0x0bad_5eedu32;
+        let mut next = || { x ^= x << 13; x ^= x >> 17; x ^= x << 5; (x >> 8) as u16 };
+        let mut blocks_l = Vec::new();
+        let mut blocks_r = Vec::new();
+        for _ in 0..(w / 2 * h / 2) {
+            let g = next();
+            blocks_l.push([g, g, g]);
+            blocks_r.push([next(), next(), next()]);
+        }
+        let eye = |blocks: &[[u16; 3]]| -> wgpu::Texture {
+            let tex = dev.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("plane_probe"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let mut bytes = Vec::with_capacity((w * h * 8) as usize);
+            for y in 0..h {
+                for xx in 0..w {
+                    let c = blocks[((y / 2) * (w / 2) + xx / 2) as usize];
+                    for v in c { bytes.extend_from_slice(&v.to_le_bytes()); }
+                    bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+                }
+            }
+            dev.queue.write_texture(
+                tex.as_image_copy(), &bytes,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            tex
+        };
+        let (left, right) = (eye(&blocks_l), eye(&blocks_r));
+        let (y_tex, uv_tex) = dev.compose_sbs_to_p010_textures(&left, &right, w, h, false).expect("compose");
+        let y_plane = dev.read_texture_planar(&y_tex, w * 2, h, 2).expect("luma readback");
+        let uv_plane = dev.read_texture_planar(&uv_tex, w, h / 2, 4).expect("chroma readback");
+        let word = |plane: &[u8], i: usize| u16::from_le_bytes([plane[i * 2], plane[i * 2 + 1]]);
+
+        // BT.709, video range, exactly.
+        let exact = |c: [u16; 3]| -> [f64; 3] {
+            let [r, g, b] = c.map(|v| v as f64 / 65535.0);
+            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            [64.0 + 876.0 * y, 512.0 + 896.0 * (b - y) / 1.8556, 512.0 + 896.0 * (r - y) / 1.5748]
+        };
+        let (mut low_bits, mut wrong, mut bias, mut n) = (0usize, 0usize, 0.0f64, 0usize);
+        let mut check = |stored: u16, want: f64| {
+            if stored & 63 != 0 { low_bits += 1; }
+            let code = (stored >> 6) as f64;
+            // The nearest code, give or take what f32 does to an exact tie.
+            if (code - want).abs() > 0.502 { wrong += 1; }
+            bias += code - want;
+            n += 1;
+        };
+        for y in 0..h as usize {
+            for xx in 0..(w * 2) as usize {
+                let blocks = if xx < w as usize { &blocks_l } else { &blocks_r };
+                let c = blocks[(y / 2) * (w as usize / 2) + (xx % w as usize) / 2];
+                check(word(&y_plane, y * (w as usize * 2) + xx), exact(c)[0]);
+            }
+        }
+        for y in 0..(h / 2) as usize {
+            for xx in 0..w as usize {
+                let blocks = if xx < (w / 2) as usize { &blocks_l } else { &blocks_r };
+                let c = blocks[y * (w as usize / 2) + xx % (w as usize / 2)];
+                let e = exact(c);
+                check(word(&uv_plane, (y * w as usize + xx) * 2), e[1]);
+                check(word(&uv_plane, (y * w as usize + xx) * 2 + 1), e[2]);
+            }
+        }
+        let bias = bias / n as f64;
+        eprintln!("{n} samples: {low_bits} with bits below the code, {wrong} not the nearest code, mean error {bias:+.3} of a 10-bit code");
+        assert_eq!((low_bits, wrong), (0, 0), "the planes are off the nearest code");
+        assert!(bias.abs() < 0.02, "the planes sit {bias:+.3} of a code off on average");
+    }
+}
+
+#[cfg(test)]
 mod lut_precision_tests {
     use super::*;
 

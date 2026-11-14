@@ -23,10 +23,11 @@ struct Uniforms { eye_w: u32, full_range: u32, _pad1: u32, _pad2: u32, }
 // value to have the 10-bit Y in its top 10 bits.
 //
 // Easier: target the 10-bit value directly (range 64..940 for video
-// range), then map to R16Unorm's [0,1] by multiplying by 64 / 65535
-// (since the bottom 6 bits should be zero, we shift left by 6 by
-// multiplying the 10-bit value by 64 before dividing by 65535 — net:
-// scale by 64/65535 ≈ 0.000976544).
+// range), ROUND it to a whole code, then map to R16Unorm's [0,1] by
+// multiplying by 64 / 65535 (a shift left by 6: the bottom 6 bits stay
+// zero). The rounding is the point: an encoder reads only the top ten
+// bits, so a fraction left in the word is cut off, not rounded, and the
+// picture comes out half a code dark on average.
 const Y_SCALE: f32 = 64.0 / 65535.0;
 
 fn rgb_to_y10_videorange(r: f32, g: f32, b: f32) -> f32 {
@@ -62,7 +63,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureLoad(right_tex, vec2<i32>(i32(local_x), i32(gid.y)), 0),
         is_right,
     );
-    let y10 = rgb_to_y10_videorange(pixel.r, pixel.g, pixel.b);
+    let y10 = floor(rgb_to_y10_videorange(pixel.r, pixel.g, pixel.b) + 0.5);
     textureStore(y_out, vec2<i32>(i32(gid.x), i32(gid.y)),
         vec4<f32>(y10 * Y_SCALE, 0.0, 0.0, 0.0));
 }
