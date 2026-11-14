@@ -150,6 +150,24 @@ impl Cube3DLut {
         }
         out
     }
+
+    /// The same repack at 16 bits a channel (little-endian `u16`, alpha
+    /// 65535), for an `Rgba16Unorm` 3D texture. At 8 bits every lattice
+    /// value is off by up to half a step of 255, two whole codes of a
+    /// 10-bit picture, and the three channels round apart; at 16 the cube
+    /// is stored as written (to 1 / 65535).
+    pub fn to_rgba16_for_upload(&self) -> Vec<u8> {
+        let n = (self.size as usize).pow(3);
+        let mut out = Vec::with_capacity(n * 8);
+        for i in 0..n {
+            for c in 0..3 {
+                let v = (self.data[i * 3 + c].clamp(0.0, 1.0) * 65535.0).round() as u16;
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&u16::MAX.to_le_bytes());
+        }
+        out
+    }
 }
 
 /// A camera's log encoding of scene light, in the form most of them share:
@@ -331,6 +349,17 @@ LUT_3D_SIZE 2
         let s = "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n";
         let err = Cube3DLut::from_str(s).unwrap_err();
         assert!(err.contains("expects 24 floats, got 6"), "err: {err}");
+    }
+
+    #[test]
+    fn rgba16_upload_keeps_the_cube_to_one_part_in_65535() {
+        let s = "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0.2 0.4 0.6\n1 1 1\n";
+        let lut = Cube3DLut::from_str(s).unwrap();
+        let bytes = lut.to_rgba16_for_upload();
+        assert_eq!(bytes.len(), 8 * 8);
+        let px = |i: usize, c: usize| u16::from_le_bytes([bytes[i * 8 + c * 2], bytes[i * 8 + c * 2 + 1]]);
+        assert_eq!([px(1, 0), px(1, 1), px(1, 2), px(1, 3)], [65535, 0, 0, 65535]);
+        assert_eq!([px(6, 0), px(6, 1), px(6, 2)], [13107, 26214, 39321]);
     }
 
     #[test]

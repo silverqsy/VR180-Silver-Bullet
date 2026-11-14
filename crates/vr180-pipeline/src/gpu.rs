@@ -4409,34 +4409,8 @@ impl Device {
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
 
-        // Upload LUT as 3D rgba8unorm texture.
-        let lut_bytes = lut.to_rgba8_for_upload();
-        let lut_tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("lut3d_cube"),
-            size: wgpu::Extent3d {
-                width: lut.size, height: lut.size, depth_or_array_layers: lut.size,
-            },
-            mip_level_count: 1, sample_count: 1,
-            dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &lut_tex, mip_level: 0,
-                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
-            },
-            &lut_bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(lut.size * 4),
-                rows_per_image: Some(lut.size),
-            },
-            wgpu::Extent3d {
-                width: lut.size, height: lut.size, depth_or_array_layers: lut.size,
-            },
-        );
+        // The cube as a 3D texture.
+        let lut_tex = self.lut3d_texture(lut, "lut3d_cube");
 
         // Output storage texture.
         let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -8192,34 +8166,48 @@ impl Device {
     /// duration of the encoder. Same content as `apply_lut3d` builds
     /// inside its own scope.
     fn upload_lut3d_resources(&self, lut: &vr180_core::color::Cube3DLut) -> Lut3DResources {
-        let lut_bytes = lut.to_rgba8_for_upload();
-        let lut_tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("stack_lut3d"),
-            size: wgpu::Extent3d {
-                width: lut.size, height: lut.size, depth_or_array_layers: lut.size,
-            },
+        Lut3DResources { tex: self.lut3d_texture(lut, "stack_lut3d"), size: lut.size }
+    }
+
+    /// A cube as the 3D texture the LUT shaders sample: 16 bits a channel
+    /// where the device has the 16-bit normalised formats (every device the
+    /// 10-bit paths run on), 8 bits otherwise. At 8 bits each lattice value
+    /// is rounded to a step of 255: up to two codes of a 10-bit picture, and
+    /// differently per channel, so neutrals pick up a tint that changes from
+    /// one lattice cell to the next.
+    fn lut3d_texture(&self, lut: &vr180_core::color::Cube3DLut, label: &str) -> wgpu::Texture {
+        let wide = self.device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        let (format, bytes, texel) = if wide {
+            (wgpu::TextureFormat::Rgba16Unorm, lut.to_rgba16_for_upload(), 8)
+        } else {
+            (wgpu::TextureFormat::Rgba8Unorm, lut.to_rgba8_for_upload(), 4)
+        };
+        let size = wgpu::Extent3d {
+            width: lut.size, height: lut.size, depth_or_array_layers: lut.size,
+        };
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size,
             mip_level_count: 1, sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &lut_tex, mip_level: 0,
+                texture: &tex, mip_level: 0,
                 origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
             },
-            &lut_bytes,
+            &bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(lut.size * 4),
+                bytes_per_row: Some(lut.size * texel),
                 rows_per_image: Some(lut.size),
             },
-            wgpu::Extent3d {
-                width: lut.size, height: lut.size, depth_or_array_layers: lut.size,
-            },
+            size,
         );
-        Lut3DResources { tex: lut_tex, size: lut.size }
+        tex
     }
 
     fn record_lut3d(
@@ -9605,6 +9593,183 @@ mod single_eye_tests {
         assert_eq!(plan.cdl.gain, 1.2);
         // Nothing left that differs per eye.
         assert!(matches!(plan.for_eye(true), std::borrow::Cow::Borrowed(_)));
+    }
+}
+
+#[cfg(test)]
+mod lut_precision_tests {
+    use super::*;
+
+    /// The official X6 I-Log → Rec.709 cube the app ships (65 points a side).
+    fn shipped_lut() -> vr180_core::Cube3DLut {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../vr180-gui/assets/insta360_x6_ilog_to_rec709.cube");
+        vr180_core::Cube3DLut::from_file(std::path::Path::new(path)).expect("the shipped LUT")
+    }
+
+    /// The cube's own values, interpolated trilinearly in f64: what the LUT
+    /// stage is an approximation of.
+    fn reference(lut: &vr180_core::Cube3DLut, rgb: [f64; 3]) -> [f64; 3] {
+        let n = lut.size as usize;
+        let at = |r: usize, g: usize, b: usize, c: usize| lut.data[((b * n + g) * n + r) * 3 + c] as f64;
+        let pos = rgb.map(|v| v.clamp(0.0, 1.0) * (n - 1) as f64);
+        let i0 = pos.map(|v| (v.floor() as usize).min(n - 2));
+        let t = [pos[0] - i0[0] as f64, pos[1] - i0[1] as f64, pos[2] - i0[2] as f64];
+        let mut out = [0.0; 3];
+        for (c, o) in out.iter_mut().enumerate() {
+            let mut acc = 0.0;
+            for (dr, wr) in [(0, 1.0 - t[0]), (1, t[0])] {
+                for (dg, wg) in [(0, 1.0 - t[1]), (1, t[1])] {
+                    for (db, wb) in [(0, 1.0 - t[2]), (1, t[2])] {
+                        acc += wr * wg * wb * at(i0[0] + dr, i0[1] + dg, i0[2] + db, c);
+                    }
+                }
+            }
+            *o = acc.clamp(0.0, 1.0);
+        }
+        out
+    }
+
+    fn texture_16(dev: &Device, codes: &[[u16; 3]], w: u32, h: u32) -> wgpu::Texture {
+        let tex = dev.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("lut_probe"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut bytes = Vec::with_capacity(codes.len() * 8);
+        for c in codes {
+            for v in c { bytes.extend_from_slice(&v.to_le_bytes()); }
+            bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+        }
+        dev.queue.write_texture(
+            tex.as_image_copy(), &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        tex
+    }
+
+    /// Worst and mean distance of the 16-bit LUT stage from the cube's own
+    /// values, in units of a 10-bit code, over `codes`.
+    fn stage_error(dev: &Device, lut: &vr180_core::Cube3DLut, codes: &[[u16; 3]]) -> (f64, f64) {
+        let (w, h) = (256u32, (codes.len() / 256) as u32);
+        let tex = texture_16(dev, codes, w, h);
+        let plan = ColorStackPlan { lut: Some((lut.clone(), 1.0)), ..Default::default() };
+        let out = dev.apply_color_stack_per_eye_16(&tex, w, h, &plan).expect("stack").expect("a stage ran");
+        let got = dev.read_texture_rgba64(&out, w, h).expect("readback");
+        let (mut worst, mut sum) = (0.0f64, 0.0f64);
+        for (px, code) in got.chunks_exact(8).zip(codes) {
+            let want = reference(lut, [code[0] as f64 / 65535.0, code[1] as f64 / 65535.0, code[2] as f64 / 65535.0]);
+            for ch in 0..3 {
+                let v = u16::from_le_bytes([px[ch * 2], px[ch * 2 + 1]]) as f64 / 65535.0;
+                let e = (v - want[ch]).abs() * 1023.0;
+                worst = worst.max(e);
+                sum += e;
+            }
+        }
+        (worst, sum / (codes.len() * 3) as f64)
+    }
+
+    /// The LUT stage of the 16-bit stack against the cube it was given: the
+    /// grey axis code by code, and colours spread through the cube.
+    #[test]
+    fn sixteen_bit_lut_stage_follows_the_cube() {
+        let dev = Device::new().expect("device");
+        if !dev.device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+            eprintln!("skip: adapter lacks TEXTURE_FORMAT_16BIT_NORM");
+            return;
+        }
+        let lut = shipped_lut();
+        let grey: Vec<[u16; 3]> = (0..65536u32).map(|i| [i as u16; 3]).collect();
+        let mut x = 0x2545_f491u32;
+        let mut next = || { x ^= x << 13; x ^= x >> 17; x ^= x << 5; (x >> 8) as u16 };
+        let colours: Vec<[u16; 3]> = (0..65536).map(|_| [next(), next(), next()]).collect();
+        let (grey_worst, grey_mean) = stage_error(&dev, &lut, &grey);
+        let (col_worst, col_mean) = stage_error(&dev, &lut, &colours);
+        eprintln!("grey axis: worst {grey_worst:.3}, mean {grey_mean:.3} of a 10-bit code");
+        eprintln!("colours:   worst {col_worst:.3}, mean {col_mean:.3} of a 10-bit code");
+        assert!(grey_worst <= LUT_STAGE_TOLERANCE_10BIT && col_worst <= LUT_STAGE_TOLERANCE_10BIT,
+            "the LUT stage is {grey_worst:.2} / {col_worst:.2} of a 10-bit code from the cube");
+    }
+
+    /// What the 16-bit stage is held to, in 10-bit codes: the rounding of the
+    /// 16-bit texels on the way in and out, with room for another GPU's
+    /// arithmetic. (An 8-bit cube texture measured 2.1 here, a 16-bit one
+    /// through a hardware sampler 0.77.)
+    const LUT_STAGE_TOLERANCE_10BIT: f64 = 0.05;
+
+    /// The 8-bit stack's LUT stage lands on the nearest 8-bit code to the
+    /// cube's value.
+    #[test]
+    fn eight_bit_lut_stage_rounds_the_cube() {
+        let dev = Device::new().expect("device");
+        let lut = shipped_lut();
+        let (w, h) = (256u32, 256u32);
+        let mut x = 0x1234_5679u32;
+        let mut next = || { x ^= x << 13; x ^= x >> 17; x ^= x << 5; (x >> 24) as u8 };
+        let mut codes: Vec<[u8; 3]> = (0..256u32).map(|i| [i as u8; 3]).collect();
+        codes.extend((0..w * h - 256).map(|_| [next(), next(), next()]));
+        let tex = make_rw_texture(&dev.device, "lut_probe_8", w, h,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC);
+        let bytes: Vec<u8> = codes.iter().flat_map(|c| [c[0], c[1], c[2], 255]).collect();
+        dev.queue.write_texture(
+            tex.as_image_copy(), &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let plan = ColorStackPlan { lut: Some((lut.clone(), 1.0)), ..Default::default() };
+        let frame = make_rw_texture(&dev.device, "frame", w, h,
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
+        dev.apply_color_stack_to_eye_bgra(&tex, &frame, w, h, &plan).expect("stack");
+        // The frame stores B, G, R.
+        let got = dev.read_texture_rgb8(&frame, w, h).expect("readback");
+        let mut worst = 0.0f64;
+        for (px, code) in got.chunks_exact(3).zip(&codes) {
+            let want = reference(&lut, [code[0] as f64 / 255.0, code[1] as f64 / 255.0, code[2] as f64 / 255.0]);
+            for ch in 0..3 {
+                worst = worst.max((px[2 - ch] as f64 - want[ch] * 255.0).abs());
+            }
+        }
+        eprintln!("8-bit stack: worst {worst:.3} of an 8-bit code");
+        assert!(worst <= 0.52, "the 8-bit LUT stage is {worst:.3} codes from the cube");
+    }
+
+    /// Time of the 16-bit LUT stage alone on one 4096 × 4096 eye.
+    #[test]
+    #[ignore]
+    fn lut_stage_speed() {
+        let dev = Device::new().expect("device");
+        let lut = shipped_lut();
+        let (w, h) = (4096u32, 4096u32);
+        let tex = dev.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("lut_speed"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut x = 0x9e37_79b9u32;
+        let bytes: Vec<u8> = (0..w * h * 8).map(|_| { x ^= x << 13; x ^= x >> 17; x ^= x << 5; (x >> 24) as u8 }).collect();
+        dev.queue.write_texture(
+            tex.as_image_copy(), &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let plan = ColorStackPlan { lut: Some((lut, 1.0)), ..Default::default() };
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            let n = 40;
+            for _ in 0..n {
+                let _ = dev.apply_color_stack_per_eye_16(&tex, w, h, &plan).expect("stack");
+            }
+            let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+            eprintln!("round {round}: {:.2} ms per 4096² eye", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+        }
     }
 }
 

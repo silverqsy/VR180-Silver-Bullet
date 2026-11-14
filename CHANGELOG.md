@@ -30,6 +30,13 @@ sensor recorded, ahead of the tone controls and the LUT.
 
 ### Fixes
 
+- **The 3D LUT was applied at 8-bit precision.** The cube was stored on the
+  GPU with 8 bits a channel and read through a hardware sampler, so a 10-bit
+  export sat up to two codes away from the LUT's own values, by a different
+  amount in each channel: a faint tint in neutrals that changed from one
+  lattice cell to the next. The cube is now stored at 16 bits and
+  interpolated exactly, within 0.02 of a 10-bit code. Every preview and
+  export that uses a LUT changes by up to those two codes.
 - **A queued export waited for the window to be seen.** With the app's
   window minimised, or completely covered by another one, the clip being
   exported finished, but the next one in the queue did not start, and the
