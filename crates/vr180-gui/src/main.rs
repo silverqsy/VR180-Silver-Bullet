@@ -16,6 +16,7 @@
 mod app;
 mod audio_player;
 mod decoder;
+mod display_colour;
 mod displays;
 mod updater;
 

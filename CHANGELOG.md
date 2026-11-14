@@ -28,6 +28,32 @@ sensor recorded, ahead of the tone controls and the LUT.
   and software encoder, ProRes) land within one 10-bit code of it on
   average.
 
+### macOS: the preview can match QuickTime
+
+On a Mac, an export played in QuickTime, in Safari or on Apple Vision Pro
+looks a little brighter than the app's preview of the same frame. Neither is
+wrong about the file. Both are colour-matched to the display; the difference
+is the tone curve the picture is read with. Apple's players read a Rec.709
+video with their own Rec.709 curve, and the preview window is treated as
+sRGB. The mid-tones end up about 10 of 255 apart.
+
+**Match QuickTime**, in the toolbar, shows the preview the way those players
+show the export.
+
+- **A video frame is read with the curve the system uses for Rec.709
+  video** (a power of 1.961 with a short straight toe near black) on its
+  way to the screen. Photos are sRGB already and are shown as before.
+- **Checked against the system's own compositor**: Core Animation's
+  renderer, drawing into a display's colour space, puts a decoded Rec.709
+  video frame and the matched preview of it within 0.6 of 255 of each other
+  on every one of 96 test colours (greys from black to white, primaries,
+  skin tones). With the switch off they are up to 11 apart.
+- **Only the preview changes.** The export, and the values in it, are the
+  same with the switch on or off.
+- **Off by default**, and remembered. Off is the preview as it always was,
+  which is closer to how most players on Windows show the file.
+- macOS only.
+
 ### Fixes
 
 - **The 3D LUT was applied at 8-bit precision.** The cube was stored on the

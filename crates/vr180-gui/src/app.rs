@@ -52,6 +52,15 @@ pub struct App {
     /// textures as gamma/raw bytes ("NOT sRGB-aware"), so an sRGB *view*
     /// would over-darken the preview to `sRGB⁻¹(v)`. See the constructor.
     preview_view_format: wgpu::TextureFormat,
+    /// Format of the pass egui draws the window in (the surface's).
+    surface_format: wgpu::TextureFormat,
+    /// The preview as Apple's players will show the export: a video frame
+    /// is read with Apple's Rec.709 video curve instead of as sRGB
+    /// (`display_colour`). The user's switch, persisted next to
+    /// settings.json; never set where the match is not available.
+    match_apple_playback: bool,
+    /// Draws the picture while the match is on; built when first needed.
+    preview_painter: Option<crate::display_colour::PreviewPainter>,
 
     // ─── User-visible state ──────────────────────────────────────
     loaded_path: Option<PathBuf>,
@@ -1009,6 +1018,17 @@ mod spatial_export_tests {
     }
 
     #[test]
+    fn the_display_match_switch_reads_in_both_languages() {
+        use super::{MATCH_PLAYBACK_HOVER, MATCH_PLAYBACK_LABEL};
+        for en in [MATCH_PLAYBACK_LABEL, MATCH_PLAYBACK_HOVER] {
+            assert_ne!(tr_zh(en), en, "no translation in the table");
+        }
+        // Both say what it changes and what it leaves alone.
+        assert!(MATCH_PLAYBACK_HOVER.contains("Only the preview changes"));
+        assert!(tr_zh(MATCH_PLAYBACK_HOVER).contains("只改变预览"));
+    }
+
+    #[test]
     fn the_scaled_view_note_is_complete_in_both_languages() {
         let zh = tr_zh(SPATIAL_VIEW_SCALED_NOTE);
         assert_ne!(zh, SPATIAL_VIEW_SCALED_NOTE, "no translation in the table");
@@ -1309,6 +1329,11 @@ fn set_cur_lang(l: Lang) {
     UI_LANG.store(if l == Lang::Zh { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The toolbar switch that shows the preview as Apple's players will show
+/// the export (`display_colour`), and what it says about itself.
+const MATCH_PLAYBACK_LABEL: &str = "Match QuickTime";
+const MATCH_PLAYBACK_HOVER: &str = "Show the preview the way Apple's players (QuickTime, Safari, Apple Vision Pro) show the exported file: read with Apple's Rec.709 video curve, so the mid-tones come out a little brighter. Off, the picture is shown as sRGB, which is closer to most players on Windows. Only the preview changes: the exported file is the same either way.";
+
 /// Translate a (static English) UI string for the current language.
 fn tr(en: &'static str) -> &'static str {
     if cur_lang() == Lang::En { en } else { tr_zh(en) }
@@ -1352,6 +1377,8 @@ fn tr_zh(en: &'static str) -> &'static str {
         "3D display" => "3D 显示器",
         "Show the stereo pair on a side-by-side 3D monitor or AR glasses that appear as one wide screen (3840×1080): left eye in the left half, right eye in the right. Goes fullscreen on that screen automatically when one is connected; otherwise opens a window to drag onto it (F = fullscreen). Esc closes it." => "在以单个宽屏（3840×1080）形式出现的左右格式 3D 显示器或 AR 眼镜上显示立体画面：左半为左眼，右半为右眼。检测到这样的屏幕时自动在其上全屏；否则打开一个窗口，拖到该屏幕后按 F 全屏。按 Esc 关闭。",
         "SBS while the 3D display is on" => "3D 显示器开启时固定为 SBS",
+        MATCH_PLAYBACK_LABEL => "匹配 QuickTime",
+        MATCH_PLAYBACK_HOVER => "按苹果播放器（QuickTime、Safari、Apple Vision Pro）显示导出文件的方式显示预览：用苹果的 Rec.709 视频曲线解读画面，中间调会略亮一些。关闭时画面按 sRGB 显示，更接近 Windows 上多数播放器的效果。只改变预览，导出的文件两种情况下完全相同。",
         "3D display — play a clip to see it here" => "3D 显示器——播放素材后在此显示",
         "Drag this window onto the 3D screen · F = fullscreen · Esc = close" => "把此窗口拖到 3D 屏幕上 · F = 全屏 · Esc = 关闭",
         "Click ▶ Play to start preview." => "点击 ▶ 播放以开始预览。",
@@ -1725,6 +1752,9 @@ fn install_cjk_font(ctx: &egui::Context) {
 struct DisplayFrame {
     texture: Arc<wgpu::Texture>,
     egui_id: egui::TextureId,
+    /// The same picture for `display_colour::PreviewPainter`: made the
+    /// first time the frame is drawn with the display match on.
+    matched_picture: Option<wgpu::BindGroup>,
     width: u32,
     height: u32,
     frame_idx: u32,
@@ -2095,6 +2125,9 @@ impl App {
             pipeline,
             egui_renderer: wgpu_state.renderer.clone(),
             preview_view_format,
+            surface_format: wgpu_state.target_format,
+            match_apple_playback: Self::load_match_apple_playback(),
+            preview_painter: None,
             loaded_path: None,
             pending_open: std::env::args_os().skip(1).map(PathBuf::from)
                 .filter(|p| p.is_file()).collect(),
@@ -2206,6 +2239,73 @@ impl App {
             }
             let _ = std::fs::write(p, if self.lang == Lang::Zh { "zh" } else { "en" });
         }
+    }
+
+    /// `…/VR180SilverBullet2.0/preview_colour` — the display-match switch.
+    fn match_apple_playback_config_path() -> Option<PathBuf> {
+        crate::decoder::Settings::config_path()
+            .and_then(|p| p.parent().map(|d| d.join("preview_colour")))
+    }
+
+    /// Off unless the user turned it on, and off wherever it cannot work.
+    fn load_match_apple_playback() -> bool {
+        crate::display_colour::available()
+            && Self::match_apple_playback_config_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .is_some_and(|s| s.trim() == "apple")
+    }
+
+    fn save_match_apple_playback(&self) {
+        if let Some(p) = Self::match_apple_playback_config_path() {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(p, if self.match_apple_playback { "apple" } else { "plain" });
+        }
+    }
+
+    /// The preview is drawn as Apple's players show the export right now.
+    fn display_match_on(&self) -> bool {
+        self.match_apple_playback && crate::display_colour::available()
+    }
+
+    /// What the loaded clip's picture is made of: a developed photograph is
+    /// sRGB, everything else is a frame of a video exported as Rec.709.
+    fn preview_encoding(&self) -> crate::display_colour::PictureEncoding {
+        use crate::display_colour::PictureEncoding;
+        if self.clip.as_ref().is_some_and(|c| c.source_kind.is_still()) {
+            PictureEncoding::Srgb
+        } else {
+            PictureEncoding::Rec709Video
+        }
+    }
+
+    /// The live frame (or the full-resolution still) as the display-matched
+    /// painter takes it, with how to read its values. `None` with the match
+    /// off or nothing to show: the caller then draws egui's image as before.
+    fn matched_picture(&mut self, full_res: bool)
+        -> Option<(wgpu::BindGroup, crate::display_colour::PictureEncoding)>
+    {
+        if !self.display_match_on() { return None; }
+        let encoding = self.preview_encoding();
+        if self.preview_painter.is_none() {
+            let painter = crate::display_colour::PreviewPainter::new(
+                &self.pipeline.device, self.surface_format);
+            // The paint callback finds it in the renderer's resources.
+            self.egui_renderer.write().callback_resources.insert(painter.clone());
+            self.preview_painter = Some(painter);
+        }
+        let painter = self.preview_painter.as_ref()?;
+        let frame = if full_res { self.full_res_display.as_mut() } else { self.current_display.as_mut() }?;
+        if frame.matched_picture.is_none() {
+            let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.preview_view_format),
+                usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+                ..Default::default()
+            });
+            frame.matched_picture = Some(painter.bind_picture(&self.pipeline.device, &view));
+        }
+        frame.matched_picture.clone().map(|picture| (picture, encoding))
     }
 
     fn export_selected(&mut self) {
@@ -3603,7 +3703,7 @@ impl App {
                 &self.pipeline.device, &view, wgpu::FilterMode::Linear);
             drop(rend);
             self.full_res_display = Some(DisplayFrame {
-                texture: Arc::new(tex), egui_id: id,
+                texture: Arc::new(tex), egui_id: id, matched_picture: None,
                 width: w, height: h,
                 frame_idx: 0, timestamp_s: ts,
             });
@@ -3660,7 +3760,7 @@ impl App {
                     &self.pipeline.device, &view, wgpu::FilterMode::Linear);
                 drop(rend);
                 self.full_res_display = Some(DisplayFrame {
-                    texture: f.texture, egui_id: id,
+                    texture: f.texture, egui_id: id, matched_picture: None,
                     width: f.width, height: f.height,
                     frame_idx: f.frame_idx, timestamp_s: f.timestamp_s,
                 });
@@ -3763,6 +3863,7 @@ impl App {
         self.current_display = Some(DisplayFrame {
             texture: frame.texture,
             egui_id: id,
+            matched_picture: None,
             width: frame.width,
             height: frame.height,
             frame_idx: frame.frame_idx,
@@ -5748,6 +5849,21 @@ impl eframe::App for App {
                     }
                     } // two-eye clips only
 
+                    // The preview as Apple's players will show the export
+                    // (macOS): a view choice, kept across launches.
+                    if crate::display_colour::available() {
+                        ui.separator();
+                        let mut on = self.match_apple_playback;
+                        if ui.toggle_value(&mut on, tr(MATCH_PLAYBACK_LABEL))
+                            .on_hover_text(tr(MATCH_PLAYBACK_HOVER))
+                            .changed()
+                        {
+                            self.match_apple_playback = on;
+                            self.save_match_apple_playback();
+                            tracing::info!("preview display match: {}", if on { "on" } else { "off" });
+                        }
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // (Version lives ONLY in the top-left brand label,
                         // which is the clickable updater entry point.)
@@ -6099,6 +6215,9 @@ impl eframe::App for App {
                 self.current_display.as_ref()
             }.map(|d| (d.egui_id, d.width, d.height));
             if let Some((egui_id, dw, dh)) = disp {
+                // With the display match on, the same texture goes through
+                // the painter that reads it as Apple's players would.
+                let matched = self.matched_picture(use_full_res);
                 let avail = ui.available_size();
                 let aspect = dw as f32 / dh as f32;
                 // Fit-to-area with aspect ratio preserved.
@@ -6219,8 +6338,14 @@ impl eframe::App for App {
                 );
 
                 // Paint the (sub-rect of the) texture into the fitted rect.
-                let sized = egui::load::SizedTexture::new(egui_id, egui::vec2(w, h));
-                egui::Image::new(sized).uv(uv).paint_at(ui, img_rect);
+                if let Some((picture, encoding)) = matched {
+                    ui.painter().add(crate::display_colour::PreviewPaint {
+                        picture, slot: crate::display_colour::PaintSlot::Main, uv, encoding,
+                    }.shape(img_rect));
+                } else {
+                    let sized = egui::load::SizedTexture::new(egui_id, egui::vec2(w, h));
+                    egui::Image::new(sized).uv(uv).paint_at(ui, img_rect);
+                }
 
                 // Zoom readout + reset hint, top-left overlay.
                 let painter = ui.painter_at(img_rect);
@@ -6280,6 +6405,17 @@ impl eframe::App for App {
         // External 3D display (side-by-side monitor / AR glasses) — an
         // immediate viewport, drawn every frame while enabled.
         self.draw_3d_display(ctx);
+
+        // The display match rests on the windows being sRGB to the system:
+        // made sure of while it is on (nothing is written where they are
+        // already, which is the rule), undone when it goes off. After the
+        // 3D display so its window, once it exists, is covered too.
+        let matching = self.display_match_on();
+        let layers = crate::display_colour::set_window_colour_matching(matching);
+        if layers > 0 {
+            tracing::info!("display match: {layers} window layer(s) {}",
+                if matching { "tagged sRGB" } else { "given their own colour space back" });
+        }
 
         // Push slider edits to the running decoder.
         self.maybe_push_settings();
@@ -6396,6 +6532,7 @@ impl App {
             None => builder.with_inner_size([1280.0, 360.0]),
         };
         let frame = self.current_display.as_ref().map(|d| (d.egui_id, d.width, d.height));
+        let matched = self.matched_picture(false);
         let windowed = target.is_none();
         let fullscreen_now = self.three_d.fullscreen;
         let mut close = false;
@@ -6472,8 +6609,17 @@ impl App {
                                 let u0 = i as f32 * 0.5;
                                 let uv = egui::Rect::from_min_max(
                                     egui::pos2(u0, 0.0), egui::pos2(u0 + 0.5, 1.0));
-                                let sized = egui::load::SizedTexture::new(tex, fit.size());
-                                egui::Image::new(sized).uv(uv).paint_at(ui, fit);
+                                if let Some((picture, encoding)) = &matched {
+                                    use crate::display_colour::PaintSlot;
+                                    ui.painter().add(crate::display_colour::PreviewPaint {
+                                        picture: picture.clone(),
+                                        slot: if i == 0 { PaintSlot::ThreeDLeft } else { PaintSlot::ThreeDRight },
+                                        uv, encoding: *encoding,
+                                    }.shape(fit));
+                                } else {
+                                    let sized = egui::load::SizedTexture::new(tex, fit.size());
+                                    egui::Image::new(sized).uv(uv).paint_at(ui, fit);
+                                }
                             }
                         }
                         _ => {
