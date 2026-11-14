@@ -205,7 +205,8 @@ pub enum EyePicture<'a> {
     Bytes8 { rgba: &'a [u8], w: u32, h: u32, slot: u32 },
     /// `w × h` pixels from the CPU, uploaded as a 16-bit texture of their
     /// own: `bit_depth` 16 is RGBA64LE, copied as it is; 8 is RGBA8, each
-    /// byte put in the high half (low byte zero — no invented precision).
+    /// byte repeated (255 becomes 65535, the same unorm value; a plain shift
+    /// leaves white at 65280, 0.39 % dark).
     Bytes16 { bytes: &'a [u8], bit_depth: u8, w: u32, h: u32 },
 }
 
@@ -319,7 +320,7 @@ impl Device {
                 } else {
                     let mut out = Vec::with_capacity((w as usize) * (h as usize) * 8);
                     for px in bytes.chunks_exact(4) {
-                        out.extend_from_slice(&[0x00, px[0], 0x00, px[1], 0x00, px[2], 0xFF, 0xFF]);
+                        out.extend_from_slice(&[px[0], px[0], px[1], px[1], px[2], px[2], 0xFF, 0xFF]);
                     }
                     std::borrow::Cow::Owned(out)
                 };

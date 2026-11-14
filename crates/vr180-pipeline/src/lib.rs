@@ -32,6 +32,7 @@ mod shader_compose;
 pub mod source_kind;
 pub mod spherical_inject;
 pub mod still_export;
+mod swscale;
 pub mod x6_pair;
 
 pub use source_kind::SourceKind;

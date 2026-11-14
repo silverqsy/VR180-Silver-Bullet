@@ -2236,6 +2236,52 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      checks it on that backend; the arms to try are the same as for any
      colour stage (zero-copy D3D11, GPU-resident, portable).
 
+31. **Colour precision of the export path (2026-11-14, Mac; UNRELEASED).**
+   Three commits, each changing export pixels by what it corrects.
+   - **3D LUT** (`f880e96`): the cube is an `Rgba16Unorm` 3D texture where
+     the device has the format (`Device::lut3d_texture`; 8-bit otherwise)
+     and both LUT shaders interpolate the eight lattice values themselves.
+     Against the cube's own values on the 16-bit stack: 2.1 codes of a
+     10-bit picture with the 8-bit texture, 0.77 with a 16-bit one through
+     a hardware sampler (its weights have 8 fractional bits), 0.015 now.
+     +0.17 ms per 4096² eye. Test: `lut_precision_tests`.
+   - **10-bit compose** (`57bf897`): `compose_sbs_p010_y` / `_uv` /
+     `p210_uv` round to a whole code before the ×64 (an encoder reads the
+     top ten bits: the fraction was cut off, 0.4 of a code low in Y, Cb,
+     Cr); chroma coefficients to six places. Test: `ten_bit_plane_tests`
+     (reads the planes `compose_sbs_to_p010_textures` writes, so it covers
+     the Windows readback arm's planes too).
+   - **swscale** (this item's third commit; module `swscale.rs`, read its
+     header): every conversion states its matrix (the software feed
+     converted RGB → Y'CbCr with **BT.601** in BT.709-tagged files; the
+     `.360` software decode had the same default); 16-bit pictures cross
+     on one scale (swscale's white is 65280: decode gets a contrast of
+     257 / 256, the feed scales by 65280 / 65535 in `encode::load_rgb16`,
+     and an 8-bit picture widens by repeating its byte); and every
+     same-size Y'CbCr → RGB conversion is the exact one on a threaded
+     context (`YuvToRgb`; the fast 8-bit converters are 2 of 255 dark).
+     Tests: `swscale::tests`, `rgb_to_yuv_tests`, `source_matrix_tests`,
+     `p010_to_rgba64_color_roundtrip` (now held to half a 10-bit code; it
+     allowed ±2 %).
+   - **End to end** (flat colours of known codes, lossless source, 16
+     decode × encode paths): every 10-bit path and the 8-bit software one
+     return the codes that went in. Software vs hardware export of the
+     same real frame, in 8-bit codes: X6 8-bit −1.82 → +0.32, GoPro 10-bit
+     −0.72 → +0.02. Software exports got faster (X6 10-bit ×1.8).
+   - **Left as they are**: 8-bit through VideoToolbox is 0.4 of a code low
+     (its own BGRA conversion; an NV12 compose on the GPU would replace
+     it); a conversion that also scales (the working-size CPU preview)
+     keeps the fast flags; **the `.360` range is untouched**: still video
+     range on every path whatever the file's `pc` tag says (item 14's rule;
+     `decode::eac_rgb_converter` says so and its test pins it).
+   - **WINDOWS**: shared code, no gate touched. To check there: the tests
+     above on the Windows GPU; that 8-bit H.265 and the software fallbacks
+     now match the 10-bit NVENC path in colour (they were BT.601); the
+     CPU preview's speed (same-size conversions now run on up to 16
+     swscale threads per stream; on this Mac they are faster than the
+     single-threaded fast ones for 10-bit sources and slower for 8-bit
+     sources, 10 ms against 2.5 for a 3840² frame).
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`
