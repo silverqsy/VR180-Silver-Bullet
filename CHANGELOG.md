@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Insta360 X6: ETTR recovery for I-Log clips
+
+A clip exposed brighter than normal on purpose (exposing to the right: more
+light on the sensor, cleaner shadows) has to come back down before its LUT.
+Doing that with Gamma or Gain bends the colours, because those act on the
+I-Log code values. The Color panel now has **ETTR recovery (I-Log)**: pick
+how far over the clip was shot (**0 / +1 / +2 / +3** stops, or type an
+amount in between) and that much exposure is taken back out in the light the
+sensor recorded, ahead of the tone controls and the LUT.
+
+- **An exposure change, not a curve.** Each channel is decoded with
+  Insta360's published I-Log transfer function, scaled, and encoded again:
+  the three channels keep their proportions, black stays where it is, and
+  the LUT (the built-in one or your own) sees what a normal exposure would
+  have given it. No extra LUT files are involved, and with no LUT the export
+  stays I-Log, that much lower, for grading elsewhere.
+- **Per clip, off by default.** A file does not record how it was exposed,
+  so every clip starts at 0. "Apply settings to all" carries the choice to
+  the other I-Log clips. Only X6 clips recorded in I-Log show the control.
+- **Clipped highlights stay clipped**: what the sensor did not record does
+  not come back, it only gets darker.
+- **Checked**: the 10-bit path follows the formula to half a 16-bit step for
+  every input code, and exports through each path (10- and 8-bit, hardware
+  and software encoder, ProRes) land within one 10-bit code of it on
+  average.
+
 ### Fixes
 
 - **A queued export waited for the window to be seen.** With the app's

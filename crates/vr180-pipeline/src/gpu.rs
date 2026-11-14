@@ -145,6 +145,9 @@ pub struct Device {
     eye_match_reduce: EyeMatchReducePipeline,
     eye_offset_apply: EyeOffsetApplyPipeline,
     eye_offset_apply_16: EyeOffsetApplyPipeline,
+    /// Exposure change on log footage, in scene-linear light (8/16-bit).
+    log_exposure: PerPixelPipeline,
+    log_exposure_16: PerPixelPipeline,
     gaussian_blur: GaussianBlur1dPipeline,
     sharpen_combine: SharpenCombinePipeline,
     mid_detail_combine: MidDetailCombinePipeline,
@@ -481,6 +484,15 @@ impl Device {
         let eye_match_reduce = EyeMatchReducePipeline::create(&device);
         let eye_offset_apply = EyeOffsetApplyPipeline::create(&device, wgpu::TextureFormat::Rgba8Unorm);
         let eye_offset_apply_16 = EyeOffsetApplyPipeline::create(&device, wgpu::TextureFormat::Rgba16Unorm);
+        let log_exposure = PerPixelPipeline::create(
+            &device, "log_exposure", LOG_EXPOSURE_WGSL,
+            std::mem::size_of::<LogExposureUniforms>() as u64,
+        );
+        let log_exposure_16 = PerPixelPipeline::create_16bit(
+            &device, "log_exposure_16",
+            &LOG_EXPOSURE_WGSL.replace("rgba8unorm, write", "rgba16unorm, write"),
+            std::mem::size_of::<LogExposureUniforms>() as u64,
+        );
         let gaussian_blur = GaussianBlur1dPipeline::create(&device);
         let sharpen_combine = SharpenCombinePipeline::create(&device);
         let mid_detail_combine = MidDetailCombinePipeline::create(&device);
@@ -528,6 +540,7 @@ impl Device {
             color_grade, color_grade_16,
             eye_scale, eye_scale_16,
             eye_match_hist, eye_match_reduce, eye_offset_apply, eye_offset_apply_16,
+            log_exposure, log_exposure_16,
             gaussian_blur, sharpen_combine, mid_detail_combine, downsample_4x,
             gaussian_blur_16, sharpen_combine_16,
             mid_detail_combine_16, downsample_4x_16,
@@ -2677,6 +2690,7 @@ const EYE_SCALE_16_WGSL: &str = include_str!("shaders/eye_scale_16.wgsl");
 const EYE_MATCH_HIST_WGSL: &str = include_str!("shaders/eye_match_hist.wgsl");
 const EYE_MATCH_REDUCE_WGSL: &str = include_str!("shaders/eye_match_reduce.wgsl");
 const EYE_OFFSET_APPLY_WGSL: &str = include_str!("shaders/eye_offset_apply.wgsl");
+const LOG_EXPOSURE_WGSL: &str = include_str!("shaders/log_exposure.wgsl");
 const GAUSSIAN_BLUR_1D_WGSL: &str = include_str!("shaders/gaussian_blur_1d.wgsl");
 const SHARPEN_COMBINE_WGSL: &str = include_str!("shaders/sharpen_combine.wgsl");
 const MID_DETAIL_COMBINE_WGSL: &str = include_str!("shaders/mid_detail_combine.wgsl");
@@ -2864,6 +2878,60 @@ impl CdlParams {
         self.lift == 0.0 && self.gamma == 1.0 && self.gain == 1.0
             && self.shadow == 0.0 && self.highlight == 0.0
     }
+}
+
+/// An exposure change on log-encoded footage, made in the light the sensor
+/// recorded: each channel is decoded with the camera's own curve, scaled by
+/// `2^stops` and encoded again (`log_exposure.wgsl`). What follows it in the
+/// stack then sees the picture another exposure would have recorded — which
+/// is how a clip shot bright on purpose (exposed to the right, for cleaner
+/// shadows) is brought back to normal ahead of its LUT. An offset of the
+/// code would do the same along the logarithm only, and move the shadows
+/// on the curve's toe by the wrong amount.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogExposure {
+    /// The curve the footage is encoded with.
+    pub curve: vr180_core::LogCurve,
+    /// Positive brightens, negative darkens.
+    pub stops: f32,
+}
+
+impl LogExposure {
+    fn uniforms(&self) -> LogExposureUniforms {
+        let c = &self.curve;
+        LogExposureUniforms {
+            lin_slope: c.lin_slope as f32,
+            lin_offset: c.lin_offset as f32,
+            lin_cut: c.lin_cut as f32,
+            code_cut: c.code_cut as f32,
+            log_scale: c.log_scale as f32,
+            log_offset: c.log_offset as f32,
+            log_bias: c.log_bias as f32,
+            gain: self.stops.exp2(),
+        }
+    }
+
+    /// The same change as a table over 8-bit codes, for the host fallback
+    /// whose pixels are bytes.
+    pub fn table8(&self) -> [u8; 256] {
+        std::array::from_fn(|i| {
+            let v = self.curve.expose(i as f64 / 255.0, self.stops as f64);
+            (v.clamp(0.0, 1.0) * 255.0).round() as u8
+        })
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct LogExposureUniforms {
+    lin_slope: f32,
+    lin_offset: f32,
+    lin_cut: f32,
+    code_cut: f32,
+    log_scale: f32,
+    log_offset: f32,
+    log_bias: f32,
+    gain: f32,
 }
 
 #[repr(C)]
@@ -5348,6 +5416,11 @@ pub struct ColorStackPlan {
     /// [`EyeMatchState`]; the single-eye entry points ignore it. Composes
     /// with the static `eye_match_exposure` trim. `None` = off.
     pub auto_eye_match: Option<EyeMatchMode>,
+    /// An exposure change in the light the sensor recorded, for footage in a
+    /// known log curve (see [`LogExposure`]). Runs right after the automatic
+    /// eye-exposure offset, which is measured on the source's own codes, and
+    /// ahead of the CDL and the LUT. `None` = off.
+    pub log_exposure: Option<LogExposure>,
     /// "BeyondVR Hack": scale each eye about its own (half-)center at the
     /// very END of the stack, padding the revealed border with black.
     /// 1.0 = off. Export-only — the preview plan never sets it.
@@ -5366,6 +5439,7 @@ impl Default for ColorStackPlan {
             eye_match_tint: 0.0,
             eye_match_exposure: 0.0,
             auto_eye_match: None,
+            log_exposure: None,
             eye_scale: 1.0,
         }
     }
@@ -5374,6 +5448,7 @@ impl Default for ColorStackPlan {
 impl ColorStackPlan {
     pub fn any_active(&self) -> bool {
         !self.cdl.is_identity()
+            || self.log_exposure.is_some()
             || self.lut.is_some()
             || !self.sharpen.is_identity()
             || !self.mid_detail.is_identity()
@@ -5607,6 +5682,16 @@ impl Device {
         let lut_resources = if let Some((ref lut, _)) = plan.lut {
             Some(self.upload_lut3d_resources(lut))
         } else { None };
+
+        // Stage 0b: exposure change on log footage, in scene-linear light.
+        if let Some(exposure) = plan.log_exposure {
+            let next = make_rw_texture(&self.device, "stack_logexp_out", w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC);
+            self.record_log_exposure(&mut encoder, equirect_tex, &next, exposure, false);
+            intermediates.push(next);
+        }
 
         // Stage 1: CDL.
         if !plan.cdl.is_identity() {
@@ -7793,6 +7878,22 @@ impl Device {
         Ok(out_rgb)
     }
 
+    /// Record the log-exposure stage into `dst` (Rgba8Unorm, or Rgba16Unorm
+    /// when `is_16`).
+    fn record_log_exposure(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        exposure: LogExposure,
+        is_16: bool,
+    ) {
+        let pipeline = if is_16 { &self.log_exposure_16 } else { &self.log_exposure };
+        let uni = self.write_uniform("log_exposure_u", &exposure.uniforms());
+        let dims = (dst.width(), dst.height());
+        self.record_per_pixel(encoder, "log_exposure", pipeline, src, dst, &uni, dims);
+    }
+
     fn record_cdl(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -8455,6 +8556,23 @@ impl Device {
             current_idx = Some(intermediates.len() - 1);
         }
 
+        // Stage 0b: exposure change on log footage, in scene-linear light.
+        // After the eye offset (measured on the source's own codes), before
+        // every creative stage.
+        if let Some(exposure) = plan.log_exposure {
+            let next = make_rw_texture(&self.device,
+                &format!("{eye_label}_logexp"), w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING);
+            let prev = match current_idx {
+                Some(i) => &intermediates[i],
+                None => src,
+            };
+            self.record_log_exposure(encoder, prev, &next, exposure, false);
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
+
         // Stage 1: CDL.
         if !plan.cdl.is_identity() {
             let next = make_rw_texture(&self.device,
@@ -8739,8 +8857,8 @@ impl Device {
     /// One eye's worth of the 16-bit colour stack, recorded into `encoder`
     /// (no submit, no readback). Returns the index into `intermediates` of
     /// the final texture, or `None` when no stage ran. Order:
-    ///   eye-exposure offset → CDL → LUT3D → sharpen → white balance →
-    ///   mid-detail → saturation → eye scale.
+    ///   eye-exposure offset → log exposure → CDL → LUT3D → sharpen →
+    ///   white balance → mid-detail → saturation → eye scale.
     /// `eye_offset` = the automatic eye-exposure state and this eye's index
     /// (0 = left, 1 = right); `None` skips that stage.
     fn record_color_stack_16(
@@ -8774,6 +8892,20 @@ impl Device {
         if let Some((state, eye)) = eye_offset {
             let next = make_16("stack16_eyeoff_out", w, h);
             self.record_eye_offset_apply(encoder, src, &next, state, eye, true);
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
+
+        // 0b. Exposure change on log footage, in scene-linear light. After
+        //     the eye offset (measured on the source's own codes), before
+        //     every creative stage.
+        if let Some(exposure) = plan.log_exposure {
+            let next = make_16("stack16_logexp_out", w, h);
+            let prev = match current_idx {
+                Some(i) => &intermediates[i],
+                None => src,
+            };
+            self.record_log_exposure(encoder, prev, &next, exposure, true);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
@@ -9473,6 +9605,159 @@ mod single_eye_tests {
         assert_eq!(plan.cdl.gain, 1.2);
         // Nothing left that differs per eye.
         assert!(matches!(plan.for_eye(true), std::borrow::Cow::Borrowed(_)));
+    }
+}
+
+#[cfg(test)]
+mod log_exposure_tests {
+    use super::*;
+    use vr180_core::LogCurve;
+
+    fn plan(stops: f32) -> ColorStackPlan {
+        ColorStackPlan {
+            log_exposure: Some(LogExposure { curve: LogCurve::INSTA360_ILOG, stops }),
+            ..Default::default()
+        }
+    }
+
+    /// A 256 × 256 `Rgba16Unorm` texture holding every 16-bit code once per
+    /// channel: red counts up, green counts down, blue steps by a prime.
+    fn all_codes_16(dev: &Device) -> (wgpu::Texture, Vec<[u16; 3]>) {
+        let (w, h) = (256u32, 256u32);
+        let tex = dev.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("all_codes_16"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let codes: Vec<[u16; 3]> = (0..w * h).map(|i| {
+            [i as u16, (65535 - i) as u16, (i.wrapping_mul(40503) & 0xffff) as u16]
+        }).collect();
+        let mut bytes = Vec::with_capacity(codes.len() * 8);
+        for c in &codes {
+            for v in c { bytes.extend_from_slice(&v.to_le_bytes()); }
+            bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+        }
+        dev.queue.write_texture(
+            tex.as_image_copy(), &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        (tex, codes)
+    }
+
+    /// A 16 × 16 `Rgba8Unorm` texture holding every 8-bit code once per
+    /// channel, the three channels out of step.
+    fn all_codes_8(dev: &Device) -> (wgpu::Texture, Vec<[u8; 3]>) {
+        let (w, h) = (16u32, 16u32);
+        let tex = make_rw_texture(&dev.device, "all_codes_8", w, h,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC);
+        let codes: Vec<[u8; 3]> = (0..w * h).map(|i| [i as u8, (255 - i) as u8, (i * 7) as u8]).collect();
+        let bytes: Vec<u8> = codes.iter().flat_map(|c| [c[0], c[1], c[2], 255]).collect();
+        dev.queue.write_texture(
+            tex.as_image_copy(), &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        (tex, codes)
+    }
+
+    /// The 16-bit stage is the curve's own arithmetic, for every code and
+    /// each of the offered amounts: within 4 parts in 65535 (0.06 of a
+    /// 10-bit step) of the f64 reference.
+    #[test]
+    fn sixteen_bit_stage_follows_the_curve() {
+        let dev = Device::new().expect("device");
+        if !dev.device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+            eprintln!("skip: adapter lacks TEXTURE_FORMAT_16BIT_NORM");
+            return;
+        }
+        let (tex, codes) = all_codes_16(&dev);
+        for stops in [-3.0f32, -2.0, -1.0, 1.0] {
+            let out = dev.apply_color_stack_per_eye_16(&tex, 256, 256, &plan(stops)).expect("stack").expect("a stage ran");
+            let got = dev.read_texture_rgba64(&out, 256, 256).expect("readback");
+            let mut worst = 0.0f64;
+            for (px, code) in got.chunks_exact(8).zip(&codes) {
+                for ch in 0..3 {
+                    let v = u16::from_le_bytes([px[ch * 2], px[ch * 2 + 1]]) as f64;
+                    let want = LogCurve::INSTA360_ILOG.expose(code[ch] as f64 / 65535.0, stops as f64).clamp(0.0, 1.0) * 65535.0;
+                    worst = worst.max((v - want).abs());
+                }
+                assert_eq!(&px[6..8], &u16::MAX.to_le_bytes(), "alpha passes through");
+            }
+            eprintln!("{stops:+} stops: worst {worst:.3} / 65535");
+            assert!(worst <= 4.0, "{stops} stops: {worst} / 65535 from the curve");
+        }
+    }
+
+    /// No change asked for, no change made (the app never records a stage
+    /// for zero stops; the arithmetic holds all the same).
+    #[test]
+    fn zero_stops_changes_nothing() {
+        let dev = Device::new().expect("device");
+        if !dev.device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+            eprintln!("skip: adapter lacks TEXTURE_FORMAT_16BIT_NORM");
+            return;
+        }
+        let (tex, codes) = all_codes_16(&dev);
+        let out = dev.apply_color_stack_per_eye_16(&tex, 256, 256, &plan(0.0)).expect("stack").expect("a stage ran");
+        let got = dev.read_texture_rgba64(&out, 256, 256).expect("readback");
+        for (px, code) in got.chunks_exact(8).zip(&codes) {
+            for ch in 0..3 {
+                let v = u16::from_le_bytes([px[ch * 2], px[ch * 2 + 1]]) as i32;
+                assert!((v - code[ch] as i32).abs() <= 3, "code {} came back {v}", code[ch]);
+            }
+        }
+    }
+
+    /// Both 8-bit stacks, and the table the host fallback uses, agree to
+    /// within one code.
+    #[test]
+    fn eight_bit_stacks_follow_the_table() {
+        let dev = Device::new().expect("device");
+        let (tex, codes) = all_codes_8(&dev);
+        for stops in [-3.0f32, -2.0, -1.0] {
+            let exposure = plan(stops).log_exposure.unwrap();
+            let table = exposure.table8();
+            let chained = dev.apply_color_stack_texture(&tex, 16, 16, &plan(stops)).expect("readback stack");
+            // The recorded stack, through the one entry whose result can be
+            // read back: it stores B, G, R.
+            let frame = make_rw_texture(&dev.device, "frame", 16, 16,
+                wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
+            dev.apply_color_stack_to_eye_bgra(&tex, &frame, 16, 16, &plan(stops)).expect("recorded stack");
+            let recorded: Vec<u8> = dev.read_texture_rgb8(&frame, 16, 16).expect("readback")
+                .chunks_exact(3).flat_map(|p| [p[2], p[1], p[0]]).collect();
+            for (name, got) in [("readback stack", &chained), ("recorded stack", &recorded)] {
+                for (px, code) in got.chunks_exact(3).zip(&codes) {
+                    for ch in 0..3 {
+                        let want = table[code[ch] as usize] as i32;
+                        assert!((px[ch] as i32 - want).abs() <= 1,
+                            "{name}, {stops} stops, code {}: {} against the table's {want}", code[ch], px[ch]);
+                    }
+                }
+            }
+        }
+        // The table itself: black holds, and two stops down takes the code
+        // of a 72 % patch to that of the 18 % grey.
+        let c = LogCurve::INSTA360_ILOG;
+        let table = plan(-2.0).log_exposure.unwrap().table8();
+        let code = |x: f64| (c.encode(x) * 255.0).round() as usize;
+        assert_eq!(table[code(0.0)] as usize, code(0.0));
+        assert!((table[code(0.72)] as i32 - code(0.18) as i32).abs() <= 1);
+    }
+
+    /// The stage alone makes the stack active, and a single-eye plan keeps it.
+    #[test]
+    fn the_stage_counts_as_a_grade_and_survives_a_single_eye_plan() {
+        assert!(!ColorStackPlan::default().any_active());
+        let p = plan(-2.0);
+        assert!(p.any_active());
+        assert_eq!(p.clone().single_eye().log_exposure, p.log_exposure);
+        // Nothing in it differs per eye.
+        assert!(matches!(p.for_eye(true), std::borrow::Cow::Borrowed(_)));
     }
 }
 

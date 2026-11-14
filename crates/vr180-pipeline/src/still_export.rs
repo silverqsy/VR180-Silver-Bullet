@@ -413,6 +413,7 @@ pub fn grade_metadata(plan: &ColorStackPlan, develop: &DevelopParams, color: &Dn
     if !plan.mid_detail.is_identity() { out.dropped.push("mid-detail"); }
     if (plan.eye_scale - 1.0).abs() > 1e-6 { out.dropped.push("eye scale"); }
     if plan.auto_eye_match.is_some() { out.dropped.push("automatic eye matching"); }
+    if plan.log_exposure.is_some() { out.dropped.push("log exposure"); }
     out
 }
 

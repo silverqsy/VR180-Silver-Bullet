@@ -342,6 +342,7 @@ impl ExportConfig {
             eye_match_tint: 0.0,
             eye_match_exposure: 0.0,
             auto_eye_match: None,
+            log_exposure: None,
             eye_scale: 1.0,
         }
     }

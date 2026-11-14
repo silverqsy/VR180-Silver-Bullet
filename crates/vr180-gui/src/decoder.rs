@@ -381,6 +381,15 @@ pub struct Settings {
     pub auto_eye_match: bool,
     /// Which eye the other follows when `auto_eye_match` is on.
     pub auto_eye_match_mode: vr180_pipeline::gpu::EyeMatchMode,
+    /// Stops of exposure the clip was given beyond normal when it was shot:
+    /// exposing to the right, so the shadows sit above the sensor's noise.
+    /// That much is taken back out in the light the sensor recorded, ahead
+    /// of the CDL and the LUT (`gpu::LogExposure`), which then see a normally
+    /// exposed picture. It needs the source's log curve: Insta360 I-Log only
+    /// (`ilog_source`), ignored elsewhere. 0 = off. A file does not record
+    /// how it was exposed, so this is the clip's own value: a new clip
+    /// starts at 0 whatever the last one had.
+    pub ettr_stops: f32,
     /// Optional 3D LUT file path. Empty string = no LUT.
     /// Equirect-aware unsharp-mask amount (0 = off, 0.5 subtle, 1 mod,
     /// 2 strong). Ported from the Python app; applies to every source.
@@ -412,6 +421,11 @@ pub struct Settings {
     /// ([`Settings::for_single_eye`]); never persisted.
     #[serde(skip)]
     pub single_eye: bool,
+    /// The source is recorded in Insta360 I-Log, the one log curve the app
+    /// changes exposure in (`ettr_stops`). Only ever set on the copy a
+    /// worker gets, from what the clip's file says; never persisted.
+    #[serde(skip)]
+    pub ilog_source: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,12 +528,14 @@ impl Default for Settings {
             eye_match_exposure: 0.0,
             auto_eye_match: false,
             auto_eye_match_mode: vr180_pipeline::gpu::EyeMatchMode::Average,
+            ettr_stops: 0.0,
             lut_path: String::new(),
             lut_intensity: 1.0,
             braw_color: Default::default(),
             preview_mode: PreviewMode::Sbs,
             preview_eye_right: false,
             single_eye: false,
+            ilog_source: false,
         }
     }
 }
@@ -629,6 +645,7 @@ pub fn restrict_to_dng_metadata(plan: &mut vr180_pipeline::gpu::ColorStackPlan) 
     plan.lut = None;
     plan.sharpen = Default::default();
     plan.auto_eye_match = None;
+    plan.log_exposure = None;
 }
 
 impl Settings {
@@ -715,6 +732,14 @@ impl Settings {
         // `EyeMatchState` (fisheye preview arms, export) act on it; the
         // source-kind gate lives at those call sites.
         plan.auto_eye_match = if self.auto_eye_match { Some(self.auto_eye_match_mode) } else { None };
+        // Exposure given beyond normal at the shoot, taken back out in the
+        // light the sensor recorded: only where the source's curve is known.
+        if self.ilog_source && self.ettr_stops > 0.0 {
+            plan.log_exposure = Some(vr180_pipeline::gpu::LogExposure {
+                curve: vr180_core::LogCurve::INSTA360_ILOG,
+                stops: -self.ettr_stops,
+            });
+        }
         if !self.lut_path.is_empty() {
             if let Some(lut) = load_lut_cached(&self.lut_path) {
                 plan.lut = Some((lut, self.lut_intensity.clamp(0.0, 1.0)));

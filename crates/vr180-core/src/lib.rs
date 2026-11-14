@@ -19,7 +19,7 @@ pub mod segments;
 pub mod color;
 pub mod atoms;
 
-pub use color::Cube3DLut;
+pub use color::{Cube3DLut, LogCurve};
 
 /// Top-level error type for the core crate. Pipeline + render
 /// layers map their own errors into / from this via `From` impls.
