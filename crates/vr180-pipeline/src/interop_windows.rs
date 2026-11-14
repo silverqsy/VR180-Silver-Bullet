@@ -27,7 +27,7 @@
 //!      `wgpu_hal::vulkan::Device::texture_from_raw(.., TextureMemory::External)`
 //!      → `Device::create_texture_from_hal::<Vulkan>()`.
 //!    - Per-plane views (`TextureAspect::Plane0/1`) feed the existing
-//!      `project_fisheye_p010_*` shaders.
+//!      plane-sourced builds of the projection kernel.
 //! 3. Sync: `IDXGIKeyedMutex` acquire/release across the two devices, mirrored
 //!    on the Vulkan submit via `VkWin32KeyedMutexAcquireReleaseInfoKHR`.
 //!
@@ -1155,7 +1155,7 @@ impl VulkanImportCtx {
     /// Import a shared **P010** eye (the d3d11va NVDEC output) into wgpu as a
     /// zero-copy `wgpu::TextureFormat::P010` texture aliasing the D3D11 memory.
     /// The returned texture's two planes (`Plane0` = Y/R16, `Plane1` = CbCr/Rg16)
-    /// feed `Device::project_fisheye_p010_planar_to_equirect_texture_16`.
+    /// can feed the projection as `EyePicture::Planes`, through plane-aspect views.
     ///
     /// Keep `eye` alive until the projection GPU work that reads this texture has
     /// completed (the D3D11 texture backs the imported memory). The convenience

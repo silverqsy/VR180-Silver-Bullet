@@ -667,7 +667,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    test: exiftool -validate OK, sips/ImageIO decodes, Adobe DNG Converter
    17.3 accepts sample-identically; NOTE macOS ImageIO rejects Deflate and
    multi-strip LJPEG, and any DNG < 100 KiB), `vr180_pipeline::still_export`
-   (`export_still`: per half develop → `project_fisheye_to_equirect_texture_16`
+   (`export_still`: per half develop → `Device::project_eye`
    with `still_eye_calib` (= `stream_lens_calib(entry, crop, 7760, 7760)` →
    `FisheyeCalib::new_omni`) → readback → CPU SBS compose → PNG16 / JPEG /
    DNG; 0.6 s for 8192×4096 on the M5 Max), `SourceKind::Insta360Dng`
@@ -760,7 +760,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    also the 3D LUT + Detail sections, and `Settings::still_dng_mode`
    (serde-skipped, set by the GUI each frame) makes `build_color_stack`
    drop LUT / sharpen / auto eye match so preview == DNG. Stills now take
-   `FisheyeExportProjection` (Fisheye → `project_fisheye_to_fisheye_texture_16`,
+   `FisheyeExportProjection` (Fisheye → `project_eye` with `fisheye_out`,
    Reframe → `with_reframe` on the equirect kernel, as `run_still` already
    did for the preview) and the per-eye lens Override via
    `StillLensOverride::from_export_cfg` (same formulas as the video
@@ -1353,7 +1353,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      Option<Arc<GpuPair>>` (textures + a `ZcSlotGuard` that releases the
      slot when the LAST Arc clone drops), `BrawZcIter` (macOS) hands such
      pairs out with the same step / seek / canvas semantics, and the
-     preview loop renders them with `Device::project_fisheye_from_texture`
+     preview loop renders them with `Device::project_eye`
      (one entry point for hequirect / fisheye-out × plain / RS — the same
      kernels, no upload) and keeps an Arc clone in
      `queue.on_submitted_work_done` so the slot is only returned after the

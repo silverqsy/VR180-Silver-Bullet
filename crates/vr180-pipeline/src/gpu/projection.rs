@@ -6,9 +6,8 @@
 //! One kernel source (`shaders/fisheye_project.wgsl`), composed into the
 //! builds of [`FisheyeKernel`]; one pipeline per build
 //! ([`ProjectionKernels`]); one entry that runs any of them:
-//! [`Device::project_eye`]. The `project_fisheye_*` functions below it are
-//! the entry points the callers grew up with, each now a few lines that
-//! put its source on the GPU and describe the request.
+//! [`Device::project_eye`], which also puts a CPU-decoded picture on the
+//! GPU first.
 
 use super::{Device, EquirectRotation, EquirectUniforms, FisheyeCalib, FisheyeCalibUniforms};
 use crate::{Error, Result};
@@ -197,6 +196,28 @@ pub enum EyePicture<'a> {
     /// chroma plane. The calibration says how the samples are encoded and
     /// where the eye sits in the planes.
     Planes { y: &'a wgpu::TextureView, uv: &'a wgpu::TextureView },
+    /// `w × h` RGBA8 pixels from the CPU, uploaded for this call into the
+    /// texture kept for `slot`: a caller that uploads every frame (the
+    /// CPU-decode preview and export) does not create a texture every
+    /// frame. The slot stays locked until the projection is submitted, so
+    /// two threads on one slot cannot read each other's upload; eyes
+    /// projected in the same frame still need a slot each.
+    Bytes8 { rgba: &'a [u8], w: u32, h: u32, slot: u32 },
+    /// `w × h` pixels from the CPU, uploaded as a 16-bit texture of their
+    /// own: `bit_depth` 16 is RGBA64LE, copied as it is; 8 is RGBA8, each
+    /// byte put in the high half (low byte zero — no invented precision).
+    Bytes16 { bytes: &'a [u8], bit_depth: u8, w: u32, h: u32 },
+}
+
+/// Per-row correction is applied to both eyes or to neither: the rows of
+/// one eye alone are dropped.
+pub fn rows_for_both<'a>(
+    left: Option<&'a [f32]>, right: Option<&'a [f32]>,
+) -> (Option<&'a [f32]>, Option<&'a [f32]>) {
+    match (left, right) {
+        (Some(l), Some(r)) => (Some(l), Some(r)),
+        _ => (None, None),
+    }
 }
 
 /// Where a projected eye lands.
@@ -276,6 +297,58 @@ impl Device {
     /// (source kind, output kind, width, per-row correction) from the
     /// picture into a texture of the output size, and return that texture.
     pub fn project_eye(&self, p: &EyeProjection<'_>) -> Result<wgpu::Texture> {
+        match p.picture {
+            EyePicture::Rgba(_) | EyePicture::Planes { .. } => self.run_projection(p),
+            EyePicture::Bytes8 { rgba, w, h, slot } => {
+                debug_assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4);
+                let mut cache = self.eye_upload_cache.lock().unwrap();
+                let hit = matches!(cache.get(&slot), Some((cw, ch, _)) if *cw == w && *ch == h);
+                if !hit {
+                    cache.insert(slot, (w, h,
+                        texture(&self.device, "eye_uploaded_slot", w, h, wgpu::TextureFormat::Rgba8Unorm, SRC_USAGE)));
+                }
+                let tex = &cache.get(&slot).unwrap().2;
+                self.write_eye(tex, rgba, w, h);
+                let view = tex.create_view(&Default::default());
+                // `cache` is held to the end of this arm: see `Bytes8`.
+                self.run_projection(&EyeProjection { picture: EyePicture::Rgba(&view), ..*p })
+            }
+            EyePicture::Bytes16 { bytes, bit_depth, w, h } => {
+                let widened: std::borrow::Cow<[u8]> = if bit_depth >= 16 {
+                    std::borrow::Cow::Borrowed(bytes)
+                } else {
+                    let mut out = Vec::with_capacity((w as usize) * (h as usize) * 8);
+                    for px in bytes.chunks_exact(4) {
+                        out.extend_from_slice(&[0x00, px[0], 0x00, px[1], 0x00, px[2], 0xFF, 0xFF]);
+                    }
+                    std::borrow::Cow::Owned(out)
+                };
+                debug_assert_eq!(widened.len(), (w as usize) * (h as usize) * 8);
+                let tex = texture(&self.device, "eye_uploaded_16", w, h, wgpu::TextureFormat::Rgba16Unorm, SRC_USAGE);
+                self.write_eye(&tex, &widened, w, h);
+                let view = tex.create_view(&Default::default());
+                self.run_projection(&EyeProjection { picture: EyePicture::Rgba(&view), ..*p })
+            }
+        }
+    }
+
+    /// Project a frame's eyes. A frame with one eye (`right` absent) returns
+    /// that eye twice.
+    pub fn project_eyes(
+        &self,
+        left: &EyeProjection<'_>,
+        right: Option<&EyeProjection<'_>>,
+    ) -> Result<(wgpu::Texture, wgpu::Texture)> {
+        let l = self.project_eye(left)?;
+        let r = match right {
+            Some(right) => self.project_eye(right)?,
+            None => l.clone(),
+        };
+        Ok((l, r))
+    }
+
+    /// [`Self::project_eye`] for a picture that is on the GPU.
+    fn run_projection(&self, p: &EyeProjection<'_>) -> Result<wgpu::Texture> {
         let kernel = FisheyeKernel {
             yuv: matches!(p.picture, EyePicture::Planes { .. }),
             rs: p.rs_rows.is_some(),
@@ -326,6 +399,8 @@ impl Device {
                 resources.push(wgpu::BindingResource::TextureView(y));
                 resources.push(wgpu::BindingResource::TextureView(uv));
             }
+            EyePicture::Bytes8 { .. } | EyePicture::Bytes16 { .. } =>
+                unreachable!("project_eye uploads bytes before it gets here"),
         }
         resources.push(wgpu::BindingResource::Sampler(&pl.sampler));
         resources.push(wgpu::BindingResource::TextureView(&out_view));
@@ -357,14 +432,6 @@ impl Device {
         Ok(out)
     }
 
-    /// Put `w × h` pixels of `bytes` (`bytes.len() / (w·h)` bytes each) into
-    /// a texture of their own.
-    fn upload_eye(&self, format: wgpu::TextureFormat, bytes: &[u8], w: u32, h: u32) -> wgpu::Texture {
-        let tex = texture(&self.device, "eye_uploaded", w, h, format, SRC_USAGE);
-        self.write_eye(&tex, bytes, w, h);
-        tex
-    }
-
     fn write_eye(&self, tex: &wgpu::Texture, bytes: &[u8], w: u32, h: u32) {
         self.queue.write_texture(
             tex.as_image_copy(), bytes,
@@ -377,175 +444,14 @@ impl Device {
         );
     }
 
-    /// Project RGBA8 bytes through the texture kept for `slot`: a caller
-    /// that uploads every frame (the CPU-decode preview) does not create a
-    /// texture every frame. The slot stays locked until the projection is
-    /// submitted, so two threads on one slot cannot read each other's
-    /// upload.
-    fn project_uploaded_slot(
-        &self,
-        slot: u32,
-        rgba: &[u8], w: u32, h: u32,
-        request: impl FnOnce(EyePicture<'_>) -> Result<wgpu::Texture>,
-    ) -> Result<wgpu::Texture> {
-        let mut cache = self.eye_upload_cache.lock().unwrap();
-        let hit = matches!(cache.get(&slot), Some((cw, ch, _)) if *cw == w && *ch == h);
-        if !hit {
-            cache.insert(slot, (w, h,
-                texture(&self.device, "eye_uploaded_slot", w, h, wgpu::TextureFormat::Rgba8Unorm, SRC_USAGE)));
-        }
-        let tex = &cache.get(&slot).unwrap().2;
-        self.write_eye(tex, rgba, w, h);
-        request(EyePicture::Rgba(&tex.create_view(&Default::default())))
-    }
-
-    // ── The entry points as their callers know them ─────────────────
+    // ── What the Windows arms still call ────────────────────────────
     //
-    // Source kind × output kind × width × per-row correction, spelled out
-    // in the names. `src_w` / `src_h` are part of the calibration and are
-    // only read where pixels are uploaded.
+    // The D3D11 zero-copy preview and the two D3D11 exports project an
+    // on-GPU `Rgba16Unorm` eye into the output kept for `slot` through
+    // these four names. They cannot be compiled on a Mac, so they keep
+    // their calls until those arms move onto the shared render flow.
+    // `src_w` / `src_h` are part of the calibration and are not read.
 
-    /// RGBA8 bytes → half-equirect, read back as packed RGB8.
-    pub fn project_fisheye_to_equirect(
-        &self,
-        src_rgba: &[u8],
-        src_w: u32,
-        src_h: u32,
-        out_w: u32,
-        out_h: u32,
-        calib: FisheyeCalib,
-        rotation: EquirectRotation,
-    ) -> Result<Vec<u8>> {
-        debug_assert_eq!(src_rgba.len(), (src_w * src_h * 4) as usize);
-        let src = self.upload_eye(wgpu::TextureFormat::Rgba8Unorm, src_rgba, src_w, src_h);
-        let view = src.create_view(&Default::default());
-        let out = self.project_eye(&EyeProjection::new(EyePicture::Rgba(&view), out_w, out_h, rotation, calib))?;
-        self.read_texture_rgb8(&out, out_w, out_h)
-    }
-
-    /// RGBA8 bytes → half-equirect texture, the upload through `slot`
-    /// (0 = left eye, 1 = right eye for the preview).
-    pub fn project_fisheye_to_equirect_texture(
-        &self,
-        src_rgba: &[u8],
-        src_w: u32, src_h: u32,
-        out_w: u32, out_h: u32,
-        rotation: EquirectRotation,
-        calib: FisheyeCalib,
-        slot: u32,
-    ) -> Result<wgpu::Texture> {
-        self.project_uploaded_slot(slot, src_rgba, src_w, src_h, |picture| {
-            self.project_eye(&EyeProjection::new(picture, out_w, out_h, rotation, calib))
-        })
-    }
-
-    /// [`Self::project_fisheye_to_equirect_texture`] with the per-row
-    /// rolling-shutter correction (`rs_rows_f32`: 12 `f32` × `src_h` rows).
-    pub fn project_fisheye_to_equirect_rs_texture(
-        &self,
-        src_rgba: &[u8],
-        src_w: u32, src_h: u32,
-        out_w: u32, out_h: u32,
-        rotation: EquirectRotation,
-        calib: FisheyeCalib,
-        rs_rows_f32: &[f32],
-        slot: u32,
-    ) -> Result<wgpu::Texture> {
-        debug_assert_eq!(rs_rows_f32.len(), (src_h as usize) * 12);
-        self.project_uploaded_slot(slot, src_rgba, src_w, src_h, |picture| {
-            self.project_eye(&EyeProjection::new(picture, out_w, out_h, rotation, calib)
-                .rs_rows(Some(rs_rows_f32)))
-        })
-    }
-
-    /// Project one eye that is ALREADY a GPU texture (a zero-copy source:
-    /// an RGBA8 eye on the 2:1 canvas, e.g. a `braw_helper --zerocopy`
-    /// IOSurface) — no upload. `fisheye_out` picks the stabilized-fisheye
-    /// output over the half-equirect one; `rs_rows_f32` (12 f32 per source
-    /// row) the per-row rolling-shutter correction, left out when the
-    /// slice is empty.
-    pub fn project_fisheye_from_texture(
-        &self,
-        src: &wgpu::Texture,
-        out_w: u32, out_h: u32,
-        rotation: EquirectRotation,
-        calib: FisheyeCalib,
-        rs_rows_f32: Option<&[f32]>,
-        fisheye_out: bool,
-    ) -> Result<wgpu::Texture> {
-        let view = src.create_view(&Default::default());
-        self.project_eye(&EyeProjection::new(EyePicture::Rgba(&view), out_w, out_h, rotation, calib)
-            .fisheye_out(fisheye_out)
-            .rs_rows(rs_rows_f32.filter(|rows| !rows.is_empty())))
-    }
-
-    /// RGBA64LE bytes → 16-bit half-equirect texture: source precision
-    /// (P010 → RGBA64LE → texture) is kept through the sampler.
-    pub fn project_fisheye_to_equirect_texture_16(
-        &self,
-        src_rgba64le: &[u8],
-        src_w: u32, src_h: u32,
-        out_w: u32, out_h: u32,
-        rotation: EquirectRotation,
-        calib: FisheyeCalib,
-    ) -> Result<wgpu::Texture> {
-        debug_assert_eq!(src_rgba64le.len(), (src_w as usize) * (src_h as usize) * 8);
-        let src = self.upload_eye(wgpu::TextureFormat::Rgba16Unorm, src_rgba64le, src_w, src_h);
-        let view = src.create_view(&Default::default());
-        self.project_eye(&EyeProjection::new(EyePicture::Rgba(&view), out_w, out_h, rotation, calib).wide())
-    }
-
-    /// Zero-copy P010 → 16-bit half-equirect: Y and CbCr are two textures
-    /// aliasing the planes of a decoded IOSurface.
-    #[cfg(target_os = "macos")]
-    pub fn project_fisheye_p010_to_equirect_texture_16(
-        &self,
-        y_tex: &wgpu::Texture,
-        uv_tex: &wgpu::Texture,
-        src_w: u32, src_h: u32,
-        out_w: u32, out_h: u32,
-        rotation: EquirectRotation,
-        calib: FisheyeCalib,
-    ) -> Result<wgpu::Texture> {
-        let _ = (src_w, src_h);
-        let (y, uv) = (y_tex.create_view(&Default::default()), uv_tex.create_view(&Default::default()));
-        self.project_eye(&EyeProjection::new(EyePicture::Planes { y: &y, uv: &uv }, out_w, out_h, rotation, calib).wide())
-    }
-
-    /// Windows zero-copy P010 projection: as
-    /// [`Self::project_fisheye_p010_to_equirect_texture_16`], but Y / CbCr
-    /// are the two planes of a **single** imported P010 texture (the
-    /// D3D11→Vulkan-imported NVDEC frame), read through plane-aspect views.
-    /// Available on all platforms.
-    pub fn project_fisheye_p010_planar_to_equirect_texture_16(
-        &self,
-        p010_tex: &wgpu::Texture,
-        src_w: u32, src_h: u32,
-        out_w: u32, out_h: u32,
-        rotation: EquirectRotation,
-        calib: FisheyeCalib,
-    ) -> Result<wgpu::Texture> {
-        let _ = (src_w, src_h);
-        // P010 plane views: plane 0 = R16 (Y), plane 1 = Rg16 (CbCr).
-        let y = p010_tex.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("p010_y_plane"),
-            format: Some(wgpu::TextureFormat::R16Unorm),
-            aspect: wgpu::TextureAspect::Plane0,
-            ..Default::default()
-        });
-        let uv = p010_tex.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("p010_uv_plane"),
-            format: Some(wgpu::TextureFormat::Rg16Unorm),
-            aspect: wgpu::TextureAspect::Plane1,
-            ..Default::default()
-        });
-        self.project_eye(&EyeProjection::new(EyePicture::Planes { y: &y, uv: &uv }, out_w, out_h, rotation, calib).wide())
-    }
-
-    /// An on-GPU `Rgba16Unorm` eye (e.g. from
-    /// [`Self::resolve_p010_planes_to_rgba16`]) → 16-bit half-equirect, into
-    /// the output kept for `slot`. `calib` MUST be resolved against the
-    /// texture's own dims, not the native ones.
     pub fn project_fisheye_rgba16_texture_to_equirect_16(
         &self,
         src_tex: &wgpu::Texture,
@@ -561,8 +467,6 @@ impl Device {
             .wide().slot(slot))
     }
 
-    /// Fisheye-output sibling of
-    /// [`Self::project_fisheye_rgba16_texture_to_equirect_16`].
     pub fn project_fisheye_rgba16_texture_to_fisheye_16(
         &self,
         src_tex: &wgpu::Texture,
@@ -578,8 +482,8 @@ impl Device {
             .wide().fisheye_out(true).slot(slot))
     }
 
-    /// [`Self::project_fisheye_rgba16_texture_to_fisheye_16`] with the
-    /// per-row correction (`src_h * 12` floats; an empty slice turns it off).
+    /// `per_row_matrices_f32`: `src_h * 12` floats; an empty slice turns the
+    /// correction off.
     pub fn project_fisheye_rgba16_texture_to_fisheye_rs_16(
         &self,
         src_tex: &wgpu::Texture,
@@ -596,9 +500,9 @@ impl Device {
             .wide().fisheye_out(true).rs_rows(Some(per_row_matrices_f32)).slot(slot))
     }
 
-    /// [`Self::project_fisheye_rgba16_texture_to_equirect_16`] with the
-    /// per-row correction (`src_h * 12` floats, from
-    /// `pack_per_row_camera_matrices`; an empty slice turns it off).
+    /// `per_row_matrices_f32`: `src_h * 12` floats, from
+    /// `pack_per_row_camera_matrices`; an empty slice turns the correction
+    /// off.
     pub fn project_fisheye_rgba16_texture_to_equirect_rs_16(
         &self,
         src_tex: &wgpu::Texture,
@@ -613,123 +517,6 @@ impl Device {
         let view = src_tex.create_view(&Default::default());
         self.project_eye(&EyeProjection::new(EyePicture::Rgba(&view), out_w, out_h, rotation, calib)
             .wide().rs_rows(Some(per_row_matrices_f32)).slot(slot))
-    }
-
-    /// [`Self::project_fisheye_p010_to_equirect_texture_16`] with the
-    /// per-row correction (`fish_h * 12` floats; an empty slice turns it
-    /// off).
-    #[cfg(target_os = "macos")]
-    pub fn project_fisheye_p010_to_equirect_rs_texture_16(
-        &self,
-        y_tex: &wgpu::Texture,
-        uv_tex: &wgpu::Texture,
-        src_w: u32, src_h: u32,
-        out_w: u32, out_h: u32,
-        rotation: EquirectRotation,
-        calib: FisheyeCalib,
-        per_row_matrices_f32: &[f32],
-    ) -> Result<wgpu::Texture> {
-        let _ = (src_w, src_h);
-        let (y, uv) = (y_tex.create_view(&Default::default()), uv_tex.create_view(&Default::default()));
-        self.project_eye(&EyeProjection::new(EyePicture::Planes { y: &y, uv: &uv }, out_w, out_h, rotation, calib)
-            .wide().rs_rows(Some(per_row_matrices_f32)))
-    }
-
-    /// RGBA8 bytes → a stabilized fisheye eye (equidistant output). The
-    /// caller can compose the per-frame stab matrix with the per-eye
-    /// view adjust before calling.
-    pub fn project_fisheye_to_fisheye_texture(
-        &self,
-        src_rgba: &[u8],
-        src_w: u32, src_h: u32,
-        out_w: u32, out_h: u32,
-        rotation: EquirectRotation,
-        calib: FisheyeCalib,
-    ) -> Result<wgpu::Texture> {
-        let src = self.upload_eye(wgpu::TextureFormat::Rgba8Unorm, src_rgba, src_w, src_h);
-        let view = src.create_view(&Default::default());
-        self.project_eye(&EyeProjection::new(EyePicture::Rgba(&view), out_w, out_h, rotation, calib)
-            .fisheye_out(true))
-    }
-
-    /// [`Self::project_fisheye_to_fisheye_texture`] with the per-row
-    /// correction (an empty slice turns it off).
-    pub fn project_fisheye_to_fisheye_rs_texture(
-        &self,
-        src_rgba: &[u8],
-        src_w: u32, src_h: u32,
-        out_w: u32, out_h: u32,
-        rotation: EquirectRotation,
-        calib: FisheyeCalib,
-        rs_rows_f32: &[f32],
-    ) -> Result<wgpu::Texture> {
-        let src = self.upload_eye(wgpu::TextureFormat::Rgba8Unorm, src_rgba, src_w, src_h);
-        let view = src.create_view(&Default::default());
-        self.project_eye(&EyeProjection::new(EyePicture::Rgba(&view), out_w, out_h, rotation, calib)
-            .fisheye_out(true).rs_rows(Some(rs_rows_f32)))
-    }
-
-    /// Bytes → a 16-bit stabilized fisheye eye. An 8-bit source (RGBA8) is
-    /// widened by putting each byte in the high half (low byte zero — no
-    /// invented precision); a 16-bit one (RGBA64LE) is copied as it is.
-    pub fn project_fisheye_to_fisheye_texture_16(
-        &self,
-        src_rgba_or_rgba64le: &[u8],
-        src_bit_depth: u8,
-        src_w: u32, src_h: u32,
-        out_w: u32, out_h: u32,
-        rotation: EquirectRotation,
-        calib: FisheyeCalib,
-    ) -> Result<wgpu::Texture> {
-        let widened: std::borrow::Cow<[u8]> = if src_bit_depth >= 16 {
-            std::borrow::Cow::Borrowed(src_rgba_or_rgba64le)
-        } else {
-            let mut out = Vec::with_capacity((src_w as usize) * (src_h as usize) * 8);
-            for px in src_rgba_or_rgba64le.chunks_exact(4) {
-                out.extend_from_slice(&[0x00, px[0], 0x00, px[1], 0x00, px[2], 0xFF, 0xFF]);
-            }
-            std::borrow::Cow::Owned(out)
-        };
-        let src = self.upload_eye(wgpu::TextureFormat::Rgba16Unorm, &widened, src_w, src_h);
-        let view = src.create_view(&Default::default());
-        self.project_eye(&EyeProjection::new(EyePicture::Rgba(&view), out_w, out_h, rotation, calib)
-            .wide().fisheye_out(true))
-    }
-
-    /// Zero-copy P010 → a 16-bit stabilized fisheye eye.
-    #[cfg(target_os = "macos")]
-    pub fn project_fisheye_p010_to_fisheye_texture_16(
-        &self,
-        y_tex: &wgpu::Texture,
-        uv_tex: &wgpu::Texture,
-        src_w: u32, src_h: u32,
-        out_w: u32, out_h: u32,
-        rotation: EquirectRotation,
-        calib: FisheyeCalib,
-    ) -> Result<wgpu::Texture> {
-        let _ = (src_w, src_h);
-        let (y, uv) = (y_tex.create_view(&Default::default()), uv_tex.create_view(&Default::default()));
-        self.project_eye(&EyeProjection::new(EyePicture::Planes { y: &y, uv: &uv }, out_w, out_h, rotation, calib)
-            .wide().fisheye_out(true))
-    }
-
-    /// [`Self::project_fisheye_p010_to_fisheye_texture_16`] with the
-    /// per-row correction (an empty slice turns it off).
-    #[cfg(target_os = "macos")]
-    pub fn project_fisheye_p010_to_fisheye_rs_texture_16(
-        &self,
-        y_tex: &wgpu::Texture,
-        uv_tex: &wgpu::Texture,
-        src_w: u32, src_h: u32,
-        out_w: u32, out_h: u32,
-        rotation: EquirectRotation,
-        calib: FisheyeCalib,
-        per_row_matrices_f32: &[f32],
-    ) -> Result<wgpu::Texture> {
-        let _ = (src_w, src_h);
-        let (y, uv) = (y_tex.create_view(&Default::default()), uv_tex.create_view(&Default::default()));
-        self.project_eye(&EyeProjection::new(EyePicture::Planes { y: &y, uv: &uv }, out_w, out_h, rotation, calib)
-            .wide().fisheye_out(true).rs_rows(Some(per_row_matrices_f32)))
     }
 }
 
@@ -764,8 +551,8 @@ mod fisheye_kernel_tests {
     }
 }
 
-/// Every per-eye projection entry run on fixed synthetic pictures, each
-/// output reduced to a hash. It pins what the projection code computes
+/// Every build of the projection kernel through every kind of picture, on
+/// fixed synthetic pictures, each output reduced to a hash. It pins what the projection code computes
 /// across a change to that code, on one machine:
 ///
 /// ```text
@@ -779,6 +566,7 @@ mod fisheye_kernel_tests {
 #[cfg(test)]
 mod projection_fingerprints {
     use super::super::{Device, EquirectRotation, FisheyeCalib};
+    use super::{EyePicture, EyeProjection};
     use crate::Result;
 
     const SW: u32 = 160;
@@ -883,66 +671,77 @@ mod projection_fingerprints {
     fn every_projection_entry_keeps_its_output() {
         let path = std::env::var("VR180_FINGERPRINTS").expect("VR180_FINGERPRINTS=<file>");
         let dev = Device::new().expect("device");
-        let (sw, sh, ow, oh) = (SW, SH, OW, OH);
+        let (sw, sh) = (SW, SH);
         let rgba8 = noise((sw * sh * 4) as usize, 11);
         let rgba64 = noise((sw * sh * 8) as usize, 23);
         let tex8 = texture(&dev, wgpu::TextureFormat::Rgba8Unorm, sw, sh, &rgba8);
         let tex16 = texture(&dev, wgpu::TextureFormat::Rgba16Unorm, sw, sh, &rgba64);
-        let (rot, rows) = (rotation(), rows());
+        let rows = rows();
         let mut run = Run { dev: &dev, lines: Vec::new() };
 
+        let (v8, v16) = (tex8.create_view(&Default::default()), tex16.create_view(&Default::default()));
+        fn req<'a>(picture: EyePicture<'a>, calib: FisheyeCalib) -> EyeProjection<'a> {
+            EyeProjection::new(picture, OW, OH, rotation(), calib)
+        }
+        let bytes8 = |slot: u32| EyePicture::Bytes8 { rgba: &rgba8, w: sw, h: sh, slot };
+
         // RGBA8 bytes in.
-        let px = dev.project_fisheye_to_equirect(&rgba8, sw, sh, ow, oh, kb(), rot).expect("bytes");
-        run.lines.push(("bytes8_equirect_readback kb".into(), fnv(&px)));
-        run.eight("bytes8_equirect kb", dev.project_fisheye_to_equirect_texture(&rgba8, sw, sh, ow, oh, rot, kb(), 0));
-        run.eight("bytes8_equirect omni", dev.project_fisheye_to_equirect_texture(&rgba8, sw, sh, ow, oh, rot, omni(), 0));
-        run.eight("bytes8_equirect reframed slot1", dev.project_fisheye_to_equirect_texture(&rgba8, sw, sh, ow, oh, rot, reframed(), 1));
-        run.eight("bytes8_equirect_rs kb", dev.project_fisheye_to_equirect_rs_texture(&rgba8, sw, sh, ow, oh, rot, kb(), &rows, 0));
-        run.eight("bytes8_equirect_rs omni", dev.project_fisheye_to_equirect_rs_texture(&rgba8, sw, sh, ow, oh, rot, omni(), &rows, 0));
-        run.eight("bytes8_fisheye kb", dev.project_fisheye_to_fisheye_texture(&rgba8, sw, sh, ow, oh, rot, kb()));
-        run.eight("bytes8_fisheye omni", dev.project_fisheye_to_fisheye_texture(&rgba8, sw, sh, ow, oh, rot, omni()));
-        run.eight("bytes8_fisheye_rs kb", dev.project_fisheye_to_fisheye_rs_texture(&rgba8, sw, sh, ow, oh, rot, kb(), &rows));
-        run.eight("bytes8_fisheye_rs no rows", dev.project_fisheye_to_fisheye_rs_texture(&rgba8, sw, sh, ow, oh, rot, kb(), &[]));
+        run.eight("bytes8_equirect_readback kb", dev.project_eye(&req(bytes8(2), kb())));
+        run.eight("bytes8_equirect kb", dev.project_eye(&req(bytes8(0), kb())));
+        run.eight("bytes8_equirect omni", dev.project_eye(&req(bytes8(0), omni())));
+        run.eight("bytes8_equirect reframed slot1", dev.project_eye(&req(bytes8(1), reframed())));
+        run.eight("bytes8_equirect_rs kb", dev.project_eye(&req(bytes8(0), kb()).rs_rows(Some(&rows))));
+        run.eight("bytes8_equirect_rs omni", dev.project_eye(&req(bytes8(0), omni()).rs_rows(Some(&rows))));
+        run.eight("bytes8_fisheye kb", dev.project_eye(&req(bytes8(0), kb()).fisheye_out(true)));
+        run.eight("bytes8_fisheye omni", dev.project_eye(&req(bytes8(0), omni()).fisheye_out(true)));
+        run.eight("bytes8_fisheye_rs kb", dev.project_eye(&req(bytes8(0), kb()).fisheye_out(true).rs_rows(Some(&rows))));
+        run.eight("bytes8_fisheye_rs no rows", dev.project_eye(&req(bytes8(0), kb()).fisheye_out(true).rs_rows(Some(&[]))));
 
-        // An RGBA8 texture in.
+        // An RGBA8 texture in. The last of each: rows asked for and none
+        // given, which a caller filters to "no correction".
         for (fisheye_out, out) in [(false, "equirect"), (true, "fisheye")] {
-            run.eight(&format!("tex8_{out} kb"), dev.project_fisheye_from_texture(&tex8, ow, oh, rot, kb(), None, fisheye_out));
-            run.eight(&format!("tex8_{out} omni"), dev.project_fisheye_from_texture(&tex8, ow, oh, rot, omni(), None, fisheye_out));
-            run.eight(&format!("tex8_{out}_rs kb"), dev.project_fisheye_from_texture(&tex8, ow, oh, rot, kb(), Some(&rows), fisheye_out));
-            run.eight(&format!("tex8_{out}_rs no rows"), dev.project_fisheye_from_texture(&tex8, ow, oh, rot, kb(), Some(&[]), fisheye_out));
+            let from_tex8 = |calib| req(EyePicture::Rgba(&v8), calib).fisheye_out(fisheye_out);
+            run.eight(&format!("tex8_{out} kb"), dev.project_eye(&from_tex8(kb())));
+            run.eight(&format!("tex8_{out} omni"), dev.project_eye(&from_tex8(omni())));
+            run.eight(&format!("tex8_{out}_rs kb"), dev.project_eye(&from_tex8(kb()).rs_rows(Some(&rows))));
+            run.eight(&format!("tex8_{out}_rs no rows"), dev.project_eye(&from_tex8(kb()).rs_rows(None)));
         }
 
-        // 16-bit bytes in.
-        run.sixteen("bytes16_equirect kb", dev.project_fisheye_to_equirect_texture_16(&rgba64, sw, sh, ow, oh, rot, kb()));
-        run.sixteen("bytes16_equirect omni", dev.project_fisheye_to_equirect_texture_16(&rgba64, sw, sh, ow, oh, rot, omni()));
-        run.sixteen("bytes16_fisheye kb", dev.project_fisheye_to_fisheye_texture_16(&rgba64, 16, sw, sh, ow, oh, rot, kb()));
-        run.sixteen("bytes8_fisheye_16 kb", dev.project_fisheye_to_fisheye_texture_16(&rgba8, 8, sw, sh, ow, oh, rot, kb()));
+        // 16-bit bytes in, and 8-bit bytes widened.
+        let bytes16 = EyePicture::Bytes16 { bytes: &rgba64, bit_depth: 16, w: sw, h: sh };
+        let widened = EyePicture::Bytes16 { bytes: &rgba8, bit_depth: 8, w: sw, h: sh };
+        run.sixteen("bytes16_equirect kb", dev.project_eye(&req(bytes16, kb()).wide()));
+        run.sixteen("bytes16_equirect omni", dev.project_eye(&req(bytes16, omni()).wide()));
+        run.sixteen("bytes16_fisheye kb", dev.project_eye(&req(bytes16, kb()).wide().fisheye_out(true)));
+        run.sixteen("bytes8_fisheye_16 kb", dev.project_eye(&req(widened, kb()).wide().fisheye_out(true)));
 
-        // A 16-bit RGBA texture in.
+        // A 16-bit RGBA texture in, the output kept per slot.
+        let from_tex16 = |calib, slot| req(EyePicture::Rgba(&v16), calib).wide().slot(slot);
         for (calib, lens) in [(kb(), "kb"), (omni(), "omni"), (reframed(), "reframed")] {
-            run.sixteen(&format!("tex16_equirect {lens}"), dev.project_fisheye_rgba16_texture_to_equirect_16(&tex16, sw, sh, ow, oh, rot, calib, 0));
-            run.sixteen(&format!("tex16_fisheye {lens}"), dev.project_fisheye_rgba16_texture_to_fisheye_16(&tex16, sw, sh, ow, oh, rot, calib, 1));
-            run.sixteen(&format!("tex16_equirect_rs {lens}"), dev.project_fisheye_rgba16_texture_to_equirect_rs_16(&tex16, sw, sh, ow, oh, rot, calib, &rows, 0));
-            run.sixteen(&format!("tex16_fisheye_rs {lens}"), dev.project_fisheye_rgba16_texture_to_fisheye_rs_16(&tex16, sw, sh, ow, oh, rot, calib, &rows, 1));
+            run.sixteen(&format!("tex16_equirect {lens}"), dev.project_eye(&from_tex16(calib, 0)));
+            run.sixteen(&format!("tex16_fisheye {lens}"), dev.project_eye(&from_tex16(calib, 1).fisheye_out(true)));
+            run.sixteen(&format!("tex16_equirect_rs {lens}"), dev.project_eye(&from_tex16(calib, 0).rs_rows(Some(&rows))));
+            run.sixteen(&format!("tex16_fisheye_rs {lens}"), dev.project_eye(&from_tex16(calib, 1).fisheye_out(true).rs_rows(Some(&rows))));
         }
-        run.sixteen("tex16_equirect_rs no rows", dev.project_fisheye_rgba16_texture_to_equirect_rs_16(&tex16, sw, sh, ow, oh, rot, kb(), &[], 0));
-        run.sixteen("tex16_fisheye_rs no rows", dev.project_fisheye_rgba16_texture_to_fisheye_rs_16(&tex16, sw, sh, ow, oh, rot, kb(), &[], 1));
+        run.sixteen("tex16_equirect_rs no rows", dev.project_eye(&from_tex16(kb(), 0).rs_rows(Some(&[]))));
+        run.sixteen("tex16_fisheye_rs no rows", dev.project_eye(&from_tex16(kb(), 1).fisheye_out(true).rs_rows(Some(&[]))));
 
         // Luma + chroma planes in: a frame two eyes wide, so the second eye
         // is read in place through the calibration's plane offset.
-        #[cfg(target_os = "macos")]
         {
             let y = texture(&dev, wgpu::TextureFormat::R16Unorm, sw * 2, sh, &noise((sw * 2 * sh * 2) as usize, 37));
             let uv = texture(&dev, wgpu::TextureFormat::Rg16Unorm, sw, sh / 2, &noise((sw * (sh / 2) * 4) as usize, 41));
+            let (y, uv) = (y.create_view(&Default::default()), uv.create_view(&Default::default()));
+            let planes = |calib| req(EyePicture::Planes { y: &y, uv: &uv }, calib).wide();
             let second = |mut c: FisheyeCalib| { c.src_x0 = sw as f32; c };
             for (calib, lens) in [(kb(), "kb"), (omni(), "omni"), (second(kb()), "kb second eye"), (reframed(), "reframed")] {
-                run.sixteen(&format!("planes_equirect {lens}"), dev.project_fisheye_p010_to_equirect_texture_16(&y, &uv, sw, sh, ow, oh, rot, calib));
-                run.sixteen(&format!("planes_fisheye {lens}"), dev.project_fisheye_p010_to_fisheye_texture_16(&y, &uv, sw, sh, ow, oh, rot, calib));
-                run.sixteen(&format!("planes_equirect_rs {lens}"), dev.project_fisheye_p010_to_equirect_rs_texture_16(&y, &uv, sw, sh, ow, oh, rot, calib, &rows));
-                run.sixteen(&format!("planes_fisheye_rs {lens}"), dev.project_fisheye_p010_to_fisheye_rs_texture_16(&y, &uv, sw, sh, ow, oh, rot, calib, &rows));
+                run.sixteen(&format!("planes_equirect {lens}"), dev.project_eye(&planes(calib)));
+                run.sixteen(&format!("planes_fisheye {lens}"), dev.project_eye(&planes(calib).fisheye_out(true)));
+                run.sixteen(&format!("planes_equirect_rs {lens}"), dev.project_eye(&planes(calib).rs_rows(Some(&rows))));
+                run.sixteen(&format!("planes_fisheye_rs {lens}"), dev.project_eye(&planes(calib).fisheye_out(true).rs_rows(Some(&rows))));
             }
-            run.sixteen("planes_equirect_rs no rows", dev.project_fisheye_p010_to_equirect_rs_texture_16(&y, &uv, sw, sh, ow, oh, rot, kb(), &[]));
-            run.sixteen("planes_fisheye_rs no rows", dev.project_fisheye_p010_to_fisheye_rs_texture_16(&y, &uv, sw, sh, ow, oh, rot, kb(), &[]));
+            run.sixteen("planes_equirect_rs no rows", dev.project_eye(&planes(kb()).rs_rows(Some(&[]))));
+            run.sixteen("planes_fisheye_rs no rows", dev.project_eye(&planes(kb()).fisheye_out(true).rs_rows(Some(&[]))));
         }
 
         let text: String = run.lines.iter().map(|(n, h)| format!("{h:016x}  {n}\n")).collect();

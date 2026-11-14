@@ -187,10 +187,10 @@ pub fn measure_stereo_align(
                 crate::fisheye_export::resolve_calib_pair(cfg, src_w, src_h, osv.as_ref())
             });
 
-            let tex_l = pipeline.project_fisheye_to_equirect_texture(
-                &pair.left, src_w, src_h, EYE, EYE, rot_l, calib_l, 10)?;
-            let tex_r = pipeline.project_fisheye_to_equirect_texture(
-                &pair.right, src_w, src_h, EYE, EYE, rot_r, calib_r, 11)?;
+            let eye = |rgba: &[u8], rot, calib, slot| pipeline.project_eye(&crate::gpu::EyeProjection::new(
+                crate::gpu::EyePicture::Bytes8 { rgba, w: src_w, h: src_h, slot }, EYE, EYE, rot, calib));
+            let tex_l = eye(&pair.left, rot_l, calib_l, 10)?;
+            let tex_r = eye(&pair.right, rot_r, calib_r, 11)?;
             let gray_l = to_gray(&pipeline.read_texture_rgb8(&tex_l, EYE, EYE)?);
             let gray_r = to_gray(&pipeline.read_texture_rgb8(&tex_r, EYE, EYE)?);
 

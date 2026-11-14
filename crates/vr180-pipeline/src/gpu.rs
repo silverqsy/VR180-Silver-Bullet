@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 mod projection;
-pub use projection::{EyeOutput, EyePicture, EyeProjection};
+pub use projection::{rows_for_both, EyeOutput, EyePicture, EyeProjection};
 use projection::ProjectionKernels;
 
 /// One wgpu device + queue + default adapter + cached pipelines.
@@ -1304,7 +1304,7 @@ pub fn yuv_range_constants(bits: u8, full_range: bool) -> [f32; 4] {
 /// Public per-eye Kannala-Brandt fisheye calibration. Caller builds
 /// one of these (typically by composing a `vr180_fisheye::FisheyeCalibration`
 /// with the working frame size) and hands it to
-/// [`Device::project_fisheye_to_equirect`].
+/// [`Device::project_eye`].
 #[derive(Copy, Clone, Debug)]
 pub struct FisheyeCalib {
     /// Focal length in pixels (x). Comes either from the camera
