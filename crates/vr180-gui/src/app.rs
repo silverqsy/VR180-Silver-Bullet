@@ -480,7 +480,8 @@ impl StillFormatChoice {
 /// ~126°, so a 180° canvas of the frame's own size scales it down. `Sharp`
 /// renders the 180° canvas at the pixel density of the frame's centre
 /// (`π × the lens' centre focal`: 6560² per eye → 13120 × 6560 on the X6).
-/// Offered only for such a clip; on any other it falls back to `R8k`.
+/// Offered only for such a clip, whose choice is kept apart from every
+/// other clip's ([`ExportOptions::resolution_for`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportResolution { Native, R8k, Sharp }
 
@@ -622,8 +623,15 @@ struct ExportOptions {
     codec: ExportCodec,
     /// Still-photo container (used only when the source is a still).
     still_format: StillFormatChoice,
-    /// Output resolution target (Native / 8192×4096 / a Crop clip's native sharpness).
+    /// Output resolution target (Native / 8192×4096) of every clip but a
+    /// Crop one. Read it through [`ExportOptions::resolution_for`].
     resolution: ExportResolution,
+    /// The same choice for a clip whose frame is a crop of the lens' view
+    /// (Native / 8192×4096 / its native sharpness). Its own, so a list that
+    /// holds both sorts exports each at the size picked on a clip of its
+    /// sort: "its own size" means something else on either side (the whole
+    /// canvas for one, a smaller canvas than was recorded for the other).
+    crop_resolution: ExportResolution,
     /// H.265 average bitrate in Mbps for VR180 output. Range 20..=1000
     /// (a native 12K export wants the top of it; the slider is logarithmic
     /// so the everyday 50–300 Mbps band keeps its resolution).
@@ -724,15 +732,22 @@ mod export_size_tests {
     }
     use vr180_fisheye::{InsvWindowCrop, X6ViewChoice};
 
-    fn eye_dims(resolution: ExportResolution, eye: u32, sharp_eye: Option<u32>) -> (u32, u32) {
-        let opts = ExportOptions { resolution, ..Default::default() };
+    /// Per-eye size of an export under `opts`: a clip of `eye` pixels a
+    /// side whose native-sharpness side is `sharp_eye` (a Crop clip's).
+    fn eye_dims_with(opts: &ExportOptions, eye: u32, sharp_eye: Option<u32>) -> (u32, u32) {
         let cfg = App::build_export_cfg(
             std::path::Path::new("/nonexistent/in.insv"), std::path::Path::new("/nonexistent/out.mp4"),
             29.97, vr180_pipeline::SourceKind::Insta360Insv,
             eye, eye, eye, eye, sharp_eye,
-            &crate::decoder::Settings::default(), &opts, Vec::new(),
+            &crate::decoder::Settings::default(), opts, Vec::new(),
         );
         (cfg.eye_w, cfg.eye_h)
+    }
+
+    /// The same with one choice made on both sorts of clip.
+    fn eye_dims(resolution: ExportResolution, eye: u32, sharp_eye: Option<u32>) -> (u32, u32) {
+        let opts = ExportOptions { resolution, crop_resolution: resolution, ..Default::default() };
+        eye_dims_with(&opts, eye, sharp_eye)
     }
 
     #[test]
@@ -744,6 +759,98 @@ mod export_size_tests {
         // Any other clip has no such size: the choice means 8K there.
         assert_eq!(eye_dims(ExportResolution::Sharp, 3840, None), (4096, 4096));
         assert_eq!(eye_dims(ExportResolution::Native, 3840, None), (3840, 3840));
+    }
+
+    /// One list, both sorts of clip: what is picked on a full-view clip
+    /// leaves a Crop clip's size alone, and the other way round.
+    #[test]
+    fn a_crop_clip_has_its_own_resolution_choice() {
+        use ExportResolution::{Native, R8k, Sharp};
+        let full = (7680, None);
+        let crop = (4912, Some(6560));
+        for (general, crop_choice, full_side, crop_side) in [
+            (Native, Sharp, 7680, 6560),
+            (Native, R8k, 7680, 4096),
+            (R8k, Sharp, 4096, 6560),
+            (R8k, Native, 4096, 4912),
+            (Native, Native, 7680, 4912),
+        ] {
+            let opts = ExportOptions { resolution: general, crop_resolution: crop_choice, ..Default::default() };
+            assert_eq!(opts.resolution_for(false), general);
+            assert_eq!(opts.resolution_for(true), crop_choice);
+            assert_eq!(eye_dims_with(&opts, full.0, full.1), (full_side, full_side), "{general:?} / {crop_choice:?}");
+            assert_eq!(eye_dims_with(&opts, crop.0, crop.1), (crop_side, crop_side), "{general:?} / {crop_choice:?}");
+        }
+        // Both start at 8K.
+        let d = ExportOptions::default();
+        assert_eq!((d.resolution, d.crop_resolution), (R8k, R8k));
+    }
+
+    /// Every piece of text the Format window paints for a VR180 clip.
+    fn panel_text(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, single_eye: bool) -> String {
+        fn collect(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => { out.push_str(text.galley.text()); out.push('\n'); }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        // Two frames: a new context lays its first one out without sizes to go by.
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 3000.0))),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(input, |ui| {
+                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, single_eye);
+            });
+            text.clear();
+            out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
+        }
+        text
+    }
+
+    /// The Format window shows each sort of clip its own choice, and
+    /// showing one never changes the other's.
+    #[test]
+    fn the_format_window_keeps_both_choices() {
+        use ExportResolution::{Native, Sharp};
+        let mut opts = ExportOptions { resolution: Native, crop_resolution: Sharp, ..Default::default() };
+        // A clip that holds one whole eye, at its own size.
+        let text = panel_text(&mut opts, (7680, 7680), None, true);
+        assert!(text.contains("7680 × 7680 (native)"), "{text}");
+        assert!(!text.contains("native sharpness"), "{text}");
+        assert_eq!((opts.resolution, opts.crop_resolution), (Native, Sharp));
+        // A 10K Crop clip in the same list.
+        let text = panel_text(&mut opts, (9824, 4912), Some((13120, 6560)), false);
+        assert!(text.contains("13120 × 6560 (native sharpness)"), "{text}");
+        assert!(!text.contains("9824 × 4912 (native)"), "{text}");
+        assert_eq!((opts.resolution, opts.crop_resolution), (Native, Sharp));
+    }
+
+    /// "Apply settings to all" stays inside one settings class: a clip that
+    /// keeps a setup of its own within a camera type is not overwritten.
+    #[test]
+    fn apply_to_all_stays_within_a_settings_class() {
+        use super::{BatchItem, BatchStatus};
+        use vr180_pipeline::SourceKind;
+        let item = |source_kind, x6| BatchItem {
+            path: "/nonexistent/in.insv".into(),
+            fps: 29.97, duration_sec: 10.0, source_kind,
+            fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
+            settings: Default::default(),
+            status: BatchStatus::Idle, selected: false, x6,
+        };
+        let x6 = |single_eye| Some(X6ClipInfo { window: None, ilog: Some(true), paraxial_native: 2086.97, single_lens: single_eye, single_eye });
+        let two = item(SourceKind::Insta360Insv, x6(false));
+        let one = item(SourceKind::Insta360Insv, x6(true));
+        assert_eq!(two.settings_class(), item(SourceKind::Insta360Insv, x6(false)).settings_class());
+        assert_eq!(one.settings_class(), item(SourceKind::Insta360Insv, x6(true)).settings_class());
+        assert_ne!(one.settings_class(), two.settings_class());
+        assert_ne!(two.settings_class(), item(SourceKind::DjiOsv, None).settings_class());
+        assert_eq!(item(SourceKind::DjiOsv, None).settings_class(), item(SourceKind::DjiOsv, None).settings_class());
     }
 
     #[test]
@@ -1162,6 +1269,23 @@ mod reframe_bitrate_tests {
 }
 
 impl ExportOptions {
+    /// The resolution choice that applies to a clip. `cropped`: its frame
+    /// is a crop of the lens' view, the one sort with a native-sharpness
+    /// size (`sharp_eye` is `Some`).
+    fn resolution_for(&self, cropped: bool) -> ExportResolution {
+        match (cropped, self.resolution) {
+            (true, _) => self.crop_resolution,
+            // No such size outside a Crop clip.
+            (false, ExportResolution::Sharp) => ExportResolution::R8k,
+            (false, r) => r,
+        }
+    }
+
+    /// The choice [`Self::resolution_for`] reads, for the control that edits it.
+    fn resolution_for_mut(&mut self, cropped: bool) -> &mut ExportResolution {
+        if cropped { &mut self.crop_resolution } else { &mut self.resolution }
+    }
+
     /// The codec an export of a clip with `settings` really uses: spatial
     /// video only where it exists ([`spatial_video_available`], and never
     /// for a still); everywhere else that choice runs as H.265. The choice
@@ -1191,6 +1315,7 @@ impl Default for ExportOptions {
             codec: ExportCodec::H265,
             still_format: StillFormatChoice::Png16,
             resolution: ExportResolution::R8k,
+            crop_resolution: ExportResolution::R8k,
             h265_bitrate_mbps: 200,
             reframe_bitrate_mbps: 35,
             reframe_bitrate_custom: false,
@@ -1256,6 +1381,12 @@ impl BatchItem {
     /// The clip is taken as Insta360 I-Log (see [`takes_ilog`]).
     fn ilog(&self) -> bool {
         takes_ilog(self.source_kind, self.x6.as_ref())
+    }
+
+    /// The settings bucket this entry belongs to (see
+    /// `App::settings_class_key`): "Apply settings to all" stays inside it.
+    fn settings_class(&self) -> &'static str {
+        App::settings_class_key(self.source_kind, self.single_eye())
     }
 
     /// The settings this entry exports with: its own, taken as a single-eye
@@ -2540,8 +2671,8 @@ impl App {
         // not a last-step upscale.
         // Native sharpness (`sharp_eye`: a clip whose frame is a crop of
         // the lens' view): the 180° canvas at the frame's own centre
-        // density. Any other clip takes the 8K target instead.
-        match (opts.resolution, sharp_eye) {
+        // density. Such a clip has its own choice; no other has that size.
+        match (opts.resolution_for(sharp_eye.is_some()), sharp_eye) {
             (ExportResolution::Sharp, Some(side)) => { eye_w = side; eye_h = side; }
             (ExportResolution::R8k | ExportResolution::Sharp, _) => { eye_w = 4096; eye_h = 4096; }
             (ExportResolution::Native, _) => {}
@@ -5027,23 +5158,20 @@ impl App {
         let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
         // A single-eye clip's frame is its one eye, not two side by side.
         let single_eye = self.clip_single_eye();
-        let res_label = match self.settings.reframe_aspect_if_active() {
-            Some(aspect) => self.export_opts.reframe_size.frame_label(aspect, single_eye),
+        // The loaded clip's own choice (a Crop clip has one apart).
+        let sharp_eye = self.clip.as_ref().and_then(|c| c.sharp_eye(self.settings.insv_view));
+        let resolution = self.export_opts.resolution_for(sharp_eye.is_some());
+        let res_label = match (self.settings.reframe_aspect_if_active(), resolution, sharp_eye) {
+            (Some(aspect), _, _) => self.export_opts.reframe_size.frame_label(aspect, single_eye),
             // Native = the clip's own size (a 12K BRAW: 12288 × 6144).
-            None if self.export_opts.resolution == ExportResolution::Native => {
-                match self.native_sbs_dims() {
-                    Some((w, h)) => format!("{w} × {h}"),
-                    None => self.export_opts.resolution.frame_label(single_eye).to_string(),
-                }
-            }
-            // A Crop clip's native-sharpness canvas; any other clip exports 8K.
-            None if self.export_opts.resolution == ExportResolution::Sharp => {
-                match self.clip.as_ref().and_then(|c| c.sharp_eye(self.settings.insv_view)) {
-                    Some(side) => format!("{} × {side}", if single_eye { side } else { side * 2 }),
-                    None => ExportResolution::R8k.frame_label(single_eye).to_string(),
-                }
-            }
-            None => self.export_opts.resolution.frame_label(single_eye).to_string(),
+            (None, ExportResolution::Native, _) => match self.native_sbs_dims() {
+                Some((w, h)) => format!("{w} × {h}"),
+                None => resolution.frame_label(single_eye).to_string(),
+            },
+            // A Crop clip's native-sharpness canvas.
+            (None, ExportResolution::Sharp, Some(side)) =>
+                format!("{} × {side}", if single_eye { side } else { side * 2 }),
+            (None, _, _) => ExportResolution::R8k.frame_label(single_eye).to_string(),
         };
         let h265_mbps = self.export_opts.effective_h265_mbps(
             self.settings.reframe_aspect_if_active(), clip_fps, single_eye);
@@ -5288,28 +5416,30 @@ impl App {
                 None => ExportResolution::Native.frame_label(single_eye).to_string(),
             };
             // Native sharpness — only a clip whose frame is a crop of the
-            // lens' view has it (the X6 Crop modes). The choice sticks while
-            // such clips are open; on any other clip it means 8K, and shows so.
+            // lens' view has it (the X6 Crop modes). Such a clip edits its
+            // own choice, every other clip the general one: neither changes
+            // what a clip of the other sort exports at.
             let sharp_label: Option<String> = sharp_dims.filter(|_| !is_still)
                 .map(|(w, h)| format!("{w} × {h} ({})", tr("native sharpness")));
-            if opts.resolution == ExportResolution::Sharp && sharp_label.is_none() {
-                opts.resolution = ExportResolution::R8k;
-            }
-            let sel_label: &str = match (opts.resolution, sharp_label.as_deref()) {
+            let cropped = sharp_label.is_some();
+            let shown = opts.resolution_for(cropped);
+            let sel_label: &str = match (shown, sharp_label.as_deref()) {
                 (ExportResolution::Native, _) => &native_label,
                 (ExportResolution::Sharp, Some(l)) => l,
                 _ => ExportResolution::R8k.frame_label(single_eye),
             };
+            let choice = opts.resolution_for_mut(cropped);
+            *choice = shown;
             egui::ComboBox::from_id_source(format!("{id_prefix}_resolution"))
                 .selected_text(sel_label)
                 .width(260.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut opts.resolution,
+                    ui.selectable_value(choice,
                         ExportResolution::Native, native_label.clone());
-                    ui.selectable_value(&mut opts.resolution,
+                    ui.selectable_value(choice,
                         ExportResolution::R8k, ExportResolution::R8k.frame_label(single_eye));
                     if let Some(l) = &sharp_label {
-                        ui.selectable_value(&mut opts.resolution, ExportResolution::Sharp, l.clone());
+                        ui.selectable_value(choice, ExportResolution::Sharp, l.clone());
                     }
                 });
             if sharp_label.is_some() {
@@ -5319,7 +5449,7 @@ impl App {
             // Beyond 8192×4096 (a 12K BRAW, a Crop clip's native-sharpness
             // canvas): what the platform's encoder does with the frame —
             // see `oversize_export_hint`.
-            let out_dims = match opts.resolution {
+            let out_dims = match opts.resolution_for(cropped) {
                 ExportResolution::Native => native_dims,
                 ExportResolution::Sharp => sharp_dims,
                 ExportResolution::R8k => None,
@@ -6683,7 +6813,8 @@ impl App {
             (clip.width.max(512), clip.height.max(512))
         };
         // Same rule as `build_export_cfg`.
-        match (self.export_opts.resolution, clip.sharp_eye(self.settings.insv_view)) {
+        let sharp_eye = clip.sharp_eye(self.settings.insv_view);
+        match (self.export_opts.resolution_for(sharp_eye.is_some()), sharp_eye) {
             (ExportResolution::Sharp, Some(side)) => { ew = side; eh = side; }
             (ExportResolution::R8k | ExportResolution::Sharp, _) => { ew = 4096; eh = 4096; }
             (ExportResolution::Native, _) => {}
@@ -6909,12 +7040,14 @@ impl App {
             }
         }
         if do_apply_all {
-            // SAME-KIND ONLY — never overwrite a different camera type's
-            // settings (OSV stab/calib means nothing to a .360 clip, etc.).
+            // SAME CLASS ONLY — never overwrite a different camera type's
+            // settings (OSV stab/calib means nothing to a .360 clip, etc.),
+            // nor those of a clip that keeps a setup of its own within the
+            // type (`settings_class_key`).
             self.sync_active_clip_settings();
-            if let Some(kind) = self.active_clip.and_then(|a| self.batch.get(a)).map(|b| b.source_kind) {
+            if let Some(class) = self.active_clip.and_then(|a| self.batch.get(a)).map(BatchItem::settings_class) {
                 for i in 0..self.batch.len() {
-                    if self.batch[i].source_kind == kind {
+                    if self.batch[i].settings_class() == class {
                         self.apply_current_settings_to_item(i);
                     }
                 }

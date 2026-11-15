@@ -2005,7 +2005,12 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      per eye = 13120 × 6560 for both Crop modes (36.4 px/° vs 18.2 on the
      8K mode). Offered in the Resolution list only when the active clip's
      geometry is `cropped` (`ClipInfo::sharp_eye` / `BatchItem::sharp_eye`,
-     passed into `build_export_cfg`); any other clip in a batch takes 8K.
+     passed into `build_export_cfg`). A Crop clip's choice is its own field
+     (`ExportOptions::crop_resolution`, read through `resolution_for(cropped)`
+     everywhere): the Format window edits it while a Crop clip is open and
+     `resolution` otherwise, so one list exports each sort at the size picked
+     for it (it used to be one choice, and no value of it gave both their
+     best).
      Mac: VideoToolbox HEVC takes it on the zero-copy path (10 fps, level
      7.0; its ceiling is 16384 × 8192), hardware ProRes does not (software
      fallback, as for a 12K BRAW). **Windows: NVENC HEVC stops at 8192

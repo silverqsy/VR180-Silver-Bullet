@@ -108,6 +108,14 @@ show the export.
   finished notification did not come, until the window was shown again: an
   unattended batch sat idle for as long as the window stayed covered. The
   hand-over to the next clip now runs whether or not the window is visible.
+- **A Crop clip's export size followed the other clips' choice.** The
+  export resolution was one choice for the whole list, so a list that held
+  X6 Crop clips next to full-view clips had no setting that gave each its
+  best: a full-view clip's own size put the Crop clips on the smaller canvas
+  of their own size, and a Crop clip's native sharpness sent the others to
+  8K. A Crop clip now keeps a choice of its own. The Format window edits it
+  while a Crop clip is open and the general one otherwise, and a batch
+  exports each clip at the size picked for its sort.
 
 ## 2.5.6 — 2026-11-13
 
