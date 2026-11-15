@@ -129,6 +129,25 @@ impl FrameTimeline {
         Some(Self::from_pts(pts, dt))
     }
 
+    /// The timeline of a clip, whoever asks (a preview worker, an export):
+    /// its chain of `segments`, or the lone `path` when it has none. `None`
+    /// for a source without an MP4 sample table (Blackmagic RAW, a still)
+    /// and when nothing could be read from it; the caller then keeps the
+    /// constant-rate arithmetic, as it did before there was a table.
+    pub fn for_clip(kind: crate::SourceKind, path: &Path, segments: &[PathBuf]) -> Option<Self> {
+        if kind == crate::SourceKind::BlackmagicRaw || kind.is_still() {
+            return None;
+        }
+        let lone;
+        let segments = if segments.is_empty() {
+            lone = [path.to_path_buf()];
+            &lone[..]
+        } else {
+            segments
+        };
+        Self::from_segments(segments).filter(|tl| !tl.is_empty())
+    }
+
     pub fn len(&self) -> usize { self.pts_s.len() }
     pub fn is_empty(&self) -> bool { self.pts_s.is_empty() }
     /// Nominal frame period (seconds).
@@ -195,6 +214,14 @@ impl FrameTimeline {
             )
         }
     }
+}
+
+/// How many rows a clip's per-frame tables need: the frames in its track
+/// when the sample table says, else `fallback` (duration × nominal rate).
+/// Rows past the last frame would be identity poses the stabilization's
+/// smoother bends toward, so the count has to be the real one when known.
+pub fn frames_or(timeline: Option<&FrameTimeline>, fallback: usize) -> usize {
+    timeline.map(|t| t.len()).filter(|n| *n > 0).unwrap_or(fallback)
 }
 
 /// The row of per-frame tables that goes with a decoded frame: the sample

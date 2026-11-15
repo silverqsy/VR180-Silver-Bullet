@@ -6,7 +6,8 @@
 //! size being projected), or a preset, or the user's manual override, then
 //! what the output asks of it (the fisheye disk's field of view, a reframed
 //! viewport). Each had its own copy of this; they now build a
-//! [`LensRequest`] and call [`resolve_lens_pair`].
+//! [`LensRequest`] and call [`resolve_lens_pair`] (or, for a GoPro `.360`
+//! clip, whose frames arrive dewarped, [`resolve_eac_lens_pair`]).
 
 use crate::gpu::{CropMask, FisheyeCalib};
 use crate::source_kind::SourceKind;
@@ -134,10 +135,9 @@ pub fn resolve_lens_pair(
                     let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
                     (fx, fx, cxn * src_w as f32, cyn * src_h as f32, k, km5)
                 } else {
-                    // Auto: full per-lens factory calibration from the OSV
-                    // protobuf — fx/fy (→FOV), cx/cy, the KB k1–k4 AND the 5th
-                    // radial coeff k5 (field 15). Must match the GUI's
-                    // resolve_fisheye_calib_pair exactly so export == preview.
+                    // Auto: the full per-lens factory calibration from the
+                    // file — fx/fy (→FOV), cx/cy, the KB k1–k4 AND the 5th
+                    // radial coeff k5 (field 15 of the OSV protobuf).
                     // k is dimensionless (no scale); missing → preset / 0.
                     let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
                     let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
@@ -149,7 +149,7 @@ pub fn resolve_lens_pair(
                     };
                     // Blackmagic: the seed is the image circle + the DEFAULT
                     // preset's FOV / k; the Camera combo's choice re-scales the
-                    // focal to its FOV and takes its k (same in the GUI resolver).
+                    // focal to its FOV and takes its k.
                     let (fx, fy, cx, cy, k) = if req.kind == SourceKind::BlackmagicRaw {
                         let (sx, sk) = crate::braw_imu::preset_rescale(preset, src_w, src_h);
                         let (cx, cy) = crate::braw_imu::preset_principal_point(preset, output, req.swap_eyes, src_w as f32, src_h as f32)
@@ -162,14 +162,13 @@ pub fn resolve_lens_pair(
                     FisheyeCalib::new_pure_kb(fx, fy, cx, cy, k, src_w as f32, src_h as f32);
                 calib.k5 = k5;
                 // Tangential: Auto from file, override uses the manual [p1,p2]
-                // (km_p, GUI-seeded from the file). Must match the preview path.
+                // (km_p, which the GUI seeds from the file).
                 calib.p1 = if ov { km_p[0] } else { lens.p1.unwrap_or(0.0) };
                 calib.p2 = if ov { km_p[1] } else { lens.p2.unwrap_or(0.0) };
                 calib
             };
             // Calib follows the STREAM: with the user swap on, the left
-            // output carries Lens A → use Lens A's calib (matches the
-            // GUI resolver so export == preview).
+            // output carries Lens A → use Lens A's calib.
             let (lens_l, lens_r) = if req.swap_eyes {
                 (&imu.lens_a, &imu.lens_b)
             } else {
@@ -185,7 +184,7 @@ pub fn resolve_lens_pair(
             );
             // A frame that is a crop of the image circle (the X6 Crop
             // modes): black outside the frame, corners kept, plus the
-            // user's mask window. Must match the GUI resolver.
+            // user's mask window.
             if lens_l.frame_crop || lens_r.frame_crop {
                 crate::gpu::apply_frame_crop(pair.0, pair.1, req.crop_mask)
             } else {
@@ -240,6 +239,41 @@ pub fn resolve_lens_pair(
     }
 }
 
+/// The per-eye re-dewarp of a GoPro `.360` clip. Its frames arrive
+/// dewarped by the file's own lens model; where an eye's Override is on,
+/// the projection undoes that model (`geoc`, the file's lens record) and
+/// applies the manual one instead. Elsewhere, and for a file without the
+/// record, nothing is re-dewarped. Left eye = the back lens, right eye =
+/// the front one. A reframed view hands the projection its viewport either
+/// way.
+pub fn resolve_eac_lens_pair(
+    req: &LensRequest,
+    geoc: Option<&vr180_core::geoc::Geoc>,
+) -> (crate::gpu::EacLensAdjust, crate::gpu::EacLensAdjust) {
+    use crate::gpu::EacLensAdjust;
+    let (l, r) = match geoc {
+        None => (EacLensAdjust::DISABLED, EacLensAdjust::DISABLED),
+        Some(g) => {
+            let cal_dim = g.cal_dim as f32;
+            let eye = |cal: Option<&vr180_core::geoc::LensCal>, ov: &EyeLensOverride| -> EacLensAdjust {
+                match (cal, ov.on) {
+                    (Some(c), true) => EacLensAdjust::from_geoc_override(
+                        c.klns, c.ctrx, c.ctry, cal_dim, ov.fov_deg, ov.cx_norm, ov.cy_norm, ov.k),
+                    _ => EacLensAdjust::DISABLED,
+                }
+            };
+            (eye(g.back.as_ref(), &req.left), eye(g.front.as_ref(), &req.right))
+        }
+    };
+    match req.output {
+        LensOutput::Reframe { hfov_deg, defish, aspect } => (
+            l.with_reframe(hfov_deg, defish, aspect),
+            r.with_reframe(hfov_deg, defish, aspect),
+        ),
+        _ => (l, r),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +321,38 @@ mod tests {
             assert_eq!((shaped.0.fx, shaped.0.cx, shaped.0.cy, shaped.0.k), (plain.0.fx, plain.0.cx, plain.0.cy, plain.0.k));
             assert_ne!(format!("{:?}", shaped.0), format!("{:?}", plain.0), "{output:?} leaves a mark on the model");
         }
+    }
+}
+
+#[cfg(test)]
+mod eac_tests {
+    use super::*;
+
+    fn request(left_on: bool, right_on: bool, output: LensOutput) -> LensRequest<'static> {
+        let eye = |on| EyeLensOverride { on, fov_deg: 185.0, cx_norm: 0.5, cy_norm: 0.5, k: [0.0; 4], k5: 0.0, p: [0.0; 2] };
+        LensRequest {
+            kind: SourceKind::GoProEac,
+            preset: "",
+            swap_eyes: false,
+            left: eye(left_on),
+            right: eye(right_on),
+            crop_mask: CropMask::default(),
+            sbs_dewarp_fisheye: false,
+            output,
+        }
+    }
+
+    #[test]
+    fn without_the_lens_record_nothing_is_redewarped() {
+        let (l, r) = resolve_eac_lens_pair(&request(true, true, LensOutput::HalfEquirect), None);
+        assert!(!l.enabled && !r.enabled);
+        // A reframed view still gets its viewport.
+        let (lf, _) = resolve_eac_lens_pair(
+            &request(false, false, LensOutput::Reframe { hfov_deg: 90.0, defish: 0.0, aspect: 1.0 }), None);
+        assert!(!lf.enabled);
+        assert_ne!(format!("{lf:?}"), format!("{l:?}"));
+        // The fisheye disk asks nothing of this stage.
+        let (ld, _) = resolve_eac_lens_pair(&request(false, false, LensOutput::Fisheye), None);
+        assert_eq!(format!("{ld:?}"), format!("{l:?}"));
     }
 }

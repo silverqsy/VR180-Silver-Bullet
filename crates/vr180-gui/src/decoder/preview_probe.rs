@@ -180,9 +180,12 @@ pub(crate) fn run(clip: &Path) -> anyhow::Result<()> {
     // The worker shows a video's first frame before the stabilization data
     // is in; every moment below is asked for once that data is there.
     drop(first);
-    // (With stabilization off the worker never loads it, and never says so.)
+    // (With stabilization off the worker never loads it, and never says so.
+    // A GoPro `.360` worker builds its per-frame rotations inside its loop,
+    // before the frame that needs them, and has no such signal either.)
+    let signals_ready = stabilized && !vr180_pipeline::source_kind::detect(&path)?.is_eac();
     let ready_by = Instant::now() + Duration::from_secs(300);
-    while stabilized && (!control.imu_ready.load(Ordering::SeqCst) || control.stab_loading.load(Ordering::SeqCst)) {
+    while signals_ready && (!control.imu_ready.load(Ordering::SeqCst) || control.stab_loading.load(Ordering::SeqCst)) {
         anyhow::ensure!(!control.finished.load(Ordering::SeqCst), "the worker ended while loading");
         anyhow::ensure!(Instant::now() < ready_by, "stabilization data never arrived");
         std::thread::sleep(Duration::from_millis(50));

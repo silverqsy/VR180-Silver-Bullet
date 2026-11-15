@@ -1091,18 +1091,7 @@ fn chain_segment_frames(path: &std::path::Path, fps: f32) -> usize {
 /// `None` for sources without an MP4 sample table (BRAW, stills); the
 /// constant-rate arithmetic then stands, as it did before.
 fn export_timeline(cfg: &FisheyeExportConfig) -> Option<crate::frame_timeline::FrameTimeline> {
-    if cfg.source_kind == SourceKind::BlackmagicRaw || cfg.source_kind.is_still() {
-        return None;
-    }
-    let segs: Vec<PathBuf> = if cfg.segments.is_empty() {
-        vec![cfg.source_path.clone()]
-    } else {
-        cfg.segments.clone()
-    };
-    let tl = crate::frame_timeline::FrameTimeline::from_segments(&segs)?;
-    if tl.is_empty() {
-        return None;
-    }
+    let tl = crate::frame_timeline::FrameTimeline::for_clip(cfg.source_kind, &cfg.source_path, &cfg.segments)?;
     if tl.dropped_frames() > 0 {
         tracing::info!(
             "fisheye_export: frame timeline — {}; each frame before a hole is written again to fill it",
@@ -1114,12 +1103,8 @@ fn export_timeline(cfg: &FisheyeExportConfig) -> Option<crate::frame_timeline::F
     Some(tl)
 }
 
-/// Frames of a sample-table timeline when there is one, else `fallback`
-/// (the constant-rate estimate). Sizes the per-frame stab table: rows past
-/// the last frame would be identity poses the smoother bends toward.
-fn timeline_frames_or(tl: Option<&crate::frame_timeline::FrameTimeline>, fallback: usize) -> usize {
-    tl.map(|t| t.len()).filter(|n| *n > 0).unwrap_or(fallback)
-}
+// Sizes the per-frame stabilization table (the name the arms know it by).
+use crate::frame_timeline::frames_or as timeline_frames_or;
 
 fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
     if cfg.source_kind == SourceKind::Insta360Insv {
@@ -2322,83 +2307,55 @@ pub type EacPerEyeFrame = (
     (EquirectRotation, crate::gpu::EquirectRsParams),
 );
 
-/// GoPro `.360` (EAC) → SBS half-equirect file export.
-///
-/// EAC is a different projection from the fisheye sources (`export_fisheye`),
-/// so it gets its own per-frame core — decode dual HEVC → assemble each
-/// lens's EAC cross → project cross→equirect per eye (with the per-frame
-/// stab/RS the GUI computed) → optional view-adjust → color → compose SBS
-/// → encode. Everything else (encoder backends, audio passthrough, VR180
-/// metadata, trim, progress) is shared with the fisheye path.
-///
-/// `per_eye[absolute_frame_idx]` carries the stabilization rotations +
-/// rolling-shutter params; the GUI owns that (GPMF parse + Settings), so
-/// it's passed in pre-computed. Empty / short → identity (no stab).
-///
-/// 8-bit core: GoPro Max footage is 8-bit, so the cross/project/compose run
-/// at 8-bit and the color stack applies on the SBS readback (same as the
-/// fisheye 8-bit arm). The encoder still honors `cfg.bit_depth` (a 10-bit
-/// codec just gets the 8-bit pixels widened by swscale — no precision lost
-/// vs the source).
-/// Resolve the per-eye ".360 Lens calibration" Override into shader
-/// re-dewarp params for an EAC export. The FACTORY model comes from the
-/// file's GEOC atom (left eye = Lens B = BACK, right eye = Lens A = FRNT
-/// — same mapping as the RS path); the USER model from the
-/// `cfg.fisheye_*` Override fields the GUI populates for every source
-/// kind. Override-off eyes (or a file with no GEOC) get the disabled
-/// sentinel — the shader warp is skipped entirely.
-///
-/// Must mirror the GUI's `resolve_eac_lens_pair` so export == preview.
+/// An export's per-eye `.360` lens re-dewarp:
+/// [`crate::lens_model::resolve_eac_lens_pair`] for this configuration, the
+/// resolver the preview asks too. The file's lens record (its GEOC atom)
+/// is read only when an eye's Override is on.
 pub(crate) fn resolve_eac_lens_pair(cfg: &FisheyeExportConfig) -> (crate::gpu::EacLensAdjust, crate::gpu::EacLensAdjust) {
-    let (l, r) = resolve_eac_lens_override(cfg);
-    // Reframed view: the equirect kernel's ray generator takes the viewport
-    // (aspect = the eye frame's).
-    if let Some((hfov_deg, defish)) = cfg.projection.reframe() {
-        let aspect = cfg.eye_w as f32 / cfg.eye_h.max(1) as f32;
-        (l.with_reframe(hfov_deg, defish, aspect), r.with_reframe(hfov_deg, defish, aspect))
+    let req = cfg.lens_request();
+    let geoc = if req.left.on || req.right.on {
+        let src = cfg.segments.first().unwrap_or(&cfg.source_path);
+        match vr180_core::geoc::parse_geoc(src) {
+            Ok(Some(g)) => Some(g),
+            _ => {
+                tracing::warn!(
+                    "export_eac: lens Override on but no GEOC in {} — Override ignored",
+                    src.display());
+                None
+            }
+        }
     } else {
-        (l, r)
-    }
-}
-
-fn resolve_eac_lens_override(cfg: &FisheyeExportConfig) -> (crate::gpu::EacLensAdjust, crate::gpu::EacLensAdjust) {
-    use crate::gpu::EacLensAdjust;
-    if !cfg.fisheye_override_left && !cfg.fisheye_override_right {
-        return (EacLensAdjust::DISABLED, EacLensAdjust::DISABLED);
-    }
-    let src = cfg.segments.first().unwrap_or(&cfg.source_path);
-    let geoc = match vr180_core::geoc::parse_geoc(src) {
-        Ok(Some(g)) => g,
-        _ => {
-            tracing::warn!(
-                "export_eac: lens Override on but no GEOC in {} — Override ignored",
-                src.display());
-            return (EacLensAdjust::DISABLED, EacLensAdjust::DISABLED);
-        }
+        None
     };
-    let cal_dim = geoc.cal_dim as f32;
-    let mk = |cal: Option<&vr180_core::geoc::LensCal>, ov: bool,
-              fov: f32, cxn: f32, cyn: f32, k: [f32; 4]| -> EacLensAdjust {
-        match (cal, ov) {
-            (Some(c), true) => EacLensAdjust::from_geoc_override(
-                c.klns, c.ctrx, c.ctry, cal_dim, fov, cxn, cyn, k),
-            _ => EacLensAdjust::DISABLED,
-        }
-    };
-    let l = mk(geoc.back.as_ref(), cfg.fisheye_override_left,
-        cfg.fisheye_fov_deg_left, cfg.fisheye_cx_norm_left,
-        cfg.fisheye_cy_norm_left, cfg.fisheye_k_left);
-    let r = mk(geoc.front.as_ref(), cfg.fisheye_override_right,
-        cfg.fisheye_fov_deg_right, cfg.fisheye_cx_norm_right,
-        cfg.fisheye_cy_norm_right, cfg.fisheye_k_right);
+    let (l, r) = crate::lens_model::resolve_eac_lens_pair(&req, geoc.as_ref());
     if l.enabled || r.enabled {
         tracing::info!("export_eac: lens Override engaged (L={}, R={})", l.enabled, r.enabled);
     }
     (l, r)
 }
 
-/// GoPro `.360` export entry point — the same reframed-view handling as
-/// [`export_fisheye`]: a reframed view is not VR180.
+/// GoPro `.360` (EAC) export: both eyes, from the two tile streams, into one
+/// file, in any of the output views.
+///
+/// EAC is a different projection from the fisheye sources
+/// ([`export_fisheye`]): each lens's cross is assembled from the two
+/// streams, then projected per eye with the stabilization the caller
+/// computed, the view adjustment and the colour stack, and the eyes are
+/// composed side by side. The frame loop is [`run_eac_frames`]; the encoder
+/// backends, the audio, the VR180 metadata, trim and progress are shared
+/// with the fisheye exports.
+///
+/// `per_eye[absolute_frame_idx]` carries each eye's stabilization rotation
+/// and rolling-shutter parameters. The GUI owns that (the GPMF parse and
+/// the settings), so it arrives precomputed; empty or short means none.
+///
+/// GoPro Max footage is 8-bit. The portable route runs an 8-bit chain and
+/// grades on the readback (a 10-bit codec gets the 8-bit pixels widened,
+/// nothing lost against the source); the macOS zero-copy route keeps a
+/// 16-bit chain for 10-bit output.
+///
+/// A reframed view is not VR180 and is never tagged as one, as in
+/// [`export_fisheye`].
 pub fn export_eac(
     pipeline: std::sync::Arc<Device>,
     cfg: FisheyeExportConfig,

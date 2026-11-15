@@ -712,6 +712,21 @@ impl Settings {
         }
     }
 
+    /// The stabilization's correction cap (degrees; infinite = none) and
+    /// smoothing window (ms; 0 = locked to the first frame) under these
+    /// settings, as `compute_dji_stabilization` takes them. Camera lock: no
+    /// window and no cap, fully locked whatever the camera does. Soft
+    /// stabilization: the window is kept off 0 (the lock's own value) and a
+    /// cap of 0 means none.
+    pub fn stab_cap_and_window(&self) -> (f32, f32) {
+        if self.dji_camera_lock {
+            (f32::INFINITY, 0.0)
+        } else {
+            let cap = if self.dji_max_corr_deg > 0.0 { self.dji_max_corr_deg } else { f32::INFINITY };
+            (cap, self.dji_smooth_ms.max(1.0))
+        }
+    }
+
     /// The L↔R eye swap that should actually be applied: the manual
     /// "Swap L↔R" toggle XOR the upside-down mount (flipping the rig
     /// 180° mirrors the physical eye positions, so upside-down implies
@@ -2213,18 +2228,8 @@ fn run_fisheye(
             vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv
             | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw => {
                 if let Some(osv) = dji_osv_imu {
-                    // Camera lock (toggle on) → smooth_ms = 0 drives the
-                    // pipeline's sharp frame-0 lock. Soft-stab (toggle off)
-                    // uses the smoothing window, floored off 0 so it never
-                    // trips the lock sentinel. Under camera lock the cap is
-                    // ignored (∞): fully locked no matter what the camera does.
                     let s = control.settings.read();
-                    let max_corr_deg = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock {
-                        s.dji_max_corr_deg
-                    } else {
-                        f32::INFINITY
-                    };
-                    let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
+                    let (max_corr_deg, smooth_ms) = s.stab_cap_and_window();
                     let responsiveness = s.dji_responsiveness;
                     drop(s);
                     match vr180_pipeline::dji_imu::compute_dji_stabilization(
@@ -2989,8 +2994,7 @@ fn run_fisheye_zerocopy(
                         control: &DecoderControl| -> Option<Vec<EquirectRotation>> {
         let osv = osv?;
         let s = control.settings.read();
-        let max_corr_deg = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock { s.dji_max_corr_deg } else { f32::INFINITY };
-        let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
+        let (max_corr_deg, smooth_ms) = s.stab_cap_and_window();
         let responsiveness = s.dji_responsiveness;
         drop(s);
         match vr180_pipeline::dji_imu::compute_dji_stabilization(
@@ -3500,8 +3504,7 @@ fn run_fisheye_vt_zerocopy(
                         control: &DecoderControl| -> Option<Vec<EquirectRotation>> {
         let osv = osv?;
         let s = control.settings.read();
-        let max_corr_deg = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock { s.dji_max_corr_deg } else { f32::INFINITY };
-        let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
+        let (max_corr_deg, smooth_ms) = s.stab_cap_and_window();
         let responsiveness = s.dji_responsiveness;
         drop(s);
         match vr180_pipeline::dji_imu::compute_dji_stabilization(
@@ -4301,49 +4304,15 @@ pub(crate) fn resolve_fisheye_calib_pair(
     vr180_pipeline::lens_model::resolve_lens_pair(&s.lens_request(kind), src_w, src_h, osv)
 }
 
-/// Per-eye ".360 Lens calibration" Override → shader re-dewarp params.
-/// The FACTORY model comes from the file's GEOC atom (left eye = Lens B =
-/// BACK, right eye = Lens A = FRNT — same mapping as the RS path); the
-/// USER model from the same per-eye `fisheye_*` Override fields the OSV
-/// panel uses (independent per source kind via the settings-by-kind map).
-/// Override-off eyes / missing GEOC → the disabled sentinel (shader warp
-/// skipped entirely). Must mirror `fisheye_export::resolve_eac_lens_pair`
-/// so preview == export.
+/// The per-eye `.360` lens re-dewarp for the current settings:
+/// [`vr180_pipeline::lens_model::resolve_eac_lens_pair`], the resolver an
+/// export asks too. `geoc` is the file's lens record, when it has one.
 pub(crate) fn resolve_eac_lens_pair(
     s: &Settings,
     geoc: Option<&vr180_core::geoc::Geoc>,
 ) -> (vr180_pipeline::gpu::EacLensAdjust, vr180_pipeline::gpu::EacLensAdjust) {
-    use vr180_pipeline::gpu::EacLensAdjust;
-    let (l, r) = match geoc {
-        None => (EacLensAdjust::DISABLED, EacLensAdjust::DISABLED),
-        Some(g) => {
-            let cal_dim = g.cal_dim as f32;
-            let mk = |cal: Option<&vr180_core::geoc::LensCal>, ov: bool,
-                      fov: f32, cxn: f32, cyn: f32, k: [f32; 4]| -> EacLensAdjust {
-                match (cal, ov) {
-                    (Some(c), true) => EacLensAdjust::from_geoc_override(
-                        c.klns, c.ctrx, c.ctry, cal_dim, fov, cxn, cyn, k),
-                    _ => EacLensAdjust::DISABLED,
-                }
-            };
-            (
-                mk(g.back.as_ref(), s.fisheye_override_left, s.fisheye_fov_deg_left,
-                   s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left),
-                mk(g.front.as_ref(), s.fisheye_override_right, s.fisheye_fov_deg_right,
-                   s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right),
-            )
-        }
-    };
-    // Reframed view: the equirect kernel's ray generator takes the viewport.
-    if s.fisheye_output_mode == FisheyeOutputMode::Reframe {
-        let a = s.reframe_aspect.ratio();
-        (
-            l.with_reframe(s.reframe_hfov_deg, s.reframe_defish, a),
-            r.with_reframe(s.reframe_hfov_deg, s.reframe_defish, a),
-        )
-    } else {
-        (l, r)
-    }
+    vr180_pipeline::lens_model::resolve_eac_lens_pair(
+        &s.lens_request(vr180_pipeline::SourceKind::GoProEac), geoc)
 }
 
 /// Publish the GEOC factory lens calibration as the `.360` clip's
@@ -5520,11 +5489,7 @@ fn clip_timeline(cfg: &DecoderConfig, kind: vr180_pipeline::SourceKind)
     if let Some(t) = cached_timeline(&cfg.path) {
         return Some(t);
     }
-    let segs: Vec<PathBuf> = if cfg.segments.is_empty() { vec![cfg.path.clone()] } else { cfg.segments.clone() };
-    let tl = vr180_pipeline::frame_timeline::FrameTimeline::from_segments(&segs)?;
-    if tl.is_empty() {
-        return None;
-    }
+    let tl = vr180_pipeline::frame_timeline::FrameTimeline::for_clip(kind, &cfg.path, &cfg.segments)?;
     tracing::info!("decoder: frame timeline — {}", tl.summary());
     let arc = std::sync::Arc::new(tl);
     let mut c = timeline_cache().lock();
@@ -5535,12 +5500,8 @@ fn clip_timeline(cfg: &DecoderConfig, kind: vr180_pipeline::SourceKind)
     Some(arc)
 }
 
-/// Frames in the clip for sizing per-frame tables: the sample table's count
-/// when it is known (rows past the last frame would be identity poses the
-/// smoother bends toward), else `fallback` (duration × fps).
-fn timeline_frames_or(tl: Option<&vr180_pipeline::frame_timeline::FrameTimeline>, fallback: usize) -> usize {
-    tl.map(|t| t.len()).filter(|n| *n > 0).unwrap_or(fallback)
-}
+// Sizes the per-frame tables (the name the workers know it by).
+use vr180_pipeline::frame_timeline::frames_or as timeline_frames_or;
 
 /// The shown frame's own time for the UI (playhead, zoom-still key): its pts
 /// when the source stamps frames, else its row on the constant-rate grid.
@@ -5832,8 +5793,7 @@ fn compute_stab_for(
     match kind {
         vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv
         | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw => imu.and_then(|osv| {
-            let max_corr = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock { s.dji_max_corr_deg } else { f32::INFINITY };
-            let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
+            let (max_corr, smooth_ms) = s.stab_cap_and_window();
             vr180_pipeline::dji_imu::compute_dji_stabilization(
                 osv, total, max_corr, smooth_ms, fps, s.dji_responsiveness)
                 .ok().map(|st| st.per_frame)
@@ -6345,6 +6305,25 @@ pub(crate) fn build_per_eye_frames_multi(
             .unwrap_or((EquirectRsParams::DISABLED, EquirectRsParams::DISABLED));
         ((rl, sl), (rr, sr))
     }).collect())
+}
+
+#[cfg(test)]
+mod stab_params_tests {
+    use super::*;
+
+    #[test]
+    fn camera_lock_has_no_window_and_no_cap() {
+        let mut s = Settings::default();
+        (s.dji_max_corr_deg, s.dji_smooth_ms) = (12.0, 800.0);
+        assert_eq!(s.stab_cap_and_window(), (12.0, 800.0));
+        s.dji_camera_lock = true;
+        assert_eq!(s.stab_cap_and_window(), (f32::INFINITY, 0.0));
+        // Soft stabilization: a cap of 0 is no cap, and the window never
+        // reaches 0, which would mean the lock.
+        s.dji_camera_lock = false;
+        (s.dji_max_corr_deg, s.dji_smooth_ms) = (0.0, 0.0);
+        assert_eq!(s.stab_cap_and_window(), (f32::INFINITY, 1.0));
+    }
 }
 
 #[cfg(test)]
