@@ -2700,8 +2700,9 @@ const LENS_FRAME_RAY_WGSL: &str = include_str!("shaders/lens_frame_ray.wgsl");
 /// image of a lens over the whole frame, see [`crate::lens_frame`]) and the
 /// two uniform slots that carry the lens declared.
 ///
-/// In a lens frame a ray that leaves the SOURCE frame repeats its edge (see
-/// the splice of `frame_cover` below); the view mask applies as ever.
+/// A ray that leaves the SOURCE frame is black, as in the half-equirect of
+/// the same clip (`frame_cover` is the kernel's own, not spliced); the view
+/// mask applies as ever.
 ///
 /// A variant, not a branch in the kernel: the disc kernels' source — and so
 /// their compiled arithmetic and every existing fisheye-output export — stays
@@ -2732,16 +2733,8 @@ fn lens_frame_wgsl(kernel: &str) -> String {
     }
     let dir = ray.xyz;
 ";
-    let splices: [(&str, String); 6] = [
+    let splices: [(&str, String); 5] = [
         (DISC, LENS.to_string()),
-        // A lens frame is the size of the recorded frame, so whatever the
-        // stabilizer corrects by leaves a band at the border with no
-        // picture behind it. It repeats the frame's edge there — as the
-        // reframed view does, and for the same reason — where the
-        // half-equirect of the same clip shows black: a still border with a
-        // thin smear in it is calmer than a border that jumps.
-        ("    if (cal.frame_mask < 0.5 || cal.proj_mode > 0.5) { return 1.0; }\n",
-         "    if (cal.frame_mask < 0.5 || cal.proj_mode > 0.5 || cal.out_lens.y > 0.0) { return 1.0; }\n".to_string()),
         ("    let px_rad = cal.output_hfov_rad / max(half, 1.0);\n", "    let px_rad = ray.w;\n".to_string()),
         ("src_y0: f32, frame_mask: f32, _p9b: f32, _p9c: f32,", "src_y0: f32, frame_mask: f32, out_rim: f32, _p9c: f32,".to_string()),
         ("    mask_hx: f32, mask_hy: f32, mask_round: f32, mask_feather: f32,\n}",
@@ -10402,6 +10395,8 @@ mod lens_frame_kernel_tests {
             assert!(v.contains("fn lens_frame_ray(") && v.contains("out_lens: vec4<f32>,") && v.contains("out_rim: f32"), "{name}");
             assert!(v.contains("let px_rad = ray.w;") && v.contains("let dir = ray.xyz;"), "{name}");
             assert!(!v.contains("let theta_out"), "{name}: the disc's ray generator is still there");
+            // Outside the recorded frame a lens frame is black, like the disc: `frame_cover` as the kernel has it.
+            assert!(v.contains("    if (cal.frame_mask < 0.5 || cal.proj_mode > 0.5) { return 1.0; }\n"), "{name}: frame_cover was changed");
         }
     }
 
@@ -10484,11 +10479,12 @@ mod lens_frame_kernel_tests {
     }
 
     /// The stabilizer turns the view by more than the frame has to spare:
-    /// the band it exposes repeats the source's edge instead of going black
-    /// (the same clip's half-equirect shows black there), and a view mask
-    /// still blackens what it covers.
+    /// the band it exposes is black, as around the picture of the same
+    /// clip's half-equirect, exactly as wide as the turn takes the frame's
+    /// edge off the recorded picture; the rest of the row is picture. And a
+    /// view mask still blackens what it covers.
     #[test]
-    fn a_lens_frame_repeats_its_edge_where_the_stabilizer_runs_out_of_picture() {
+    fn a_lens_frame_is_black_where_the_stabilizer_runs_out_of_picture() {
         let dev = Device::new().expect("device");
         let (w, h) = (640u32, 448u32);
         let src = picture(w, h);
@@ -10506,22 +10502,30 @@ mod lens_frame_kernel_tests {
             bytemuck::cast_slice::<u8, u16>(&dev.read_texture_rgba64(&tex, w, h).unwrap()).to_vec()
         };
         let out = run(lens.with_lens_frame(&frame));
-        let px = |v: &[u16], x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; [v[i], v[i + 1], v[i + 2]] };
+        let row = h / 2;
+        // The test picture is black nowhere (its blue is the row).
+        let black = |v: &[u16], x: u32| { let i = ((row * w + x) * 4) as usize; v[i..i + 3] == [0, 0, 0] };
         // One side of the middle row ran out of picture; which one is the
-        // rotation's sign. Find it: the green ramp (x across the source) is
-        // flat there, pinned at one end of the source.
-        let (left, right) = (px(&out, 2, h / 2), px(&out, w - 3, h / 2));
-        let exposed = if left[1] < 800 || left[1] > 64_700 { 2 } else { w - 3 };
-        let band = px(&out, exposed, h / 2);
-        assert!(band[1] < 800 || band[1] > 64_700, "no exposed side found: left {left:?} right {right:?}");
-        assert_ne!(band, [0, 0, 0], "the exposed band is black");
-        // The same value a little further in: the edge, repeated.
-        let further = if exposed == 2 { 12 } else { w - 13 };
-        assert!((px(&out, further, h / 2)[1] as i32 - band[1] as i32).abs() < 300, "the band is not the repeated edge");
+        // rotation's sign. Count inwards from it.
+        let from_left = black(&out, 0);
+        assert!(from_left != black(&out, w - 1), "one side of the row is exposed, not both and not neither");
+        let at = |i: u32| if from_left { i } else { w - 1 - i };
+        let band = (0..w).take_while(|&i| black(&out, at(i))).count() as u32;
+        // How far the turn takes the frame's edge off the recorded picture:
+        // the frame's own lens on the CPU (the source here is that lens).
+        let (s64, c64) = 3.0_f64.to_radians().sin_cos();
+        let exposed = (0..w).take_while(|&i| {
+            let d = frame.ray(i as f64 + 0.5, row as f64 + 0.5).unwrap();
+            frame.project([c64 * d[0] - s64 * d[2], d[1], s64 * d[0] + c64 * d[2]])[0] < 0.0
+        }).count() as u32;
+        assert!(exposed > 10, "the turn exposes a band: {exposed} px");
+        // (The soft edge is one output pixel: the last column may be partly covered.)
+        assert!(band.abs_diff(exposed) <= 1, "black band {band} px, the turn exposes {exposed} px");
+        assert!((band + 1..w).all(|i| !black(&out, at(i))), "black inside the picture");
         // A view mask blackens the lens frame's border as it does any output's.
         let masked = run(lens.with_view_mask([0.3, 0.2], 0.0, 0.0).with_lens_frame(&frame));
-        assert_eq!(px(&masked, exposed, h / 2), [0, 0, 0]);
-        assert_ne!(px(&masked, w / 2, h / 2), [0, 0, 0]);
+        assert!(black(&masked, at(band + 6)), "the mask leaves picture at the border");
+        assert!(!black(&masked, w / 2));
     }
 
     /// From a source with another lens, every pixel of the lens frame shows

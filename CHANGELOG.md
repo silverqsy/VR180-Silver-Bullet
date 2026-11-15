@@ -48,10 +48,11 @@ own angle.
   eyes are rendered into one common lens with the camera lens's own radial
   law, so the picture is resampled at very nearly one to one.
 - **Stabilization has no spare canvas here.** The frame is as large as the
-  recording, so a correction leaves a band at the border with no picture
-  behind it. The frame's edge repeats there (a few pixels wide most of the
-  time, a few degrees at worst on a hand-held walk); a crop mask hides it.
-  Camera lock suits a camera that stays put.
+  recording, so a correction leaves a band at one border with no picture
+  behind it and cuts as much off the opposite one. The band is black, as
+  around the picture of a VR180 export (a few pixels wide most of the time
+  on a steady clip, a few degrees on a hand-held walk); a crop mask gives
+  the frame a steady edge. Camera lock suits a camera that stays put.
 - **Apple Vision Pro only** (visionOS 26 or later). No other headset and
   not YouTube read this form, so the VR180 export stays the default and is
   unchanged: export a clip both ways and you get `…_SBS` and `…_Lens`.

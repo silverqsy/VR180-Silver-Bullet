@@ -2405,12 +2405,16 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      the changed source differently) and failed the regression set. The
      uniform grew to 13 vec4 (208 B): `out_lens` + `out_rim` in a spare slot;
      the half-equirect kernels do not declare the new row.
-   - **Edge policy**: in a lens frame a ray that leaves the SOURCE frame
-     repeats the edge (`frame_cover` → 1 in the variant, as in the reframed
-     view); the view mask applies; `out_rim` (8 px at 4912) keeps the frame's
-     own border black for players that clamp. Measured on a hand-held walk
-     with soft stabilization (1.2 s, cap 15°): the band is 4 px at the
-     median, 164 px (3.9°) at worst, of 4912.
+   - **Edge policy**: in a lens frame a ray that leaves the SOURCE frame is
+     black: the kernels' own `frame_cover`, as in the half-equirect (soft
+     over one output pixel). It repeated the edge at first, as the reframed
+     view does; on the headset the smeared band was an eyesore, so the
+     variant no longer splices `frame_cover`. The view mask applies;
+     `out_rim` (8 px at 4912) keeps the frame's own border black for players
+     that clamp. Measured on hand-held walks with soft stabilization (1.2 s,
+     cap 15°): the band is 4 px at the median and 164 px (3.9°) at worst of
+     4912 on a 10K Crop clip; 46 px and 325 px (8.0°) of 3712 on a 7.4K Crop
+     60 fps clip, whose frame is narrower (97° across).
    - **File conventions, measured against the system's player mesh** (not
      what the model's textbook form suggests): the projection offset is
      stored NEGATED; the principal point counts from the view's edges; the
