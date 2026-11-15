@@ -1005,18 +1005,7 @@ fn chain_segment_frames(path: &std::path::Path, fps: f32) -> usize {
 /// `None` for sources without an MP4 sample table (BRAW, stills); the
 /// constant-rate arithmetic then stands, as it did before.
 fn export_timeline(cfg: &FisheyeExportConfig) -> Option<crate::frame_timeline::FrameTimeline> {
-    if cfg.source_kind == SourceKind::BlackmagicRaw || cfg.source_kind.is_still() {
-        return None;
-    }
-    let segs: Vec<PathBuf> = if cfg.segments.is_empty() {
-        vec![cfg.source_path.clone()]
-    } else {
-        cfg.segments.clone()
-    };
-    let tl = crate::frame_timeline::FrameTimeline::from_segments(&segs)?;
-    if tl.is_empty() {
-        return None;
-    }
+    let tl = clip_timeline(cfg)?;
     if tl.dropped_frames() > 0 {
         tracing::info!(
             "fisheye_export: frame timeline — {}; each frame before a hole is written again to fill it",
@@ -1026,6 +1015,19 @@ fn export_timeline(cfg: &FisheyeExportConfig) -> Option<crate::frame_timeline::F
         tracing::info!("fisheye_export: frame timeline — {}", tl.summary());
     }
     Some(tl)
+}
+
+/// [`export_timeline`] without its log line.
+fn clip_timeline(cfg: &FisheyeExportConfig) -> Option<crate::frame_timeline::FrameTimeline> {
+    if cfg.source_kind == SourceKind::BlackmagicRaw || cfg.source_kind.is_still() {
+        return None;
+    }
+    let segs: Vec<PathBuf> = if cfg.segments.is_empty() {
+        vec![cfg.source_path.clone()]
+    } else {
+        cfg.segments.clone()
+    };
+    crate::frame_timeline::FrameTimeline::from_segments(&segs).filter(|tl| !tl.is_empty())
 }
 
 /// Frames of a sample-table timeline when there is one, else `fallback`
@@ -1266,12 +1268,86 @@ fn resolve_lens_frame(cfg: &mut FisheyeExportConfig) -> Result<Option<(crate::le
     let (left, right) = resolve_calib_pair(&lenses_only, src_w, src_h, imu.as_ref());
     let mono = single_eye_source(cfg);
     let sources: Vec<&FisheyeCalib> = if mono { vec![&left] } else { vec![&left, &right] };
-    let frame = crate::lens_frame::LensFrame::from_sources(&sources, cfg.eye_w, cfg.eye_h).ok_or_else(|| Error::Ffmpeg(
+    let mut frame = crate::lens_frame::LensFrame::from_sources(&sources, cfg.eye_w, cfg.eye_h).ok_or_else(|| Error::Ffmpeg(
         "this source has no lens record a lens frame can be made from — export it as VR180".into()))?;
+    // Room for what the stabilizer shifts on this clip: the frame grows by
+    // it, up to its limit. A reduced copy keeps its size instead, and holds
+    // the wider field at a smaller scale.
+    if let Some(over) = lens_frame_overhang(cfg, &frame, mono) {
+        let (gx, gy) = frame.margin(over);
+        if gx > 0 || gy > 0 {
+            let grown = frame.grown(gx, gy);
+            let reduced = cfg.eye_w.min(cfg.eye_h) < src_w.min(src_h);
+            let held = if reduced { grown.fitted(cfg.eye_w, cfg.eye_h) } else { grown };
+            tracing::info!(
+                "fisheye_export: lens frame {}x{} → {}x{} per view: the stabilizer carries the picture {:.0} px past its sides and {:.0} px past its top and bottom at most, {} and {} px a side are added{}",
+                frame.width, frame.height, held.width, held.height, over.0, over.1, gx, gy,
+                if reduced { " and the frame is kept to its size" } else { "" },
+            );
+            frame = held;
+            cfg.eye_w = frame.width;
+            cfg.eye_h = frame.height;
+        }
+    }
     cfg.lens_frame = LensFrameOut::Resolved(frame);
     cfg.inject_apmp = false;
     cfg.inject_youtube_vr180 = false;
     Ok(Some((frame, !mono)))
+}
+
+/// How far the stabilizer carries the recorded picture past a lens frame's
+/// edges over the frames this export writes ([`LensFrame::overhang_over`]):
+/// the stabilization table every path builds, read ahead of them. `None`
+/// when the export does not stabilize or the clip has no motion data.
+///
+/// [`LensFrame::overhang_over`]: crate::lens_frame::LensFrame::overhang_over
+fn lens_frame_overhang(
+    cfg: &FisheyeExportConfig,
+    frame: &crate::lens_frame::LensFrame,
+    mono: bool,
+) -> Option<(f64, f64)> {
+    if !cfg.stabilize {
+        return None;
+    }
+    let imu = resolve_export_imu(cfg)?;
+    let timeline = clip_timeline(cfg);
+    let clip_slots = if cfg.segments.len() > 1 {
+        cfg.segments.iter().map(|p| chain_segment_frames(p, cfg.fps)).sum::<usize>()
+    } else {
+        crate::decode::probe_video(&cfg.source_path)
+            .map(|p| (p.duration_sec * p.fps as f64).round() as usize)
+            .unwrap_or(0)
+    }.max(1);
+    let total = timeline_frames_or(timeline.as_ref(), clip_slots);
+    let max_corr = if cfg.dji_max_corr_deg > 0.0 { cfg.dji_max_corr_deg } else { f32::INFINITY };
+    let mut table = crate::dji_imu::compute_dji_stabilization(
+        &imu, total, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness,
+    ).ok()?.per_frame;
+    crate::dji_imu::apply_lock_ref_diag(&mut table, cfg.dji_smooth_ms);
+    // The rows of the frames between the trim points.
+    let dt = 1.0 / cfg.fps as f64;
+    let t_in = cfg.trim_in_s.unwrap_or(0.0).max(0.0);
+    let t_out = cfg.trim_out_s.map(|t| t.max(t_in + 1e-3)).unwrap_or(f64::INFINITY);
+    let first = match timeline.as_ref() {
+        Some(tl) => tl.row_at_or_after(t_in),
+        None => (t_in / dt).round() as usize,
+    };
+    let time_of = |row: usize| timeline.as_ref().and_then(|tl| tl.pts(row)).unwrap_or(row as f64 * dt);
+    let mut turns: Vec<[f32; 9]> = Vec::new();
+    for row in first..table.len() {
+        if time_of(row) >= t_out {
+            break;
+        }
+        let (left, right) = crate::dji_imu::per_eye_rotations(table[row], Some(&imu), row, cfg.fisheye_swap_eyes);
+        turns.push(left.0);
+        if !mono {
+            turns.push(right.0);
+        }
+    }
+    if turns.is_empty() {
+        return None;
+    }
+    Some(frame.overhang_over(turns.iter()))
 }
 
 fn export_fisheye_inner(

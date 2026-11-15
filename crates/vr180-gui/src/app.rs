@@ -470,7 +470,7 @@ impl StillFormatChoice {
 const LENS_FRAME_LABEL: &str = "Lens frame for Apple Vision Pro (no black canvas)";
 const LENS_FRAME_HOVER: &str = "Crop clips only. Instead of placing the recorded frame in the middle of a 180° canvas that is mostly black, each eye is written the way the camera recorded it, through one lens that the file describes (Apple Projected Media Profile, parametric immersive projection). Stabilization, rolling shutter, eye alignment, the crop mask and colour are applied as always. Off: the usual VR180 half-equirect, which every headset and YouTube read.";
 const LENS_FRAME_NOTE: &str = "Lens frame: the whole frame is picture, at the density it was recorded, so the clip's own size already holds all of its detail. It plays immersively on Apple Vision Pro (visionOS 26 or later) and nowhere else: for other headsets and YouTube, export the clip once more with this off. The file is named …_Lens.";
-const LENS_FRAME_STAB_NOTE: &str = "Stabilization: the frame is as large as the recording, so whatever the stabilizer shifts leaves a band at one border with no picture behind it, and cuts as much off the opposite one. The band is black, as around the picture of a VR180 export; a crop mask gives the frame a steady edge. With camera lock the picture leaves the frame as the camera turns: keep that for a camera that stays put.";
+const LENS_FRAME_STAB_NOTE: &str = "Stabilization: the frame has no spare canvas, so it grows by what the stabilizer shifts the picture on this clip, up to 5 % on each side (an 8K copy keeps its size and scales the picture instead). Where the picture does not reach, the frame is black, as around the picture of a VR180 export; a shift beyond the limit is cut at the frame's edge. A crop mask gives the picture a steady edge. With camera lock the picture leaves the frame as the camera turns: keep that for a camera that stays put.";
 const LENS_FRAME_METADATA_NOTE: &str = "A lens frame carries its own metadata: the lens, for Apple Vision Pro. The choice of VR180 metadata applies to the clips that export as VR180.";
 
 /// The reduced size of a lens frame (the 8K choice): the frame scaled so
@@ -946,9 +946,13 @@ mod export_size_tests {
         let text = panel_text_with(&mut opts, (7680, 3840), None, false, false);
         assert!(!text.contains("Lens frame"), "{text}");
         assert!(opts.lens_frame);
-        for s in [LENS_FRAME_LABEL, LENS_FRAME_HOVER, LENS_FRAME_NOTE, LENS_FRAME_STAB_NOTE, LENS_FRAME_METADATA_NOTE, "Lens frame"] {
+        for s in [LENS_FRAME_LABEL, LENS_FRAME_HOVER, LENS_FRAME_NOTE, LENS_FRAME_STAB_NOTE, LENS_FRAME_METADATA_NOTE, "Lens frame", "margin"] {
             assert_ne!(tr_zh(s), s, "no Chinese text for: {s}");
         }
+        // The limit the note names is the pipeline's.
+        let limit = (vr180_pipeline::lens_frame::MARGIN_LIMIT * 100.0).round() as u32;
+        assert!(LENS_FRAME_STAB_NOTE.contains(&format!("up to {limit} % on each side")), "{LENS_FRAME_STAB_NOTE}");
+        assert!(tr_zh(LENS_FRAME_STAB_NOTE).contains(&format!("每边最多 {limit}%")));
     }
 
     /// "Apply settings to all" stays inside one settings class: a clip that
@@ -1713,8 +1717,8 @@ fn tr_zh(en: &'static str) -> &'static str {
             => "仅用于 Crop 片段。不再把拍到的画面放在大半是黑色的 180° 画布中央，而是按相机拍摄时的样子写出每只眼，并在文件里写明所用的同一个镜头（Apple Projected Media Profile 的参数化沉浸投影）。防抖、卷帘快门校正、双眼对齐、裁切遮罩和调色照常生效。关闭：常规的 VR180 半等距柱状投影，所有头显和 YouTube 都能读取。",
         "Lens frame: the whole frame is picture, at the density it was recorded, so the clip's own size already holds all of its detail. It plays immersively on Apple Vision Pro (visionOS 26 or later) and nowhere else: for other headsets and YouTube, export the clip once more with this off. The file is named …_Lens."
             => "镜头画幅：整个画面都是图像，密度与拍摄时相同，所以片段自身的尺寸已经包含全部细节。只有 Apple Vision Pro（visionOS 26 或更高版本）能沉浸播放；其他头显和 YouTube 请关闭此项再导出一次。文件名以 _Lens 结尾。",
-        "Stabilization: the frame is as large as the recording, so whatever the stabilizer shifts leaves a band at one border with no picture behind it, and cuts as much off the opposite one. The band is black, as around the picture of a VR180 export; a crop mask gives the frame a steady edge. With camera lock the picture leaves the frame as the camera turns: keep that for a camera that stays put."
-            => "防抖：画幅和拍到的画面一样大，防抖修正了多少，一侧边缘就有多宽的一条没有画面可用，对侧则被裁掉同样多。这条带是黑色的，和 VR180 导出里画面四周一样；用裁切遮罩可以让画幅的边缘固定不动。开启相机锁定时，相机一转画面就会移出画幅，只适合机位不动的镜头。",
+        "Stabilization: the frame has no spare canvas, so it grows by what the stabilizer shifts the picture on this clip, up to 5 % on each side (an 8K copy keeps its size and scales the picture instead). Where the picture does not reach, the frame is black, as around the picture of a VR180 export; a shift beyond the limit is cut at the frame's edge. A crop mask gives the picture a steady edge. With camera lock the picture leaves the frame as the camera turns: keep that for a camera that stays put."
+            => "防抖：画幅没有多余的画布，所以它会按这条片段里防抖移动画面的幅度向外扩大，每边最多 5%（8K 缩小版保持尺寸不变，改为缩小画面）。画面没有覆盖到的地方是黑色，和 VR180 导出里画面四周一样；超出上限的偏移会在画幅边缘被裁掉。用裁切遮罩可以让画面的边缘固定不动。开启相机锁定时，相机一转画面就会移出画幅，只适合机位不动的镜头。",
         "A lens frame carries its own metadata: the lens, for Apple Vision Pro. The choice of VR180 metadata applies to the clips that export as VR180."
             => "镜头画幅自带元数据：写给 Apple Vision Pro 的镜头定义。VR180 元数据的选择只作用于按 VR180 导出的片段。",
         "H.265 bitrate" => "H.265 码率",
@@ -1842,6 +1846,7 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Toe shape of the darkest few percent only — lower = softer, which lifts the deepest shadows; higher = harder, which pushes them down. A subtle control by design; for a level change use Black level."
             => "只影响最暗几个百分点的趾部形状——数值越低越柔和（最深的暗部被抬起），越高越硬（暗部被压下）。设计上作用就很轻微；要改电平请用“黑电平”。",
         "native" => "原始",
+        "margin" => "余量",
         "full" => "全尺寸",
         "Above 8192 × 4096 the Mac's hardware ProRes encoder refuses the frame — the software encoder takes over (several times slower)."
             => "超过 8192 × 4096 时 Mac 的硬件 ProRes 编码器不接受该画幅——改用软件编码器（慢数倍）。",
@@ -5340,7 +5345,11 @@ impl App {
             _ if lens_frame => {
                 let (ew, eh) = self.clip.as_ref().map(|c| (c.fisheye_eye_w, c.fisheye_eye_h)).unwrap_or((0, 0));
                 let (w, h) = self.export_opts.lens_frame_eye_dims(ew, eh);
-                format!("{} {} × {h}", tr("Lens frame"), if single_eye { w } else { w * 2 })
+                // A stabilized frame grows by what the clip needs (decided at
+                // export, from its motion); a reduced copy keeps its size.
+                let grows = self.settings.stabilize && (w, h) == (ew, eh);
+                format!("{} {} × {h}{}", tr("Lens frame"), if single_eye { w } else { w * 2 },
+                        if grows { format!(" + {}", tr("margin")) } else { String::new() })
             }
             (Some(aspect), _, _) => self.export_opts.reframe_size.frame_label(aspect, single_eye),
             // Native = the clip's own size (a 12K BRAW: 12288 × 6144).

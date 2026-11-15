@@ -2411,10 +2411,28 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      view does; on the headset the smeared band was an eyesore, so the
      variant no longer splices `frame_cover`. The view mask applies;
      `out_rim` (8 px at 4912) keeps the frame's own border black for players
-     that clamp. Measured on hand-held walks with soft stabilization (1.2 s,
-     cap 15°): the band is 4 px at the median and 164 px (3.9°) at worst of
-     4912 on a 10K Crop clip; 46 px and 325 px (8.0°) of 3712 on a 7.4K Crop
-     60 fps clip, whose frame is narrower (97° across).
+     that clamp.
+   - **Room for the stabilizer**: the recorded frame has no spare canvas, so
+     a stabilized lens frame GROWS by what the stabilizer shifts the picture
+     on that clip, capped at `lens_frame::MARGIN_LIMIT` (5 % of the shorter
+     side) per border; past the cap the picture is cut at the frame's edge.
+     `resolve_lens_frame` → `lens_frame_overhang` builds the stabilization
+     table the paths build (same calls, read ahead of them; `clip_timeline`
+     is `export_timeline` without its log line), takes each written frame's
+     per-eye rotation, and asks `LensFrame::overhang_over` where the frame's
+     border lands (`rotᵀ` · border ray → `project`); `margin` rounds to pairs
+     of pixels and caps; `grown` adds them (same lens, wider field) and
+     `cfg.eye_w / eye_h` follow, so no path function knows about it. A
+     reduced copy (the 8K choice) keeps its size: `fitted` scales the grown
+     frame back into it. Stabilization off → the frame is the recorded one,
+     byte for byte as before. The GUI cannot know the size ahead (it has no
+     stabilization table): its label says `+ margin`. Measured on hand-held
+     walks with soft stabilization (1.2 s, cap 15°): the picture leaves the
+     frame by 4 px at the median and 164 px (3.9°) at worst of 4912 on a 10K
+     Crop clip; 46 px and 325 px (8.0°) of 3712 on a 7.4K Crop 60 fps clip,
+     whose frame is narrower (97° across) — that one exports at 8160 × 4028
+     (its corners swing further: 343 px across, 157 px up and down) and is
+     still cut at a side in 6 % of its frames (159 px at most).
    - **File conventions, measured against the system's player mesh** (not
      what the model's textbook form suggests): the projection offset is
      stored NEGATED; the principal point counts from the view's edges; the

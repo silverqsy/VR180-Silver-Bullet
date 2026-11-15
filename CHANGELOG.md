@@ -47,12 +47,15 @@ own angle.
   eye alignment, the crop mask and colour are applied the same way. Both
   eyes are rendered into one common lens with the camera lens's own radial
   law, so the picture is resampled at very nearly one to one.
-- **Stabilization has no spare canvas here.** The frame is as large as the
-  recording, so a correction leaves a band at one border with no picture
-  behind it and cuts as much off the opposite one. The band is black, as
-  around the picture of a VR180 export (a few pixels wide most of the time
-  on a steady clip, a few degrees on a hand-held walk); a crop mask gives
-  the frame a steady edge. Camera lock suits a camera that stays put.
+- **Stabilization has no spare canvas here**, so the frame grows by what
+  the stabilizer shifts the picture on that clip, up to 5 % on each side:
+  next to nothing for a camera on a tripod, 8160 × 4028 instead of
+  7424 × 3712 for a rough hand-held walk. Where the picture does not
+  reach, the frame is black, as around the picture of a VR180 export; a
+  shift beyond the limit is cut at the frame's edge (under 4 seconds of
+  that one-minute walk). An 8K copy keeps its size and scales the picture
+  instead. A crop mask gives the picture a steady edge; camera lock suits
+  a camera that stays put.
 - **Apple Vision Pro only** (visionOS 26 or later). No other headset and
   not YouTube read this form, so the VR180 export stays the default and is
   unchanged: export a clip both ways and you get `…_SBS` and `…_Lens`.
