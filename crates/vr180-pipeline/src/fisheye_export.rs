@@ -65,6 +65,23 @@ impl Default for FisheyeExportProjection {
 /// disk edge sits at `FISHEYE_OUT_FULL_FOV_DEG / 2` from the optical axis.
 pub const FISHEYE_OUT_FULL_FOV_DEG: f32 = 195.0;
 
+/// What the [`FisheyeExportProjection::Fisheye`] projection writes: its
+/// equidistant disc, or a LENS FRAME — each eye as the image of a lens with
+/// the source lens's own radial law, the whole frame full, and that lens
+/// stated in the file (Apple Projected Media Profile, parametric immersive).
+/// See [`crate::lens_frame`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum LensFrameOut {
+    /// The equidistant disc.
+    #[default]
+    Off,
+    /// A lens frame: [`export_fisheye`] derives the lens from the source's
+    /// lens record before the first frame. What a caller asks for.
+    FromSource,
+    /// The lens, derived. Set by the export itself.
+    Resolved(crate::lens_frame::LensFrame),
+}
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -177,6 +194,10 @@ pub struct FisheyeExportConfig {
     /// Output projection. `HalfEquirect` = standard VR180 (default).
     /// `Fisheye` = raw fisheye pass-through SBS, no equirect projection.
     pub projection: FisheyeExportProjection,
+    /// `Fisheye` projection only: write a lens frame instead of the
+    /// equidistant disc ([`LensFrameOut`]). The VR180 metadata flags are
+    /// then ignored: the file gets the lens's own.
+    pub lens_frame: LensFrameOut,
     /// `Some` → write an Apple spatial video (MV-HEVC `.mov`) instead of a
     /// side-by-side frame. Needs a rectilinear reframed `projection` and
     /// macOS; `encoder` / `bit_depth` are then fixed by the export
@@ -1202,7 +1223,55 @@ pub fn export_fisheye(
         cfg.color_stack = cfg.color_stack.single_eye();
     }
     prepare_spatial(&mut cfg)?;
-    export_fisheye_inner(pipeline, cfg, progress_cb, cancel)
+    // A lens frame: fix its lens before the first frame, and state it in the
+    // file once the file is whole (after the audio, which rewrites it).
+    let lens_frame = resolve_lens_frame(&mut cfg)?;
+    let out = cfg.output_path.clone();
+    export_fisheye_inner(pipeline, cfg, progress_cb, cancel)?;
+    if let Some((frame, stereo)) = lens_frame {
+        if out.is_file() {
+            let lens = frame.apmp();
+            crate::spherical_inject::inject_apmp_lens(&out, &lens, stereo)?;
+            tracing::info!(
+                "fisheye_export: lens frame stated in the file — {}x{} per view, focal {:.2} px, xi {:.5}, k1 {:.5}, k2 {:.5}, to {:.0}°, {}",
+                lens.width, lens.height, lens.focal, lens.xi, lens.k1, lens.k2, lens.limit_deg,
+                if stereo { "two views side by side" } else { "one view" },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A lens-frame export ([`LensFrameOut::FromSource`]): derive the frame's
+/// lens from the source's lens record and put it in `cfg` for the projection
+/// ([`resolve_calib_pair`]). Returns the lens and whether the frame holds two
+/// views; `None` for every other export.
+///
+/// The VR180 metadata flags are cleared: a lens frame is not a half-equirect,
+/// and the file gets its own metadata from [`export_fisheye`].
+fn resolve_lens_frame(cfg: &mut FisheyeExportConfig) -> Result<Option<(crate::lens_frame::LensFrame, bool)>> {
+    if cfg.lens_frame == LensFrameOut::Off {
+        return Ok(None);
+    }
+    if cfg.projection != FisheyeExportProjection::Fisheye || cfg.spatial.is_some() {
+        return Err(Error::Ffmpeg("a lens frame is written by the fisheye projection, as a side-by-side or single-view frame".into()));
+    }
+    // The source's lenses alone: no gyro is read for this.
+    let mut lenses_only = cfg.clone();
+    lenses_only.stabilize = false;
+    lenses_only.lens_frame = LensFrameOut::Off;
+    let path = cfg.segments.first().unwrap_or(&cfg.source_path);
+    let (src_w, src_h) = crate::decode::probe_video(path).map(|p| (p.width, p.height))?;
+    let imu = resolve_export_imu(&lenses_only);
+    let (left, right) = resolve_calib_pair(&lenses_only, src_w, src_h, imu.as_ref());
+    let mono = single_eye_source(cfg);
+    let sources: Vec<&FisheyeCalib> = if mono { vec![&left] } else { vec![&left, &right] };
+    let frame = crate::lens_frame::LensFrame::from_sources(&sources, cfg.eye_w, cfg.eye_h).ok_or_else(|| Error::Ffmpeg(
+        "this source has no lens record a lens frame can be made from — export it as VR180".into()))?;
+    cfg.lens_frame = LensFrameOut::Resolved(frame);
+    cfg.inject_apmp = false;
+    cfg.inject_youtube_vr180 = false;
+    Ok(Some((frame, !mono)))
 }
 
 fn export_fisheye_inner(
@@ -2083,6 +2152,9 @@ pub fn export_eac(
     if cfg.projection.is_reframe() {
         cfg.inject_apmp = false;
         cfg.inject_youtube_vr180 = false;
+    }
+    if cfg.lens_frame != LensFrameOut::Off {
+        return Err(Error::Ffmpeg("a lens frame needs a source with its own lens record — a .360 file is exported as VR180".into()));
     }
     prepare_spatial(&mut cfg)?;
     export_eac_inner(pipeline, cfg, per_eye, progress_cb, cancel)
@@ -4508,7 +4580,13 @@ pub(crate) fn resolve_calib_pair(
     // default 90° horizontal half-FOV.)
     if cfg.projection == FisheyeExportProjection::Fisheye {
         let hfov = (FISHEYE_OUT_FULL_FOV_DEG * 0.5).to_radians();
-        (calib_l.with_output_hfov(hfov), calib_r.with_output_hfov(hfov))
+        let (l, r) = (calib_l.with_output_hfov(hfov), calib_r.with_output_hfov(hfov));
+        // A lens frame: the same kernels write the lens's image over the
+        // whole frame instead of the disc.
+        match cfg.lens_frame {
+            LensFrameOut::Resolved(frame) => (l.with_lens_frame(&frame), r.with_lens_frame(&frame)),
+            _ => (l, r),
+        }
     } else if let Some((hfov_deg, defish)) = cfg.projection.reframe() {
         // Reframed view: the viewport's aspect is the eye frame's.
         let aspect = cfg.eye_w as f32 / cfg.eye_h.max(1) as f32;

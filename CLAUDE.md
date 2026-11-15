@@ -2371,6 +2371,69 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      conversion is 8-bit in, 8-bit out with egui's dither, like the image
      path it replaces.
 
+33. **Lens-frame export of Crop clips (2026-11-14, Mac; UNRELEASED,
+    Windows not built).** A Crop clip's VR180 export can be written as a
+    LENS FRAME instead of a half-equirect: each eye through a lens, the
+    whole frame full, the lens stated in the file (APMP, projection `prim`
+    with a lens collection). Format window ▸ **Lens frame for Apple Vision
+    Pro**; `ExportOptions::lens_frame` (one choice for the list, applied
+    where `lens_frame_for` says: a cropped video clip in the VR180 view).
+    Default off; the half-equirect export is untouched.
+   - **Pipeline**: `FisheyeExportConfig::lens_frame: LensFrameOut` on the
+     `Fisheye` projection. `export_fisheye` (the one entry of every fisheye
+     path, all platforms) calls `resolve_lens_frame`: lenses only (no gyro)
+     → `resolve_calib_pair` → `lens_frame::LensFrame::from_sources` → stored
+     as `LensFrameOut::Resolved`, which `resolve_calib_pair` turns into
+     `FisheyeCalib::with_lens_frame`; after the path returns it injects
+     `spherical_inject::inject_apmp_lens`. No path function was edited, the
+     Windows-only ones included.
+   - **The lens** (`lens_frame.rs`): Mei-Rives, centred, ONE for both eyes —
+     ξ from the source, focal / k1 / k2 a least-squares refit of the source
+     lenses' mean radial law out to the frame's corner (two terms for the
+     factory's four: within 1 px to the frame's edges, 3 px in the far
+     corners). Frame = the source eye's own size (the fisheye view's square
+     rule is skipped), or a reduced copy with the longer side 4096 for the
+     8K choice. A source without a
+     unified-camera-model lens record has no lens frame (export fails with a
+     message; the GUI only offers it on cropped X6 clips).
+   - **Kernels**: the five `fisheye_*_to_fisheye*.wgsl` files are NOT
+     edited. `gpu::lens_frame_wgsl` splices `shaders/lens_frame_ray.wgsl`
+     into each (anchors asserted) to make a variant, compiled on first use
+     (`LensFramePipelines`, `Device::fisheye_out_*` accessors chosen by
+     `FisheyeCalib::out_lens`). A branch inside the kernels was tried first:
+     it changed the disc's output at rounding level (the compiler optimises
+     the changed source differently) and failed the regression set. The
+     uniform grew to 13 vec4 (208 B): `out_lens` + `out_rim` in a spare slot;
+     the half-equirect kernels do not declare the new row.
+   - **Edge policy**: in a lens frame a ray that leaves the SOURCE frame
+     repeats the edge (`frame_cover` → 1 in the variant, as in the reframed
+     view); the view mask applies; `out_rim` (8 px at 4912) keeps the frame's
+     own border black for players that clamp. Measured on a hand-held walk
+     with soft stabilization (1.2 s, cap 15°): the band is 4 px at the
+     median, 164 px (3.9°) at worst, of 4912.
+   - **File conventions, measured against the system's player mesh** (not
+     what the model's textbook form suggests): the projection offset is
+     stored NEGATED; the principal point counts from the view's edges; the
+     player builds one mesh from the FIRST lens of the collection. Byte-exact
+     tests against AVFoundation's writer.
+   - **Verified** (macOS 27.2): 26 fisheye-export regression cases
+     frame-identical; lens frames through zero-copy 10 / 8-bit, the portable
+     loop, libx265 10 / 8-bit, ProRes, noise reduction, stabilization on and
+     off — each read by the system as parametric immersive, its mesh within
+     0.001 px of the written lens, its picture within 0.2 px of the same
+     frames' half-equirect re-projected by an independent script. GPU tests in
+     `gpu::lens_frame_kernel_tests`. Test clips of this form were viewed on
+     a headset (visionOS 27): immersive, placement and scale as the
+     half-equirect.
+   - **Windows: untested.** Shared code only (no new gates; two
+     `cfg_attr(not(macos), allow(dead_code))` on accessors of the macOS-only
+     P010 kernels). To check there: the spliced WGSL compiles on D3D12 /
+     Vulkan, a lens-frame export through NVENC (9824 wide falls to libx265
+     as the 13120 canvas does) and through the GPU-resident path.
+   - Not done: no preview of the lens frame (the preview stays VR180), no
+     MV-HEVC lens frame, full-view modes not offered, no automatic mask
+     sized to the stabilizer's corrections.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

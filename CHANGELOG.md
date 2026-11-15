@@ -28,6 +28,39 @@ sensor recorded, ahead of the tone controls and the LUT.
   and software encoder, ProRes) land within one 10-bit code of it on
   average.
 
+### Insta360 X6 Crop clips: a lens-frame export for Apple Vision Pro
+
+A Crop clip covers about 97° or 126°. Exported as VR180 it sits in the
+middle of a 180° canvas that is half to two thirds black, and the canvas has
+to be far larger than the recording to keep its detail: 13120 × 6560 for a
+recording of 9824 × 4912. The Format window now has **Lens frame for Apple
+Vision Pro**: each eye is written the way the camera recorded it, in a lens
+projection, and the file states that lens (Apple Projected Media Profile,
+parametric immersive projection), so the headset shows every pixel at its
+own angle.
+
+- **No black canvas.** The whole frame is picture, at the density it was
+  recorded: 9824 × 4912 for a 10K Crop clip (56 % of the pixels of its 180°
+  canvas), 7424 × 3712 for a 7.4K Crop clip (32 %), each with all of its
+  detail. The 8K choice writes a reduced copy of the same frame.
+- **Everything else as before**: stabilization, rolling-shutter correction,
+  eye alignment, the crop mask and colour are applied the same way. Both
+  eyes are rendered into one common lens with the camera lens's own radial
+  law, so the picture is resampled at very nearly one to one.
+- **Stabilization has no spare canvas here.** The frame is as large as the
+  recording, so a correction leaves a band at the border with no picture
+  behind it. The frame's edge repeats there (a few pixels wide most of the
+  time, a few degrees at worst on a hand-held walk); a crop mask hides it.
+  Camera lock suits a camera that stays put.
+- **Apple Vision Pro only** (visionOS 26 or later). No other headset and
+  not YouTube read this form, so the VR180 export stays the default and is
+  unchanged: export a clip both ways and you get `…_SBS` and `…_Lens`.
+- **Checked**: the system's own playback mesh, built from the lens in the
+  file, lands within a thousandth of a pixel of what the app rendered; the
+  picture agrees with the VR180 export of the same frames, re-projected
+  independently, to 0.2 of a pixel; the lens boxes are byte for byte what
+  Apple's writer produces. Every existing export is frame-identical.
+
 ### macOS: the preview can match QuickTime
 
 On a Mac, an export played in QuickTime, in Safari or on Apple Vision Pro

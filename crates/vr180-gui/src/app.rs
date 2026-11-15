@@ -466,6 +466,26 @@ impl StillFormatChoice {
     }
 }
 
+/// The lens-frame choice of the Format window (see `ExportOptions::lens_frame`).
+const LENS_FRAME_LABEL: &str = "Lens frame for Apple Vision Pro (no black canvas)";
+const LENS_FRAME_HOVER: &str = "Crop clips only. Instead of placing the recorded frame in the middle of a 180° canvas that is mostly black, each eye is written the way the camera recorded it, through one lens that the file describes (Apple Projected Media Profile, parametric immersive projection). Stabilization, rolling shutter, eye alignment, the crop mask and colour are applied as always. Off: the usual VR180 half-equirect, which every headset and YouTube read.";
+const LENS_FRAME_NOTE: &str = "Lens frame: the whole frame is picture, at the density it was recorded, so the clip's own size already holds all of its detail. It plays immersively on Apple Vision Pro (visionOS 26 or later) and nowhere else: for other headsets and YouTube, export the clip once more with this off. The file is named …_Lens.";
+const LENS_FRAME_STAB_NOTE: &str = "Stabilization: the frame is as large as the recording, so whatever the stabilizer shifts leaves a band at the border with no picture behind it. The frame's edge repeats there (a few pixels wide most of the time); a crop mask hides it. With camera lock the picture leaves the frame as the camera turns: keep that for a camera that stays put.";
+const LENS_FRAME_METADATA_NOTE: &str = "A lens frame carries its own metadata: the lens, for Apple Vision Pro. The choice of VR180 metadata applies to the clips that export as VR180.";
+
+/// The reduced size of a lens frame (the 8K choice): the frame scaled so
+/// that its longer side is 4096, its shape kept, each side a multiple of 4.
+/// `None` for a frame no larger than that: a lens frame is never enlarged.
+fn lens_frame_reduced_dims(eye_w: u32, eye_h: u32) -> Option<(u32, u32)> {
+    let long = eye_w.max(eye_h);
+    if long <= 4096 || eye_w.min(eye_h) == 0 {
+        return None;
+    }
+    let scale = 4096.0 / long as f64;
+    let side = |v: u32| (((v as f64 * scale) / 4.0).round() as u32 * 4).max(16);
+    Some((side(eye_w), side(eye_h)))
+}
+
 /// Output resolution target for the export. `Native` renders at the
 /// source's per-eye dimensions — labeled by the OSV case (3840² per eye
 /// → 7680×3840 SBS); a `.360` source actually renders its cross-native
@@ -632,6 +652,14 @@ struct ExportOptions {
     /// sort: "its own size" means something else on either side (the whole
     /// canvas for one, a smaller canvas than was recorded for the other).
     crop_resolution: ExportResolution,
+    /// Write a Crop clip's VR180 export as a LENS FRAME: each eye the way it
+    /// was recorded, through one lens that the file states (Apple Projected
+    /// Media Profile, parametric immersive), instead of the 180° canvas the
+    /// frame only half fills. One choice for the list; it takes effect where
+    /// it can ([`ExportOptions::lens_frame_for`]) and every other clip
+    /// exports as before. Apple Vision Pro reads such a file; other headsets
+    /// and YouTube need the half-equirect form.
+    lens_frame: bool,
     /// H.265 average bitrate in Mbps for VR180 output. Range 20..=1000
     /// (a native 12K export wants the top of it; the slider is logarithmic
     /// so the everyday 50–300 Mbps band keeps its resolution).
@@ -788,6 +816,11 @@ mod export_size_tests {
 
     /// Every piece of text the Format window paints for a VR180 clip.
     fn panel_text(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, single_eye: bool) -> String {
+        panel_text_with(opts, native, sharp, false, single_eye)
+    }
+
+    /// The same, for a clip that may (`lens_offered`) be written as a lens frame.
+    fn panel_text_with(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, lens_offered: bool, single_eye: bool) -> String {
         fn collect(shape: &egui::Shape, out: &mut String) {
             match shape {
                 egui::Shape::Text(text) => { out.push_str(text.galley.text()); out.push('\n'); }
@@ -804,7 +837,7 @@ mod export_size_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, single_eye);
+                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, lens_offered, single_eye);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -828,6 +861,94 @@ mod export_size_tests {
         assert!(text.contains("13120 × 6560 (native sharpness)"), "{text}");
         assert!(!text.contains("9824 × 4912 (native)"), "{text}");
         assert_eq!((opts.resolution, opts.crop_resolution), (Native, Sharp));
+    }
+
+    /// A lens frame stands in for a Crop clip's VR180 export, at the size
+    /// and shape the eye was recorded, and nowhere else.
+    #[test]
+    fn a_lens_frame_is_the_recorded_frame() {
+        use crate::decoder::{FisheyeOutputMode, Settings};
+        use vr180_pipeline::fisheye_export::{FisheyeExportProjection, LensFrameOut};
+        use vr180_pipeline::SourceKind;
+        let cfg = |opts: &ExportOptions, settings: &Settings, kind, eye: (u32, u32), sharp_eye| App::build_export_cfg(
+            std::path::Path::new("/nonexistent/in.insv"), std::path::Path::new("/nonexistent/out.mp4"),
+            29.97, kind, eye.0, eye.1, eye.0, eye.1, sharp_eye, settings, opts, Vec::new(),
+        );
+        let vr = Settings::default();
+        let insv = SourceKind::Insta360Insv;
+        let on = ExportOptions { lens_frame: true, crop_resolution: ExportResolution::Sharp, ..Default::default() };
+
+        // A square Crop frame: its own size, whatever the VR180 canvas would be.
+        let c = cfg(&on, &vr, insv, (4912, 4912), Some(6560));
+        assert_eq!((c.projection, c.lens_frame), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource));
+        assert_eq!((c.eye_w, c.eye_h), (4912, 4912));
+        // A frame that is not square keeps its shape.
+        for eye in [(6000, 3968), (3840, 3008)] {
+            let c = cfg(&on, &vr, insv, eye, Some(6560));
+            assert_eq!((c.eye_w, c.eye_h, c.lens_frame), (eye.0, eye.1, LensFrameOut::FromSource), "{eye:?}");
+        }
+        // The clip's own size and its native sharpness are the same frame here.
+        let native = ExportOptions { crop_resolution: ExportResolution::Native, ..on };
+        assert_eq!((cfg(&native, &vr, insv, (4912, 4912), Some(6560)).eye_w), 4912);
+        // The 8K choice is a reduced copy of the same shape, never an enlargement.
+        let small = ExportOptions { crop_resolution: ExportResolution::R8k, ..on };
+        let c = cfg(&small, &vr, insv, (4912, 4912), Some(6560));
+        assert_eq!((c.eye_w, c.eye_h), (4096, 4096));
+        let c = cfg(&small, &vr, insv, (6000, 3968), Some(6560));
+        assert_eq!((c.eye_w, c.eye_h), (4096, 2708));
+        let c = cfg(&small, &vr, insv, (3712, 3712), Some(6560));
+        assert_eq!((c.eye_w, c.eye_h), (3712, 3712));
+        assert_eq!(super::lens_frame_reduced_dims(3840, 3008), None);
+
+        // Off, a clip whose frame is not a crop, another view: as before.
+        let off = ExportOptions { lens_frame: false, ..on };
+        let c = cfg(&off, &vr, insv, (4912, 4912), Some(6560));
+        assert_eq!((c.projection, c.lens_frame, c.eye_w), (FisheyeExportProjection::HalfEquirect, LensFrameOut::Off, 6560));
+        let c = cfg(&on, &vr, insv, (3840, 3840), None);
+        assert_eq!((c.projection, c.lens_frame), (FisheyeExportProjection::HalfEquirect, LensFrameOut::Off));
+        // The fisheye view keeps writing its disc, in a square frame.
+        let disc = Settings { fisheye_output_mode: FisheyeOutputMode::Fisheye, ..Default::default() };
+        let c = cfg(&native, &disc, insv, (6000, 3968), Some(6560));
+        assert_eq!((c.projection, c.lens_frame, c.eye_w, c.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::Off, 3968, 3968));
+        let flat = Settings { fisheye_output_mode: FisheyeOutputMode::Reframe, ..Default::default() };
+        assert_eq!(cfg(&on, &flat, insv, (4912, 4912), Some(6560)).lens_frame, LensFrameOut::Off);
+        assert!(on.lens_frame_for(&vr, true, false));
+        assert!(!on.lens_frame_for(&vr, true, true) && !on.lens_frame_for(&vr, false, false) && !off.lens_frame_for(&vr, true, false));
+    }
+
+    /// The Format window offers the lens frame on a Crop clip in the VR180
+    /// view, and its sizes are the frame's own.
+    #[test]
+    fn the_format_window_offers_the_lens_frame() {
+        use super::{tr_zh, LENS_FRAME_HOVER, LENS_FRAME_LABEL, LENS_FRAME_METADATA_NOTE, LENS_FRAME_NOTE, LENS_FRAME_STAB_NOTE};
+        let mut opts = ExportOptions { crop_resolution: ExportResolution::Sharp, ..Default::default() };
+        // Offered and off: the usual sizes, and the box to tick.
+        let text = panel_text_with(&mut opts, (9824, 4912), Some((13120, 6560)), true, false);
+        assert!(text.contains(LENS_FRAME_LABEL) && text.contains("13120 × 6560 (native sharpness)"), "{text}");
+        assert!(!text.contains("Lens frame: the whole frame"), "{text}");
+        // Not offered (another clip, another view): no trace of it.
+        let text = panel_text_with(&mut opts, (9824, 4912), Some((13120, 6560)), false, false);
+        assert!(!text.contains(LENS_FRAME_LABEL), "{text}");
+        // On: the clip's own size stands for its native sharpness, and the
+        // note says where the file plays.
+        opts.lens_frame = true;
+        let text = panel_text_with(&mut opts, (9824, 4912), Some((13120, 6560)), true, false);
+        assert!(text.contains("9824 × 4912 (native)") && !text.contains("13120"), "{text}");
+        assert!(text.contains(LENS_FRAME_NOTE) && text.contains(LENS_FRAME_METADATA_NOTE), "{text}");
+        assert!(text.contains(LENS_FRAME_STAB_NOTE), "{text}");
+        assert!(!text.contains("YouTube (Spherical V2"), "{text}");
+        // The stored choices are untouched by the look.
+        assert_eq!(opts.crop_resolution, ExportResolution::Sharp);
+        // A frame that is not square, one eye.
+        let text = panel_text_with(&mut opts, (6000, 3968), Some((6560, 6560)), true, true);
+        assert!(text.contains("6000 × 3968 (native)"), "{text}");
+        // On a clip it does not apply to, the choice shows nothing and stays.
+        let text = panel_text_with(&mut opts, (7680, 3840), None, false, false);
+        assert!(!text.contains("Lens frame"), "{text}");
+        assert!(opts.lens_frame);
+        for s in [LENS_FRAME_LABEL, LENS_FRAME_HOVER, LENS_FRAME_NOTE, LENS_FRAME_STAB_NOTE, LENS_FRAME_METADATA_NOTE, "Lens frame"] {
+            assert_ne!(tr_zh(s), s, "no Chinese text for: {s}");
+        }
     }
 
     /// "Apply settings to all" stays inside one settings class: a clip that
@@ -1091,11 +1212,14 @@ mod spatial_export_tests {
     #[test]
     fn spatial_video_gets_its_own_file_name() {
         let src = std::path::Path::new("/clips/VID_0005.insv");
-        assert_eq!(App::default_output_for(src, ExportCodec::H265, false), std::path::Path::new("/clips/VID_0005_SBS.mp4"));
-        assert_eq!(App::default_output_for(src, ExportCodec::ProRes, false), std::path::Path::new("/clips/VID_0005_SBS.mov"));
-        assert_eq!(App::default_output_for(src, ExportCodec::Spatial, false), std::path::Path::new("/clips/VID_0005_Spatial.mov"));
-        assert_eq!(App::default_output_for(src, ExportCodec::H265, true), std::path::Path::new("/clips/VID_0005_Mono.mp4"));
-        assert_eq!(App::default_output_for(src, ExportCodec::ProRes, true), std::path::Path::new("/clips/VID_0005_Mono.mov"));
+        assert_eq!(App::default_output_for(src, ExportCodec::H265, false, false), std::path::Path::new("/clips/VID_0005_SBS.mp4"));
+        assert_eq!(App::default_output_for(src, ExportCodec::ProRes, false, false), std::path::Path::new("/clips/VID_0005_SBS.mov"));
+        assert_eq!(App::default_output_for(src, ExportCodec::Spatial, false, false), std::path::Path::new("/clips/VID_0005_Spatial.mov"));
+        assert_eq!(App::default_output_for(src, ExportCodec::H265, true, false), std::path::Path::new("/clips/VID_0005_Mono.mp4"));
+        assert_eq!(App::default_output_for(src, ExportCodec::ProRes, true, false), std::path::Path::new("/clips/VID_0005_Mono.mov"));
+        // A lens frame has its own name, next to the VR180 export of the same clip.
+        assert_eq!(App::default_output_for(src, ExportCodec::H265, false, true), std::path::Path::new("/clips/VID_0005_Lens.mp4"));
+        assert_eq!(App::default_output_for(src, ExportCodec::ProRes, true, true), std::path::Path::new("/clips/VID_0005_Lens.mov"));
     }
 
     #[test]
@@ -1170,7 +1294,7 @@ mod spatial_export_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, false);
+                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, false, false);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -1286,6 +1410,27 @@ impl ExportOptions {
         if cropped { &mut self.crop_resolution } else { &mut self.resolution }
     }
 
+    /// Whether an export of a clip with `settings` really is a lens frame:
+    /// the choice, on a video whose frame is a crop of the lens' view
+    /// (`cropped`) and whose output is VR180 — the lens frame takes the
+    /// place of the 180° canvas, nothing else. The choice itself stays put,
+    /// so a list of mixed clips exports each as it can.
+    fn lens_frame_for(&self, settings: &crate::decoder::Settings, cropped: bool, is_still: bool) -> bool {
+        self.lens_frame && cropped && !is_still
+            && matches!(settings.fisheye_output_mode, crate::decoder::FisheyeOutputMode::HalfEquirect)
+    }
+
+    /// Per-eye size of a lens frame for a clip whose eye is `eye_w × eye_h`:
+    /// the frame as it was recorded, whatever its shape — which is its
+    /// native sharpness, so that choice means the same here — or its reduced
+    /// copy for the 8K choice ([`lens_frame_reduced_dims`]).
+    fn lens_frame_eye_dims(&self, eye_w: u32, eye_h: u32) -> (u32, u32) {
+        match self.resolution_for(true) {
+            ExportResolution::R8k => lens_frame_reduced_dims(eye_w, eye_h).unwrap_or((eye_w, eye_h)),
+            ExportResolution::Native | ExportResolution::Sharp => (eye_w, eye_h),
+        }
+    }
+
     /// The codec an export of a clip with `settings` really uses: spatial
     /// video only where it exists ([`spatial_video_available`], and never
     /// for a still); everywhere else that choice runs as H.265. The choice
@@ -1316,6 +1461,7 @@ impl Default for ExportOptions {
             still_format: StillFormatChoice::Png16,
             resolution: ExportResolution::R8k,
             crop_resolution: ExportResolution::R8k,
+            lens_frame: false,
             h265_bitrate_mbps: 200,
             reframe_bitrate_mbps: 35,
             reframe_bitrate_custom: false,
@@ -1561,6 +1707,16 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Bit depth" => "位深",
         "ProRes profile" => "ProRes 配置",
         "VR180 metadata" => "VR180 元数据",
+        "Lens frame" => "镜头画幅",
+        "Lens frame for Apple Vision Pro (no black canvas)" => "镜头画幅，供 Apple Vision Pro 使用（无黑边画布）",
+        "Crop clips only. Instead of placing the recorded frame in the middle of a 180° canvas that is mostly black, each eye is written the way the camera recorded it, through one lens that the file describes (Apple Projected Media Profile, parametric immersive projection). Stabilization, rolling shutter, eye alignment, the crop mask and colour are applied as always. Off: the usual VR180 half-equirect, which every headset and YouTube read."
+            => "仅用于 Crop 片段。不再把拍到的画面放在大半是黑色的 180° 画布中央，而是按相机拍摄时的样子写出每只眼，并在文件里写明所用的同一个镜头（Apple Projected Media Profile 的参数化沉浸投影）。防抖、卷帘快门校正、双眼对齐、裁切遮罩和调色照常生效。关闭：常规的 VR180 半等距柱状投影，所有头显和 YouTube 都能读取。",
+        "Lens frame: the whole frame is picture, at the density it was recorded, so the clip's own size already holds all of its detail. It plays immersively on Apple Vision Pro (visionOS 26 or later) and nowhere else: for other headsets and YouTube, export the clip once more with this off. The file is named …_Lens."
+            => "镜头画幅：整个画面都是图像，密度与拍摄时相同，所以片段自身的尺寸已经包含全部细节。只有 Apple Vision Pro（visionOS 26 或更高版本）能沉浸播放；其他头显和 YouTube 请关闭此项再导出一次。文件名以 _Lens 结尾。",
+        "Stabilization: the frame is as large as the recording, so whatever the stabilizer shifts leaves a band at the border with no picture behind it. The frame's edge repeats there (a few pixels wide most of the time); a crop mask hides it. With camera lock the picture leaves the frame as the camera turns: keep that for a camera that stays put."
+            => "防抖：画幅和拍到的画面一样大，防抖修正了多少，边缘就有多宽的一条没有画面可用，那里用画面边缘的像素延展补上（大多数时候只有几个像素宽），用裁切遮罩可以把它盖住。开启相机锁定时，相机一转画面就会移出画幅，只适合机位不动的镜头。",
+        "A lens frame carries its own metadata: the lens, for Apple Vision Pro. The choice of VR180 metadata applies to the clips that export as VR180."
+            => "镜头画幅自带元数据：写给 Apple Vision Pro 的镜头定义。VR180 元数据的选择只作用于按 VR180 导出的片段。",
         "H.265 bitrate" => "H.265 码率",
         "Spatial video (MV-HEVC)" => "空间视频 (MV-HEVC)",
         "per eye" => "每眼",
@@ -2586,11 +2742,13 @@ impl App {
     }
 
     /// `<source_stem>_SBS.<ext-for-codec>` next to the source; a spatial
-    /// video (one stream, not a side-by-side frame) is `<stem>_Spatial.mov`.
-    fn default_output_for(source: &std::path::Path, codec: ExportCodec, single_eye: bool) -> PathBuf {
+    /// video (one stream, not a side-by-side frame) is `<stem>_Spatial.mov`,
+    /// and a lens frame `<stem>_Lens.<ext>` — the same clip may well be
+    /// exported both ways, for two kinds of headset.
+    fn default_output_for(source: &std::path::Path, codec: ExportCodec, single_eye: bool, lens_frame: bool) -> PathBuf {
         let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
         // A single-eye source's frame is not side by side.
-        let frame = if single_eye { "Mono" } else { "SBS" };
+        let frame = if lens_frame { "Lens" } else if single_eye { "Mono" } else { "SBS" };
         let (tag, ext) = match codec {
             ExportCodec::H265 => (frame, "mp4"),
             ExportCodec::ProRes => (frame, "mov"), // ProRes is conventional in MOV
@@ -2678,7 +2836,19 @@ impl App {
             (ExportResolution::Native, _) => {}
         }
 
+        // A lens frame takes the place of a Crop clip's 180° canvas: the
+        // fisheye projection, writing the lens's image instead of its disc,
+        // at the size the eye was recorded (or the 8K copy).
+        let lens_frame_on = opts.lens_frame_for(settings, sharp_eye.is_some(), source_kind.is_still());
+        let lens_frame = if lens_frame_on {
+            (eye_w, eye_h) = opts.lens_frame_eye_dims(fisheye_eye_w, fisheye_eye_h);
+            vr180_pipeline::fisheye_export::LensFrameOut::FromSource
+        } else {
+            vr180_pipeline::fisheye_export::LensFrameOut::Off
+        };
         let projection = match settings.fisheye_output_mode {
+            crate::decoder::FisheyeOutputMode::HalfEquirect if lens_frame_on =>
+                vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye,
             crate::decoder::FisheyeOutputMode::HalfEquirect =>
                 vr180_pipeline::fisheye_export::FisheyeExportProjection::HalfEquirect,
             crate::decoder::FisheyeOutputMode::Fisheye =>
@@ -2702,7 +2872,8 @@ impl App {
         // so SBS becomes (2*side × side). For OSV (3840×3840) this is a
         // no-op; for non-square sources it picks the smaller side so
         // the fisheye disk fits.
-        if projection == vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye {
+        // (A lens frame is the recorded frame, of whatever shape.)
+        if projection == vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye && !lens_frame_on {
             let side = eye_w.min(eye_h);
             eye_w = side;
             eye_h = side;
@@ -2821,6 +2992,7 @@ impl App {
             trim_out_s: settings.trim_out_s,
             color_stack,
             projection,
+            lens_frame,
         }
     }
 
@@ -3540,7 +3712,8 @@ impl App {
         let mut out = if item.source_kind.is_still() {
             Self::default_still_output_for(&item.path, opts.still_format)
         } else {
-            Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye())
+            Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye(),
+                opts.lens_frame_for(&item.settings, item.sharp_eye().is_some(), false))
         };
         if let Some(dir) = &self.batch_out_dir {
             if let Some(name) = out.file_name() {
@@ -5161,7 +5334,14 @@ impl App {
         // The loaded clip's own choice (a Crop clip has one apart).
         let sharp_eye = self.clip.as_ref().and_then(|c| c.sharp_eye(self.settings.insv_view));
         let resolution = self.export_opts.resolution_for(sharp_eye.is_some());
+        let lens_frame = self.export_opts.lens_frame_for(&self.settings, sharp_eye.is_some(), is_still);
         let res_label = match (self.settings.reframe_aspect_if_active(), resolution, sharp_eye) {
+            // A lens frame: the eye as recorded (or its 8K copy), named as such.
+            _ if lens_frame => {
+                let (ew, eh) = self.clip.as_ref().map(|c| (c.fisheye_eye_w, c.fisheye_eye_h)).unwrap_or((0, 0));
+                let (w, h) = self.export_opts.lens_frame_eye_dims(ew, eh);
+                format!("{} {} × {h}", tr("Lens frame"), if single_eye { w } else { w * 2 })
+            }
             (Some(aspect), _, _) => self.export_opts.reframe_size.frame_label(aspect, single_eye),
             // Native = the clip's own size (a 12K BRAW: 12288 × 6144).
             (None, ExportResolution::Native, _) => match self.native_sbs_dims() {
@@ -5346,6 +5526,9 @@ impl App {
             let sharp_dims = self.clip.as_ref()
                 .and_then(|c| c.sharp_eye(self.settings.insv_view))
                 .map(|side| (if single_eye { side } else { side * 2 }, side));
+            // A lens frame stands in for a Crop clip's VR180 export alone.
+            let lens_frame_offered = sharp_dims.is_some() && !is_still
+                && matches!(self.settings.fisheye_output_mode, crate::decoder::FisheyeOutputMode::HalfEquirect);
             egui::Window::new(tr("Export format"))
                 .collapsible(false)
                 .resizable(false)
@@ -5356,7 +5539,7 @@ impl App {
                     Self::export_options_ui(ui, &mut self.export_opts, "export",
                         self.settings.reframe_aspect_if_active(),
                         (self.settings.reframe_hfov_deg, self.settings.reframe_defish),
-                        clip_fps, is_still, native_dims, sharp_dims, single_eye);
+                        clip_fps, is_still, native_dims, sharp_dims, lens_frame_offered, single_eye);
                 });
             self.show_export_settings = open;
         }
@@ -5376,6 +5559,9 @@ impl App {
         is_still: bool,
         native_dims: Option<(u32, u32)>,
         sharp_dims: Option<(u32, u32)>,
+        // The loaded clip can be exported as a lens frame (a Crop clip in
+        // the VR180 view): the choice is shown, and applies when ticked.
+        lens_frame_offered: bool,
         // The clip holds ONE eye: its frame is that eye (sizes and rates
         // follow), and nothing that needs two eyes is offered.
         single_eye: bool,
@@ -5422,11 +5608,30 @@ impl App {
             let sharp_label: Option<String> = sharp_dims.filter(|_| !is_still)
                 .map(|(w, h)| format!("{w} × {h} ({})", tr("native sharpness")));
             let cropped = sharp_label.is_some();
+            // A lens frame instead of the 180° canvas (see `ExportOptions::lens_frame`).
+            if lens_frame_offered {
+                ui.checkbox(&mut opts.lens_frame, tr(LENS_FRAME_LABEL)).on_hover_text(tr(LENS_FRAME_HOVER));
+            }
+            let lens_frame = lens_frame_offered && opts.lens_frame;
             let shown = opts.resolution_for(cropped);
+            // The 8K choice of a lens frame is its reduced copy, listed only
+            // where the frame is larger than that.
+            let lens_reduced: Option<String> = native_dims.filter(|_| lens_frame).and_then(|(w, h)| {
+                let eye_w = if single_eye { w } else { w / 2 };
+                lens_frame_reduced_dims(eye_w, h)
+                    .map(|(rw, rh)| format!("{} × {rh}", if single_eye { rw } else { rw * 2 }))
+            });
+            let r8k_label: String = lens_reduced.clone()
+                .unwrap_or_else(|| ExportResolution::R8k.frame_label(single_eye).to_string());
+            let r8k_listed = !lens_frame || lens_reduced.is_some();
+            // In a lens frame the clip's own size IS its native sharpness:
+            // that choice shows as the native size and is not listed apart.
             let sel_label: &str = match (shown, sharp_label.as_deref()) {
                 (ExportResolution::Native, _) => &native_label,
+                (ExportResolution::Sharp, Some(_)) if lens_frame => &native_label,
                 (ExportResolution::Sharp, Some(l)) => l,
-                _ => ExportResolution::R8k.frame_label(single_eye),
+                (ExportResolution::R8k, _) if !r8k_listed => &native_label,
+                _ => &r8k_label,
             };
             let choice = opts.resolution_for_mut(cropped);
             *choice = shown;
@@ -5436,13 +5641,17 @@ impl App {
                 .show_ui(ui, |ui| {
                     ui.selectable_value(choice,
                         ExportResolution::Native, native_label.clone());
-                    ui.selectable_value(choice,
-                        ExportResolution::R8k, ExportResolution::R8k.frame_label(single_eye));
-                    if let Some(l) = &sharp_label {
+                    if r8k_listed {
+                        ui.selectable_value(choice, ExportResolution::R8k, r8k_label.clone());
+                    }
+                    if let Some(l) = sharp_label.as_ref().filter(|_| !lens_frame) {
                         ui.selectable_value(choice, ExportResolution::Sharp, l.clone());
                     }
                 });
-            if sharp_label.is_some() {
+            if lens_frame {
+                ui.label(RichText::new(tr(LENS_FRAME_NOTE)).small().color(Color32::GRAY));
+                ui.label(RichText::new(tr(LENS_FRAME_STAB_NOTE)).small().color(Color32::GRAY));
+            } else if sharp_label.is_some() {
                 ui.label(RichText::new(tr("Native sharpness: the 180° canvas at the pixel density of the Crop frame's centre, so nothing recorded is scaled down. The clip's own size puts the same frame on a smaller canvas."))
                     .small().color(Color32::GRAY));
             }
@@ -5451,7 +5660,9 @@ impl App {
             // see `oversize_export_hint`.
             let out_dims = match opts.resolution_for(cropped) {
                 ExportResolution::Native => native_dims,
+                ExportResolution::Sharp if lens_frame => native_dims,
                 ExportResolution::Sharp => sharp_dims,
+                ExportResolution::R8k if !r8k_listed => native_dims,
                 ExportResolution::R8k => None,
             };
             if !is_still {
@@ -5615,7 +5826,15 @@ impl App {
             }
         }
 
-        if reframe.is_none() {
+        if reframe.is_none() && lens_frame_offered && opts.lens_frame {
+            // A lens frame is not a half-equirect: it carries its own
+            // metadata, and the VR180 choice below is for the other clips.
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(RichText::new(tr("VR180 metadata")).strong());
+            ui.label(RichText::new(tr(LENS_FRAME_METADATA_NOTE)).small().color(Color32::GRAY));
+        } else if reframe.is_none() {
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(4.0);

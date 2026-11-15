@@ -113,6 +113,8 @@ pub struct Device {
     /// RS-aware sibling of `fisheye_p010_to_fisheye_16` (zero-copy 10-bit
     /// fisheye-output export with per-row rolling-shutter correction).
     fisheye_p010_to_fisheye_rs_16: FisheyeP010ToHequirectRsPipeline,
+    /// The lens-frame variants of the six fisheye-output kernels above.
+    lens_frame: LensFramePipelines,
     /// P010 → RGBA16 resolve + box downscale (Windows zero-copy preview
     /// prefilter — upsamples chroma to RGB then downscales, so the
     /// preview's big minification doesn't alias).
@@ -533,6 +535,7 @@ impl Device {
             fisheye_to_fisheye, fisheye_to_fisheye_rs, fisheye_to_fisheye_16,
             fisheye_to_fisheye_rs_16,
             fisheye_p010_to_fisheye_16, fisheye_p010_to_fisheye_rs_16,
+            lens_frame: LensFramePipelines::default(),
             p010_resolve,
             lut3d, lut3d_16, nv12_to_eac, nv12_to_eac_16,
             rgba_to_eac, rgba_to_eac_16,
@@ -2095,7 +2098,7 @@ impl EacLensUniforms {
 // ── Fisheye → half-equirect uniforms ───────────────────────────────
 
 /// std140 layout for the fisheye→equirect shader's calibration uniform.
-/// 48 scalars (12 × vec4 = 192 bytes). Matches the WGSL
+/// 52 scalars (13 × vec4 = 208 bytes). Matches the WGSL
 /// `FisheyeCalibUniforms` struct field-by-field. See
 /// `fisheye_to_hequirect.wgsl` for the per-pixel use of each value.
 #[repr(C)]
@@ -2132,7 +2135,8 @@ struct FisheyeCalibUniforms {
     // top/bottom frame: the bottom eye starts at `src_h`), padded.
     // `frame_mask` > 0.5: the frame is a crop of the image circle — a ray
     // that projects outside it renders black (`frame_cover` in the shaders).
-    src_y0: f32, frame_mask: f32, _p9b: f32, _p9c: f32,
+    // `out_rim`: black rim of a lens-frame output, in output pixels.
+    src_y0: f32, frame_mask: f32, out_rim: f32, _p9c: f32,
     // vec4 #10 — YCbCr→RGB matrix coefficients (r_v, g_u, g_v, b_u), see
     // `yuv_matrix_constants`: BT.709 for every camera file except the
     // QooCam's HLG BT.2020 stream.
@@ -2141,6 +2145,12 @@ struct FisheyeCalibUniforms {
     // rounded rectangle on the output's equidistant angle plane (radians;
     // 0 = off), its corner radius and its feather.
     mask_hx: f32, mask_hy: f32, mask_round: f32, mask_feather: f32,
+    // vec4 #12 — lens-frame output of the fisheye-output kernels: the frame
+    // is the image of a centred Mei-Rives lens (ξ, focal in output pixels,
+    // k1, k2). Focal 0 = their equidistant disc as before. The half-equirect
+    // kernels do not read this row (a buffer larger than the WGSL struct is
+    // fine).
+    out_lens: [f32; 4],
 }
 
 /// Range expansion for 10-bit samples stored in the top 10 bits of a
@@ -2297,6 +2307,14 @@ pub struct FisheyeCalib {
     /// View mask feather, radians: the image fades to black over this
     /// distance inside the mask edge (0 = hard edge).
     pub mask_feather: f32,
+    /// Lens-frame output (the fisheye-output kernels only): `[ξ, focal in
+    /// output pixels, k1, k2]` of the centred Mei-Rives lens whose image the
+    /// output frame is. Focal 0 = off (their equidistant disc). Set by
+    /// [`with_lens_frame`](Self::with_lens_frame); see
+    /// [`crate::lens_frame::LensFrame`].
+    pub out_lens: [f32; 4],
+    /// Lens-frame output: how many pixels at the frame's border stay black.
+    pub out_rim: f32,
 }
 
 /// The crop-mask controls of a source whose frame is a crop of the image
@@ -2427,6 +2445,7 @@ impl FisheyeCalib {
             src_proj: 0.0, src_x0: 0.0, src_y0: 0.0,
             yuv_range: YUV_RANGE_P010_LIMITED, yuv_mat: YUV_MAT_BT709,
             frame_mask: 0.0, mask_half: [0.0; 2], mask_round: 0.0, mask_feather: 0.0,
+            out_lens: [0.0; 4], out_rim: 0.0,
         }
     }
 
@@ -2467,6 +2486,7 @@ impl FisheyeCalib {
             src_proj: 0.0, src_x0: 0.0, src_y0: 0.0,
             yuv_range: YUV_RANGE_P010_LIMITED, yuv_mat: YUV_MAT_BT709,
             frame_mask: 0.0, mask_half: [0.0; 2], mask_round: 0.0, mask_feather: 0.0,
+            out_lens: [0.0; 4], out_rim: 0.0,
         }
     }
 
@@ -2516,6 +2536,7 @@ impl FisheyeCalib {
             src_proj: 0.0, src_x0: 0.0, src_y0: 0.0,
             yuv_range: YUV_RANGE_P010_LIMITED, yuv_mat: YUV_MAT_BT709,
             frame_mask: 0.0, mask_half: [0.0; 2], mask_round: 0.0, mask_feather: 0.0,
+            out_lens: [0.0; 4], out_rim: 0.0,
         }
     }
 
@@ -2663,10 +2684,153 @@ impl FisheyeCalibUniforms {
             s1: c.prism[0], s2: c.prism[1], s3: c.prism[2], s4: c.prism[3],
             proj_mode: c.proj_mode, defish_k: c.defish_k, edge_x: c.edge_x, edge_y: c.edge_y,
             yuv_range: c.yuv_range,
-            src_y0: c.src_y0, frame_mask: c.frame_mask, _p9b: 0.0, _p9c: 0.0,
+            src_y0: c.src_y0, frame_mask: c.frame_mask, out_rim: c.out_rim, _p9c: 0.0,
             yuv_mat: c.yuv_mat,
             mask_hx: c.mask_half[0], mask_hy: c.mask_half[1],
             mask_round: c.mask_round, mask_feather: c.mask_feather,
+            out_lens: c.out_lens,
+        }
+    }
+}
+
+const LENS_FRAME_RAY_WGSL: &str = include_str!("shaders/lens_frame_ray.wgsl");
+
+/// The lens-frame variant of a fisheye-output kernel: its WGSL with the
+/// equidistant-disc ray generator replaced by [`LENS_FRAME_RAY_WGSL`] (the
+/// image of a lens over the whole frame, see [`crate::lens_frame`]) and the
+/// two uniform slots that carry the lens declared.
+///
+/// In a lens frame a ray that leaves the SOURCE frame repeats its edge (see
+/// the splice of `frame_cover` below); the view mask applies as ever.
+///
+/// A variant, not a branch in the kernel: the disc kernels' source — and so
+/// their compiled arithmetic and every existing fisheye-output export — stays
+/// exactly as it was. Each splice must find its anchor exactly once; a
+/// kernel edit that moves one fails here (and in the test that runs this
+/// over all five), not in a silently wrong picture.
+fn lens_frame_wgsl(kernel: &str) -> String {
+    const DISC: &str = "    let half = min(f32(out_dim.x), f32(out_dim.y)) * 0.5;
+    let dx = (f32(gid.x) + 0.5) - f32(out_dim.x) * 0.5;
+    let dy = f32(out_dim.y) * 0.5 - (f32(gid.y) + 0.5);
+    let r_norm = sqrt(dx * dx + dy * dy) / max(half, 1.0);
+    if (r_norm > 1.0) {
+        textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)),
+                     vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    let phi_out = atan2(dy, dx);
+    let theta_out = r_norm * cal.output_hfov_rad;   // equidistant: θ = ρ · θ_max
+    let s_t = sin(theta_out);
+    let c_t = cos(theta_out);
+    let dir = vec3<f32>(s_t * cos(phi_out), s_t * sin(phi_out), c_t);
+";
+    const LENS: &str = "    let ray = lens_frame_ray(gid.xy, out_dim);
+    if (ray.w < 0.0) {
+        textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)),
+                     vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    let dir = ray.xyz;
+";
+    let splices: [(&str, String); 6] = [
+        (DISC, LENS.to_string()),
+        // A lens frame is the size of the recorded frame, so whatever the
+        // stabilizer corrects by leaves a band at the border with no
+        // picture behind it. It repeats the frame's edge there — as the
+        // reframed view does, and for the same reason — where the
+        // half-equirect of the same clip shows black: a still border with a
+        // thin smear in it is calmer than a border that jumps.
+        ("    if (cal.frame_mask < 0.5 || cal.proj_mode > 0.5) { return 1.0; }\n",
+         "    if (cal.frame_mask < 0.5 || cal.proj_mode > 0.5 || cal.out_lens.y > 0.0) { return 1.0; }\n".to_string()),
+        ("    let px_rad = cal.output_hfov_rad / max(half, 1.0);\n", "    let px_rad = ray.w;\n".to_string()),
+        ("src_y0: f32, frame_mask: f32, _p9b: f32, _p9c: f32,", "src_y0: f32, frame_mask: f32, out_rim: f32, _p9c: f32,".to_string()),
+        ("    mask_hx: f32, mask_hy: f32, mask_round: f32, mask_feather: f32,\n}",
+         "    mask_hx: f32, mask_hy: f32, mask_round: f32, mask_feather: f32,\n    out_lens: vec4<f32>,\n}".to_string()),
+        ("@compute @workgroup_size(8, 8)\nfn main(", format!("{LENS_FRAME_RAY_WGSL}@compute @workgroup_size(8, 8)\nfn main(")),
+    ];
+    let mut out = kernel.to_string();
+    for (anchor, with) in &splices {
+        assert_eq!(out.matches(anchor).count(), 1, "lens-frame variant: anchor not found exactly once: {anchor:?}");
+        out = out.replacen(anchor, with, 1);
+    }
+    out
+}
+
+/// The lens-frame variants of the six fisheye-output kernels
+/// ([`lens_frame_wgsl`]), each compiled the first time a lens frame is
+/// projected through it. Chosen by [`FisheyeCalib::out_lens`].
+#[derive(Default, Debug)]
+struct LensFramePipelines {
+    to_fisheye: std::sync::OnceLock<FisheyeToHequirectPipeline>,
+    to_fisheye_16: std::sync::OnceLock<FisheyeToHequirectPipeline>,
+    to_fisheye_rs: std::sync::OnceLock<FisheyeToHequirectRsPipeline>,
+    to_fisheye_rs_16: std::sync::OnceLock<FisheyeToHequirectRsPipeline>,
+    p010_to_fisheye_16: std::sync::OnceLock<FisheyeP010ToHequirectPipeline>,
+    p010_to_fisheye_rs_16: std::sync::OnceLock<FisheyeP010ToHequirectRsPipeline>,
+}
+
+impl Device {
+    // The kernel that writes `calib`'s fisheye output frame: the equidistant
+    // disc, or — when the calibration asks for a lens frame
+    // (`FisheyeCalib::out_lens`) — its lens-frame variant, compiled on first
+    // use. One accessor per kernel; the bindings of the two are the same.
+
+    fn fisheye_out_8(&self, calib: &FisheyeCalib) -> &FisheyeToHequirectPipeline {
+        if calib.out_lens[1] > 0.0 {
+            self.lens_frame.to_fisheye.get_or_init(|| FisheyeToHequirectPipeline::create_for_format_with_wgsl(
+                &self.device, wgpu::TextureFormat::Rgba8Unorm, "lens_frame_8bit", &lens_frame_wgsl(FISHEYE_TO_FISHEYE_WGSL)))
+        } else {
+            &self.fisheye_to_fisheye
+        }
+    }
+
+    fn fisheye_out_16(&self, calib: &FisheyeCalib) -> &FisheyeToHequirectPipeline {
+        if calib.out_lens[1] > 0.0 {
+            self.lens_frame.to_fisheye_16.get_or_init(|| FisheyeToHequirectPipeline::create_for_format_with_wgsl(
+                &self.device, wgpu::TextureFormat::Rgba16Unorm, "lens_frame_16bit", &lens_frame_wgsl(FISHEYE_TO_FISHEYE_16_WGSL)))
+        } else {
+            &self.fisheye_to_fisheye_16
+        }
+    }
+
+    fn fisheye_out_rs_8(&self, calib: &FisheyeCalib) -> &FisheyeToHequirectRsPipeline {
+        if calib.out_lens[1] > 0.0 {
+            self.lens_frame.to_fisheye_rs.get_or_init(|| FisheyeToHequirectRsPipeline::create_with_shader(
+                &self.device, "lens_frame_rs", &lens_frame_wgsl(FISHEYE_TO_FISHEYE_RS_WGSL)))
+        } else {
+            &self.fisheye_to_fisheye_rs
+        }
+    }
+
+    fn fisheye_out_rs_16(&self, calib: &FisheyeCalib) -> &FisheyeToHequirectRsPipeline {
+        if calib.out_lens[1] > 0.0 {
+            self.lens_frame.to_fisheye_rs_16.get_or_init(|| {
+                let wgsl = lens_frame_wgsl(FISHEYE_TO_FISHEYE_RS_WGSL).replace("rgba8unorm, write", "rgba16unorm, write");
+                FisheyeToHequirectRsPipeline::create_with_shader_fmt(
+                    &self.device, "lens_frame_rs_16", &wgsl, wgpu::TextureFormat::Rgba16Unorm)
+            })
+        } else {
+            &self.fisheye_to_fisheye_rs_16
+        }
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn fisheye_p010_out_16(&self, calib: &FisheyeCalib) -> &FisheyeP010ToHequirectPipeline {
+        if calib.out_lens[1] > 0.0 {
+            self.lens_frame.p010_to_fisheye_16.get_or_init(|| FisheyeP010ToHequirectPipeline::create_with_shader(
+                &self.device, "lens_frame_p010_16", &lens_frame_wgsl(FISHEYE_P010_TO_FISHEYE_16_WGSL)))
+        } else {
+            &self.fisheye_p010_to_fisheye_16
+        }
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn fisheye_p010_out_rs_16(&self, calib: &FisheyeCalib) -> &FisheyeP010ToHequirectRsPipeline {
+        if calib.out_lens[1] > 0.0 {
+            self.lens_frame.p010_to_fisheye_rs_16.get_or_init(|| FisheyeP010ToHequirectRsPipeline::create_with_shader(
+                &self.device, "lens_frame_p010_rs_16", &lens_frame_wgsl(FISHEYE_P010_TO_FISHEYE_RS_16_WGSL)))
+        } else {
+            &self.fisheye_p010_to_fisheye_rs_16
         }
     }
 }
@@ -6099,8 +6263,8 @@ impl Device {
         let (pipe, layout, sampler, label) = match (fisheye_out, rs.is_some()) {
             (false, false) => (&self.fisheye_to_hequirect.pipeline, &self.fisheye_to_hequirect.bind_group_layout, &self.fisheye_to_hequirect.sampler, "zc_hequirect"),
             (false, true) => (&self.fisheye_to_hequirect_rs.pipeline, &self.fisheye_to_hequirect_rs.bind_group_layout, &self.fisheye_to_hequirect_rs.sampler, "zc_hequirect_rs"),
-            (true, false) => (&self.fisheye_to_fisheye.pipeline, &self.fisheye_to_fisheye.bind_group_layout, &self.fisheye_to_fisheye.sampler, "zc_fisheye"),
-            (true, true) => (&self.fisheye_to_fisheye_rs.pipeline, &self.fisheye_to_fisheye_rs.bind_group_layout, &self.fisheye_to_fisheye_rs.sampler, "zc_fisheye_rs"),
+            (true, false) => { let k = self.fisheye_out_8(&calib); (&k.pipeline, &k.bind_group_layout, &k.sampler, "zc_fisheye") }
+            (true, true) => { let k = self.fisheye_out_rs_8(&calib); (&k.pipeline, &k.bind_group_layout, &k.sampler, "zc_fisheye_rs") }
         };
         let output_tex = make_rw_texture(&self.device, label, out_w, out_h,
             wgpu::TextureUsages::TEXTURE_BINDING
@@ -6552,6 +6716,7 @@ impl Device {
         calib: FisheyeCalib,
         slot: u32,
     ) -> Result<wgpu::Texture> {
+        let kernel = self.fisheye_out_16(&calib);
         let _ = (src_w, src_h); // encoded in the calib uniform's src_w/src_h
         let output_tex = {
             let mut cache = self.rgba16_eq_out_cache.lock().unwrap();
@@ -6580,10 +6745,10 @@ impl Device {
             &FisheyeCalibUniforms::from_public(calib));
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fisheye_rgba16_fish_bg_16"),
-            layout: &self.fisheye_to_fisheye_16.bind_group_layout,
+            layout: &kernel.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_fisheye_16.sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&kernel.sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
@@ -6596,7 +6761,7 @@ impl Device {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("fisheye_rgba16_fish_pass_16"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.fisheye_to_fisheye_16.pipeline);
+            pass.set_pipeline(&kernel.pipeline);
             pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
@@ -6619,6 +6784,7 @@ impl Device {
         per_row_matrices_f32: &[f32],
         slot: u32,
     ) -> Result<wgpu::Texture> {
+        let kernel = self.fisheye_out_rs_16(&calib);
         let _ = (src_w, src_h); // encoded in the calib uniform's src_w/src_h
         let output_tex = {
             let mut cache = self.rgba16_eq_out_cache.lock().unwrap();
@@ -6661,10 +6827,10 @@ impl Device {
         self.queue.write_buffer(&rs_buf, 0, rs_bytes);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fisheye_rgba16_rs_fish_bg_16"),
-            layout: &self.fisheye_to_fisheye_rs_16.bind_group_layout,
+            layout: &kernel.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_fisheye_rs_16.sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&kernel.sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
@@ -6678,7 +6844,7 @@ impl Device {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("fisheye_rgba16_rs_fish_pass_16"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.fisheye_to_fisheye_rs_16.pipeline);
+            pass.set_pipeline(&kernel.pipeline);
             pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
@@ -6868,6 +7034,7 @@ impl Device {
         rotation: EquirectRotation,
         calib: FisheyeCalib,
     ) -> Result<wgpu::Texture> {
+        let kernel = self.fisheye_out_8(&calib);
         let src_tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("fish_out_src"),
             size: wgpu::Extent3d { width: src_w, height: src_h, depth_or_array_layers: 1 },
@@ -6890,10 +7057,10 @@ impl Device {
             &FisheyeCalibUniforms::from_public(calib));
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fish_out_bg"),
-            layout: &self.fisheye_to_fisheye.bind_group_layout,
+            layout: &kernel.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_fisheye.sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&kernel.sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
@@ -6906,7 +7073,7 @@ impl Device {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("fish_out_pass"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.fisheye_to_fisheye.pipeline);
+            pass.set_pipeline(&kernel.pipeline);
             pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
@@ -6928,6 +7095,7 @@ impl Device {
         calib: FisheyeCalib,
         rs_rows_f32: &[f32],
     ) -> Result<wgpu::Texture> {
+        let kernel = self.fisheye_out_rs_8(&calib);
         let src_tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("fish_out_rs_src"),
             size: wgpu::Extent3d { width: src_w, height: src_h, depth_or_array_layers: 1 },
@@ -6962,10 +7130,10 @@ impl Device {
         self.queue.write_buffer(&rs_buf, 0, rs_bytes);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fish_out_rs_bg"),
-            layout: &self.fisheye_to_fisheye_rs.bind_group_layout,
+            layout: &kernel.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_fisheye_rs.sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&kernel.sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
@@ -6979,7 +7147,7 @@ impl Device {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("fish_out_rs_pass"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.fisheye_to_fisheye_rs.pipeline);
+            pass.set_pipeline(&kernel.pipeline);
             pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
@@ -6998,6 +7166,7 @@ impl Device {
         rotation: EquirectRotation,
         calib: FisheyeCalib,
     ) -> Result<wgpu::Texture> {
+        let kernel = self.fisheye_out_16(&calib);
         // Source texture: Rgba16Unorm. If the source is 8-bit (RGBA8)
         // we widen to 16-bit by repeating each byte: 255 becomes 65535,
         // the same unorm value. (A plain shift leaves white at 65280,
@@ -7056,10 +7225,10 @@ impl Device {
             &FisheyeCalibUniforms::from_public(calib));
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fish_out16_bg"),
-            layout: &self.fisheye_to_fisheye_16.bind_group_layout,
+            layout: &kernel.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.fisheye_to_fisheye_16.sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&kernel.sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dst_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: r_uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: cal_uniform.as_entire_binding() },
@@ -7072,7 +7241,7 @@ impl Device {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("fish_out16_pass"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.fisheye_to_fisheye_16.pipeline);
+            pass.set_pipeline(&kernel.pipeline);
             pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
@@ -7092,6 +7261,7 @@ impl Device {
         rotation: EquirectRotation,
         calib: FisheyeCalib,
     ) -> Result<wgpu::Texture> {
+        let kernel = self.fisheye_p010_out_16(&calib);
         let _ = (src_w, src_h);
         let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("fish_out_p010_16"),
@@ -7113,11 +7283,11 @@ impl Device {
             &FisheyeCalibUniforms::from_public(calib));
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fish_p010_out_bg"),
-            layout: &self.fisheye_p010_to_fisheye_16.bind_group_layout,
+            layout: &kernel.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.fisheye_p010_to_fisheye_16.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&kernel.sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dst_view) },
                 wgpu::BindGroupEntry { binding: 4, resource: r_uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: cal_uniform.as_entire_binding() },
@@ -7130,7 +7300,7 @@ impl Device {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("fish_p010_out_pass"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.fisheye_p010_to_fisheye_16.pipeline);
+            pass.set_pipeline(&kernel.pipeline);
             pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
@@ -7152,6 +7322,7 @@ impl Device {
         calib: FisheyeCalib,
         per_row_matrices_f32: &[f32],
     ) -> Result<wgpu::Texture> {
+        let kernel = self.fisheye_p010_out_rs_16(&calib);
         let _ = (src_w, src_h);
         let output_tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("fish_out_p010_rs_16"),
@@ -7185,11 +7356,11 @@ impl Device {
         self.queue.write_buffer(&rs_buf, 0, rs_bytes);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fish_p010_out_rs_bg"),
-            layout: &self.fisheye_p010_to_fisheye_rs_16.bind_group_layout,
+            layout: &kernel.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.fisheye_p010_to_fisheye_rs_16.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&kernel.sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dst_view) },
                 wgpu::BindGroupEntry { binding: 4, resource: r_uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: cal_uniform.as_entire_binding() },
@@ -7203,7 +7374,7 @@ impl Device {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("fish_p010_out_rs_pass"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.fisheye_p010_to_fisheye_rs_16.pipeline);
+            pass.set_pipeline(&kernel.pipeline);
             pass.set_bind_group(0, Some(&bg), &[]);
             pass.dispatch_workgroups((out_w + 7) / 8, (out_h + 7) / 8, 1);
         }
@@ -10079,10 +10250,13 @@ mod reframe_tests {
         assert!((u.defish_k - 2.0).abs() < 1e-6);
         assert!((u.edge_x - 2.0 * (45.0f32.to_radians() / 2.0).tan()).abs() < 1e-5);
         assert!((u.edge_y - u.edge_x * 9.0 / 16.0).abs() < 1e-5);
-        // 12 vec4s: the nine the shaders always read, the stacked y-offset /
-        // frame-mask row, the YCbCr matrix row and the view-mask row.
-        assert_eq!(std::mem::size_of::<FisheyeCalibUniforms>(), 48 * 4);
+        // 13 vec4s: the nine the shaders always read, the stacked y-offset /
+        // frame-mask row, the YCbCr matrix row, the view-mask row and the
+        // lens-frame row.
+        assert_eq!(std::mem::size_of::<FisheyeCalibUniforms>(), 52 * 4);
         assert_eq!((u.frame_mask, u.mask_hx, u.mask_feather), (0.0, 0.0, 0.0));
+        // No lens frame unless asked for: the fisheye kernels write their disc.
+        assert_eq!((u.out_lens, u.out_rim), ([0.0; 4], 0.0));
         let plain = FisheyeCalibUniforms::from_public(FisheyeCalib::new(1000.0, 1000.0, 960.0, 960.0, [0.0; 4], 1920.0, 1920.0, 900.0));
         assert_eq!(plain.proj_mode, 0.0);
         assert_eq!((plain.src_x0, plain.src_y0), (0.0, 0.0));
@@ -10202,4 +10376,213 @@ pub fn last_gpu_error() -> Option<String> {
 /// Clear the recorded GPU error (after it has been shown).
 pub fn clear_gpu_error() {
     *LAST_GPU_ERROR.lock().unwrap() = None;
+}
+
+#[cfg(test)]
+mod lens_frame_kernel_tests {
+    use super::*;
+    use crate::lens_frame::LensFrame;
+
+    const KERNELS: [(&str, &str); 5] = [
+        ("fisheye_to_fisheye", FISHEYE_TO_FISHEYE_WGSL),
+        ("fisheye_to_fisheye_16", FISHEYE_TO_FISHEYE_16_WGSL),
+        ("fisheye_to_fisheye_rs", FISHEYE_TO_FISHEYE_RS_WGSL),
+        ("fisheye_p010_to_fisheye_16", FISHEYE_P010_TO_FISHEYE_16_WGSL),
+        ("fisheye_p010_to_fisheye_rs_16", FISHEYE_P010_TO_FISHEYE_RS_16_WGSL),
+    ];
+
+    /// The splice finds its anchors in all five fisheye-output kernels, and
+    /// the disc kernels themselves carry nothing of the lens frame: their
+    /// source — and their output — is what it was.
+    #[test]
+    fn every_fisheye_output_kernel_has_a_lens_frame_variant() {
+        for (name, src) in KERNELS {
+            assert!(!src.contains("lens_frame_ray") && !src.contains("out_lens") && !src.contains("out_rim"), "{name}");
+            let v = lens_frame_wgsl(src);
+            assert!(v.contains("fn lens_frame_ray(") && v.contains("out_lens: vec4<f32>,") && v.contains("out_rim: f32"), "{name}");
+            assert!(v.contains("let px_rad = ray.w;") && v.contains("let dir = ray.xyz;"), "{name}");
+            assert!(!v.contains("let theta_out"), "{name}: the disc's ray generator is still there");
+        }
+    }
+
+    /// A smooth picture with detail in both directions, `w × h`, 16 bits.
+    fn picture(w: u32, h: u32) -> Vec<u16> {
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = (x as f32 / w as f32, y as f32 / h as f32);
+                let r = 0.5 + 0.45 * (fx * 37.0).sin() * (fy * 23.0).cos();
+                let g = fx;
+                let b = fy;
+                for v in [r, g, b, 1.0] {
+                    px.push((v.clamp(0.0, 1.0) * 65535.0).round() as u16);
+                }
+            }
+        }
+        px
+    }
+
+    fn worst(a: &[u16], b: &[u16], w: u32, h: u32, inset: u32) -> i32 {
+        let mut worst = 0;
+        for y in inset..h - inset {
+            for x in inset..w - inset {
+                let i = ((y * w + x) * 4) as usize;
+                for c in 0..3 {
+                    worst = worst.max((a[i + c] as i32 - b[i + c] as i32).abs());
+                }
+            }
+        }
+        worst
+    }
+
+    /// A lens frame of a source that already IS that lens is the source,
+    /// pixel for pixel: the kernel's ray generator and the source lens
+    /// model are each other's inverse — on a frame that is not square, up to
+    /// its corners. And the rim, when asked for, is black.
+    #[test]
+    fn a_lens_frame_of_its_own_lens_is_the_source() {
+        let dev = Device::new().expect("device");
+        let (w, h) = (640u32, 448u32);
+        let src = picture(w, h);
+        let bytes: &[u8] = bytemuck::cast_slice(&src);
+        let (xi, f, k1, k2) = (2.45543_f32, 940.0_f32, 1.19_f32, 0.11_f32);
+        let frame = LensFrame { width: w, height: h, xi, focal: f, k1, k2, rim_px: 0.0 };
+        let lens = FisheyeCalib::new_omni(
+            f, f, w as f32 * 0.5, h as f32 * 0.5, xi, [k1, k2, 0.0, 0.0, 0.0], [0.0; 4], [0.0; 4], w as f32, h as f32,
+        ).with_frame_crop();
+        // 16-bit kernel.
+        let tex = dev.project_fisheye_to_fisheye_texture_16(bytes, 16, w, h, w, h, EquirectRotation::IDENTITY, lens.with_lens_frame(&frame)).unwrap();
+        let out = dev.read_texture_rgba64(&tex, w, h).unwrap();
+        let out16: &[u16] = bytemuck::cast_slice(&out);
+        let off = worst(&src, out16, w, h, 0);
+        assert!(off <= 40, "16-bit lens frame differs from its source by {off} of 65535");
+        // With a rim: black at the border, the picture inside it.
+        let rimmed = LensFrame { rim_px: 5.0, ..frame };
+        let tex = dev.project_fisheye_to_fisheye_texture_16(bytes, 16, w, h, w, h, EquirectRotation::IDENTITY, lens.with_lens_frame(&rimmed)).unwrap();
+        let out = dev.read_texture_rgba64(&tex, w, h).unwrap();
+        let out16: &[u16] = bytemuck::cast_slice(&out);
+        assert!(worst(&src, out16, w, h, 5) <= 40);
+        for &(x, y) in &[(0u32, 200u32), (4, 200), (639, 10), (300, 0), (300, 4), (300, 447), (635, 447)] {
+            let i = ((y * w + x) * 4) as usize;
+            assert_eq!(&out16[i..i + 3], &[0, 0, 0], "rim pixel ({x}, {y})");
+        }
+        let i = ((200 * w + 5) * 4) as usize;
+        assert!(out16[i + 1] > 0, "the first pixel inside the rim is picture");
+
+        // The rolling-shutter kernel (8-bit, correction off) is the same map.
+        let src8: Vec<u8> = src.iter().map(|v| (v >> 8) as u8).collect();
+        let rows = vec![0.0_f32; h as usize * 12];
+        let tex = dev.project_fisheye_to_fisheye_rs_texture(&src8, w, h, w, h, EquirectRotation::IDENTITY, lens.with_lens_frame(&frame), &rows).unwrap();
+        let out8 = dev.read_texture_rgb8(&tex, w, h).unwrap();
+        let mut off8 = 0;
+        for (a, b) in src8.chunks_exact(4).zip(out8.chunks_exact(3)) {
+            for c in 0..3 {
+                off8 = off8.max((a[c] as i32 - b[c] as i32).abs());
+            }
+        }
+        assert!(off8 <= 1, "8-bit rolling-shutter lens frame differs from its source by {off8} of 255");
+    }
+
+    /// The stabilizer turns the view by more than the frame has to spare:
+    /// the band it exposes repeats the source's edge instead of going black
+    /// (the same clip's half-equirect shows black there), and a view mask
+    /// still blackens what it covers.
+    #[test]
+    fn a_lens_frame_repeats_its_edge_where_the_stabilizer_runs_out_of_picture() {
+        let dev = Device::new().expect("device");
+        let (w, h) = (640u32, 448u32);
+        let src = picture(w, h);
+        let bytes: &[u8] = bytemuck::cast_slice(&src);
+        let (xi, f, k1, k2) = (2.45543_f32, 940.0_f32, 1.19_f32, 0.11_f32);
+        let frame = LensFrame { width: w, height: h, xi, focal: f, k1, k2, rim_px: 0.0 };
+        let lens = FisheyeCalib::new_omni(
+            f, f, w as f32 * 0.5, h as f32 * 0.5, xi, [k1, k2, 0.0, 0.0, 0.0], [0.0; 4], [0.0; 4], w as f32, h as f32,
+        ).with_frame_crop();
+        // A 3° turn about the vertical axis.
+        let (s, c) = 3.0_f32.to_radians().sin_cos();
+        let turn = EquirectRotation([c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c]);
+        let run = |calib: FisheyeCalib| -> Vec<u16> {
+            let tex = dev.project_fisheye_to_fisheye_texture_16(bytes, 16, w, h, w, h, turn, calib).unwrap();
+            bytemuck::cast_slice::<u8, u16>(&dev.read_texture_rgba64(&tex, w, h).unwrap()).to_vec()
+        };
+        let out = run(lens.with_lens_frame(&frame));
+        let px = |v: &[u16], x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; [v[i], v[i + 1], v[i + 2]] };
+        // One side of the middle row ran out of picture; which one is the
+        // rotation's sign. Find it: the green ramp (x across the source) is
+        // flat there, pinned at one end of the source.
+        let (left, right) = (px(&out, 2, h / 2), px(&out, w - 3, h / 2));
+        let exposed = if left[1] < 800 || left[1] > 64_700 { 2 } else { w - 3 };
+        let band = px(&out, exposed, h / 2);
+        assert!(band[1] < 800 || band[1] > 64_700, "no exposed side found: left {left:?} right {right:?}");
+        assert_ne!(band, [0, 0, 0], "the exposed band is black");
+        // The same value a little further in: the edge, repeated.
+        let further = if exposed == 2 { 12 } else { w - 13 };
+        assert!((px(&out, further, h / 2)[1] as i32 - band[1] as i32).abs() < 300, "the band is not the repeated edge");
+        // A view mask blackens the lens frame's border as it does any output's.
+        let masked = run(lens.with_view_mask([0.3, 0.2], 0.0, 0.0).with_lens_frame(&frame));
+        assert_eq!(px(&masked, exposed, h / 2), [0, 0, 0]);
+        assert_ne!(px(&masked, w / 2, h / 2), [0, 0, 0]);
+    }
+
+    /// From a source with another lens, every pixel of the lens frame shows
+    /// what its ray — the CPU twin's — hits in the source.
+    #[test]
+    fn a_lens_frame_pixel_shows_what_its_ray_hits() {
+        let dev = Device::new().expect("device");
+        let (sw, sh) = (800u32, 800u32);
+        // Two linear ramps: bilinear sampling reads them back exactly.
+        let mut src = Vec::with_capacity((sw * sh * 4) as usize);
+        for y in 0..sh {
+            for x in 0..sw {
+                src.extend_from_slice(&[
+                    (((x as f32 + 0.5) / sw as f32) * 65535.0).round() as u16,
+                    (((y as f32 + 0.5) / sh as f32) * 65535.0).round() as u16,
+                    0, 65535,
+                ]);
+            }
+        }
+        // The source: an off-centre lens with the full factory terms.
+        let source = FisheyeCalib::new_omni(
+            1150.0, 1150.0, 392.0, 407.0, 2.45543,
+            [1.28, -0.8, 1.1, 12.0, 0.0], [8.0e-4, 8.0e-4, -9.0e-3, 3.8e-3], [-1.0e-3, 3.7e-3, -2.0e-3, -3.6e-2],
+            sw as f32, sh as f32,
+        ).with_frame_crop();
+        let (w, h) = (512u32, 384u32);
+        let frame = LensFrame { width: w, height: h, xi: 2.45543, focal: 900.0, k1: 1.19, k2: 0.11, rim_px: 0.0 };
+        let tex = dev.project_fisheye_to_fisheye_texture_16(
+            bytemuck::cast_slice(&src), 16, sw, sh, w, h, EquirectRotation::IDENTITY, source.with_lens_frame(&frame)).unwrap();
+        let out = dev.read_texture_rgba64(&tex, w, h).unwrap();
+        let out16: &[u16] = bytemuck::cast_slice(&out);
+        // The source lens model on the CPU (as the kernels' UCM branch).
+        let project = |d: [f64; 3]| -> (f64, f64) {
+            let (xi, k) = (source.xi as f64, source.k.map(|v| v as f64));
+            let n = (d[0] * d[0] + d[1] * d[1]).sqrt() / (xi + d[2]);
+            let s = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-12);
+            let (x, y) = (n * d[0] / s, -n * d[1] / s);
+            let r2 = n * n;
+            let dd = 1.0 + r2 * (k[0] + r2 * (k[1] + r2 * (k[2] + r2 * k[3])));
+            let (t, p) = (source.tangential.map(|v| v as f64), source.prism.map(|v| v as f64));
+            let xd = x * dd + (r2 + 2.0 * x * x) * (t[0] + t[2] * r2) + 2.0 * x * y * (t[1] + t[3] * r2) + p[0] * r2 + p[1] * r2 * r2;
+            let yd = y * dd + (r2 + 2.0 * y * y) * (t[1] + t[3] * r2) + 2.0 * x * y * (t[0] + t[2] * r2) + p[2] * r2 + p[3] * r2 * r2;
+            (source.cx as f64 + source.fx as f64 * xd, source.cy as f64 + source.fy as f64 * yd)
+        };
+        let mut worst_px = 0.0_f64;
+        let mut checked = 0;
+        for y in (3..h).step_by(19) {
+            for x in (3..w).step_by(23) {
+                let d = frame.ray(x as f64 + 0.5, y as f64 + 0.5).expect("a ray");
+                let (sx, sy) = project(d);
+                // Inside the source frame, away from its soft edge.
+                if !(sx > 2.0 && sx < sw as f64 - 2.0 && sy > 2.0 && sy < sh as f64 - 2.0) {
+                    continue;
+                }
+                let i = ((y * w + x) * 4) as usize;
+                let (gx, gy) = (out16[i] as f64 / 65535.0 * sw as f64, out16[i + 1] as f64 / 65535.0 * sh as f64);
+                worst_px = worst_px.max((gx - sx).abs()).max((gy - sy).abs());
+                checked += 1;
+            }
+        }
+        assert!(checked > 200, "only {checked} pixels landed in the source");
+        assert!(worst_px < 0.05, "a lens-frame pixel is {worst_px} source pixels from where its ray lands");
+    }
 }
