@@ -4602,7 +4602,19 @@ pub(crate) fn resolve_calib_pair(
         // A lens frame: the same kernels write the lens's image over the
         // whole frame instead of the disc.
         match cfg.lens_frame {
-            LensFrameOut::Resolved(frame) => (l.with_lens_frame(&frame), r.with_lens_frame(&frame)),
+            LensFrameOut::Resolved(frame) => {
+                // The crop mask of a lens frame is measured from the frame's
+                // own edge, not from the recorded picture's: a stabilized
+                // frame is larger than the recording, and the window may be
+                // as large as the frame (the picture's own border, which
+                // moves, then shows inside it).
+                let (l, r) = match cfg.crop_mask.window(frame.half_angles()) {
+                    Some((half, round, feather)) =>
+                        (l.with_view_mask(half, round, feather), r.with_view_mask(half, round, feather)),
+                    None => (l, r),
+                };
+                (l.with_lens_frame(&frame), r.with_lens_frame(&frame))
+            }
             _ => (l, r),
         }
     } else if let Some((hfov_deg, defish)) = cfg.projection.reframe() {

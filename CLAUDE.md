@@ -2431,6 +2431,14 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      343 px (8°) of 3712 on a 7.4K Crop 60 fps clip, whose frame is narrower
      (97° across) — with its 184 px margin that one is still cut at a side
      in 6 % of its frames (159 px at most).
+   - **Crop mask**: on a lens frame the window is sized from the frame's
+     OWN coverage (`LensFrame::half_angles`, applied in `resolve_calib_pair`
+     over the one `apply_frame_crop` set from the recorded picture), so on a
+     stabilized frame it can be as wide as the larger frame; the picture's
+     moving border then shows inside it (the user's call). Without
+     stabilization the two measures agree to 0.1°. The preview still draws
+     the mask against the recorded picture, about a tenth further in: the
+     Format window's note says so.
    - **File conventions, measured against the system's player mesh** (not
      what the model's textbook form suggests): the projection offset is
      stored NEGATED; the principal point counts from the view's edges; the

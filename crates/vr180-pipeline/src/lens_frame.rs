@@ -215,6 +215,17 @@ impl LensFrame {
         if xi > 1.0 { (-1.0 / xi).acos().to_degrees() } else { 180.0 }
     }
 
+    /// What the frame covers around the lens axis: the angles (radians) of
+    /// the middle of its side edge and of its top edge. A crop mask on a
+    /// lens frame is measured from these (see `fisheye_export`).
+    pub fn half_angles(&self) -> [f32; 2] {
+        let fold = self.fold_deg().to_radians();
+        let angle = |px: f64, py: f64| {
+            self.ray(px, py).map(|d| d[2].clamp(-1.0, 1.0).acos()).unwrap_or(fold) as f32
+        };
+        [angle(self.width as f64, self.height as f64 * 0.5), angle(self.width as f64 * 0.5, 0.0)]
+    }
+
     /// How far off the axis the frame reaches, degrees: its corner.
     pub fn reach_deg(&self) -> f32 {
         match self.ray(0.0, 0.0) {
@@ -410,6 +421,28 @@ mod tests {
         let e = frame.ray(4912.0, 2456.0).unwrap();
         let q = grown.project([c * e[0] + s * e[2], e[1], -s * e[0] + c * e[2]]);
         assert!(q[0] > 4912.0 + 244.0 && q[0] < grown.width as f64, "{q:?}");
+    }
+
+    /// What a frame covers at the middle of its edges: the recorded frame of
+    /// a 10K Crop clip 63° each way, its stabilized frame 69°; a frame that
+    /// is not square less far up than across.
+    #[test]
+    fn a_frame_covers_its_edge_midpoints() {
+        let (l, r) = crop_10k();
+        let frame = LensFrame::from_sources(&[&l, &r], 4912, 4912).unwrap();
+        let [hx, hy] = frame.half_angles();
+        assert!((hx - hy).abs() < 1e-6 && (hx.to_degrees() - 62.8).abs() < 0.3, "{}", hx.to_degrees());
+        // The source lenses' own measure of the same frame agrees.
+        let mean = 0.5 * (l.frame_half_angles()[0] + r.frame_half_angles()[0]);
+        assert!((hx - mean).abs().to_degrees() < 0.1, "{} vs {}", hx.to_degrees(), mean.to_degrees());
+        let m = frame.margin_px();
+        let [gx, gy] = frame.grown(m, m).half_angles();
+        assert!((gx - gy).abs() < 1e-6 && (gx.to_degrees() - 68.6).abs() < 0.3, "{}", gx.to_degrees());
+        // The same field in a smaller frame covers the same.
+        let fitted = frame.grown(m, m).fitted(4096, 4096).half_angles();
+        assert!((fitted[0] - gx).abs() < 1e-5);
+        let wide = LensFrame { width: 6000, height: 3968, ..frame }.half_angles();
+        assert!(wide[0] > wide[1] + 0.2, "{wide:?}");
     }
 
     /// A grown frame put back into its size keeps its field: the lens

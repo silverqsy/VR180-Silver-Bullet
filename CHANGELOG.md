@@ -54,8 +54,11 @@ own angle.
   the picture of a VR180 export; a shift beyond the margin is cut at the
   frame's edge (under 4 seconds of a rough one-minute hand-held walk).
   With stabilization off the frame is the recorded one. An 8K copy keeps
-  its size and scales the picture instead. A crop mask gives the picture
-  a steady edge; camera lock suits a camera that stays put.
+  its size and scales the picture instead. A crop mask is measured from
+  the frame's own edge (the larger one, on a stabilized clip): its window
+  can be as wide as the frame, and gives a steady edge once it is small
+  enough to stay inside the moving picture. Camera lock suits a camera
+  that stays put.
 - **Apple Vision Pro only** (visionOS 26 or later). No other headset and
   not YouTube read this form, so the VR180 export stays the default and is
   unchanged: export a clip both ways and you get `…_SBS` and `…_Lens`.
