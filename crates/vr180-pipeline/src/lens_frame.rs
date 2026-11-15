@@ -46,11 +46,26 @@ pub struct LensFrame {
 /// most: short of where this lens family folds back (114° for the X6).
 const FIT_LIMIT_DEG: f64 = 105.0;
 
-/// The most a lens frame grows at each border to hold what the stabilizer
-/// shifts ([`LensFrame::margin`]), as a fraction of the frame's shorter side.
-/// A shift beyond it is cut at the frame's edge: a frame sized for the worst
-/// moment of a rough clip would be margin for the rest of it.
-pub const MARGIN_LIMIT: f64 = 0.05;
+/// What a stabilized lens frame adds at each border to hold the picture the
+/// stabilizer shifts, as a fraction of the recorded frame's shorter side
+/// ([`LensFrame::margin_px`]). One figure for every clip, so the clips of a
+/// recording mode come out the same size; a shift beyond it is cut at the
+/// frame's edge. (Sized to each clip's own largest shift, a rough clip's
+/// frame would be margin most of the time, and no two clips would match.)
+pub const STABILIZER_MARGIN: f64 = 0.05;
+
+/// The size of a stabilized lens frame for an eye recorded at
+/// `width × height`: [`STABILIZER_MARGIN`] of the shorter side added at each
+/// border, in pairs of pixels (a frame whose sides are multiples of four
+/// keeps them so).
+pub fn stabilized_dims(width: u32, height: u32) -> (u32, u32) {
+    let m = margin_px(width, height);
+    (width + 2 * m, height + 2 * m)
+}
+
+fn margin_px(width: u32, height: u32) -> u32 {
+    (STABILIZER_MARGIN * width.min(height) as f64 / 2.0).floor() as u32 * 2
+}
 
 impl LensFrame {
     /// The lens frame of `width × height` pixels for a source seen through
@@ -166,70 +181,10 @@ impl LensFrame {
         [self.width as f64 * 0.5 + f * x * d, self.height as f64 * 0.5 + f * y * d]
     }
 
-    /// How far the recorded picture reaches past this frame's edges when the
-    /// projection turns the view by `rot` — the row-major matrix that takes
-    /// an output ray to the source's, as the kernels apply it. In pixels:
-    /// past the left or right edge, and past the top or bottom edge; 0 where
-    /// the picture stays inside. The picture is taken to fill this frame
-    /// when the view is not turned. Infinite when the turn carries the
-    /// picture's border past where the lens family ends.
-    pub fn overhang(&self, rot: &[f32; 9]) -> (f64, f64) {
-        self.overhang_over(std::iter::once(rot))
-    }
-
-    /// The largest [`Self::overhang`] over a clip's turns, each side taken
-    /// on its own.
-    pub fn overhang_over<'a>(&self, turns: impl IntoIterator<Item = &'a [f32; 9]>) -> (f64, f64) {
-        const PER_EDGE: usize = 8;
-        let (w, h) = (self.width as f64, self.height as f64);
-        // The rays of the frame's border, corners included, clockwise from
-        // the top left.
-        let mut border = Vec::with_capacity(4 * PER_EDGE);
-        for i in 0..PER_EDGE {
-            let t = i as f64 / PER_EDGE as f64;
-            for (px, py) in [(t * w, 0.0), (w, t * h), (w - t * w, h), (0.0, h - t * h)] {
-                border.push(self.ray(px, py));
-            }
-        }
-        let fold_cos = self.fold_deg().to_radians().cos();
-        let (mut ox, mut oy) = (0.0_f64, 0.0_f64);
-        for rot in turns {
-            let r = rot.map(|v| v as f64);
-            for ray in &border {
-                // The output ray that shows the source's ray `s`: rotᵀ · s.
-                let shown = ray.map(|s| [
-                    r[0] * s[0] + r[3] * s[1] + r[6] * s[2],
-                    r[1] * s[0] + r[4] * s[1] + r[7] * s[2],
-                    r[2] * s[0] + r[5] * s[1] + r[8] * s[2],
-                ]);
-                match shown {
-                    Some(o) if o[2] > fold_cos + 1e-6 => {
-                        let q = self.project(o);
-                        ox = ox.max((q[0] - w * 0.5).abs() - w * 0.5);
-                        oy = oy.max((q[1] - h * 0.5).abs() - h * 0.5);
-                    }
-                    _ => return (f64::INFINITY, f64::INFINITY),
-                }
-            }
-        }
-        (ox.max(0.0), oy.max(0.0))
-    }
-
-    /// The pixels to add at the left and at the right, and at the top and at
-    /// the bottom, for a picture that reaches `over` past the edges (the
-    /// largest [`Self::overhang`] of a clip): what it needs, in pairs of
-    /// pixels so a frame whose sides are multiples of four keeps them so, and
-    /// no more than [`MARGIN_LIMIT`] of the shorter side.
-    pub fn margin(&self, over: (f64, f64)) -> (u32, u32) {
-        let limit = (MARGIN_LIMIT * self.width.min(self.height) as f64 / 2.0).floor() * 2.0;
-        let one = |o: f64| -> u32 {
-            // Less than half a pixel (or not a number): nothing to hold.
-            if !(o > 0.5) {
-                return 0;
-            }
-            ((o / 2.0).ceil() * 2.0).min(limit) as u32
-        };
-        (one(over.0), one(over.1))
+    /// The pixels a stabilized frame adds at each border of this one
+    /// ([`STABILIZER_MARGIN`]).
+    pub fn margin_px(&self) -> u32 {
+        margin_px(self.width, self.height)
     }
 
     /// This frame with `gx` more pixels at the left and at the right and
@@ -427,74 +382,34 @@ mod tests {
         assert_eq!(c.out_rim, frame.rim_px);
     }
 
-    /// The view turned 3° about the vertical axis: the picture reaches past
-    /// one side edge by what the turn spans at the edge's middle, and less
-    /// past the top and bottom (its corners swing up and down); the other
-    /// way round it is the same; not turned, it stays inside.
+    /// A stabilized frame is a twentieth of the recorded frame's shorter side
+    /// larger at each border, whatever the clip: the same lens and centre,
+    /// a wider field.
     #[test]
-    fn a_turn_carries_the_picture_past_the_edge() {
+    fn a_stabilized_frame_has_one_margin_for_every_clip() {
         let (l, r) = crop_10k();
         let frame = LensFrame::from_sources(&[&l, &r], 4912, 4912).unwrap();
-        let none = frame.overhang(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
-        assert!(none.0 < 1e-6 && none.1 < 1e-6, "{none:?}");
-        let (s, c) = 3.0_f32.to_radians().sin_cos();
-        let yaw = [c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c];
-        let over = frame.overhang(&yaw);
-        // The edge midpoint sits 63° off the axis; 3° further out along the
-        // middle row is this many pixels (the lens on the CPU).
-        let edge = frame.ray(4912.0, 2456.0).unwrap();
-        let theta = edge[0].atan2(edge[2]) + 3.0_f64.to_radians();
-        let at_edge = frame.project([theta.sin(), 0.0, theta.cos()])[0] - 4912.0;
-        assert!(at_edge > 100.0 && at_edge < 140.0, "{at_edge}");
-        assert!((over.0 - at_edge).abs() < 0.01, "{over:?} vs {at_edge}");
-        assert!(over.1 > 10.0 && over.1 < over.0 * 0.5, "{over:?}");
-        let back = frame.overhang(&[c, 0.0, -s, 0.0, 1.0, 0.0, s, 0.0, c]);
-        assert!((back.0 - over.0).abs() < 1e-6 && (back.1 - over.1).abs() < 1e-6);
-        // A pitch does to the top and bottom what a yaw does to the sides.
-        let pitch = frame.overhang(&[1.0, 0.0, 0.0, 0.0, c, s, 0.0, -s, c]);
-        assert!((pitch.1 - over.0).abs() < 1e-6 && (pitch.0 - over.1).abs() < 1e-6, "{pitch:?}");
-        // A frame that already ends where the lens family does has nothing
-        // further out to show.
-        let wide = LensFrame { width: 9000, height: 9000, ..frame };
-        assert_eq!(wide.overhang(&yaw), (f64::INFINITY, f64::INFINITY));
-    }
-
-    /// The frame grows by what the picture needs, in pairs of pixels, up to
-    /// a twentieth of its shorter side; the lens and its centre stay.
-    #[test]
-    fn the_frame_grows_up_to_its_limit() {
-        let (l, r) = crop_10k();
-        let frame = LensFrame::from_sources(&[&l, &r], 4912, 4912).unwrap();
-        assert_eq!(frame.margin((0.0, 0.3)), (0, 0));
-        assert_eq!(frame.margin((120.4, 37.0)), (122, 38));
         // 5 % of 4912 is 245.6: the even number below it.
-        assert_eq!(frame.margin((400.0, f64::INFINITY)), (244, 244));
-        assert_eq!(frame.margin((f64::NAN, 244.0)), (0, 244));
-        let tall = LensFrame { width: 6000, height: 3968, ..frame };
-        assert_eq!(tall.margin((1e9, 1e9)), (198, 198));
-        let grown = frame.grown(122, 38);
-        assert_eq!((grown.width, grown.height), (4912 + 244, 4912 + 76));
+        assert_eq!(frame.margin_px(), 244);
+        assert_eq!(stabilized_dims(4912, 4912), (5400, 5400));
+        assert_eq!(stabilized_dims(3712, 3712), (4080, 4080));
+        // A frame that is not square adds the same band on every side.
+        assert_eq!(stabilized_dims(6000, 3968), (6396, 4364));
+        assert_eq!(stabilized_dims(3840, 3008), (4140, 3308));
+        let m = frame.margin_px();
+        let grown = frame.grown(m, m);
+        assert_eq!((grown.width, grown.height), stabilized_dims(4912, 4912));
         assert_eq!((grown.focal, grown.k1, grown.k2, grown.xi, grown.rim_px), (frame.focal, frame.k1, frame.k2, frame.xi, frame.rim_px));
         // The same ray sits the margin further in.
         let d = frame.ray(1000.0, 3000.0).unwrap();
         let p = grown.project(d);
-        assert!((p[0] - 1122.0).abs() < 1e-6 && (p[1] - 3038.0).abs() < 1e-6, "{p:?}");
-        // What a 3° turn carried out of the frame is inside the grown one.
-        let (s, c) = 3.0_f32.to_radians().sin_cos();
-        let yaw = [c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c];
-        let (gx, gy) = frame.margin(frame.overhang(&yaw));
-        assert!(gx > 100 && gx < 244 && gy > 0, "({gx}, {gy})");
-        let held = frame.grown(gx, gy);
-        let q = held.project({
-            let e = frame.ray(4912.0, 0.0).unwrap();
-            [c as f64 * e[0] - s as f64 * e[2], e[1], s as f64 * e[0] + c as f64 * e[2]]
-        });
-        let q2 = held.project({
-            let e = frame.ray(4912.0, 0.0).unwrap();
-            [c as f64 * e[0] + s as f64 * e[2], e[1], -(s as f64) * e[0] + c as f64 * e[2]]
-        });
-        let inside = |q: [f64; 2]| q[0] >= 0.0 && q[0] <= held.width as f64 && q[1] >= 0.0 && q[1] <= held.height as f64;
-        assert!(inside(q) && inside(q2), "{q:?} {q2:?} in {}x{}", held.width, held.height);
+        assert!((p[0] - 1244.0).abs() < 1e-6 && (p[1] - 3244.0).abs() < 1e-6, "{p:?}");
+        // What a 5° turn about the vertical axis carries past the side edge
+        // is inside the grown frame (the margin spans more than 5° there).
+        let (s, c) = 5.0_f64.to_radians().sin_cos();
+        let e = frame.ray(4912.0, 2456.0).unwrap();
+        let q = grown.project([c * e[0] + s * e[2], e[1], -s * e[0] + c * e[2]]);
+        assert!(q[0] > 4912.0 + 244.0 && q[0] < grown.width as f64, "{q:?}");
     }
 
     /// A grown frame put back into its size keeps its field: the lens
