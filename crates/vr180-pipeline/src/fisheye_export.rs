@@ -1779,6 +1779,14 @@ fn export_fisheye_inner(
     // Export always passes max_decode_side=0 (no cap) so we get the
     // source's native fisheye resolution. The preview path is the
     // only consumer that caps to MAX_DECODE_SIDE for real-time fps.
+    // The noise filter takes frames in memory. A raw take normally keeps its
+    // eyes on the GPU (the demosaic's output): with the filter on it is opened
+    // without the device and hands them over in memory instead.
+    #[cfg(target_os = "macos")]
+    let denoising = cfg.denoise_strength > 0.0 && crate::vt_denoise::is_supported();
+    #[cfg(not(target_os = "macos"))]
+    let denoising = false;
+    let source_gpu = (!(denoising && cfg.source_kind.is_raw_video())).then(|| pipeline.clone());
     let mut decoder: Box<dyn FisheyePairIter> = if cfg.segments.len() > 1 {
         // Merged recording: chain the segments into one continuous timeline
         // (the IMU is aggregated the same way below, so stab indexes by
@@ -1796,9 +1804,9 @@ fn export_fisheye_inner(
             cfg.segments.len(), durations.iter().sum::<f64>());
         Box::new(SegmentedFisheyeIter::new(
             &cfg.segments, &durations,
-            fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), Some(pipeline.clone()), cfg.raw_enhanced()))?)
+            fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), source_gpu.clone(), cfg.raw_enhanced()))?)
     } else {
-        let mut open = fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), Some(pipeline.clone()), cfg.raw_enhanced());
+        let mut open = fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), source_gpu.clone(), cfg.raw_enhanced());
         open(&cfg.source_path)?
     };
     // A raw take read from its enhanced frames: each frame is a picture to
@@ -1825,7 +1833,13 @@ fn export_fisheye_inner(
                         "fisheye_export: temporal NR ENGAGED (strength={:.2})",
                         cfg.denoise_strength
                     );
-                    decoder = Box::new(d);
+                    // A raw take's eyes are camera-linear: they pass the
+                    // filter white-balanced and on a logarithmic curve.
+                    decoder = Box::new(if cfg.source_kind.is_raw_video() {
+                        d.with_linear_source(crate::x6_raw::BAYER.neutral)
+                    } else {
+                        d
+                    });
                 }
                 Err(e) => {
                     return Err(Error::Ffmpeg(format!("denoise init failed: {e}")));

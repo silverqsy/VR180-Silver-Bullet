@@ -3001,6 +3001,28 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      (the GPU stages against their CPU twins, the tables and families
      against Camera Raw's numbers, the keys read off the reduced copy,
      the sharpening's kernel and limits).
+   - **Noise reduction** (2026-11-16; `fisheye_decode::LinearCoding`,
+     `DenoisingFisheyeIter::with_linear_source`). The filter wrapper takes
+     frames IN MEMORY; a raw take hands out GPU pairs with empty buffers,
+     and the 16-bit copy in `VtDenoiser::build_source` read from the empty
+     `Vec`'s dangling pointer: the app died with SIGSEGV at address 1 the
+     moment an export of a raw take had Noise Reduction above zero (the
+     user's report). Now: `VtDenoiser::push` refuses a short frame;
+     `export_fisheye` opens a raw take WITHOUT the device when the filter
+     is on (`source_gpu`), so its eyes arrive in memory (CPU demosaic, on
+     every core); and since those eyes are camera-linear, not
+     white-balanced, they pass the filter coded: each channel scaled to
+     the camera's neutral (a grey then has nothing in the half-resolution
+     colour planes), then `log(1 + x / TOE) / log(1 + 1 / TOE)`, TOE =
+     1/1024 (4–9 ten-bit codes per 14-bit sensor code at black, 0.7 % of
+     full scale per code at white), decoded after. Measured on take
+     162217, strength 0.71: mean RGB within 0.10 / 255, every brightness
+     band within 0.2; grain in flat areas ×0.47; strongest 1 % of edges
+     ×0.97; a sky gradient as smooth as without it; 0.31 s a pair at
+     8192×4096 (0.065 without), 4.5 GB. Also runs on enhanced frames
+     (7680² an eye) and in a stabilized lens frame (the export that
+     crashed). Windows has no such filter (the wrapper is macOS-gated;
+     the new `denoising` flag is `false` there).
    - **Not done**: the shutter time is not in a take, so the pose is
      sampled half a shutter (plus the gyro's lag) early (Motion and
      timing); takes of the earlier camera build have neither readout nor

@@ -597,6 +597,14 @@ impl VtDenoiser {
     /// Feed one RGBA source frame; returns zero or more denoised frames that
     /// are now ready (output is delayed by `next_count` frames).
     pub fn push(&mut self, rgba: &[u8]) -> Result<Vec<Vec<u8>>> {
+        // The frame is copied row by row from `rgba`: it has to be all there
+        // (a source that keeps its picture on the GPU hands over none).
+        let need = self.width * self.height * if self.bit_depth >= 16 { 8 } else { 4 };
+        if rgba.len() < need {
+            return Err(Error::Ffmpeg(format!(
+                "noise reduction: a {}x{} frame of {} bytes was expected, {} came (the source's frames are not in memory)",
+                self.width, self.height, need, rgba.len())));
+        }
         let pts_val = self.frame_counter;
         let pb = unsafe { self.build_source(rgba)? };
         let frame = unsafe { self.wrap_frame(pb, pts_val)? };

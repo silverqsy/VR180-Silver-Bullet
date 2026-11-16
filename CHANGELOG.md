@@ -144,6 +144,14 @@ converter's controls for it, and every frame can be had as a DNG.
   them the far-field shake of a locked export fell from 1.5 to 0.4 pixels
   a frame at 1024 pixels an eye (2.6 without stabilization). Takes of the
   earlier build have neither and stabilize as before.
+- **Noise reduction.** The Noise Reduction section (macOS) works on raw
+  takes. The filter is a video filter, 10-bit and with colour at half
+  resolution, so a take's frames pass it white-balanced and on a
+  logarithmic curve and come back as the camera's linear values: tone and
+  colour stay where they were (within 0.1 of 255 on a dusk take), grain in
+  flat areas halves at strength 0.7, the strongest edges keep 97 % of
+  their contrast and a clear sky gets no banding. It costs about 0.3 s a
+  frame pair.
 - **What a take does not carry.** No shutter time: a frame's pose is taken
   half a shutter early, which leaves the 0.4 pixels above (0.06 with the
   3 ms these takes turn out to need). No white balance of its own: As

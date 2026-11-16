@@ -4480,9 +4480,69 @@ fn bgra_to_rgba_row(src: &[u8], bpp: usize, dst: &mut Vec<u8>) {
 // mirroring the Python pipeline. Output order and frame count are
 // preserved 1:1 (delayed by the filter's look-ahead, drained at EOF), so
 // stabilization-by-index and audio sync downstream stay aligned.
+/// The coding camera-linear eyes go through the noise filter in.
+///
+/// The filter works on 10-bit video (YCbCr 4:2:0). A raw take's eyes are
+/// 16-bit camera-linear values, not white-balanced: handed over as they
+/// are, the deep shadows would get a handful of codes and every grey edge
+/// would sit in the half-resolution colour planes. So each channel is first
+/// scaled to the camera's neutral (a grey then has no colour to subsample)
+/// and put through a logarithmic curve (`log(1 + x / TOE) / log(1 + 1 /
+/// TOE)`: at black one of the sensor's 14-bit codes spans four to nine
+/// 10-bit codes, depending on the channel, and at white a 10-bit code is
+/// 0.7 % of full scale, both finer than the sensor's own noise there), and
+/// the filter's output is taken back the same way.
+pub struct LinearCoding {
+    encode: [Vec<u16>; 3],
+    decode: [Vec<u16>; 3],
+}
+
+impl LinearCoding {
+    /// Where the curve turns from linear to logarithmic, as a share of white.
+    pub const TOE: f64 = 1.0 / 1024.0;
+
+    /// The coding for a camera whose neutral (a grey's camera values over
+    /// its green) is `neutral`.
+    pub fn new(neutral: [f32; 3]) -> Self {
+        let least = neutral.iter().cloned().fold(f32::INFINITY, f32::min).max(1e-3) as f64;
+        let span = (1.0 + 1.0 / Self::TOE).ln();
+        let table = |gain: f64, forward: bool| -> Vec<u16> {
+            (0..=u16::MAX as u32).map(|code| {
+                let v = code as f64 / 65535.0;
+                let out = if forward {
+                    ((1.0 + (v * gain).min(1.0) / Self::TOE).ln() / span).min(1.0)
+                } else {
+                    (Self::TOE * ((v * span).exp() - 1.0) / gain).min(1.0)
+                };
+                (out * 65535.0).round() as u16
+            }).collect()
+        };
+        let gains = neutral.map(|n| least / (n.max(1e-3) as f64));
+        Self {
+            encode: gains.map(|g| table(g, true)),
+            decode: gains.map(|g| table(g, false)),
+        }
+    }
+
+    /// Code (`forward`) or decode an eye of `width` RGBA64LE pixels a row, in place.
+    pub fn apply(&self, rgba64: &mut [u8], width: usize, forward: bool) {
+        let tables = if forward { &self.encode } else { &self.decode };
+        crate::bayer::fill_rows(rgba64, width.max(1) * 8, |_, row| {
+            for px in row.chunks_exact_mut(8) {
+                for c in 0..3 {
+                    let v = u16::from_le_bytes([px[2 * c], px[2 * c + 1]]);
+                    px[2 * c..2 * c + 2].copy_from_slice(&tables[c][v as usize].to_le_bytes());
+                }
+            }
+        });
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub struct DenoisingFisheyeIter {
     inner: Box<dyn FisheyePairIter>,
+    /// Camera-linear eyes are coded for the filter and decoded after it.
+    linear: Option<LinearCoding>,
     strength: f32,
     eye_w: u32,
     eye_h: u32,
@@ -4508,6 +4568,7 @@ impl DenoisingFisheyeIter {
         let (eye_w, eye_h) = inner.eye_dims();
         Ok(Self {
             inner,
+            linear: None,
             strength,
             eye_w,
             eye_h,
@@ -4521,6 +4582,13 @@ impl DenoisingFisheyeIter {
             emitted: 0,
             inner_done: false,
         })
+    }
+
+    /// The source's eyes are 16-bit camera-linear values of a camera with
+    /// this neutral (a raw take's): they pass the filter in [`LinearCoding`].
+    pub fn with_linear_source(mut self, neutral: [f32; 3]) -> Self {
+        self.linear = Some(LinearCoding::new(neutral));
+        self
     }
 
     fn ensure_denoisers(&mut self, bit_depth: u8) -> Result<()> {
@@ -4537,7 +4605,11 @@ impl DenoisingFisheyeIter {
     }
 
     fn emit(&mut self, lefts: Vec<Vec<u8>>, rights: Vec<Vec<u8>>) {
-        for (l, r) in lefts.into_iter().zip(rights.into_iter()) {
+        for (mut l, mut r) in lefts.into_iter().zip(rights.into_iter()) {
+            if let Some(code) = &self.linear {
+                code.apply(&mut l, self.eye_w as usize, false);
+                code.apply(&mut r, self.eye_w as usize, false);
+            }
             let pts = self.pending_pts.pop_front().unwrap_or(0.0);
             self.emitted += 1;
             self.ready.push_back(FisheyePair {
@@ -4564,13 +4636,17 @@ impl FisheyePairIter for DenoisingFisheyeIter {
                 return Ok(None);
             }
             match self.inner.next_pair()? {
-                Some(pair) => {
+                Some(mut pair) => {
                     self.ensure_denoisers(pair.bit_depth)?;
                     if self.pushed == 0 {
                         self.first_pair = Some(pair.clone());
                     }
                     self.pushed += 1;
                     self.pending_pts.push_back(pair.pts_s);
+                    if let Some(code) = self.linear.as_ref().filter(|_| pair.bit_depth >= 16) {
+                        code.apply(&mut pair.left, self.eye_w as usize, true);
+                        code.apply(&mut pair.right, self.eye_w as usize, true);
+                    }
                     let lefts = self.left.as_mut().unwrap().push(&pair.left)?;
                     let rights = self.right.as_mut().unwrap().push(&pair.right)?;
                     self.emit(lefts, rights);
@@ -4626,6 +4702,101 @@ fn _force_link(_: &dyn FisheyePairIter) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Camera-linear values pass the noise filter coded: a grey has the
+    /// same code in every channel, the darkest sensor codes get codes of
+    /// their own, and decoding gives the values back.
+    #[test]
+    fn linear_coding_balances_spreads_the_shadows_and_comes_back() {
+        let neutral = [0.565_429_7f32, 1.0, 0.401_367_2];
+        let code = LinearCoding::new(neutral);
+        let px = |rgb: [u16; 3]| -> Vec<u8> { rgb.iter().chain(&[65535u16]).flat_map(|v| v.to_le_bytes()).collect() };
+        let read = |b: &[u8]| -> [u16; 4] { [0, 1, 2, 3].map(|c| u16::from_le_bytes([b[2 * c], b[2 * c + 1]])) };
+        // A grey: camera values in the neutral's ratio.
+        for level in [0.002f32, 0.02, 0.18, 0.6, 1.0] {
+            let grey = neutral.map(|n| (level * n * 65535.0).round() as u16);
+            let mut b = px(grey);
+            code.apply(&mut b, 1, true);
+            let c = read(&b);
+            assert!(c[0].abs_diff(c[1]) <= 40 && c[2].abs_diff(c[1]) <= 40, "grey at {level}: {c:?}");
+            assert_eq!(c[3], 65535, "alpha is left alone");
+            code.apply(&mut b, 1, false);
+            let back = read(&b);
+            for k in 0..3 {
+                let tol = 2 + grey[k] / 2000;
+                assert!(back[k].abs_diff(grey[k]) <= tol, "level {level} channel {k}: {} -> {}", grey[k], back[k]);
+            }
+        }
+        // Black stays black, and the curve rises all the way.
+        let mut b = px([0, 0, 0]);
+        code.apply(&mut b, 1, true);
+        assert_eq!(&read(&b)[..3], &[0, 0, 0]);
+        for c in 0..3 {
+            assert!(code.encode[c].windows(2).all(|w| w[1] >= w[0]) && code.decode[c].windows(2).all(|w| w[1] >= w[0]));
+        }
+        // One 14-bit sensor code above black (4 of these 16-bit codes) moves
+        // the 10-bit picture (64 of these codes a step) by more than three of
+        // its codes even in the channel with the least gain, green, and by
+        // about nine in blue.
+        assert!(code.encode[1][4] >= 3 * 64 && code.encode[2][4] >= 8 * 64, "one sensor code: green {} blue {}", code.encode[1][4], code.encode[2][4]);
+        // At white the step of a 10-bit code is under one percent of full scale.
+        let top = code.encode[2][65535] as usize;
+        let below = code.decode[2][top - 64] as f64 / 65535.0;
+        assert!(1.0 - below < 0.01, "blue at white: one 10-bit code = {}", 1.0 - below);
+        // A whole eye in rows: every pixel is coded (rows on several cores).
+        let (w, h) = (96usize, 200usize);
+        let mut eye: Vec<u8> = (0..w * h).flat_map(|i| px([(i % 60000) as u16, (i * 7 % 60000) as u16, (i * 13 % 60000) as u16])).collect();
+        let before = eye.clone();
+        code.apply(&mut eye, w, true);
+        assert!(eye.chunks_exact(8).zip(before.chunks_exact(8)).skip(1).all(|(a, b)| read(a)[1] >= read(b)[1] / 2 && read(a)[3] == 65535));
+        code.apply(&mut eye, w, false);
+        let worst = eye.chunks_exact(8).zip(before.chunks_exact(8)).flat_map(|(a, b)| (0..3).map(move |k| read(a)[k].abs_diff(read(b)[k]))).max().unwrap();
+        assert!(worst <= 40, "round trip of an eye: worst {worst}");
+    }
+
+    /// The noise filter refuses a frame that is not in memory instead of
+    /// reading past it (a raw take's eyes used to arrive that way), and a raw
+    /// take's frames pass it with their tone where it was. Skipped where the
+    /// filter does not run or the sample is not there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_noise_filter_takes_a_raw_takes_frames_in_memory() {
+        if !crate::vt_denoise::is_supported() { return; }
+        let mut filter = crate::vt_denoise::VtDenoiser::new(1024, 1024, 16, 0.5).unwrap();
+        let e = filter.push(&[]).unwrap_err().to_string();
+        assert!(e.contains("not in memory"), "{e}");
+        assert!(filter.push(&vec![0u8; 1024 * 1024 * 8 - 1]).is_err());
+        let take = std::path::Path::new("/Volumes/Database/x6/1116 Raw Video/RAWVIDEO-20261116-162217");
+        if !take.exists() { return; }
+        // The take without a device hands out frames in memory.
+        let mut plain = crate::x6_raw::X6RawIter::new(take, false, false, 1, None).unwrap();
+        plain.seek(5.0).unwrap();
+        let first = plain.next_pair().unwrap().unwrap();
+        assert_eq!((first.left.len(), first.bit_depth, first.gpu.is_none()), (3840 * 3840 * 8, 16, true));
+        let mut source = crate::x6_raw::X6RawIter::new(take, false, false, 1, None).unwrap();
+        source.seek(5.0).unwrap();
+        let mut filtered = DenoisingFisheyeIter::new(Box::new(source), 0.7).unwrap().with_linear_source(crate::x6_raw::BAYER.neutral);
+        let out = filtered.next_pair().unwrap().unwrap();
+        assert_eq!((out.left.len(), out.eye_w, out.bit_depth), (3840 * 3840 * 8, 3840, 16));
+        assert!((out.pts_s - first.pts_s).abs() < 1e-9);
+        // The middle of the eye: the same picture, to a part in a hundred of its level.
+        let mean = |eye: &[u8]| -> [f64; 3] {
+            let mut sum = [0f64; 3];
+            let mut n = 0f64;
+            for y in (1400..2400).step_by(7) {
+                for x in (1400..2400).step_by(7) {
+                    let at = (y * 3840 + x) * 8;
+                    for c in 0..3 { sum[c] += u16::from_le_bytes([eye[at + 2 * c], eye[at + 2 * c + 1]]) as f64; }
+                    n += 1.0;
+                }
+            }
+            sum.map(|s| s / n)
+        };
+        let (a, b) = (mean(&first.left), mean(&out.left));
+        for c in 0..3 {
+            assert!((a[c] - b[c]).abs() <= a[c] * 0.01 + 2.0, "channel {c}: {} -> {}", a[c], b[c]);
+        }
+    }
 
     /// Build a P010LE AVFrame filled with a single Y/U/V triple
     /// (10-bit video range values, e.g. Y=940 for white). Stores the
