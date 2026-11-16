@@ -2899,6 +2899,16 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      in ImageIO and in Camera Raw 18.7. A folder written this way is not
      yet something the app opens: `x6b::read_take` names it
      (`TakeProblem::FramesOnly`).
+     WHAT THE UI SAYS OF IT (2026-11-16, after the user asked whether a
+     Camera original export "still used NR" and a "native" resolution):
+     the export itself never did (`spawn_export_job` routes it to
+     `export_sensor_dng_sequence`: 1884 pairs in 57 s on the user's run),
+     but the export bar's "NR" followed the clip's Noise Reduction
+     slider and Export format still listed a Resolution. Now
+     `export_runs_noise_filter` says when an export runs the filter (a
+     video file; never a folder of DNG frames or a still), and Export
+     format shows "3840 × 3840 per eye" in place of the list for Camera
+     original.
    - **Enhanced frames** (2026-11-16; `enhanced_dng.rs`, `jxl_macos.rs`,
      `X6RawIter::with_enhanced_frames`, `FisheyeExportConfig::
      raw_enhanced_dir`, GUI `ExportOptions::raw_use_enhanced` → the

@@ -561,6 +561,14 @@ impl ExportResolution {
     }
 }
 
+/// Whether an export of a clip runs the noise filter, which is what the
+/// export bar's "NR" says: a video file does when the clip's Noise Reduction
+/// is above zero; a folder of DNG frames (the developed view or the camera's
+/// own) and a still are written without it, whatever the clip's setting.
+fn export_runs_noise_filter(kind: vr180_pipeline::SourceKind, denoise_strength: f32, opts: &ExportOptions) -> bool {
+    denoise_strength > 0.0 && !kind.is_still() && !(kind.is_raw_video() && opts.raw_dng_sequence)
+}
+
 /// Which list of sizes a clip picks from. Each list has a choice of its
 /// own, so a size picked on one sort of clip never changes what a clip of
 /// another sort exports at.
@@ -816,7 +824,7 @@ mod file_info_tests {
 
 #[cfg(test)]
 mod export_size_tests {
-    use super::{App, EnhancedFrames, ExportOptions, ExportResolution, SizeList, X6ClipInfo};
+    use super::{export_runs_noise_filter, App, EnhancedFrames, ExportOptions, ExportResolution, SizeList, X6ClipInfo};
     use super::{oversize_export_hint, tr_zh, ExportCodec};
 
     /// The note for an oversize video names the encoder that runs on this
@@ -987,6 +995,33 @@ mod export_size_tests {
         // Another clip never sees those sizes.
         let text = panel_text(&mut opts, (7680, 3840), None, false);
         assert!(!text.contains("16384") && !text.contains("enhanced"), "{text}");
+    }
+
+    /// The camera's own frames are written as they are: Export format shows
+    /// their size instead of a list to pick from, and the export bar's "NR"
+    /// is for exports that do run the noise filter.
+    #[test]
+    fn camera_original_frames_have_no_size_to_pick_and_no_noise_filter() {
+        use ExportResolution::Native;
+        let mut opts = ExportOptions { resolution: Native, raw_dng_sequence: true, raw_dng_original: true, ..Default::default() };
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Absent));
+        assert!(text.contains("3840 × 3840 per eye") && text.contains("sensor's own"), "{text}");
+        assert!(!text.contains("(native)") && !text.contains("8192 × 4096") && !text.contains("Use enhanced frames"), "{text}");
+        // The developed view is a picture of a size: its list is there.
+        opts.raw_dng_original = false;
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Absent));
+        assert!(text.contains("7680 × 3840 (native)") && text.contains("Use enhanced frames"), "{text}");
+        assert_eq!(opts.resolution, Native);
+
+        let raw = vr180_pipeline::SourceKind::X6Raw;
+        let video = ExportOptions::default();
+        let frames = ExportOptions { raw_dng_sequence: true, ..Default::default() };
+        let original = ExportOptions { raw_dng_sequence: true, raw_dng_original: true, ..Default::default() };
+        assert!(export_runs_noise_filter(raw, 0.71, &video));
+        assert!(!export_runs_noise_filter(raw, 0.0, &video));
+        assert!(!export_runs_noise_filter(raw, 0.71, &frames) && !export_runs_noise_filter(raw, 0.71, &original));
+        // Another clip in the same list is a video whatever the raw option says.
+        assert!(export_runs_noise_filter(vr180_pipeline::SourceKind::Insta360Insv, 0.5, &original));
     }
 
     /// The export of a raw take carries both sizes: the one picked without
@@ -1995,6 +2030,8 @@ fn tr_zh(en: &'static str) -> &'static str {
         "DNG sequence" => "DNG 序列",
         "Developed view" => "显影后的画面",
         "Use enhanced frames" => "使用增强后的帧",
+        "Camera original frames are the sensor's own: the view and its size, the grade, stabilization and noise reduction are not applied to them."
+            => "相机原片就是传感器记录的帧：视图及其尺寸、调色、防抖和降噪都不会作用到它们上面。",
         "Enhanced frames found:" => "已找到增强后的帧：",
         "No enhanced frame found for this clip: it exports from the capture." => "没有找到这个片段的增强帧：导出取自采集文件。",
         "Looking for enhanced frames…" => "正在查找增强后的帧…",
@@ -5949,9 +5986,10 @@ impl App {
         // mutably borrows `self.export_opts` (egui disjoint-field capture).
         let running = self.batch_running;
         let run_progress = self.overall_run_progress();
+        let run_opts = self.batch_opts.unwrap_or(self.export_opts);
         let cur_nr = self.batch_current
             .and_then(|i| self.batch.get(i))
-            .map_or(false, |b| b.settings.denoise_strength > 0.0);
+            .map_or(false, |b| export_runs_noise_filter(b.source_kind, b.settings.denoise_strength, &run_opts));
         let n_all = self.batch.iter().filter(|b| matches!(b.status,
             BatchStatus::Idle | BatchStatus::Queued
             | BatchStatus::Failed(_) | BatchStatus::Skipped)).count();
@@ -6241,7 +6279,15 @@ impl App {
             ExportCodec::Spatial if !spatial_offered => ExportCodec::H265,
             c => c,
         };
-        if let Some(aspect) = reframe {
+        // The camera's own frames have no view and no size to pick: the list
+        // that would offer one is not shown for them.
+        let camera_original = raw_video.is_some() && !is_still && opts.raw_dng_sequence && opts.raw_dng_original;
+        if camera_original {
+            ui.label(RichText::new(tr("Resolution")).strong());
+            ui.label(format!("3840 × 3840 {}", tr("per eye")));
+            ui.label(RichText::new(tr("Camera original frames are the sensor's own: the view and its size, the grade, stabilization and noise reduction are not applied to them."))
+                .small().color(Color32::GRAY));
+        } else if let Some(aspect) = reframe {
             // Reframed view: the exact viewport at a per-eye size.
             ui.label(RichText::new(tr(if single_eye { "Size" } else { "Per-eye size" })).strong());
             opts.reframe_size = opts.reframe_size.clamped(is_still, aspect);
