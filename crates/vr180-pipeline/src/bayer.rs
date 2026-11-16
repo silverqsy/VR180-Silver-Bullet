@@ -44,6 +44,31 @@ fn mirror(i: i32, n: i32) -> usize {
     k.clamp(0, n - 1) as usize
 }
 
+/// Fill `out`, rows of `row_len`, on every core: `fill(y, row)` writes row
+/// `y`. A small picture stays on the caller's thread.
+pub(crate) fn fill_rows<T: Send>(out: &mut [T], row_len: usize, fill: impl Fn(usize, &mut [T]) + Sync) {
+    let row_len = row_len.max(1);
+    let rows = out.len() / row_len;
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(rows / 64);
+    if workers <= 1 {
+        for (y, row) in out.chunks_mut(row_len).enumerate() {
+            fill(y, row);
+        }
+        return;
+    }
+    let band = rows.div_ceil(workers);
+    std::thread::scope(|scope| {
+        for (b, part) in out.chunks_mut(band * row_len).enumerate() {
+            let fill = &fill;
+            scope.spawn(move || {
+                for (i, row) in part.chunks_mut(row_len).enumerate() {
+                    fill(b * band + i, row);
+                }
+            });
+        }
+    });
+}
+
 /// The demosaiced picture of a `w × h` mosaic: camera-linear RGB with the
 /// sensor's white level at 1, row-major. `half` gives the picture at half
 /// size, each pixel the mean of the 2×2 full-size pixels it covers.
@@ -59,30 +84,37 @@ pub fn demosaic(mosaic: &[u16], w: usize, h: usize, layout: &BayerLayout, half: 
     let red_row = |y: i32| (y as u32 & 1) == red_y;
     let (gain_r, gain_b) = (1.0 / layout.neutral[0], 1.0 / layout.neutral[2]);
     // The white-balanced mosaic.
-    let balanced: Vec<f32> = (0..w * h).map(|i| {
-        let (x, y) = ((i % w) as i32, (i / w) as i32);
-        let lin = (mosaic[i] as f32 - layout.black) * scale;
-        if red_col(x) == red_row(y) { lin * if red_row(y) { gain_r } else { gain_b } } else { lin }
-    }).collect();
+    let mut balanced = vec![0f32; w * h];
+    fill_rows(&mut balanced, w, |y, row| {
+        for (x, v) in row.iter_mut().enumerate() {
+            let (xi, yi) = (x as i32, y as i32);
+            let lin = (mosaic[y * w + x] as f32 - layout.black) * scale;
+            *v = if red_col(xi) == red_row(yi) { lin * if red_row(yi) { gain_r } else { gain_b } } else { lin };
+        }
+    });
     let bal = |x: i32, y: i32| balanced[mirror(y, hi) * w + mirror(x, wi)];
     // How much it changes along the row and along the column, at every site.
     let mut along = vec![[0f32; 2]; w * h];
-    for y in 0..hi {
-        for x in 0..wi {
+    fill_rows(&mut along, w, |y, row| {
+        let y = y as i32;
+        for (x, v) in row.iter_mut().enumerate() {
+            let x = x as i32;
             let c = bal(x, y);
-            along[y as usize * w + x as usize] = [
+            *v = [
                 (bal(x - 1, y) - bal(x + 1, y)).abs() + 0.5 * (2.0 * c - bal(x - 2, y) - bal(x + 2, y)).abs(),
                 (bal(x, y - 1) - bal(x, y + 1)).abs() + 0.5 * (2.0 * c - bal(x, y - 2) - bal(x, y + 2)).abs(),
             ];
         }
-    }
+    });
     // Green.
     let cells = ((2 * WINDOW + 1) * (2 * WINDOW + 1)) as f32;
     let mut green = vec![0f32; w * h];
-    for y in 0..hi {
-        for x in 0..wi {
+    fill_rows(&mut green, w, |y, row| {
+        let y = y as i32;
+        for (x, v) in row.iter_mut().enumerate() {
+            let x = x as i32;
             let c = bal(x, y);
-            green[y as usize * w + x as usize] = if red_col(x) != red_row(y) { c } else {
+            *v = if red_col(x) != red_row(y) { c } else {
                 let mut sum = [0f32; 2];
                 for dy in -WINDOW..=WINDOW {
                     for dx in -WINDOW..=WINDOW {
@@ -98,7 +130,7 @@ pub fn demosaic(mosaic: &[u16], w: usize, h: usize, layout: &BayerLayout, half: 
                 share * row + (1.0 - share) * col
             };
         }
-    }
+    });
     let grn = |x: i32, y: i32| green[mirror(y, hi) * w + mirror(x, wi)];
     let dif = |x: i32, y: i32| bal(x, y) - grn(x, y);
     // Red and blue.
@@ -115,14 +147,24 @@ pub fn demosaic(mosaic: &[u16], w: usize, h: usize, layout: &BayerLayout, half: 
         [(r * layout.neutral[0]).clamp(0.0, 1.0), g.clamp(0.0, 1.0), (b * layout.neutral[2]).clamp(0.0, 1.0)]
     };
     if !half {
-        return (0..w * h).map(|i| full((i % w) as i32, (i / w) as i32)).collect();
+        let mut out = vec![[0f32; 3]; w * h];
+        fill_rows(&mut out, w, |y, row| {
+            for (x, v) in row.iter_mut().enumerate() {
+                *v = full(x as i32, y as i32);
+            }
+        });
+        return out;
     }
     let (ow, oh) = (w / 2, h / 2);
-    (0..ow * oh).map(|i| {
-        let (x, y) = (2 * (i % ow) as i32, 2 * (i / ow) as i32);
-        let (p, q, r, s) = (full(x, y), full(x + 1, y), full(x, y + 1), full(x + 1, y + 1));
-        [0, 1, 2].map(|c| 0.25 * (p[c] + q[c] + r[c] + s[c]))
-    }).collect()
+    let mut out = vec![[0f32; 3]; ow * oh];
+    fill_rows(&mut out, ow, |y, row| {
+        for (x, v) in row.iter_mut().enumerate() {
+            let (x, y) = (2 * x as i32, 2 * y as i32);
+            let (p, q, r, s) = (full(x, y), full(x + 1, y), full(x, y + 1), full(x + 1, y + 1));
+            *v = [0, 1, 2].map(|c| 0.25 * (p[c] + q[c] + r[c] + s[c]));
+        }
+    });
+    out
 }
 
 #[cfg(test)]
@@ -144,6 +186,19 @@ mod tests {
 
     /// The numbers of the model the method was fitted with (the script that
     /// compared it with Camera Raw's result).
+    #[test]
+    fn rows_are_filled_whatever_the_core_count() {
+        for (rows, len) in [(1usize, 5usize), (63, 3), (64, 3), (129, 7), (1000, 2), (3840, 1)] {
+            let mut out = vec![0u32; rows * len];
+            fill_rows(&mut out, len, |y, row| {
+                for (x, v) in row.iter_mut().enumerate() {
+                    *v = (y * 1000 + x) as u32;
+                }
+            });
+            assert!(out.iter().enumerate().all(|(i, v)| *v as usize == (i / len) * 1000 + i % len), "{rows}x{len}");
+        }
+    }
+
     #[test]
     fn the_models_numbers() {
         let (w, h) = (24usize, 16usize);

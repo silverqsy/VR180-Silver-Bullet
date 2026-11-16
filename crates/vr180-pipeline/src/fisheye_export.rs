@@ -265,6 +265,16 @@ pub struct FisheyeExportConfig {
     pub raw_enhanced_dir: Option<PathBuf>,
 }
 
+impl FisheyeExportConfig {
+    /// A raw take's enhanced frames for the stretch this export covers
+    /// ([`Self::raw_enhanced_dir`] and the trim).
+    pub(crate) fn raw_enhanced(&self) -> Option<crate::x6_raw::EnhancedSource> {
+        self.raw_enhanced_dir.as_ref().map(|dir| crate::x6_raw::EnhancedSource {
+            dir: dir.clone(), t_in: self.trim_in_s, t_out: self.trim_out_s,
+        })
+    }
+}
+
 /// Progress update emitted via the caller's callback after each
 /// rendered frame.
 #[derive(Debug, Clone, Copy)]
@@ -978,8 +988,8 @@ pub(crate) fn fisheye_export_opener(
     // The device a raw (Bayer) source demosaics on; without one it does so
     // on the CPU. Other sources ignore it.
     gpu: Option<Arc<Device>>,
-    // A raw take's enhanced frames (`FisheyeExportConfig::raw_enhanced_dir`).
-    raw_enhanced: Option<PathBuf>,
+    // A raw take's enhanced frames (`FisheyeExportConfig::raw_enhanced`).
+    raw_enhanced: Option<crate::x6_raw::EnhancedSource>,
 ) -> Box<dyn FnMut(&std::path::Path) -> Result<Box<dyn FisheyePairIter>>> {
     let bd = if bit_depth >= 10 { 16u8 } else { 8u8 };
     Box::new(move |p: &std::path::Path| -> Result<Box<dyn FisheyePairIter>> {
@@ -1015,7 +1025,7 @@ pub(crate) fn fisheye_export_opener(
             // Full size, every frame, camera-linear 16-bit eyes (on the GPU
             // when there is a device).
             SourceKind::X6Raw => Box::new(crate::x6_raw::X6RawIter::new(
-                p, kind.dual_stream_iter_swap(swap_eyes), false, 1, gpu.clone())?.with_enhanced_frames(raw_enhanced.as_deref())),
+                p, kind.dual_stream_iter_swap(swap_eyes), false, 1, gpu.clone())?.with_enhanced_frames(raw_enhanced.as_ref())),
             other => return Err(Error::Ffmpeg(format!(
                 "export_fisheye non-fisheye source: {other:?}"))),
         })
@@ -1744,11 +1754,19 @@ fn export_fisheye_inner(
             cfg.segments.len(), durations.iter().sum::<f64>());
         Box::new(SegmentedFisheyeIter::new(
             &cfg.segments, &durations,
-            fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), Some(pipeline.clone()), cfg.raw_enhanced_dir.clone()))?)
+            fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), Some(pipeline.clone()), cfg.raw_enhanced()))?)
     } else {
-        let mut open = fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), Some(pipeline.clone()), cfg.raw_enhanced_dir.clone());
+        let mut open = fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), Some(pipeline.clone()), cfg.raw_enhanced());
         open(&cfg.source_path)?
     };
+    // A raw take read from its enhanced frames: each frame is a picture to
+    // decode and the eyes are larger, which the export bar says.
+    if cfg.source_kind.is_raw_video() && cfg.raw_enhanced_dir.is_some() {
+        let (w, h) = decoder.eye_dims();
+        if w as usize > vr180_fisheye::x6b::EYE_SIDE {
+            append_export_path_note(&format!("frames from the enhanced DNGs, {w} × {h} per eye"));
+        }
+    }
 
     // ── Temporal noise reduction (macOS VideoToolbox) ────────────
     // Source-domain denoise, before projection — matches the Python app.

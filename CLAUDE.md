@@ -2893,6 +2893,31 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      0.41 s a pair with both eyes enhanced at 8192×4096 output (capture:
      0.07 s), 4 GB peak; render from the enhanced eye aligned to the
      capture's (shift 0, 0), mean |difference| 0.5/255 (it is sharper).
+     WHICH FRAMES: the folder is listed once per export
+     (`enhanced_listing`: each channel's requests and file sizes; only
+     files named as `sensor_dng::frame_file` names them), and the export
+     says which stretch of the take it covers (`x6_raw::EnhancedSource {
+     dir, t_in, t_out }` from `FisheyeExportConfig::raw_enhanced()`; a
+     single-frame export passes that frame's time and a frame later).
+     Among the stretch's files the LARGEST are opened first
+     (`enhanced_candidates`: a file keeps its mosaic and gains the
+     picture, so an enhanced one is larger than a plain one wherever it
+     sits; 8 of them, then the stretch's first / middle / last). No
+     enhanced picture in the stretch → the iterator stays the plain one
+     (0.07 s a pair): a folder that holds a few test frames costs an
+     export nothing. (The first form probed the take's frames in order
+     and gave up after 600 files: frames enhanced past the first 300
+     pairs were not found.) Per frame the listing says whether a file is
+     there (no stat on the share). A frame of an enhanced stretch without
+     a picture: `bayer::demosaic` + `enlarged`, both on every core
+     (`bayer::fill_rows`): 0.38 s a pair (single-threaded it was 1.4 s).
+     The export bar's note says "frames from the enhanced DNGs, 7680 ×
+     7680 per eye". Output sizes from enhanced frames, measured
+     (hardware H.265 Main 10, M5 Max, ten pairs with the start-up):
+     8192×4096 0.45 s a pair, 4.2 GB peak; 13120×6560 0.60 s, 5.7 GB;
+     15360×7680 0.66 s, 6.6 GB; 16384×8192 0.69 s, 7.2 GB: all four
+     encode and decode. The GUI still offers a raw take only its present
+     sizes.
      The harness: `X6_ENHANCED=<folder>`. CFG: `#[cfg(target_os =
      "macos")] mod jxl_macos` in `lib.rs` and ONE gated pair of blocks in
      `enhanced_dng::decode_tile` (the other arm returns an error); nothing

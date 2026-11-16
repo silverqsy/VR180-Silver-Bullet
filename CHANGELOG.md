@@ -115,14 +115,16 @@ converter's controls for it, and every frame can be had as a DNG.
   values. With **Use enhanced frames** on (Export format, on by default)
   and the folder of Camera original DNGs beside the take, every frame of
   an export is taken from that picture where the folder has one, and from
-  the capture, enlarged to match, where it has not. Preview, grading and
-  stabilization stay on the capture; lens, timing and sound are the
-  take's. So the whole round trip is: export Camera original, enhance the
-  folder in Camera Raw, export the video. Read from a frame enhanced by
-  Camera Raw 18.7; its values agree with Camera Raw's own demosaic of the
-  frame to a part in a thousand. About 0.4 s a frame pair and 4 GB of
-  memory at 8192×4096. macOS only for now: the enhanced picture is JPEG
-  XL, which this build decodes through the system.
+  the capture, enlarged to match, where it has not. An export whose
+  stretch of the take holds no enhanced frame runs on the capture as
+  before, and the export bar says when enhanced frames are in use.
+  Preview, grading and stabilization stay on the capture; lens, timing
+  and sound are the take's. So the whole round trip is: export Camera
+  original, enhance the folder in Camera Raw, export the video. Read from
+  a frame enhanced by Camera Raw 18.7; its values agree with Camera Raw's
+  own demosaic of the frame to a part in a thousand. About 0.45 s a frame
+  pair and 4 GB of memory at 8192×4096. macOS only for now: the enhanced
+  picture is JPEG XL, which this build decodes through the system.
 - **What a take does not carry.** No accelerometer: the stabilizer has the
   gyro, but no horizon to level to. No readout time: there is no
   rolling-shutter correction. No white balance of its own: As shot is the

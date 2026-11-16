@@ -119,7 +119,10 @@ struct FrameSource {
 }
 
 impl FrameSource {
-    fn open(pipeline: Arc<Device>, cfg: &FisheyeExportConfig) -> Result<Self> {
+    /// `stretch`: the seconds of the clip the frames are taken from (what an
+    /// enhanced-frames folder is looked through for); for one frame, from
+    /// its time to a frame later, either of which may be the one written.
+    fn open(pipeline: Arc<Device>, cfg: &FisheyeExportConfig, stretch: (Option<f64>, Option<f64>)) -> Result<Self> {
         if !cfg.source_kind.is_raw_video() {
             return Err(Error::Ffmpeg(format!("{}: not a raw video clip, its frames have no DNG", cfg.source_path.display())));
         }
@@ -141,7 +144,8 @@ impl FrameSource {
         }
         let cfg = &cfg;
         let mut open = crate::fisheye_export::fisheye_export_opener(
-            cfg.source_kind, cfg.fisheye_swap_eyes, 10, cfg.braw_color.clone(), Some(pipeline.clone()), cfg.raw_enhanced_dir.clone());
+            cfg.source_kind, cfg.fisheye_swap_eyes, 10, cfg.braw_color.clone(), Some(pipeline.clone()),
+            cfg.raw_enhanced().map(|e| crate::x6_raw::EnhancedSource { t_in: stretch.0, t_out: stretch.1, ..e }));
         let decoder = open(&cfg.source_path)?;
         let src = decoder.eye_dims();
         let imu = crate::fisheye_export::resolve_export_imu(cfg);
@@ -229,7 +233,7 @@ impl FrameSource {
 /// output view, size, stabilization and lens; its encoder fields are not
 /// used.
 pub fn export_frame_dng(pipeline: Arc<Device>, cfg: &FisheyeExportConfig, t_s: f64, out: &Path) -> Result<()> {
-    let mut source = FrameSource::open(pipeline, cfg)?;
+    let mut source = FrameSource::open(pipeline, cfg, (Some(t_s), Some(t_s + 1.0 / cfg.fps.max(1.0) as f64)))?;
     source.decoder.seek(t_s.max(0.0))?;
     let pair = source.decoder.decode_forward_to(t_s.max(0.0), 1.0 / cfg.fps as f64)?
         .ok_or_else(|| Error::Ffmpeg("no frame at that time".into()))?;
@@ -241,7 +245,7 @@ pub fn export_frame_dng(pipeline: Arc<Device>, cfg: &FisheyeExportConfig, t_s: f
 /// clip's whole colour stack) into a 16-bit PNG at `out`: the picture the
 /// DNG of [`export_frame_dng`] should give in a raw converter.
 pub fn export_frame_png16(pipeline: Arc<Device>, cfg: &FisheyeExportConfig, t_s: f64, out: &Path) -> Result<()> {
-    let mut source = FrameSource::open(pipeline.clone(), cfg)?;
+    let mut source = FrameSource::open(pipeline.clone(), cfg, (Some(t_s), Some(t_s + 1.0 / cfg.fps.max(1.0) as f64)))?;
     source.decoder.seek(t_s.max(0.0))?;
     let pair = source.decoder.decode_forward_to(t_s.max(0.0), 1.0 / cfg.fps as f64)?
         .ok_or_else(|| Error::Ffmpeg("no frame at that time".into()))?;
@@ -280,7 +284,7 @@ pub fn export_dng_sequence(
     mut progress: impl FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
 ) -> Result<u64> {
-    let mut source = FrameSource::open(pipeline, &cfg)?;
+    let mut source = FrameSource::open(pipeline, &cfg, (cfg.trim_in_s, cfg.trim_out_s))?;
     let dir = cfg.output_path.clone();
     std::fs::create_dir_all(&dir)?;
     let stem = cfg.source_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "frame".into());

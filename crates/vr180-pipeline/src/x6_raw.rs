@@ -26,7 +26,7 @@
 //! level at 1.0, no white balance): they need the raw development stage of
 //! the colour stack before anything display-referred.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -502,20 +502,75 @@ impl Drop for EyeLoan {
     }
 }
 
-/// A take's frames as a raw converter enhanced them: the folder its
-/// camera-original DNGs were written into ([`crate::sensor_dng`]) and the
-/// side of the pictures the converter left in them
-/// ([`crate::enhanced_dng`]).
+/// Where an export takes a take's enhanced frames from: the folder its
+/// camera-original DNGs were written into ([`crate::sensor_dng`]) and a raw
+/// converter then enhanced in place ([`crate::enhanced_dng`]), and the
+/// stretch of the take the export covers (seconds on its timeline; `None`
+/// = from the start, to the end).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnhancedSource {
+    pub dir: PathBuf,
+    pub t_in: Option<f64>,
+    pub t_out: Option<f64>,
+}
+
+/// A take's enhanced frames in use: the folder, the side of the pictures
+/// the converter left in its files, and which frames it holds a file of.
 struct EnhancedFrames {
     dir: PathBuf,
     side: usize,
+    /// The requests each channel's folder holds a file of.
+    held: [HashSet<u32>; 2],
     /// Eye pictures taken from the folder, and from the capture instead.
     used: usize,
     missing: usize,
 }
 
-/// How many files are looked at for the first enhanced picture.
-const ENHANCED_SEARCH: usize = 600;
+/// How many of a stretch's largest files are opened for the enhanced
+/// pictures' size.
+const ENHANCED_SEARCH: usize = 8;
+
+/// The frame files of an enhanced-frames folder: each channel's requests
+/// with their file sizes, in order. Only files named as
+/// [`crate::sensor_dng::frame_file`] names them count.
+fn enhanced_listing(dir: &Path) -> [Vec<(u32, u64)>; 2] {
+    std::array::from_fn(|channel| {
+        let mut files = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir.join(crate::sensor_dng::channel_dir(channel))) else { return files };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(request) = name.strip_suffix(".dng").and_then(|stem| stem.parse::<u32>().ok()) else { continue };
+            if crate::sensor_dng::frame_file(channel, request).ends_with(&format!("/{name}")) {
+                files.push((request, entry.metadata().map(|m| m.len()).unwrap_or(0)));
+            }
+        }
+        files.sort_unstable();
+        files
+    })
+}
+
+/// Which files of a listing to open for the enhanced pictures' size, as
+/// `(channel, request)`, and how many files the stretch `wanted` has. A
+/// file keeps its mosaic and gains the enhanced picture, so the enhanced
+/// ones are the largest: those come first, then the stretch's first, middle
+/// and last file.
+fn enhanced_candidates(listing: &[Vec<(u32, u64)>; 2], wanted: impl Fn(u32) -> bool) -> (usize, Vec<(usize, u32)>) {
+    let mut files: Vec<(usize, u32, u64)> = listing.iter().enumerate()
+        .flat_map(|(channel, files)| files.iter().filter(|f| wanted(f.0)).map(move |f| (channel, f.0, f.1)))
+        .collect();
+    let count = files.len();
+    let by_name: Vec<(usize, u32)> = [0, count / 2, count.saturating_sub(1)].iter()
+        .filter_map(|&i| files.get(i).map(|f| (f.0, f.1))).collect();
+    files.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut out: Vec<(usize, u32)> = files.iter().take(ENHANCED_SEARCH).map(|f| (f.0, f.1)).collect();
+    for file in by_name {
+        if !out.contains(&file) {
+            out.push(file);
+        }
+    }
+    (count, out)
+}
 
 /// The frames of a raw take as fisheye pairs.
 ///
@@ -577,41 +632,46 @@ impl X6RawIter {
         })
     }
 
-    /// Take the frames from `dir` where a raw converter has enhanced them:
-    /// the folder the take's camera-original DNGs were written into
-    /// ([`crate::sensor_dng`]), whose files then hold the enhanced picture
-    /// ([`crate::enhanced_dng`]). The eyes become that picture's size
-    /// (twice the mosaic's for Super Resolution); a frame the folder has no
-    /// enhanced picture of comes from the capture, enlarged to match.
-    /// Nothing changes when the folder holds no enhanced picture.
-    pub fn with_enhanced_frames(mut self, dir: Option<&Path>) -> Self {
-        let Some(dir) = dir else { return self };
-        // The first, the middle and the last pair, then every pair in order.
-        let n = self.index.pairs.len();
-        let order = [0, n / 2, n.saturating_sub(1)].into_iter().chain(0..n);
-        let mut looked = 0usize;
-        let mut found = None;
-        'search: for i in order {
-            for channel in 0..2 {
-                if looked >= ENHANCED_SEARCH { break 'search; }
-                looked += 1;
-                let path = dir.join(crate::sensor_dng::frame_file(channel, self.index.pairs[i].request));
-                if let Ok(Some(p)) = crate::enhanced_dng::find(&path) {
-                    found = Some(p);
-                    break 'search;
-                }
-            }
-        }
+    /// Take the frames from `source`'s folder where a raw converter has
+    /// enhanced them. The eyes become the enhanced pictures' size (twice the
+    /// mosaic's for Super Resolution); a frame the folder has no enhanced
+    /// picture of comes from the capture, enlarged to match. Nothing changes
+    /// when no frame of the export's stretch has an enhanced picture: the
+    /// capture's frames are then used as they are.
+    pub fn with_enhanced_frames(mut self, source: Option<&EnhancedSource>) -> Self {
+        let Some(source) = source else { return self };
+        let dir = &source.dir;
+        let listing = enhanced_listing(dir);
+        // The frames of the stretch: from the one shown at its start to the
+        // one shown at its end.
+        let frames = self.index.pairs.len();
+        let first = source.t_in.map(|t| self.index.frame_at(t.max(0.0))).unwrap_or(0);
+        let last = source.t_out.map(|t| self.index.frame_at(t.max(0.0))).unwrap_or(frames).min(frames.saturating_sub(1));
+        let wanted: HashSet<u32> = self.index.pairs.iter().skip(first).take((last + 1).saturating_sub(first)).map(|p| p.request).collect();
+        let (count, candidates) = enhanced_candidates(&listing, |request| wanted.contains(&request));
+        let found = candidates.iter().find_map(|&(channel, request)|
+            crate::enhanced_dng::find(&dir.join(crate::sensor_dng::frame_file(channel, request))).ok().flatten());
         match found {
             Some(p) if p.width == p.height && p.width as usize % EYE_SIDE == 0 => {
-                tracing::info!("raw take {}: enhanced frames of {}x{} in {}", self.index.take.dir.display(), p.width, p.height, dir.display());
-                self.enhanced = Some(EnhancedFrames { dir: dir.to_path_buf(), side: p.width as usize, used: 0, missing: 0 });
+                tracing::info!("raw take {}: enhanced frames of {}x{} in {} ({count} files for the {} frames of this stretch)",
+                    self.index.take.dir.display(), p.width, p.height, dir.display(), wanted.len());
+                self.enhanced = Some(EnhancedFrames {
+                    dir: dir.clone(), side: p.width as usize,
+                    held: listing.map(|files| files.into_iter().map(|f| f.0).collect()),
+                    used: 0, missing: 0,
+                });
                 self.half = false;
             }
             Some(p) => tracing::warn!("raw take: the enhanced frames in {} are {}x{}, not a whole multiple of the take's: not used", dir.display(), p.width, p.height),
-            None => tracing::warn!("raw take: no enhanced frame in {} ({looked} files looked at): the capture's frames are used", dir.display()),
+            None if count > 0 => tracing::warn!("raw take: none of the {count} files of this stretch in {} holds an enhanced picture ({} looked at): the capture's frames are used", dir.display(), candidates.len()),
+            None => tracing::info!("raw take: {} holds no frame of this stretch: the capture's frames are used", dir.display()),
         }
         self
+    }
+
+    /// The side of the enhanced pictures in use, if any are.
+    pub fn enhanced_side(&self) -> Option<u32> {
+        self.enhanced.as_ref().map(|e| e.side as u32)
     }
 
     /// Hand out each frame as its two mosaics ([`MOSAIC_BIT_DEPTH`] pairs)
@@ -647,18 +707,18 @@ impl X6RawIter {
     /// has no enhanced picture of is the capture's frame, demosaiced and
     /// enlarged to the same size.
     fn enhanced_channels(&mut self, i: usize) -> Result<[Vec<u16>; 2]> {
-        let (dir, side) = match &self.enhanced {
-            Some(e) => (e.dir.clone(), e.side),
+        let request = self.index.pairs.get(i).ok_or_else(|| take_err(format!("frame {i} is past the take's end")))?.request;
+        let (dir, side, held) = match &self.enhanced {
+            Some(e) => (e.dir.clone(), e.side, [e.held[0].contains(&request), e.held[1].contains(&request)]),
             None => return Err(take_err("no enhanced frames")),
         };
-        let request = self.index.pairs.get(i).ok_or_else(|| take_err(format!("frame {i} is past the take's end")))?.request;
         // The two channels' pictures decode side by side.
         let channel = |channel: usize| -> Result<Vec<u16>> {
-            let path = dir.join(crate::sensor_dng::frame_file(channel, request));
             // A frame the folder does not hold is not worth a line of its own.
-            if !path.is_file() {
+            if !held[channel] {
                 return Ok(Vec::new());
             }
+            let path = dir.join(crate::sensor_dng::frame_file(channel, request));
             match crate::enhanced_dng::find(&path) {
                 Ok(Some(p)) if p.width as usize == side && p.height as usize == side => {
                     let mut px = vec![0u16; side * side * 4];
@@ -671,10 +731,14 @@ impl X6RawIter {
             }
             Ok(Vec::new())
         };
-        let (first, second) = std::thread::scope(|scope| {
-            let other = scope.spawn(|| channel(1));
-            (channel(0), other.join().unwrap_or_else(|_| Err(take_err("the enhanced picture's decoder stopped"))))
-        });
+        let (first, second) = if held[0] && held[1] {
+            std::thread::scope(|scope| {
+                let other = scope.spawn(|| channel(1));
+                (channel(0), other.join().unwrap_or_else(|_| Err(take_err("the enhanced picture's decoder stopped"))))
+            })
+        } else {
+            (channel(0), channel(1))
+        };
         let mut eyes: [Vec<u16>; 2] = [first?, second?];
         let absent = eyes.iter().filter(|e| e.is_empty()).count();
         if absent > 0 {
@@ -745,21 +809,21 @@ fn enlarged(rgb: &[[f32; 3]], side: usize, factor: usize) -> Vec<u16> {
     let out_side = side * factor;
     let mut out = vec![u16::MAX; out_side * out_side * 4];
     let f = factor as f32;
-    for y in 0..out_side {
+    crate::bayer::fill_rows(&mut out, out_side * 4, |y, row| {
         let sy = ((y as f32 + 0.5) / f - 0.5).clamp(0.0, side as f32 - 1.0);
         let (y0, fy) = (sy.floor() as usize, sy - sy.floor());
         let y1 = (y0 + 1).min(side - 1);
-        for x in 0..out_side {
+        for (x, px) in row.chunks_exact_mut(4).enumerate() {
             let sx = ((x as f32 + 0.5) / f - 0.5).clamp(0.0, side as f32 - 1.0);
             let (x0, fx) = (sx.floor() as usize, sx - sx.floor());
             let x1 = (x0 + 1).min(side - 1);
             let (a, b, c, d) = (rgb[y0 * side + x0], rgb[y0 * side + x1], rgb[y1 * side + x0], rgb[y1 * side + x1]);
             for k in 0..3 {
                 let v = (a[k] * (1.0 - fx) + b[k] * fx) * (1.0 - fy) + (c[k] * (1.0 - fx) + d[k] * fx) * fy;
-                out[(y * out_side + x) * 4 + k] = (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                px[k] = (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
             }
         }
-    }
+    });
     out
 }
 
@@ -903,6 +967,44 @@ mod tests {
         assert_eq!(&same[4..8], &[65535, 32768, 16384, 65535]);
     }
 
+    #[test]
+    fn the_largest_files_of_a_stretch_are_looked_at_first() {
+        let dir = std::env::temp_dir().join(format!("vr180-enhanced-candidates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for channel in 0..2 {
+            std::fs::create_dir_all(dir.join(crate::sensor_dng::channel_dir(channel))).unwrap();
+        }
+        // Forty plain frames a channel, and one large one late in channel 1.
+        for channel in 0..2 {
+            for request in 100..140u32 {
+                let len = if (channel, request) == (1, 131) { 900 } else { 100 + (request as usize % 7) };
+                std::fs::write(dir.join(crate::sensor_dng::frame_file(channel, request)), vec![0u8; len]).unwrap();
+            }
+        }
+        // What is not a frame file of the folder's naming is not listed.
+        for stray in ["CAM0/._000000100.dng", "CAM0/notes.txt", "CAM0/364.dng", "CAM1/000000131-Enhanced.dng"] {
+            std::fs::write(dir.join(stray), vec![0u8; 5000]).unwrap();
+        }
+        let listing = enhanced_listing(&dir);
+        assert_eq!((listing[0].len(), listing[1].len()), (40, 40));
+        assert_eq!((listing[0][0], listing[1][31]), ((100, 102), (131, 900)));
+        // The whole take: the large file first, and the ends of the listing among the rest.
+        let (count, files) = enhanced_candidates(&listing, |_| true);
+        assert_eq!(count, 80);
+        assert_eq!(files[0], (1, 131));
+        assert!(files.len() >= ENHANCED_SEARCH && files.len() <= ENHANCED_SEARCH + 3, "{}", files.len());
+        assert!(files.contains(&(0, 100)) && files.contains(&(1, 139)));
+        // A stretch the large file is not in: its own files only.
+        let (count, files) = enhanced_candidates(&listing, |request| (100..110).contains(&request));
+        assert_eq!(count, 20);
+        assert!(files.iter().all(|f| (100..110).contains(&f.1)) && !files.contains(&(1, 131)));
+        // A stretch the folder holds nothing of, and a folder that is not there.
+        assert_eq!(enhanced_candidates(&listing, |request| request > 500), (0, Vec::new()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let none = enhanced_listing(&dir);
+        assert!(none[0].is_empty() && none[1].is_empty());
+    }
+
     /// The sample frame Camera Raw enhanced (skipped when the volume is not
     /// mounted or the folder no longer holds it): the take's frames come at
     /// the enhanced size, the enhanced eye from the folder and the other
@@ -915,15 +1017,24 @@ mod tests {
         if !take.exists() || !cfg!(target_os = "macos") || !matches!(crate::enhanced_dng::find(&file), Ok(Some(_))) { return; }
         // Without the folder, and with a folder that holds nothing: the capture's own size.
         let plain = X6RawIter::new(&take, false, false, 1, None).unwrap().with_enhanced_frames(None);
-        assert_eq!(plain.eye_dims(), (3840, 3840));
+        assert_eq!((plain.eye_dims(), plain.enhanced_side()), ((3840, 3840), None));
+        let whole = |dir: &Path| EnhancedSource { dir: dir.to_path_buf(), t_in: None, t_out: None };
         let empty = std::env::temp_dir().join(format!("vr180-no-enhanced-{}", std::process::id()));
         std::fs::create_dir_all(&empty).unwrap();
-        assert_eq!(X6RawIter::new(&take, false, false, 1, None).unwrap().with_enhanced_frames(Some(&empty)).eye_dims(), (3840, 3840));
+        assert_eq!(X6RawIter::new(&take, false, false, 1, None).unwrap().with_enhanced_frames(Some(&whole(&empty))).eye_dims(), (3840, 3840));
         let _ = std::fs::remove_dir_all(&empty);
-        let mut iter = X6RawIter::new(&take, false, true, 1, None).unwrap().with_enhanced_frames(Some(&dir));
-        assert_eq!(iter.eye_dims(), (7680, 7680));
+        let mut iter = X6RawIter::new(&take, false, true, 1, None).unwrap().with_enhanced_frames(Some(&whole(&dir)));
+        assert_eq!((iter.eye_dims(), iter.enhanced_side()), ((7680, 7680), Some(7680)));
         let i = iter.index().pairs.iter().position(|p| p.request == 364).expect("request 364");
         let t = iter.index().pts_s(i);
+        // A stretch around the frame uses it; a stretch it is not in leaves the capture as it is.
+        let stretch = |t_in: f64, t_out: f64| X6RawIter::new(&take, false, false, 1, None).unwrap()
+            .with_enhanced_frames(Some(&EnhancedSource { dir: dir.clone(), t_in: Some(t_in), t_out: Some(t_out) })).eye_dims();
+        let dt = 1.0 / 50.0;
+        assert_eq!(stretch(t - 0.1, t + 0.1), (7680, 7680));
+        assert_eq!(stretch(t, t), (7680, 7680));
+        assert_eq!(stretch(t + dt, t + 2.0), (3840, 3840));
+        assert_eq!(stretch(0.0, t - dt), (3840, 3840));
         iter.seek(t).unwrap();
         let pair = iter.next_pair().unwrap().expect("a frame");
         assert_eq!((pair.eye_w, pair.eye_h, pair.bit_depth), (7680, 7680, 16));
