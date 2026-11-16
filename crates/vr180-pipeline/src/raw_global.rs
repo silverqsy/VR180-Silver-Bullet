@@ -15,8 +15,17 @@
 //! - **Blacks**: belongs to the picture only through its darkest level — a
 //!   bright picture's black is clipped, or lifted, from where the picture's
 //!   own black is (a table over the slider and that level).
-//! - **Whites above zero** and **Contrast** belong to the frame (how far
-//!   its top is from white; where its weight lies): not here yet.
+//! - **Contrast** belongs to the frame by where its weight lies: over 300
+//!   distributions its maps at every slider value are the median maps plus
+//!   three shapes (0.2/255 left over), and small networks give a frame's
+//!   three numbers from its reduced copy — the same copy the Shadows /
+//!   Highlights curves come from.
+//! - **Whites above zero** is no map of the output but, on the value the
+//!   tone curve is fed, `v' = a1·v + a2·v²` (to 0.2–0.8/255 on every chart),
+//!   with the two numbers following mostly how far the frame's top is from
+//!   white: networks again ([`whites_up`]).
+
+use crate::raw_local::{curve_inputs, CurveNet};
 
 /// Samples of a map: the encoded default output `k / (NODES − 1)`.
 pub const NODES: usize = 129;
@@ -111,15 +120,139 @@ pub fn blacks_map(amount: f32, dark: f32) -> Option<Vec<f32>> {
     blacks().at(amount, dark)
 }
 
-/// The map of Whites at `amount` (−100..100). `None` at zero, and above
-/// zero (the frame's own curve: not here yet).
+/// The map of Whites at `amount` below zero. `None` at zero and above
+/// (see [`whites_up`]).
 pub fn whites_map(amount: f32) -> Option<Vec<f32>> {
     whites_down().at(amount, 0.0)
 }
 
-/// The map of Contrast at `amount`: the frame's own curve, not here yet.
-pub fn contrast_map(_amount: f32) -> Option<Vec<f32>> {
-    None
+/// The inputs the networks take of a frame: the shape of its reduced copy's
+/// levels (sorted rising). `None` when there is too little to go by.
+fn shape_inputs(levels: &[f32]) -> Option<Vec<f32>> {
+    if levels.len() < 8 || levels[levels.len() - 1] - levels[0] < 0.05 {
+        return None;
+    }
+    let (mut x, _) = curve_inputs(levels, 0.0);
+    x.truncate(20);
+    Some(x)
+}
+
+struct ContrastFamily {
+    amounts: Vec<f32>,
+    nodes: usize,
+    /// `amounts × nodes`: the median map less the identity.
+    median: Vec<f32>,
+    /// Per shape `amounts × nodes`.
+    shapes: Vec<Vec<f32>>,
+    /// A frame's numbers on the shapes: the networks' outputs times `scale`
+    /// plus `mean`.
+    mean: Vec<f32>,
+    scale: Vec<f32>,
+    nets: Vec<CurveNet>,
+}
+
+fn contrast_family() -> &'static ContrastFamily {
+    static F: std::sync::OnceLock<ContrastFamily> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        let v = floats(include_bytes!("data/raw_contrast.f32"));
+        let na = v[0] as usize;
+        let amounts = v[1..1 + na].to_vec();
+        let (nodes, rank) = (v[1 + na] as usize, v[2 + na] as usize);
+        let mut at = 3 + na;
+        let mut take = |n: usize| { let s = v[at..at + n].to_vec(); at += n; s };
+        let median = take(na * nodes);
+        let shapes = (0..rank).map(|_| take(na * nodes)).collect();
+        let (mean, scale) = (take(rank), take(rank));
+        let nets = CurveNet::read(&v, &mut at);
+        assert_eq!(at, v.len(), "raw_contrast.f32");
+        ContrastFamily { amounts, nodes, median, shapes, mean, scale, nets }
+    })
+}
+
+/// The map of Contrast at `amount` (−100..100) for a frame whose reduced
+/// copy has the levels `levels` (sorted rising; as shot or exposed, only
+/// their shape counts). `None` at zero. A frame nothing is known of gets
+/// the median maps.
+pub fn contrast_map(amount: f32, levels: &[f32]) -> Option<Vec<f32>> {
+    if amount == 0.0 {
+        return None;
+    }
+    let f = contrast_family();
+    let numbers: Vec<f32> = match shape_inputs(levels) {
+        Some(x) => CurveNet::mean_of(&f.nets, &x).iter().zip(&f.scale).zip(&f.mean).map(|((y, s), m)| y * s + m).collect(),
+        None => vec![0.0; f.mean.len()],
+    };
+    // The frame's maps at the measured slider values, on the tables' nodes:
+    // rising, within 0..1, white kept.
+    let last = (f.nodes - 1) as f32;
+    let mut values = Vec::with_capacity(f.amounts.len() * NODES);
+    for a in 0..f.amounts.len() {
+        let coarse: Vec<f32> = (0..f.nodes).map(|k| {
+            let i = a * f.nodes + k;
+            k as f32 / last + f.median[i] + numbers.iter().zip(&f.shapes).map(|(n, s)| n * s[i]).sum::<f32>()
+        }).collect();
+        let mut top = 0f32;
+        for k in 0..NODES {
+            let e = k as f32 / (NODES - 1) as f32;
+            top = top.max(apply(&coarse, e).clamp(0.0, 1.0));
+            values.push(if k == NODES - 1 { 1.0 } else { top });
+        }
+    }
+    Table { amounts: f.amounts.clone(), darks: Vec::new(), values }.at(amount, 0.0)
+}
+
+struct WhitesUp {
+    amounts: Vec<f32>,
+    /// Per slider value log₂ a1, log₂ a2: the networks' outputs times
+    /// `scale` plus `mean`.
+    mean: Vec<f32>,
+    scale: Vec<f32>,
+    nets: Vec<CurveNet>,
+}
+
+fn whites_up_nets() -> &'static WhitesUp {
+    static W: std::sync::OnceLock<WhitesUp> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
+        let v = floats(include_bytes!("data/raw_whites_up.f32"));
+        let na = v[0] as usize;
+        let mut at = 1 + na;
+        let mut take = |n: usize| { let s = v[at..at + n].to_vec(); at += n; s };
+        let (mean, scale) = (take(2 * na), take(2 * na));
+        let nets = CurveNet::read(&v, &mut at);
+        assert_eq!(at, v.len(), "raw_whites_up.f32");
+        WhitesUp { amounts: v[1..1 + na].to_vec(), mean, scale, nets }
+    })
+}
+
+/// What the frame's top reads lower on a frame than on the charts the
+/// networks were fitted to, in stops (nineteen frames: 0.27 ± 0.11).
+pub const WHITES_TOP_OFFSET: f32 = 0.27;
+
+/// Whites at `amount` above zero: `(a1, a2)` of `v' = a1·v + a2·v²` on the
+/// value the tone curve is fed (the result not above 1). `levels`: the
+/// reduced copy's levels as Whites meet the frame (exposed, Shadows /
+/// Highlights in; sorted rising); `top`: log₂ of the fed value of the
+/// frame's top. `None` at zero or below, or with nothing known of the frame.
+pub fn whites_up(amount: f32, levels: &[f32], top: f32) -> Option<(f32, f32)> {
+    if amount <= 0.0 {
+        return None;
+    }
+    let w = whites_up_nets();
+    let mut x = shape_inputs(levels)?;
+    x.push((top + WHITES_TOP_OFFSET).clamp(-8.0, 0.0));
+    let y: Vec<f32> = CurveNet::mean_of(&w.nets, &x).iter().zip(&w.scale).zip(&w.mean).map(|((y, s), m)| y * s + m).collect();
+    let amount = amount.min(w.amounts[w.amounts.len() - 1]);
+    // Below the first measured value: log₂ a1 with the slider, a2 with its square.
+    let first = w.amounts[0];
+    if amount <= first {
+        let t = amount / first;
+        return Some((2f32.powf(y[0] * t), 2f32.powf(y[1]) * t * t));
+    }
+    // Between two measured values: both in log₂.
+    let i = (1..w.amounts.len()).find(|i| amount <= w.amounts[*i]).unwrap_or(w.amounts.len() - 1);
+    let t = (amount - w.amounts[i - 1]) / (w.amounts[i] - w.amounts[i - 1]);
+    let between = |k: usize| 2f32.powf(y[2 * (i - 1) + k] * (1.0 - t) + y[2 * i + k] * t);
+    Some((between(0), between(1)))
 }
 
 /// A map at the encoded default output `e`.
@@ -167,6 +300,65 @@ mod tests {
         assert!((at(&blacks_map(-1.0, -10.0).unwrap(), 96.0) - 96.0).abs() < 0.5);
         assert_eq!(blacks_map(-140.0, -10.0), blacks_map(-100.0, -10.0));
         assert_eq!(blacks_map(-100.0, -30.0), blacks_map(-100.0, -13.0));
+    }
+
+    /// Levels spread evenly from `lo` to `hi`.
+    fn spread(lo: f32, hi: f32) -> Vec<f32> {
+        (0..441).map(|i| lo + (hi - lo) * i as f32 / 440.0).collect()
+    }
+
+    #[test]
+    fn contrast_belongs_to_the_frame() {
+        let levels = spread(-9.0, 0.0);
+        assert!(contrast_map(0.0, &levels).is_none());
+        // Camera Raw on a chart spread evenly over nine stops, +100:
+        // 32 → 9, 64 → 41, 128 → 137, 192 → 219; −100: 32 → 54, 128 → 121,
+        // 192 → 168; what is left alone lies near 113.
+        let up = contrast_map(100.0, &levels).unwrap();
+        for (e, want, tol) in [(32.0, 9.4, 4.0), (64.0, 40.7, 6.0), (128.0, 137.5, 8.0), (192.0, 218.6, 6.0)] {
+            assert!((at(&up, e) - want).abs() < tol, "+100 at {e}: {} vs {want}", at(&up, e));
+        }
+        let down = contrast_map(-100.0, &levels).unwrap();
+        for (e, want, tol) in [(32.0, 54.2, 5.0), (128.0, 121.4, 8.0), (192.0, 167.9, 6.0)] {
+            assert!((at(&down, e) - want).abs() < tol, "-100 at {e}: {} vs {want}", at(&down, e));
+        }
+        for m in [&up, &down] {
+            assert!(m[0] >= 0.0 && (m[NODES - 1] - 1.0).abs() < 1e-6 && m.windows(2).all(|w| w[1] >= w[0]));
+        }
+        // The same levels three stops down: the same maps (only the shape counts).
+        let lower: Vec<f32> = levels.iter().map(|l| l - 3.0).collect();
+        let same = contrast_map(100.0, &lower).unwrap();
+        assert!(up.iter().zip(&same).all(|(a, b)| (a - b).abs() < 1e-4));
+        // A real frame (a room by lamplight; its reduced copy's levels at
+        // every twentieth of the ranks): what is left alone lies higher,
+        // near 150 — Camera Raw takes 128 to 111 on it, 96 to 68.
+        let ranks = [-10.40, -8.03, -7.28, -6.84, -6.50, -6.21, -5.83, -5.53, -5.23, -5.04, -4.86, -4.63, -4.51, -4.42, -4.27, -4.06, -3.76, -3.51, -3.35, -3.16, -3.01f32];
+        let room: Vec<f32> = (0..=400).map(|i| { let (k, f) = (i / 20, (i % 20) as f32 / 20.0); ranks[k] * (1.0 - f) + ranks[(k + 1).min(20)] * f }).collect();
+        let lamp = contrast_map(100.0, &room).unwrap();
+        assert!((at(&lamp, 128.0) - 111.4).abs() < 8.0 && (at(&lamp, 96.0) - 67.8).abs() < 6.0, "{} {}", at(&lamp, 128.0), at(&lamp, 96.0));
+        // Half the slider: the map measured there; nothing known: the median maps.
+        let half = contrast_map(50.0, &levels).unwrap();
+        assert!(at(&half, 64.0) > at(&up, 64.0) + 5.0 && at(&half, 64.0) < 64.0);
+        assert!(contrast_map(100.0, &[]).is_some());
+    }
+
+    #[test]
+    fn whites_above_zero_follow_the_frames_top() {
+        let levels = spread(-9.0, 0.0);
+        assert!(whites_up(0.0, &levels, 0.0).is_none() && whites_up(-30.0, &levels, 0.0).is_none() && whites_up(50.0, &[], 0.0).is_none());
+        // A frame reaching white: +100 is about v + 7·v² (Camera Raw on such
+        // a chart: a fed value of 1/8 goes to 0.24).
+        let (a1, a2) = whites_up(100.0, &levels, -0.15 - WHITES_TOP_OFFSET).unwrap();
+        let to = a1 * 0.125 + a2 * 0.125 * 0.125;
+        assert!((to - 0.243).abs() < 0.07 && a1 > 0.9 && a1 < 1.3, "{a1} {a2} {to}");
+        // A frame whose top is three stops down: far more.
+        let (b1, b2) = whites_up(100.0, &spread(-10.0, -3.0), -3.0 - WHITES_TOP_OFFSET).unwrap();
+        assert!(b2 > 20.0 * a2 && b1 > a1, "{b1} {b2}");
+        // Less slider, less of both; toward zero nothing.
+        let (c1, c2) = whites_up(50.0, &levels, -0.15 - WHITES_TOP_OFFSET).unwrap();
+        assert!(c2 < 0.4 * a2 && c1 > 0.95 && c1 < 1.1, "{c1} {c2}");
+        let (d1, d2) = whites_up(1.0, &levels, -0.15 - WHITES_TOP_OFFSET).unwrap();
+        assert!((d1 - 1.0).abs() < 2e-3 && d2 < 1e-3);
     }
 
     #[test]

@@ -1006,6 +1006,8 @@ mod tests {
             RawSettings { blacks: 80.0, whites: -60.0, ..Default::default() },
             RawSettings { blacks: -50.0, exposure: 1.0, ..Default::default() },
             RawSettings { blacks: -80.0, whites: -100.0, ..Default::default() },
+            RawSettings { contrast: 70.0, ..Default::default() },
+            RawSettings { contrast: -50.0, whites: 40.0, ..Default::default() },
         ] {
             let stage = RawDevelop { camera: RawCamera::X6, settings, measure: Measure::Wait };
             // The keys the GPU reads off the picture are the CPU's own of the same cells.

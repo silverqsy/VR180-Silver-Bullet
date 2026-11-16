@@ -369,7 +369,7 @@ impl RawDevelop {
             None => plain_white,
         };
         // Contrast: the tone curve the fed value goes through.
-        let tone = self.tone_table();
+        let tone = self.tone_table(&stats.levels);
         let tone_at = |fed: f64| match &tone {
             Some(t) => lerp_table(t, fed.clamp(0.0, 1.0) * (t.len() - 1) as f64),
             None => default_curve(fed),
@@ -402,7 +402,26 @@ impl RawDevelop {
                 };
                 ((0..CURVE_SAMPLES).map(|i| at(level(i, OUT_LO, 0.0)) as f32).collect(), at(0.0) as f32)
             };
-            let (whites, whites_floor) = fed_map(crate::raw_global::whites_map(self.settings.whites));
+            // Whites above zero go by the frame as they meet it: its levels
+            // and its top with exposure and the gain in, the top as the
+            // white point hands it on.
+            let whites_up = || -> Option<(f32, f32)> {
+                let shift = gain.log2() as f32;
+                let gained = |l: f32| l + shift + sample_curve(&log_gain, (l + shift - LOCAL_LO) * LOCAL_PER_STOP);
+                let mut levels: Vec<f32> = stats.levels.iter().map(|l| gained(*l)).collect();
+                levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let top = stats.levels.last()?;
+                let lit = default_black(2f64.powf((*top + shift) as f64), dark_key) * 2f64.powf((gained(*top) - *top - shift) as f64);
+                let fed_top = default_white(lit, white).clamp(1e-9, 1.0).log2() as f32;
+                crate::raw_global::whites_up(self.settings.whites, &levels, fed_top)
+            };
+            let (whites, whites_floor) = match whites_up() {
+                Some((a1, a2)) => ((0..CURVE_SAMPLES).map(|i| {
+                    let v = level(i, OUT_LO, 0.0);
+                    (a1 as f64 * v + a2 as f64 * v * v).min(1.0) as f32
+                }).collect(), 0.0),
+                None => fed_map(crate::raw_global::whites_map(self.settings.whites)),
+            };
             let (blacks, blacks_floor) = fed_map(crate::raw_global::blacks_map(self.settings.blacks, dark));
             let tone: Vec<f32> = (0..CURVE_SAMPLES).map(|i| tone_at(level(i, OUT_LO, 0.0)) as f32).collect();
             LocalTone {
@@ -424,9 +443,11 @@ impl RawDevelop {
 
     /// The frame's tone curve with Contrast in: output light over the value
     /// the default curve is fed, [`TONE_SAMPLES`] equally spaced samples
-    /// over 0..1. `None`: the default curve.
-    fn tone_table(&self) -> Option<Vec<f32>> {
-        let map = crate::raw_global::contrast_map(self.settings.contrast)?;
+    /// over 0..1. `None`: the default curve. `levels`: the frame's reduced
+    /// copy as shot (exposure and Shadows / Highlights do not change the
+    /// curve: measured).
+    fn tone_table(&self, levels: &[f32]) -> Option<Vec<f32>> {
+        let map = crate::raw_global::contrast_map(self.settings.contrast, levels)?;
         Some((0..TONE_SAMPLES).map(|i| {
             let e = srgb_encode(default_curve(i as f64 / (TONE_SAMPLES - 1) as f64) as f32);
             srgb_decode(crate::raw_global::apply(&map, e))
@@ -1083,6 +1104,36 @@ mod tests {
         // go by the lifted one.
         let lifted = with(RawSettings { blacks: 100.0, shadows: 50.0, ..Default::default() });
         assert!(lifted.local.as_ref().unwrap().blacks.floor != up.local.as_ref().unwrap().blacks.floor);
+    }
+
+    #[test]
+    fn contrast_and_whites_above_zero() {
+        let stats = spread_frame(0.0);
+        let with = |settings: RawSettings| x6(settings).constants_for(&stats, None);
+        let plain = with(RawSettings::default());
+        // Contrast alone is a tone curve of the frame's own: no stage.
+        let hard = with(RawSettings { contrast: 100.0, ..Default::default() });
+        assert!(hard.local.is_none() && hard.curve != plain.curve);
+        // Shadows darker, highlights brighter, the two ends where they were.
+        assert!(hard.tone(0.01) < 0.7 * plain.tone(0.01) && hard.tone(0.7) > plain.tone(0.7) + 0.02, "{} {} / {} {}", hard.tone(0.01), plain.tone(0.01), hard.tone(0.7), plain.tone(0.7));
+        assert!(hard.tone(0.0) == 0.0 && (hard.tone(hard.white_point) - 1.0).abs() < 1e-3);
+        let soft = with(RawSettings { contrast: -100.0, ..Default::default() });
+        assert!(soft.tone(0.01) > 1.3 * plain.tone(0.01) && soft.tone(0.7) < plain.tone(0.7));
+        // With Shadows the stage's tone curve carries it.
+        let both = with(RawSettings { contrast: 100.0, shadows: 30.0, ..Default::default() });
+        let local = both.local.as_ref().unwrap();
+        assert!((local.tone_of(0.05) - default_curve(0.05) as f32).abs() > 0.01);
+        // Whites above zero: a curve of the fed value, brighter everywhere
+        // and most at the top; nothing passes white.
+        let bright = with(RawSettings { whites: 60.0, ..Default::default() });
+        let w = &bright.local.as_ref().unwrap().whites;
+        assert!(!w.keyed && w.floor == 0.0 && w.at(0.02) > 0.02 && w.at(0.02) < 0.03 && w.at(0.4) > 0.5 && w.at(0.99) <= 1.0, "{} {}", w.at(0.02), w.at(0.4));
+        // A frame whose top is lower gets more of it.
+        let low = x6(RawSettings { whites: 60.0, ..Default::default() }).constants_for(&spread_frame(-3.0), None);
+        assert!(low.local.as_ref().unwrap().whites.at(0.05) > w.at(0.05) * 1.2);
+        // Nothing known of the frame: Whites above zero do nothing.
+        let blind = x6(RawSettings { whites: 60.0, ..Default::default() }).constants(ToneKeys { max: 1.0, dark: 0.002 });
+        assert!((blind.local.as_ref().unwrap().whites.at(0.3) - 0.3).abs() < 1e-4);
     }
 
     #[test]

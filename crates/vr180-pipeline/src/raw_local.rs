@@ -194,7 +194,7 @@ pub const HEADROOM_MAX: f32 = 4.0;
 /// What the curves are derived from: the levels at [`RANKS`] and three
 /// means of the copy, all relative to the anchor (the power mean, p = 0.6,
 /// of the copy's luminance), then `headroom`; and the anchor itself.
-fn curve_inputs(sorted: &[f32], headroom: f32) -> (Vec<f32>, f32) {
+pub(crate) fn curve_inputs(sorted: &[f32], headroom: f32) -> (Vec<f32>, f32) {
     let anchor = power_mean(sorted, 0.6);
     let mean = sorted.iter().map(|l| *l as f64).sum::<f64>() / sorted.len() as f64;
     let mut x: Vec<f32> = RANKS.iter().map(|q| (quantile(sorted, *q) - anchor) as f32).collect();
@@ -204,7 +204,7 @@ fn curve_inputs(sorted: &[f32], headroom: f32) -> (Vec<f32>, f32) {
 }
 
 /// One fitted network: inputs standardised, `tanh` layers, a linear last one.
-struct CurveNet {
+pub(crate) struct CurveNet {
     mean: Vec<f32>,
     scale: Vec<f32>,
     /// Per layer: weights (`inputs × outputs`, an input's row after the
@@ -213,7 +213,37 @@ struct CurveNet {
 }
 
 impl CurveNet {
-    fn eval(&self, x: &[f32]) -> Vec<f32> {
+    /// Networks as they are stored from `values[*at]` on: their count; per
+    /// network the layer count, the sizes, the inputs' means and scales,
+    /// then every layer's weights and biases.
+    pub(crate) fn read(values: &[f32], at: &mut usize) -> Vec<CurveNet> {
+        let mut take = |n: usize| { let s = values[*at..*at + n].to_vec(); *at += n; s };
+        let count = take(1)[0] as usize;
+        (0..count).map(|_| {
+            let layers = take(1)[0] as usize;
+            let sizes: Vec<usize> = take(layers + 1).iter().map(|s| *s as usize).collect();
+            let (mean, scale) = (take(sizes[0]), take(sizes[0]));
+            let layers = sizes.windows(2).map(|w| (take(w[0] * w[1]), take(w[1]))).collect();
+            CurveNet { mean, scale, layers }
+        }).collect()
+    }
+
+    /// The mean of several networks' outputs for the inputs `x`.
+    pub(crate) fn mean_of(nets: &[CurveNet], x: &[f32]) -> Vec<f32> {
+        let mut y: Vec<f32> = Vec::new();
+        for net in nets {
+            let out = net.eval(x);
+            if y.is_empty() {
+                y = vec![0.0; out.len()];
+            }
+            for (acc, v) in y.iter_mut().zip(&out) {
+                *acc += v / nets.len() as f32;
+            }
+        }
+        y
+    }
+
+    pub(crate) fn eval(&self, x: &[f32]) -> Vec<f32> {
         let mut h: Vec<f32> = x.iter().zip(&self.mean).zip(&self.scale).map(|((v, m), s)| (v - m) / s).collect();
         let last = self.layers.len() - 1;
         for (n, (w, b)) in self.layers.iter().enumerate() {
@@ -242,16 +272,7 @@ fn curve_nets() -> &'static [CurveNet] {
     NETS.get_or_init(|| {
         let v: Vec<f32> = include_bytes!("data/raw_local_curves.f32").chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-        let mut at = 0usize;
-        let mut take = |n: usize| { let s = v[at..at + n].to_vec(); at += n; s };
-        let count = take(1)[0] as usize;
-        (0..count).map(|_| {
-            let layers = take(1)[0] as usize;
-            let sizes: Vec<usize> = take(layers + 1).iter().map(|s| *s as usize).collect();
-            let (mean, scale) = (take(sizes[0]), take(sizes[0]));
-            let layers = sizes.windows(2).map(|w| (take(w[0] * w[1]), take(w[1]))).collect();
-            CurveNet { mean, scale, layers }
-        }).collect()
+        CurveNet::read(&v, &mut 0)
     })
 }
 
@@ -279,15 +300,8 @@ pub fn local_curves(levels: &[f32], headroom: f32) -> LocalCurves {
         return LocalCurves::flat();
     }
     let (x, anchor) = curve_inputs(levels, headroom);
-    let nets = curve_nets();
-    let mut y = vec![0f32; 3 * CURVE_POINTS + 3];
-    for net in nets {
-        let out = net.eval(&x);
-        assert_eq!(out.len(), y.len(), "raw_local_curves.f32: three curves and three numbers a network");
-        for (acc, v) in y.iter_mut().zip(&out) {
-            *acc += v / nets.len() as f32;
-        }
-    }
+    let y = CurveNet::mean_of(curve_nets(), &x);
+    assert_eq!(y.len(), 3 * CURVE_POINTS + 3, "raw_local_curves.f32: three curves and three numbers a network");
     // A curve over the frame's own range; outside it it stays level.
     let curve = |n: usize| -> Vec<f32> {
         let points = &y[n * CURVE_POINTS..(n + 1) * CURVE_POINTS];
