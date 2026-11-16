@@ -75,6 +75,9 @@ impl FrameTimeline {
         if let Some(take) = crate::x6_pair::plan_for(path) {
             return Ok(take.timeline.clone());
         }
+        if crate::x6_raw::is_take(path) {
+            return crate::x6_raw::timeline(path);
+        }
         Self::from_mp4_file(path)
     }
 

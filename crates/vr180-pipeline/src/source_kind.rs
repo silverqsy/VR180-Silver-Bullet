@@ -54,6 +54,13 @@ pub enum SourceKind {
     /// post-mod), the lens record and shading grids in the EXIF
     /// `UserComment`. Same still pipeline as the X6's.
     KandaoDng,
+    /// Insta360 X6 raw video: a take FOLDER (`clip.json`, `capture.x6b`, …)
+    /// holding one 3840×3840 Bayer frame per sensor and time step, with the
+    /// factory lens string, a gyro file and the sound beside it
+    /// ([`crate::x6_raw`]). The clip's path is the folder. Its frames are
+    /// the sensor's linear values and need the raw development stage of the
+    /// colour stack; lens, eye order and audio follow the camera's `.insv`.
+    X6Raw,
     /// Unrecognised — the GUI should surface an "unknown format"
     /// message and let the user pick a preset manually.
     Unknown,
@@ -67,7 +74,7 @@ impl SourceKind {
 
     /// True if this source uses the fisheye (KB) pipeline.
     pub fn is_fisheye(self) -> bool {
-        matches!(self, Self::DjiOsv | Self::Insta360Insv | Self::SbsFisheye | Self::BlackmagicRaw | Self::KandaoQoocam)
+        matches!(self, Self::DjiOsv | Self::Insta360Insv | Self::SbsFisheye | Self::BlackmagicRaw | Self::KandaoQoocam | Self::X6Raw)
     }
 
     /// ONE video stream holding both eyes stacked top/bottom (Kandao QooCam
@@ -105,7 +112,8 @@ impl SourceKind {
     /// convention for both cameras.
     pub fn dual_stream_iter_swap(self, user_swap: bool) -> bool {
         match self {
-            Self::DjiOsv | Self::Insta360Insv => !user_swap,
+            // A raw take's two channels are the `.insv`'s two streams.
+            Self::DjiOsv | Self::Insta360Insv | Self::X6Raw => !user_swap,
             _ => user_swap,
         }
     }
@@ -114,7 +122,21 @@ impl SourceKind {
     /// the DJI-style stabilization controls (smooth / max-corr / IMU
     /// phase) apply. DJI reads camera quats; Insta360 fuses its raw gyro.
     pub fn has_frame_imu(self) -> bool {
-        matches!(self, Self::DjiOsv | Self::Insta360Insv | Self::KandaoQoocam | Self::BlackmagicRaw)
+        matches!(self, Self::DjiOsv | Self::Insta360Insv | Self::KandaoQoocam | Self::BlackmagicRaw | Self::X6Raw)
+    }
+
+    /// Raw (Bayer) video: the frames reach the pipeline as the camera's
+    /// linear RGB, so the colour stack opens with the raw development stage
+    /// and a frame can be written out as a DNG.
+    pub fn is_raw_video(self) -> bool {
+        matches!(self, Self::X6Raw)
+    }
+
+    /// The Insta360 X6's own recordings of both lenses: the `.insv` and the
+    /// raw take. They share the factory lens model, the eye order and the
+    /// 360° Audio track.
+    pub fn is_x6_video(self) -> bool {
+        matches!(self, Self::Insta360Insv | Self::X6Raw)
     }
 
     /// Blackmagic RAW: decoded by the SDK helper, both eyes side by side
@@ -171,6 +193,7 @@ impl SourceKind {
             Self::Insta360Dng   => "Insta360 X6 DNG still",
             Self::KandaoQoocam  => "Kandao QooCam 3 Ultra (stacked fisheye)",
             Self::KandaoDng     => "Kandao QooCam 3 Ultra DNG still",
+            Self::X6Raw         => "Insta360 X6 raw video",
             Self::Unknown       => "Unknown",
         }
     }
@@ -227,6 +250,10 @@ impl EyeLayout {
 /// callers should pair this with the camera preset library and let
 /// the user override.
 pub fn detect(path: &Path) -> Result<SourceKind> {
+    // A raw take is a folder; it is also named by any of its own files.
+    if crate::x6_raw::is_take(path) {
+        return Ok(SourceKind::X6Raw);
+    }
     let ext = path
         .extension()
         .and_then(|s| s.to_str())

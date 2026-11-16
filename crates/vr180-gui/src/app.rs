@@ -105,6 +105,9 @@ pub struct App {
     /// while the disks wake — never freezes the GUI. `update` polls `rx`;
     /// `finish_load` applies the result. `None` when no load is in flight.
     load_pending: Option<LoadPending>,
+    /// Why something the user just opened was not taken (a raw take the
+    /// camera never closed, …). Shown in the Source panel until the next open.
+    import_notice: Option<String>,
     /// Monotonic load id. Bumped on every `load_file_inner`; a delivered
     /// `LoadedMeta` is applied only if its token still matches, so a newer
     /// load (clip switch mid-read) cleanly supersedes an older one.
@@ -1685,6 +1688,7 @@ impl BatchItem {
     fn export_settings(&self) -> crate::decoder::Settings {
         let mut s = if self.single_eye() { self.settings.for_single_eye() } else { self.settings.clone() };
         s.ilog_source = self.ilog();
+        s.raw_source = self.source_kind.is_raw_video();
         s
     }
 
@@ -2418,6 +2422,50 @@ impl ClipInfo {
     }
 }
 
+/// A raw take without sound leaves its folder as the "audio path": there
+/// is nothing to open.
+fn take_audio_missing(audio_path: &std::path::Path) -> bool {
+    audio_path.is_dir()
+}
+
+/// Raw video takes are FOLDERS. Turn what the user opened into clip paths:
+/// a take's folder, or one of its own files, becomes the folder; any other
+/// folder stands for the takes directly inside it; everything else passes
+/// through. A take that cannot be opened (never closed by the camera, an
+/// incomplete copy, no frames) is left out and named in the returned note.
+fn resolve_raw_takes(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Option<String>) {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut take = |dir: PathBuf, out: &mut Vec<PathBuf>, notes: &mut Vec<String>| {
+        match vr180_pipeline::x6_raw::describe(&dir) {
+            Ok(_) => { if !out.contains(&dir) { out.push(dir); } }
+            Err(e) => {
+                let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                tracing::warn!("import: raw take {}: {e}", dir.display());
+                notes.push(format!("{name}: {}", e.to_string().trim_start_matches("ffmpeg: ").rsplit(": ").next().unwrap_or_default()));
+            }
+        }
+    };
+    for p in paths {
+        if let Some(dir) = vr180_pipeline::x6_raw::take_dir(&p) {
+            take(dir, &mut out, &mut notes);
+        } else if p.is_dir() {
+            let mut inside: Vec<PathBuf> = std::fs::read_dir(&p).into_iter().flatten().flatten()
+                .map(|e| e.path())
+                .filter(|c| c.is_dir() && vr180_pipeline::x6_raw::is_take(c))
+                .collect();
+            inside.sort();
+            if inside.is_empty() {
+                notes.push(format!("{}: no raw video takes in this folder", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+            }
+            for dir in inside { take(dir, &mut out, &mut notes); }
+        } else if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    (out, (!notes.is_empty()).then(|| notes.join("\n")))
+}
+
 /// An async clip load in flight (see `App::load_pending`). The worker
 /// thread does all the blocking source I/O and posts a [`LoadOutcome`]
 /// back on `rx`; the UI thread shows a "Loading…" state until it arrives.
@@ -2637,6 +2685,7 @@ impl App {
             fisheye_last_seeded: None,
             suppress_reseed_once: false,
             load_pending: None,
+            import_notice: None,
             load_token: 0,
             play_when_ready: false,
         }
@@ -3605,6 +3654,7 @@ impl App {
             // camera's two eyes (their alignment above all) is not its.
             K::Insta360Insv if single_eye => "insv_single_eye",
             K::Insta360Insv   => "insv",
+            K::X6Raw          => "x6raw",
             K::GoProEac       => "eac",
             K::SbsFisheye     => "sbs",
             K::BlackmagicRaw  => "braw",
@@ -3756,6 +3806,7 @@ impl App {
                 | vr180_pipeline::SourceKind::KandaoDng => (probe.width / 2, probe.height),
                 vr180_pipeline::SourceKind::KandaoQoocam => (probe.width, probe.height / 2),
                 vr180_pipeline::SourceKind::DjiOsv
+                | vr180_pipeline::SourceKind::X6Raw
                 | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
                 // The probe is the helper's own (`probe_video` routes `.braw`
                 // to it): the frame holds both eyes side by side, unless the
@@ -4335,6 +4386,8 @@ impl App {
     /// (GoPro `.360` EAC) bypass the list and load directly, exactly as
     /// before — they aren't batchable.
     fn open_paths(&mut self, paths: Vec<PathBuf>) {
+        let (paths, notice) = resolve_raw_takes(paths);
+        self.import_notice = notice;
         if paths.is_empty() { return; }
         let first = paths[0].clone();
         let groups = self.group_imports(&paths);
@@ -4656,6 +4709,7 @@ impl App {
             | vr180_pipeline::SourceKind::KandaoDng => (probe.width / 2, probe.height),
             vr180_pipeline::SourceKind::KandaoQoocam => (probe.width, probe.height / 2),
             vr180_pipeline::SourceKind::DjiOsv
+            | vr180_pipeline::SourceKind::X6Raw
             | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
             vr180_pipeline::SourceKind::BlackmagicRaw => braw_eye_dims(&path, probe.width, probe.height),
             _ => (0, 0),
@@ -4737,8 +4791,14 @@ impl App {
 
         // X6 "360° Audio": a 4-channel AmbiX AAC instead of stereo. Header
         // read only; the worker is off the UI thread.
-        let foa_audio = source_kind == vr180_pipeline::SourceKind::Insta360Insv
-            && vr180_pipeline::audio::probe_foa_aac(&vr180_pipeline::x6_pair::audio_source(&path).0).ok().flatten().is_some();
+        let foa_audio = match source_kind {
+            vr180_pipeline::SourceKind::Insta360Insv =>
+                vr180_pipeline::audio::probe_foa_aac(&vr180_pipeline::x6_pair::audio_source(&path).0).ok().flatten().is_some(),
+            // A raw take's sound is its own file beside the capture.
+            vr180_pipeline::SourceKind::X6Raw => vr180_pipeline::x6_raw::audio_source(&path)
+                .is_some_and(|(file, _)| vr180_pipeline::audio::probe_foa_aac(&file).ok().flatten().is_some()),
+            _ => false,
+        };
         if foa_audio { tracing::info!("load: X6 360° Audio track (4-ch AmbiX) detected"); }
         // Kandao QooCam: a 4-channel AAC of its microphone capsules (not a
         // sound field) — mixed to stereo by the player and the export.
@@ -4836,6 +4896,7 @@ impl App {
             let auto = match source_kind {
                 vr180_pipeline::SourceKind::DjiOsv        => "DJI Osmo 360",
                 vr180_pipeline::SourceKind::Insta360Insv
+                | vr180_pipeline::SourceKind::X6Raw
                 | vr180_pipeline::SourceKind::Insta360Dng => "Insta360 X6",
                 vr180_pipeline::SourceKind::KandaoQoocam
                 | vr180_pipeline::SourceKind::KandaoDng   => vr180_pipeline::kandao_imu::KANDAO_PRESET_NAME,
@@ -5145,8 +5206,15 @@ impl App {
                 else if c.quad_audio { Some(vr180_pipeline::audio::StereoMix::Quad) }
                 else { None }
             });
-            let (audio_path, audio_base_s) = vr180_pipeline::x6_pair::audio_source(&audio_path);
-            self.audio_player = match crate::audio_player::AudioPlayer::open_at(
+            // A raw take: the sound file beside the capture, from the
+            // first frame's time in it (nothing to play when it has none).
+            let raw_take = self.clip.as_ref().is_some_and(|c| c.source_kind == vr180_pipeline::SourceKind::X6Raw);
+            let take_audio = if raw_take { vr180_pipeline::x6_raw::audio_source(&audio_path) } else { None };
+            let (audio_path, audio_base_s) = match take_audio {
+                Some(a) => a,
+                None => vr180_pipeline::x6_pair::audio_source(&audio_path),
+            };
+            self.audio_player = if raw_take && take_audio_missing(&audio_path) { None } else { match crate::audio_player::AudioPlayer::open_at(
                 audio_path, start_paused, mix, audio_base_s,
             ) {
                 Ok(Some(player)) => Some(player),
@@ -5155,7 +5223,7 @@ impl App {
                     tracing::warn!("audio_player: open failed: {e}");
                     None
                 }
-            };
+            } };
             tracing::info!("load_timing: AudioPlayer::open @ {:?}", t_audio.elapsed());
         }
     }
@@ -5406,6 +5474,7 @@ impl App {
     fn worker_settings(&self) -> Settings {
         let mut s = if self.clip_single_eye() { self.settings.for_single_eye() } else { self.settings.clone() };
         s.ilog_source = self.clip.as_ref().is_some_and(|c| c.ilog());
+        s.raw_source = self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
         s
     }
 
@@ -7557,11 +7626,12 @@ impl App {
             .add_filter(
                 "All supported video",
                 &["360", "osv", "OSV", "insv", "INSV", "braw", "BRAW",
-                  "mp4", "MP4", "mov", "MOV", "dng", "DNG"],
+                  "mp4", "MP4", "mov", "MOV", "dng", "DNG", "x6b", "X6B"],
             )
             .add_filter("Camera still (.dng: Insta360 X6, Kandao QooCam 3 Ultra)", &["dng", "DNG"])
             .add_filter("DJI Osmo 360 (.osv)", &["osv", "OSV"])
             .add_filter("Insta360 (.insv)", &["insv", "INSV"])
+            .add_filter("Insta360 X6 raw video (capture.x6b in the take's folder)", &["x6b", "X6B"])
             .add_filter("Kandao QooCam 3 Ultra (.mp4)", &["mp4", "MP4"])
             .add_filter("Blackmagic RAW (.braw)", &["braw", "BRAW"])
             .add_filter("Side-by-side fisheye (.mp4 / .mov)",
@@ -7569,6 +7639,9 @@ impl App {
     }
 
     fn draw_source_info(&self, ui: &mut egui::Ui) {
+        if let Some(note) = &self.import_notice {
+            ui.label(RichText::new(note).small().color(Color32::from_rgb(255, 200, 120)));
+        }
         match (&self.loaded_path, &self.clip) {
             (Some(p), Some(c)) => {
                 let fname = p.file_name()
@@ -8283,7 +8356,7 @@ impl App {
         let is_osv  = matches!(kind, Some(vr180_pipeline::SourceKind::DjiOsv));
         // Insta360: raw gyro fused at load (VQF) — same stab controls as OSV,
         // no background quat load to gate on.
-        let is_insv = matches!(kind, Some(vr180_pipeline::SourceKind::Insta360Insv));
+        let is_insv = matches!(kind, Some(vr180_pipeline::SourceKind::Insta360Insv | vr180_pipeline::SourceKind::X6Raw));
         // Kandao QooCam: same raw-gyro fusion as the X6.
         let is_kandao = matches!(kind, Some(vr180_pipeline::SourceKind::KandaoQoocam));
         // DJI OSV loads the lens calib first (instant preview) and streams the
@@ -8418,6 +8491,7 @@ impl App {
             self.clip.as_ref().map(|c| c.source_kind),
             Some(vr180_pipeline::SourceKind::DjiOsv)
                 | Some(vr180_pipeline::SourceKind::Insta360Insv)
+                | Some(vr180_pipeline::SourceKind::X6Raw)
                 | Some(vr180_pipeline::SourceKind::Insta360Dng)
                 | Some(vr180_pipeline::SourceKind::KandaoQoocam)
                 | Some(vr180_pipeline::SourceKind::KandaoDng)

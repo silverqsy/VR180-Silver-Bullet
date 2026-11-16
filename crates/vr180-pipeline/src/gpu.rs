@@ -223,6 +223,8 @@ pub struct Device {
     /// `vkAllocateMemory` of host-visible memory isn't free. Reusing one of
     /// the right size makes the readback transfer-bound instead of alloc-bound.
     readback_staging: Mutex<HashMap<u64, wgpu::Buffer>>,
+    /// Pipelines of the raw (Bayer) video path, built on first use.
+    pub(crate) raw: std::sync::OnceLock<crate::raw_gpu::RawPipelines>,
 }
 
 #[derive(Debug)]
@@ -556,6 +558,7 @@ impl Device {
             sbs_split_cache: Mutex::new(HashMap::new()),
             p010_resolve_out_cache: Mutex::new(HashMap::new()),
             readback_staging: Mutex::new(HashMap::new()),
+            raw: std::sync::OnceLock::new(),
         })
     }
 
@@ -4041,7 +4044,7 @@ impl Device {
         );
     }
 
-    fn write_uniform<T: bytemuck::Pod>(&self, label: &str, value: &T) -> wgpu::Buffer {
+    pub(crate) fn write_uniform<T: bytemuck::Pod>(&self, label: &str, value: &T) -> wgpu::Buffer {
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: std::mem::size_of::<T>() as u64,
@@ -5679,6 +5682,13 @@ pub struct ColorStackPlan {
     /// very END of the stack, padding the revealed border with black.
     /// 1.0 = off. Export-only — the preview plan never sets it.
     pub eye_scale: f32,
+    /// Raw development: the eyes are a raw (Bayer) source's camera-linear
+    /// RGB and this stage, the FIRST of the stack, turns them into
+    /// display-referred code values (white balance, camera matrix, exposure,
+    /// tone — [`crate::raw_tone`]). Every later stage then sees what it
+    /// sees from any other clip. 16-bit stacks only; `None` for every
+    /// source that is not raw.
+    pub raw_develop: Option<crate::raw_tone::RawDevelop>,
 }
 
 impl Default for ColorStackPlan {
@@ -5695,6 +5705,7 @@ impl Default for ColorStackPlan {
             auto_eye_match: None,
             log_exposure: None,
             eye_scale: 1.0,
+            raw_develop: None,
         }
     }
 }
@@ -5712,6 +5723,7 @@ impl ColorStackPlan {
             || self.eye_match_exposure != 0.0
             || self.auto_eye_match.is_some()
             || self.eye_scale != 1.0
+            || self.raw_develop.is_some()
     }
 
     /// This plan for a source that holds ONE eye: everything that sets the two
@@ -9165,11 +9177,24 @@ impl Device {
 
         let mut current_idx: Option<usize> = None;
 
+        // R. Raw development — a raw source's camera-linear eyes become
+        //    display-referred here, ahead of everything else.
+        if let Some(stage) = &plan.raw_develop {
+            let next = make_16("stack16_raw_out", w, h);
+            self.record_raw_develop(encoder, src, &next, stage);
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
+
         // 0. Automatic eye-exposure offset — sensor-side, so before every
         //    creative stage (same place as the static exposure trim).
         if let Some((state, eye)) = eye_offset {
             let next = make_16("stack16_eyeoff_out", w, h);
-            self.record_eye_offset_apply(encoder, src, &next, state, eye, true);
+            let prev = match current_idx {
+                Some(i) => &intermediates[i],
+                None => src,
+            };
+            self.record_eye_offset_apply(encoder, prev, &next, state, eye, true);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }

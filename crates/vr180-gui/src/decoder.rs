@@ -429,6 +429,14 @@ pub struct Settings {
     /// worker gets, from what the clip's file says; never persisted.
     #[serde(skip)]
     pub ilog_source: bool,
+    /// Raw development of a raw (Bayer) video clip: white balance and the
+    /// tone controls. Ignored for every other source.
+    pub raw: vr180_pipeline::raw_tone::RawSettings,
+    /// The source is raw video, so its colour stack opens with the raw
+    /// development stage (`raw`). Only ever set on the copy a worker gets,
+    /// from the clip's kind; never persisted.
+    #[serde(skip)]
+    pub raw_source: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,6 +548,8 @@ impl Default for Settings {
             preview_eye_right: false,
             single_eye: false,
             ilog_source: false,
+            raw: Default::default(),
+            raw_source: false,
         }
     }
 }
@@ -746,6 +756,13 @@ impl Settings {
         // `EyeMatchState` (fisheye preview arms, export) act on it; the
         // source-kind gate lives at those call sites.
         plan.auto_eye_match = if self.auto_eye_match { Some(self.auto_eye_match_mode) } else { None };
+        // A raw clip's eyes are the camera's linear RGB: developed first.
+        if self.raw_source {
+            plan.raw_develop = Some(vr180_pipeline::raw_tone::RawDevelop {
+                camera: vr180_pipeline::raw_color::RawCamera::X6,
+                settings: self.raw,
+            });
+        }
         // Exposure given beyond normal at the shoot, taken back out in the
         // light the sensor recorded: only where the source's curve is known.
         if self.ilog_source && self.ettr_stops > 0.0 {
@@ -1233,6 +1250,9 @@ fn load_or_publish_dji_imu(
     if matches!(kind, vr180_pipeline::SourceKind::BlackmagicRaw) {
         return load_braw_imu(cfg, control, src_w, src_h);
     }
+    if matches!(kind, vr180_pipeline::SourceKind::X6Raw) {
+        return load_raw_take_imu(cfg, control, src_w, src_h);
+    }
     if !matches!(kind, vr180_pipeline::SourceKind::DjiOsv) {
         return None;
     }
@@ -1378,6 +1398,34 @@ fn load_insv_imu(
     Some(imu)
 }
 
+/// Raw take: the factory lens string and the gyro file of the take folder,
+/// as per-frame poses at the frames' exposure stamps. Cached per path;
+/// seeds the Override UI.
+fn load_raw_take_imu(
+    cfg: &DecoderConfig,
+    control: &DecoderControl,
+    src_w: u32,
+    src_h: u32,
+) -> Option<vr180_fisheye::DjiOsvImu> {
+    if let Some(arc) = cached_dji_imu(&cfg.path).filter(|a| !a.frame_quats.is_empty()) {
+        seed_detected_calib(control, &arc, src_w, src_h);
+        return Some((*arc).clone());
+    }
+    let index = match vr180_pipeline::x6_raw::open(&cfg.path) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!("decoder (raw take): {e}");
+            return None;
+        }
+    };
+    // Built at the take's own frame size; the resolvers scale it to the
+    // size the preview works at.
+    let imu = vr180_pipeline::x6_raw::build_imu(&index, index.take.width, index.take.height);
+    cache_dji_imu(&cfg.path, std::sync::Arc::new(imu.clone()));
+    seed_detected_calib(control, &imu, src_w, src_h);
+    Some(imu)
+}
+
 /// Kandao QooCam: the `kfix`/`kvar` boxes (lens record + 1 kHz gyro + PTS +
 /// exposure tables) sit after `moov` and are a few MB at most, so the whole
 /// build runs inline like the X6's. Cached per path; seeds the Override UI.
@@ -1491,7 +1539,7 @@ fn load_dji_imu_progressive(
 ) -> Option<vr180_fisheye::DjiOsvImu> {
     use std::sync::atomic::Ordering;
     if matches!(kind, vr180_pipeline::SourceKind::Insta360Insv | vr180_pipeline::SourceKind::KandaoQoocam
-                      | vr180_pipeline::SourceKind::BlackmagicRaw) {
+                      | vr180_pipeline::SourceKind::BlackmagicRaw | vr180_pipeline::SourceKind::X6Raw) {
         // The whole trailer (calib + gyro + stamps) is ~1 MB at the file end
         // and VQF runs in well under a second — no progressive split needed.
         // Same for the Kandao boxes after `moov`, and the BRAW helper's gyro
@@ -1499,6 +1547,8 @@ fn load_dji_imu_progressive(
         let imu = match kind {
             vr180_pipeline::SourceKind::Insta360Insv => load_insv_imu(cfg, control, src_w, src_h),
             vr180_pipeline::SourceKind::BlackmagicRaw => load_braw_imu(cfg, control, src_w, src_h),
+            // A calibration string and a gyro CSV beside the capture.
+            vr180_pipeline::SourceKind::X6Raw => load_raw_take_imu(cfg, control, src_w, src_h),
             _ => load_kandao_imu(cfg, control, src_w, src_h),
         };
         control.imu_ready.store(true, Ordering::SeqCst);
@@ -1811,6 +1861,12 @@ fn open_fisheye_segment(
         }
         vr180_pipeline::SourceKind::SbsFisheye | vr180_pipeline::SourceKind::KandaoQoocam =>
             Box::new(SbsFisheyeIter::new_with_layout(path, HwDecode::Auto, 0, 8, kind.eye_layout())?),
+        // Raw take: every frame stands alone, so a >30 fps take is thinned
+        // at the source like Blackmagic RAW; the eyes are demosaiced on the
+        // GPU at half size (1920², still above the preview's working eye),
+        // at full size for a reframed view, which shows a part of the lens.
+        vr180_pipeline::SourceKind::X6Raw => Box::new(vr180_pipeline::x6_raw::X6RawIter::new(
+            path, kind.dual_stream_iter_swap(swap_eyes), !braw_reframe, braw_preview_step(fps), gpu)?),
         vr180_pipeline::SourceKind::BlackmagicRaw => {
             // The SDK decodes at a fraction of the recorded size from a
             // fraction of the bit stream — pick the coarsest of ITS steps
@@ -2219,7 +2275,8 @@ fn run_fisheye(
         let total_frames = timeline_frames_or(timeline.as_deref(), segments_total_frames(&cfg.segments)).max(1);
         match kind {
             vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv
-            | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw => {
+            | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw
+            | vr180_pipeline::SourceKind::X6Raw => {
                 if let Some(osv) = dji_osv_imu {
                     // Camera lock (toggle on) → smooth_ms = 0 drives the
                     // pipeline's sharp frame-0 lock. Soft-stab (toggle off)
@@ -2748,10 +2805,10 @@ fn run_fisheye(
                     let (eye_w, eye_h) = preview_out_dims(mode, aspect, eye_w, eye_h);
                     if let Some(g) = pair.gpu.as_deref() {
                         // Zero-copy source: the eyes are textures already.
-                        let l = pipeline.project_fisheye_from_texture(
-                            &g.left, eye_w, eye_h, rot_left, calib_left, rs_rows_l.as_deref(), false)?;
-                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_from_texture(
-                            &g.right, eye_w, eye_h, rot_right, calib_right, rs_rows_r.as_deref(), false)? };
+                        let l = project_gpu_eye(
+                            &pipeline, &g.left, eye_w, eye_h, rot_left, calib_left, rs_rows_l.as_deref(), false, 0)?;
+                        let r = if one_eye { l.clone() } else { project_gpu_eye(
+                            &pipeline, &g.right, eye_w, eye_h, rot_right, calib_right, rs_rows_r.as_deref(), false, 1)? };
                         (l, r)
                     } else if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         let l = pipeline.project_fisheye_to_equirect_rs_texture(
@@ -2777,10 +2834,10 @@ fn run_fisheye(
                     // A lens frame: its own size.
                     let (fw, fh) = view_out_dims(mode, aspect, eye_w, eye_h, lens_dims);
                     if let Some(g) = pair.gpu.as_deref() {
-                        let l = pipeline.project_fisheye_from_texture(
-                            &g.left, fw, fh, rot_left, calib_left, rs_rows_l.as_deref(), true)?;
-                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_from_texture(
-                            &g.right, fw, fh, rot_right, calib_right, rs_rows_r.as_deref(), true)? };
+                        let l = project_gpu_eye(
+                            &pipeline, &g.left, fw, fh, rot_left, calib_left, rs_rows_l.as_deref(), true, 0)?;
+                        let r = if one_eye { l.clone() } else { project_gpu_eye(
+                            &pipeline, &g.right, fw, fh, rot_right, calib_right, rs_rows_r.as_deref(), true, 1)? };
                         (l, r)
                     } else if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
                         // Per-row rolling-shutter correction, same as the
@@ -2882,6 +2939,33 @@ fn run_fisheye(
         last_iter_end = std::time::Instant::now();
     }
     Ok(())
+}
+
+/// Project one eye that is already a GPU texture. An 8-bit eye (a zero-copy
+/// Blackmagic RAW slot) goes through the 8-bit kernels as before; a 16-bit
+/// one (a raw take's demosaiced eye) through the rgba16 kernels, so its
+/// linear values reach the colour stack at full precision. `slot` is the
+/// projection cache slot of those kernels (one per eye in flight).
+fn project_gpu_eye(
+    pipeline: &Device,
+    eye: &wgpu::Texture,
+    out_w: u32, out_h: u32,
+    rot: EquirectRotation,
+    calib: vr180_pipeline::gpu::FisheyeCalib,
+    rs_rows: Option<&[f32]>,
+    fisheye_out: bool,
+    slot: u32,
+) -> vr180_pipeline::Result<wgpu::Texture> {
+    if eye.format() != wgpu::TextureFormat::Rgba16Unorm {
+        return pipeline.project_fisheye_from_texture(eye, out_w, out_h, rot, calib, rs_rows, fisheye_out);
+    }
+    let (sw, sh) = (eye.width(), eye.height());
+    match (fisheye_out, rs_rows.filter(|r| !r.is_empty())) {
+        (false, Some(rows)) => pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(eye, sw, sh, out_w, out_h, rot, calib, rows, slot),
+        (false, None) => pipeline.project_fisheye_rgba16_texture_to_equirect_16(eye, sw, sh, out_w, out_h, rot, calib, slot),
+        (true, Some(rows)) => pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(eye, sw, sh, out_w, out_h, rot, calib, rows, slot),
+        (true, None) => pipeline.project_fisheye_rgba16_texture_to_fisheye_16(eye, sw, sh, out_w, out_h, rot, calib, slot),
+    }
 }
 
 /// Holds one source frame's GPU-resident resources alive together: the shared
@@ -4406,6 +4490,7 @@ pub(crate) fn resolve_fisheye_calib_pair(
         let auto_name = match kind {
             vr180_pipeline::SourceKind::DjiOsv         => "DJI Osmo 360",
             vr180_pipeline::SourceKind::Insta360Insv
+            | vr180_pipeline::SourceKind::X6Raw
             | vr180_pipeline::SourceKind::Insta360Dng  => "Insta360 X6",
             vr180_pipeline::SourceKind::KandaoQoocam
             | vr180_pipeline::SourceKind::KandaoDng    => vr180_pipeline::kandao_imu::KANDAO_PRESET_NAME,
@@ -4439,6 +4524,7 @@ pub(crate) fn resolve_fisheye_calib_pair(
     let (calib_l, calib_r) = match (kind, osv) {
         (vr180_pipeline::SourceKind::DjiOsv
          | vr180_pipeline::SourceKind::Insta360Insv
+         | vr180_pipeline::SourceKind::X6Raw
          | vr180_pipeline::SourceKind::Insta360Dng
          | vr180_pipeline::SourceKind::KandaoQoocam
          | vr180_pipeline::SourceKind::KandaoDng
@@ -6213,7 +6299,8 @@ fn compute_stab_for(
     ).max(1);
     match kind {
         vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv
-        | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw => imu.and_then(|osv| {
+        | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw
+        | vr180_pipeline::SourceKind::X6Raw => imu.and_then(|osv| {
             let max_corr = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock { s.dji_max_corr_deg } else { f32::INFINITY };
             let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
             vr180_pipeline::dji_imu::compute_dji_stabilization(

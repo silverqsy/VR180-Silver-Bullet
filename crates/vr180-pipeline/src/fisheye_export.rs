@@ -580,6 +580,12 @@ fn eac_audio_source(cfg: &FisheyeExportConfig) -> (PathBuf, Option<PathBuf>) {
     if let Some(take) = crate::x6_pair::plan_for(&cfg.source_path) {
         return (take.audio_source().0.to_path_buf(), None);
     }
+    // A raw take's sound is a file of its own inside the folder.
+    if cfg.source_kind == SourceKind::X6Raw {
+        if let Some((file, _)) = crate::x6_raw::audio_source(&cfg.source_path) {
+            return (file, None);
+        }
+    }
     let tag = cfg.output_path.file_stem().and_then(|s| s.to_str())
         .unwrap_or("eac").to_string();
     match crate::audio::build_segment_playlist(&cfg.segments, &tag) {
@@ -589,6 +595,9 @@ fn eac_audio_source(cfg: &FisheyeExportConfig) -> (PathBuf, Option<PathBuf>) {
 }
 
 fn source_audio_start_s(cfg: &FisheyeExportConfig) -> f64 {
+    if cfg.source_kind == SourceKind::X6Raw {
+        return crate::x6_raw::audio_source(&cfg.source_path).map_or(0.0, |(_, start)| start);
+    }
     crate::x6_pair::plan_for(&cfg.source_path).map_or(0.0, |take| take.audio_source().1)
 }
 
@@ -826,7 +835,7 @@ fn one_pass_audio_eligible(cfg: &FisheyeExportConfig) -> bool {
         // post-encode steps; their Stereo export muxes inline (the X6's
         // from a decoded stereo temp, the QooCam's from its capsules —
         // `stereo_audio_source`).
-        SourceKind::GoProEac | SourceKind::Insta360Insv | SourceKind::KandaoQoocam =>
+        SourceKind::GoProEac | SourceKind::Insta360Insv | SourceKind::KandaoQoocam | SourceKind::X6Raw =>
             matches!(cfg.audio_track, AudioTrack::Stereo),
         // Not an ffmpeg container: the helper extracts the PCM to a WAV
         // and the finalize step encodes the window to AAC and muxes it.
@@ -897,7 +906,18 @@ fn stereo_audio_source(cfg: &FisheyeExportConfig, t_in: f64, dur_s: f64) -> (Pat
             }
         }
     }
-    if cfg.source_kind == SourceKind::Insta360Insv {
+    // A raw take that recorded plain stereo holds it as PCM: encode the
+    // export window (an MP4 does not carry the WAV as is).
+    if cfg.source_kind == SourceKind::X6Raw
+        && src.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+    {
+        let out = video_only_temp_path(&cfg.output_path).with_extension("take_stereo.m4a");
+        match crate::audio::stereo_to_aac(&src, &out, t_in, Some(dur_s), 192_000) {
+            Ok(_) => return (out.clone(), Some(out), 0.0),
+            Err(e) => tracing::warn!("raw take: stereo WAV to AAC failed ({e}); muxing the file as is"),
+        }
+    }
+    if cfg.source_kind.is_x6_video() {
         if let Ok(Some(_)) = crate::audio::probe_foa_aac(&src) {
             let out = video_only_temp_path(&cfg.output_path).with_extension("foa_stereo.m4a");
             match crate::audio::foa_to_stereo_aac(&src, &out, t_in, Some(dur_s), 192_000) {
@@ -922,7 +942,7 @@ fn finalize_fisheye_audio(
     offset_s: f64,
     dur_s: f64,
 ) -> Result<()> {
-    if cfg.source_kind == SourceKind::Insta360Insv {
+    if cfg.source_kind.is_x6_video() {
         return finalize_eac_audio(cfg, video_tmp, offset_s, dur_s);
     }
     if cfg.source_kind == SourceKind::KandaoQoocam {
@@ -948,6 +968,9 @@ pub(crate) fn fisheye_export_opener(
     swap_eyes: bool,
     bit_depth: u8,
     braw_color: vr180_braw::BrawColorParams,
+    // The device a raw (Bayer) source demosaics on; without one it does so
+    // on the CPU. Other sources ignore it.
+    gpu: Option<Arc<Device>>,
 ) -> Box<dyn FnMut(&std::path::Path) -> Result<Box<dyn FisheyePairIter>>> {
     let bd = if bit_depth >= 10 { 16u8 } else { 8u8 };
     Box::new(move |p: &std::path::Path| -> Result<Box<dyn FisheyePairIter>> {
@@ -980,6 +1003,10 @@ pub(crate) fn fisheye_export_opener(
                 Box::new(BrawFisheyeIter::new_with_options(
                     p, &info, bd, scale, vr180_braw::DecodeLook::Film, swap_eyes, layout.mono, 1, 0, &braw_color)?)
             }
+            // Full size, every frame, camera-linear 16-bit eyes (on the GPU
+            // when there is a device).
+            SourceKind::X6Raw => Box::new(crate::x6_raw::X6RawIter::new(
+                p, kind.dual_stream_iter_swap(swap_eyes), false, 1, gpu.clone())?),
             other => return Err(Error::Ffmpeg(format!(
                 "export_fisheye non-fisheye source: {other:?}"))),
         })
@@ -1051,6 +1078,9 @@ fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsv
     }
     if cfg.source_kind == SourceKind::BlackmagicRaw {
         return resolve_export_braw_imu(cfg);
+    }
+    if cfg.source_kind == SourceKind::X6Raw {
+        return resolve_export_raw_take_imu(cfg);
     }
     if cfg.source_kind != SourceKind::DjiOsv { return None; }
     if let Some(arc) = &cfg.preloaded_imu {
@@ -1135,6 +1165,24 @@ fn resolve_export_insv_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::D
     } else {
         crate::insv_imu::insv_calib_only(&meta, w, h, cfg.insv_view)
     })
+}
+
+/// Raw take: the GUI's cached copy when it has the poses a stabilized
+/// export needs, else the take's own files (a calibration string and a
+/// gyro CSV — quick to read).
+fn resolve_export_raw_take_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
+    if let Some(arc) = &cfg.preloaded_imu {
+        if !cfg.stabilize || !arc.frame_quats.is_empty() {
+            return Some((**arc).clone());
+        }
+    }
+    match crate::x6_raw::open(&cfg.source_path) {
+        Ok(index) => Some(crate::x6_raw::build_imu(&index, index.take.width, index.take.height)),
+        Err(e) => {
+            tracing::warn!("raw take: {e} — no lens calibration from the take");
+            None
+        }
+    }
 }
 
 /// Kandao QooCam: the boxes after `moov` are small — reuse the GUI's cached
@@ -1687,9 +1735,9 @@ fn export_fisheye_inner(
             cfg.segments.len(), durations.iter().sum::<f64>());
         Box::new(SegmentedFisheyeIter::new(
             &cfg.segments, &durations,
-            fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone()))?)
+            fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), Some(pipeline.clone())))?)
     } else {
-        let mut open = fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone());
+        let mut open = fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), Some(pipeline.clone()));
         open(&cfg.source_path)?
     };
 
@@ -1751,7 +1799,7 @@ fn export_fisheye_inner(
     let total_clip_frames = timeline_frames_or(timeline.as_ref(), clip_slots);
     let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
         match cfg.source_kind {
-            SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam | SourceKind::BlackmagicRaw => {
+            SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam | SourceKind::BlackmagicRaw | SourceKind::X6Raw => {
                 dji_osv_imu.as_ref().and_then(|osv| {
                     // Slider=0 → legacy camera-lock (∞ cap, no
                     // smoothing). User-set values activate the cap /
@@ -4613,6 +4661,7 @@ pub(crate) fn resolve_calib_pair(
         let auto_name = match cfg.source_kind {
             SourceKind::DjiOsv        => "DJI Osmo 360",
             SourceKind::Insta360Insv
+            | SourceKind::X6Raw
             | SourceKind::Insta360Dng => "Insta360 X6",
             SourceKind::KandaoQoocam
             | SourceKind::KandaoDng   => crate::kandao_imu::KANDAO_PRESET_NAME,
@@ -4639,7 +4688,7 @@ pub(crate) fn resolve_calib_pair(
     // For OSV, prefer the per-lens protobuf calibration. After the DJI
     // iter's default swap: left = Lens B, right = Lens A.
     let (calib_l, calib_r) = match (cfg.source_kind, osv) {
-        (SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam | SourceKind::BlackmagicRaw, Some(imu)) => {
+        (SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam | SourceKind::BlackmagicRaw | SourceKind::X6Raw, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
             let eye = |output: usize, lens: &vr180_fisheye::DjiLensCalib,
@@ -4893,6 +4942,23 @@ fn build_eye_eq_16(
     };
     // Per-row RS needs both eyes' rows, as before.
     let (rs_l, rs_r) = match rs { (Some(l), Some(r)) => (Some(l), Some(r)), _ => (None, None) };
+    // Eyes already on the GPU (a raw source demosaiced there): the same
+    // rgba16 kernels, without the upload.
+    if let Some(g) = pair.gpu.as_deref() {
+        let eye = |tex: &wgpu::Texture, rot: EquirectRotation, calib: FisheyeCalib, rows: Option<&[f32]>, slot: u32| -> Result<wgpu::Texture> {
+            match (projection, rows) {
+                (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, Some(rows)) =>
+                    pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(tex, src_w, src_h, eye_w, eye_h, rot, calib, rows, slot),
+                (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, None) =>
+                    pipeline.project_fisheye_rgba16_texture_to_equirect_16(tex, src_w, src_h, eye_w, eye_h, rot, calib, slot),
+                (FisheyeExportProjection::Fisheye, Some(rows)) =>
+                    pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(tex, src_w, src_h, eye_w, eye_h, rot, calib, rows, slot),
+                (FisheyeExportProjection::Fisheye, None) =>
+                    pipeline.project_fisheye_rgba16_texture_to_fisheye_16(tex, src_w, src_h, eye_w, eye_h, rot, calib, slot),
+            }
+        };
+        return Ok((eye(&g.left, rot_left, calib_left, rs_l, 30)?, eye(&g.right, rot_right, calib_right, rs_r, 31)?));
+    }
     let left = eye(&pair.left, rot_left, calib_left, rs_l, 30)?;
     if pair.single_eye() {
         return Ok((left.clone(), left));

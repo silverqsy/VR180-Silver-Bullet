@@ -13,7 +13,10 @@ pub mod braw_imu;
 pub mod circles;
 pub mod decode;
 pub mod dji_imu;
+pub mod raw_color;
 pub mod raw_develop;
+pub mod raw_gpu;
+pub mod raw_tone;
 pub mod ljpeg;
 pub mod dng_write;
 pub mod encode;
@@ -34,6 +37,7 @@ pub mod spherical_inject;
 pub mod still_export;
 mod swscale;
 pub mod x6_pair;
+pub mod x6_raw;
 
 pub use source_kind::SourceKind;
 
