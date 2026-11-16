@@ -1194,13 +1194,13 @@ impl Device {
         let per_log = (MASK_SAMPLES - 1) as f32 / (MASK_HI - MASK_LO);
         let params = self.write_uniform("raw_sharpen_apply_params", &SharpenApplyParams {
             luma: [LUMA[0], LUMA[1], LUMA[2], k.gamma],
-            soft: [k.soft, k.q, 0.0, if k.mask.is_some() { 1.0 } else { 0.0 }],
+            soft: [k.soft, k.q, k.halo, if k.mask.is_some() { 1.0 } else { 0.0 }],
             fade: k.fade,
             mask: match &k.mask {
                 Some(m) => [m.gain, 1.0 / m.threshold, MASK_LO, per_log],
                 None => [1.0, 1.0, MASK_LO, per_log],
             },
-            table: [(LIMIT_SAMPLES - 1) as f32, (MASK_SAMPLES - 1) as f32, 0.0, 0.0],
+            table: [(LIMIT_SAMPLES - 1) as f32, (MASK_SAMPLES - 1) as f32, k.window as f32, 0.0],
         });
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("raw_sharpen_apply_bg"),
@@ -1536,6 +1536,11 @@ mod tests {
             (RawSharpen { amount: 60.0, radius: 1.4, detail: 40.0, masking: 85.0 }, 1.0),
             (RawSharpen { amount: 80.0, radius: 1.0, detail: 25.0, masking: 30.0 }, 0.25),
             (RawSharpen { amount: 80.0, radius: 3.0, detail: 60.0, masking: 0.0 }, 2.0),
+            // Low Detail: the halo rule, over one pixel and over more.
+            (RawSharpen { amount: 40.0, radius: 1.0, detail: 0.0, masking: 0.0 }, 1.0),
+            (RawSharpen { amount: 100.0, radius: 2.0, detail: 10.0, masking: 20.0 }, 1.0),
+            (RawSharpen { amount: 150.0, radius: 1.0, detail: 0.0, masking: 0.0 }, 2.0),
+            (RawSharpen { amount: 60.0, radius: 3.0, detail: 5.0, masking: 0.0 }, 2.6),
         ] {
             let k = settings.constants(scale).expect("on");
             let dst = dev.new_linear_eye_texture(w, h);

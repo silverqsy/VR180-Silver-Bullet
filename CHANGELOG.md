@@ -34,16 +34,23 @@ converter's controls for it, and every frame can be had as a DNG.
 - **Sharpening.** The detail panel's four controls, Amount, Radius, Detail
   and Masking, on the developed picture, done the way Camera Raw does it:
   on the luminance alone, fading out toward black and toward white, held
-  back at strong edges. The kernel was read off Camera Raw itself for 1008
-  combinations of Amount, Radius and Detail. Measured on frames of sample
-  takes as the change each makes to the same frame:
+  back at strong edges. The kernel was read off Camera Raw itself for 1386
+  combinations of Amount, Radius and Detail. Low Detail holds halos back
+  as it does there: what the sharpening adds beyond the range of the
+  picture around a pixel is cut to a third at Detail 0, less and less up
+  to Detail 25 or so, while the steepening of an edge between its two
+  sides is kept whole. Measured on frames of sample takes as the change
+  each makes to the same frame:
   - from Detail 25 up the two changes correlate at 0.96 to 0.99 and differ
     by 12 to 34 % of their size (least at high Detail), with the overall
     strength within a tenth;
+  - at Detail 0 to 20 they differ by 16 to 36 % with the strength within a
+    twentieth (a Radius of 3 at Detail 0: about 50 %);
   - with Masking in use, 23 to 40 %;
-  - below Detail 25 Camera Raw also smooths fine texture and holds hard
-    edges back. That part is not reproduced: at Detail 0 the app changes
-    the picture about half as much, and fine texture stays crisper.
+  - with any Amount above zero Camera Raw also smooths the finest texture a
+    little before it sharpens, most at low Detail and large radii. That
+    part is not reproduced, and it is most of what is left at low Detail:
+    the finest texture and noise stay a little crisper here.
 
   The radius is in pixels of the exported frame, so the preview shows the
   export's picture reduced: judge sharpening in the zoom view or on a

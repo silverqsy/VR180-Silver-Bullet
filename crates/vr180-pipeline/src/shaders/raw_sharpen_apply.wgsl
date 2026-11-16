@@ -2,7 +2,10 @@
 // limited and faded as Camera Raw limits and fades it, put back into the
 // picture as one gain on its linear RGB.
 //
-//   d  = fade(phi) · mask · soft(delta)          clamped to what the pixel's
+//   s  = phi + delta                             the kernel's result
+//   h  = clamp(s, lo, hi)                        lo, hi: the range of phi around the pixel
+//   e  = (h − phi) + halo · (s − h)              the halo — what leaves that range — held back
+//   d  = fade(phi) · mask · soft(e)              clamped to what the pixel's
 //   phi' = phi + d                                own level allows
 //   rgb' = rgb · (phi' / phi)^gamma
 //
@@ -23,14 +26,16 @@
 struct Params {
     // xyz = luminance weights (unused here); w = gamma
     luma: vec4<f32>,
-    // x = the soft limit's scale; y = the mix of its two shapes; w = 1 with a mask
+    // x = the soft limit's scale; y = the mix of its two shapes; z = the share
+    // kept of a change beyond the range around the pixel; w = 1 with a mask
     soft: vec4<f32>,
     // none of the change at x, all of it from y to z, none at w
     fade: vec4<f32>,
     // x = what the spread gradient is multiplied by; y = 1 / threshold;
     // z = log2 of the curve's first sample; w = samples per unit of log2
     mask: vec4<f32>,
-    // x = last index of a limit table; y = last index of the mask's curve
+    // x = last index of a limit table; y = last index of the mask's curve;
+    // z = pixels to each side the range around a pixel is taken over
     table: vec4<f32>,
 }
 @group(0) @binding(2) var<uniform> p: Params;
@@ -67,7 +72,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let at = vec2<i32>(i32(gid.x), i32(gid.y));
     let texel = textureLoad(src, at, 0);
     let phi = textureLoad(level, at, 0).r;
-    let d = textureLoad(delta, at, 0).r;
+
+    // The range of the original around the pixel.
+    let reach = i32(p.table.z);
+    let last = vec2<i32>(size) - vec2<i32>(1);
+    var lo = phi;
+    var hi = phi;
+    for (var dy = -reach; dy <= reach; dy = dy + 1) {
+        for (var dx = -reach; dx <= reach; dx = dx + 1) {
+            let v = textureLoad(level, clamp(at + vec2<i32>(dx, dy), vec2<i32>(0), last), 0).r;
+            lo = min(lo, v);
+            hi = max(hi, v);
+        }
+    }
+    let sharp = phi + textureLoad(delta, at, 0).r;
+    let held = clamp(sharp, lo, hi);
+    let d = (held - phi) + p.soft.z * (sharp - held);
 
     let x = abs(d) / p.soft.x;
     let limited = sign(d) * p.soft.x * ((1.0 - p.soft.y) * (1.0 - exp(-x)) + p.soft.y * x / (1.0 + x));

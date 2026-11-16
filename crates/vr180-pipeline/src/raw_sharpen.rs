@@ -10,13 +10,23 @@
 //!   luminance alone: the linear RGB of a pixel is scaled by one factor
 //!   (the three channels' ratios agree to 3 parts in 10 000 on real frames).
 //!   The luminance is worked on as `φ = Y^(1/1.8)`.
-//! - On an edge the change is a fixed kernel for each Amount / Radius /
-//!   Detail (the same for a hard step and a soft one from Detail 25 up). It
-//!   was read off the response to a small step for 14 Amounts × 9 Radii ×
-//!   8 Details and is held here as a sum of five blurs:
+//! - On a hard edge the change is a fixed kernel for each Amount / Radius /
+//!   Detail. It was read off the response to a small step for 14 Amounts ×
+//!   9 Radii × 11 Details and is held here as a sum of five blurs:
 //!   `Δ = Σ cⱼ (φ − Gⱼ ∗ φ)`, the `cⱼ` in the table (taps within 0.0015
 //!   of the measured kernels). Between the measured settings the
 //!   coefficients are interpolated.
+//! - Low Detail holds halos back, and that is all it does to an edge: the
+//!   sharpening is a stronger kernel (the step kernel over a factor `h`),
+//!   and of its change the part that stays within the range of the
+//!   original picture around the pixel is kept whole, while the part that
+//!   leaves that range — the halo — is scaled by `h` ([`halo_change`]). A
+//!   hard step is all halo, so it gets the step kernel; a soft edge, whose
+//!   steepening stays between its two sides, gets up to `1 / h` of it.
+//!   `h` is a third at Detail 0 for every Amount and Radius, a half to
+//!   three quarters around Detail 5 to 10, and reaches one between Detail
+//!   20 and 55 (later for a large Radius); it was fitted to edges of five
+//!   softnesses at every setting ([`halo_factor`]).
 //! - A large change is limited softly ([`soft_limit`]), a pixel near black
 //!   or white keeps a share of it only ([`fade`]), and no pixel is
 //!   darkened or lightened further than its own level allows (the limits
@@ -27,11 +37,12 @@
 //!   with Radius) against a threshold that grows with Masking, through one
 //!   curve ([`MaskConstants`]).
 //!
-//! What it does not do: below Detail 25 Camera Raw also smooths fine
-//! texture (an edge-preserving smoothing, strongest at Detail 0 and at
-//! large radii) and holds a hard edge back more than a soft one. Neither
-//! is here, so at low Detail fine texture and noise come out crisper than
-//! there.
+//! What it does not do: with any Amount above zero Camera Raw also smooths
+//! fine texture a little before it sharpens (an edge-preserving smoothing
+//! that leaves steps alone and takes isolated extremes down; strongest at
+//! Detail 0 and at large radii, gone by Detail 100). That is not here, so
+//! at low Detail the finest texture and noise come out a little crisper
+//! than there.
 //!
 //! The radius is in pixels of the frame an export writes. A preview drawn
 //! smaller scales it ([`RawSharpen::constants`]'s `pixel_scale`), so it
@@ -52,6 +63,8 @@ pub const MASK_LO: f32 = -4.0;
 pub const MASK_HI: f32 = 8.0;
 /// The widest blur a pass runs, taps to each side.
 pub const MAX_RADIUS: usize = 31;
+/// The widest neighbourhood the halo rule looks at, pixels to each side.
+pub const MAX_WINDOW: u32 = 3;
 
 /// The sharpening settings of a raw clip. `Default` is off.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -85,8 +98,11 @@ struct Tables {
     radii: Vec<f32>,
     details: Vec<f32>,
     sigmas: [f32; BLURS],
-    /// `[amount][radius][detail][blur]`.
+    /// `[amount][radius][detail][blur]`: the kernel of a hard step.
     coeff: Vec<f32>,
+    /// `[amount][radius][detail]`: the share kept of a change that leaves
+    /// the range of the original around the pixel.
+    halo: Vec<f32>,
     levels: Vec<f32>,
     down: Vec<f32>,
     lift: Vec<f32>,
@@ -113,6 +129,7 @@ fn tables() -> &'static Tables {
         let (amounts, radii, details) = (take(n[0]), take(n[1]), take(n[2]));
         let sigmas: [f32; BLURS] = take(BLURS).try_into().expect("sigmas");
         let coeff = take(n[0] * n[1] * n[2] * BLURS);
+        let halo = take(n[0] * n[1] * n[2]);
         let (levels, down, lift) = (take(n[4]), take(n[4]), take(n[4]));
         let (mask_at, mask_threshold) = (take(n[5]), take(n[5]));
         let (mask_u, mask_g) = (take(n[6]), take(n[6]));
@@ -120,7 +137,7 @@ fn tables() -> &'static Tables {
         let c = take(10);
         assert_eq!(at, v.len(), "sharpening table: length");
         Tables {
-            amounts, radii, details, sigmas, coeff, levels, down, lift, mask_at, mask_threshold, mask_u, mask_g, mask_radii, mask_gain,
+            amounts, radii, details, sigmas, coeff, halo, levels, down, lift, mask_at, mask_threshold, mask_u, mask_g, mask_radii, mask_gain,
             gamma: c[0], fade: [c[1], c[2], c[3], c[4]], q: c[5], soft: [c[6], c[7], c[8], c[9]],
         }
     })
@@ -141,24 +158,45 @@ fn interp(grid: &[f32], values: &[f32], v: f32) -> f32 {
     values[i] * (1.0 - f) + values[i + 1] * f
 }
 
-/// The blur coefficients for an Amount, a Radius and a Detail: linear
-/// between the measured settings, held outside them.
-pub fn coefficients(amount: f32, radius: f32, detail: f32) -> [f32; BLURS] {
+/// The eight settings around an Amount, a Radius and a Detail: each one's
+/// place in the tables (`(amount · radii + radius) · details + detail`)
+/// and its weight (linear between the measured settings, held outside).
+fn corners(amount: f32, radius: f32, detail: f32) -> [(usize, f32); 8] {
     let t = tables();
     let ((ia, fa), (ir, fr), (id, fd)) = (locate(&t.amounts, amount), locate(&t.radii, radius), locate(&t.details, detail));
     let (nr, nd) = (t.radii.len(), t.details.len());
-    let mut out = [0f32; BLURS];
+    let mut out = [(0usize, 0f32); 8];
+    let mut n = 0;
     for (da, wa) in [(0, 1.0 - fa), (1, fa)] {
         for (dr, wr) in [(0, 1.0 - fr), (1, fr)] {
             for (dd, wd) in [(0, 1.0 - fd), (1, fd)] {
-                let base = (((ia + da) * nr + ir + dr) * nd + id + dd) * BLURS;
-                for (j, o) in out.iter_mut().enumerate() {
-                    *o += wa * wr * wd * t.coeff[base + j];
-                }
+                out[n] = (((ia + da) * nr + ir + dr) * nd + id + dd, wa * wr * wd);
+                n += 1;
             }
         }
     }
     out
+}
+
+/// The blur coefficients of the kernel a hard step is sharpened with, for
+/// an Amount, a Radius and a Detail.
+pub fn coefficients(amount: f32, radius: f32, detail: f32) -> [f32; BLURS] {
+    let t = tables();
+    let mut out = [0f32; BLURS];
+    for (at, w) in corners(amount, radius, detail) {
+        for (j, o) in out.iter_mut().enumerate() {
+            *o += w * t.coeff[at * BLURS + j];
+        }
+    }
+    out
+}
+
+/// The share kept of a change that leaves the range of the original around
+/// the pixel (see [`halo_change`]), for an Amount, a Radius and a Detail:
+/// 1 where halos are not held back.
+pub fn halo_factor(amount: f32, radius: f32, detail: f32) -> f32 {
+    let t = tables();
+    corners(amount, radius, detail).iter().map(|(at, w)| w * t.halo[*at]).sum()
 }
 
 /// One blur as its taps from the centre outward (`[0]` is the centre; the
@@ -204,7 +242,13 @@ pub struct SharpenConstants {
     pub gamma: f32,
     /// The blurs, pixels of the frame drawn.
     pub sigmas: [f32; BLURS],
+    /// The whole kernel: the step kernel over `halo`.
     pub coeff: [f32; BLURS],
+    /// The share kept of a change that leaves the range of the original
+    /// within `window` pixels (1 = all of it).
+    pub halo: f32,
+    /// Pixels of the frame drawn, to each side.
+    pub window: u32,
     /// The soft limit's scale and the mix of its two shapes.
     pub soft: f32,
     pub q: f32,
@@ -257,10 +301,15 @@ impl RawSharpen {
             }).collect();
             MaskConstants { sigma, gain: interp(&t.mask_radii, &t.mask_gain, radius) / beside, threshold, curve }
         });
+        let halo = halo_factor(amount, radius, detail).clamp(0.05, 1.0);
         Some(SharpenConstants {
             gamma: t.gamma,
             sigmas: t.sigmas.map(|s| s * scale),
-            coeff: coefficients(amount, radius, detail),
+            coeff: coefficients(amount, radius, detail).map(|c| c / halo),
+            halo,
+            // One pixel of the exported frame; a frame drawn larger takes
+            // as many of its own.
+            window: (scale.round() as u32).clamp(1, MAX_WINDOW),
             soft: interp(&[0.0, 25.0, 50.0, 100.0], &t.soft, detail),
             q: t.q,
             fade: t.fade,
@@ -303,9 +352,19 @@ pub fn mask_share(strength: f32, m: &MaskConstants) -> f32 {
     m.curve[i] * (1.0 - f) + m.curve[i + 1] * f
 }
 
-/// What a pixel of level `phi` becomes, given the linear change `delta`
-/// (the kernel's) and the share Masking keeps: the soft limit, the fade,
-/// the mask, the limits of its own level.
+/// The kernel's change `delta` of a pixel of level `phi` with its halo
+/// held back: the part that keeps the sharpened level between `lo` and `hi`
+/// (the smallest and the largest level of the original around the pixel)
+/// is kept, the part beyond is scaled by `halo`.
+pub fn halo_change(phi: f32, delta: f32, lo: f32, hi: f32, halo: f32) -> f32 {
+    let sharp = phi + delta;
+    let held = sharp.clamp(lo, hi);
+    (held - phi) + halo * (sharp - held)
+}
+
+/// What a pixel of level `phi` becomes, given the change `delta` (the
+/// kernel's, its halo held back) and the share Masking keeps: the soft
+/// limit, the fade, the mask, the limits of its own level.
 pub fn sharpened_level(phi: f32, delta: f32, mask: f32, k: &SharpenConstants) -> f32 {
     let d = fade(phi, k) * mask * soft_limit(delta, k);
     (phi + d.clamp(-table_at(&k.down, phi), table_at(&k.lift, phi))).clamp(0.0, 1.0)
@@ -363,6 +422,24 @@ pub fn sharpen_picture(rgb: &[[f32; 3]], w: usize, h: usize, k: &SharpenConstant
             *d += c * (p - b);
         }
     }
+    // The range of the original around each pixel: rows, then columns.
+    let r = k.window as usize;
+    let range = |plane: &[f32], pick: fn(f32, f32) -> f32| -> Vec<f32> {
+        let mut rows = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                rows[y * w + x] = (x.saturating_sub(r)..=(x + r).min(w - 1)).map(|i| plane[y * w + i]).fold(plane[y * w + x], pick);
+            }
+        }
+        let mut out = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                out[y * w + x] = (y.saturating_sub(r)..=(y + r).min(h - 1)).map(|i| rows[i * w + x]).fold(rows[y * w + x], pick);
+            }
+        }
+        out
+    };
+    let (lo, hi) = (range(&phi, f32::min), range(&phi, f32::max));
     let strength = k.mask.as_ref().map(|m| {
         let mut size = vec![0f32; w * h];
         for y in 0..h {
@@ -379,7 +456,7 @@ pub fn sharpen_picture(rgb: &[[f32; 3]], w: usize, h: usize, k: &SharpenConstant
             (Some(m), Some(s)) => mask_share(m.gain * s[i], m),
             _ => 1.0,
         };
-        let out = sharpened_level(phi[i], delta[i], mask, k);
+        let out = sharpened_level(phi[i], halo_change(phi[i], delta[i], lo[i], hi[i], k.halo), mask, k);
         let gain = (out / phi[i]).powf(k.gamma);
         linear[i].map(|c| srgb_encode((c * gain).clamp(0.0, 1.0)))
     }).collect()
@@ -408,8 +485,21 @@ mod tests {
         assert!(near(coefficients(40.0, 1.0, 25.0), [-0.97132, 1.90921, 0.10352, -0.07381, 0.01971]), "{:?}", coefficients(40.0, 1.0, 25.0));
         assert!(near(coefficients(100.0, 2.0, 55.0), [6.60594, -5.35279, 10.906, -3.29471, 0.37018]), "{:?}", coefficients(100.0, 2.0, 55.0));
         assert!(near(coefficients(47.0, 1.1, 30.0), [-1.60164, 2.83213, 0.03987, -0.09157, 0.02694]), "{:?}", coefficients(47.0, 1.1, 30.0));
+        assert!(near(coefficients(40.0, 1.0, 5.0), [-1.01699, 1.08285, 0.03357, -0.00296, 0.00034]), "{:?}", coefficients(40.0, 1.0, 5.0));
         // Held outside the measured range.
         assert_eq!(coefficients(400.0, 9.0, 300.0), coefficients(150.0, 3.0, 100.0));
+        // The halo factor: a third at Detail 0 whatever the Amount, rising
+        // with Detail, one where halos are not held back.
+        for (a, r, d, want) in [(40.0f32, 1.0f32, 0.0f32, 0.3375f32), (40.0, 1.0, 10.0, 0.6625), (70.0, 2.0, 15.0, 0.7125), (47.0, 1.1, 7.0, 0.55225),
+                                (5.0, 1.0, 0.0, 0.3375), (100.0, 1.0, 25.0, 0.6875), (40.0, 1.0, 25.0, 1.0), (40.0, 1.0, 55.0, 1.0), (150.0, 3.0, 100.0, 1.0)] {
+            assert!((halo_factor(a, r, d) - want).abs() < 2e-4, "halo({a}, {r}, {d}) = {}", halo_factor(a, r, d));
+        }
+        // The constants carry the whole kernel: the step kernel over the factor.
+        let k = RawSharpen { amount: 40.0, radius: 1.0, detail: 0.0, masking: 0.0 }.constants(1.0).expect("on");
+        assert!((k.halo - 0.3375).abs() < 2e-4 && k.window == 1);
+        for (whole, step) in k.coeff.iter().zip(coefficients(40.0, 1.0, 0.0)) {
+            assert!((whole * k.halo - step).abs() < 1e-5 * (1.0 + step.abs()));
+        }
         // Off below half an Amount; on from there.
         assert!(RawSharpen::default().constants(1.0).is_none());
         assert!(RawSharpen { amount: 0.4, ..Default::default() }.constants(1.0).is_none());
@@ -476,6 +566,59 @@ mod tests {
         // Flat ground stays as it is, whatever the setting.
         let flat = run(RawSharpen { amount: 150.0, radius: 3.0, detail: 100.0, masking: 0.0 }, &[0.5; 32]);
         assert!(flat.iter().all(|v| (v - 0.5).abs() < 1e-5));
+        let flat = run(RawSharpen { amount: 150.0, radius: 3.0, detail: 0.0, masking: 0.0 }, &[0.5; 32]);
+        assert!(flat.iter().all(|v| (v - 0.5).abs() < 1e-5));
+    }
+
+    /// Low Detail: a hard step is sharpened as the step kernel says, a soft
+    /// edge more, its steepening kept and only its halo held back. Against
+    /// the model's numbers.
+    #[test]
+    fn low_detail_holds_the_halo_back_and_nothing_else() {
+        let run = |s: RawSharpen, levels: &[f32]| -> Vec<f32> {
+            let k = s.constants(1.0).expect("on");
+            let out = sharpen_picture(&grey_rows(levels, k.gamma, 5), levels.len(), 5, &k);
+            levels_of(&out, levels.len(), 2, k.gamma)
+        };
+        // 0.40 to 0.45 over four pixels.
+        let ramp: Vec<f32> = (0..32).map(|i| 0.40 + 0.01 * (i as f32 - 13.0).clamp(0.0, 5.0)).collect();
+        let got = run(RawSharpen { amount: 40.0, radius: 1.0, detail: 0.0, masking: 0.0 }, &ramp);
+        let want = [0.39999f32, 0.399981, 0.399769, 0.398829, 0.409339, 0.41997, 0.43003, 0.440661, 0.451171, 0.450231, 0.450019, 0.45001];
+        for (g, w) in got[10..22].iter().zip(want) {
+            assert!((g - w).abs() < 2e-4, "{:?}", &got[10..22]);
+        }
+        let got = run(RawSharpen { amount: 100.0, radius: 2.0, detail: 10.0, masking: 0.0 }, &ramp);
+        let want = [0.399968f32, 0.399609, 0.397538, 0.391747, 0.405273, 0.419286, 0.430714, 0.444727, 0.458253, 0.452462, 0.450391, 0.450032];
+        for (g, w) in got[10..22].iter().zip(want) {
+            assert!((g - w).abs() < 3e-4, "{:?}", &got[10..22]);
+        }
+        // The ramp's inside is steepened by more than the step kernel alone
+        // would (which is what it got before the rule): 1 / h of it.
+        let k = RawSharpen { amount: 40.0, radius: 1.0, detail: 0.0, masking: 0.0 }.constants(1.0).expect("on");
+        let mut plain = k.clone();
+        plain.coeff = coefficients(40.0, 1.0, 0.0);
+        plain.halo = 1.0;
+        let out = sharpen_picture(&grey_rows(&ramp, k.gamma, 5), 32, 5, &plain);
+        let old = levels_of(&out, 32, 2, k.gamma);
+        let got = run(RawSharpen { amount: 40.0, radius: 1.0, detail: 0.0, masking: 0.0 }, &ramp);
+        let (inside_new, inside_old) = (ramp[14] - got[14], ramp[14] - old[14]);
+        assert!(inside_old > 1e-4 && (inside_new / inside_old - 1.0 / k.halo).abs() < 0.05, "{inside_new} {inside_old}");
+        // A hard step is all halo: the same picture with the rule and without.
+        let step: Vec<f32> = (0..32).map(|i| if i >= 16 { 0.45 } else { 0.40 }).collect();
+        let with = run(RawSharpen { amount: 40.0, radius: 1.0, detail: 0.0, masking: 0.0 }, &step);
+        let out = sharpen_picture(&grey_rows(&step, k.gamma, 5), 32, 5, &plain);
+        let without = levels_of(&out, 32, 2, k.gamma);
+        for (a, b) in with.iter().zip(&without) {
+            assert!((a - b).abs() < 2e-5, "{with:?} {without:?}");
+        }
+        for (g, w) in with[13..19].iter().zip([0.39995f32, 0.398933, 0.395355, 0.454645, 0.451067, 0.45005]) {
+            assert!((g - w).abs() < 2e-4, "{:?}", &with[13..19]);
+        }
+        // The rule itself.
+        assert!((halo_change(0.5, 0.02, 0.4, 0.6, 0.3) - 0.02).abs() < 1e-7);
+        assert!((halo_change(0.5, 0.2, 0.4, 0.6, 0.3) - (0.1 + 0.3 * 0.1)).abs() < 1e-6);
+        assert!((halo_change(0.5, -0.3, 0.45, 0.6, 0.5) - (-0.05 - 0.5 * 0.25)).abs() < 1e-6);
+        assert!((halo_change(0.5, 0.2, 0.5, 0.5, 1.0) - 0.2).abs() < 1e-7);
     }
 
     #[test]
@@ -543,6 +686,10 @@ mod tests {
         assert!((mh.sigma - 0.5 * mf.sigma).abs() < 1e-6 && mh.threshold == mf.threshold);
         // A scale that makes no sense is the export's own.
         assert_eq!(s.constants(f32::NAN).expect("on").sigmas, full.sigmas);
+        // The halo rule's neighbourhood is one pixel of the export: one of
+        // a smaller frame's too, as many of a larger one's.
+        assert_eq!((full.window, half.window), (1, 1));
+        assert_eq!((s.constants(2.0).expect("on").window, s.constants(2.6).expect("on").window, s.constants(40.0).expect("on").window), (2, 3, MAX_WINDOW));
     }
 
     /// Colour: the three channels of a pixel are scaled alike.

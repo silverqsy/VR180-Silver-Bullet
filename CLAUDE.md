@@ -2709,19 +2709,33 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      `data/sharp_*.npz`). What was found, and what the stage does:
      it works on the DEVELOPED picture (its fades follow the output level
      whatever the tone settings), on `φ = Y^(1/1.8)` of the Rec.709
-     luminance, and scales a pixel's linear RGB by one gain. On an edge
-     the change is a fixed kernel per (Amount, Radius, Detail), read off
-     the response to a small step for 14 × 9 × 8 settings and held as five
-     blurs (`data/raw_sharpen.f32`: `Δ = Σ cⱼ (φ − Gⱼ ∗ φ)`, σ = 0.5, 0.8,
-     1.3, 2.1, 3.4; taps within 0.0015). Then a soft limit, a fade by the
-     pixel's own level (none below φ 0.028, all from 0.204 to 0.851, none
-     above 0.969), limits on how far a pixel of each level may be darkened
-     or lightened (44 measured levels), and Masking = one curve of (edge
-     strength / threshold): the gradient's size spread by a blur of
-     1.2 + 0.5·Radius px, the threshold a table over Masking. GPU:
-     `Device::record_raw_sharpen` right after the development in
-     `record_color_stack_16` (`raw_sharpen_level` / `_blur` / `_apply.wgsl`,
-     four `R32Float` planes, 12 to 15 passes an eye); CPU twin
+     luminance, and scales a pixel's linear RGB by one gain. On a HARD
+     edge the change is a fixed kernel per (Amount, Radius, Detail), read
+     off the response to a small step for 14 × 9 × 11 settings and held as
+     five blurs (`data/raw_sharpen.f32`: `Δ = Σ cⱼ (φ − Gⱼ ∗ φ)`, σ = 0.5,
+     0.8, 1.3, 2.1, 3.4; taps within 0.0015). **Low Detail = halo
+     suppression** (found 2026-11-16 on edges of five softnesses over
+     882 settings, `sharp8.py`, `halo_b.py`): the sharpening is the step
+     kernel over a factor `h`, and of its change the part that keeps the
+     pixel within the range of the original around it (3×3) is kept, the
+     part beyond — the halo — is scaled by `h` (`raw_sharpen::halo_change`,
+     `halo_factor`; the table holds `h` beside the coefficients). A hard
+     step is all halo, so it gets the step kernel exactly; a soft edge
+     gets up to `1 / h` of it. `h` = 0.34 at Detail 0 for every Amount and
+     Radius, 0.5–0.75 at Detail 5–10, 1 from Detail 20–55 (later at large
+     radii), and it falls again above Amount 85 at Detail 5–25; below
+     Amount 10 the chart does not resolve it and Amount 10's is used. The
+     range is taken over one pixel of the EXPORTED frame
+     (`SharpenConstants::window` = the pixel scale rounded, 1 to 3). Then a
+     soft limit, a fade by the pixel's own level (none below φ 0.028, all
+     from 0.204 to 0.851, none above 0.969), limits on how far a pixel of
+     each level may be darkened or lightened (44 measured levels), and
+     Masking = one curve of (edge strength / threshold): the gradient's
+     size spread by a blur of 1.2 + 0.5·Radius px, the threshold a table
+     over Masking. GPU: `Device::record_raw_sharpen` right after the
+     development in `record_color_stack_16` (`raw_sharpen_level` / `_blur`
+     / `_apply.wgsl`, four `R32Float` planes, 12 to 15 passes an eye; the
+     apply pass reads the level plane's 3×3 for the range); CPU twin
      `raw_sharpen::sharpen_picture`. The radius is in pixels of the
      EXPORTED frame: `ColorStackPlan::raw_pixel_scale` (the GUI sets it
      from `Settings::export_eye_w`, which `maybe_push_settings` keeps at
@@ -2729,14 +2743,20 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      go into the DNG's XMP. Against Camera Raw on three frames (the change
      each makes; `sharp_app.py`): Detail 25 error 18–34 % of the change,
      correlation 0.96–0.985; Detail 100 12–15 %, 0.99; Masking 40 / 80
-     23–40 %; Detail 0 60 % (the app changes half as much). NOT
-     reproduced: below Detail 25 Camera Raw also smooths fine texture
-     (edge-preserving, scale-free, median-like; strongest at Detail 0 and
-     large radii — a 1 px line loses 7 to 28 % at Amount 1) and holds a
-     hard step back more than a soft one (at Detail 0 a soft edge gets
-     2.8× what a hard one gets); at Amount 100+ the limiting at big edges
-     is 20–40 % off. Cost: +14 ms a frame at 4096×2048, +24 ms at
-     7680×3840 (Apple silicon).
+     23–40 %; Detail 0: Amount 40 29–36 %, Amount 100 19–24 %, Amount 150
+     16–20 % (before the halo rule 41–63 %, the app changing half as
+     much); Detail 5–20 at Amount 40 21–33 %; Radius 3 at Detail 0 44–52 %.
+     NOT reproduced: with any Amount above zero Camera Raw first smooths
+     the finest texture (edge-preserving, scale-free: it leaves a step
+     alone, takes a 1 px line down by 7 to 28 % without spreading it, acts
+     mostly on local extremes; the same for every Radius up to 1.4, growing
+     above; gone at Detail 100). Its size on the sample frames is 0.24/255
+     rms at Detail 0 (0.66 at Radius 3), 0.16 at Detail 25, against 1.2 of
+     the Amount 40 sharpening at Detail 0; running the model on Camera
+     Raw's own Amount 1 picture brings Detail 0 to 18–25 % and Detail 25
+     to 15–18 %, so it is most of what is left. At Amount 100+ the
+     limiting at big edges is 20–40 % off. Cost: +14 ms a frame at
+     4096×2048, +24 ms at 7680×3840 (Apple silicon).
    - **DNG**: `raw_export.rs` — a frame as a linear DNG with the settings
      as `crs:` XMP (written beside every Snapshot of a raw clip), and the
      export option "DNG sequence" (`ExportOptions::raw_dng_sequence`,
