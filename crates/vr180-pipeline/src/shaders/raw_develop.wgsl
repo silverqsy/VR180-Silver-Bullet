@@ -28,7 +28,8 @@ struct Params {
     // x = log2 of the first sample, y = samples per stop, z = last index,
     // w = scene value of the first sample
     curve: vec4<f32>,
-    // x, y = a channel counts as clipped from x to y (of the sensor's white)
+    // x, y = a channel counts as clipped from x to y (of the sensor's white);
+    // z = output light of a scene value of zero
     clip: vec4<f32>,
 }
 @group(0) @binding(2) var<uniform> p: Params;
@@ -51,8 +52,8 @@ fn scene(camera: vec3<f32>) -> vec3<f32> {
 }
 
 fn tone(x: f32) -> f32 {
-    if (x <= 0.0) { return 0.0; }
-    if (x <= p.curve.w) { return curve[0] * x / p.curve.w; }
+    if (x <= 0.0) { return p.clip.z; }
+    if (x <= p.curve.w) { return mix(p.clip.z, curve[0], x / p.curve.w); }
     let y = min((log2(x) - p.curve.x) * p.curve.y, p.curve.z);
     let i = min(floor(y), p.curve.z - 1.0);
     let f = y - i;

@@ -126,11 +126,13 @@ struct DevelopLocalParams {
     cam_to_work: [[f32; 4]; 3],
     work_to_out: [[f32; 4]; 3],
     black: [f32; 4],
-    outc: [f32; 4],
+    fed: [f32; 4],
     gains: [f32; 4],
     clip: [f32; 4],
     luma: [f32; 4],
     grid: [f32; 4],
+    stage: [f32; 4],
+    keyed: [f32; 4],
 }
 
 /// Cells along the longer side of the frame the keys are read from: three
@@ -364,6 +366,9 @@ impl RawPipelines {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                bgl_storage_buffer(8),
+                bgl_storage_buffer(9),
+                bgl_storage_buffer(10),
             ],
         });
         let develop_local = compute_pipeline(device, "raw_develop_local", RAW_DEVELOP_LOCAL_WGSL, "main", &develop_local_layout);
@@ -855,22 +860,28 @@ impl Device {
         let lo = CURVE_LO as f32;
         let last = (local.black.len() - 1) as f32;
         let out_lo = OUT_LO as f32;
-        let out_last = (local.out.len() - 1) as f32;
+        let fed_last = (local.fed.len() - 1) as f32;
+        let stage_last = (local.tone.len() - 1) as f32;
         let params = self.write_uniform("raw_develop_local_params", &DevelopLocalParams {
             neutral: [k.geometry.neutral[0], k.geometry.neutral[1], k.geometry.neutral[2], k.gain],
             cam_to_work: k.geometry.camera_to_work.map(row4),
             work_to_out: k.geometry.work_to_out.map(row4),
             black: [lo, last / (local.black_hi - lo), last, 2f32.powf(lo)],
-            outc: [out_lo, out_last / (local.out_hi - out_lo), out_last, 2f32.powf(out_lo)],
-            gains: [LOCAL_LO, LOCAL_PER_STOP, (local.gain.len() - 1) as f32, 0.0],
+            fed: [out_lo, fed_last / (local.fed_hi - out_lo), fed_last, 2f32.powf(out_lo)],
+            gains: [LOCAL_LO, LOCAL_PER_STOP, (local.gain.len() - 1) as f32, local.floor],
             clip: [CLIP_FROM, CLIP_TO, BASE_FLOOR, BASE_FALLBACK],
             luma: luma4(cell_px),
             grid: [BASE_LO, 1.0 / BASE_RANGE, local.white.log2(), 0.0],
+            stage: [stage_last / -out_lo, stage_last, 0.0, 0.0],
+            keyed: [local.whites.floor, local.blacks.floor, if local.whites.keyed { 1.0 } else { 0.0 }, if local.blacks.keyed { 1.0 } else { 0.0 }],
         });
-        let (pre, outc, gains) = (
+        let (pre, outc, gains, whites, blacks, tone) = (
             self.curve_buffer("raw_develop_black", &local.black),
-            self.curve_buffer("raw_develop_out", &local.out),
+            self.curve_buffer("raw_develop_fed", &local.fed),
             self.curve_buffer("raw_develop_gains", &local.gain),
+            self.curve_buffer("raw_develop_whites", &local.whites.map),
+            self.curve_buffer("raw_develop_blacks", &local.blacks.map),
+            self.curve_buffer("raw_develop_tone", &local.tone),
         );
         let pipes = self.raw_pipelines();
         let (src_view, dst_view, grid_view) = (src.create_view(&Default::default()), dst.create_view(&Default::default()), grid.create_view(&Default::default()));
@@ -886,6 +897,9 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 5, resource: gains.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&grid_view) },
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&pipes.grid_sampler) },
+                wgpu::BindGroupEntry { binding: 8, resource: whites.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: blacks.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: tone.as_entire_binding() },
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("raw_develop_local"), timestamp_writes: None });
@@ -913,7 +927,7 @@ impl Device {
             cam_to_work: k.geometry.camera_to_work.map(row4),
             work_to_out: k.geometry.work_to_out.map(row4),
             curve: [lo, last / (k.curve_hi - lo), last, 2f32.powf(lo)],
-            clip: [CLIP_FROM, CLIP_TO, 0.0, 0.0],
+            clip: [CLIP_FROM, CLIP_TO, k.floor, 0.0],
         });
         let bytes: &[u8] = bytemuck::cast_slice(&k.curve);
         let curve = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -989,6 +1003,9 @@ mod tests {
             RawSettings::default(),
             RawSettings { exposure: 1.5, ..Default::default() },
             RawSettings { exposure: -2.0, temperature: Some(3200.0), tint: Some(12.0), ..Default::default() },
+            RawSettings { blacks: 80.0, whites: -60.0, ..Default::default() },
+            RawSettings { blacks: -50.0, exposure: 1.0, ..Default::default() },
+            RawSettings { blacks: -80.0, whites: -100.0, ..Default::default() },
         ] {
             let stage = RawDevelop { camera: RawCamera::X6, settings, measure: Measure::Wait };
             // The keys the GPU reads off the picture are the CPU's own of the same cells.
@@ -1054,6 +1071,7 @@ mod tests {
             RawSettings { shadows: 100.0, ..Default::default() },
             RawSettings { highlights: -100.0, exposure: 1.0, ..Default::default() },
             RawSettings { shadows: -40.0, highlights: 60.0, ..Default::default() },
+            RawSettings { shadows: 70.0, blacks: 60.0, whites: -40.0, ..Default::default() },
         ] {
             let stage = RawDevelop { camera: RawCamera::X6, settings, measure: Measure::Wait };
             let mut k = dev.raw_develop_constants(&[&src], &stage);
