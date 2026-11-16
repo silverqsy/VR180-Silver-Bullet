@@ -132,10 +132,22 @@ converter's controls for it, and every frame can be had as a DNG.
   own demosaic of the frame to a part in a thousand. About 0.45 s a frame
   pair and 4 GB of memory at 8192×4096. macOS only for now: the enhanced
   picture is JPEG XL, which this build decodes through the system.
-- **What a take does not carry.** No accelerometer: the stabilizer has the
-  gyro, but no horizon to level to. No readout time: there is no
-  rolling-shutter correction. No white balance of its own: As shot is the
-  camera's reference white.
+- **Rolling shutter and the accelerometer.** Takes from the camera build
+  that records the sensor's row timing and the accelerometer use both.
+  Each frame's pose is taken where its centre row starts exposing (the
+  frame's stamp plus half the readout the take states: 14.6 ms at 30 and
+  60 fps, 15.4 ms at 50), every row is corrected for its own time, top
+  row first, and the poses are built with the accelerometer as the
+  camera's own video files' are, which keeps a long take from tilting.
+  Measured on six hand-held takes against the picture itself: the readout
+  the take states is the one the picture shows, and on the hardest of
+  them the far-field shake of a locked export fell from 1.5 to 0.4 pixels
+  a frame at 1024 pixels an eye (2.6 without stabilization). Takes of the
+  earlier build have neither and stabilize as before.
+- **What a take does not carry.** No shutter time: a frame's pose is taken
+  half a shutter early, which leaves the 0.4 pixels above (0.06 with the
+  3 ms these takes turn out to need). No white balance of its own: As
+  shot is the camera's reference white.
 
 ### Insta360 X6: ETTR recovery for I-Log clips
 

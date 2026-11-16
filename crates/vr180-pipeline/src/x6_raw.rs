@@ -373,22 +373,58 @@ pub fn lens_meta(take: &Take) -> Insta360Meta {
     }
 }
 
-/// Timing of the capture that the take itself does not state.
+/// Timing of a take's frames, as far as the take states it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaptureTiming {
     /// Sensor readout (first row to last), ms. `None` = not known: no
     /// per-row rolling-shutter correction.
     pub readout_ms: Option<f32>,
-    /// From a frame's exposure stamp to the middle of its centre row's
-    /// exposure, ms.
+    /// From a frame's exposure stamp to the time its centre row is sampled
+    /// at, ms.
     pub stamp_to_content_ms: f64,
 }
 
-/// The timing of a take's frames. The take states neither its readout time
-/// nor its shutter time, so nothing here is known yet: the pose of a frame
-/// is sampled at its exposure stamp and rows are not corrected one by one.
-pub fn capture_timing(_take: &Take) -> CaptureTiming {
-    CaptureTiming { readout_ms: None, stamp_to_content_ms: 0.0 }
+/// The timing of a take's frames, from its sensor record
+/// ([`x6b::read_sensor_readout`]): the stamp is the start of the first
+/// row's exposure and each row starts a line period after the one above, so
+/// the centre row starts half the readout after the stamp and the rows span
+/// the readout around it, top row first. A take without the record states
+/// nothing: the pose is sampled at the stamp and rows are not corrected.
+///
+/// Measured on six takes with the camera in the hand (features tracked in
+/// the sensor picture against the gyro through the lens model): the fitted
+/// readout is the record's (14.26–14.54 ms for its 14.556, 15.38 for
+/// 15.356), top row first, and the centre row's content sits 9.9–11.4 ms
+/// after the stamp, that is 2.7–3.6 ms beyond half the readout. That rest
+/// is half the shutter time plus whatever the gyro's stamps lag by; the
+/// take states neither, so neither is added here.
+pub fn capture_timing(take: &Take) -> CaptureTiming {
+    let readout_ms = x6b::read_sensor_readout(take).map(|eyes| (eyes[0].first_to_last_row_ns * 1e-6) as f32);
+    CaptureTiming { readout_ms, stamp_to_content_ms: readout_ms.map_or(0.0, |r| r as f64 * 0.5) }
+}
+
+/// The accelerometer (m/s²) at each gyro sample's time: the two streams
+/// share a clock, and nearly every stamp. Empty when the take has too
+/// little of it to be of use.
+fn accel_at_gyro(gyro: &[x6b::GyroSample], accel: &[x6b::GyroSample]) -> Vec<[f32; 3]> {
+    if accel.len() < 16 || gyro.is_empty() {
+        return Vec::new();
+    }
+    // It has to cover the gyro's span, give or take a few samples.
+    let slack = 20_000_000;
+    if accel[0].t_ns > gyro[0].t_ns + slack || accel[accel.len() - 1].t_ns + slack < gyro[gyro.len() - 1].t_ns {
+        return Vec::new();
+    }
+    let mut j = 0usize;
+    gyro.iter().map(|g| {
+        while j + 2 < accel.len() && accel[j + 1].t_ns <= g.t_ns {
+            j += 1;
+        }
+        let (a, b) = (accel[j], accel[j + 1]);
+        let span = b.t_ns.saturating_sub(a.t_ns).max(1) as f64;
+        let f = ((g.t_ns as f64 - a.t_ns as f64) / span).clamp(0.0, 1.0) as f32;
+        [0, 1, 2].map(|k| a.xyz[k] + (b.xyz[k] - a.xyz[k]) * f)
+    }).collect()
 }
 
 /// Gyro bias in rad/s from the stillest half second of the stream, when one
@@ -442,13 +478,31 @@ pub fn build_imu(index: &TakeIndex, stream_w: u32, stream_h: u32) -> DjiOsvImu {
         }
     };
     let deg = 180.0 / std::f32::consts::PI;
-    let samples: Vec<InsvImuSample> = gyro.iter()
-        .map(|g| InsvImuSample { t_us: g.t_ns / 1000, acc_g: [0.0; 3], gyr_dps: [g.xyz[0] * deg, g.xyz[1] * deg, g.xyz[2] * deg] })
+    const G: f32 = 9.80665;
+    // The accelerometer, where the take has one: the camera's own, on the
+    // gyro's axes (it holds its direction in the gyro-integrated frame to
+    // 1–2° through a hand-held minute, and reads as the camera's own video
+    // files' does at rest).
+    let accel = accel_at_gyro(&gyro, &x6b::read_accel(&take.dir, hz));
+    let samples: Vec<InsvImuSample> = gyro.iter().enumerate()
+        .map(|(i, g)| InsvImuSample {
+            t_us: g.t_ns / 1000,
+            acc_g: accel.get(i).map_or([0.0; 3], |a| [a[0] / G, a[1] / G, a[2] / G]),
+            gyr_dps: [g.xyz[0] * deg, g.xyz[1] * deg, g.xyz[2] * deg],
+        })
         .collect();
-    let bias = rest_bias(&samples);
-    // No accelerometer in the take: the poses are the integrated gyro alone
-    // (no levelling, no slow trim).
-    let quats = crate::insv_imu::integrate_orientation_samples(&samples, bias, 0.0);
+    // With an accelerometer the poses are built as the camera's own video
+    // files' are: the gyro's bias from a 6-axis pass, its integration, and
+    // the slow trim that keeps a long take level. Without one: the gyro
+    // alone, its bias from a still stretch if the take has one.
+    let (bias, trim_tau_s) = if accel.is_empty() {
+        (rest_bias(&samples), 0.0)
+    } else {
+        let rates: Vec<[f32; 3]> = gyro.iter().map(|g| g.xyz).collect();
+        let dt = ((gyro[gyro.len() - 1].t_ns - gyro[0].t_ns) as f64 * 1e-9 / (gyro.len() - 1) as f64) as f32;
+        (vr180_core::gyro::vqf::run(&rates, &accel, None, dt).bias_rad_s, crate::insv_imu::INSV_TAU_ACC_S)
+    };
+    let quats = crate::insv_imu::integrate_orientation_samples(&samples, bias, trim_tau_s);
     let line = crate::insv_imu::QuatTimeline { t_s: gyro.iter().map(|g| g.t_ns as f64 * 1e-9).collect(), quats: &quats };
     let frame_dur = index.dt_s();
     let lead = timing.stamp_to_content_ms * 1e-3;
@@ -470,8 +524,14 @@ pub fn build_imu(index: &TakeIndex, stream_w: u32, stream_h: u32) -> DjiOsvImu {
     let (first, last) = (gyro[0].t_ns as f64 * 1e-9, gyro[gyro.len() - 1].t_ns as f64 * 1e-9);
     let (f0, f1) = (index.pairs[0].exposure_ns[0] as f64 * 1e-9, index.pairs[index.pairs.len() - 1].exposure_ns[0] as f64 * 1e-9);
     tracing::info!(
-        "raw take {}: {} gyro samples @ {:.1} Hz, bias {:?} rad/s, covers {:+.3} s before the first frame to {:+.3} s after the last; {} frame poses",
-        take.dir.display(), gyro.len(), (gyro.len() - 1) as f64 / (last - first).max(1e-9), bias, f0 - first, last - f1, out.frame_quats.len());
+        "raw take {}: {} gyro samples @ {:.1} Hz, bias {:?} rad/s, {}, covers {:+.3} s before the first frame to {:+.3} s after the last; {} frame poses, {}",
+        take.dir.display(), gyro.len(), (gyro.len() - 1) as f64 / (last - first).max(1e-9), bias,
+        if accel.is_empty() { "no accelerometer".to_string() } else { format!("accelerometer (trim {trim_tau_s} s)") },
+        f0 - first, last - f1, out.frame_quats.len(),
+        match timing.readout_ms {
+            Some(r) => format!("readout {r:.3} ms, centre row {:.3} ms after the stamp", timing.stamp_to_content_ms),
+            None => "no readout record".to_string(),
+        });
     if first > f0 || last < f1 {
         tracing::warn!("raw take {}: the gyro does not cover every frame; the uncovered ones hold the nearest pose", take.dir.display());
     }
@@ -938,7 +998,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let take = Take {
             dir: dir.clone(), fps_setting: 60, width: 3840, height: 3840, clock_start: None,
-            audio_file: None, audio_timing: None,
+            audio_file: None, audio_timing: None, sensor_metadata: None,
             seal: x6b::Seal { fps_setting: 60, request_window: (10, 13), received_pairs: 3, pairs: 3, bytes: 3 * 8192 },
             capture_bytes: 3 * 8192,
         };
@@ -987,6 +1047,79 @@ mod tests {
         let d = std::f32::consts::PI / 180.0;
         assert!((b[0] - 0.2 * d).abs() < 1e-4 && (b[1] + 0.1 * d).abs() < 1e-4, "{b:?}");
         assert_eq!(rest_bias(&moving(4000).collect::<Vec<_>>()), [0.0; 3]);
+    }
+
+    #[test]
+    fn the_accelerometer_is_read_at_the_gyros_times() {
+        let at = |t_ms: u64, v: f32| x6b::GyroSample { t_ns: t_ms * 1_000_000, xyz: [v, -v, 2.0 * v] };
+        let gyro: Vec<_> = (0..40).map(|i| at(100 + i, 0.0)).collect();
+        // The same stamps: the readings themselves.
+        let same: Vec<_> = (0..45).map(|i| at(100 + i, i as f32)).collect();
+        let a = accel_at_gyro(&gyro, &same);
+        assert_eq!((a.len(), a[0], a[39]), (40, [0.0, 0.0, 0.0], [39.0, -39.0, 78.0]));
+        // Stamps half a sample off: the reading in between.
+        let off: Vec<_> = (0..45).map(|i| x6b::GyroSample { t_ns: (100 + i) * 1_000_000 - 500_000, xyz: [i as f32, 0.0, 0.0] }).collect();
+        let a = accel_at_gyro(&gyro, &off);
+        assert!((a[10][0] - 10.5).abs() < 1e-4 && (a[39][0] - 39.5).abs() < 1e-4, "{:?} {:?}", a[10], a[39]);
+        // Too few samples, or a stream that stops well short of the gyro's: none.
+        assert!(accel_at_gyro(&gyro, &same[..10]).is_empty());
+        let short: Vec<_> = (0..16).map(|i| at(100 + i, 1.0)).collect();
+        let long_gyro: Vec<_> = (0..200).map(|i| at(100 + i, 0.0)).collect();
+        assert!(accel_at_gyro(&long_gyro, &short).is_empty());
+        assert!(accel_at_gyro(&[], &same).is_empty());
+    }
+
+    /// A take's frame timing is its sensor record's: the readout, and the
+    /// centre row half of it after the stamp. Without the record, nothing.
+    #[test]
+    fn the_frame_timing_is_the_sensor_records() {
+        let dir = std::env::temp_dir().join(format!("vr180-take-timing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut take = Take {
+            dir: dir.clone(), fps_setting: 30, width: 3840, height: 3840, clock_start: None,
+            audio_file: None, audio_timing: None, sensor_metadata: None,
+            seal: x6b::Seal { fps_setting: 30, request_window: (1, 1), received_pairs: 1, pairs: 1, bytes: 8192 },
+            capture_bytes: 8192,
+        };
+        assert_eq!(capture_timing(&take), CaptureTiming { readout_ms: None, stamp_to_content_ms: 0.0 });
+        let eye = r#"{"bayer_output_wh":[3840,3840],"line_period_ns":3791.6666628749995,"rolling_shutter_first_to_last_row_ns":14556208}"#;
+        std::fs::write(dir.join("sensor-metadata.json"), format!(r#"{{"eyes":{{"CAM0":{eye},"CAM1":{eye}}}}}"#)).unwrap();
+        take.sensor_metadata = Some("sensor-metadata.json".into());
+        let t = capture_timing(&take);
+        assert!((t.readout_ms.unwrap() - 14.556208).abs() < 1e-5 && (t.stamp_to_content_ms - 7.278104).abs() < 1e-5, "{t:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A take of the camera build that records the sensor's row timing and
+    /// the accelerometer (skipped when the volume is not mounted): its
+    /// readout is the record's, its poses are built with the accelerometer,
+    /// and the earth frame they are in has the accelerometer's vector up.
+    #[test]
+    fn a_take_with_a_sensor_record_builds_its_poses_from_it() {
+        let dir = Path::new("/Volumes/Database/x6/1116 Raw Video/RAWVIDEO-20261116-162028");
+        if !dir.exists() { return; }
+        let index = open(dir).unwrap();
+        assert_eq!(index.take.sensor_metadata.as_deref(), Some("sensor-metadata.json"));
+        let timing = capture_timing(&index.take);
+        assert!((timing.readout_ms.unwrap() - 14.556208).abs() < 1e-4 && (timing.stamp_to_content_ms - 7.278104).abs() < 1e-4);
+        let imu = build_imu(&index, 3840, 3840);
+        assert_eq!(imu.frame_quats.len(), index.frames());
+        assert!((imu.readout_ms.unwrap() - 14.556208).abs() < 1e-4);
+        assert!((crate::dji_imu::readout_ms_for(crate::SourceKind::X6Raw, 29.97, Some(&imu)) - 14.556208).abs() < 1e-4);
+        // The accelerometer at rest, turned by a frame's pose, points up (+z of the poses' earth frame).
+        let hz = index.take.clock_start.unwrap().counter_hz;
+        let accel = x6b::read_accel(dir, hz);
+        assert!(accel.len() > 30_000);
+        let mid = index.frames() / 2;
+        let t = index.pairs[mid].exposure_ns[0];
+        let near = accel.iter().min_by_key(|a| a.t_ns.abs_diff(t)).unwrap();
+        let q = imu.frame_quats[mid];
+        let (a, n) = (near.xyz, (near.xyz[0].powi(2) + near.xyz[1].powi(2) + near.xyz[2].powi(2)).sqrt());
+        let v = [a[0] / n, a[1] / n, a[2] / n];
+        // q v q*: the z component of the rotated vector.
+        let (w, x, y, z) = (q.w, q.x, q.y, q.z);
+        let up = 2.0 * (x * z - w * y) * v[0] + 2.0 * (y * z + w * x) * v[1] + (1.0 - 2.0 * (x * x + y * y)) * v[2];
+        assert!(up > 0.995, "accelerometer in the earth frame: z = {up}");
     }
 
     #[test]

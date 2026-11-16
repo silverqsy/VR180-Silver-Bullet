@@ -2649,6 +2649,45 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      poses; `X6RawIter` hands out pairs demosaiced on the GPU as
      camera-linear `Rgba16Unorm` eyes, at half size for the preview). Raw
      clips take the 16-bit stacks only; video export is forced to 10-bit.
+   - **Motion and timing** (2026-11-16, on the first takes that carry a
+     sensor record; `x6b::read_sensor_readout`, `read_accel`,
+     `x6_raw::capture_timing`, `build_imu`). `clip.json.sensor_metadata`
+     → `sensor-metadata.json`: per eye `line_period_ns` (3791.67 at 30 and
+     60p, 4000 at 50p) and `rolling_shutter_first_to_last_row_ns`
+     (14.556 / 15.356 / 14.556 ms: the camera's own video files state the
+     same numbers); `accel.csv` + `accel-info.json` beside `gyro.csv`
+     (m/s², gravity in it, the gyro's stamps; `status` other than `ok` =
+     none, one of the seven takes has it so). RULE (rule 7: from the
+     file, nothing tuned): a frame's stamp is the start of its first
+     row's exposure, so the pose is sampled at the centre row's start,
+     `stamp + readout / 2`, and the rows span the readout around it, top
+     row first (`readout_ms` reaches the shared per-row path through the
+     pose structure; `readout_ms_for` honours it). With an accelerometer
+     the poses are built as the camera's own video files' are (bias from a
+     6-axis pass, the integration, the 100 s trim); without one, as
+     before. A take without the record: pose at the stamp, no per-row
+     correction, as before.
+     MEASURED (`~/vr180-internal/x6raw-imu/raw_gyro_flow.py`: features
+     tracked in the binned mosaic against the gyro through the factory
+     lens model, per-row times; six hand-held takes): the gyro's axes are
+     the camera's own files' (the best of the 24 signed permutations, and
+     a free rotation moves it 1–2°); the accelerometer shares them (its
+     direction holds to 1–2° in the gyro-integrated frame through a
+     minute, and reads −1 g on x at rest as the camera's files' does);
+     readout 14.26–14.54 ms fitted for the record's 14.556 and 15.38 for
+     15.356, top row first; centre-row content 9.9–11.4 ms after the
+     stamp = half the readout + 2.7–3.6 ms. THAT REST IS NOT IN THE TAKE:
+     half the shutter time plus the gyro's own lag (the same hardware's
+     video files state 1.1 ms for the latter, which would make the
+     shutter about 1/200 s). It is not added (no tuned phase numbers).
+     What it costs, far-field shake of a locked export at 1024 px an eye,
+     the hardest take: unstabilized 2.60 px a frame; pose at the stamp
+     (before) 1.52; this rule 0.42; with 3 ms more 0.06. Per-row
+     correction, same take with those 3 ms: top of the frame 0.54 → 0.13,
+     middle 0.15 → 0.06, reversed 1.14. ASKED OF THE CAMERA SIDE: the
+     shutter time of every frame (and the gyro's lag if known).
+     Diagnostics: `VR180_IMU_PHASE_OFFSET_MS`, `VR180_RS_SCALE`,
+     `VR180_INSV_BASIS`, `VR180_LOCK_REF_FRAME`.
    - **Demosaic** (2026-11-16; `bayer.rs` = the specification and the CPU
      twin, `Device::demosaic_bayer` = three passes: `bayer_measure` →
      `Rg32Float`, `bayer_green` → `R32Float`, `bayer_demosaic` → the eye;
@@ -2962,10 +3001,12 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      (the GPU stages against their CPU twins, the tables and families
      against Camera Raw's numbers, the keys read off the reduced copy,
      the sharpening's kernel and limits).
-   - **Not done**: no rolling-shutter correction and no horizon (a take
-     states neither readout time nor acceleration); raw clips are not in
-     stereo auto-align; the development panel, the DNG snapshot and the DNG
-     sequence option have not been seen running on a display yet.
+   - **Not done**: the shutter time is not in a take, so the pose is
+     sampled half a shutter (plus the gyro's lag) early (Motion and
+     timing); takes of the earlier camera build have neither readout nor
+     accelerometer; raw clips are not in stereo auto-align; the
+     development panel, the DNG snapshot and the DNG sequence option have
+     not been seen running on a display yet.
    - **WINDOWS**: shared code; the only gate touched is the pair moved into
      `export_device()` in `app.rs`. To check there: the raw shaders compile
      on D3D12 / Vulkan (the staged one binds six storage buffers and a 3D

@@ -77,6 +77,8 @@ pub const CAPTURE_FILE: &str = "capture.x6b";
 pub const CALIBRATION_FILE: &str = "calibration.json";
 pub const GYRO_FILE: &str = "gyro.csv";
 pub const GYRO_INFO_FILE: &str = "gyro-info.json";
+pub const ACCEL_FILE: &str = "accel.csv";
+pub const ACCEL_INFO_FILE: &str = "accel-info.json";
 /// The index of a folder that holds a take's frames as DNG files (one line
 /// per pair) in place of the capture.
 pub const FRAMES_FILE: &str = "frames.jsonl";
@@ -245,6 +247,10 @@ pub struct Take {
     pub audio_file: Option<String>,
     /// Its timing record (`clip.json` → `audio_timing`).
     pub audio_timing: Option<String>,
+    /// The sensor record (`clip.json` → `sensor_metadata`): the readout
+    /// timing and the motion streams. Takes of an earlier camera build have
+    /// none.
+    pub sensor_metadata: Option<String>,
     pub seal: Seal,
     pub capture_bytes: u64,
 }
@@ -344,6 +350,7 @@ pub fn read_take(dir: &Path) -> Result<std::result::Result<Take, TakeProblem>> {
         clock_start: clip.get("clock_start").and_then(ClockAnchor::from_json),
         audio_file: text("audio_file"),
         audio_timing: text("audio_timing"),
+        sensor_metadata: text("sensor_metadata"),
         seal: Seal { fps_setting, request_window: (lo as u32, hi as u32), received_pairs: received, pairs, bytes },
         capture_bytes: meta.len(),
     }))
@@ -686,7 +693,25 @@ pub struct GyroSample {
 /// Read `gyro.csv` (`counter_ticks,x,y,z`), ticks converted with
 /// `counter_hz`. Lines that do not parse are skipped.
 pub fn read_gyro(dir: &Path, counter_hz: u64) -> Result<Vec<GyroSample>> {
-    let text = std::fs::read_to_string(dir.join(GYRO_FILE))?;
+    read_motion(&dir.join(GYRO_FILE), counter_hz)
+}
+
+/// Read `accel.csv`, the accelerometer in m/s² with gravity in it, on the
+/// gyro's axes and clock (the same columns as `gyro.csv`). Empty for a take
+/// that has none: no file (an earlier camera build), a file with no
+/// samples, or a record that says the stream did not run.
+pub fn read_accel(dir: &Path, counter_hz: u64) -> Vec<GyroSample> {
+    let ran = std::fs::read(dir.join(ACCEL_INFO_FILE)).ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .map_or(true, |v| v.get("status").and_then(|x| x.as_str()).map_or(true, |x| x.eq_ignore_ascii_case("ok")));
+    if !ran {
+        return Vec::new();
+    }
+    read_motion(&dir.join(ACCEL_FILE), counter_hz).unwrap_or_default()
+}
+
+fn read_motion(file: &Path, counter_hz: u64) -> Result<Vec<GyroSample>> {
+    let text = std::fs::read_to_string(file)?;
     let hz = counter_hz.max(1) as u128;
     let mut out = Vec::with_capacity(text.len() / 40);
     for line in text.lines() {
@@ -696,6 +721,39 @@ pub fn read_gyro(dir: &Path, counter_hz: u64) -> Result<Vec<GyroSample>> {
         out.push(GyroSample { t_ns: (t as u128 * 1_000_000_000 / hz) as u64, xyz: [x, y, z] });
     }
     Ok(out)
+}
+
+/// One eye's row timing, as the take's sensor record states it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EyeReadout {
+    /// From one row's start to the next, ns.
+    pub line_period_ns: f64,
+    /// From the frame's first row to its last, ns.
+    pub first_to_last_row_ns: f64,
+}
+
+/// The row timing of the take's two eyes (channel 0, then 1) from its
+/// sensor record: a frame's stamp is the start of its first row's exposure
+/// and every row starts a line period after the one above it. `None` when
+/// the take has no such record, or the record is of another frame size.
+pub fn read_sensor_readout(take: &Take) -> Option<[EyeReadout; 2]> {
+    let name = take.sensor_metadata.as_deref()?;
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(take.dir.join(name)).ok()?).ok()?;
+    let eyes = v.get("eyes")?;
+    let eye = |key: &str| -> Option<EyeReadout> {
+        let e = eyes.get(key)?;
+        let size: Vec<u64> = e.get("bayer_output_wh")?.as_array()?.iter().filter_map(|x| x.as_u64()).collect();
+        if size != [take.width as u64, take.height as u64] {
+            return None;
+        }
+        let line = e.get("line_period_ns")?.as_f64()?;
+        let rows = line * (take.height as f64 - 1.0);
+        // The record's own span where it agrees with its line period.
+        let span = e.get("rolling_shutter_first_to_last_row_ns").and_then(|x| x.as_f64())
+            .filter(|s| (s - rows).abs() <= rows * 0.01).unwrap_or(rows);
+        (line.is_finite() && line > 0.0 && span < 1e9).then_some(EyeReadout { line_period_ns: line, first_to_last_row_ns: span })
+    };
+    Some([eye("CAM0")?, eye("CAM1")?])
 }
 
 /// `audio-info.json`: where the sound sits on the take's clock.
@@ -1033,6 +1091,35 @@ mod tests {
         write_take(&dir, 30, (1, 1), &[a]);
         let mut take = read_take(&dir).unwrap().unwrap();
         assert!(read_audio_timing(&take).is_none());
+        // The accelerometer: the gyro's columns; none without the file, with
+        // an empty one, or when its record says it did not run.
+        assert!(read_accel(&dir, 19_200_000).is_empty());
+        std::fs::write(dir.join(ACCEL_FILE), "counter_ticks,x,y,z\n").unwrap();
+        assert!(read_accel(&dir, 19_200_000).is_empty());
+        std::fs::write(dir.join(ACCEL_FILE), "counter_ticks,x,y,z\n19200000,-9.8,-0.5,0.125\n19219200,-9.75,-0.5,0.25\n").unwrap();
+        let acc = read_accel(&dir, 19_200_000);
+        assert_eq!((acc.len(), acc[0].t_ns, acc[1].xyz), (2, 1_000_000_000, [-9.75, -0.5, 0.25]));
+        std::fs::write(dir.join(ACCEL_INFO_FILE), r#"{"unit":"m/s^2","status":"unavailable","samples":0}"#).unwrap();
+        assert!(read_accel(&dir, 19_200_000).is_empty());
+        std::fs::write(dir.join(ACCEL_INFO_FILE), r#"{"unit":"m/s^2","status":"ok","samples":2}"#).unwrap();
+        assert_eq!(read_accel(&dir, 19_200_000).len(), 2);
+        // The sensor record: each eye's row timing. No record, none.
+        assert!(take.sensor_metadata.is_none() && read_sensor_readout(&take).is_none());
+        take.sensor_metadata = Some("sensor-metadata.json".into());
+        assert!(read_sensor_readout(&take).is_none());
+        let eye = |line: f64, span: u64, w: u32| format!(r#"{{"bayer_output_wh":[{w},3840],"line_period_ns":{line},"rolling_shutter_first_to_last_row_ns":{span}}}"#);
+        let record = |a: String, b: String| format!(r#"{{"schema":"raw-sensor-metadata-v1","eyes":{{"CAM0":{a},"CAM1":{b}}}}}"#);
+        std::fs::write(dir.join("sensor-metadata.json"), record(eye(3791.6666628749995, 14556208, 3840), eye(3791.6666973791675, 14556208, 3840))).unwrap();
+        let r = read_sensor_readout(&take).unwrap();
+        assert!(r[0].first_to_last_row_ns == 14556208.0 && (r[1].line_period_ns - 3791.6666973791675).abs() < 1e-6, "{r:?}");
+        // A span that is not the rows times the line period gives way to that.
+        std::fs::write(dir.join("sensor-metadata.json"), record(eye(4000.0, 99, 3840), eye(4000.0, 15356000, 3840))).unwrap();
+        let r = read_sensor_readout(&take).unwrap();
+        assert_eq!((r[0].first_to_last_row_ns, r[1].first_to_last_row_ns), (15356000.0, 15356000.0));
+        // A record of another frame size says nothing of this one.
+        std::fs::write(dir.join("sensor-metadata.json"), record(eye(4000.0, 15356000, 4096), eye(4000.0, 15356000, 3840))).unwrap();
+        assert!(read_sensor_readout(&take).is_none());
+        take.sensor_metadata = None;
         take.audio_timing = Some("audio-info.json".into());
         std::fs::write(dir.join("audio-info.json"), r#"{"version":2,"file":"audio.aac","source":"ambisonic","channels":4,"codec_delay_samples":2048,"trailing_padding_samples":384,"sample_rate_hz":48000,"sample_frames":1142400,"first_sample_counter_ns":372569353830,"anchors":[{"sample_index":960,"counter_ns":372589353830}]}"#).unwrap();
         let t = read_audio_timing(&take).unwrap();
