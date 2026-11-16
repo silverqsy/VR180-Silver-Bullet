@@ -656,6 +656,10 @@ struct ExportOptions {
     /// A raw video clip exports as a folder of DNG frames instead of a
     /// video file (used only when the source is a raw video).
     raw_dng_sequence: bool,
+    /// The frames of that folder are the sensor's own (one Bayer DNG per
+    /// eye per frame: no projection, no stabilization, no grade) and not
+    /// the developed view.
+    raw_dng_original: bool,
     /// Still-photo container (used only when the source is a still).
     still_format: StillFormatChoice,
     /// Output resolution target (Native / 8192×4096) of every clip but a
@@ -1613,6 +1617,7 @@ impl Default for ExportOptions {
         Self {
             codec: ExportCodec::H265,
             raw_dng_sequence: false,
+            raw_dng_original: false,
             still_format: StillFormatChoice::Png16,
             resolution: ExportResolution::R8k,
             crop_resolution: ExportResolution::R8k,
@@ -1800,6 +1805,11 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Output" => "输出",
         "View" => "视图",
         "DNG sequence" => "DNG 序列",
+        "Developed view" => "显影后的画面",
+        "Camera original" => "相机原片",
+        "camera original" => "相机原片",
+        "Every frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number. No projection, no stabilization, no grading — for running the frames through a raw converter first." => "每一帧按传感器记录的原样导出：每眼一个 Bayer DNG，以相机的帧号命名。不投影、不防抖、不调色，适合先把每一帧交给 RAW 转换软件处理。",
+        "Every frame as a DNG in a folder: the developed view, or the sensor's own frames." => "每一帧导出为文件夹里的一个 DNG：可以是显影后的画面，也可以是传感器原片。",
         "Every frame as a linear DNG in a folder, with this clip's raw development settings inside each file." => "每一帧导出为一个线性 DNG，放进同一个文件夹，每个文件里带着这个片段的 RAW 显影设置。",
         "📷 Snapshot" => "📷 截图",
         "Save this frame as a JPEG in the export folder (S)" => "把当前帧存为 JPEG 到导出文件夹（S）",
@@ -2999,12 +3009,12 @@ impl App {
 
     /// The folder of a raw video clip's DNG frames: `<source_stem>_DNG`
     /// next to the source (a take is a folder: next to that folder).
-    fn default_frames_dir_for(source: &std::path::Path) -> PathBuf {
+    fn default_frames_dir_for(source: &std::path::Path, original: bool) -> PathBuf {
         let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
         source.parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-            .join(format!("{stem}_DNG"))
+            .join(format!("{stem}_{}", if original { "OriginalDNG" } else { "DNG" }))
     }
 
     /// `<source_stem>_SBS.<png|jpg|dng>` next to the source (stills).
@@ -3286,6 +3296,7 @@ impl App {
         let output_path = cfg.output_path.clone();
         let still_format = self.batch_opts.unwrap_or(self.export_opts).still_format;
         let raw_frames = cfg.source_kind.is_raw_video() && self.batch_opts.unwrap_or(self.export_opts).raw_dng_sequence;
+        let raw_original = raw_frames && self.batch_opts.unwrap_or(self.export_opts).raw_dng_original;
 
         // Stop preview playback when it reads the SAME file as the export
         // (they'd race on the decoder / file). Previewing a DIFFERENT clip
@@ -3346,6 +3357,13 @@ impl App {
                         fps_avg: done as f32 / t0.elapsed().as_secs_f32().max(1e-3),
                     });
                 })
+            } else if raw_original {
+                // A raw video clip's frames as the sensor recorded them.
+                vr180_pipeline::sensor_dng::export_sensor_dng_sequence(
+                    &cfg.source_path, &cfg.output_path, cfg.trim_in_s, cfg.trim_out_s,
+                    move |p| { let _ = progress_tx2.try_send(p); },
+                    cancel_for_thread,
+                ).map(|_| ())
             } else if raw_frames {
                 // A raw video clip as a folder of linear DNG frames.
                 vr180_pipeline::raw_export::export_dng_sequence(
@@ -3975,7 +3993,7 @@ impl App {
         let mut out = if item.source_kind.is_still() {
             Self::default_still_output_for(&item.path, opts.still_format)
         } else if item.source_kind.is_raw_video() && opts.raw_dng_sequence {
-            Self::default_frames_dir_for(&item.path)
+            Self::default_frames_dir_for(&item.path, opts.raw_dng_original)
         } else {
             Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye(),
                 item.settings.lens_frame_view(item.source_kind))
@@ -5666,6 +5684,9 @@ impl App {
         let fmt_label = if is_still {
             // A still has no codec / bitrate: container + size only.
             format!("{} · {}", self.export_opts.still_format.label(), res_label)
+        } else if raw_frames && self.export_opts.raw_dng_original {
+            // The sensor's own frames: neither the view nor its size applies.
+            format!("{} · {} · 3840 × 3840 {}", tr("DNG sequence"), tr("camera original"), tr("per eye"))
         } else if raw_frames {
             format!("{} · {}", tr("DNG sequence"), res_label)
         } else { format!("{} · {}{}{}",
@@ -6010,12 +6031,19 @@ impl App {
 
         if raw_video {
             ui.checkbox(&mut opts.raw_dng_sequence, tr("DNG sequence"));
-            ui.label(RichText::new(tr("Every frame as a linear DNG in a folder, with this clip's raw development settings inside each file."))
-                .small().color(Color32::GRAY));
-            ui.add_space(8.0);
             if opts.raw_dng_sequence {
+                ui.radio_value(&mut opts.raw_dng_original, false, tr("Developed view"));
+                ui.label(RichText::new(tr("Every frame as a linear DNG in a folder, with this clip's raw development settings inside each file."))
+                    .small().color(Color32::GRAY));
+                ui.radio_value(&mut opts.raw_dng_original, true, tr("Camera original"));
+                ui.label(RichText::new(tr("Every frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number. No projection, no stabilization, no grading — for running the frames through a raw converter first."))
+                    .small().color(Color32::GRAY));
+                ui.add_space(8.0);
                 return;
             }
+            ui.label(RichText::new(tr("Every frame as a DNG in a folder: the developed view, or the sensor's own frames."))
+                .small().color(Color32::GRAY));
+            ui.add_space(8.0);
         }
 
         ui.label(RichText::new(tr("Codec")).strong());

@@ -36,6 +36,7 @@ pub mod kandao_imu;
 pub mod lens_frame;
 pub mod panomap;
 pub mod render;
+pub mod sensor_dng;
 pub mod source_kind;
 pub mod spherical_inject;
 pub mod still_export;

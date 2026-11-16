@@ -2744,6 +2744,33 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      the lens frame the video export writes (`FrameSource::open` resolves
      it with `resolve_lens_frame`; before 2026-11-16 these frames held the
      equidistant disc).
+   - **Sensor frames** (`sensor_dng.rs`, export option "DNG sequence" →
+     "Camera original", `ExportOptions::raw_dng_original`, folder
+     `<stem>_OriginalDNG`): the take's frames as recorded, one CFA DNG per
+     channel per pair, `CAM0/<request:09>.dng` + `CAM1/…`, no GPU and
+     nothing of the app's rendering. File = one little-endian IFD, 14-bit,
+     `PhotometricInterpretation` 32803, CFA `[1, 2, 0, 1]`, black 64,
+     white 15408 (codes above it kept), 3840×160 tiles of lossless JPEG
+     (`ljpeg::encode_tile_cfa_into`: two components, half the width, so a
+     sample is predicted from its own colour), `ColorMatrix1` /
+     `AsShotNeutral` of `RawCamera::X6`, `UniqueCameraModel` "Insta360 X6
+     Raw Video" (a name no converter has a profile for, so the file's own
+     matrix is used: the condition the raw development was matched under),
+     `ImageDescription` "CAM<n> request=<r> exposure_start_ns=<t>"
+     (`FrameTag`). Beside the frames: `frames.jsonl` (one line a pair:
+     request, both exposure starts, the record's signature, the files and
+     their sizes) and the take's small files copied (everything but the
+     capture and `seal.json`). One thread reads the capture front to back,
+     up to 12 workers unpack / pack / write, a file appears under its name
+     only when whole (`.part` + rename); a cancelled run keeps and lists
+     what it finished. Measured (M5 Max): 57 pairs a second from a cached
+     source (CPU-bound, 0.18 core-seconds a pair), 13 from the NAS (its
+     read speed); 12.0 MB per eye frame at 30 fps, 10 at 50, 8.7 at 60;
+     1.2–1.5 GB of memory. Checked: samples identical to the capture's
+     (test `a_stretch_of_a_sample_take`), `exiftool -validate` OK, opens
+     in ImageIO and in Camera Raw 18.7. A folder written this way is not
+     yet something the app opens: `x6b::read_take` names it
+     (`TakeProblem::FramesOnly`).
    - **Against Camera Raw** (three frames, mean |difference| of 16-px block
      means, of 255): default 0.33; white balance 0.1–0.7; Shadows /
      Highlights ±50 0.7–1.4, ±100 1.3–2.5, both at their ends 2.9–4.6;

@@ -68,6 +68,19 @@ converter's controls for it, and every frame can be had as a DNG.
   settings inside, so another raw converter opens it as it looks here. In
   the export bar a raw clip can be written as a **DNG sequence** (a folder
   of numbered frames) or as video; video is 10-bit.
+- **The camera's own frames as a DNG sequence.** The DNG sequence has a
+  second form, **Camera original**: every frame exactly as the sensor
+  recorded it, one 3840×3840 Bayer DNG per eye (`CAM0/000000094.dng`,
+  `CAM1/000000094.dng`, named by the camera's frame number), with no
+  projection, no stabilization and no grading in it. It is for work that
+  has to happen on the raw frames before anything else, such as running
+  every frame through a raw converter's enhancement. The files are
+  losslessly packed (about 12 MB a frame per eye at 30 fps, as much as the
+  capture itself), carry the camera's colour description, and open in
+  Adobe Camera Raw and in macOS. The take's small files (lens record,
+  gyro, sound) and a list of the frames with their exposure times are
+  written beside them. Trim points apply. From a fast disk a one-minute
+  30 fps take (1800 frame pairs, 43 GB) writes in about half a minute.
 - **What a take does not carry.** No accelerometer: the stabilizer has the
   gyro, but no horizon to level to. No readout time: there is no
   rolling-shutter correction. No white balance of its own: As shot is the

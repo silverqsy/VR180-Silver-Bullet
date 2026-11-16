@@ -77,6 +77,9 @@ pub const CAPTURE_FILE: &str = "capture.x6b";
 pub const CALIBRATION_FILE: &str = "calibration.json";
 pub const GYRO_FILE: &str = "gyro.csv";
 pub const GYRO_INFO_FILE: &str = "gyro-info.json";
+/// The index of a folder that holds a take's frames as DNG files (one line
+/// per pair) in place of the capture.
+pub const FRAMES_FILE: &str = "frames.jsonl";
 const LAYOUT: &str = "paired-bayer-v1";
 
 fn err(msg: impl Into<String>) -> Error {
@@ -211,6 +214,9 @@ pub enum TakeProblem {
     Empty,
     /// No `capture.x6b`.
     NoCapture,
+    /// No `capture.x6b` but an index of DNG frames: the folder a take's
+    /// frames were written into, not the take.
+    FramesOnly,
 }
 
 impl std::fmt::Display for TakeProblem {
@@ -221,6 +227,7 @@ impl std::fmt::Display for TakeProblem {
                 write!(f, "the capture is {actual} bytes but the camera closed it at {sealed} (an incomplete copy?)"),
             Self::Empty => write!(f, "the take holds no frames"),
             Self::NoCapture => write!(f, "the take has no {CAPTURE_FILE}"),
+            Self::FramesOnly => write!(f, "the folder holds a take's frames as DNG files, not the capture ({CAPTURE_FILE}): open the take they were written from"),
         }
     }
 }
@@ -305,7 +312,9 @@ pub fn read_take(dir: &Path) -> Result<std::result::Result<Take, TakeProblem>> {
     }
     let text = |k: &str| clip.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
     let capture = dir.join(CAPTURE_FILE);
-    let Ok(meta) = std::fs::metadata(&capture) else { return Ok(Err(TakeProblem::NoCapture)) };
+    let Ok(meta) = std::fs::metadata(&capture) else {
+        return Ok(Err(if dir.join(FRAMES_FILE).is_file() { TakeProblem::FramesOnly } else { TakeProblem::NoCapture }));
+    };
     let Ok(seal_bytes) = std::fs::read(dir.join(SEAL_FILE)) else { return Ok(Err(TakeProblem::NotSealed)) };
     let seal: serde_json::Value = serde_json::from_slice(&seal_bytes)?;
     let u = |k: &str| seal.get(k).and_then(|v| v.as_u64());
@@ -1001,6 +1010,10 @@ mod tests {
         assert_eq!(read_take(&dir).unwrap(), Err(TakeProblem::NotSealed));
         std::fs::remove_file(dir.join(CAPTURE_FILE)).unwrap();
         assert_eq!(read_take(&dir).unwrap(), Err(TakeProblem::NoCapture));
+        // The folder a take's frames were written into is named as such.
+        std::fs::write(dir.join(FRAMES_FILE), "{}\n").unwrap();
+        assert_eq!(read_take(&dir).unwrap(), Err(TakeProblem::FramesOnly));
+        assert!(TakeProblem::FramesOnly.to_string().contains("DNG"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
