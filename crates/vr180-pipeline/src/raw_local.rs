@@ -262,44 +262,45 @@ fn curve_nets() -> &'static [CurveNet] {
 /// networks fitted to the curves Camera Raw gave some 1600 distributions
 /// (real frames' and synthetic ones) stand in for it.
 pub fn local_curves(levels: &[f32]) -> LocalCurves {
-    let flat = || LocalCurves { shadows: vec![0.0; LOCAL_SAMPLES], highlights: vec![0.0; LOCAL_SAMPLES], highlights_up: vec![0.0; LOCAL_SAMPLES] };
     if levels.len() < 8 {
-        return flat();
+        return LocalCurves::flat();
     }
     let (top, bottom) = (levels[levels.len() - 1], levels[0]);
     if top - bottom < 0.05 {
-        return flat();
+        return LocalCurves::flat();
     }
     let (x, anchor) = curve_inputs(levels);
     let nets = curve_nets();
-    let mut y = vec![0f32; 3 * CURVE_POINTS];
+    let mut y: Vec<f32> = Vec::new();
     for net in nets {
         let out = net.eval(&x);
+        if y.is_empty() {
+            y = vec![0.0; out.len()];
+        }
         for (acc, v) in y.iter_mut().zip(&out) {
             *acc += v / nets.len() as f32;
         }
-        // A network without the third curve: Highlights up as the mirror of down.
-        if out.len() < 3 * CURVE_POINTS {
-            for i in 0..CURVE_POINTS {
-                y[2 * CURVE_POINTS + i] -= out[CURVE_POINTS + i] / nets.len() as f32;
-            }
+    }
+    // A curve over the frame's own range; outside it it stays level.
+    let curve = |n: usize| -> Vec<f32> {
+        let points = &y[n * CURVE_POINTS..(n + 1) * CURVE_POINTS];
+        (0..LOCAL_SAMPLES).map(|i| {
+            let pos = ((local_level(i).clamp(bottom, top) - anchor - CURVE_FIRST) / CURVE_STEP).clamp(0.0, (CURVE_POINTS - 1) as f32);
+            let k = (pos.floor() as usize).min(CURVE_POINTS - 2);
+            let f = pos - k as f32;
+            points[k] * (1.0 - f) + points[k + 1] * f
+        }).collect()
+    };
+    // Networks give Shadows +100 and Highlights −100, and, the later ones,
+    // Highlights +100 and the two pairs.
+    match y.len() / CURVE_POINTS {
+        5 => LocalCurves { shadows: curve(0), highlights: curve(1), highlights_up: curve(2), both_down: curve(3), both_up: curve(4) },
+        _ => {
+            let down = curve(1);
+            let up = down.iter().map(|v| -v).collect();
+            LocalCurves::additive(curve(0), down, up)
         }
     }
-    // The curves over the frame's own range; outside it they stay level.
-    let at = |curve: &[f32], level: f32| -> f32 {
-        let pos = ((level.clamp(bottom, top) - anchor - CURVE_FIRST) / CURVE_STEP).clamp(0.0, (CURVE_POINTS - 1) as f32);
-        let i = (pos.floor() as usize).min(CURVE_POINTS - 2);
-        let f = pos - i as f32;
-        curve[i] * (1.0 - f) + curve[i + 1] * f
-    };
-    let mut c = flat();
-    for i in 0..LOCAL_SAMPLES {
-        let l = local_level(i);
-        c.shadows[i] = at(&y[..CURVE_POINTS], l);
-        c.highlights[i] = at(&y[CURVE_POINTS..2 * CURVE_POINTS], l);
-        c.highlights_up[i] = at(&y[2 * CURVE_POINTS..], l);
-    }
-    c
 }
 
 #[cfg(test)]
@@ -351,7 +352,7 @@ mod tests {
     fn curves_of_a_frame() {
         // A flat frame has none.
         let c = local_curves(&[-3.0; 100]);
-        assert!(c.shadows.iter().chain(&c.highlights).all(|v| *v == 0.0));
+        assert_eq!(c, LocalCurves::flat());
         // Levels spread evenly over nine stops (Camera Raw on such a chart,
         // as gains on the black-subtracted signal: pivot 3.3 stops below the
         // top; Shadows +0.13 there, +1.5 at −5, +2.7 at −7, next to nothing
@@ -378,5 +379,27 @@ mod tests {
         assert_eq!(c.gain(50.0, 0.0)[100], 0.5 * c.shadows[100]);
         assert_eq!(c.gain(0.0, -100.0)[200], c.highlights[200]);
         assert_eq!(c.gain(0.0, 100.0)[200], c.highlights_up[200]);
+    }
+
+    #[test]
+    fn two_sliders_meet_at_their_pair() {
+        let ramp = |k: f32| -> Vec<f32> { (0..LOCAL_SAMPLES).map(|i| k * i as f32).collect() };
+        let c = LocalCurves { shadows: ramp(1.0), highlights: ramp(-2.0), highlights_up: ramp(3.0), both_down: ramp(-0.5), both_up: ramp(5.0) };
+        let at = |s: f32, h: f32| c.gain(s, h)[10] / 10.0;
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        // Either slider alone, and Shadows below zero.
+        assert!(near(at(100.0, 0.0), 1.0) && near(at(-40.0, 0.0), -0.4) && near(at(0.0, -100.0), -2.0) && near(at(0.0, 50.0), 1.5));
+        // The diagonals: the pair's curve, scaled with the amount.
+        assert!(near(at(100.0, -100.0), -0.5) && near(at(50.0, -50.0), -0.25));
+        assert!(near(at(100.0, 100.0), 5.0) && near(at(30.0, 30.0), 1.5));
+        // Off the diagonal: the common part at the pair, the rest alone.
+        assert!(near(at(100.0, -50.0), 0.5 * 1.0 + 0.5 * -0.5));
+        assert!(near(at(50.0, -100.0), 0.5 * -2.0 + 0.5 * -0.5));
+        assert!(near(at(20.0, 100.0), 0.8 * 3.0 + 0.2 * 5.0));
+        // Shadows down: the mirror of the opposite pair.
+        assert!(near(at(-100.0, 100.0), 0.5) && near(at(-100.0, -100.0), -5.0));
+        // Curves made of the single ones add.
+        let a = LocalCurves::additive(ramp(1.0), ramp(-2.0), ramp(3.0));
+        assert!(near(a.gain(100.0, -100.0)[10] / 10.0, -1.0) && near(a.gain(60.0, 60.0)[10] / 10.0, 2.4));
     }
 }

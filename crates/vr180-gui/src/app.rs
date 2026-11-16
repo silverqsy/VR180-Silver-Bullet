@@ -308,6 +308,9 @@ pub struct App {
     snapshot_status: Option<(String, std::time::Instant)>,
     /// A snapshot waiting for the export-size still of the paused frame.
     snapshot_pending: Option<SnapshotReq>,
+    /// A raw video clip's snapshot also writes the frame as a linear DNG, on
+    /// its own thread: the file and where its outcome arrives.
+    frame_dng_job: Option<(PathBuf, crossbeam_channel::Receiver<std::result::Result<(), String>>)>,
     /// Key (frame+settings) the current `full_res_display` was rendered for.
     full_res_key: u64,
     /// Key (frame+settings) we currently *want* a still for. While this
@@ -650,6 +653,9 @@ impl ProResProfile {
 #[derive(Debug, Clone, Copy)]
 struct ExportOptions {
     codec: ExportCodec,
+    /// A raw video clip exports as a folder of DNG frames instead of a
+    /// video file (used only when the source is a raw video).
+    raw_dng_sequence: bool,
     /// Still-photo container (used only when the source is a still).
     still_format: StillFormatChoice,
     /// Output resolution target (Native / 8192×4096) of every clip but a
@@ -844,7 +850,7 @@ mod export_size_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, lens_space, stabilized, single_eye);
+                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, lens_space, stabilized, single_eye, false);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -1436,7 +1442,7 @@ mod spatial_export_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, None, false, false);
+                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, None, false, false, false);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -1606,6 +1612,7 @@ impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             codec: ExportCodec::H265,
+            raw_dng_sequence: false,
             still_format: StillFormatChoice::Png16,
             resolution: ExportResolution::R8k,
             crop_resolution: ExportResolution::R8k,
@@ -1792,8 +1799,11 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Fisheye dewarp is off for this side-by-side file (Source ▸ Input) — the lens settings below are not applied." => "此左右格式文件已关闭鱼眼去畸变（素材 ▸ 输入）——下方镜头设置不生效。",
         "Output" => "输出",
         "View" => "视图",
+        "DNG sequence" => "DNG 序列",
+        "Every frame as a linear DNG in a folder, with this clip's raw development settings inside each file." => "每一帧导出为一个线性 DNG，放进同一个文件夹，每个文件里带着这个片段的 RAW 显影设置。",
         "📷 Snapshot" => "📷 截图",
         "Save this frame as a JPEG in the export folder (S)" => "把当前帧存为 JPEG 到导出文件夹（S）",
+        "Save this frame as a JPEG and as a linear DNG in the export folder (S)" => "把当前帧存为 JPEG 和线性 DNG 到导出文件夹（S）",
         "Nothing to snapshot yet" => "还没有可截图的画面",
         "Saved" => "已保存",
         "Rendering snapshot" => "正在渲染截图",
@@ -2541,6 +2551,11 @@ struct LoadedMeta {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Raw takes: keep the list of a take's pairs between sessions (walking
+        // a take on a network volume takes seconds).
+        if let Some(dir) = crate::decoder::Settings::config_path().and_then(|p| p.parent().map(|d| d.join("raw-takes"))) {
+            vr180_pipeline::x6_raw::set_cache_dir(Some(dir));
+        }
         // Force dark visuals regardless of the OS appearance preference.
         // egui's dark theme reads better against the half-equirect
         // preview (which is typically dark imagery itself) and matches
@@ -2685,6 +2700,7 @@ impl App {
             three_d: ThreeDDisplay::default(),
             snapshot_status: None,
             snapshot_pending: None,
+            frame_dng_job: None,
             full_res_key: 0,
             full_res_desired_key: 0,
             full_res_rendered_at: std::time::Instant::now(),
@@ -2973,6 +2989,16 @@ impl App {
             .join(format!("{stem}_{tag}.{ext}"))
     }
 
+    /// The folder of a raw video clip's DNG frames: `<source_stem>_DNG`
+    /// next to the source (a take is a folder: next to that folder).
+    fn default_frames_dir_for(source: &std::path::Path) -> PathBuf {
+        let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+        source.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+            .join(format!("{stem}_DNG"))
+    }
+
     /// `<source_stem>_SBS.<png|jpg|dng>` next to the source (stills).
     fn default_still_output_for(source: &std::path::Path, format: StillFormatChoice) -> PathBuf {
         let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
@@ -3121,8 +3147,9 @@ impl App {
                 // the user pinned one; VR180 takes the VR180 slider.
                 opts.effective_h265_mbps(settings.reframe_aspect_if_active(), fps, settings.single_eye)
                     .saturating_mul(1000),
-                // A spatial video is always Main10.
-                if codec == ExportCodec::Spatial { 10 } else { opts.h265_bit_depth },
+                // A spatial video is always Main10; so is a raw video clip
+                // (its eyes are 16-bit all the way through the grade).
+                if codec == ExportCodec::Spatial || source_kind.is_raw_video() { 10 } else { opts.h265_bit_depth },
             ),
             ExportCodec::ProRes => {
                 // The encoder ignores bitrate for ProRes but the config
@@ -3208,36 +3235,8 @@ impl App {
         }
     }
 
-    /// Spawn the export worker thread for a prepared config and install
-    /// it as the (single) running `export_job`.
-    /// `eac_stab`: for a GoPro `.360` (EAC) export, the `(Settings,
-    /// n_frames)` needed to compute the per-eye stabilization (the
-    /// preview's `build_per_eye_frames`); `None` for fisheye sources,
-    /// which compute stab inside `export_fisheye`.
-    fn spawn_export_job(
-        &mut self,
-        cfg: vr180_pipeline::fisheye_export::FisheyeExportConfig,
-        eac_stab: Option<(crate::decoder::Settings, usize)>,
-    ) {
-        let output_path = cfg.output_path.clone();
-        let still_format = self.batch_opts.unwrap_or(self.export_opts).still_format;
-
-        // Stop preview playback when it reads the SAME file as the export
-        // (they'd race on the decoder / file). Previewing a DIFFERENT clip
-        // is fine — that's what lets you keep tuning clips mid-batch.
-        // A STILL is the exception: its preview thread read the DNG once
-        // and now holds only textures, and the export re-reads the file
-        // itself, so there is nothing to race on. Stopping it left the
-        // photo frozen on the last render with no transport to restart it
-        // (the still has no Play button) — the "UI stopped responding
-        // after exporting" report.
-        if self.loaded_path.as_ref() == Some(&cfg.source_path) && !cfg.source_kind.is_still() {
-            self.stop_playback();
-        }
-
-        let (progress_tx, progress_rx) = crossbeam_channel::bounded(256);
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancel_for_thread = cancel.clone();
+    /// The device a background export runs on.
+    fn export_device(&self) -> Arc<vr180_pipeline::gpu::Device> {
         // The export worker runs GPU work + RGB48 readback (`Maintain::Wait`)
         // on a background thread. Lesson #1: doing that on the device eframe
         // presents with can wedge the present queue. Export never hands a
@@ -3262,6 +3261,41 @@ impl App {
         };
         #[cfg(not(target_os = "windows"))]
         let pipeline = self.pipeline.clone();
+        pipeline
+    }
+
+    /// Spawn the export worker thread for a prepared config and install
+    /// it as the (single) running `export_job`.
+    /// `eac_stab`: for a GoPro `.360` (EAC) export, the `(Settings,
+    /// n_frames)` needed to compute the per-eye stabilization (the
+    /// preview's `build_per_eye_frames`); `None` for fisheye sources,
+    /// which compute stab inside `export_fisheye`.
+    fn spawn_export_job(
+        &mut self,
+        cfg: vr180_pipeline::fisheye_export::FisheyeExportConfig,
+        eac_stab: Option<(crate::decoder::Settings, usize)>,
+    ) {
+        let output_path = cfg.output_path.clone();
+        let still_format = self.batch_opts.unwrap_or(self.export_opts).still_format;
+        let raw_frames = cfg.source_kind.is_raw_video() && self.batch_opts.unwrap_or(self.export_opts).raw_dng_sequence;
+
+        // Stop preview playback when it reads the SAME file as the export
+        // (they'd race on the decoder / file). Previewing a DIFFERENT clip
+        // is fine — that's what lets you keep tuning clips mid-batch.
+        // A STILL is the exception: its preview thread read the DNG once
+        // and now holds only textures, and the export re-reads the file
+        // itself, so there is nothing to race on. Stopping it left the
+        // photo frozen on the last render with no transport to restart it
+        // (the still has no Play button) — the "UI stopped responding
+        // after exporting" report.
+        if self.loaded_path.as_ref() == Some(&cfg.source_path) && !cfg.source_kind.is_still() {
+            self.stop_playback();
+        }
+
+        let (progress_tx, progress_rx) = crossbeam_channel::bounded(256);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_for_thread = cancel.clone();
+        let pipeline = self.export_device();
         let progress_tx2 = progress_tx.clone();
         let handle = std::thread::spawn(move || {
             if let Some((settings, n_frames)) = eac_stab {
@@ -3304,6 +3338,13 @@ impl App {
                         fps_avg: done as f32 / t0.elapsed().as_secs_f32().max(1e-3),
                     });
                 })
+            } else if raw_frames {
+                // A raw video clip as a folder of linear DNG frames.
+                vr180_pipeline::raw_export::export_dng_sequence(
+                    pipeline, cfg,
+                    move |p| { let _ = progress_tx2.try_send(p); },
+                    cancel_for_thread,
+                ).map(|_| ())
             } else {
                 vr180_pipeline::fisheye_export::export_fisheye(
                     pipeline, cfg,
@@ -3925,6 +3966,8 @@ impl App {
     fn batch_output_for(&self, item: &BatchItem, opts: &ExportOptions) -> PathBuf {
         let mut out = if item.source_kind.is_still() {
             Self::default_still_output_for(&item.path, opts.still_format)
+        } else if item.source_kind.is_raw_video() && opts.raw_dng_sequence {
+            Self::default_frames_dir_for(&item.path)
         } else {
             Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye(),
                 item.settings.lens_frame_view(item.source_kind))
@@ -3936,10 +3979,12 @@ impl App {
         }
         if out.exists() {
             let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("output").to_string();
-            let ext = out.extension().and_then(|s| s.to_str()).unwrap_or("mp4").to_string();
+            // A folder of frames has no extension to keep.
+            let ext = out.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+            let ext = if ext.is_empty() && !out.is_dir() { ".mp4".to_string() } else { ext };
             let dir = out.parent().map(|p| p.to_path_buf()).unwrap_or_default();
             for n in 2.. {
-                let cand = dir.join(format!("{stem} ({n}).{ext}"));
+                let cand = dir.join(format!("{stem} ({n}){ext}"));
                 if !cand.exists() { out = cand; break; }
             }
         }
@@ -5605,9 +5650,13 @@ impl App {
             }
             _ => res_label,
         };
+        let raw_frames = self.export_opts.raw_dng_sequence
+            && self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
         let fmt_label = if is_still {
             // A still has no codec / bitrate: container + size only.
             format!("{} · {}", self.export_opts.still_format.label(), res_label)
+        } else if raw_frames {
+            format!("{} · {}", tr("DNG sequence"), res_label)
         } else { format!("{} · {}{}{}",
             bar_codec.label(),
             res_label,
@@ -5757,6 +5806,7 @@ impl App {
             let mut open = true;
             let clip_fps = self.clip.as_ref().map(|c| c.fps).unwrap_or(30.0);
             let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
+            let raw_video = self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
             let native_dims = self.native_sbs_dims();
             let single_eye = self.clip_single_eye();
             // A Crop clip's native-sharpness canvas (side by side, or the one
@@ -5777,7 +5827,7 @@ impl App {
                         self.settings.reframe_aspect_if_active(),
                         (self.settings.reframe_hfov_deg, self.settings.reframe_defish),
                         clip_fps, is_still, native_dims, sharp_dims, lens_space,
-                        self.settings.stabilize, single_eye);
+                        self.settings.stabilize, single_eye, raw_video);
                 });
             self.show_export_settings = open;
         }
@@ -5807,6 +5857,8 @@ impl App {
         // The clip holds ONE eye: its frame is that eye (sizes and rates
         // follow), and nothing that needs two eyes is offered.
         single_eye: bool,
+        // The clip is a raw video: it can also leave as a folder of DNG frames.
+        raw_video: bool,
     ) {
         // Spatial video is offered for the reframed view on macOS. Selected
         // on a clip it does not exist for, the choice shows (and exports) as
@@ -5943,6 +5995,16 @@ impl App {
             }
             ui.add_space(8.0);
             return;
+        }
+
+        if raw_video {
+            ui.checkbox(&mut opts.raw_dng_sequence, tr("DNG sequence"));
+            ui.label(RichText::new(tr("Every frame as a linear DNG in a folder, with this clip's raw development settings inside each file."))
+                .small().color(Color32::GRAY));
+            ui.add_space(8.0);
+            if opts.raw_dng_sequence {
+                return;
+            }
         }
 
         ui.label(RichText::new(tr("Codec")).strong());
@@ -6260,6 +6322,7 @@ impl eframe::App for App {
         // Drive the full-res still for the zoom magnifier (and snapshots).
         self.poll_full_res(ctx);
         self.poll_snapshot(ctx);
+        self.poll_frame_dng(ctx);
         // Import merge/individual prompt (shown when a multi-file recording
         // is picked). Modal-ish: it sits on top until resolved.
         self.draw_import_prompt(ctx);
@@ -6726,7 +6789,11 @@ impl eframe::App for App {
                     if ui.button(tr("■ Stop")).clicked() { self.stop_playback(); }
                     let has_frame = self.current_display.is_some();
                     if ui.add_enabled(has_frame, egui::Button::new(tr("📷 Snapshot")))
-                        .on_hover_text(tr("Save this frame as a JPEG in the export folder (S)"))
+                        .on_hover_text(if self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) {
+                            tr("Save this frame as a JPEG and as a linear DNG in the export folder (S)")
+                        } else {
+                            tr("Save this frame as a JPEG in the export folder (S)")
+                        })
                         .clicked()
                     {
                         self.request_snapshot();
@@ -7405,6 +7472,9 @@ impl App {
             enc.encode(&rgb, w, h, image::ExtendedColorType::Rgb8)?;
             Ok(())
         })();
+        if result.is_ok() {
+            self.spawn_frame_dng(path.with_extension("dng"));
+        }
         let msg = match result {
             Ok(()) => {
                 tracing::info!("snapshot: {} ({w}×{h}, preview_fallback={preview_fallback})", path.display());
@@ -7421,6 +7491,50 @@ impl App {
             }
         };
         self.snapshot_status = Some((msg, std::time::Instant::now()));
+    }
+
+    /// A raw video clip's snapshot: the frame on screen also as a linear DNG
+    /// at `out` (projected and stabilized as the export would, with the
+    /// clip's raw development settings inside), written on its own thread.
+    fn spawn_frame_dng(&mut self, out: PathBuf) {
+        let Some(src) = self.loaded_path.clone() else { return; };
+        let Some(t_s) = self.current_display.as_ref().map(|d| d.timestamp_s) else { return; };
+        let Some(item) = self.batch.iter().find(|b| b.path == src).filter(|b| b.source_kind.is_raw_video()) else { return; };
+        if self.frame_dng_job.is_some() {
+            return;
+        }
+        let cfg = Self::build_export_cfg(
+            &item.path, &out, item.fps, item.source_kind,
+            item.fisheye_eye_w, item.fisheye_eye_h, item.width, item.height, item.sharp_eye(),
+            &self.worker_settings(), &self.export_opts, self.clip_segments(&item.path));
+        let pipeline = self.export_device();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let path = out.clone();
+        std::thread::spawn(move || {
+            let result = vr180_pipeline::raw_export::export_frame_dng(pipeline, &cfg, t_s as f64, &path).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.frame_dng_job = Some((out, rx));
+    }
+
+    /// Report the frame DNG of a snapshot once it is written.
+    fn poll_frame_dng(&mut self, ctx: &egui::Context) {
+        let Some((path, rx)) = self.frame_dng_job.as_ref() else { return; };
+        let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                tracing::info!("snapshot: {}", path.display());
+                self.snapshot_status = Some((format!("{} {name}", tr("Saved")), std::time::Instant::now()));
+                self.frame_dng_job = None;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("snapshot: frame DNG failed: {e}");
+                self.snapshot_status = Some((format!("{name}: {e}"), std::time::Instant::now()));
+                self.frame_dng_job = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => self.frame_dng_job = None,
+        }
     }
 
     fn draw_source_panel(&mut self, ui: &mut egui::Ui) {

@@ -149,6 +149,11 @@ pub const LOCAL_SAMPLES: usize = 321;
 
 /// The frame's Shadows / Highlights curves: log₂ gain at full slider over
 /// the base level, [`LOCAL_SAMPLES`] samples from [`LOCAL_LO`].
+///
+/// The two sliders do not simply add in Camera Raw: moved together they
+/// give their own curve (Shadows +100 with Highlights −100 is less than the
+/// two alone, with Highlights +100 more), which along the diagonal scales
+/// with the amount like the single ones do.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalCurves {
     /// Shadows +100 (−100 is its negative).
@@ -157,16 +162,46 @@ pub struct LocalCurves {
     pub highlights: Vec<f32>,
     /// Highlights +100.
     pub highlights_up: Vec<f32>,
+    /// Shadows +100 with Highlights −100.
+    pub both_down: Vec<f32>,
+    /// Shadows +100 with Highlights +100.
+    pub both_up: Vec<f32>,
 }
 
 impl LocalCurves {
+    /// No gain anywhere.
+    pub fn flat() -> Self {
+        let z = || vec![0.0; LOCAL_SAMPLES];
+        Self { shadows: z(), highlights: z(), highlights_up: z(), both_down: z(), both_up: z() }
+    }
+
+    /// Curves from the three single-slider ones: together the sliders add.
+    pub fn additive(shadows: Vec<f32>, highlights: Vec<f32>, highlights_up: Vec<f32>) -> Self {
+        let both_down = shadows.iter().zip(&highlights).map(|(a, b)| a + b).collect();
+        let both_up = shadows.iter().zip(&highlights_up).map(|(a, b)| a + b).collect();
+        Self { shadows, highlights, highlights_up, both_down, both_up }
+    }
+
     /// The gain curve of the settings: `shadows`, `highlights` in −100..100.
+    ///
+    /// What the two sliders have in common (the smaller of the two
+    /// amounts) is taken at the curve of both together, the rest at the
+    /// single slider's: exact on either slider alone and on the diagonals.
+    /// Shadows below zero is the negative of above (measured); the pairs
+    /// with Shadows below zero mirror the measured ones.
     pub fn gain(&self, shadows: f32, highlights: f32) -> Vec<f32> {
-        let s = shadows / 100.0;
-        let h = highlights / 100.0;
+        let (s, h) = (shadows / 100.0, highlights / 100.0);
+        let m = s.abs().min(h.abs());
+        let (rest_s, rest_h) = (s.abs() - m, h.abs() - m);
+        // Signs: Shadows' own, and of the common part.
+        let sign = if s < 0.0 { -1.0 } else { 1.0 };
+        // The pair's curve: with Shadows up, Highlights down or up as set;
+        // with Shadows down, the mirror of the opposite pair.
+        let down_pair = (s >= 0.0) == (h < 0.0);
         (0..LOCAL_SAMPLES).map(|i| {
-            let hl = if h < 0.0 { -h * self.highlights[i] } else { h * self.highlights_up[i] };
-            s * self.shadows[i] + hl
+            let single_h = if h < 0.0 { self.highlights[i] } else { self.highlights_up[i] };
+            let pair = if down_pair { self.both_down[i] } else { self.both_up[i] };
+            sign * rest_s * self.shadows[i] + rest_h * single_h + sign * m * pair
         }).collect()
     }
 }
