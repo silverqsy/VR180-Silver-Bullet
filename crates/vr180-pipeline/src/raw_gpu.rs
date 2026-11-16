@@ -203,11 +203,16 @@ impl Device {
 
     /// Replace a mosaic texture's samples (`w × h` codes, row-major).
     pub fn write_bayer_texture(&self, tex: &wgpu::Texture, samples: &[u16]) {
+        self.write_bayer_bytes(tex, bytemuck::cast_slice(samples));
+    }
+
+    /// [`Self::write_bayer_texture`] from the codes' little-endian bytes.
+    pub fn write_bayer_bytes(&self, tex: &wgpu::Texture, samples: &[u8]) {
         let (w, h) = (tex.width(), tex.height());
-        debug_assert_eq!(samples.len(), (w as usize) * (h as usize));
+        debug_assert_eq!(samples.len(), (w as usize) * (h as usize) * 2);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            bytemuck::cast_slice(samples),
+            samples,
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 2), rows_per_image: Some(h) },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );

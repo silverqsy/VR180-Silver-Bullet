@@ -6268,6 +6268,10 @@ fn open_native_iter(
                 path, &info, 8, vr180_braw::DecodeScale::Full, vr180_braw::DecodeLook::Film,
                 swap_eyes, layout.mono, &Default::default()))
         }
+        // The frame's two mosaics: this worker stays off the GPU, and the
+        // renderer demosaics them at full size (`render_still_from_pair`).
+        vr180_pipeline::SourceKind::X6Raw => Box::new(
+            vr180_pipeline::x6_raw::X6RawIter::new(path, kind.dual_stream_iter_swap(swap_eyes), false, 1, None)?.mosaic_pairs()),
         _ => anyhow::bail!("non-fisheye source"),
     })
 }
@@ -6393,40 +6397,52 @@ fn render_still_from_pair(
         )).unwrap_or((None, None))
     } else { (None, None) };
 
+    // A raw source's still arrives as its two mosaics: demosaiced here, at
+    // full size, into camera-linear eyes for the rgba16 kernels.
+    let raw_eyes = if pair.bit_depth == vr180_pipeline::x6_raw::MOSAIC_BIT_DEPTH {
+        Some(vr180_pipeline::x6_raw::demosaic_pair(pipeline, pair)?)
+    } else { None };
+    // One eye through the kernel its source and the frame's rows ask for.
+    let project = |bytes: &[u8], eye: Option<&wgpu::Texture>, w: u32, h: u32, rot: EquirectRotation,
+                   calib: vr180_pipeline::gpu::FisheyeCalib, rows: Option<&[f32]>, fisheye_out: bool, slot: u32|
+        -> vr180_pipeline::Result<wgpu::Texture>
+    {
+        if let Some(eye) = eye {
+            return project_gpu_eye(pipeline, eye, w, h, rot, calib, rows, fisheye_out, slot);
+        }
+        match (fisheye_out, rows) {
+            (false, Some(rows)) => pipeline.project_fisheye_to_equirect_rs_texture(bytes, src_w, src_h, w, h, rot, calib, rows, slot),
+            (false, None) => pipeline.project_fisheye_to_equirect_texture(bytes, src_w, src_h, w, h, rot, calib, slot),
+            (true, Some(rows)) => pipeline.project_fisheye_to_fisheye_rs_texture(bytes, src_w, src_h, w, h, rot, calib, rows),
+            (true, None) => pipeline.project_fisheye_to_fisheye_texture(bytes, src_w, src_h, w, h, rot, calib),
+        }
+    };
+    // Per-row correction needs both eyes' rows, as before.
+    let (rs_l, rs_r) = match (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
+        (Some(l), Some(r)) => (Some(l), Some(r)),
+        _ => (None, None),
+    };
+    let (eye_l, eye_r) = (raw_eyes.as_ref().map(|e| &e.0), raw_eyes.as_ref().map(|e| &e.1));
     let (left_tex, right_tex) = match s.fisheye_output_mode {
         FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => {
             // A reframed view keeps the working width and takes its aspect.
             // A snapshot renders at the export's exact eye size instead.
             let (oeq_w, oeq_h) = out_eye.unwrap_or_else(||
                 preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, oeq_w, oeq_h));
-            if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                let l = pipeline.project_fisheye_to_equirect_rs_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, rs_l, 20)?;
-                let r = if one_eye { l.clone() } else {
-                    pipeline.project_fisheye_to_equirect_rs_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, rs_r, 21)? };
-                (l, r)
-            } else {
-                let l = pipeline.project_fisheye_to_equirect_texture(&pair.left, src_w, src_h, oeq_w, oeq_h, rot_left, calib_left, 20)?;
-                let r = if one_eye { l.clone() } else {
-                    pipeline.project_fisheye_to_equirect_texture(&pair.right, src_w, src_h, oeq_w, oeq_h, rot_right, calib_right, 21)? };
-                (l, r)
-            }
+            let l = project(&pair.left, eye_l, oeq_w, oeq_h, rot_left, calib_left, rs_l, false, 20)?;
+            let r = if one_eye { l.clone() } else {
+                project(&pair.right, eye_r, oeq_w, oeq_h, rot_right, calib_right, rs_r, false, 21)? };
+            (l, r)
         }
         FisheyeOutputMode::Fisheye => {
             let (fw, fh) = view.lens_dims.unwrap_or_else(|| {
                 let side = out_eye.map(|(w, h)| w.min(h)).unwrap_or(oside);
                 (side, side)
             });
-            if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                let l = pipeline.project_fisheye_to_fisheye_rs_texture(&pair.left, src_w, src_h, fw, fh, rot_left, calib_left, rs_l)?;
-                let r = if one_eye { l.clone() } else {
-                    pipeline.project_fisheye_to_fisheye_rs_texture(&pair.right, src_w, src_h, fw, fh, rot_right, calib_right, rs_r)? };
-                (l, r)
-            } else {
-                let l = pipeline.project_fisheye_to_fisheye_texture(&pair.left, src_w, src_h, fw, fh, rot_left, calib_left)?;
-                let r = if one_eye { l.clone() } else {
-                    pipeline.project_fisheye_to_fisheye_texture(&pair.right, src_w, src_h, fw, fh, rot_right, calib_right)? };
-                (l, r)
-            }
+            let l = project(&pair.left, eye_l, fw, fh, rot_left, calib_left, rs_l, true, 20)?;
+            let r = if one_eye { l.clone() } else {
+                project(&pair.right, eye_r, fw, fh, rot_right, calib_right, rs_r, true, 21)? };
+            (l, r)
         }
     };
     let (ew, eh) = (left_tex.width(), left_tex.height());

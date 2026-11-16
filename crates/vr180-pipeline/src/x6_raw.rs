@@ -47,6 +47,30 @@ fn take_err(e: impl std::fmt::Display) -> Error {
     Error::Ffmpeg(e.to_string())
 }
 
+/// `FisheyePair::bit_depth` of a pair whose two buffers are MOSAICS (one
+/// little-endian `u16` per site, `eye_w × eye_h` sites) and not pictures:
+/// what [`X6RawIter::mosaic_pairs`] hands a consumer that demosaics on its
+/// own device ([`demosaic_pair`]).
+pub const MOSAIC_BIT_DEPTH: u8 = 14;
+
+/// Demosaic a mosaic pair (see [`MOSAIC_BIT_DEPTH`]) on `dev` at full size:
+/// the two camera-linear eyes, left and right.
+pub fn demosaic_pair(dev: &Device, pair: &FisheyePair) -> Result<(wgpu::Texture, wgpu::Texture)> {
+    let (w, h) = (pair.eye_w, pair.eye_h);
+    let want = w as usize * h as usize * 2;
+    if pair.bit_depth != MOSAIC_BIT_DEPTH || pair.left.len() != want || pair.right.len() != want {
+        return Err(take_err("not a mosaic pair"));
+    }
+    let eye = |bytes: &[u8]| -> Result<wgpu::Texture> {
+        let mosaic = dev.new_bayer_texture(w, h);
+        dev.write_bayer_bytes(&mosaic, bytes);
+        let out = dev.new_linear_eye_texture(w, h);
+        dev.demosaic_bayer(&mosaic, &BAYER, &out)?;
+        Ok(out)
+    };
+    Ok((eye(&pair.left)?, eye(&pair.right)?))
+}
+
 /// The mosaic of a take's frames.
 pub const BAYER: BayerLayout = BayerLayout { cfa: x6b::CFA, black: x6b::BLACK_LEVEL as f32, white: x6b::WHITE_LEVEL as f32 };
 
@@ -493,6 +517,8 @@ pub struct X6RawIter {
     pool: Arc<EyePool>,
     /// Stop after this many frames from the start of the take (0 = all).
     frame_limit: usize,
+    /// Without a device: hand out the mosaics themselves, not pictures.
+    mosaics_out: bool,
 }
 
 impl std::fmt::Debug for X6RawIter {
@@ -514,8 +540,18 @@ impl X6RawIter {
         Ok(Self {
             index, file, next: 0, step: step.max(1) as usize, swap_eyes, half, gpu,
             record: Vec::new(), samples: vec![0u16; 2 * EYE_SAMPLES], mosaics: None,
-            pool: Arc::default(), frame_limit: 0,
+            pool: Arc::default(), frame_limit: 0, mosaics_out: false,
         })
+    }
+
+    /// Hand out each frame as its two mosaics ([`MOSAIC_BIT_DEPTH`] pairs)
+    /// instead of demosaicing: for a consumer on a thread that must not
+    /// touch the GPU, whose renderer then calls [`demosaic_pair`].
+    pub fn mosaic_pairs(mut self) -> Self {
+        self.mosaics_out = true;
+        self.gpu = None;
+        self.half = false;
+        self
     }
 
     /// Stop after `frames` frames of the take (0 = no limit).
@@ -603,6 +639,11 @@ impl FisheyePairIter for X6RawIter {
                 left: Vec::new(), right: Vec::new(), eye_w: side, eye_h: side, bit_depth: 16, pts_s,
                 gpu: Some(Arc::new(pair)),
             }));
+        }
+        if self.mosaics_out {
+            let bytes = |ch: usize| bytemuck::cast_slice::<u16, u8>(&self.samples[ch * EYE_SAMPLES..(ch + 1) * EYE_SAMPLES]).to_vec();
+            let (left, right) = if self.swap_eyes { (bytes(1), bytes(0)) } else { (bytes(0), bytes(1)) };
+            return Ok(Some(FisheyePair { left, right, eye_w: side, eye_h: side, bit_depth: MOSAIC_BIT_DEPTH, pts_s, gpu: None }));
         }
         let (left, right) = self.cpu_pair();
         Ok(Some(FisheyePair { left, right, eye_w: side, eye_h: side, bit_depth: 16, pts_s, gpu: None }))

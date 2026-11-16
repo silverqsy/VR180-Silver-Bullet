@@ -2101,6 +2101,15 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Stabilization (VQF 6D, BRAW)" => "防抖 (VQF 6D, BRAW)",
         "Stabilization (DJI camera quats)" => "防抖（DJI 相机四元数）",
         "Stabilization (Insta360 gyro)" => "防抖（Insta360 陀螺仪）",
+        "Raw development" => "RAW 显影",
+        "Temperature (K)" => "色温 (K)",
+        "Exposure" => "曝光",
+        "Whites" => "白色色阶",
+        "Blacks" => "黑色色阶",
+        "As shot" => "原始设置",
+        "Reset raw development" => "重置 RAW 显影",
+        "The white the frame is developed for, as a colour temperature in kelvin and a tint, the way a raw converter states it." => "显影所用的白点，以色温（开尔文）和色调表示，与 RAW 转换软件的写法一致。",
+        "The take records no white balance of its own: As shot is the camera's reference white." => "该素材没有记录自己的白平衡：“原始设置”是相机的参考白点。",
         "No gyro stabilization available for this source yet." => "此素材暂无陀螺仪防抖。",
         "Camera" => "相机",
         "(Auto)" => "（自动）",
@@ -7899,10 +7908,17 @@ impl App {
         let is_braw = matches!(kind, Some(vr180_pipeline::SourceKind::BlackmagicRaw));
         // The ETTR recovery works in the source's log curve: I-Log clips only.
         let ilog = self.clip.as_ref().is_some_and(|c| c.ilog());
+        // Raw video: the frames are developed here (white balance, exposure,
+        // tone) before every display-referred control below.
+        let is_raw = matches!(kind, Some(k) if k.is_raw_video());
         let braw_info = if is_braw { self.clip.as_ref().and_then(|c| c.braw_color.clone()) } else { None };
         let braw_lut = if is_braw { self.clip.as_ref().and_then(|c| c.braw_lut.clone()) } else { None };
         let s = &mut self.settings;
 
+        if is_raw {
+            draw_raw_develop_section(ui, &mut s.raw, vr180_pipeline::raw_color::RawCamera::X6);
+            ui.separator();
+        }
         if let Some(info) = braw_info.as_deref() {
             draw_braw_color_section(ui, s, info, braw_lut.as_deref());
         } else if is_braw {
@@ -8959,6 +8975,50 @@ fn draw_eye_lens(
 /// slider. The trick: after egui maps the cursor position to a value, we
 /// keep only `1/zoom` of this frame's change, so the value creeps at
 /// `1/zoom` of cursor speed.
+/// Color panel ▸ Raw development: the white balance and tone controls of a
+/// raw video clip, in a raw converter's own terms (kelvin and tint; stops;
+/// −100..100). The white balance shows the effective value: the camera's
+/// until the user moves it.
+fn draw_raw_develop_section(
+    ui: &mut egui::Ui,
+    raw: &mut vr180_pipeline::raw_tone::RawSettings,
+    camera: vr180_pipeline::raw_color::RawCamera,
+) {
+    ui.label(RichText::new(tr("Raw development")).strong());
+    let (shot_k, shot_tint) = camera.as_shot_temperature();
+    let mut kelvin = raw.temperature.unwrap_or(shot_k as f32);
+    let mut tint = raw.tint.unwrap_or(shot_tint as f32);
+    let hover = tr("The white the frame is developed for, as a colour temperature in kelvin and a tint, the way a raw converter states it.");
+    if ui.add(egui::Slider::new(&mut kelvin, 2000.0..=50000.0).logarithmic(true).text(tr("Temperature (K)")).fixed_decimals(0))
+        .on_hover_text(hover).changed()
+    {
+        raw.temperature = Some(kelvin.round());
+    }
+    if ui.add(egui::Slider::new(&mut tint, -150.0..=150.0).text(tr("Tint")).fixed_decimals(0))
+        .on_hover_text(hover).changed()
+    {
+        raw.tint = Some(tint.round());
+    }
+    ui.add_enabled_ui(raw.temperature.is_some() || raw.tint.is_some(), |ui| {
+        if ui.button(tr("As shot")).on_hover_text(tr("The take records no white balance of its own: As shot is the camera's reference white.")).clicked() {
+            raw.temperature = None;
+            raw.tint = None;
+        }
+    });
+    ui.add(egui::Slider::new(&mut raw.exposure, -5.0..=5.0).text(tr("Exposure")).fixed_decimals(2));
+    let amount = |ui: &mut egui::Ui, v: &mut f32, label: &'static str| {
+        ui.add(egui::Slider::new(v, -100.0..=100.0).text(tr(label)).fixed_decimals(0));
+    };
+    amount(ui, &mut raw.contrast, "Contrast");
+    amount(ui, &mut raw.highlights, "Highlights");
+    amount(ui, &mut raw.shadows, "Shadows");
+    amount(ui, &mut raw.whites, "Whites");
+    amount(ui, &mut raw.blacks, "Blacks");
+    if ui.button(tr("Reset raw development")).clicked() {
+        *raw = Default::default();
+    }
+}
+
 /// Color panel ▸ Blackmagic RAW: the SDK's colour processing. Every control
 /// shows the EFFECTIVE value — the clip's own until the user moves it, then
 /// the override (marked with a dot); "Reset to clip" clears every override.
