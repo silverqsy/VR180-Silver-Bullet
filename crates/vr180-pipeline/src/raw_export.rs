@@ -102,6 +102,8 @@ struct FrameSource {
     cfg: FisheyeExportConfig,
     decoder: Box<dyn FisheyePairIter>,
     imu: Option<vr180_fisheye::DjiOsvImu>,
+    /// The eyes' calibrations before the view, and with it.
+    source_calib: (FisheyeCalib, FisheyeCalib),
     calib: (FisheyeCalib, FisheyeCalib),
     stab: Option<Vec<EquirectRotation>>,
     timeline: Option<crate::frame_timeline::FrameTimeline>,
@@ -114,12 +116,30 @@ impl FrameSource {
         if !cfg.source_kind.is_raw_video() {
             return Err(Error::Ffmpeg(format!("{}: not a raw video clip, its frames have no DNG", cfg.source_path.display())));
         }
+        // A lens frame is fixed before the first frame, as the video export
+        // fixes it: the frames are then the picture that export writes. A
+        // lens no frame can be made of keeps the disc, as the preview does;
+        // and a frame is no spatial video, whatever the clip's export is.
+        let mut cfg = cfg.clone();
+        cfg.spatial = None;
+        match crate::fisheye_export::resolve_lens_frame(&mut cfg) {
+            Ok(Some((frame, _))) => tracing::debug!(
+                "raw frames: lens frame {}x{}, focal {:.3} px, xi {:.5}, k1 {:.6}, k2 {:.6}",
+                frame.width, frame.height, frame.focal, frame.xi, frame.k1, frame.k2),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("raw frames: no lens frame ({e}) — the frames hold the disc");
+                cfg.lens_frame = crate::fisheye_export::LensFrameOut::Off;
+            }
+        }
+        let cfg = &cfg;
         let mut open = crate::fisheye_export::fisheye_export_opener(
             cfg.source_kind, cfg.fisheye_swap_eyes, 10, cfg.braw_color.clone(), Some(pipeline.clone()));
         let decoder = open(&cfg.source_path)?;
         let src = decoder.eye_dims();
         let imu = crate::fisheye_export::resolve_export_imu(cfg);
-        let calib = crate::fisheye_export::resolve_calib_pair(cfg, src.0, src.1, imu.as_ref());
+        let source_calib = crate::fisheye_export::resolve_source_calib_pair(cfg, src.0, src.1, imu.as_ref());
+        let calib = crate::fisheye_export::view_calib_pair(cfg, source_calib);
         let timeline = crate::fisheye_export::export_timeline(cfg);
         let frames = timeline.as_ref().map(|t| t.len()).filter(|n| *n > 0)
             .or_else(|| crate::decode::probe_video(&cfg.source_path).ok().map(|p| (p.duration_sec * p.fps as f64).round() as usize))
@@ -132,7 +152,7 @@ impl FrameSource {
             })
         } else { None };
         let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, imu.as_ref()) / 1000.0;
-        Ok(Self { pipeline, cfg: cfg.clone(), decoder, imu, calib, stab, timeline, src, readout_s })
+        Ok(Self { pipeline, cfg: cfg.clone(), decoder, imu, source_calib, calib, stab, timeline, src, readout_s })
     }
 
     /// The frame's row in the per-frame tables.
@@ -140,8 +160,9 @@ impl FrameSource {
         crate::frame_timeline::stab_row(self.timeline.as_ref(), pair.pts_s, 1.0 / self.cfg.fps as f64, fallback)
     }
 
-    /// The pair's two eyes as the export projects them, camera-linear.
-    fn eyes(&self, pair: &FisheyePair, row: usize) -> Result<(wgpu::Texture, wgpu::Texture)> {
+    /// The frame's rotations and per-row matrices, eye by eye.
+    #[allow(clippy::type_complexity)]
+    fn motion(&self, row: usize) -> ((EquirectRotation, EquirectRotation), (Option<Vec<f32>>, Option<Vec<f32>>)) {
         let cfg = &self.cfg;
         let rot = self.stab.as_ref().and_then(|v| v.get(row).copied()).unwrap_or(EquirectRotation::IDENTITY);
         let (rl, rr) = crate::dji_imu::per_eye_rotations(rot, self.imu.as_ref(), row, cfg.fisheye_swap_eyes);
@@ -149,13 +170,31 @@ impl FrameSource {
             let (vl, vr) = cfg.view_adjust.per_eye_matrices();
             (EquirectRotation(crate::panomap::mat3_mul_row_major(&rl.0, &vl)), EquirectRotation(crate::panomap::mat3_mul_row_major(&rr.0, &vr)))
         };
-        let (rows_l, rows_r) = if cfg.stabilize && self.imu.is_some() && self.readout_s > 0.0 {
+        let rows = if cfg.stabilize && self.imu.is_some() && self.readout_s > 0.0 {
             self.imu.as_ref().map(|osv| crate::dji_imu::per_eye_rs_rows(osv, row, self.readout_s, self.src.1, cfg.fps, cfg.fisheye_swap_eyes))
                 .unwrap_or((None, None))
         } else { (None, None) };
+        ((rl, rr), rows)
+    }
+
+    /// The pair's two eyes as the export projects them, camera-linear.
+    fn eyes(&self, pair: &FisheyePair, row: usize) -> Result<(wgpu::Texture, wgpu::Texture)> {
+        let cfg = &self.cfg;
+        let ((rl, rr), (rows_l, rows_r)) = self.motion(row);
         crate::fisheye_export::build_eye_eq_16(
             &self.pipeline, pair, self.src.0, self.src.1, cfg.eye_w, cfg.eye_h,
             rl, rr, self.calib.0, self.calib.1, cfg.projection, (rows_l.as_deref(), rows_r.as_deref()))
+    }
+
+    /// The clip's colour plan for this frame: with the frame's reference
+    /// where the view is not the half-equirect.
+    fn plan(&self, pair: &FisheyePair, row: usize) -> Result<std::borrow::Cow<'_, crate::gpu::ColorStackPlan>> {
+        let cfg = &self.cfg;
+        let (rot, (rows_l, rows_r)) = self.motion(row);
+        let mono = crate::source_kind::is_single_eye(cfg.source_kind, &cfg.source_path);
+        crate::fisheye_export::plan_with_raw_reference(
+            &self.pipeline, &cfg.color_stack, pair, cfg.projection, &self.calib.0, cfg.eye_w, cfg.eye_h,
+            self.source_calib, rot, (rows_l.as_deref(), rows_r.as_deref()), mono)
     }
 
     /// Write the pair as a linear DNG.
@@ -201,12 +240,15 @@ pub fn export_frame_png16(pipeline: Arc<Device>, cfg: &FisheyeExportConfig, t_s:
         .ok_or_else(|| Error::Ffmpeg("no frame at that time".into()))?;
     let row = source.row(&pair, 0);
     let (left, right) = source.eyes(&pair, row)?;
+    let plan = source.plan(&pair, row)?;
+    // The frame's size is the opened source's: a lens frame sets its own.
+    let cfg = &source.cfg;
     let mono = crate::source_kind::is_single_eye(cfg.source_kind, &cfg.source_path);
     let (w, h) = if mono { (cfg.eye_w, cfg.eye_h) } else { (cfg.eye_w * 2, cfg.eye_h) };
     let frame = if mono {
-        pipeline.apply_color_stack_per_eye_16(&left, cfg.eye_w, cfg.eye_h, &cfg.color_stack)?.unwrap_or(left)
+        pipeline.apply_color_stack_per_eye_16(&left, cfg.eye_w, cfg.eye_h, &plan)?.unwrap_or(left)
     } else {
-        let (l, r) = pipeline.apply_color_stack_pair_16(&left, &right, cfg.eye_w, cfg.eye_h, &cfg.color_stack, None)?;
+        let (l, r) = pipeline.apply_color_stack_pair_16(&left, &right, cfg.eye_w, cfg.eye_h, &plan, None)?;
         pipeline.compose_sbs_textures_16(&l.unwrap_or(left), &r.unwrap_or(right), cfg.eye_w, cfg.eye_h)?
     };
     let bytes = pipeline.read_texture_rgb48(&frame, w, h)?;

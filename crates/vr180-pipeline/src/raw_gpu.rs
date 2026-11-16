@@ -3,7 +3,7 @@
 //! fisheye projection kernels sample like any other 16-bit source
 //! (`shaders/bayer_demosaic.wgsl`).
 
-use crate::gpu::Device;
+use crate::gpu::{Device, EquirectRotation, FisheyeCalib};
 use crate::{Error, Result};
 
 const BAYER_DEMOSAIC_WGSL: &str = include_str!("shaders/bayer_demosaic.wgsl");
@@ -134,6 +134,38 @@ struct DevelopLocalParams {
     stage: [f32; 4],
     keyed: [f32; 4],
 }
+
+/// What a raw clip's development is read from when the picture being drawn
+/// is another view of the clip. The rendering is derived from the frame it
+/// is given (its darkest and brightest parts, the spread of its levels), so
+/// the same moment as a reframed view or a lens frame would come out
+/// developed differently from its half-equirect. One frame stands for the
+/// moment instead: its half-equirect, which every view takes its keys and
+/// curves from. See [`Device::raw_reference`].
+#[derive(Debug, Clone)]
+pub struct RawReference {
+    /// The frame's eyes as half-equirects: camera-linear, turned as the
+    /// view drawn is.
+    pub eyes: Vec<wgpu::Texture>,
+    /// The long side the reference frame has at the scale the view drawn
+    /// shows the scene at (at its centre). The local stage sizes its
+    /// neighbourhoods from it, so they cover the same part of the scene in
+    /// every view.
+    pub long_side: u32,
+}
+
+/// One eye of a [`RawReference`] to draw: the camera-linear source eye, the
+/// rotation and per-row matrices of the view, and the eye's calibration as
+/// the half-equirect resolves it.
+pub struct RawReferenceEye<'a> {
+    pub src: &'a wgpu::Texture,
+    pub rotation: EquirectRotation,
+    pub calib: FisheyeCalib,
+    pub rows: Option<&'a [f32]>,
+}
+
+/// The side of a reference eye, pixels: 16 to a cell of the measurement.
+pub const RAW_REFERENCE_SIDE: u32 = 1008;
 
 /// Cells along the longer side of the frame the keys are read from: three
 /// to a cell of the reduced copy the curves are derived from.
@@ -763,14 +795,51 @@ impl Device {
         self.raw_frame_stats(eyes, stage).keys
     }
 
+    /// The reference frame of a raw clip's frame, for a view that is not
+    /// the half-equirect: every eye drawn as a half-equirect of
+    /// [`RAW_REFERENCE_SIDE`]. `view_px_per_rad`: the density of the view
+    /// being drawn, at its centre ([`FisheyeCalib::center_px_per_rad`]).
+    /// `slot`: the projection cache slot of the first eye (the next ones
+    /// follow it); the textures are the slots' own, good until the next
+    /// reference is drawn there.
+    pub fn raw_reference(&self, eyes: &[RawReferenceEye<'_>], view_px_per_rad: f32, slot: u32) -> Result<RawReference> {
+        let side = RAW_REFERENCE_SIDE;
+        let mut drawn = Vec::with_capacity(eyes.len());
+        for (n, eye) in eyes.iter().enumerate() {
+            let (sw, sh) = (eye.src.width(), eye.src.height());
+            let slot = slot + n as u32;
+            drawn.push(match eye.rows.filter(|rows| !rows.is_empty()) {
+                Some(rows) => self.project_fisheye_rgba16_texture_to_equirect_rs_16(
+                    eye.src, sw, sh, side, side, eye.rotation, eye.calib, rows, slot)?,
+                None => self.project_fisheye_rgba16_texture_to_equirect_16(
+                    eye.src, sw, sh, side, side, eye.rotation, eye.calib, slot)?,
+            });
+        }
+        // A half-equirect eye is π radians wide; the frame is its eyes side by side.
+        let long_side = (std::f32::consts::PI * view_px_per_rad * eyes.len() as f32).round().max(1.0) as u32;
+        Ok(RawReference { eyes: drawn, long_side })
+    }
+
     /// The per-frame constants of `stage` for the given eyes (measured as
     /// the stage asks). The eyes are one frame: side by side when two.
-    pub fn raw_develop_constants(&self, eyes: &[&wgpu::Texture], stage: &RawDevelop) -> DevelopConstants {
-        let stats = self.raw_frame_stats(eyes, stage);
+    /// `reference`: the frame to read instead, when the eyes are another
+    /// view of the clip than its half-equirect.
+    pub fn raw_develop_constants(&self, eyes: &[&wgpu::Texture], reference: Option<&RawReference>, stage: &RawDevelop) -> DevelopConstants {
+        let reference = reference.filter(|r| !r.eyes.is_empty());
+        let stats = match reference {
+            Some(r) => self.raw_frame_stats(&r.eyes.iter().collect::<Vec<_>>(), stage),
+            None => self.raw_frame_stats(eyes, stage),
+        };
+        tracing::debug!(
+            "raw development: dark {:.5} max {:.4}, {} levels (reference: {})",
+            stats.keys.dark, stats.keys.max, stats.levels.len(), reference.is_some());
         let curves = self.raw_pipelines().memory.lock().ok().and_then(|m| m.curves.clone());
         let mut k = stage.constants_for(&stats, curves.as_deref());
         if let (Some(local), Some(eye)) = (k.local.as_mut(), eyes.first()) {
-            local.long_side = (eye.width() * eyes.len() as u32).max(eye.height());
+            local.long_side = match reference {
+                Some(r) => r.long_side,
+                None => (eye.width() * eyes.len() as u32).max(eye.height()),
+            };
         }
         k
     }
@@ -1076,7 +1145,7 @@ mod tests {
             RawSettings { shadows: 70.0, blacks: 60.0, whites: -40.0, ..Default::default() },
         ] {
             let stage = RawDevelop { camera: RawCamera::X6, settings, measure: Measure::Wait };
-            let mut k = dev.raw_develop_constants(&[&src], &stage);
+            let mut k = dev.raw_develop_constants(&[&src], None, &stage);
             let local = k.local.as_mut().expect("local stage");
             // A long side that gives more than one pixel per texel of the reduced copy.
             local.long_side = 2048;
@@ -1171,6 +1240,62 @@ mod tests {
         // One eye alone is a frame of its own: 126 cells of 2 px.
         let mono = dev.raw_tone_keys(&[&right], &stage);
         assert!((mono.max - 0.2).abs() < 1e-3 && (mono.dark - 0.2).abs() < 1e-3, "{mono:?}");
+    }
+
+    /// A view that is not the half-equirect is developed from its
+    /// reference frame: the keys are the reference's, and the local stage
+    /// is sized from it.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_view_is_developed_from_its_reference() {
+        use crate::raw_color::RawCamera;
+        use crate::raw_tone::RawSettings;
+        let dev = Device::new().expect("device");
+        let n = RawCamera::X6.as_shot_neutral.map(|v| v as f32);
+        let eye = |w: u32, h: u32, level_at: &dyn Fn(u32, u32) -> f32| -> wgpu::Texture {
+            let px: Vec<u16> = (0..w * h).flat_map(|i| {
+                let l = level_at(i % w, i / w);
+                [(n[0] * l * 65535.0) as u16, (n[1] * l * 65535.0) as u16, (n[2] * l * 65535.0) as u16, u16::MAX]
+            }).collect();
+            let t = dev.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("test_eye"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            dev.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bytemuck::cast_slice(&px),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+            t
+        };
+        // The view: a flat grey with a black border (a lens frame's). The
+        // reference: the scene, from a deep shadow to a bright wall.
+        let view = eye(320, 240, &|x, y| if x < 40 || y < 30 { 0.0 } else { 0.2 });
+        let scene = |x: u32, _y: u32| 0.004 * 2f32.powf(x as f32 / 252.0 * 7.0);
+        let (ref_l, ref_r) = (eye(252, 252, &scene), eye(252, 252, &scene));
+        let settings = RawSettings { shadows: 60.0, highlights: -40.0, ..Default::default() };
+        let stage = RawDevelop { camera: RawCamera::X6, settings, measure: Measure::Wait };
+        let reference = RawReference { eyes: vec![ref_l.clone(), ref_r.clone()], long_side: 1234 };
+        let of_view = dev.raw_develop_constants(&[&view, &view], None, &stage);
+        let of_reference = dev.raw_develop_constants(&[&ref_l, &ref_r], None, &stage);
+        let with_reference = dev.raw_develop_constants(&[&view, &view], Some(&reference), &stage);
+        // Read off the reference, not off the view's own eyes.
+        assert_eq!(with_reference.curve, of_reference.curve);
+        assert_ne!(with_reference.curve, of_view.curve);
+        let (a, b, c) = (with_reference.local.expect("local"), of_reference.local.expect("local"), of_view.local.expect("local"));
+        assert_eq!(a.gain, b.gain);
+        assert_eq!((a.white, a.black.clone(), a.tone.clone()), (b.white, b.black.clone(), b.tone.clone()));
+        assert_ne!(a.gain, c.gain);
+        // The neighbourhoods: from the reference's scale, where the others
+        // take their own frame's long side.
+        assert_eq!((a.long_side, b.long_side, c.long_side), (1234, 504, 640));
+        // An empty reference is none.
+        let none = RawReference { eyes: Vec::new(), long_side: 99 };
+        assert_eq!(dev.raw_develop_constants(&[&view, &view], Some(&none), &stage).local.expect("local").long_side, 640);
     }
 
     #[test]

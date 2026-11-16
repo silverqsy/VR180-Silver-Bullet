@@ -2673,10 +2673,42 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      `FrameStats { keys, levels, peaks }`. `Measure::Wait` for exports and
      stills, `Measure::Latest` for the preview (uses the last measurement
      that came back and asks for a redraw when it changes).
+   - **One look in every view** (2026-11-16): the measurement belongs to
+     the picture it is made on, so a reframed view (a part of the scene) or
+     a lens frame (a black border) came out in other colours than the
+     half-equirect — 8–13 of 255 with Shadows / Highlights at their ends.
+     Every view that is not the half-equirect is now developed from a
+     REFERENCE FRAME: the same frame's eyes drawn as half-equirects of
+     `RAW_REFERENCE_SIDE` (1008 px) with the view's own rotations and
+     per-row matrices (`raw_gpu::RawReference`, `Device::raw_reference`,
+     `ColorStackPlan::raw_reference`); the keys and curves are read off it,
+     and the local stage's cell is sized from `RawReference::long_side` =
+     eyes × π × `FisheyeCalib::center_px_per_rad` of the view, so its
+     neighbourhoods cover the same angle as in the half-equirect. Callers:
+     `fisheye_export::plan_with_raw_reference` (the export loop's two
+     10-bit arms, `raw_export`'s developed frame), `decoder.rs`
+     `raw_view_reference` (live preview, still). Both resolvers are split
+     for it: source calibrations (`resolve_source_calib_pair`,
+     `resolve_fisheye_source_calib_pair`) and the view put on them
+     (`view_calib_pair`, `fisheye_view_calib_pair`). Views against the
+     half-equirect at the same scene points (`~/vr180-internal/x6raw-acr/
+     viewcmp.py`, three frames, Shadows +100 / Highlights −100): disc 0.2–0.3
+     of 255, lens frame 0.3, reframe 90° 0.5–0.8, 40° 0.8–1.3 — the
+     resampling floor of that comparison is 0.2 / 0.2 / 0.3–0.4 / 0.6–1.0,
+     mean bias under 0.25. What is left: the base grid is still built on
+     the view's own picture, so at a strong zoom (20°) with both sliders at
+     their ends regions differ by about half a step (a few at most); the
+     cure would be a grid built on the reference and looked up through the
+     view's ray. The half-equirect itself is unchanged (its eyes are the
+     reference), and so is its match with Camera Raw; a DNG of another view
+     is developed by Camera Raw from that picture alone.
    - **DNG**: `raw_export.rs` — a frame as a linear DNG with the settings
      as `crs:` XMP (written beside every Snapshot of a raw clip), and the
      export option "DNG sequence" (`ExportOptions::raw_dng_sequence`,
-     folder `<stem>_DNG`).
+     folder `<stem>_DNG`). A Lens Space frame through the camera's lens is
+     the lens frame the video export writes (`FrameSource::open` resolves
+     it with `resolve_lens_frame`; before 2026-11-16 these frames held the
+     equidistant disc).
    - **Against Camera Raw** (three frames, mean |difference| of 16-px block
      means, of 255): default 0.33; white balance 0.1–0.7; Shadows /
      Highlights ±50 0.7–1.4, ±100 1.3–2.5, both at their ends 2.9–4.6;

@@ -37,6 +37,14 @@ converter's controls for it, and every frame can be had as a DNG.
   flicker (the picture's mean changes from frame to frame by 0.18 of an
   8-bit step with and without Shadows and Highlights, 0.22 with every
   slider in use).
+- **One grade, one look, in every view.** A reframed view shows a part of
+  the scene and a Lens Space frame has a black border, so measured on their
+  own they would be developed differently from the VR180 picture (with
+  Shadows and Highlights in use, by as much as 13 steps). They are developed
+  from the half-equirect of the same frame instead, and the three views
+  agree to within about half a step. A raw converter given the DNG of such a view develops
+  it from that picture alone, so there the views still differ; the DNG of
+  the VR180 frame is the one that matches.
 - **Every frame is a DNG.** Snapshot writes a linear DNG beside the JPEG:
   the projected frame in the camera's own linear colour, with the panel's
   settings inside, so another raw converter opens it as it looks here. In

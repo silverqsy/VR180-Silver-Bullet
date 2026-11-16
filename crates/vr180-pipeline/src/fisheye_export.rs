@@ -1423,7 +1423,7 @@ fn size_lens_frame(
 ///
 /// The VR180 metadata flags are cleared: a lens frame is not a half-equirect,
 /// and the file gets its own metadata from [`export_fisheye`].
-fn resolve_lens_frame(cfg: &mut FisheyeExportConfig) -> Result<Option<(crate::lens_frame::LensFrame, bool)>> {
+pub(crate) fn resolve_lens_frame(cfg: &mut FisheyeExportConfig) -> Result<Option<(crate::lens_frame::LensFrame, bool)>> {
     if cfg.lens_frame == LensFrameOut::Off {
         return Ok(None);
     }
@@ -1778,9 +1778,8 @@ fn export_fisheye_inner(
     let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = resolve_export_imu(&cfg);
 
     // ── Resolve per-eye calibrations ─────────────────────────────
-    let (calib_left, calib_right) = resolve_calib_pair(
-        &cfg, src_w, src_h, dji_osv_imu.as_ref(),
-    );
+    let source_calib = resolve_source_calib_pair(&cfg, src_w, src_h, dji_osv_imu.as_ref());
+    let (calib_left, calib_right) = view_calib_pair(&cfg, source_calib);
 
     // ── Stab rotations (one per source frame) ────────────────────
     // `clip_slots` = duration × nominal fps (the OUTPUT frames, holes
@@ -2135,8 +2134,11 @@ fn export_fisheye_inner(
                     rot_left, rot_right, calib_left, calib_right,
                     projection, (rs_rows_l.as_deref(), rs_rows_r.as_deref()),
                 )?;
+                let frame_plan = plan_with_raw_reference(
+                    &pipeline, &color_plan, &pair, projection, &calib_left, cfg.eye_w, cfg.eye_h,
+                    source_calib, (rot_left, rot_right), (rs_rows_l.as_deref(), rs_rows_r.as_deref()), mono)?;
                 let (l_final, r_final) = grade_eyes_16(
-                    &pipeline, &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan, eye_match(), mono,
+                    &pipeline, &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &frame_plan, eye_match(), mono,
                 )?;
                 let (l_final, r_final) = (&l_final, &r_final);
                 // ProRes gets a P210 (true 4:2:2) surface; HEVC Main10 P010.
@@ -2169,8 +2171,11 @@ fn export_fisheye_inner(
                 rot_left, rot_right, calib_left, calib_right,
                 projection, (rs_rows_l.as_deref(), rs_rows_r.as_deref()),
             )?;
+            let frame_plan = plan_with_raw_reference(
+                &pipeline, &color_plan, &pair, projection, &calib_left, cfg.eye_w, cfg.eye_h,
+                source_calib, (rot_left, rot_right), (rs_rows_l.as_deref(), rs_rows_r.as_deref()), mono)?;
             let (l_final, r_final) = grade_eyes_16(
-                &pipeline, &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &color_plan, eye_match(), mono,
+                &pipeline, &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &frame_plan, eye_match(), mono,
             )?;
             // One eye is the frame itself; two are composed side by side.
             let sbs_tex_16 = if mono { l_final } else {
@@ -4651,6 +4656,18 @@ pub(crate) fn resolve_calib_pair(
     src_h: u32,
     osv: Option<&vr180_fisheye::DjiOsvImu>,
 ) -> (FisheyeCalib, FisheyeCalib) {
+    view_calib_pair(cfg, resolve_source_calib_pair(cfg, src_w, src_h, osv))
+}
+
+/// The two eyes' calibrations before the output view is put on them
+/// ([`view_calib_pair`]): the source's lenses as the half-equirect is drawn
+/// through them.
+pub(crate) fn resolve_source_calib_pair(
+    cfg: &FisheyeExportConfig,
+    src_w: u32,
+    src_h: u32,
+    osv: Option<&vr180_fisheye::DjiOsvImu>,
+) -> (FisheyeCalib, FisheyeCalib) {
     use vr180_fisheye::presets;
 
     let preset = if !cfg.fisheye_preset.is_empty() && cfg.fisheye_preset != "Auto" {
@@ -4802,12 +4819,16 @@ pub(crate) fn resolve_calib_pair(
     // Generic SBS with the fisheye dewarp off: the halves are already
     // half-equirect — bypass the lens model (identity resample for the
     // default output, a correct (lon, lat) lookup for the reframed view).
-    let (calib_l, calib_r) = if cfg.source_kind == SourceKind::SbsFisheye && !cfg.sbs_dewarp_fisheye {
+    if cfg.source_kind == SourceKind::SbsFisheye && !cfg.sbs_dewarp_fisheye {
         (calib_l.with_equirect_input(), calib_r.with_equirect_input())
     } else {
         (calib_l, calib_r)
-    };
+    }
+}
 
+/// The calibrations of [`resolve_source_calib_pair`] for the view the
+/// export writes (`cfg.projection`).
+pub(crate) fn view_calib_pair(cfg: &FisheyeExportConfig, (calib_l, calib_r): (FisheyeCalib, FisheyeCalib)) -> (FisheyeCalib, FisheyeCalib) {
     // Equidistant FISHEYE output target: set the output half-FOV so the
     // shaders map the inscribed circle of the square frame to a clean
     // FISHEYE_OUT_FULL_FOV_DEG fisheye. (The equirect target keeps the
@@ -4888,6 +4909,50 @@ pub fn eac_lens_frame(stabilized: bool, side: u32) -> Option<crate::lens_frame::
 // (CPU compose test removed — GPU compose has no per-byte invariants
 // to assert in isolation; correctness validated by an end-to-end
 // export run.)
+
+/// Projection cache slots of a raw frame's reference eyes in an export.
+const RAW_REFERENCE_SLOT: u32 = 40;
+
+/// The colour plan for one frame of a raw clip: `plan` with the frame's
+/// reference ([`crate::raw_gpu::RawReference`]) when the view written is
+/// not the half-equirect, so that the frame is developed as its
+/// half-equirect would be. Any other clip, and the half-equirect itself
+/// (its own eyes are the reference), keep `plan` as it is.
+///
+/// `source_calib`: the eyes' calibrations before the view
+/// ([`resolve_source_calib_pair`]); `view_calib`: one eye's with the view,
+/// for a frame `eye_w × eye_h`; `rot`, `rs`: the frame's rotations and
+/// per-row matrices, as [`build_eye_eq_16`] takes them; `single_eye`: the
+/// frame written is one eye (the left), and so is its reference.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_with_raw_reference<'a>(
+    pipeline: &Device,
+    plan: &'a ColorStackPlan,
+    pair: &FisheyePair,
+    projection: FisheyeExportProjection,
+    view_calib: &FisheyeCalib,
+    eye_w: u32, eye_h: u32,
+    source_calib: (FisheyeCalib, FisheyeCalib),
+    rot: (EquirectRotation, EquirectRotation),
+    rs: (Option<&[f32]>, Option<&[f32]>),
+    single_eye: bool,
+) -> Result<std::borrow::Cow<'a, ColorStackPlan>> {
+    let eyes = match pair.gpu.as_deref() {
+        Some(g) if plan.raw_develop.is_some() && projection != FisheyeExportProjection::HalfEquirect => g,
+        _ => return Ok(std::borrow::Cow::Borrowed(plan)),
+    };
+    // Per-row correction needs both eyes' rows, as in the projection itself.
+    let (rs_l, rs_r) = match rs { (Some(l), Some(r)) => (Some(l), Some(r)), _ => (None, None) };
+    let density = view_calib.center_px_per_rad(eye_w, eye_h, projection == FisheyeExportProjection::Fisheye);
+    let drawn = [
+        crate::raw_gpu::RawReferenceEye { src: &eyes.left, rotation: rot.0, calib: source_calib.0, rows: rs_l },
+        crate::raw_gpu::RawReferenceEye { src: &eyes.right, rotation: rot.1, calib: source_calib.1, rows: rs_r },
+    ];
+    let reference = pipeline.raw_reference(if single_eye { &drawn[..1] } else { &drawn[..] }, density, RAW_REFERENCE_SLOT)?;
+    let mut plan = plan.clone();
+    plan.raw_reference = Some(reference);
+    Ok(std::borrow::Cow::Owned(plan))
+}
 
 /// Build a per-eye `Rgba16Unorm` half-equirect (or normalized fisheye)
 /// for the 10-bit export paths. Honors `projection`:

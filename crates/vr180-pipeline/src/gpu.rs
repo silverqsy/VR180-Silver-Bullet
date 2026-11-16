@@ -2586,6 +2586,25 @@ impl FisheyeCalib {
         self
     }
 
+    /// Output pixels per radian at the centre of the picture this
+    /// calibration draws in a frame `out_w × out_h`: the half-equirect or
+    /// the reframed view of the equirect kernels, or (`fisheye_out`) the
+    /// disc or the lens frame of the fisheye-output ones.
+    pub fn center_px_per_rad(&self, out_w: u32, out_h: u32, fisheye_out: bool) -> f32 {
+        if fisheye_out {
+            if self.out_lens[1] > 0.0 {
+                // A Mei-Rives lens: r = f·sin θ / (ξ + cos θ) near the axis.
+                return self.out_lens[1] / (1.0 + self.out_lens[0]).max(1e-3);
+            }
+            return 0.5 * out_w.min(out_h) as f32 / self.output_hfov_rad.max(1e-3);
+        }
+        if self.proj_mode > 0.5 {
+            // r = k·tan(θ / k) is θ near the axis, on a plane `edge_x` wide to each side.
+            return 0.5 * out_w as f32 / self.edge_x.max(1e-3);
+        }
+        0.5 * out_w as f32 / self.output_hfov_rad.max(1e-3)
+    }
+
     /// Radial part of the lens model itself, without the rim extension:
     /// image radius (px from the principal point, along x) of a ray `theta`
     /// radians off the axis — the UCM curve when `xi > 0`, else the KB
@@ -5689,6 +5708,11 @@ pub struct ColorStackPlan {
     /// sees from any other clip. 16-bit stacks only; `None` for every
     /// source that is not raw.
     pub raw_develop: Option<crate::raw_tone::RawDevelop>,
+    /// The frame the raw development is read from when the eyes the stack
+    /// is given are another view of the clip (a reframed view, a lens
+    /// frame): see [`crate::raw_gpu::RawReference`]. `None`: the eyes
+    /// themselves, which is right for the half-equirect.
+    pub raw_reference: Option<crate::raw_gpu::RawReference>,
 }
 
 impl Default for ColorStackPlan {
@@ -5706,6 +5730,7 @@ impl Default for ColorStackPlan {
             log_exposure: None,
             eye_scale: 1.0,
             raw_develop: None,
+            raw_reference: None,
         }
     }
 }
@@ -9339,7 +9364,7 @@ impl Device {
         } else { None };
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(12);
         // A raw source: this frame's tone keys, read off the eye itself.
-        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[src], stage));
+        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[src], plan.raw_reference.as_ref(), stage));
         let idx = self.record_color_stack_16(
             &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates, None, raw.as_ref());
         self.queue.submit(Some(encoder.finish()));
@@ -9376,7 +9401,7 @@ impl Device {
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(24);
         // A raw source: ONE set of tone keys for the frame, read off both
         // eyes together, so the two are developed alike.
-        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[left, right], stage));
+        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[left, right], plan.raw_reference.as_ref(), stage));
         let li = self.record_color_stack_16(
             &mut encoder, left, w, h, &plan.for_eye(true), &lut_resources, &mut intermediates,
             matching.map(|s| (s, 0)), raw.as_ref());
@@ -10443,6 +10468,37 @@ mod reframe_tests {
         // The frame covers ~±63° along each axis from its centre.
         let c = crop.frame_half_angles();
         assert!((c[0].to_degrees() - 62.7).abs() < 1.0 && (c[1] - c[0]).abs() < 1e-6, "{:?}", c);
+    }
+
+    /// The density a view shows the scene at, at its centre: against the
+    /// angle between the rays of two pixels there.
+    #[test]
+    fn the_density_of_a_view_at_its_centre() {
+        let c = FisheyeCalib::new_pure_kb(1000.0, 1000.0, 960.0, 960.0, [0.0; 4], 1920.0, 1920.0);
+        // The half-equirect: 180° across the eye.
+        let eq = c.center_px_per_rad(2000, 2000, false);
+        assert!((eq - 2000.0 / std::f32::consts::PI).abs() < 1e-2, "{eq}");
+        // A reframed view, flat and with a fisheye look: one pixel's angle
+        // at the centre, from the ray generator itself.
+        for (hfov, defish, (w, h)) in [(90.0f32, 0.0f32, (1920u32, 1080u32)), (40.0, 0.0, (1024, 1024)), (120.0, 0.6, (1920, 1920))] {
+            let v = c.with_reframe(hfov, defish, w as f32 / h as f32);
+            let ray = |px: f32| reframe_ray(px / w as f32, 0.5, v.defish_k, v.edge_x, v.edge_y);
+            // Twenty pixels apart: the chord of so small an angle is the angle.
+            let (a, b) = (ray(w as f32 * 0.5 - 10.0), ray(w as f32 * 0.5 + 10.0));
+            let step = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() / 20.0;
+            let got = v.center_px_per_rad(w, h, false);
+            assert!((got * step - 1.0).abs() < 2e-3, "hfov {hfov} defish {defish}: {got} px/rad, one pixel is {step} rad");
+        }
+        // The disc: half the field over half the shorter side.
+        let half = 97.5f32.to_radians();
+        let disc = c.with_output_hfov(half).center_px_per_rad(1000, 1200, true);
+        assert!((disc - 500.0 / half).abs() < 1e-3, "{disc}");
+        // A lens frame: one pixel's angle at the centre, from its own rays.
+        let frame = crate::lens_frame::LensFrame::equidistant(1200, 1000, 100.0).expect("a frame");
+        let (a, b) = (frame.ray(590.0, 500.0).unwrap(), frame.ray(610.0, 500.0).unwrap());
+        let step = (((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() / 20.0) as f32;
+        let got = c.with_output_hfov(half).with_lens_frame(&frame).center_px_per_rad(1200, 1000, true);
+        assert!((got * step - 1.0).abs() < 2e-3, "{got} px/rad, one pixel is {step} rad");
     }
 
     #[test]

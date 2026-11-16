@@ -2263,6 +2263,7 @@ fn run_fisheye(
         LensViewSize::Long(eye_w.max(eye_h)),
     );
     let (mut calib_left, mut calib_right, mut lens_dims) = (view.left, view.right, view.lens_dims);
+    let mut source_calib = view.source;
     tracing::info!(
         "decoder (fisheye): initial calib L fx={:.1}, cx={:.1}, cy={:.1}, k={:?}, k5={:.6} | R fx={:.1}, cx={:.1}, cy={:.1}, k={:?}, k5={:.6}",
         calib_left.fx, calib_left.cx, calib_left.cy, calib_left.k, calib_left.k5,
@@ -2592,6 +2593,7 @@ fn run_fisheye(
             calib_left = view.left;
             calib_right = view.right;
             lens_dims = view.lens_dims;
+            source_calib = view.source;
             drop(snap);
             cached_gen = current_gen;
             // Blackmagic RAW: the SDK's colour processing changed → the
@@ -2886,10 +2888,21 @@ fn run_fisheye(
         let phase_project = phase_t2.elapsed();
         let phase_t3 = std::time::Instant::now();
         let auto_eye = control.settings.read().auto_eye_match;
-        let (sbs_tex, out_w, out_h) = compose_with_color_and_mode(
+        // A raw clip in a view that is not the half-equirect is developed
+        // from the half-equirect of the same frame.
+        let raw_reference = {
+            let s = control.settings.read();
+            let one_eye = s.single_eye || pair.single_eye();
+            raw_view_reference(
+                &pipeline, &s, pair.gpu.as_deref().map(|g| (&g.left, &g.right)), one_eye,
+                &calib_left, (preview_eye_w, preview_eye_h), source_calib,
+                (rot_left, rot_right), (rs_rows_l.as_deref(), rs_rows_r.as_deref()), RAW_REFERENCE_SLOT_LIVE)?
+        };
+        let (sbs_tex, out_w, out_h) = compose_view_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex,
             preview_eye_w, preview_eye_h,
             eye_match_arg(&eye_match_state, kind, stab_idx, auto_eye),
+            raw_reference,
         )?;
         if matches!(kind, vr180_pipeline::SourceKind::Insta360Insv) && auto_eye {
             if let Some(r) = pipeline.eye_match_readback_poll(&eye_match_state, &mut eye_match_rb) {
@@ -4496,6 +4509,19 @@ pub(crate) fn resolve_fisheye_calib_pair(
     src_h: u32,
     osv: Option<&vr180_fisheye::DjiOsvImu>,
 ) -> (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib) {
+    fisheye_view_calib_pair(s, resolve_fisheye_source_calib_pair(s, kind, src_w, src_h, osv))
+}
+
+/// The two eyes' calibrations before the output view is put on them
+/// ([`fisheye_view_calib_pair`]): the source's lenses, as the half-equirect
+/// is drawn through them.
+pub(crate) fn resolve_fisheye_source_calib_pair(
+    s: &Settings,
+    kind: vr180_pipeline::SourceKind,
+    src_w: u32,
+    src_h: u32,
+    osv: Option<&vr180_fisheye::DjiOsvImu>,
+) -> (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib) {
     use vr180_fisheye::presets;
 
     // Pick a preset. Explicit name wins; else fall back to the
@@ -4681,12 +4707,19 @@ pub(crate) fn resolve_fisheye_calib_pair(
 
     // Generic SBS with the fisheye dewarp off: the halves are already
     // half-equirect — bypass the lens model (mirrors the export resolver).
-    let (calib_l, calib_r) = if kind == vr180_pipeline::SourceKind::SbsFisheye && !s.sbs_dewarp_fisheye {
+    if kind == vr180_pipeline::SourceKind::SbsFisheye && !s.sbs_dewarp_fisheye {
         (calib_l.with_equirect_input(), calib_r.with_equirect_input())
     } else {
         (calib_l, calib_r)
-    };
+    }
+}
 
+/// The calibrations of [`resolve_fisheye_source_calib_pair`] for the output
+/// view the settings ask for.
+pub(crate) fn fisheye_view_calib_pair(
+    s: &Settings,
+    (calib_l, calib_r): (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib),
+) -> (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib) {
     // Equidistant FISHEYE output target: set the output half-FOV so the
     // fisheye shaders map the inscribed circle to a clean normalized
     // fisheye (matches the export path). Equirect keeps the default 90°.
@@ -4714,6 +4747,10 @@ pub(crate) struct FisheyeView {
     pub left: vr180_pipeline::gpu::FisheyeCalib,
     pub right: vr180_pipeline::gpu::FisheyeCalib,
     pub lens_dims: Option<(u32, u32)>,
+    /// The two eyes' calibrations before the view was put on them (what a
+    /// raw clip's reference frame is drawn through, see
+    /// [`raw_view_reference`]).
+    pub source: (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib),
 }
 
 /// The size a lens-frame view is drawn at.
@@ -4741,9 +4778,10 @@ pub(crate) fn resolve_fisheye_view(
     osv: Option<&vr180_fisheye::DjiOsvImu>,
     size: LensViewSize,
 ) -> FisheyeView {
-    let (left, right) = resolve_fisheye_calib_pair(s, kind, src_w, src_h, osv);
+    let source = resolve_fisheye_source_calib_pair(s, kind, src_w, src_h, osv);
+    let (left, right) = fisheye_view_calib_pair(s, source);
     if !s.lens_frame_view(kind) {
-        return FisheyeView { left, right, lens_dims: None };
+        return FisheyeView { left, right, lens_dims: None, source };
     }
     let frame = {
         let sources: &[&vr180_pipeline::gpu::FisheyeCalib] = if s.single_eye { &[&left] } else { &[&left, &right] };
@@ -4756,10 +4794,57 @@ pub(crate) fn resolve_fisheye_view(
                 LensViewSize::Exact(w, h) => full.fitted(w, h),
             };
             let (left, right) = vr180_pipeline::fisheye_export::lens_frame_calib_pair(left, right, &frame, s.crop_mask);
-            FisheyeView { left, right, lens_dims: Some((frame.width, frame.height)) }
+            FisheyeView { left, right, lens_dims: Some((frame.width, frame.height)), source }
         }
-        None => FisheyeView { left, right, lens_dims: None },
+        None => FisheyeView { left, right, lens_dims: None, source },
     }
+}
+
+/// Projection cache slots of a raw frame's reference eyes: the live
+/// preview's, a still's.
+const RAW_REFERENCE_SLOT_LIVE: u32 = 42;
+const RAW_REFERENCE_SLOT_STILL: u32 = 44;
+
+/// The frame a raw clip's view is developed from when that view is not the
+/// half-equirect (`vr180_pipeline::raw_gpu::RawReference`): the same moment
+/// as a half-equirect, turned as the view is, so a reframed view or a lens
+/// frame comes out in the colours of the half-equirect. `None` for the
+/// half-equirect itself (its own eyes are that frame) and for every source
+/// that is not raw.
+///
+/// `eyes`: the camera-linear source eyes; `view_calib`: one eye's
+/// calibration with the view, drawing a frame of `out`; `source_calib`:
+/// both eyes' before the view ([`FisheyeView::source`]); `rot`, `rs`: the
+/// frame's rotations and per-row matrices, as its projection takes them.
+#[allow(clippy::too_many_arguments)]
+fn raw_view_reference(
+    pipeline: &Device,
+    s: &Settings,
+    eyes: Option<(&wgpu::Texture, &wgpu::Texture)>,
+    one_eye: bool,
+    view_calib: &vr180_pipeline::gpu::FisheyeCalib,
+    out: (u32, u32),
+    source_calib: (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib),
+    rot: (EquirectRotation, EquirectRotation),
+    rs: (Option<&[f32]>, Option<&[f32]>),
+    slot: u32,
+) -> vr180_pipeline::Result<Option<vr180_pipeline::raw_gpu::RawReference>> {
+    use vr180_pipeline::raw_gpu::RawReferenceEye;
+    let Some((left, right)) = eyes else { return Ok(None) };
+    if !s.raw_source
+        || s.fisheye_output_mode == FisheyeOutputMode::HalfEquirect
+        || left.format() != wgpu::TextureFormat::Rgba16Unorm
+    {
+        return Ok(None);
+    }
+    // Per-row correction needs both eyes' rows, as in the projection itself.
+    let (rs_l, rs_r) = match rs { (Some(l), Some(r)) => (Some(l), Some(r)), _ => (None, None) };
+    let density = view_calib.center_px_per_rad(out.0, out.1, s.fisheye_output_mode == FisheyeOutputMode::Fisheye);
+    let mut drawn = vec![RawReferenceEye { src: left, rotation: rot.0, calib: source_calib.0, rows: rs_l }];
+    if !one_eye {
+        drawn.push(RawReferenceEye { src: right, rotation: rot.1, calib: source_calib.1, rows: rs_r });
+    }
+    pipeline.raw_reference(&drawn, density, slot).map(Some)
 }
 
 /// Per-eye size of a view: the lens frame's own where the view is one
@@ -5836,7 +5921,25 @@ fn compose_with_color_and_mode(
     eye_h: u32,
     eye_match: Option<(&vr180_pipeline::gpu::EyeMatchState, vr180_pipeline::gpu::EyeMatchFrame)>,
 ) -> anyhow::Result<(wgpu::Texture, u32, u32)> {
+    compose_view_with_color_and_mode(pipeline, s, left_tex, right_tex, eye_w, eye_h, eye_match, None)
+}
+
+/// [`compose_with_color_and_mode`] for a view that may be a raw clip's:
+/// `raw_reference` is the frame its development is read from when the eyes
+/// are not the half-equirect ([`raw_view_reference`]).
+#[allow(clippy::too_many_arguments)]
+fn compose_view_with_color_and_mode(
+    pipeline: &Device,
+    s: &Settings,
+    left_tex: &wgpu::Texture,
+    right_tex: &wgpu::Texture,
+    eye_w: u32,
+    eye_h: u32,
+    eye_match: Option<(&vr180_pipeline::gpu::EyeMatchState, vr180_pipeline::gpu::EyeMatchFrame)>,
+    raw_reference: Option<vr180_pipeline::raw_gpu::RawReference>,
+) -> anyhow::Result<(wgpu::Texture, u32, u32)> {
     let mut color_plan = s.build_color_stack();
+    color_plan.raw_reference = raw_reference;
     // A raw clip's tone keys: the live preview takes the last measurement
     // that came back; a still drawn on demand measures its own frame.
     if let Some(stage) = color_plan.raw_develop.as_mut() {
@@ -6485,9 +6588,15 @@ fn render_still_from_pair(
     // to). Allocated only when it can be used.
     let eye_match_state = (matches!(kind, vr180_pipeline::SourceKind::Insta360Insv) && s.auto_eye_match)
         .then(|| pipeline.create_eye_match_state());
-    let (sbs, ow, oh) = compose_with_color_and_mode(
+    // A raw clip in a view that is not the half-equirect is developed from
+    // the half-equirect of the same frame.
+    let raw_reference = raw_view_reference(
+        pipeline, s, eye_l.zip(eye_r), one_eye, &calib_left, (ew, eh), view.source,
+        (rot_left, rot_right), (rs_l, rs_r), RAW_REFERENCE_SLOT_STILL)?;
+    let (sbs, ow, oh) = compose_view_with_color_and_mode(
         pipeline, s, &left_tex, &right_tex, ew, eh,
         eye_match_state.as_ref().and_then(|st| eye_match_arg(st, kind, stab_idx, true)),
+        raw_reference,
     )?;
     Ok(Some((sbs, ow, oh)))
 }
