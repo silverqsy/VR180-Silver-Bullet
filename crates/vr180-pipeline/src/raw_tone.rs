@@ -79,13 +79,20 @@ pub struct RawSettings {
     /// Sharpening of the developed picture (the detail panel's four
     /// controls): see [`crate::raw_sharpen`].
     pub sharpen: crate::raw_sharpen::RawSharpen,
+    /// Colour noise reduction, 0..100 (a raw converter's default is 25):
+    /// see [`crate::raw_chroma`].
+    pub color_noise: f32,
 }
+
+/// The colour noise reduction a clip starts with: a raw converter's default.
+pub const DEFAULT_COLOR_NOISE: f32 = 25.0;
 
 impl Default for RawSettings {
     fn default() -> Self {
         Self {
             temperature: None, tint: None, exposure: 0.0, contrast: 0.0, highlights: 0.0, shadows: 0.0, whites: 0.0, blacks: 0.0,
             sharpen: crate::raw_sharpen::RawSharpen::default(),
+            color_noise: DEFAULT_COLOR_NOISE,
         }
     }
 }
@@ -444,7 +451,7 @@ impl RawDevelop {
                 long_side: 0,
             }
         });
-        DevelopConstants { geometry, gain: gain as f32, curve: curve.into(), curve_hi: hi as f32, white_point: plain_white as f32, dark_key: dark_key as f32, floor, local: staged, sharpen: None }
+        DevelopConstants { geometry, gain: gain as f32, curve: curve.into(), curve_hi: hi as f32, white_point: plain_white as f32, dark_key: dark_key as f32, floor, local: staged, sharpen: None, chroma: None }
     }
 
     /// The frame's tone curve with Contrast in: output light over the value
@@ -680,6 +687,9 @@ pub struct DevelopConstants {
     /// [`RawDevelop::constants_for`], which does not know the size the
     /// frame is drawn at: see [`crate::gpu::Device::raw_develop_constants`].
     pub sharpen: Option<crate::raw_sharpen::SharpenConstants>,
+    /// The colour noise reduction ahead of the development, when it is on.
+    /// Set beside `sharpen`, for the same reason.
+    pub chroma: Option<crate::raw_chroma::ChromaConstants>,
 }
 
 /// log₂ of the first sample of the staged development's tables over a
@@ -1150,6 +1160,10 @@ mod tests {
     fn settings_read_from_older_files() {
         let s: RawSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(s, RawSettings::default());
+        // A file from before the colour noise reduction gets a raw converter's default.
+        assert_eq!(s.color_noise, 25.0);
+        let s: RawSettings = serde_json::from_str(r#"{"color_noise":0.0}"#).unwrap();
+        assert_eq!(s.color_noise, 0.0);
         let s: RawSettings = serde_json::from_str(r#"{"exposure":1.5,"temperature":5200.0}"#).unwrap();
         assert_eq!((s.exposure, s.temperature, s.tint), (1.5, Some(5200.0), None));
     }

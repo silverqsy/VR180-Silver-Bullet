@@ -39,9 +39,17 @@ converter's controls for it, and every frame can be had as a DNG.
   2×2 sites and showed colour fringes for it, now shows the full method's
   picture reduced. Developed, a frame differs from Camera Raw's by a
   quarter of an 8-bit step on average where it was one to three before.
-  Camera Raw opened with its defaults also runs its colour noise reduction
-  (25), which this app does not have yet: fine lines there are free of the
-  last bit of colour that its own demosaic, and this one, leave in them.
+- **Colour noise reduction.** A raw converter also smooths the picture's
+  colour by default, and that is what frees fine lines of the last colour
+  a demosaic leaves in them and takes the coloured speckle out of noise.
+  The Color panel has it now, under Noise reduction: one slider, 0 to 100,
+  starting at 25 as Camera Raw's does. Luminance is left exactly as it is;
+  a real colour edge is not smeared. It was fitted to Camera Raw's own
+  result at 10, 25, 50 and 100: it takes out 0.9 to 0.95 of what Camera
+  Raw takes out up to 50 and the two changes correlate at 0.88 to 0.95;
+  at 100 Camera Raw reaches further (it flattens faint colour over tens
+  of pixels). Costs about 10 ms a frame at 8192×4096. The setting travels
+  in the DNG. A clip graded before this gets the default 25.
 - **Sharpening.** The detail panel's four controls, Amount, Radius, Detail
   and Masking, on the developed picture, done the way Camera Raw does it:
   on the luminance alone, fading out toward black and toward white, held

@@ -14,6 +14,7 @@ pub mod braw_imu;
 pub mod circles;
 pub mod decode;
 pub mod dji_imu;
+pub mod raw_chroma;
 pub mod raw_color;
 pub mod raw_develop;
 pub mod raw_export;

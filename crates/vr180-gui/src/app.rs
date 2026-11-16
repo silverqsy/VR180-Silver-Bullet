@@ -2128,10 +2128,13 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Blacks" => "黑色色阶",
         "As shot" => "原始设置",
         "Sharpening" => "锐化",
+        "Noise reduction" => "降噪",
+        "Color noise" => "颜色",
+        "Colour noise reduction, as a raw converter's: the picture's colour is smoothed and its luminance left alone, which takes the coloured speckle out of noise and the colour out of fine lines. 25 is a raw converter's default; 0 turns it off." => "颜色降噪，与 RAW 转换软件的做法一致：只平滑画面的颜色，亮度不动，用来去掉噪点里的彩色斑点和细线上的杂色。25 是 RAW 转换软件的默认值，0 为关闭。",
+        "How much of the finest detail is sharpened. Low values hold halos back, as a raw converter's do: a hard edge is sharpened less, a soft one keeps its steepening." => "最细的细节锐化多少。数值低时会像 RAW 转换软件那样抑制光晕：硬边锐化得少，柔和的边缘仍然变陡。",
         "Amount" => "数量",
         "Masking" => "蒙版",
         "Sharpening of the developed picture, as a raw converter's detail panel does it: the same numbers give the same edges there. The radius is in pixels of the exported frame, so judge it in the zoom view or on a snapshot; the preview shows the export's picture reduced." => "对显影后的画面做锐化，与 RAW 转换软件“细节”面板的做法一致：同样的数值在那里得到同样的边缘。半径以导出画面的像素计，请在放大视图或快照上判断；预览显示的是导出画面缩小后的样子。",
-        "How much of the finest detail is sharpened. From 25 up the edges match a raw converter's; below that it also smooths fine texture and holds hard edges back, which this does not." => "最细的细节被锐化多少。25 及以上时边缘与 RAW 转换软件一致；低于 25 时它还会平滑细纹理并压低硬边，这里没有做。",
         "Keeps the sharpening to edges: the higher, the stronger an edge has to be." => "把锐化限制在边缘上：数值越高，边缘要越强才会被锐化。",
         "Reset raw development" => "重置 RAW 显影",
         "The white the frame is developed for, as a colour temperature in kelvin and a tint, the way a raw converter states it." => "显影所用的白点，以色温（开尔文）和色调表示，与 RAW 转换软件的写法一致。",
@@ -9176,10 +9179,15 @@ fn draw_raw_develop_section(
     ui.add_enabled_ui(sharpen.amount >= 0.5, |ui| {
         ui.add(egui::Slider::new(&mut sharpen.radius, 0.5..=3.0).step_by(0.1).text(tr("Radius")).fixed_decimals(1));
         ui.add(egui::Slider::new(&mut sharpen.detail, 0.0..=100.0).step_by(1.0).text(tr("Detail")).fixed_decimals(0))
-            .on_hover_text(tr("How much of the finest detail is sharpened. From 25 up the edges match a raw converter's; below that it also smooths fine texture and holds hard edges back, which this does not."));
+            .on_hover_text(tr("How much of the finest detail is sharpened. Low values hold halos back, as a raw converter's do: a hard edge is sharpened less, a soft one keeps its steepening."));
         ui.add(egui::Slider::new(&mut sharpen.masking, 0.0..=100.0).step_by(1.0).text(tr("Masking")).fixed_decimals(0))
             .on_hover_text(tr("Keeps the sharpening to edges: the higher, the stronger an edge has to be."));
     });
+    // The detail panel's noise reduction: colour only.
+    ui.add_space(4.0);
+    ui.label(tr("Noise reduction"));
+    ui.add(egui::Slider::new(&mut raw.color_noise, 0.0..=100.0).step_by(1.0).text(tr("Color noise")).fixed_decimals(0))
+        .on_hover_text(tr("Colour noise reduction, as a raw converter's: the picture's colour is smoothed and its luminance left alone, which takes the coloured speckle out of noise and the colour out of fine lines. 25 is a raw converter's default; 0 turns it off."));
     if ui.button(tr("Reset raw development")).clicked() {
         *raw = Default::default();
     }

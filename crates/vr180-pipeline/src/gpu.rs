@@ -9212,8 +9212,15 @@ impl Device {
         // R. Raw development — a raw source's camera-linear eyes become
         //    display-referred here, ahead of everything else.
         if let Some(constants) = raw {
+            // Colour noise reduction first, on the camera's own values.
+            let cleaned = constants.chroma.as_ref().map(|chroma| {
+                let next = make_16("stack16_raw_chroma", w, h);
+                self.record_raw_chroma(encoder, src, &next, chroma);
+                intermediates.push(next.clone());
+                next
+            });
             let next = make_16("stack16_raw_out", w, h);
-            self.record_raw_develop(encoder, src, &next, constants);
+            self.record_raw_develop(encoder, cleaned.as_ref().unwrap_or(src), &next, constants);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
             // The developed picture's sharpening, when it is on.

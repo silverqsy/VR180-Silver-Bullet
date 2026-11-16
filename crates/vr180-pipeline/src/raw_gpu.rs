@@ -18,6 +18,9 @@ const RAW_DEVELOP_LOCAL_WGSL: &str = include_str!("shaders/raw_develop_local.wgs
 const RAW_SHARPEN_LEVEL_WGSL: &str = include_str!("shaders/raw_sharpen_level.wgsl");
 const RAW_SHARPEN_BLUR_WGSL: &str = include_str!("shaders/raw_sharpen_blur.wgsl");
 const RAW_SHARPEN_APPLY_WGSL: &str = include_str!("shaders/raw_sharpen_apply.wgsl");
+const RAW_CHROMA_REDUCE_WGSL: &str = include_str!("shaders/raw_chroma_reduce.wgsl");
+const RAW_CHROMA_SMOOTH_WGSL: &str = include_str!("shaders/raw_chroma_smooth.wgsl");
+const RAW_CHROMA_APPLY_WGSL: &str = include_str!("shaders/raw_chroma_apply.wgsl");
 
 use crate::raw_color::prophoto_luma;
 use crate::raw_sharpen::SharpenConstants;
@@ -82,6 +85,12 @@ pub(crate) struct RawPipelines {
     sharpen_blur_layout: wgpu::BindGroupLayout,
     sharpen_apply: wgpu::ComputePipeline,
     sharpen_apply_layout: wgpu::BindGroupLayout,
+    chroma_reduce: wgpu::ComputePipeline,
+    chroma_reduce_layout: wgpu::BindGroupLayout,
+    chroma_smooth: wgpu::ComputePipeline,
+    chroma_smooth_layout: wgpu::BindGroupLayout,
+    chroma_apply: wgpu::ComputePipeline,
+    chroma_apply_layout: wgpu::BindGroupLayout,
     /// What the live preview's measurements have found so far.
     memory: Arc<Mutex<ToneMemory>>,
 }
@@ -170,6 +179,19 @@ struct SharpenLevelParams {
 struct SharpenBlurParams {
     dir: [i32; 4],
     coeff: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ChromaParams {
+    /// 1 / the camera's neutral.
+    balance: [f32; 4],
+    /// The luminance's weights and the darkest luminance a colour is taken of.
+    luma: [f32; 4],
+    /// The pass's direction, its taps to each side, 1 = back at the pixel's own luminance.
+    dir: [i32; 4],
+    /// 1 / (2 tau²).
+    range: [f32; 4],
 }
 
 #[repr(C)]
@@ -469,6 +491,22 @@ impl RawPipelines {
             ],
         });
         let sharpen_apply = compute_pipeline(device, "raw_sharpen_apply", RAW_SHARPEN_APPLY_WGSL, "main", &sharpen_apply_layout);
+        let chroma_params = bgl_uniform(2, std::mem::size_of::<ChromaParams>());
+        let chroma_reduce_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raw_chroma_reduce_bgl"),
+            entries: &[bgl_texture(0, D2, false), bgl_storage(1, wgpu::TextureFormat::Rgba16Float, D2), chroma_params],
+        });
+        let chroma_reduce = compute_pipeline(device, "raw_chroma_reduce", RAW_CHROMA_REDUCE_WGSL, "main", &chroma_reduce_layout);
+        let chroma_smooth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raw_chroma_smooth_bgl"),
+            entries: &[bgl_texture(0, D2, false), bgl_storage(1, wgpu::TextureFormat::Rgba16Float, D2), chroma_params, bgl_storage_buffer(3)],
+        });
+        let chroma_smooth = compute_pipeline(device, "raw_chroma_smooth", RAW_CHROMA_SMOOTH_WGSL, "main", &chroma_smooth_layout);
+        let chroma_apply_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raw_chroma_apply_bgl"),
+            entries: &[bgl_texture(0, D2, false), bgl_storage(1, wgpu::TextureFormat::Rgba16Unorm, D2), chroma_params, bgl_texture(3, D2, false)],
+        });
+        let chroma_apply = compute_pipeline(device, "raw_chroma_apply", RAW_CHROMA_APPLY_WGSL, "main", &chroma_apply_layout);
         let grid_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("raw_grid_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -484,6 +522,7 @@ impl RawPipelines {
             reduce, reduce_layout, grid_build, grid_build_layout, grid_blur, grid_blur_layout,
             develop_local, develop_local_layout, grid_sampler,
             sharpen_level, sharpen_edge, sharpen_level_layout, sharpen_blur, sharpen_blur_layout, sharpen_apply, sharpen_apply_layout,
+            chroma_reduce, chroma_reduce_layout, chroma_smooth, chroma_smooth_layout, chroma_apply, chroma_apply_layout,
             memory: Arc::default(),
         }
     }
@@ -949,6 +988,8 @@ impl Device {
             };
         }
         k.sharpen = stage.settings.sharpen.constants(pixel_scale);
+        let neutral = stage.camera.as_shot_neutral.map(|v| v as f32);
+        k.chroma = crate::raw_chroma::constants(stage.settings.color_noise, pixel_scale, neutral);
         k
     }
 
@@ -1131,6 +1172,74 @@ impl Device {
         pass.set_pipeline(&pipes.develop);
         pass.set_bind_group(0, Some(&bind), &[]);
         pass.dispatch_workgroups(dst.width().div_ceil(8), dst.height().div_ceil(8), 1);
+    }
+
+    /// Record the colour noise reduction of a camera-linear picture
+    /// (`src` → `dst`, both `Rgba16Unorm` of one size): [`crate::raw_chroma`]'s
+    /// three steps — the picture at half size, its colour smoothed there
+    /// along the rows and the columns, and that colour put back at every
+    /// pixel's own luminance.
+    pub(crate) fn record_raw_chroma(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, dst: &wgpu::Texture, k: &crate::raw_chroma::ChromaConstants) {
+        use crate::raw_chroma::{FLOOR, LUMA};
+        let pipes = self.raw_pipelines();
+        let (w, h) = (src.width(), src.height());
+        let (hw, hh) = (w.div_ceil(2), h.div_ceil(2));
+        let half = |label: &str| self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: hw, height: hh, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let (a, b) = (half("raw_chroma_a"), half("raw_chroma_b"));
+        let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let (src_v, dst_v, a_v, b_v) = (view(src), view(dst), view(&a), view(&b));
+        fn tex<'a>(binding: u32, v: &'a wgpu::TextureView) -> wgpu::BindGroupEntry<'a> {
+            wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) }
+        }
+        let taps = k.taps();
+        let side = taps.len() as i32 - 1;
+        let taps = self.curve_buffer("raw_chroma_taps", &taps);
+        let params = |dir: [i32; 4]| self.write_uniform("raw_chroma_params", &ChromaParams {
+            balance: [1.0 / k.neutral[0], 1.0 / k.neutral[1], 1.0 / k.neutral[2], 0.0],
+            luma: [LUMA[0], LUMA[1], LUMA[2], FLOOR],
+            dir,
+            range: [1.0 / (2.0 * k.tau * k.tau), 0.0, 0.0, 0.0],
+        });
+        let run = |encoder: &mut wgpu::CommandEncoder, label: &str, pipeline: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, size: (u32, u32)| {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, Some(bind), &[]);
+            pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
+        };
+        let plain = params([0, 0, side, 0]);
+        let reduce = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raw_chroma_reduce_bg"),
+            layout: &pipes.chroma_reduce_layout,
+            entries: &[tex(0, &src_v), tex(1, &a_v), wgpu::BindGroupEntry { binding: 2, resource: plain.as_entire_binding() }],
+        });
+        run(encoder, "raw_chroma_reduce", &pipes.chroma_reduce, &reduce, (hw, hh));
+        // Rows (back at each pixel's own luminance), then columns.
+        for (from, to, dir) in [(&a_v, &b_v, [1, 0, side, 1]), (&b_v, &a_v, [0, 1, side, 0])] {
+            let uniform = params(dir);
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("raw_chroma_smooth_bg"),
+                layout: &pipes.chroma_smooth_layout,
+                entries: &[
+                    tex(0, from), tex(1, to),
+                    wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: taps.as_entire_binding() },
+                ],
+            });
+            run(encoder, "raw_chroma_smooth", &pipes.chroma_smooth, &bind, (hw, hh));
+        }
+        let apply = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raw_chroma_apply_bg"),
+            layout: &pipes.chroma_apply_layout,
+            entries: &[tex(0, &src_v), tex(1, &dst_v), wgpu::BindGroupEntry { binding: 2, resource: plain.as_entire_binding() }, tex(3, &a_v)],
+        });
+        run(encoder, "raw_chroma_apply", &pipes.chroma_apply, &apply, (w, h));
     }
 
     /// Record the sharpening of a developed eye: `src` (the development's
@@ -1608,6 +1717,65 @@ mod tests {
 
     /// The GPU kernels against the CPU demosaic of the stills path
     /// (`raw_develop`), on a random mosaic.
+    /// The GPU's colour noise reduction against the CPU's, at several
+    /// amounts and scales and on an odd-sized picture.
+    #[test]
+    fn gpu_colour_noise_reduction_matches_the_cpu_one() {
+        use crate::raw_chroma::{constants, denoise_picture};
+        let dev = Device::new().expect("device");
+        let neutral = [0.565_429_7f32, 1.0, 0.401_367_2];
+        for (w, h) in [(96u32, 80u32), (77, 51)] {
+            let mut s = 21u32;
+            let mut next = move || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; (s % 10_000) as f32 / 10_000.0 };
+            // Grey ground of several levels with noise in each channel, a
+            // coloured patch, and a column near black.
+            let picture: Vec<[f32; 3]> = (0..w * h).map(|i| {
+                let (x, y) = (i % w, i / w);
+                let v = [0.002f32, 0.03, 0.1, 0.25, 0.5, 0.8][(x as usize * 6 / w as usize).min(5)];
+                let patch = if (20..40).contains(&y) && (30..60).contains(&x) { [1.8f32, 0.7, 0.4] } else { [1.0; 3] };
+                [0, 1, 2].map(|c| (v * neutral[c] * patch[c] * (0.8 + 0.4 * next())).clamp(0.0, 1.0))
+            }).collect();
+            let px: Vec<u16> = picture.iter().flat_map(|p| [(p[0] * 65535.0).round() as u16, (p[1] * 65535.0).round() as u16, (p[2] * 65535.0).round() as u16, u16::MAX]).collect();
+            let exact: Vec<[f32; 3]> = px.chunks_exact(4).map(|c| [c[0], c[1], c[2]].map(|v| v as f32 / 65535.0)).collect();
+            let src = dev.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("test_camera_linear"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            dev.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &src, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bytemuck::cast_slice(&px),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+            for (amount, scale) in [(25.0f32, 1.0f32), (10.0, 1.0), (100.0, 1.0), (25.0, 0.25), (60.0, 2.0)] {
+                let k = constants(amount, scale, neutral).expect("on");
+                let dst = dev.new_linear_eye_texture(w, h);
+                let mut encoder = dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test_chroma") });
+                dev.record_raw_chroma(&mut encoder, &src, &dst, &k);
+                dev.queue.submit(Some(encoder.finish()));
+                let bytes = dev.read_texture_rgb48(&dst, w, h).expect("readback");
+                let got: Vec<f32> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]) as f32 / 65535.0).collect();
+                let want = denoise_picture(&exact, w as usize, h as usize, &k);
+                let (mut worst, mut moved) = (0f32, 0usize);
+                for (i, (g, wv)) in got.chunks_exact(3).zip(&want).enumerate() {
+                    for c in 0..3 {
+                        // The smoothed colour is held as half floats on the GPU: a
+                        // part in two thousand of the value.
+                        let d = (g[c] - wv[c]).abs();
+                        assert!(d < 1.5e-3 * (wv[c] + 0.02), "{w}x{h} amount {amount} scale {scale} pixel {i} channel {c}: gpu {} cpu {}", g[c], wv[c]);
+                        worst = worst.max(d);
+                    }
+                    if (wv[0] - exact[i][0]).abs() > 1e-3 { moved += 1; }
+                }
+                assert!(moved > (w * h / 10) as usize, "{w}x{h} amount {amount} scale {scale}: only {moved} pixels changed");
+                eprintln!("{w}x{h} amount {amount} scale {scale}: worst difference {worst}");
+            }
+        }
+    }
+
     /// What a frame's demosaic costs at the X6's size (prints; run with
     /// `--include-ignored --nocapture`).
     #[test]

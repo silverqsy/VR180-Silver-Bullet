@@ -2681,14 +2681,44 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      at full size, 2.5 ms at half (the half-size eye is the mean of each
      2×2 of the full result), M5 Max. Camera Raw's flat-ground response
      to single samples (`dem3.py`) says the same: green = four neighbours'
-     mean + a second-difference term of 0.115–0.12 in balanced units. NOT
-     done: what Camera Raw's default colour noise reduction (25) does on
-     top (it leaves luminance alone and takes the colour's fine part down
-     to 20–35 % at 0.25 cycles a pixel, 50–70 % at 0.09): that is why a
-     DNG opened there with its defaults shows no colour in fine lines
-     where its own demosaic, and ours, still has a little. Stills
-     (`raw_develop::mhc`) still use the old kernels. WINDOWS: `Rg32Float`
-     and `R32Float` as storage textures, read back with `textureLoad`.
+     mean + a second-difference term of 0.115–0.12 in balanced units.
+     Stills (`raw_develop::mhc`) still use the old kernels. WINDOWS:
+     `Rg32Float` and `R32Float` as storage textures, read back with
+     `textureLoad`.
+   - **Colour noise reduction** (2026-11-16; `RawSettings::color_noise`,
+     0–100, default 25 = Camera Raw's; `raw_chroma.rs` = the specification
+     and the CPU twin; `Device::record_raw_chroma`, first in
+     `record_color_stack_16`, AHEAD of the development, on the camera's
+     values: `raw_chroma_reduce` / `_smooth` (rows, columns) / `_apply`,
+     two half-size `Rgba16Float` planes). Camera Raw opened with its
+     defaults runs it, which is why a DNG there shows no colour in fine
+     lines where its own demosaic — and ours — still has a little.
+     Measured (`cnr1.py` … `cnr3.py`, `cnr_app.py`): it leaves luminance
+     alone (L* amplitude 1.00–1.02 at every frequency) and takes the
+     colour's fine part down (a* / b* to 0.2 / 0.33 at 0.25 cycles a
+     pixel, 0.51 / 0.71 at 0.09, on a frame at 25); it is a threshold, not
+     a blur (a 4 % grating in one channel goes grey at every period up to
+     100 px, a 32 % one keeps 80–90 %; the share left by level × period ×
+     amplitude × amount is in `data/cnr2.npz`); the luminance it keeps is
+     0.195 / 0.667 / 0.138 of the white-balanced camera R / G / B (not the
+     camera's CIE Y). The stage: balanced values at half size → a
+     separable bilateral there (spatial sigma / 2, colour distance `tau`,
+     the rows' result put back at the pixel's own luminance) → bilinear
+     back, each pixel taking the smoothed colour at its OWN luminance.
+     Amount → (sigma px of the export, tau): 10 → (4, 0.1), 25 → (6, 0.2),
+     50 → (12, 0.3), 100 → (16, 0.5), fitted to Camera Raw's result taken
+     back to camera values (`cnr3.py targets`) on take 011809 and checked
+     on 021546. Against it in balanced camera values ×1000 at 25: 0.90 /
+     0.33 / 0.76 with the stage, 1.77 / 0.49 / 1.51 without, floor (the
+     demosaics alone) 0.75 / 0.24 / 0.45. End to end on the app's projected
+     frame (`cnr_app.py`, the change each makes): strength 0.91–0.95 of
+     Camera Raw's at 10–25, 0.89 at 50, 0.80–0.86 at 100; correlation
+     0.88–0.95; error 32–51 % of the change (both leave a different faint
+     residue). Cost +10 ms a frame at 8192×4096 (+15 at amount 100). The
+     harness leaves it off unless `X6_RAW_CNR=<amount>` (the reference
+     renders of the other scripts have none). NOT done: Camera Raw's reach
+     at high amounts (multi-scale), its Detail / Smoothness sub-sliders
+     (written as 50 / 50 in the XMP), luminance noise reduction.
    - **Development** is the first stage of `record_color_stack_16`
      (`ColorStackPlan::raw_develop`). `raw_tone.rs`'s header is the
      specification; `RawDevelop::constants_for(stats, curves)` is the one
