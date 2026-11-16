@@ -4480,6 +4480,71 @@ fn bgra_to_rgba_row(src: &[u8], bpp: usize, dst: &mut Vec<u8>) {
 // mirroring the Python pipeline. Output order and frame count are
 // preserved 1:1 (delayed by the filter's look-ahead, drained at EOF), so
 // stabilization-by-index and audio sync downstream stay aligned.
+/// Hands a source's 16-bit camera-linear eyes on as GPU pairs.
+///
+/// A raw take's frames normally arrive on the GPU, and what follows goes by
+/// that: a view other than the half-equirect is developed from a reference
+/// frame drawn from the pair's textures. When the frames have to pass
+/// through memory first (the noise filter), they come out of it as buffers;
+/// this puts them back on the GPU, so the same frame is developed the same
+/// way whichever route it took.
+pub struct CameraEyeUploader {
+    inner: Box<dyn FisheyePairIter>,
+    device: std::sync::Arc<crate::gpu::Device>,
+}
+
+impl CameraEyeUploader {
+    pub fn new(inner: Box<dyn FisheyePairIter>, device: std::sync::Arc<crate::gpu::Device>) -> Self {
+        Self { inner, device }
+    }
+
+    /// `pair` with its eyes on the GPU (a pair that is there already, or is
+    /// not 16-bit, is handed back as it came).
+    fn upload(&self, pair: FisheyePair) -> FisheyePair {
+        let need = pair.eye_w as usize * pair.eye_h as usize * 8;
+        if pair.gpu.is_some() || pair.bit_depth < 16 || pair.left.len() < need || pair.right.len() < need {
+            return pair;
+        }
+        let eye = |bytes: &[u8]| -> wgpu::Texture {
+            let tex = self.device.new_camera_eye_texture(pair.eye_w, pair.eye_h);
+            // The buffer is RGBA64, little-endian: sixteen-bit samples as
+            // they are where it is aligned for them, copied where it is not.
+            match bytemuck::try_cast_slice::<u8, u16>(&bytes[..need]) {
+                Ok(samples) if cfg!(target_endian = "little") => self.device.write_camera_eye_texture(&tex, samples),
+                _ => {
+                    let samples: Vec<u16> = bytes[..need].chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+                    self.device.write_camera_eye_texture(&tex, &samples);
+                }
+            }
+            tex
+        };
+        let gpu = GpuPair { left: eye(&pair.left), right: eye(&pair.right), keep: Box::new(()) };
+        FisheyePair {
+            left: Vec::new(), right: Vec::new(),
+            eye_w: pair.eye_w, eye_h: pair.eye_h, bit_depth: pair.bit_depth, pts_s: pair.pts_s,
+            gpu: Some(std::sync::Arc::new(gpu)),
+        }
+    }
+}
+
+impl FisheyePairIter for CameraEyeUploader {
+    fn next_pair(&mut self) -> Result<Option<FisheyePair>> {
+        Ok(self.inner.next_pair()?.map(|pair| self.upload(pair)))
+    }
+    fn seek(&mut self, target_s: f64) -> Result<()> {
+        self.inner.seek(target_s)
+    }
+    fn eye_dims(&self) -> (u32, u32) {
+        self.inner.eye_dims()
+    }
+    fn source_decimation(&self) -> u32 {
+        self.inner.source_decimation()
+    }
+    fn apply_braw_color(&mut self, params: &vr180_braw::BrawColorParams) -> Result<()> {
+        self.inner.apply_braw_color(params)
+    }
+}
+
 /// The coding camera-linear eyes go through the noise filter in.
 ///
 /// The filter works on 10-bit video (YCbCr 4:2:0). A raw take's eyes are
@@ -4752,6 +4817,38 @@ mod tests {
         code.apply(&mut eye, w, false);
         let worst = eye.chunks_exact(8).zip(before.chunks_exact(8)).flat_map(|(a, b)| (0..3).map(move |k| read(a)[k].abs_diff(read(b)[k]))).max().unwrap();
         assert!(worst <= 40, "round trip of an eye: worst {worst}");
+    }
+
+    /// Camera-linear eyes that had to pass through memory go back on the GPU
+    /// as they are: the pair that comes out has its eyes there and nothing in
+    /// memory, and what is read back from them is what went in. A pair that
+    /// is on the GPU already, or is not 16-bit, is left as it came.
+    #[test]
+    fn eyes_that_passed_through_memory_go_back_on_the_gpu() {
+        struct Once(Option<FisheyePair>);
+        impl FisheyePairIter for Once {
+            fn next_pair(&mut self) -> Result<Option<FisheyePair>> { Ok(self.0.take()) }
+            fn seek(&mut self, _t: f64) -> Result<()> { Ok(()) }
+            fn eye_dims(&self) -> (u32, u32) { (16, 8) }
+        }
+        let dev = std::sync::Arc::new(crate::gpu::Device::new().expect("device"));
+        let eye = |seed: u16| -> Vec<u8> {
+            (0..16u16 * 8).flat_map(|i| [i * 300 + seed, i * 111 + 7, 65535 - i * 200, 65535]).flat_map(|v| v.to_le_bytes()).collect()
+        };
+        let pair = FisheyePair { left: eye(1), right: eye(2), eye_w: 16, eye_h: 8, bit_depth: 16, pts_s: 1.25, gpu: None };
+        let mut up = CameraEyeUploader::new(Box::new(Once(Some(pair.clone()))), dev.clone());
+        assert_eq!(up.eye_dims(), (16, 8));
+        let out = up.next_pair().unwrap().expect("a pair");
+        assert!(out.left.is_empty() && out.right.is_empty());
+        assert_eq!((out.eye_w, out.eye_h, out.bit_depth, out.pts_s), (16, 8, 16, 1.25));
+        let gpu = out.gpu.as_deref().expect("eyes on the GPU");
+        assert_eq!(dev.read_texture_rgba64(&gpu.left, 16, 8).unwrap(), pair.left);
+        assert_eq!(dev.read_texture_rgba64(&gpu.right, 16, 8).unwrap(), pair.right);
+        assert!(up.next_pair().unwrap().is_none());
+        // An 8-bit pair is nothing of the sort: handed on untouched.
+        let small = FisheyePair { left: vec![9u8; 16 * 8 * 4], right: vec![8u8; 16 * 8 * 4], eye_w: 16, eye_h: 8, bit_depth: 8, pts_s: 0.0, gpu: None };
+        let out = CameraEyeUploader::new(Box::new(Once(Some(small.clone()))), dev).next_pair().unwrap().unwrap();
+        assert!(out.gpu.is_none() && out.left == small.left && out.right == small.right);
     }
 
     /// The noise filter refuses a frame that is not in memory instead of

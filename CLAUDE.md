@@ -3059,6 +3059,17 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      (7680² an eye) and in a stabilized lens frame (the export that
      crashed). Windows has no such filter (the wrapper is macOS-gated;
      the new `denoising` flag is `false` there).
+     THE FILTERED FRAMES GO BACK ON THE GPU (`fisheye_decode::
+     CameraEyeUploader`, same day): `plan_with_raw_reference` draws the
+     reference frame a non-half-equirect view is developed from only for
+     a pair that HAS GPU eyes; the filter's pairs are buffers, so a Lens
+     Space (or reframed) export with the filter on was developed without
+     its reference and came out unlike the preview (the user: "颜色差很
+     多"; with Shadows +100 / Highlights −100 / Exposure +1.95 the mean
+     level of a frame was 73 against 95, mean difference 23 / 255). With
+     the eyes uploaded again after the filter the same frame differs by
+     0.9 / 255, the filter's own effect. Rule: whatever hands a raw
+     take's frames to the export must hand them as GPU pairs.
    - **Not done**: the shutter time is not in a take, so the pose is
      sampled half a shutter (plus the gyro's lag) early (Motion and
      timing); takes of the earlier camera build have neither readout nor

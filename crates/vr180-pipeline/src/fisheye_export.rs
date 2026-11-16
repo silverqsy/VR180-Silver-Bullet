@@ -1834,12 +1834,18 @@ fn export_fisheye_inner(
                         cfg.denoise_strength
                     );
                     // A raw take's eyes are camera-linear: they pass the
-                    // filter white-balanced and on a logarithmic curve.
-                    decoder = Box::new(if cfg.source_kind.is_raw_video() {
-                        d.with_linear_source(crate::x6_raw::BAYER.neutral)
+                    // filter white-balanced and on a logarithmic curve, and
+                    // go back on the GPU after it, where a raw take's frames
+                    // are developed from (a view other than the half-equirect
+                    // takes its reference frame from the pair's textures: a
+                    // pair left in memory was developed without one, and its
+                    // tone and colour came out unlike the preview's).
+                    decoder = if cfg.source_kind.is_raw_video() {
+                        Box::new(crate::fisheye_decode::CameraEyeUploader::new(
+                            Box::new(d.with_linear_source(crate::x6_raw::BAYER.neutral)), pipeline.clone()))
                     } else {
-                        d
-                    });
+                        Box::new(d)
+                    };
                 }
                 Err(e) => {
                     return Err(Error::Ffmpeg(format!("denoise init failed: {e}")));
