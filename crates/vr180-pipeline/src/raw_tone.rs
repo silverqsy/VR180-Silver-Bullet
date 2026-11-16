@@ -32,8 +32,20 @@
 //! reduced copy of the frame as it is graded (`raw_measure.wgsl`).
 //!
 //! Then: ProPhoto → Rec.709 primaries, clipped to 0..1, sRGB encoding.
+//!
+//! **Shadows and Highlights** are a gain on the signal the default black
+//! has already been taken off, the same for the three channels, and it is
+//! local: `gain = curve(base)`, where `base` is the pixel's level smoothed
+//! across what surrounds it without crossing strong edges (a bilateral
+//! grid of log₂ luminance: cells [`BASE_CELL`] of the frame's long side by
+//! [`BASE_RANGE`] stops), so texture keeps its contrast and an object is
+//! lifted as a whole. The curve belongs to the frame: Camera Raw derives it
+//! from a reduced copy of the picture ([`FrameStats::levels`]), and
+//! [`local_curves`] reproduces what it derives. The gain is linear in the
+//! slider (measured: half the slider is half the gain, in stops).
 
 use crate::raw_color::{apply, prophoto_luma, prophoto_to_rec709, xy_from_temperature, RawCamera, Xy, M3};
+pub use crate::raw_local::local_curves;
 
 /// The raw development settings of a clip: the white balance and the tone
 /// controls of a raw converter's basic panel. `Default` develops the frame
@@ -94,6 +106,71 @@ impl ToneKeys {
     }
 }
 
+/// What a frame's rendering is derived from: its tone keys and the levels
+/// of its reduced copy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameStats {
+    pub keys: ToneKeys,
+    /// log₂ luminance of the reduced copy's cells (each [`STAT_CELL`] of the
+    /// frame's long side, averaged in log), at exposure 0, sorted rising.
+    /// Empty when nothing was measured.
+    pub levels: std::sync::Arc<[f32]>,
+}
+
+impl FrameStats {
+    /// A frame nothing is known about.
+    pub fn unknown() -> Self {
+        Self { keys: ToneKeys::UNKNOWN, levels: Vec::new().into() }
+    }
+}
+
+/// A cell of the reduced copy the tone curves are derived from, as a
+/// fraction of the frame's long side.
+pub const STAT_CELL: f32 = 1.0 / 42.0;
+/// A cell of the base's grid, as a fraction of the frame's long side.
+pub const BASE_CELL: f32 = 0.006;
+/// A cell of the base's grid along level, in stops.
+pub const BASE_RANGE: f32 = 1.2;
+/// The grid's first level (log₂ of the scene value) and its cells along level.
+pub const BASE_LO: f32 = -15.0;
+pub const BASE_LEVELS: u32 = 18;
+/// The darkest luminance the base distinguishes.
+pub const BASE_FLOOR: f32 = 6.103_515_6e-5;
+/// Weight of the plain local average where the grid holds nothing at the
+/// pixel's own level (a speck unlike everything around it takes the gain
+/// of its surroundings).
+pub const BASE_FALLBACK: f32 = 0.5;
+
+/// log₂ of the base level of the first sample of a local curve, samples
+/// per stop, and the sample count (levels −16 … +4).
+pub const LOCAL_LO: f32 = -16.0;
+pub const LOCAL_PER_STOP: f32 = 16.0;
+pub const LOCAL_SAMPLES: usize = 321;
+
+/// The frame's Shadows / Highlights curves: log₂ gain at full slider over
+/// the base level, [`LOCAL_SAMPLES`] samples from [`LOCAL_LO`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalCurves {
+    /// Shadows +100 (−100 is its negative).
+    pub shadows: Vec<f32>,
+    /// Highlights −100.
+    pub highlights: Vec<f32>,
+    /// Highlights +100.
+    pub highlights_up: Vec<f32>,
+}
+
+impl LocalCurves {
+    /// The gain curve of the settings: `shadows`, `highlights` in −100..100.
+    pub fn gain(&self, shadows: f32, highlights: f32) -> Vec<f32> {
+        let s = shadows / 100.0;
+        let h = highlights / 100.0;
+        (0..LOCAL_SAMPLES).map(|i| {
+            let hl = if h < 0.0 { -h * self.highlights[i] } else { h * self.highlights_up[i] };
+            s * self.shadows[i] + hl
+        }).collect()
+    }
+}
+
 /// When the frame's keys are measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Measure {
@@ -138,7 +215,45 @@ impl RawDevelop {
         }
     }
 
-    /// Everything the stage needs for one frame with the keys `keys`.
+    /// The settings move Shadows or Highlights: the frame needs its base.
+    pub fn is_local(&self) -> bool {
+        self.settings.shadows != 0.0 || self.settings.highlights != 0.0
+    }
+
+    /// Everything the stage needs for one frame: `stats` measured on it;
+    /// `curves` replaces the Shadows / Highlights curves derived from them.
+    pub fn constants_for(&self, stats: &FrameStats, curves: Option<&LocalCurves>) -> DevelopConstants {
+        let mut k = self.constants(stats.keys);
+        if !self.is_local() {
+            return k;
+        }
+        let gain = 2f64.powf(self.exposure());
+        let derived;
+        let curves = match curves {
+            Some(c) => c,
+            None => {
+                let shift = gain.log2() as f32;
+                let levels: Vec<f32> = stats.levels.iter().map(|l| l + shift).collect();
+                derived = local_curves(&levels);
+                &derived
+            }
+        };
+        let (white_point, dark_key) = (k.white_point as f64, k.dark_key as f64);
+        let pre: Vec<f32> = (0..CURVE_SAMPLES).map(|i| {
+            let x = 2f64.powf(CURVE_LO + (k.curve_hi as f64 - CURVE_LO) * i as f64 / (CURVE_SAMPLES - 1) as f64);
+            default_black(default_white(x, white_point), dark_key).clamp(0.0, 1.0) as f32
+        }).collect();
+        let out: Vec<f32> = (0..CURVE_SAMPLES).map(|i| {
+            let x = 2f64.powf(OUT_LO * (1.0 - i as f64 / (CURVE_SAMPLES - 1) as f64));
+            default_curve(x) as f32
+        }).collect();
+        k.local = Some(LocalTone { gain: curves.gain(self.settings.shadows, self.settings.highlights).into(), pre: pre.into(), out: out.into(), long_side: 0 });
+        k
+    }
+
+    /// Everything the stage needs for one frame with the keys `keys`
+    /// (no Shadows / Highlights: those need the frame's levels, see
+    /// [`Self::constants_for`]).
     pub fn constants(&self, keys: ToneKeys) -> DevelopConstants {
         let geometry = self.geometry();
         let gain = 2f64.powf(self.exposure());
@@ -153,7 +268,7 @@ impl RawDevelop {
             let x = 2f64.powf(CURVE_LO + (hi - CURVE_LO) * i as f64 / (CURVE_SAMPLES - 1) as f64);
             default_render(x, white_point, dark_key) as f32
         }).collect();
-        DevelopConstants { geometry, gain: gain as f32, curve: curve.into(), curve_hi: hi as f32, white_point: white_point as f32, dark_key: dark_key as f32 }
+        DevelopConstants { geometry, gain: gain as f32, curve: curve.into(), curve_hi: hi as f32, white_point: white_point as f32, dark_key: dark_key as f32, local: None }
     }
 }
 
@@ -307,6 +422,44 @@ pub struct DevelopConstants {
     /// The white point and the dark key the curve was built for.
     pub white_point: f32,
     pub dark_key: f32,
+    /// Shadows / Highlights, when the settings move them.
+    pub local: Option<LocalTone>,
+}
+
+/// log₂ of the black-subtracted value of the first sample of
+/// [`LocalTone::out`]; below it the output shrinks with the value.
+pub const OUT_LO: f64 = -18.0;
+
+/// The Shadows / Highlights stage of one frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalTone {
+    /// log₂ gain over the base level: [`LOCAL_SAMPLES`] samples from
+    /// [`LOCAL_LO`], [`LOCAL_PER_STOP`] per stop.
+    pub gain: CurveSamples,
+    /// The black-subtracted value over log₂(scene), sampled as
+    /// [`DevelopConstants::curve`] (white point and default black).
+    pub pre: CurveSamples,
+    /// Output light over log₂ of the black-subtracted value, from
+    /// [`OUT_LO`] to 0: the default tone curve.
+    pub out: CurveSamples,
+    /// The long side, in pixels, of the frame the eyes belong to (two eyes
+    /// side by side count as one frame); 0 = the eye's own.
+    pub long_side: u32,
+}
+
+impl LocalTone {
+    /// The gain (log₂) at a base level.
+    pub fn gain_at(&self, base: f32) -> f32 {
+        sample_curve(&self.gain, (base - LOCAL_LO) * LOCAL_PER_STOP)
+    }
+}
+
+fn sample_curve(curve: &[f32], at: f32) -> f32 {
+    let last = (curve.len() - 1) as f32;
+    let y = at.clamp(0.0, last);
+    let i = (y.floor() as usize).min(curve.len() - 2);
+    let f = y - i as f32;
+    curve[i] * (1.0 - f) + curve[i + 1] * f
 }
 
 fn srgb_encode(x: f32) -> f32 {
@@ -327,6 +480,44 @@ impl DevelopConstants {
         let i = (y.floor() as usize).min(self.curve.len() - 2);
         let f = y - i as f32;
         self.curve[i] * (1.0 - f) + self.curve[i + 1] * f
+    }
+
+    /// The luminance the base is taken from: of the scene value at this
+    /// frame's exposure, not below [`BASE_FLOOR`].
+    pub fn base_luminance(&self, camera: [f32; 3]) -> f32 {
+        let luma = prophoto_luma().map(|v| v as f32);
+        let scene = self.geometry.scene(camera).map(|v| (v * self.gain).max(0.0));
+        (scene[0] * luma[0] + scene[1] * luma[1] + scene[2] * luma[2]).max(BASE_FLOOR)
+    }
+
+    /// Develop one pixel whose base level (log₂) is `base`: as
+    /// [`Self::develop`], with the Shadows / Highlights gain of that level
+    /// on the black-subtracted signal. The GPU stage computes the same.
+    pub fn develop_local(&self, camera: [f32; 3], base: f32) -> [f32; 3] {
+        let Some(local) = &self.local else { return self.develop(camera) };
+        let g = 2f32.powf(local.gain_at(base));
+        let lo_u = CURVE_LO as f32;
+        let pre = |x: f32| -> f32 {
+            if x <= 0.0 { return 0.0; }
+            let u = x.log2();
+            if u <= lo_u { return local.pre[0] * x / 2f32.powf(lo_u); }
+            sample_curve(&local.pre, (u - lo_u) / (self.curve_hi - lo_u) * (local.pre.len() - 1) as f32)
+        };
+        let out = |p: f32| -> f32 {
+            if p <= 0.0 { return 0.0; }
+            let u = p.log2();
+            let lo = OUT_LO as f32;
+            if u <= lo { return local.out[0] * p / 2f32.powf(lo); }
+            sample_curve(&local.out, (1.0 - u / lo) * (local.out.len() - 1) as f32)
+        };
+        let tone = |x: f32| out((g * pre(x)).min(1.0));
+        let scene = self.geometry.scene(camera).map(|v| (v * self.gain).max(0.0));
+        let hi = scene.iter().cloned().fold(f32::MIN, f32::max);
+        let lo = scene.iter().cloned().fold(f32::MAX, f32::min);
+        let (thi, tlo) = (tone(hi), tone(lo));
+        let toned = scene.map(|v| if hi > lo { tlo + (thi - tlo) * (v - lo) / (hi - lo) } else { thi });
+        let m = self.geometry.work_to_out.map(|r| r.map(|x| x as f64));
+        apply(&m, toned.map(|x| x as f64)).map(|v| srgb_encode((v as f32).clamp(0.0, 1.0)))
     }
 
     /// Develop one pixel on the CPU: camera-linear RGB in, sRGB-encoded

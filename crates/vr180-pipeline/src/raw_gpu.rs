@@ -9,8 +9,16 @@ use crate::{Error, Result};
 const BAYER_DEMOSAIC_WGSL: &str = include_str!("shaders/bayer_demosaic.wgsl");
 const RAW_DEVELOP_WGSL: &str = include_str!("shaders/raw_develop.wgsl");
 const RAW_MEASURE_WGSL: &str = include_str!("shaders/raw_measure.wgsl");
+const RAW_REDUCE_WGSL: &str = include_str!("shaders/raw_reduce.wgsl");
+const RAW_GRID_BUILD_WGSL: &str = include_str!("shaders/raw_grid_build.wgsl");
+const RAW_GRID_BLUR_WGSL: &str = include_str!("shaders/raw_grid_blur.wgsl");
+const RAW_DEVELOP_LOCAL_WGSL: &str = include_str!("shaders/raw_develop_local.wgsl");
 
-use crate::raw_tone::{DevelopConstants, DevelopGeometry, Measure, RawDevelop, ToneKeys, CLIP_FROM, CLIP_TO, CURVE_LO};
+use crate::raw_color::prophoto_luma;
+use crate::raw_tone::{
+    DevelopConstants, DevelopGeometry, FrameStats, LocalCurves, LocalTone, Measure, RawDevelop, ToneKeys, BASE_FALLBACK, BASE_FLOOR,
+    BASE_LO, BASE_RANGE, CLIP_FROM, CLIP_TO, CURVE_LO, LOCAL_LO, LOCAL_PER_STOP, OUT_LO,
+};
 use std::sync::{Arc, Mutex};
 
 /// What a mosaic's codes mean.
@@ -42,6 +50,15 @@ pub(crate) struct RawPipelines {
     develop_layout: wgpu::BindGroupLayout,
     measure: wgpu::ComputePipeline,
     measure_layout: wgpu::BindGroupLayout,
+    reduce: wgpu::ComputePipeline,
+    reduce_layout: wgpu::BindGroupLayout,
+    grid_build: wgpu::ComputePipeline,
+    grid_build_layout: wgpu::BindGroupLayout,
+    grid_blur: wgpu::ComputePipeline,
+    grid_blur_layout: wgpu::BindGroupLayout,
+    develop_local: wgpu::ComputePipeline,
+    develop_local_layout: wgpu::BindGroupLayout,
+    grid_sampler: wgpu::Sampler,
     /// What the live preview's measurements have found so far.
     memory: Arc<Mutex<ToneMemory>>,
 }
@@ -51,8 +68,11 @@ pub(crate) struct RawPipelines {
 /// none is on its way, queues one of itself.
 #[derive(Default)]
 struct ToneMemory {
-    latest: Option<ToneKeys>,
+    latest: Option<FrameStats>,
     in_flight: bool,
+    /// Curves to use instead of the ones derived from the frame (a
+    /// measuring harness sets them).
+    curves: Option<Arc<LocalCurves>>,
     /// Called when a measurement lands that differs from `latest`: a paused
     /// preview draws its frame again with it.
     notify: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -81,10 +101,43 @@ struct MeasureParams {
     cam_to_work: [[f32; 4]; 3],
     clip: [f32; 4],
     cell: [f32; 4],
+    luma: [f32; 4],
 }
 
-/// Cells along the longer side of the frame the keys are read from.
-const KEY_CELLS: u32 = 128;
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ReduceParams {
+    neutral: [f32; 4],
+    cam_to_work: [[f32; 4]; 3],
+    clip: [f32; 4],
+    luma: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GridParams {
+    cell: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DevelopLocalParams {
+    neutral: [f32; 4],
+    cam_to_work: [[f32; 4]; 3],
+    work_to_out: [[f32; 4]; 3],
+    pre: [f32; 4],
+    outc: [f32; 4],
+    gains: [f32; 4],
+    clip: [f32; 4],
+    luma: [f32; 4],
+    grid: [f32; 4],
+}
+
+/// Cells along the longer side of the frame the keys are read from: three
+/// to a cell of the reduced copy the curves are derived from.
+const KEY_CELLS: u32 = 126;
+/// Key cells along one side of a cell of that reduced copy.
+const STAT_BLOCK: usize = 3;
 /// Most taps along one side of a cell.
 const KEY_TAPS: u32 = 64;
 
@@ -269,8 +322,119 @@ impl RawPipelines {
             compilation_options: Default::default(),
             cache: None,
         });
-        Self { demosaic, demosaic_layout, develop, develop_layout, measure, measure_layout, memory: Arc::default() }
+        // Shadows / Highlights: the reduced copy, its bilateral grid, and
+        // the development that reads the base from it.
+        use wgpu::TextureViewDimension::{D2, D3};
+        let reduce_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raw_reduce_bgl"),
+            entries: &[
+                bgl_texture(0, D2, true),
+                bgl_storage(1, wgpu::TextureFormat::R32Float, D2),
+                bgl_uniform(2, std::mem::size_of::<ReduceParams>()),
+            ],
+        });
+        let reduce = compute_pipeline(device, "raw_reduce", RAW_REDUCE_WGSL, "main", &reduce_layout);
+        let grid_build_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raw_grid_build_bgl"),
+            entries: &[
+                bgl_texture(0, D2, false),
+                bgl_storage(1, wgpu::TextureFormat::Rgba16Float, D3),
+                bgl_uniform(2, std::mem::size_of::<GridParams>()),
+            ],
+        });
+        let grid_build = compute_pipeline(device, "raw_grid_build", RAW_GRID_BUILD_WGSL, "build", &grid_build_layout);
+        let grid_blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raw_grid_blur_bgl"),
+            entries: &[bgl_texture(0, D3, true), bgl_storage(1, wgpu::TextureFormat::Rgba16Float, D3)],
+        });
+        let grid_blur = compute_pipeline(device, "raw_grid_blur", RAW_GRID_BLUR_WGSL, "blur", &grid_blur_layout);
+        let develop_local_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raw_develop_local_bgl"),
+            entries: &[
+                bgl_texture(0, D2, true),
+                bgl_storage(1, wgpu::TextureFormat::Rgba16Unorm, D2),
+                bgl_uniform(2, std::mem::size_of::<DevelopLocalParams>()),
+                bgl_storage_buffer(3),
+                bgl_storage_buffer(4),
+                bgl_storage_buffer(5),
+                bgl_texture(6, D3, true),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let develop_local = compute_pipeline(device, "raw_develop_local", RAW_DEVELOP_LOCAL_WGSL, "main", &develop_local_layout);
+        let grid_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("raw_grid_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        Self {
+            demosaic, demosaic_layout, develop, develop_layout, measure, measure_layout,
+            reduce, reduce_layout, grid_build, grid_build_layout, grid_blur, grid_blur_layout,
+            develop_local, develop_local_layout, grid_sampler, memory: Arc::default(),
+        }
     }
+}
+
+fn bgl_texture(binding: u32, dim: wgpu::TextureViewDimension, filterable: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable }, view_dimension: dim, multisampled: false },
+        count: None,
+    }
+}
+
+fn bgl_storage(binding: u32, format: wgpu::TextureFormat, dim: wgpu::TextureViewDimension) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format, view_dimension: dim },
+        count: None,
+    }
+}
+
+fn bgl_uniform(binding: u32, size: usize) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: std::num::NonZeroU64::new(size as u64),
+        },
+        count: None,
+    }
+}
+
+fn bgl_storage_buffer(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    }
+}
+
+fn compute_pipeline(device: &wgpu::Device, label: &str, wgsl: &str, entry: &str, layout: &wgpu::BindGroupLayout) -> wgpu::ComputePipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(wgsl.into()) });
+    let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[Some(layout)], immediate_size: 0 });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pll),
+        module: &module,
+        entry_point: Some(entry),
+        compilation_options: Default::default(),
+        cache: None,
+    })
 }
 
 impl Device {
@@ -379,19 +543,49 @@ fn row4(r: [f32; 3]) -> [f32; 4] {
     [r[0], r[1], r[2], 0.0]
 }
 
-/// The keys of a mapped measurement: `bytes` holds the cells of every eye
-/// measured, 16 bytes (four `f32`) each.
-fn keys_from_cells(bytes: &[u8]) -> Option<ToneKeys> {
-    let cells: Vec<[f32; 3]> = bytes.chunks_exact(16)
-        .map(|c| [0, 1, 2].map(|i| f32::from_le_bytes([c[4 * i], c[4 * i + 1], c[4 * i + 2], c[4 * i + 3]])))
-        .collect();
-    ToneKeys::from_cells(&cells)
+/// The working space's luminance weights, with `w` in the fourth place.
+fn luma4(w: f32) -> [f32; 4] {
+    let l = prophoto_luma();
+    [l[0] as f32, l[1] as f32, l[2] as f32, w]
+}
+
+/// What a mapped measurement says of the frame: `bytes` holds the cells of
+/// every eye measured (`cx × cy` each, eye after eye), 16 bytes (four
+/// `f32`: the mean scene RGB and the mean log₂ luminance) each.
+fn stats_from_cells(bytes: &[u8], cx: usize, cy: usize) -> Option<FrameStats> {
+    let word = |c: &[u8], i: usize| f32::from_le_bytes([c[4 * i], c[4 * i + 1], c[4 * i + 2], c[4 * i + 3]]);
+    let cells: Vec<[f32; 3]> = bytes.chunks_exact(16).map(|c| [0, 1, 2].map(|i| word(c, i))).collect();
+    let keys = ToneKeys::from_cells(&cells)?;
+    // The reduced copy the curves come from: blocks of key cells, averaged in log.
+    let logs: Vec<f32> = bytes.chunks_exact(16).map(|c| word(c, 3)).collect();
+    let mut levels = Vec::new();
+    for eye in logs.chunks_exact(cx * cy) {
+        for by in (0..cy).step_by(STAT_BLOCK) {
+            for bx in (0..cx).step_by(STAT_BLOCK) {
+                let (mut sum, mut n) = (0f32, 0u32);
+                for y in by..(by + STAT_BLOCK).min(cy) {
+                    for x in bx..(bx + STAT_BLOCK).min(cx) {
+                        sum += eye[y * cx + x];
+                        n += 1;
+                    }
+                }
+                levels.push(sum / n as f32);
+            }
+        }
+    }
+    levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(FrameStats { keys, levels: levels.into() })
 }
 
 /// Two measurements say the same about a frame (nothing to draw again for).
-fn same_keys(a: ToneKeys, b: ToneKeys) -> bool {
+fn same_stats(a: &FrameStats, b: &FrameStats) -> bool {
     let stops = |x: f32, y: f32| (x.max(1e-9).log2() - y.max(1e-9).log2()).abs();
-    stops(a.max, b.max) < 0.01 && stops(a.dark, b.dark) < 0.03
+    if stops(a.keys.max, b.keys.max) >= 0.01 || stops(a.keys.dark, b.keys.dark) >= 0.03 || a.levels.len() != b.levels.len() {
+        return false;
+    }
+    // The levels at a few ranks.
+    let n = a.levels.len();
+    n == 0 || (0..=8).all(|i| { let k = i * (n - 1) / 8; (a.levels[k] - b.levels[k]).abs() < 0.02 })
 }
 
 impl Device {
@@ -408,17 +602,20 @@ impl Device {
 
     /// Queue the reduced copies of the given eyes and return the buffer
     /// they are copied into (16 bytes per cell, eye after eye).
-    fn submit_tone_measurement(&self, eyes: &[&wgpu::Texture], geometry: &DevelopGeometry) -> wgpu::Buffer {
+    fn submit_tone_measurement(&self, eyes: &[&wgpu::Texture], geometry: &DevelopGeometry) -> (wgpu::Buffer, usize, usize) {
         let pipes = self.raw_pipelines();
         // The frame the keys describe is all the eyes side by side.
         let (ew, eh) = (eyes[0].width(), eyes[0].height());
         let long = (ew * eyes.len() as u32).max(eh) as f32;
         let cell = long / KEY_CELLS as f32;
         let (cx, cy) = (((ew as f32 / cell).round() as u32).max(1), ((eh as f32 / cell).round() as u32).max(1));
-        let cell_bytes = (cx * cy * 16) as u64;
+        // A row of the copy must be a multiple of 256 bytes: the cells'
+        // texture is that wide (16 texels), the cells past `cx` are not read.
+        let padded = cx.div_ceil(16) * 16;
+        let eye_bytes = (padded * cy * 16) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("raw_measure_staging"),
-            size: cell_bytes * eyes.len() as u64,
+            size: eye_bytes * eyes.len() as u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -427,12 +624,13 @@ impl Device {
             cam_to_work: geometry.camera_to_work.map(row4),
             clip: [CLIP_FROM, CLIP_TO, 0.0, 0.0],
             cell: [ew as f32 / cx as f32, eh as f32 / cy as f32, cell.ceil().clamp(1.0, KEY_TAPS as f32), 0.0],
+            luma: luma4(BASE_FLOOR),
         });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("raw_measure") });
         for (n, eye) in eyes.iter().enumerate() {
             let cells = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("raw_measure_cells"),
-                size: wgpu::Extent3d { width: cx, height: cy, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d { width: padded, height: cy, depth_or_array_layers: 1 },
                 mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba32Float,
                 usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
@@ -458,53 +656,62 @@ impl Device {
                 wgpu::TexelCopyTextureInfo { texture: &cells, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                 wgpu::TexelCopyBufferInfo {
                     buffer: &staging,
-                    // A row of cells is a multiple of 256 bytes only for
-                    // some widths: one row per copy keeps every width legal.
-                    layout: wgpu::TexelCopyBufferLayout { offset: cell_bytes * n as u64, bytes_per_row: None, rows_per_image: None },
+                    layout: wgpu::TexelCopyBufferLayout { offset: eye_bytes * n as u64, bytes_per_row: Some(padded * 16), rows_per_image: Some(cy) },
                 },
-                wgpu::Extent3d { width: cx, height: 1, depth_or_array_layers: 1 },
+                wgpu::Extent3d { width: padded, height: cy, depth_or_array_layers: 1 },
             );
-            for y in 1..cy {
-                encoder.copy_texture_to_buffer(
-                    wgpu::TexelCopyTextureInfo { texture: &cells, mip_level: 0, origin: wgpu::Origin3d { x: 0, y, z: 0 }, aspect: wgpu::TextureAspect::All },
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &staging,
-                        layout: wgpu::TexelCopyBufferLayout { offset: cell_bytes * n as u64 + (y * cx * 16) as u64, bytes_per_row: None, rows_per_image: None },
-                    },
-                    wgpu::Extent3d { width: cx, height: 1, depth_or_array_layers: 1 },
-                );
-            }
         }
         self.queue.submit(Some(encoder.finish()));
-        staging
+        (staging, cx as usize, cy as usize)
     }
 
-    /// The tone keys of a frame: its eyes (camera-linear, as they enter the
-    /// colour stack) under `stage`'s white balance. [`Measure::Wait`]
-    /// measures this frame and waits; [`Measure::Latest`] returns what the
-    /// last finished measurement found and queues one of this frame when
-    /// none is on its way.
-    pub fn raw_tone_keys(&self, eyes: &[&wgpu::Texture], stage: &RawDevelop) -> ToneKeys {
+    /// The cells of a mapped measurement without the padding of its rows:
+    /// 16 bytes each, `cx × cy` an eye, eye after eye.
+    fn measured_cells(bytes: &[u8], cx: usize, cy: usize) -> Vec<u8> {
+        let padded = cx.div_ceil(16) * 16;
+        let mut out = Vec::with_capacity(bytes.len());
+        for eye in bytes.chunks_exact(padded * cy * 16) {
+            for row in eye.chunks_exact(padded * 16) {
+                out.extend_from_slice(&row[..cx * 16]);
+            }
+        }
+        out
+    }
+
+    /// Curves to use for Shadows / Highlights instead of the ones derived
+    /// from each frame (`None`: derive them again). For measurements.
+    pub fn set_raw_local_curves(&self, curves: Option<Arc<LocalCurves>>) {
+        if let Ok(mut m) = self.raw_pipelines().memory.lock() {
+            m.curves = curves;
+        }
+    }
+
+    /// What a frame's rendering is derived from: its eyes (camera-linear,
+    /// as they enter the colour stack) under `stage`'s white balance.
+    /// [`Measure::Wait`] measures this frame and waits; [`Measure::Latest`]
+    /// returns what the last finished measurement found and queues one of
+    /// this frame when none is on its way.
+    pub fn raw_frame_stats(&self, eyes: &[&wgpu::Texture], stage: &RawDevelop) -> FrameStats {
         if eyes.is_empty() {
-            return ToneKeys::UNKNOWN;
+            return FrameStats::unknown();
         }
         let geometry = stage.geometry();
         let memory = self.raw_pipelines().memory.clone();
         match stage.measure {
             Measure::Wait => {
-                let staging = self.submit_tone_measurement(eyes, &geometry);
+                let (staging, cx, cy) = self.submit_tone_measurement(eyes, &geometry);
                 let (tx, rx) = std::sync::mpsc::channel();
                 staging.slice(..).map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
                 let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
                 match rx.recv() {
                     Ok(Ok(())) => {
-                        let keys = keys_from_cells(&staging.slice(..).get_mapped_range());
+                        let stats = stats_from_cells(&Self::measured_cells(&staging.slice(..).get_mapped_range(), cx, cy), cx, cy);
                         staging.unmap();
-                        keys.unwrap_or(ToneKeys::UNKNOWN)
+                        stats.unwrap_or_else(FrameStats::unknown)
                     }
                     _ => {
                         tracing::warn!("raw development: the frame's tone keys could not be read back");
-                        ToneKeys::UNKNOWN
+                        FrameStats::unknown()
                     }
                 }
             }
@@ -513,21 +720,21 @@ impl Device {
                     Ok(mut m) => {
                         let start = !m.in_flight;
                         m.in_flight = true;
-                        (m.latest, start)
+                        (m.latest.clone(), start)
                     }
                     Err(_) => (None, false),
                 };
                 if start {
-                    let staging = self.submit_tone_measurement(eyes, &geometry);
+                    let (staging, cx, cy) = self.submit_tone_measurement(eyes, &geometry);
                     let buffer = staging.clone();
                     staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                        let keys = r.ok().and_then(|()| keys_from_cells(&buffer.slice(..).get_mapped_range()));
+                        let stats = r.ok().and_then(|()| stats_from_cells(&Self::measured_cells(&buffer.slice(..).get_mapped_range(), cx, cy), cx, cy));
                         buffer.unmap();
                         let notify = memory.lock().ok().and_then(|mut m| {
                             m.in_flight = false;
-                            let keys = keys?;
-                            let changed = !m.latest.is_some_and(|old| same_keys(old, keys));
-                            m.latest = Some(keys);
+                            let stats = stats?;
+                            let changed = !m.latest.as_ref().is_some_and(|old| same_stats(old, &stats));
+                            m.latest = Some(stats);
                             changed.then(|| m.notify.clone()).flatten()
                         });
                         if let Some(notify) = notify {
@@ -535,15 +742,150 @@ impl Device {
                         }
                     });
                 }
-                latest.unwrap_or(ToneKeys::UNKNOWN)
+                latest.unwrap_or_else(FrameStats::unknown)
             }
         }
     }
 
+    /// The tone keys of a frame (see [`Self::raw_frame_stats`]).
+    pub fn raw_tone_keys(&self, eyes: &[&wgpu::Texture], stage: &RawDevelop) -> ToneKeys {
+        self.raw_frame_stats(eyes, stage).keys
+    }
+
     /// The per-frame constants of `stage` for the given eyes (measured as
-    /// the stage asks).
+    /// the stage asks). The eyes are one frame: side by side when two.
     pub fn raw_develop_constants(&self, eyes: &[&wgpu::Texture], stage: &RawDevelop) -> DevelopConstants {
-        stage.constants(self.raw_tone_keys(eyes, stage))
+        let stats = self.raw_frame_stats(eyes, stage);
+        let curves = self.raw_pipelines().memory.lock().ok().and_then(|m| m.curves.clone());
+        let mut k = stage.constants_for(&stats, curves.as_deref());
+        if let (Some(local), Some(eye)) = (k.local.as_mut(), eyes.first()) {
+            local.long_side = (eye.width() * eyes.len() as u32).max(eye.height());
+        }
+        k
+    }
+
+    /// Record the bilateral grid of one eye for a frame's local tone: the
+    /// reduced copy, the gathered grid, the smoothed grid. Returns the
+    /// smoothed grid and its cell in pixels of the eye.
+    fn record_raw_base(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, k: &DevelopConstants, local: &LocalTone) -> (wgpu::Texture, f32) {
+        let pipes = self.raw_pipelines();
+        let long = if local.long_side > 0 { local.long_side } else { src.width().max(src.height()) };
+        let (n, cell) = crate::raw_local::base_layout(long);
+        let (rw, rh) = (src.width().div_ceil(n), src.height().div_ceil(n));
+        let (gx, gy, gz) = crate::raw_local::grid_dims(rw, rh, cell);
+        let reduced = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("raw_reduced"),
+            size: wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let grid = |label: &str| self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: gx, height: gy, depth_or_array_layers: gz },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let (gathered, smoothed) = (grid("raw_grid_gathered"), grid("raw_grid"));
+        let reduce_params = self.write_uniform("raw_reduce_params", &ReduceParams {
+            neutral: [k.geometry.neutral[0], k.geometry.neutral[1], k.geometry.neutral[2], k.gain],
+            cam_to_work: k.geometry.camera_to_work.map(row4),
+            clip: [CLIP_FROM, CLIP_TO, BASE_FLOOR, 0.0],
+            luma: luma4(n as f32),
+        });
+        let grid_params = self.write_uniform("raw_grid_params", &GridParams { cell: [cell, BASE_LO, 1.0 / BASE_RANGE, 0.0] });
+        let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let (src_v, red_v, gat_v, smo_v) = (view(src), view(&reduced), view(&gathered), view(&smoothed));
+        fn tex<'a>(binding: u32, v: &'a wgpu::TextureView) -> wgpu::BindGroupEntry<'a> {
+            wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) }
+        }
+        let reduce_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raw_reduce_bg"),
+            layout: &pipes.reduce_layout,
+            entries: &[tex(0, &src_v), tex(1, &red_v), wgpu::BindGroupEntry { binding: 2, resource: reduce_params.as_entire_binding() }],
+        });
+        let build_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raw_grid_build_bg"),
+            layout: &pipes.grid_build_layout,
+            entries: &[tex(0, &red_v), tex(1, &gat_v), wgpu::BindGroupEntry { binding: 2, resource: grid_params.as_entire_binding() }],
+        });
+        let blur_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raw_grid_blur_bg"),
+            layout: &pipes.grid_blur_layout,
+            entries: &[tex(0, &gat_v), tex(1, &smo_v)],
+        });
+        for (label, pipeline, bind, (x, y)) in [
+            ("raw_reduce", &pipes.reduce, &reduce_bg, (rw, rh)),
+            ("raw_grid_build", &pipes.grid_build, &build_bg, (gx, gy)),
+            ("raw_grid_blur", &pipes.grid_blur, &blur_bg, (gx, gy)),
+        ] {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, Some(bind), &[]);
+            pass.dispatch_workgroups(x.div_ceil(8), y.div_ceil(8), 1);
+        }
+        (smoothed, cell * n as f32)
+    }
+
+    fn curve_buffer(&self, label: &str, samples: &[f32]) -> wgpu::Buffer {
+        let bytes: &[u8] = bytemuck::cast_slice(samples);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buffer, 0, bytes);
+        buffer
+    }
+
+    /// The development with Shadows / Highlights: the eye's base, then the
+    /// stage that reads it.
+    fn record_raw_develop_local(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, dst: &wgpu::Texture, k: &DevelopConstants, local: &LocalTone) {
+        let (grid, cell_px) = self.record_raw_base(encoder, src, k, local);
+        let lo = CURVE_LO as f32;
+        let last = (local.pre.len() - 1) as f32;
+        let out_lo = OUT_LO as f32;
+        let out_last = (local.out.len() - 1) as f32;
+        let params = self.write_uniform("raw_develop_local_params", &DevelopLocalParams {
+            neutral: [k.geometry.neutral[0], k.geometry.neutral[1], k.geometry.neutral[2], k.gain],
+            cam_to_work: k.geometry.camera_to_work.map(row4),
+            work_to_out: k.geometry.work_to_out.map(row4),
+            pre: [lo, last / (k.curve_hi - lo), last, 2f32.powf(lo)],
+            outc: [out_lo, out_last / -out_lo, out_last, 2f32.powf(out_lo)],
+            gains: [LOCAL_LO, LOCAL_PER_STOP, (local.gain.len() - 1) as f32, 0.0],
+            clip: [CLIP_FROM, CLIP_TO, BASE_FLOOR, BASE_FALLBACK],
+            luma: luma4(cell_px),
+            grid: [BASE_LO, 1.0 / BASE_RANGE, 0.0, 0.0],
+        });
+        let (pre, outc, gains) = (
+            self.curve_buffer("raw_develop_pre", &local.pre),
+            self.curve_buffer("raw_develop_out", &local.out),
+            self.curve_buffer("raw_develop_gains", &local.gain),
+        );
+        let pipes = self.raw_pipelines();
+        let (src_view, dst_view, grid_view) = (src.create_view(&Default::default()), dst.create_view(&Default::default()), grid.create_view(&Default::default()));
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raw_develop_local_bg"),
+            layout: &pipes.develop_local_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&dst_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: pre.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: outc.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: gains.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&grid_view) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&pipes.grid_sampler) },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("raw_develop_local"), timestamp_writes: None });
+        pass.set_pipeline(&pipes.develop_local);
+        pass.set_bind_group(0, Some(&bind), &[]);
+        pass.dispatch_workgroups(dst.width().div_ceil(8), dst.height().div_ceil(8), 1);
     }
 
     /// Record the raw development stage: `src` (a camera-linear eye) →
@@ -555,6 +897,9 @@ impl Device {
         dst: &wgpu::Texture,
         k: &DevelopConstants,
     ) {
+        if let Some(local) = &k.local {
+            return self.record_raw_develop_local(encoder, src, dst, k, local);
+        }
         let lo = CURVE_LO as f32;
         let last = (k.curve.len() - 1) as f32;
         let params = self.write_uniform("raw_develop_params", &DevelopParams {
@@ -648,7 +993,7 @@ mod tests {
             let scenes: Vec<[f32; 3]> = px.chunks_exact(4).map(|c| g.scene([c[0], c[1], c[2]].map(|v| v as f32 / 65535.0))).collect();
             let brightest = scenes.iter().flat_map(|c| c.iter().copied()).fold(0f32, f32::max);
             assert!(keys.max <= brightest * 1.001 && keys.max > brightest * 0.2, "{settings:?}: max {} of {brightest}", keys.max);
-            assert!(keys.dark > 0.0 && keys.dark < keys.max);
+            assert!(keys.dark >= 0.0 && keys.dark < keys.max);
             let k = stage.constants(keys);
             let out = dev.develop_raw_eye(&src, &k);
             let got = dev.read_texture_rgba64(&out, w, h).unwrap();
@@ -664,6 +1009,82 @@ mod tests {
         }
     }
 
+    /// Shadows / Highlights on the GPU against the CPU twin: the base read
+    /// from the bilateral grid, the gain of that base, the black-subtracted
+    /// signal through it.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn gpu_local_tone_matches_the_cpu_one() {
+        use crate::raw_color::RawCamera;
+        use crate::raw_local::{base_layout, reduce_log, BaseGrid};
+        use crate::raw_tone::RawSettings;
+        let dev = Device::new().expect("device");
+        let (w, h) = (192u32, 128u32);
+        let mut s = 7u32;
+        let mut next = move || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; s };
+        // Regions of different brightness with texture inside, and a few specks.
+        let px: Vec<u16> = (0..w * h).flat_map(|i| {
+            let (x, y) = (i % w, i / w);
+            let region = match (x / 48, y / 64) { (0, _) => 300.0, (1, 0) => 2500.0, (1, _) => 900.0, (2, _) => 12000.0, _ => 40000.0 };
+            let texture = 0.7 + 0.6 * ((next() % 1000) as f32 / 1000.0);
+            let speck = if next() % 211 == 0 { 20.0 } else { 1.0 };
+            let v = (region * texture * speck).min(65535.0);
+            [(v * 0.55) as u16, v as u16, (v * 0.4) as u16, u16::MAX]
+        }).collect();
+        let src = dev.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test_src"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        dev.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &src, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&px),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+        for settings in [
+            RawSettings { shadows: 100.0, ..Default::default() },
+            RawSettings { highlights: -100.0, exposure: 1.0, ..Default::default() },
+            RawSettings { shadows: -40.0, highlights: 60.0, ..Default::default() },
+        ] {
+            let stage = RawDevelop { camera: RawCamera::X6, settings, measure: Measure::Wait };
+            let mut k = dev.raw_develop_constants(&[&src], &stage);
+            let local = k.local.as_mut().expect("local stage");
+            // A long side that gives more than one pixel per texel of the reduced copy.
+            local.long_side = 2048;
+            assert!(local.gain.iter().any(|g| g.abs() > 0.2), "{settings:?}: no gain");
+            let (n, cell) = base_layout(2048);
+            let lum: Vec<f32> = px.chunks_exact(4).map(|c| k.base_luminance([c[0], c[1], c[2]].map(|v| v as f32 / 65535.0))).collect();
+            let (red, rw, rh) = reduce_log(&lum, w as usize, h as usize, n as usize);
+            let grid = BaseGrid::build(&red, rw, rh, cell);
+            let out = dev.develop_raw_eye(&src, &k);
+            let got = dev.read_texture_rgba64(&out, w, h).unwrap();
+            let got: Vec<u16> = got.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+            let (mut worst, mut sum) = (0f32, 0f64);
+            for (i, (g, c)) in got.chunks_exact(4).zip(px.chunks_exact(4)).enumerate() {
+                let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
+                let base = grid.base(x, y, n as f32, lum[i].log2());
+                let want = k.develop_local([c[0], c[1], c[2]].map(|v| v as f32 / 65535.0), base);
+                for ch in 0..3 {
+                    let d = (g[ch] as f32 / 65535.0 - want[ch]).abs();
+                    worst = worst.max(d);
+                    sum += d as f64;
+                }
+            }
+            let mean = sum / (3 * w * h) as f64;
+            // The grid is 16-bit float on the GPU: a few thousandths at most.
+            assert!(mean < 6e-4 && worst < 8e-3, "{settings:?}: mean {mean}, worst {worst}");
+            // And the stage did something: against the plain development.
+            let plain = stage.constants(dev.raw_tone_keys(&[&src], &stage));
+            let moved = px.chunks_exact(4).zip(got.chunks_exact(4)).filter(|(c, g)| {
+                (plain.develop([c[0], c[1], c[2]].map(|v| v as f32 / 65535.0))[1] - g[1] as f32 / 65535.0).abs() > 0.02
+            }).count();
+            assert!(moved > (w * h / 10) as usize, "{settings:?}: only {moved} pixels moved");
+        }
+    }
+
     /// The reduced copy is the mean of each cell, eye after eye.
     #[test]
     #[ignore = "needs a GPU"]
@@ -671,9 +1092,9 @@ mod tests {
         use crate::raw_color::RawCamera;
         use crate::raw_tone::RawSettings;
         let dev = Device::new().expect("device");
-        // Two 256 px eyes: 64 cells of 4 px along each. Left: a flat grey
-        // with one bright cell and one dark one; right: flat.
-        let (w, h) = (256u32, 256u32);
+        // Two 252 px eyes: 63 cells of 4 px along each. Left: a flat grey
+        // with one bright cell and twelve dark ones; right: flat.
+        let (w, h) = (252u32, 252u32);
         let stage = RawDevelop { camera: RawCamera::X6, settings: RawSettings::default(), measure: Measure::Wait };
         let n = RawCamera::X6.as_shot_neutral.map(|v| v as f32);
         let eye = |level_at: &dyn Fn(u32, u32) -> f32| -> wgpu::Texture {
@@ -698,12 +1119,25 @@ mod tests {
         };
         let left = eye(&|x, y| if (40..44).contains(&x) && (80..84).contains(&y) { 0.6 } else if x < 48 && y < 4 { 0.01 } else { 0.2 });
         let right = eye(&|_, _| 0.2);
-        let keys = dev.raw_tone_keys(&[&left, &right], &stage);
-        // 8192 cells; the brightest is the 0.6 one, and the 0.1th
+        let stats = dev.raw_frame_stats(&[&left, &right], &stage);
+        let keys = stats.keys;
+        // 7938 cells; the brightest is the 0.6 one, and the 0.1th
         // percentile falls among the twelve dark ones.
         assert!((keys.max - 0.6).abs() < 2e-3, "max {}", keys.max);
         assert!((keys.dark - 0.01).abs() < 5e-4, "dark {}", keys.dark);
-        // One eye alone is a frame of its own: 128 cells of 2 px.
+        // The levels the curves come from: blocks of 3 × 3 cells averaged
+        // in log, 21 × 21 an eye, sorted. Nearly all are the grey's.
+        assert_eq!(stats.levels.len(), 2 * 21 * 21);
+        let grey = 0.2f32.log2();
+        assert!((stats.levels[441] - grey).abs() < 0.01, "{} vs {grey}", stats.levels[441]);
+        assert!(stats.levels.windows(2).all(|w| w[0] <= w[1]));
+        // The four blocks over the dark cells: a third of each is dark.
+        let dark_block = (2.0 * grey + 0.01f32.log2()) / 3.0;
+        assert!((stats.levels[0] - dark_block).abs() < 0.02, "{} vs {dark_block}", stats.levels[0]);
+        // The block with the bright cell: one cell of nine.
+        let bright_block = (8.0 * grey + 0.6f32.log2()) / 9.0;
+        assert!((stats.levels[881] - bright_block).abs() < 0.02, "{} vs {bright_block}", stats.levels[881]);
+        // One eye alone is a frame of its own: 126 cells of 2 px.
         let mono = dev.raw_tone_keys(&[&right], &stage);
         assert!((mono.max - 0.2).abs() < 1e-3 && (mono.dark - 0.2).abs() < 1e-3, "{mono:?}");
     }

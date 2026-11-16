@@ -17,6 +17,7 @@ pub mod raw_color;
 pub mod raw_develop;
 pub mod raw_export;
 pub mod raw_gpu;
+pub mod raw_local;
 pub mod raw_tone;
 pub mod ljpeg;
 pub mod dng_write;
