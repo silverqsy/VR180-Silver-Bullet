@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+### Insta360 X6: raw video
+
+A raw take of the X6 is a folder: the sensor's own 14-bit Bayer data of both
+lenses for every frame, the gyro log, the factory lens record and the sound.
+The app opens such a folder as one clip (add the folder, the capture file in
+it, or a folder of takes) and treats it like any other video: preview, trim,
+stabilization, eye alignment, every output format. What is new is the
+developing: a raw clip has no look of its own, so the Color panel gets a raw
+converter's controls for it, and every frame can be had as a DNG.
+
+- **Raw development.** Temperature and Tint (or As shot), Exposure,
+  Contrast, Highlights, Shadows, Whites, Blacks, in a raw converter's own
+  terms. The rendering follows Adobe Camera Raw's, control by control, so a
+  frame graded here and the same frame's DNG opened there with the same
+  numbers look alike. It was measured there, on charts and on frames of
+  sample takes, not taken from a description:
+  - with nothing moved the two differ by a third of an 8-bit step on
+    average, and a white balance by a tenth to seven tenths;
+  - Shadows and Highlights are local, as there: they lift or hold back an
+    object as a whole and leave the texture inside it alone, they belong to
+    the frame (what counts as a shadow follows the frame's own levels), and
+    moved together they do not simply add. Half the slider is within about
+    one step, the whole slider within one and a half to two and a half;
+  - Blacks and Whites below zero are within half a step to one; Contrast
+    within about one step at half the slider and two at its ends; Whites
+    above zero within one to two and a half steps up to the middle of the
+    slider and coarser beyond it;
+  - a grade with every slider in use lands within one to two steps for
+    moderate amounts, three to five at the extremes.
+- **It follows the footage.** The frame's brightest and darkest levels and
+  the spread of its levels are measured on every frame, as a raw converter
+  does per picture; over three seconds of a sample take this adds no
+  flicker (the picture's mean changes from frame to frame by 0.18 of an
+  8-bit step with and without Shadows and Highlights, 0.22 with every
+  slider in use).
+- **Every frame is a DNG.** Snapshot writes a linear DNG beside the JPEG:
+  the projected frame in the camera's own linear colour, with the panel's
+  settings inside, so another raw converter opens it as it looks here. In
+  the export bar a raw clip can be written as a **DNG sequence** (a folder
+  of numbered frames) or as video; video is 10-bit.
+- **What a take does not carry.** No accelerometer: the stabilizer has the
+  gyro, but no horizon to level to. No readout time: there is no
+  rolling-shutter correction. No white balance of its own: As shot is the
+  camera's reference white.
+
 ### Insta360 X6: ETTR recovery for I-Log clips
 
 A clip exposed brighter than normal on purpose (exposing to the right: more

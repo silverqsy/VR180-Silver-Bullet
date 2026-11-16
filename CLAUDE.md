@@ -2637,6 +2637,68 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      (`SharpenParams::apply_lat_weight` is on for every plan, a
      half-equirect's weight; the user has been told, their call).
 
+34. **Insta360 X6 raw video (2026-11-16, Mac; UNRELEASED).** A raw take —
+   a folder with `capture.x6b` (both lenses' 14-bit Bayer frames in pairs),
+   the gyro file, the factory lens string and the sound — opens as one clip
+   (`SourceKind::X6Raw`; import takes the folder, the capture file or a
+   folder of takes).
+   - **Reading**: `vr180-fisheye::x6b` (take description, pair scan, tile
+     decoder, checked against reference pixels of three sample takes);
+     `vr180-pipeline::x6_raw` (one index per take, cached on disk under the
+     settings folder; frame timeline from the exposure stamps; lens and gyro
+     poses; `X6RawIter` hands out pairs demosaiced on the GPU —
+     `raw_gpu.rs`, `bayer_demosaic.wgsl` — as camera-linear `Rgba16Unorm`
+     eyes, binned to half size for the preview). Raw clips take the 16-bit
+     stacks only; video export is forced to 10-bit.
+   - **Development** is the first stage of `record_color_stack_16`
+     (`ColorStackPlan::raw_develop`). `raw_tone.rs`'s header is the
+     specification; `RawDevelop::constants_for(stats, curves)` is the one
+     entry. It reproduces Adobe Camera Raw (process version 15.4), measured
+     on Camera Raw 18.7 by developing charts and frames there:
+     exposure → default black (keyed to the frame's darkest cell) →
+     Shadows / Highlights (`gain = curve(base)`; base = a bilateral grid of
+     log₂ luminance, `raw_local.rs` + `raw_reduce` / `raw_grid_build` /
+     `raw_grid_blur.wgsl`; the frame's curves from networks fitted to
+     Camera Raw's own on 1400 distributions; `LocalCurves` holds how the two
+     sliders act on each other; gains above zero are limited toward the
+     white point, `limit_gain`) → white point of the frame WITH the gain in
+     (`gained_white`) → Whites → Blacks (`raw_global.rs`: tables; each a
+     gain keyed to the pixel's luminance or a curve per extreme channel, by
+     sign — `StageMap`) → the tone curve with Contrast in (a family of
+     maps + networks; Whites above zero is `a1·v + a2·v²` from networks).
+     Plain settings run `raw_develop.wgsl` (one curve); anything between
+     black and tone curve runs `raw_develop_local.wgsl` (the staged one).
+   - **Per frame**: `Device::raw_frame_stats` measures the frame as it is
+     graded (`raw_measure.wgsl`: 126 cells along the long side) —
+     `FrameStats { keys, levels, peaks }`. `Measure::Wait` for exports and
+     stills, `Measure::Latest` for the preview (uses the last measurement
+     that came back and asks for a redraw when it changes).
+   - **DNG**: `raw_export.rs` — a frame as a linear DNG with the settings
+     as `crs:` XMP (written beside every Snapshot of a raw clip), and the
+     export option "DNG sequence" (`ExportOptions::raw_dng_sequence`,
+     folder `<stem>_DNG`).
+   - **Against Camera Raw** (three frames, mean |difference| of 16-px block
+     means, of 255): default 0.33; white balance 0.1–0.7; Shadows /
+     Highlights ±50 0.7–1.4, ±100 1.3–2.5, both at their ends 2.9–4.6;
+     Blacks 0.3–0.8; Whites below zero 0.4; Contrast ±50 0.7–1.2, ±100
+     1.6–2.4; Whites +50 1.2–2.3, +100 5–16; six mixed grades 0.8–2 for
+     moderate ones, 3.4–5.0 at the extremes. What limits it: the networks
+     (0.03–0.15 stops on the curves), the base (Camera Raw's is not known;
+     small bright things get too much of Highlights), and which reading of
+     the frame's top Whites above zero goes by.
+   - **Tests**: `cargo test -p vr180-pipeline --lib raw_ -- --include-ignored`
+     (the GPU stages against their CPU twins, the tables and families
+     against Camera Raw's numbers, the keys read off the reduced copy).
+   - **Not done**: no rolling-shutter correction and no horizon (a take
+     states neither readout time nor acceleration); raw clips are not in
+     stereo auto-align; the development panel, the DNG snapshot and the DNG
+     sequence option have not been seen running on a display yet.
+   - **WINDOWS**: shared code; the only gate touched is the pair moved into
+     `export_device()` in `app.rs`. To check there: the raw shaders compile
+     on D3D12 / Vulkan (the staged one binds six storage buffers and a 3D
+     `Rgba16Float` texture; the measure pass writes `Rgba32Float`), and
+     the `raw_` tests pass on that GPU.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`
