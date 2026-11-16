@@ -660,6 +660,10 @@ struct ExportOptions {
     /// eye per frame: no projection, no stabilization, no grade) and not
     /// the developed view.
     raw_dng_original: bool,
+    /// A raw video clip's frames come from the folder of its camera-original
+    /// DNGs where a raw converter has enhanced them (the folder beside the
+    /// take, see `default_frames_dir_for`).
+    raw_use_enhanced: bool,
     /// Still-photo container (used only when the source is a still).
     still_format: StillFormatChoice,
     /// Output resolution target (Native / 8192×4096) of every clip but a
@@ -1618,6 +1622,7 @@ impl Default for ExportOptions {
             codec: ExportCodec::H265,
             raw_dng_sequence: false,
             raw_dng_original: false,
+            raw_use_enhanced: true,
             still_format: StillFormatChoice::Png16,
             resolution: ExportResolution::R8k,
             crop_resolution: ExportResolution::R8k,
@@ -1806,6 +1811,8 @@ fn tr_zh(en: &'static str) -> &'static str {
         "View" => "视图",
         "DNG sequence" => "DNG 序列",
         "Developed view" => "显影后的画面",
+        "Use enhanced frames" => "使用增强后的帧",
+        "When the folder of Camera original DNGs is beside the take and a raw converter has enhanced its frames in place (Camera Raw's Super Resolution), each frame is taken from there, at the enhanced size. A frame that was not enhanced comes from the capture." => "素材旁边有相机原片 DNG 文件夹，并且其中的帧已在 RAW 转换软件里原地增强过时（Camera Raw 的超分辨率），每一帧从那里读取，按增强后的尺寸处理。没有增强过的帧仍取自采集文件。",
         "Camera original" => "相机原片",
         "camera original" => "相机原片",
         "Every frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number. No projection, no stabilization, no grading — for running the frames through a raw converter first." => "每一帧按传感器记录的原样导出：每眼一个 Bayer DNG，以相机的帧号命名。不投影、不防抖、不调色，适合先把每一帧交给 RAW 转换软件处理。",
@@ -3029,6 +3036,15 @@ impl App {
             .join(format!("{stem}_SBS.{}", format.extension()))
     }
 
+    /// The export option that takes a raw clip's frames from the folder of
+    /// its camera-original DNGs where a raw converter has enhanced them.
+    fn enhanced_frames_ui(ui: &mut egui::Ui, opts: &mut ExportOptions) {
+        ui.checkbox(&mut opts.raw_use_enhanced, tr("Use enhanced frames"));
+        ui.label(RichText::new(tr("When the folder of Camera original DNGs is beside the take and a raw converter has enhanced its frames in place (Camera Raw's Super Resolution), each frame is taken from there, at the enhanced size. A frame that was not enhanced comes from the capture."))
+            .small().color(Color32::GRAY));
+        ui.add_space(8.0);
+    }
+
     /// Build the full `FisheyeExportConfig` for one (source, output) pair
     /// from explicit clip facts + a Settings/ExportOptions pair. Pure —
     /// used by both the single export (current clip + live settings) and
@@ -3250,6 +3266,11 @@ impl App {
             braw_color: settings.braw_color.clone(),
             trim_in_s: settings.trim_in_s,
             trim_out_s: settings.trim_out_s,
+            // A raw take's enhanced frames: the folder of its camera-original
+            // DNGs beside it, when it is there and the option is on.
+            raw_enhanced_dir: (source_kind.is_raw_video() && opts.raw_use_enhanced)
+                .then(|| Self::default_frames_dir_for(source_path, true))
+                .filter(|dir| dir.join("CAM0").is_dir()),
             color_stack,
             projection,
             lens_frame,
@@ -6042,11 +6063,15 @@ impl App {
                 ui.label(RichText::new(tr("Every frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number. No projection, no stabilization, no grading — for running the frames through a raw converter first."))
                     .small().color(Color32::GRAY));
                 ui.add_space(8.0);
+                if !opts.raw_dng_original {
+                    Self::enhanced_frames_ui(ui, opts);
+                }
                 return;
             }
             ui.label(RichText::new(tr("Every frame as a DNG in a folder: the developed view, or the sensor's own frames."))
                 .small().color(Color32::GRAY));
             ui.add_space(8.0);
+            Self::enhanced_frames_ui(ui, opts);
         }
 
         ui.label(RichText::new(tr("Codec")).strong());

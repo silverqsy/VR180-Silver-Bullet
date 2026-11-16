@@ -617,6 +617,34 @@ impl Device {
         );
     }
 
+    /// An empty camera-linear eye (`Rgba16Unorm`) that is filled from memory
+    /// ([`Self::write_camera_eye_texture`]) and read by the 16-bit
+    /// projection kernels: a frame that arrives demosaiced.
+    pub fn new_camera_eye_texture(&self, w: u32, h: u32) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("camera_linear_eye"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    /// Fill a camera-linear eye with `w × h` pixels of four 16-bit samples.
+    pub fn write_camera_eye_texture(&self, tex: &wgpu::Texture, pixels: &[u16]) {
+        let (w, h) = (tex.width(), tex.height());
+        debug_assert_eq!(pixels.len(), (w as usize) * (h as usize) * 4);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(pixels),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+    }
+
     /// An empty camera-linear eye (`Rgba16Unorm`) a demosaic writes and the
     /// 16-bit projection kernels read.
     pub fn new_linear_eye_texture(&self, w: u32, h: u32) -> wgpu::Texture {

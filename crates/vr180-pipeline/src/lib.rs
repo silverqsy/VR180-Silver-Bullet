@@ -26,6 +26,7 @@ pub mod raw_tone;
 pub mod ljpeg;
 pub mod dng_write;
 pub mod encode;
+pub mod enhanced_dng;
 pub mod fisheye_decode;
 pub mod fisheye_export;
 pub mod frame_timeline;
@@ -55,6 +56,11 @@ pub use interop_macos::{
     RetainedIOSurface, IOSurfaceNv12Descriptor, IOSurfacePlaneTexture,
     extract_iosurface_from_vt_frame, wgpu_texture_from_iosurface_plane,
 };
+
+// JPEG XL through ImageIO, for a raw converter's enhanced frames
+// (`enhanced_dng`); the one caller is gated the same way.
+#[cfg(target_os = "macos")]
+mod jxl_macos;
 
 // In-process VideoToolbox temporal noise reduction (objc2 FFI, no Swift
 // helper). macOS-only; the consuming paths are gated the same way.

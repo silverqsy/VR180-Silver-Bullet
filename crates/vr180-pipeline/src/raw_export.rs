@@ -141,7 +141,7 @@ impl FrameSource {
         }
         let cfg = &cfg;
         let mut open = crate::fisheye_export::fisheye_export_opener(
-            cfg.source_kind, cfg.fisheye_swap_eyes, 10, cfg.braw_color.clone(), Some(pipeline.clone()));
+            cfg.source_kind, cfg.fisheye_swap_eyes, 10, cfg.braw_color.clone(), Some(pipeline.clone()), cfg.raw_enhanced_dir.clone());
         let decoder = open(&cfg.source_path)?;
         let src = decoder.eye_dims();
         let imu = crate::fisheye_export::resolve_export_imu(cfg);

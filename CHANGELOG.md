@@ -107,6 +107,22 @@ converter's controls for it, and every frame can be had as a DNG.
   gyro, sound) and a list of the frames with their exposure times are
   written beside them. Trim points apply. From a fast disk a one-minute
   30 fps take (1800 frame pairs, 43 GB) writes in about half a minute.
+- **Frames enhanced in a raw converter come back in.** Camera Raw's
+  Super Resolution can be run on the Camera original DNGs, and the export
+  then uses its result. Camera Raw 18 enhances a DNG in place: the file
+  keeps its mosaic and gains the enhanced picture, the frame demosaiced
+  and enlarged twofold (7680×7680 an eye) in the camera's own linear
+  values. With **Use enhanced frames** on (Export format, on by default)
+  and the folder of Camera original DNGs beside the take, every frame of
+  an export is taken from that picture where the folder has one, and from
+  the capture, enlarged to match, where it has not. Preview, grading and
+  stabilization stay on the capture; lens, timing and sound are the
+  take's. So the whole round trip is: export Camera original, enhance the
+  folder in Camera Raw, export the video. Read from a frame enhanced by
+  Camera Raw 18.7; its values agree with Camera Raw's own demosaic of the
+  frame to a part in a thousand. About 0.4 s a frame pair and 4 GB of
+  memory at 8192×4096. macOS only for now: the enhanced picture is JPEG
+  XL, which this build decodes through the system.
 - **What a take does not carry.** No accelerometer: the stabilizer has the
   gyro, but no horizon to level to. No readout time: there is no
   rolling-shutter correction. No white balance of its own: As shot is the

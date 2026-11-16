@@ -502,6 +502,21 @@ impl Drop for EyeLoan {
     }
 }
 
+/// A take's frames as a raw converter enhanced them: the folder its
+/// camera-original DNGs were written into ([`crate::sensor_dng`]) and the
+/// side of the pictures the converter left in them
+/// ([`crate::enhanced_dng`]).
+struct EnhancedFrames {
+    dir: PathBuf,
+    side: usize,
+    /// Eye pictures taken from the folder, and from the capture instead.
+    used: usize,
+    missing: usize,
+}
+
+/// How many files are looked at for the first enhanced picture.
+const ENHANCED_SEARCH: usize = 600;
+
 /// The frames of a raw take as fisheye pairs.
 ///
 /// `swap_eyes` has the dual-stream iterators' meaning: `true` puts channel 1
@@ -525,6 +540,18 @@ pub struct X6RawIter {
     frame_limit: usize,
     /// Without a device: hand out the mosaics themselves, not pictures.
     mosaics_out: bool,
+    /// Frames a raw converter enhanced, used in place of the capture's.
+    enhanced: Option<EnhancedFrames>,
+}
+
+impl Drop for X6RawIter {
+    fn drop(&mut self) {
+        if let Some(e) = &self.enhanced {
+            if e.used + e.missing > 0 {
+                tracing::info!("raw take: {} eye pictures from the enhanced frames, {} from the capture", e.used, e.missing);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for X6RawIter {
@@ -546,8 +573,45 @@ impl X6RawIter {
         Ok(Self {
             index, file, next: 0, step: step.max(1) as usize, swap_eyes, half, gpu,
             record: Vec::new(), samples: vec![0u16; 2 * EYE_SAMPLES], mosaics: None,
-            pool: Arc::default(), frame_limit: 0, mosaics_out: false,
+            pool: Arc::default(), frame_limit: 0, mosaics_out: false, enhanced: None,
         })
+    }
+
+    /// Take the frames from `dir` where a raw converter has enhanced them:
+    /// the folder the take's camera-original DNGs were written into
+    /// ([`crate::sensor_dng`]), whose files then hold the enhanced picture
+    /// ([`crate::enhanced_dng`]). The eyes become that picture's size
+    /// (twice the mosaic's for Super Resolution); a frame the folder has no
+    /// enhanced picture of comes from the capture, enlarged to match.
+    /// Nothing changes when the folder holds no enhanced picture.
+    pub fn with_enhanced_frames(mut self, dir: Option<&Path>) -> Self {
+        let Some(dir) = dir else { return self };
+        // The first, the middle and the last pair, then every pair in order.
+        let n = self.index.pairs.len();
+        let order = [0, n / 2, n.saturating_sub(1)].into_iter().chain(0..n);
+        let mut looked = 0usize;
+        let mut found = None;
+        'search: for i in order {
+            for channel in 0..2 {
+                if looked >= ENHANCED_SEARCH { break 'search; }
+                looked += 1;
+                let path = dir.join(crate::sensor_dng::frame_file(channel, self.index.pairs[i].request));
+                if let Ok(Some(p)) = crate::enhanced_dng::find(&path) {
+                    found = Some(p);
+                    break 'search;
+                }
+            }
+        }
+        match found {
+            Some(p) if p.width == p.height && p.width as usize % EYE_SIDE == 0 => {
+                tracing::info!("raw take {}: enhanced frames of {}x{} in {}", self.index.take.dir.display(), p.width, p.height, dir.display());
+                self.enhanced = Some(EnhancedFrames { dir: dir.to_path_buf(), side: p.width as usize, used: 0, missing: 0 });
+                self.half = false;
+            }
+            Some(p) => tracing::warn!("raw take: the enhanced frames in {} are {}x{}, not a whole multiple of the take's: not used", dir.display(), p.width, p.height),
+            None => tracing::warn!("raw take: no enhanced frame in {} ({looked} files looked at): the capture's frames are used", dir.display()),
+        }
+        self
     }
 
     /// Hand out each frame as its two mosaics ([`MOSAIC_BIT_DEPTH`] pairs)
@@ -571,7 +635,63 @@ impl X6RawIter {
     }
 
     fn eye_side(&self) -> u32 {
-        if self.half { EYE_SIDE as u32 / 2 } else { EYE_SIDE as u32 }
+        match &self.enhanced {
+            Some(e) => e.side as u32,
+            None if self.half => EYE_SIDE as u32 / 2,
+            None => EYE_SIDE as u32,
+        }
+    }
+
+    /// Frame `i`'s two channels from the enhanced frames' folder, as 16-bit
+    /// camera values (RGBA): channel 0, then channel 1. A channel the folder
+    /// has no enhanced picture of is the capture's frame, demosaiced and
+    /// enlarged to the same size.
+    fn enhanced_channels(&mut self, i: usize) -> Result<[Vec<u16>; 2]> {
+        let (dir, side) = match &self.enhanced {
+            Some(e) => (e.dir.clone(), e.side),
+            None => return Err(take_err("no enhanced frames")),
+        };
+        let request = self.index.pairs.get(i).ok_or_else(|| take_err(format!("frame {i} is past the take's end")))?.request;
+        // The two channels' pictures decode side by side.
+        let channel = |channel: usize| -> Result<Vec<u16>> {
+            let path = dir.join(crate::sensor_dng::frame_file(channel, request));
+            // A frame the folder does not hold is not worth a line of its own.
+            if !path.is_file() {
+                return Ok(Vec::new());
+            }
+            match crate::enhanced_dng::find(&path) {
+                Ok(Some(p)) if p.width as usize == side && p.height as usize == side => {
+                    let mut px = vec![0u16; side * side * 4];
+                    p.decode_rgba16(&path, &mut px)?;
+                    return Ok(px);
+                }
+                Ok(Some(p)) => tracing::warn!("{}: its enhanced picture is {}x{}, the others {side}x{side}: the capture's frame is used", path.display(), p.width, p.height),
+                Ok(None) => {}
+                Err(e) => tracing::warn!("{}: {e}: the capture's frame is used", path.display()),
+            }
+            Ok(Vec::new())
+        };
+        let (first, second) = std::thread::scope(|scope| {
+            let other = scope.spawn(|| channel(1));
+            (channel(0), other.join().unwrap_or_else(|_| Err(take_err("the enhanced picture's decoder stopped"))))
+        });
+        let mut eyes: [Vec<u16>; 2] = [first?, second?];
+        let absent = eyes.iter().filter(|e| e.is_empty()).count();
+        if absent > 0 {
+            self.decode_frame(i)?;
+            for (channel, eye) in eyes.iter_mut().enumerate().filter(|(_, e)| e.is_empty()) {
+                let rgb = crate::bayer::demosaic(&self.samples[channel * EYE_SAMPLES..(channel + 1) * EYE_SAMPLES], EYE_SIDE, EYE_SIDE, &BAYER, false);
+                *eye = enlarged(&rgb, EYE_SIDE, side / EYE_SIDE);
+            }
+        }
+        if let Some(e) = self.enhanced.as_mut() {
+            if absent > 0 && e.missing == 0 {
+                tracing::warn!("raw take: request {request} has no enhanced picture for {absent} of its two eyes in {}: the capture's frame stands in, enlarged (further ones are counted, not listed)", e.dir.display());
+            }
+            e.used += 2 - absent;
+            e.missing += absent;
+        }
+        Ok(eyes)
     }
 
     /// The mosaic of the frame decoded last: channel 0 then channel 1.
@@ -618,16 +738,60 @@ impl X6RawIter {
     }
 }
 
+/// A demosaiced picture (`side × side`, camera values) enlarged `factor`
+/// times, bilinearly, as 16-bit RGBA: what stands in for a frame a raw
+/// converter did not enhance.
+fn enlarged(rgb: &[[f32; 3]], side: usize, factor: usize) -> Vec<u16> {
+    let out_side = side * factor;
+    let mut out = vec![u16::MAX; out_side * out_side * 4];
+    let f = factor as f32;
+    for y in 0..out_side {
+        let sy = ((y as f32 + 0.5) / f - 0.5).clamp(0.0, side as f32 - 1.0);
+        let (y0, fy) = (sy.floor() as usize, sy - sy.floor());
+        let y1 = (y0 + 1).min(side - 1);
+        for x in 0..out_side {
+            let sx = ((x as f32 + 0.5) / f - 0.5).clamp(0.0, side as f32 - 1.0);
+            let (x0, fx) = (sx.floor() as usize, sx - sx.floor());
+            let x1 = (x0 + 1).min(side - 1);
+            let (a, b, c, d) = (rgb[y0 * side + x0], rgb[y0 * side + x1], rgb[y1 * side + x0], rgb[y1 * side + x1]);
+            for k in 0..3 {
+                let v = (a[k] * (1.0 - fx) + b[k] * fx) * (1.0 - fy) + (c[k] * (1.0 - fx) + d[k] * fx) * fy;
+                out[(y * out_side + x) * 4 + k] = (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
+            }
+        }
+    }
+    out
+}
+
 impl FisheyePairIter for X6RawIter {
     fn next_pair(&mut self) -> Result<Option<FisheyePair>> {
         let i = self.next;
         if i >= self.index.frames() || (self.frame_limit > 0 && i >= self.frame_limit) {
             return Ok(None);
         }
-        self.decode_frame(i)?;
-        self.next = i + self.step;
         let side = self.eye_side();
         let pts_s = self.index.pts_s(i);
+        if self.enhanced.is_some() && !self.mosaics_out {
+            let [c0, c1] = self.enhanced_channels(i)?;
+            self.next = i + self.step;
+            let (left, right) = if self.swap_eyes { (c1, c0) } else { (c0, c1) };
+            if let Some(dev) = self.gpu.clone() {
+                let upload = |px: &[u16]| {
+                    let tex = dev.new_camera_eye_texture(side, side);
+                    dev.write_camera_eye_texture(&tex, px);
+                    tex
+                };
+                let pair = GpuPair { left: upload(&left), right: upload(&right), keep: Box::new(()) };
+                return Ok(Some(FisheyePair {
+                    left: Vec::new(), right: Vec::new(), eye_w: side, eye_h: side, bit_depth: 16, pts_s,
+                    gpu: Some(Arc::new(pair)),
+                }));
+            }
+            let bytes = |px: &[u16]| bytemuck::cast_slice::<u16, u8>(px).to_vec();
+            return Ok(Some(FisheyePair { left: bytes(&left), right: bytes(&right), eye_w: side, eye_h: side, bit_depth: 16, pts_s, gpu: None }));
+        }
+        self.decode_frame(i)?;
+        self.next = i + self.step;
         if let Some(dev) = self.gpu.clone() {
             let pair = self.gpu_pair(&dev)?;
             return Ok(Some(FisheyePair {
@@ -720,6 +884,60 @@ mod tests {
         let d = std::f32::consts::PI / 180.0;
         assert!((b[0] - 0.2 * d).abs() < 1e-4 && (b[1] + 0.1 * d).abs() < 1e-4, "{b:?}");
         assert_eq!(rest_bias(&moving(4000).collect::<Vec<_>>()), [0.0; 3]);
+    }
+
+    #[test]
+    fn a_frame_without_an_enhanced_picture_is_enlarged() {
+        // 2x2 → 4x4: the corners keep their values, the middle is their mix.
+        let rgb = [[0.0f32, 0.0, 0.0], [1.0, 0.5, 0.25], [0.5, 1.0, 0.0], [1.0, 1.0, 1.0]];
+        let out = enlarged(&rgb, 2, 2);
+        assert_eq!(out.len(), 4 * 4 * 4);
+        let px = |x: usize, y: usize| [out[(y * 4 + x) * 4], out[(y * 4 + x) * 4 + 1], out[(y * 4 + x) * 4 + 2], out[(y * 4 + x) * 4 + 3]];
+        assert_eq!(px(0, 0), [0, 0, 0, 65535]);
+        assert_eq!(px(3, 0), [65535, 32768, 16384, 65535]);
+        assert_eq!(px(3, 3), [65535, 65535, 65535, 65535]);
+        // (1, 0) sits a quarter of the way from the first source pixel to the second.
+        assert_eq!(px(1, 0), [16384, 8192, 4096, 65535]);
+        // Once (factor 1) it is the picture itself.
+        let same = enlarged(&rgb, 2, 1);
+        assert_eq!(&same[4..8], &[65535, 32768, 16384, 65535]);
+    }
+
+    /// The sample frame Camera Raw enhanced (skipped when the volume is not
+    /// mounted or the folder no longer holds it): the take's frames come at
+    /// the enhanced size, the enhanced eye from the folder and the other
+    /// from the capture.
+    #[test]
+    fn enhanced_frames_replace_the_captures() {
+        let take = Path::new(SAMPLES).join("RAWVIDEO-20261116-011723");
+        let dir = Path::new(SAMPLES).join("RAWVIDEO-20261116-011723_OriginalDNG");
+        let file = dir.join("CAM0/000000364.dng");
+        if !take.exists() || !cfg!(target_os = "macos") || !matches!(crate::enhanced_dng::find(&file), Ok(Some(_))) { return; }
+        // Without the folder, and with a folder that holds nothing: the capture's own size.
+        let plain = X6RawIter::new(&take, false, false, 1, None).unwrap().with_enhanced_frames(None);
+        assert_eq!(plain.eye_dims(), (3840, 3840));
+        let empty = std::env::temp_dir().join(format!("vr180-no-enhanced-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(X6RawIter::new(&take, false, false, 1, None).unwrap().with_enhanced_frames(Some(&empty)).eye_dims(), (3840, 3840));
+        let _ = std::fs::remove_dir_all(&empty);
+        let mut iter = X6RawIter::new(&take, false, true, 1, None).unwrap().with_enhanced_frames(Some(&dir));
+        assert_eq!(iter.eye_dims(), (7680, 7680));
+        let i = iter.index().pairs.iter().position(|p| p.request == 364).expect("request 364");
+        let t = iter.index().pts_s(i);
+        iter.seek(t).unwrap();
+        let pair = iter.next_pair().unwrap().expect("a frame");
+        assert_eq!((pair.eye_w, pair.eye_h, pair.bit_depth), (7680, 7680, 16));
+        assert_eq!((pair.left.len(), pair.right.len()), (7680 * 7680 * 8, 7680 * 7680 * 8));
+        // Channel 0 (left here: no swap) is the enhanced picture: the file's own values.
+        let px = |eye: &[u8], x: usize, y: usize| -> [u16; 3] {
+            let at = (y * 7680 + x) * 8;
+            [0, 1, 2].map(|c| u16::from_le_bytes([eye[at + 2 * c], eye[at + 2 * c + 1]]))
+        };
+        let got = px(&pair.left, 4100, 2500);
+        assert!(got.iter().zip(&[4516u16, 6556, 2314]).all(|(g, w)| (*g as i32 - *w as i32).abs() <= 6), "{got:?}");
+        // Channel 1 was not enhanced: the capture's frame, enlarged — the same scene, about as bright.
+        let other = px(&pair.right, 4100, 2500);
+        assert!(other[1] > 1500 && other[1] < 20000, "{other:?}");
     }
 
     /// The sample takes (skipped when the volume is not mounted): they open,

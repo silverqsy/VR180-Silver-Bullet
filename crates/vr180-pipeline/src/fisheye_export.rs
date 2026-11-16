@@ -256,6 +256,13 @@ pub struct FisheyeExportConfig {
     // ── Trim ──────────────────────────────────────────────────────
     pub trim_in_s: Option<f64>,
     pub trim_out_s: Option<f64>,
+
+    /// A raw take's frames as a raw converter enhanced them: the folder the
+    /// take's camera-original DNGs were written into, whose files now hold
+    /// the converter's enhanced picture (Camera Raw's Super Resolution).
+    /// Frames found there replace the capture's, at their own size; `None`
+    /// uses the capture. Other sources ignore it.
+    pub raw_enhanced_dir: Option<PathBuf>,
 }
 
 /// Progress update emitted via the caller's callback after each
@@ -971,6 +978,8 @@ pub(crate) fn fisheye_export_opener(
     // The device a raw (Bayer) source demosaics on; without one it does so
     // on the CPU. Other sources ignore it.
     gpu: Option<Arc<Device>>,
+    // A raw take's enhanced frames (`FisheyeExportConfig::raw_enhanced_dir`).
+    raw_enhanced: Option<PathBuf>,
 ) -> Box<dyn FnMut(&std::path::Path) -> Result<Box<dyn FisheyePairIter>>> {
     let bd = if bit_depth >= 10 { 16u8 } else { 8u8 };
     Box::new(move |p: &std::path::Path| -> Result<Box<dyn FisheyePairIter>> {
@@ -1006,7 +1015,7 @@ pub(crate) fn fisheye_export_opener(
             // Full size, every frame, camera-linear 16-bit eyes (on the GPU
             // when there is a device).
             SourceKind::X6Raw => Box::new(crate::x6_raw::X6RawIter::new(
-                p, kind.dual_stream_iter_swap(swap_eyes), false, 1, gpu.clone())?),
+                p, kind.dual_stream_iter_swap(swap_eyes), false, 1, gpu.clone())?.with_enhanced_frames(raw_enhanced.as_deref())),
             other => return Err(Error::Ffmpeg(format!(
                 "export_fisheye non-fisheye source: {other:?}"))),
         })
@@ -1735,9 +1744,9 @@ fn export_fisheye_inner(
             cfg.segments.len(), durations.iter().sum::<f64>());
         Box::new(SegmentedFisheyeIter::new(
             &cfg.segments, &durations,
-            fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), Some(pipeline.clone())))?)
+            fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), Some(pipeline.clone()), cfg.raw_enhanced_dir.clone()))?)
     } else {
-        let mut open = fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), Some(pipeline.clone()));
+        let mut open = fisheye_export_opener(cfg.source_kind, cfg.fisheye_swap_eyes, cfg.bit_depth, cfg.braw_color.clone(), Some(pipeline.clone()), cfg.raw_enhanced_dir.clone());
         open(&cfg.source_path)?
     };
 

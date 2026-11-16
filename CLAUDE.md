@@ -2860,6 +2860,47 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      in ImageIO and in Camera Raw 18.7. A folder written this way is not
      yet something the app opens: `x6b::read_take` names it
      (`TakeProblem::FramesOnly`).
+   - **Enhanced frames** (2026-11-16; `enhanced_dng.rs`, `jxl_macos.rs`,
+     `X6RawIter::with_enhanced_frames`, `FisheyeExportConfig::
+     raw_enhanced_dir`, GUI `ExportOptions::raw_use_enhanced` → the
+     `<stem>_OriginalDNG` folder beside the take when it has a `CAM0`).
+     Camera Raw 18.7 applies Super Resolution IN PLACE (no second file):
+     the DNG keeps IFD0 and its mosaic and gains three tags — `0xCD3C`
+     (16-byte digest), `0xCD3D` (offset), `0xCD3E` (length) — for a block
+     appended to it: a 60-byte header (5, 2, the digest, width, height,
+     planes 3, sample type 3, a length, 2, 1, 0, 0), then a TIFF of its own
+     (one IFD, 7680×7680, 3 × 16 bit, `Compression` 52546 = JPEG XL, 90
+     tiles of 768×864, each a bare codestream tagged BT.2020 / sRGB gamma;
+     32 MB for a frame: lossy). The codes are per-channel companded; the
+     XMP says how (`crs:FilterList` → the `Enhance` filter → `Images` →
+     `ColorVariations`: three `crs:MapPolynomial` of four fractions and
+     three `crs:Black="black,white"`): camera value = `c0 + c1·x + c2·x² +
+     c3·x³`, `x = (code − black) / (white − black)`, white level = 1 (in
+     the sample `c1·(x + 15x³)`, each channel scaled to its own maximum).
+     Checked against Camera Raw's own demosaic of that frame taken back
+     to camera values: 8×8 block means within 0.03 / 0.09 / 0.28 %. Other
+     settings in that XMP (the user's Shadows, sharpening …) are NOT in
+     the picture: it is pre-development. `find` parses, `decode_rgba16`
+     decodes (tile rows on threads) through ImageIO (`jxl_macos`: the
+     provider's bytes of the decoded `CGImage`, no colour conversion;
+     within 6 codes of `sips`). The iterator: eyes become the picture's
+     size, both channels decode side by side, a channel with no enhanced
+     picture is the capture's frame demosaiced on the CPU and enlarged
+     bilinearly (`enlarged`), pairs go to the GPU as `new_camera_eye_
+     texture` uploads so everything downstream (the reference frame, the
+     16-bit stack) sees an ordinary GPU pair; the lens scales itself (the
+     export scales the take's lens by eye size / lens canvas). Measured:
+     0.41 s a pair with both eyes enhanced at 8192×4096 output (capture:
+     0.07 s), 4 GB peak; render from the enhanced eye aligned to the
+     capture's (shift 0, 0), mean |difference| 0.5/255 (it is sharper).
+     The harness: `X6_ENHANCED=<folder>`. CFG: `#[cfg(target_os =
+     "macos")] mod jxl_macos` in `lib.rs` and ONE gated pair of blocks in
+     `enhanced_dng::decode_tile` (the other arm returns an error); nothing
+     else is gated, tests use `cfg!()`. NOT done: Windows (needs a JPEG XL
+     decoder crate), the preview and zoom view from enhanced frames,
+     export sizes above the present ones for a 7680 source, Camera Raw's
+     other in-place enhancements (Denoise, Raw Details: same container
+     presumably, 1× size; untested).
    - **Against Camera Raw** (three frames, mean |difference| of 16-px block
      means, of 255): default 0.33; white balance 0.1–0.7; Shadows /
      Highlights ±50 0.7–1.4, ±100 1.3–2.5, both at their ends 2.9–4.6;
