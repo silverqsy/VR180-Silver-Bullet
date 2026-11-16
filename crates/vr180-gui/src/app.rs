@@ -2636,8 +2636,10 @@ impl App {
             match_apple_playback: Self::load_match_apple_playback(),
             preview_painter: None,
             loaded_path: None,
+            // Files, and folders: a raw video take is one (`open_paths`
+            // sorts out which folders are takes).
             pending_open: std::env::args_os().skip(1).map(PathBuf::from)
-                .filter(|p| p.is_file()).collect(),
+                .filter(|p| p.is_file() || p.is_dir()).collect(),
             eye_orientation_applied: (defaults.fisheye_swap_eyes, defaults.camera_upside_down),
             insv_view_applied: defaults.insv_view,
             clip: None,
