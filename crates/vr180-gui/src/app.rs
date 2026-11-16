@@ -2117,6 +2117,12 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Whites" => "白色色阶",
         "Blacks" => "黑色色阶",
         "As shot" => "原始设置",
+        "Sharpening" => "锐化",
+        "Amount" => "数量",
+        "Masking" => "蒙版",
+        "Sharpening of the developed picture, as a raw converter's detail panel does it: the same numbers give the same edges there. The radius is in pixels of the exported frame, so judge it in the zoom view or on a snapshot; the preview shows the export's picture reduced." => "对显影后的画面做锐化，与 RAW 转换软件“细节”面板的做法一致：同样的数值在那里得到同样的边缘。半径以导出画面的像素计，请在放大视图或快照上判断；预览显示的是导出画面缩小后的样子。",
+        "How much of the finest detail is sharpened. From 25 up the edges match a raw converter's; below that it also smooths fine texture and holds hard edges back, which this does not." => "最细的细节被锐化多少。25 及以上时边缘与 RAW 转换软件一致；低于 25 时它还会平滑细纹理并压低硬边，这里没有做。",
+        "Keeps the sharpening to edges: the higher, the stronger an edge has to be." => "把锐化限制在边缘上：数值越高，边缘要越强才会被锐化。",
         "Reset raw development" => "重置 RAW 显影",
         "The white the frame is developed for, as a colour temperature in kelvin and a tint, the way a raw converter states it." => "显影所用的白点，以色温（开尔文）和色调表示，与 RAW 转换软件的写法一致。",
         "The take records no white balance of its own: As shot is the camera's reference white." => "该素材没有记录自己的白平衡：“原始设置”是相机的参考白点。",
@@ -5538,6 +5544,9 @@ impl App {
     /// push to the shared control and bump the generation counter so
     /// the decoder rebuilds per-eye bundles on its next iteration.
     fn maybe_push_settings(&mut self) {
+        // What a raw clip's sharpening counts its radius in: the width of
+        // one eye of the frame an export would write now.
+        self.settings.export_eye_w = if self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) { self.export_eye_dims().0 } else { 0 };
         if self.settings == self.last_pushed_settings {
             return;
         }
@@ -9130,6 +9139,19 @@ fn draw_raw_develop_section(
     amount(ui, &mut raw.shadows, "Shadows");
     amount(ui, &mut raw.whites, "Whites");
     amount(ui, &mut raw.blacks, "Blacks");
+    // The detail panel's sharpening, in a raw converter's own terms.
+    ui.add_space(4.0);
+    ui.label(tr("Sharpening"));
+    let sharpen = &mut raw.sharpen;
+    ui.add(egui::Slider::new(&mut sharpen.amount, 0.0..=150.0).step_by(1.0).text(tr("Amount")).fixed_decimals(0))
+        .on_hover_text(tr("Sharpening of the developed picture, as a raw converter's detail panel does it: the same numbers give the same edges there. The radius is in pixels of the exported frame, so judge it in the zoom view or on a snapshot; the preview shows the export's picture reduced."));
+    ui.add_enabled_ui(sharpen.amount >= 0.5, |ui| {
+        ui.add(egui::Slider::new(&mut sharpen.radius, 0.5..=3.0).step_by(0.1).text(tr("Radius")).fixed_decimals(1));
+        ui.add(egui::Slider::new(&mut sharpen.detail, 0.0..=100.0).step_by(1.0).text(tr("Detail")).fixed_decimals(0))
+            .on_hover_text(tr("How much of the finest detail is sharpened. From 25 up the edges match a raw converter's; below that it also smooths fine texture and holds hard edges back, which this does not."));
+        ui.add(egui::Slider::new(&mut sharpen.masking, 0.0..=100.0).step_by(1.0).text(tr("Masking")).fixed_decimals(0))
+            .on_hover_text(tr("Keeps the sharpening to edges: the higher, the stronger an edge has to be."));
+    });
     if ui.button(tr("Reset raw development")).clicked() {
         *raw = Default::default();
     }

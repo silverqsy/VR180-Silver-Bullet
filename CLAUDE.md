@@ -2702,6 +2702,41 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      view's ray. The half-equirect itself is unchanged (its eyes are the
      reference), and so is its match with Camera Raw; a DNG of another view
      is developed by Camera Raw from that picture alone.
+   - **Sharpening** (2026-11-16): `RawSettings::sharpen` (`raw_sharpen.rs`:
+     Amount 0–150, Radius 0.5–3, Detail 0–100, Masking 0–100; off at
+     Amount 0) — Camera Raw's detail panel, measured there with charts
+     and frames (scripts `~/vr180-internal/x6raw-acr/sharp*.py`, data
+     `data/sharp_*.npz`). What was found, and what the stage does:
+     it works on the DEVELOPED picture (its fades follow the output level
+     whatever the tone settings), on `φ = Y^(1/1.8)` of the Rec.709
+     luminance, and scales a pixel's linear RGB by one gain. On an edge
+     the change is a fixed kernel per (Amount, Radius, Detail), read off
+     the response to a small step for 14 × 9 × 8 settings and held as five
+     blurs (`data/raw_sharpen.f32`: `Δ = Σ cⱼ (φ − Gⱼ ∗ φ)`, σ = 0.5, 0.8,
+     1.3, 2.1, 3.4; taps within 0.0015). Then a soft limit, a fade by the
+     pixel's own level (none below φ 0.028, all from 0.204 to 0.851, none
+     above 0.969), limits on how far a pixel of each level may be darkened
+     or lightened (44 measured levels), and Masking = one curve of (edge
+     strength / threshold): the gradient's size spread by a blur of
+     1.2 + 0.5·Radius px, the threshold a table over Masking. GPU:
+     `Device::record_raw_sharpen` right after the development in
+     `record_color_stack_16` (`raw_sharpen_level` / `_blur` / `_apply.wgsl`,
+     four `R32Float` planes, 12 to 15 passes an eye); CPU twin
+     `raw_sharpen::sharpen_picture`. The radius is in pixels of the
+     EXPORTED frame: `ColorStackPlan::raw_pixel_scale` (the GUI sets it
+     from `Settings::export_eye_w`, which `maybe_push_settings` keeps at
+     `export_eye_dims().0`) scales the blurs in a preview. The settings
+     go into the DNG's XMP. Against Camera Raw on three frames (the change
+     each makes; `sharp_app.py`): Detail 25 error 18–34 % of the change,
+     correlation 0.96–0.985; Detail 100 12–15 %, 0.99; Masking 40 / 80
+     23–40 %; Detail 0 60 % (the app changes half as much). NOT
+     reproduced: below Detail 25 Camera Raw also smooths fine texture
+     (edge-preserving, scale-free, median-like; strongest at Detail 0 and
+     large radii — a 1 px line loses 7 to 28 % at Amount 1) and holds a
+     hard step back more than a soft one (at Detail 0 a soft edge gets
+     2.8× what a hard one gets); at Amount 100+ the limiting at big edges
+     is 20–40 % off. Cost: +14 ms a frame at 4096×2048, +24 ms at
+     7680×3840 (Apple silicon).
    - **DNG**: `raw_export.rs` — a frame as a linear DNG with the settings
      as `crs:` XMP (written beside every Snapshot of a raw clip), and the
      export option "DNG sequence" (`ExportOptions::raw_dng_sequence`,
@@ -2720,7 +2755,8 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      the frame's top Whites above zero goes by.
    - **Tests**: `cargo test -p vr180-pipeline --lib raw_ -- --include-ignored`
      (the GPU stages against their CPU twins, the tables and families
-     against Camera Raw's numbers, the keys read off the reduced copy).
+     against Camera Raw's numbers, the keys read off the reduced copy,
+     the sharpening's kernel and limits).
    - **Not done**: no rolling-shutter correction and no horizon (a take
      states neither readout time nor acceleration); raw clips are not in
      stereo auto-align; the development panel, the DNG snapshot and the DNG
@@ -2728,8 +2764,9 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    - **WINDOWS**: shared code; the only gate touched is the pair moved into
      `export_device()` in `app.rs`. To check there: the raw shaders compile
      on D3D12 / Vulkan (the staged one binds six storage buffers and a 3D
-     `Rgba16Float` texture; the measure pass writes `Rgba32Float`), and
-     the `raw_` tests pass on that GPU.
+     `Rgba16Float` texture; the measure pass writes `Rgba32Float`; the
+     sharpening writes `R32Float` storage textures and reads them with
+     `textureLoad`), and the `raw_` tests pass on that GPU.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

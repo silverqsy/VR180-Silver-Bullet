@@ -437,6 +437,12 @@ pub struct Settings {
     /// from the clip's kind; never persisted.
     #[serde(skip)]
     pub raw_source: bool,
+    /// The width of one eye of the frame an export of the clip would write
+    /// now (0 = not known): a raw clip's sharpening counts its radius in
+    /// that frame's pixels, and a preview drawn smaller scales it. Set by
+    /// the app from its export options; never persisted.
+    #[serde(skip)]
+    pub export_eye_w: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -550,6 +556,7 @@ impl Default for Settings {
             ilog_source: false,
             raw: Default::default(),
             raw_source: false,
+            export_eye_w: 0,
         }
     }
 }
@@ -5940,6 +5947,11 @@ fn compose_view_with_color_and_mode(
 ) -> anyhow::Result<(wgpu::Texture, u32, u32)> {
     let mut color_plan = s.build_color_stack();
     color_plan.raw_reference = raw_reference;
+    // A raw clip's sharpening is the export's: a frame drawn at another
+    // size scales its radius.
+    if s.export_eye_w > 0 && eye_w > 0 {
+        color_plan.raw_pixel_scale = eye_w as f32 / s.export_eye_w as f32;
+    }
     // A raw clip's tone keys: the live preview takes the last measurement
     // that came back; a still drawn on demand measures its own frame.
     if let Some(stage) = color_plan.raw_develop.as_mut() {

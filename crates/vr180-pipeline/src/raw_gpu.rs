@@ -13,8 +13,12 @@ const RAW_REDUCE_WGSL: &str = include_str!("shaders/raw_reduce.wgsl");
 const RAW_GRID_BUILD_WGSL: &str = include_str!("shaders/raw_grid_build.wgsl");
 const RAW_GRID_BLUR_WGSL: &str = include_str!("shaders/raw_grid_blur.wgsl");
 const RAW_DEVELOP_LOCAL_WGSL: &str = include_str!("shaders/raw_develop_local.wgsl");
+const RAW_SHARPEN_LEVEL_WGSL: &str = include_str!("shaders/raw_sharpen_level.wgsl");
+const RAW_SHARPEN_BLUR_WGSL: &str = include_str!("shaders/raw_sharpen_blur.wgsl");
+const RAW_SHARPEN_APPLY_WGSL: &str = include_str!("shaders/raw_sharpen_apply.wgsl");
 
 use crate::raw_color::prophoto_luma;
+use crate::raw_sharpen::SharpenConstants;
 use crate::raw_tone::{
     DevelopConstants, DevelopGeometry, FrameStats, LocalCurves, LocalTone, Measure, RawDevelop, ToneKeys, BASE_FALLBACK, BASE_FLOOR,
     BASE_LO, BASE_RANGE, CLIP_FROM, CLIP_TO, CURVE_LO, LOCAL_LO, LOCAL_PER_STOP, LOCAL_SAMPLES, OUT_LO,
@@ -59,6 +63,13 @@ pub(crate) struct RawPipelines {
     develop_local: wgpu::ComputePipeline,
     develop_local_layout: wgpu::BindGroupLayout,
     grid_sampler: wgpu::Sampler,
+    sharpen_level: wgpu::ComputePipeline,
+    sharpen_edge: wgpu::ComputePipeline,
+    sharpen_level_layout: wgpu::BindGroupLayout,
+    sharpen_blur: wgpu::ComputePipeline,
+    sharpen_blur_layout: wgpu::BindGroupLayout,
+    sharpen_apply: wgpu::ComputePipeline,
+    sharpen_apply_layout: wgpu::BindGroupLayout,
     /// What the live preview's measurements have found so far.
     memory: Arc<Mutex<ToneMemory>>,
 }
@@ -133,6 +144,30 @@ struct DevelopLocalParams {
     grid: [f32; 4],
     stage: [f32; 4],
     keyed: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SharpenLevelParams {
+    luma: [f32; 4],
+    floor: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SharpenBlurParams {
+    dir: [i32; 4],
+    coeff: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SharpenApplyParams {
+    luma: [f32; 4],
+    soft: [f32; 4],
+    fade: [f32; 4],
+    mask: [f32; 4],
+    table: [f32; 4],
 }
 
 /// What a raw clip's development is read from when the picture being drawn
@@ -404,6 +439,43 @@ impl RawPipelines {
             ],
         });
         let develop_local = compute_pipeline(device, "raw_develop_local", RAW_DEVELOP_LOCAL_WGSL, "main", &develop_local_layout);
+        // Sharpening of the developed picture: its level, the kernel's
+        // blurs summed, the change put back.
+        let sharpen_level_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raw_sharpen_level_bgl"),
+            entries: &[
+                bgl_texture(0, D2, false),
+                bgl_storage(1, wgpu::TextureFormat::R32Float, D2),
+                bgl_uniform(2, std::mem::size_of::<SharpenLevelParams>()),
+            ],
+        });
+        let sharpen_level = compute_pipeline(device, "raw_sharpen_level", RAW_SHARPEN_LEVEL_WGSL, "level", &sharpen_level_layout);
+        let sharpen_edge = compute_pipeline(device, "raw_sharpen_edge", RAW_SHARPEN_LEVEL_WGSL, "edge", &sharpen_level_layout);
+        let sharpen_blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raw_sharpen_blur_bgl"),
+            entries: &[
+                bgl_texture(0, D2, false),
+                bgl_storage(1, wgpu::TextureFormat::R32Float, D2),
+                bgl_uniform(2, std::mem::size_of::<SharpenBlurParams>()),
+                bgl_storage_buffer(3),
+                bgl_texture(4, D2, false),
+                bgl_texture(5, D2, false),
+            ],
+        });
+        let sharpen_blur = compute_pipeline(device, "raw_sharpen_blur", RAW_SHARPEN_BLUR_WGSL, "main", &sharpen_blur_layout);
+        let sharpen_apply_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raw_sharpen_apply_bgl"),
+            entries: &[
+                bgl_texture(0, D2, false),
+                bgl_storage(1, wgpu::TextureFormat::Rgba16Unorm, D2),
+                bgl_uniform(2, std::mem::size_of::<SharpenApplyParams>()),
+                bgl_texture(3, D2, false),
+                bgl_texture(4, D2, false),
+                bgl_texture(5, D2, false),
+                bgl_storage_buffer(6),
+            ],
+        });
+        let sharpen_apply = compute_pipeline(device, "raw_sharpen_apply", RAW_SHARPEN_APPLY_WGSL, "main", &sharpen_apply_layout);
         let grid_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("raw_grid_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -416,7 +488,9 @@ impl RawPipelines {
         Self {
             demosaic, demosaic_layout, develop, develop_layout, measure, measure_layout,
             reduce, reduce_layout, grid_build, grid_build_layout, grid_blur, grid_blur_layout,
-            develop_local, develop_local_layout, grid_sampler, memory: Arc::default(),
+            develop_local, develop_local_layout, grid_sampler,
+            sharpen_level, sharpen_edge, sharpen_level_layout, sharpen_blur, sharpen_blur_layout, sharpen_apply, sharpen_apply_layout,
+            memory: Arc::default(),
         }
     }
 }
@@ -823,8 +897,10 @@ impl Device {
     /// The per-frame constants of `stage` for the given eyes (measured as
     /// the stage asks). The eyes are one frame: side by side when two.
     /// `reference`: the frame to read instead, when the eyes are another
-    /// view of the clip than its half-equirect.
-    pub fn raw_develop_constants(&self, eyes: &[&wgpu::Texture], reference: Option<&RawReference>, stage: &RawDevelop) -> DevelopConstants {
+    /// view of the clip than its half-equirect. `pixel_scale`: pixels of
+    /// these eyes to one pixel of the frame an export writes (what the
+    /// sharpening's radius is counted in).
+    pub fn raw_develop_constants(&self, eyes: &[&wgpu::Texture], reference: Option<&RawReference>, stage: &RawDevelop, pixel_scale: f32) -> DevelopConstants {
         let reference = reference.filter(|r| !r.eyes.is_empty());
         let stats = match reference {
             Some(r) => self.raw_frame_stats(&r.eyes.iter().collect::<Vec<_>>(), stage),
@@ -841,6 +917,7 @@ impl Device {
                 None => (eye.width() * eyes.len() as u32).max(eye.height()),
             };
         }
+        k.sharpen = stage.settings.sharpen.constants(pixel_scale);
         k
     }
 
@@ -1025,6 +1102,120 @@ impl Device {
         pass.dispatch_workgroups(dst.width().div_ceil(8), dst.height().div_ceil(8), 1);
     }
 
+    /// Record the sharpening of a developed eye: `src` (the development's
+    /// output, sRGB-encoded) → `dst` (`Rgba16Unorm`, the same size). The
+    /// level plane, the kernel's five blurs summed into the change of that
+    /// level, Masking's edge strength when it is on, and the pass that puts
+    /// the change back. CPU twin: [`crate::raw_sharpen::sharpen_picture`].
+    pub(crate) fn record_raw_sharpen(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, dst: &wgpu::Texture, k: &SharpenConstants) {
+        use crate::raw_sharpen::{blur_taps, LIMIT_SAMPLES, LUMA, LUMA_FLOOR, MASK_HI, MASK_LO, MASK_SAMPLES};
+        let pipes = self.raw_pipelines();
+        let (w, h) = (src.width(), src.height());
+        let plane = |label: &str| self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let (level, tmp, sum_a, sum_b) = (plane("raw_sharpen_level"), plane("raw_sharpen_tmp"), plane("raw_sharpen_sum_a"), plane("raw_sharpen_sum_b"));
+        let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let (src_v, dst_v, level_v, tmp_v, sum_v) = (view(src), view(dst), view(&level), view(&tmp), [view(&sum_a), view(&sum_b)]);
+        fn tex<'a>(binding: u32, v: &'a wgpu::TextureView) -> wgpu::BindGroupEntry<'a> {
+            wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) }
+        }
+        let groups = (w.div_ceil(8), h.div_ceil(8));
+        let run = |encoder: &mut wgpu::CommandEncoder, label: &str, pipeline: &wgpu::ComputePipeline, bind: &wgpu::BindGroup| {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, Some(bind), &[]);
+            pass.dispatch_workgroups(groups.0, groups.1, 1);
+        };
+        // The level plane (and, for Masking, the size of its gradient).
+        let level_params = self.write_uniform("raw_sharpen_level_params", &SharpenLevelParams {
+            luma: [LUMA[0], LUMA[1], LUMA[2], 1.0 / k.gamma],
+            floor: [LUMA_FLOOR, 0.0, 0.0, 0.0],
+        });
+        let level_bind = |from: &wgpu::TextureView, to: &wgpu::TextureView| self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raw_sharpen_level_bg"),
+            layout: &pipes.sharpen_level_layout,
+            entries: &[tex(0, from), tex(1, to), wgpu::BindGroupEntry { binding: 2, resource: level_params.as_entire_binding() }],
+        });
+        run(encoder, "raw_sharpen_level", &pipes.sharpen_level, &level_bind(&src_v, &level_v));
+        // One pass of a blur: `mode` as the shader's (0 = the blur itself).
+        let blur = |encoder: &mut wgpu::CommandEncoder, from: &wgpu::TextureView, to: &wgpu::TextureView, sum: &wgpu::TextureView,
+                    taps: &wgpu::Buffer, side: usize, vertical: bool, mode: i32, coeff: f32| {
+            let params = self.write_uniform("raw_sharpen_blur_params", &SharpenBlurParams {
+                dir: [if vertical { 0 } else { 1 }, if vertical { 1 } else { 0 }, side as i32, mode],
+                coeff: [coeff, 0.0, 0.0, 0.0],
+            });
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("raw_sharpen_blur_bg"),
+                layout: &pipes.sharpen_blur_layout,
+                entries: &[
+                    tex(0, from), tex(1, to),
+                    wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: taps.as_entire_binding() },
+                    tex(4, &level_v), tex(5, sum),
+                ],
+            });
+            run(encoder, "raw_sharpen_blur", &pipes.sharpen_blur, &bind);
+        };
+        // The kernel: each blur along x into `tmp`, then along y into the
+        // sum (the two sum planes take turns).
+        let mut held = 0usize;
+        for (n, (sigma, coeff)) in k.sigmas.iter().zip(&k.coeff).enumerate() {
+            let taps = blur_taps(*sigma);
+            let buffer = self.curve_buffer("raw_sharpen_taps", &taps);
+            blur(encoder, &level_v, &tmp_v, &level_v, &buffer, taps.len() - 1, false, 0, 0.0);
+            let next = 1 - held;
+            blur(encoder, &tmp_v, &sum_v[next], if n == 0 { &level_v } else { &sum_v[held] }, &buffer, taps.len() - 1, true, if n == 0 { 2 } else { 1 }, *coeff);
+            held = next;
+        }
+        // Masking: the gradient's size, spread, into the sum plane not held.
+        let free = 1 - held;
+        if let Some(m) = &k.mask {
+            run(encoder, "raw_sharpen_edge", &pipes.sharpen_edge, &level_bind(&level_v, &sum_v[free]));
+            let taps = blur_taps(m.sigma);
+            let buffer = self.curve_buffer("raw_sharpen_mask_taps", &taps);
+            blur(encoder, &sum_v[free], &tmp_v, &level_v, &buffer, taps.len() - 1, false, 0, 0.0);
+            blur(encoder, &tmp_v, &sum_v[free], &level_v, &buffer, taps.len() - 1, true, 0, 0.0);
+        }
+        // The tables: the two limits, then the mask's curve.
+        let mut tables = Vec::with_capacity(2 * LIMIT_SAMPLES + MASK_SAMPLES);
+        tables.extend_from_slice(&k.down);
+        tables.extend_from_slice(&k.lift);
+        match &k.mask {
+            Some(m) => tables.extend_from_slice(&m.curve),
+            None => tables.resize(2 * LIMIT_SAMPLES + MASK_SAMPLES, 1.0),
+        }
+        let tables = self.curve_buffer("raw_sharpen_tables", &tables);
+        let per_log = (MASK_SAMPLES - 1) as f32 / (MASK_HI - MASK_LO);
+        let params = self.write_uniform("raw_sharpen_apply_params", &SharpenApplyParams {
+            luma: [LUMA[0], LUMA[1], LUMA[2], k.gamma],
+            soft: [k.soft, k.q, 0.0, if k.mask.is_some() { 1.0 } else { 0.0 }],
+            fade: k.fade,
+            mask: match &k.mask {
+                Some(m) => [m.gain, 1.0 / m.threshold, MASK_LO, per_log],
+                None => [1.0, 1.0, MASK_LO, per_log],
+            },
+            table: [(LIMIT_SAMPLES - 1) as f32, (MASK_SAMPLES - 1) as f32, 0.0, 0.0],
+        });
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raw_sharpen_apply_bg"),
+            layout: &pipes.sharpen_apply_layout,
+            entries: &[
+                tex(0, &src_v), tex(1, &dst_v),
+                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                tex(3, &level_v), tex(4, &sum_v[held]),
+                tex(5, if k.mask.is_some() { &sum_v[free] } else { &level_v }),
+                wgpu::BindGroupEntry { binding: 6, resource: tables.as_entire_binding() },
+            ],
+        });
+        run(encoder, "raw_sharpen_apply", &pipes.sharpen_apply, &bind);
+    }
+
     /// Develop one camera-linear eye into a new display-referred texture,
     /// with the constants given (see [`Self::raw_develop_constants`]).
     pub fn develop_raw_eye(&self, src: &wgpu::Texture, k: &DevelopConstants) -> wgpu::Texture {
@@ -1145,7 +1336,7 @@ mod tests {
             RawSettings { shadows: 70.0, blacks: 60.0, whites: -40.0, ..Default::default() },
         ] {
             let stage = RawDevelop { camera: RawCamera::X6, settings, measure: Measure::Wait };
-            let mut k = dev.raw_develop_constants(&[&src], None, &stage);
+            let mut k = dev.raw_develop_constants(&[&src], None, &stage, 1.0);
             let local = k.local.as_mut().expect("local stage");
             // A long side that gives more than one pixel per texel of the reduced copy.
             local.long_side = 2048;
@@ -1280,9 +1471,9 @@ mod tests {
         let settings = RawSettings { shadows: 60.0, highlights: -40.0, ..Default::default() };
         let stage = RawDevelop { camera: RawCamera::X6, settings, measure: Measure::Wait };
         let reference = RawReference { eyes: vec![ref_l.clone(), ref_r.clone()], long_side: 1234 };
-        let of_view = dev.raw_develop_constants(&[&view, &view], None, &stage);
-        let of_reference = dev.raw_develop_constants(&[&ref_l, &ref_r], None, &stage);
-        let with_reference = dev.raw_develop_constants(&[&view, &view], Some(&reference), &stage);
+        let of_view = dev.raw_develop_constants(&[&view, &view], None, &stage, 1.0);
+        let of_reference = dev.raw_develop_constants(&[&ref_l, &ref_r], None, &stage, 1.0);
+        let with_reference = dev.raw_develop_constants(&[&view, &view], Some(&reference), &stage, 1.0);
         // Read off the reference, not off the view's own eyes.
         assert_eq!(with_reference.curve, of_reference.curve);
         assert_ne!(with_reference.curve, of_view.curve);
@@ -1295,7 +1486,77 @@ mod tests {
         assert_eq!((a.long_side, b.long_side, c.long_side), (1234, 504, 640));
         // An empty reference is none.
         let none = RawReference { eyes: Vec::new(), long_side: 99 };
-        assert_eq!(dev.raw_develop_constants(&[&view, &view], Some(&none), &stage).local.expect("local").long_side, 640);
+        assert_eq!(dev.raw_develop_constants(&[&view, &view], Some(&none), &stage, 1.0).local.expect("local").long_side, 640);
+    }
+
+    /// The sharpening on the GPU against its CPU twin: a picture with
+    /// edges hard and soft, texture, colour, deep shadows and near-white
+    /// ground, at several settings, with and without Masking, and at a
+    /// preview's scale.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn gpu_sharpening_matches_the_cpu_one() {
+        use crate::raw_sharpen::{sharpen_picture, RawSharpen};
+        let dev = Device::new().expect("device");
+        let (w, h) = (96u32, 80u32);
+        let mut s = 7u32;
+        let mut next = move || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; (s % 10_000) as f32 / 10_000.0 };
+        let picture: Vec<[f32; 3]> = (0..w * h).map(|i| {
+            let (x, y) = ((i % w) as f32, (i / w) as f32);
+            // Columns of ground from near black to near white, a hard edge
+            // between each pair, a soft ramp across the middle rows, some
+            // texture, and a colour that changes down the picture.
+            let ground = [0.02f32, 0.09, 0.2, 0.42, 0.63, 0.8, 0.93, 0.985][(x as usize / 12).min(7)];
+            let ramp = if (30.0..50.0).contains(&y) { 0.25 * ((x - 48.0) / 20.0).tanh() } else { 0.0 };
+            let v = (ground + ramp + 0.03 * (next() - 0.5)).clamp(0.0, 1.0);
+            let tint = y / h as f32;
+            [v * (1.0 - 0.3 * tint), v, v * (0.7 + 0.3 * tint)]
+        }).collect();
+        let px: Vec<u16> = picture.iter().flat_map(|p| [(p[0] * 65535.0).round() as u16, (p[1] * 65535.0).round() as u16, (p[2] * 65535.0).round() as u16, u16::MAX]).collect();
+        let exact: Vec<[f32; 3]> = px.chunks_exact(4).map(|c| [c[0], c[1], c[2]].map(|v| v as f32 / 65535.0)).collect();
+        let src = dev.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test_developed"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        dev.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &src, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&px),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+        for (settings, scale) in [
+            (RawSharpen { amount: 40.0, radius: 1.0, detail: 25.0, masking: 0.0 }, 1.0f32),
+            (RawSharpen { amount: 100.0, radius: 2.0, detail: 55.0, masking: 0.0 }, 1.0),
+            (RawSharpen { amount: 150.0, radius: 3.0, detail: 100.0, masking: 0.0 }, 1.0),
+            (RawSharpen { amount: 70.0, radius: 0.5, detail: 0.0, masking: 0.0 }, 1.0),
+            (RawSharpen { amount: 100.0, radius: 1.0, detail: 25.0, masking: 40.0 }, 1.0),
+            (RawSharpen { amount: 60.0, radius: 1.4, detail: 40.0, masking: 85.0 }, 1.0),
+            (RawSharpen { amount: 80.0, radius: 1.0, detail: 25.0, masking: 30.0 }, 0.25),
+            (RawSharpen { amount: 80.0, radius: 3.0, detail: 60.0, masking: 0.0 }, 2.0),
+        ] {
+            let k = settings.constants(scale).expect("on");
+            let dst = dev.new_linear_eye_texture(w, h);
+            let mut encoder = dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test_sharpen") });
+            dev.record_raw_sharpen(&mut encoder, &src, &dst, &k);
+            dev.queue.submit(Some(encoder.finish()));
+            let bytes = dev.read_texture_rgb48(&dst, w, h).expect("readback");
+            let got: Vec<f32> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]) as f32 / 65535.0).collect();
+            let want = sharpen_picture(&exact, w as usize, h as usize, &k);
+            let mut worst = 0f32;
+            let mut moved = 0usize;
+            for (i, (g, wv)) in got.chunks_exact(3).zip(&want).enumerate() {
+                for c in 0..3 {
+                    worst = worst.max((g[c] - wv[c]).abs());
+                }
+                if (wv[1] - exact[i][1]).abs() > 2e-3 { moved += 1; }
+            }
+            // A few 16-bit codes: the two do the same sums in another order.
+            assert!(worst < 6e-4, "{settings:?} at scale {scale}: worst difference {worst}");
+            assert!(moved > (w * h / 20) as usize, "{settings:?} at scale {scale}: only {moved} pixels changed");
+        }
     }
 
     #[test]

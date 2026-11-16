@@ -5713,6 +5713,11 @@ pub struct ColorStackPlan {
     /// frame): see [`crate::raw_gpu::RawReference`]. `None`: the eyes
     /// themselves, which is right for the half-equirect.
     pub raw_reference: Option<crate::raw_gpu::RawReference>,
+    /// Pixels of the eyes the stack is given to one pixel of the frame an
+    /// export writes: 1 for an export, less for a preview drawn smaller. A
+    /// raw clip's sharpening counts its radius in the export's pixels
+    /// ([`crate::raw_sharpen`]).
+    pub raw_pixel_scale: f32,
 }
 
 impl Default for ColorStackPlan {
@@ -5731,6 +5736,7 @@ impl Default for ColorStackPlan {
             eye_scale: 1.0,
             raw_develop: None,
             raw_reference: None,
+            raw_pixel_scale: 1.0,
         }
     }
 }
@@ -9210,6 +9216,13 @@ impl Device {
             self.record_raw_develop(encoder, src, &next, constants);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
+            // The developed picture's sharpening, when it is on.
+            if let Some(sharpen) = &constants.sharpen {
+                let next = make_16("stack16_raw_sharp", w, h);
+                self.record_raw_sharpen(encoder, &intermediates[intermediates.len() - 1], &next, sharpen);
+                intermediates.push(next);
+                current_idx = Some(intermediates.len() - 1);
+            }
         }
 
         // 0. Automatic eye-exposure offset — sensor-side, so before every
@@ -9364,7 +9377,7 @@ impl Device {
         } else { None };
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(12);
         // A raw source: this frame's tone keys, read off the eye itself.
-        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[src], plan.raw_reference.as_ref(), stage));
+        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[src], plan.raw_reference.as_ref(), stage, plan.raw_pixel_scale));
         let idx = self.record_color_stack_16(
             &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates, None, raw.as_ref());
         self.queue.submit(Some(encoder.finish()));
@@ -9401,7 +9414,7 @@ impl Device {
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(24);
         // A raw source: ONE set of tone keys for the frame, read off both
         // eyes together, so the two are developed alike.
-        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[left, right], plan.raw_reference.as_ref(), stage));
+        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[left, right], plan.raw_reference.as_ref(), stage, plan.raw_pixel_scale));
         let li = self.record_color_stack_16(
             &mut encoder, left, w, h, &plan.for_eye(true), &lut_resources, &mut intermediates,
             matching.map(|s| (s, 0)), raw.as_ref());

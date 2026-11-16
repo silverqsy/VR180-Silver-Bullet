@@ -76,11 +76,17 @@ pub struct RawSettings {
     pub shadows: f32,
     pub whites: f32,
     pub blacks: f32,
+    /// Sharpening of the developed picture (the detail panel's four
+    /// controls): see [`crate::raw_sharpen`].
+    pub sharpen: crate::raw_sharpen::RawSharpen,
 }
 
 impl Default for RawSettings {
     fn default() -> Self {
-        Self { temperature: None, tint: None, exposure: 0.0, contrast: 0.0, highlights: 0.0, shadows: 0.0, whites: 0.0, blacks: 0.0 }
+        Self {
+            temperature: None, tint: None, exposure: 0.0, contrast: 0.0, highlights: 0.0, shadows: 0.0, whites: 0.0, blacks: 0.0,
+            sharpen: crate::raw_sharpen::RawSharpen::default(),
+        }
     }
 }
 
@@ -438,7 +444,7 @@ impl RawDevelop {
                 long_side: 0,
             }
         });
-        DevelopConstants { geometry, gain: gain as f32, curve: curve.into(), curve_hi: hi as f32, white_point: plain_white as f32, dark_key: dark_key as f32, floor, local: staged }
+        DevelopConstants { geometry, gain: gain as f32, curve: curve.into(), curve_hi: hi as f32, white_point: plain_white as f32, dark_key: dark_key as f32, floor, local: staged, sharpen: None }
     }
 
     /// The frame's tone curve with Contrast in: output light over the value
@@ -670,6 +676,10 @@ pub struct DevelopConstants {
     pub floor: f32,
     /// Shadows / Highlights, when the settings move them.
     pub local: Option<LocalTone>,
+    /// The sharpening of the developed picture, when it is on. Not set by
+    /// [`RawDevelop::constants_for`], which does not know the size the
+    /// frame is drawn at: see [`crate::gpu::Device::raw_develop_constants`].
+    pub sharpen: Option<crate::raw_sharpen::SharpenConstants>,
 }
 
 /// log₂ of the first sample of the staged development's tables over a

@@ -26,8 +26,9 @@ use crate::{Error, Result};
 
 /// A raw converter's settings for a frame, as the XMP packet it reads them
 /// from: the clip's raw development settings under Camera Raw's own
-/// property names (process version 2012). Detail controls that would
-/// change the pixels beyond this app's rendering are left at zero.
+/// property names (process version 2012), the sharpening among them.
+/// Noise reduction, which this app's rendering has none of, is left at
+/// zero.
 pub fn develop_xmp(settings: &RawSettings, camera: &RawCamera) -> String {
     let (shot_k, shot_tint) = camera.as_shot_temperature();
     let white = match (settings.temperature, settings.tint) {
@@ -44,7 +45,8 @@ pub fn develop_xmp(settings: &RawSettings, camera: &RawCamera) -> String {
             "<rdf:Description rdf:about=\"\" xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" ",
             "crs:ProcessVersion=\"15.4\" {white} crs:Exposure2012=\"{exposure:+.2}\" crs:Contrast2012=\"{contrast}\" ",
             "crs:Highlights2012=\"{highlights}\" crs:Shadows2012=\"{shadows}\" crs:Whites2012=\"{whites}\" crs:Blacks2012=\"{blacks}\" ",
-            "crs:Sharpness=\"0\" crs:LuminanceSmoothing=\"0\" crs:ColorNoiseReduction=\"0\" crs:HasSettings=\"True\"/>",
+            "crs:Sharpness=\"{sharpness:.0}\" crs:SharpenRadius=\"{radius:+.1}\" crs:SharpenDetail=\"{detail:.0}\" crs:SharpenEdgeMasking=\"{masking:.0}\" ",
+            "crs:LuminanceSmoothing=\"0\" crs:ColorNoiseReduction=\"0\" crs:HasSettings=\"True\"/>",
             "</rdf:RDF></x:xmpmeta>\n<?xpacket end=\"w\"?>"),
         white = white,
         exposure = settings.exposure,
@@ -53,6 +55,10 @@ pub fn develop_xmp(settings: &RawSettings, camera: &RawCamera) -> String {
         shadows = amount(settings.shadows),
         whites = amount(settings.whites),
         blacks = amount(settings.blacks),
+        sharpness = if settings.sharpen.is_off() { 0.0 } else { settings.sharpen.amount.clamp(1.0, 150.0) },
+        radius = settings.sharpen.radius.clamp(0.5, 3.0),
+        detail = settings.sharpen.detail.clamp(0.0, 100.0),
+        masking = settings.sharpen.masking.clamp(0.0, 100.0),
     )
 }
 
@@ -323,6 +329,11 @@ mod tests {
         let x = develop_xmp(&RawSettings::default(), &cam);
         assert!(x.contains(r#"crs:WhiteBalance="As Shot""#) && x.contains(r#"crs:Exposure2012="+0.00""#), "{x}");
         assert!(x.contains(r#"crs:Shadows2012="0""#) && x.contains(r#"crs:ProcessVersion="15.4""#));
+        // No sharpening: the converter's own stays off too.
+        assert!(x.contains(r#"crs:Sharpness="0" crs:SharpenRadius="+1.0" crs:SharpenDetail="25" crs:SharpenEdgeMasking="0""#), "{x}");
+        let sharp = RawSettings { sharpen: crate::raw_sharpen::RawSharpen { amount: 55.0, radius: 1.4, detail: 30.0, masking: 20.0 }, ..Default::default() };
+        let x2 = develop_xmp(&sharp, &cam);
+        assert!(x2.contains(r#"crs:Sharpness="55" crs:SharpenRadius="+1.4" crs:SharpenDetail="30" crs:SharpenEdgeMasking="20""#), "{x2}");
         let s = RawSettings { temperature: Some(5200.0), exposure: -1.25, shadows: 40.0, highlights: -65.0, ..Default::default() };
         let x = develop_xmp(&s, &cam);
         assert!(x.contains(r#"crs:WhiteBalance="Custom" crs:Temperature="5200""#), "{x}");

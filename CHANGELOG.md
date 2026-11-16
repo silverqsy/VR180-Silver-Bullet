@@ -31,6 +31,24 @@ converter's controls for it, and every frame can be had as a DNG.
     slider and coarser beyond it;
   - a grade with every slider in use lands within one to two steps for
     moderate amounts, three to five at the extremes.
+- **Sharpening.** The detail panel's four controls, Amount, Radius, Detail
+  and Masking, on the developed picture, done the way Camera Raw does it:
+  on the luminance alone, fading out toward black and toward white, held
+  back at strong edges. The kernel was read off Camera Raw itself for 1008
+  combinations of Amount, Radius and Detail. Measured on frames of sample
+  takes as the change each makes to the same frame:
+  - from Detail 25 up the two changes correlate at 0.96 to 0.99 and differ
+    by 12 to 34 % of their size (least at high Detail), with the overall
+    strength within a tenth;
+  - with Masking in use, 23 to 40 %;
+  - below Detail 25 Camera Raw also smooths fine texture and holds hard
+    edges back. That part is not reproduced: at Detail 0 the app changes
+    the picture about half as much, and fine texture stays crisper.
+
+  The radius is in pixels of the exported frame, so the preview shows the
+  export's picture reduced: judge sharpening in the zoom view or on a
+  snapshot. It adds about half to the export time at full size. The
+  settings travel in the DNG.
 - **It follows the footage.** The frame's brightest and darkest levels and
   the spread of its levels are measured on every frame, as a raw converter
   does per picture; over three seconds of a sample take this adds no
