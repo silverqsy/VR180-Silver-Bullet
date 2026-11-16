@@ -188,14 +188,18 @@ const CURVE_FIRST: f32 = -12.0;
 const CURVE_STEP: f32 = 0.25;
 const CURVE_POINTS: usize = 73;
 
+/// The most headroom the curves tell apart, in stops.
+pub const HEADROOM_MAX: f32 = 4.0;
+
 /// What the curves are derived from: the levels at [`RANKS`] and three
 /// means of the copy, all relative to the anchor (the power mean, p = 0.6,
-/// of the copy's luminance), and the anchor itself.
-fn curve_inputs(sorted: &[f32]) -> (Vec<f32>, f32) {
+/// of the copy's luminance), then `headroom`; and the anchor itself.
+fn curve_inputs(sorted: &[f32], headroom: f32) -> (Vec<f32>, f32) {
     let anchor = power_mean(sorted, 0.6);
     let mean = sorted.iter().map(|l| *l as f64).sum::<f64>() / sorted.len() as f64;
     let mut x: Vec<f32> = RANKS.iter().map(|q| (quantile(sorted, *q) - anchor) as f32).collect();
     x.extend([power_mean(sorted, 1.0) - anchor, power_mean(sorted, 0.3) - anchor, mean - anchor].map(|v| v as f32));
+    x.push(headroom.clamp(0.0, HEADROOM_MAX));
     (x, anchor as f32)
 }
 
@@ -252,16 +256,21 @@ fn curve_nets() -> &'static [CurveNet] {
 }
 
 /// The Shadows / Highlights curves of a frame whose reduced copy has the
-/// log₂ levels `levels` (sorted rising, exposure applied).
+/// log₂ levels `levels` (sorted rising, exposure applied) and whose top
+/// level sits `headroom` stops below the white point.
 ///
 /// Camera Raw's curves have one pivot for both sliders. Shadows: a gain at
 /// the pivot that falls linearly to zero at the frame's top and, below the
 /// pivot, rises to a plateau near the frame's black; Highlights mirrors it
 /// about the pivot. Where the pivot lies and how strong the branches are
 /// follows the copy's whole distribution, by a rule this does not know:
-/// networks fitted to the curves Camera Raw gave some 1600 distributions
-/// (real frames' and synthetic ones) stand in for it.
-pub fn local_curves(levels: &[f32]) -> LocalCurves {
+/// networks fitted to the curves Camera Raw gave 1400 distributions (real
+/// frames' and synthetic ones) stand in for it. They give the three single
+/// curves and the three numbers by which the sliders act on each other
+/// ([`LocalCurves`]). The curves follow the frame down the scale unchanged
+/// (a darker exposure of the same frame has the same curves lower), but
+/// for what happens next to white: hence the headroom.
+pub fn local_curves(levels: &[f32], headroom: f32) -> LocalCurves {
     if levels.len() < 8 {
         return LocalCurves::flat();
     }
@@ -269,14 +278,12 @@ pub fn local_curves(levels: &[f32]) -> LocalCurves {
     if top - bottom < 0.05 {
         return LocalCurves::flat();
     }
-    let (x, anchor) = curve_inputs(levels);
+    let (x, anchor) = curve_inputs(levels, headroom);
     let nets = curve_nets();
-    let mut y: Vec<f32> = Vec::new();
+    let mut y = vec![0f32; 3 * CURVE_POINTS + 3];
     for net in nets {
         let out = net.eval(&x);
-        if y.is_empty() {
-            y = vec![0.0; out.len()];
-        }
+        assert_eq!(out.len(), y.len(), "raw_local_curves.f32: three curves and three numbers a network");
         for (acc, v) in y.iter_mut().zip(&out) {
             *acc += v / nets.len() as f32;
         }
@@ -291,15 +298,15 @@ pub fn local_curves(levels: &[f32]) -> LocalCurves {
             points[k] * (1.0 - f) + points[k + 1] * f
         }).collect()
     };
-    // Networks give Shadows +100 and Highlights −100, and, the later ones,
-    // Highlights +100 and the two pairs.
-    match y.len() / CURVE_POINTS {
-        5 => LocalCurves { shadows: curve(0), highlights: curve(1), highlights_up: curve(2), both_down: curve(3), both_up: curve(4) },
-        _ => {
-            let down = curve(1);
-            let up = down.iter().map(|v| -v).collect();
-            LocalCurves::additive(curve(0), down, up)
-        }
+    LocalCurves {
+        shadows: curve(0),
+        highlights: curve(1),
+        highlights_up: curve(2),
+        tilt_top: y[3 * CURVE_POINTS],
+        tilt_bottom: y[3 * CURVE_POINTS + 1],
+        shift: y[3 * CURVE_POINTS + 2],
+        top,
+        bottom,
     }
 }
 
@@ -351,55 +358,82 @@ mod tests {
     #[test]
     fn curves_of_a_frame() {
         // A flat frame has none.
-        let c = local_curves(&[-3.0; 100]);
+        let c = local_curves(&[-3.0; 100], 3.0);
         assert_eq!(c, LocalCurves::flat());
         // Levels spread evenly over nine stops (Camera Raw on such a chart,
-        // as gains on the black-subtracted signal: pivot 3.3 stops below the
-        // top; Shadows +0.13 there, +1.5 at −5, +2.7 at −7, next to nothing
-        // at the top; Highlights −0.14 at the pivot, −1.0 at −2, −1.7 at
-        // the top, nothing at the black end).
+        // as gains on the black-subtracted signal: pivot 3.2 stops below the
+        // top with ±0.16 there; Shadows +1.5 at −5, +2.7 at −7, next to
+        // nothing at the top; Highlights −1.0 at −2, −1.8 at the top,
+        // nothing at the black end; +100 the mirror of −100 before the
+        // limiter; together the same way +0.31 everywhere; in opposition
+        // +0.24 at the top, −0.20 at the black end).
         let levels: Vec<f32> = (0..900).map(|i| -9.0 + 0.01 * i as f32).collect();
-        let c = local_curves(&levels);
+        let c = local_curves(&levels, 0.0);
         let at = |curve: &[f32], l: f32| curve[((l - LOCAL_LO) * LOCAL_PER_STOP).round() as usize];
-        for (l, want, tol) in [(-0.25, 0.03, 0.12), (-3.0, 0.13, 0.15), (-5.0, 1.47, 0.3), (-7.0, 2.7, 0.5)] {
+        for (l, want, tol) in [(-0.25, 0.03, 0.12), (-3.0, 0.14, 0.15), (-5.0, 1.47, 0.3), (-7.0, 2.7, 0.5)] {
             assert!((at(&c.shadows, l) - want).abs() < tol, "shadows at {l}: {} vs {want}", at(&c.shadows, l));
         }
-        for (l, want, tol) in [(-8.0, -0.05, 0.12), (-4.0, -0.13, 0.15), (-2.0, -1.0, 0.3), (-0.25, -1.7, 0.4)] {
+        for (l, want, tol) in [(-8.0, -0.05, 0.12), (-4.0, -0.14, 0.15), (-2.0, -1.0, 0.3), (-0.25, -1.8, 0.4)] {
             assert!((at(&c.highlights, l) - want).abs() < tol, "highlights at {l}: {} vs {want}", at(&c.highlights, l));
         }
+        for (l, want, tol) in [(-8.0, 0.05, 0.12), (-2.0, 1.0, 0.3), (-0.5, 1.8, 0.5)] {
+            assert!((at(&c.highlights_up, l) - want).abs() < tol, "highlights up at {l}: {} vs {want}", at(&c.highlights_up, l));
+        }
+        assert!((c.pivot() + 3.2).abs() < 0.5, "pivot {}", c.pivot());
+        assert!((c.shift - 0.31).abs() < 0.15 && (c.tilt_top - 0.24).abs() < 0.15 && (c.tilt_bottom + 0.25).abs() < 0.2, "{} {} {}", c.shift, c.tilt_top, c.tilt_bottom);
+        assert!((c.top + 0.01).abs() < 1e-4 && c.bottom == -9.0);
         // Level outside the frame's own range.
         assert_eq!(at(&c.shadows, -12.0), at(&c.shadows, -9.0));
-        assert_eq!(at(&c.highlights, 2.0), at(&c.highlights, 0.0));
-        // The same frame two stops darker: the same curves two stops lower.
+        assert_eq!(at(&c.highlights, 2.0), at(&c.highlights, -0.01));
+        // The same frame two stops darker with as much room above it: the
+        // same curves two stops lower.
         let darker: Vec<f32> = levels.iter().map(|l| l - 2.0).collect();
-        let d = local_curves(&darker);
+        let d = local_curves(&darker, 0.0);
         for l in [-8.0f32, -6.0, -4.0, -2.0, -1.0] {
             assert!((at(&d.shadows, l - 2.0) - at(&c.shadows, l)).abs() < 0.02 && (at(&d.highlights, l - 2.0) - at(&c.highlights, l)).abs() < 0.02);
         }
+        assert!((d.shift - c.shift).abs() < 1e-4 && (d.pivot() - c.pivot() + 2.0).abs() < 0.02);
         assert_eq!(c.gain(50.0, 0.0)[100], 0.5 * c.shadows[100]);
         assert_eq!(c.gain(0.0, -100.0)[200], c.highlights[200]);
         assert_eq!(c.gain(0.0, 100.0)[200], c.highlights_up[200]);
     }
 
     #[test]
-    fn two_sliders_meet_at_their_pair() {
-        let ramp = |k: f32| -> Vec<f32> { (0..LOCAL_SAMPLES).map(|i| k * i as f32).collect() };
-        let c = LocalCurves { shadows: ramp(1.0), highlights: ramp(-2.0), highlights_up: ramp(3.0), both_down: ramp(-0.5), both_up: ramp(5.0) };
-        let at = |s: f32, h: f32| c.gain(s, h)[10] / 10.0;
-        let near = |a: f32, b: f32| (a - b).abs() < 1e-5;
+    fn the_two_sliders_together() {
+        // A frame from −16 to 0 with, `t` stops above its bottom, Shadows
+        // 1 − t/4 and Highlights −t/8: they cancel at t = 8/3.
+        let level = |i: usize| LOCAL_LO + i as f32 / LOCAL_PER_STOP;
+        let t = |i: usize| level(i).clamp(-16.0, 0.0) + 16.0;
+        let c = LocalCurves {
+            shadows: (0..LOCAL_SAMPLES).map(|i| 1.0 - t(i) / 4.0).collect(),
+            highlights: (0..LOCAL_SAMPLES).map(|i| -t(i) / 8.0).collect(),
+            highlights_up: (0..LOCAL_SAMPLES).map(|i| t(i) / 4.0).collect(),
+            tilt_top: 0.6, tilt_bottom: -0.3, shift: 0.5, top: 0.0, bottom: -16.0,
+        };
+        let pivot = -16.0 + 8.0 / 3.0;
+        assert!((c.pivot() - pivot).abs() < 1e-3, "{}", c.pivot());
+        let near = |a: f32, b: f32| (a - b).abs() < 2e-4;
+        let (top, low) = (256usize, 0usize);          // level 0 and level −16
         // Either slider alone, and Shadows below zero.
-        assert!(near(at(100.0, 0.0), 1.0) && near(at(-40.0, 0.0), -0.4) && near(at(0.0, -100.0), -2.0) && near(at(0.0, 50.0), 1.5));
-        // The diagonals: the pair's curve, scaled with the amount.
-        assert!(near(at(100.0, -100.0), -0.5) && near(at(50.0, -50.0), -0.25));
-        assert!(near(at(100.0, 100.0), 5.0) && near(at(30.0, 30.0), 1.5));
-        // Off the diagonal: the common part at the pair, the rest alone.
-        assert!(near(at(100.0, -50.0), 0.5 * 1.0 + 0.5 * -0.5));
-        assert!(near(at(50.0, -100.0), 0.5 * -2.0 + 0.5 * -0.5));
-        assert!(near(at(20.0, 100.0), 0.8 * 3.0 + 0.2 * 5.0));
-        // Shadows down: the mirror of the opposite pair.
-        assert!(near(at(-100.0, 100.0), 0.5) && near(at(-100.0, -100.0), -5.0));
-        // Curves made of the single ones add.
-        let a = LocalCurves::additive(ramp(1.0), ramp(-2.0), ramp(3.0));
-        assert!(near(a.gain(100.0, -100.0)[10] / 10.0, -1.0) && near(a.gain(60.0, 60.0)[10] / 10.0, 2.4));
+        assert!(near(c.gain(100.0, 0.0)[low], 1.0) && near(c.gain(-40.0, 0.0)[low], -0.4));
+        assert!(near(c.gain(0.0, -100.0)[top], -2.0) && near(c.gain(0.0, 50.0)[top], 2.0));
+        // The same way: the sum and the shift; its part off the diagonal.
+        assert!(near(c.gain(100.0, 100.0)[top], -3.0 + 4.0 + 0.5) && near(c.gain(100.0, 100.0)[low], 1.0 + 0.5));
+        assert!(near(c.gain(50.0, 50.0)[low], 0.5 + 0.25));
+        assert!(near(c.gain(100.0, 25.0)[low], 1.0 + 0.5 * 0.25 * 0.25f32.powf(0.25)));
+        // Both down: the mirror, with Highlights −100's own curve.
+        assert!(near(c.gain(-100.0, -100.0)[top], 3.0 - 2.0 - 0.5));
+        // In opposition: the tilt, whole at the two ends, none at the pivot.
+        assert!(near(c.gain(100.0, -100.0)[top], -3.0 - 2.0 + 0.6) && near(c.gain(100.0, -100.0)[low], 1.0 - 0.3));
+        let at_pivot = ((pivot - LOCAL_LO) * LOCAL_PER_STOP).round() as usize;
+        assert!(c.gain(100.0, -100.0)[at_pivot].abs() < 0.03);
+        // Off the diagonal: above the pivot by Shadows' amount at most,
+        // below it by Highlights'.
+        assert!(near(c.gain(100.0, -25.0)[top], -3.0 - 0.5 + 0.5 * 0.6) && near(c.gain(100.0, -25.0)[low], 1.0 - 0.25 * 0.3));
+        assert!(near(c.gain(25.0, -100.0)[top], -0.75 - 2.0 + 0.25 * 0.6) && near(c.gain(25.0, -100.0)[low], 0.25 - 0.5 * 0.3));
+        // Shadows down with Highlights up: the mirror.
+        assert!(near(c.gain(-100.0, 100.0)[low], -1.0 + 0.3) && near(c.gain(-100.0, 100.0)[top], 3.0 + 4.0 - 0.6));
+        // Level outside the frame's range.
+        assert_eq!(c.gain(100.0, -100.0)[300], c.gain(100.0, -100.0)[top]);
     }
 }

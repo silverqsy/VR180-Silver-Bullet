@@ -13,14 +13,14 @@
 //!    channel is rebuilt from the ones that still read, so a neutral goes
 //!    on rising to the level at which its LAST channel clips: the sensor's
 //!    white `W`.
-//! 2. **White point.** A shoulder above 0.25 maps `W*` to 1 (a table
-//!    measured over `W*`), where `W*` is the sensor's white, but at most
-//!    twice the frame's own maximum and at least 1. At `W* = 1` it does
-//!    nothing.
-//! 3. **Default black.** Shadows are pulled down by an amount that follows
+//! 2. **Default black.** Shadows are pulled down by an amount that follows
 //!    the frame's darkest level (a table measured over that level): from a
 //!    quarter of a per cent at the very bottom to the plain DNG black point
 //!    of 0.005 once the darkest level is above 2⁻⁷.
+//! 3. **White point.** A shoulder above 0.25 maps `W*` to 1 (a table
+//!    measured over `W*`), where `W*` is the sensor's white, but at most
+//!    twice the frame's own maximum and at least 1. At `W* = 1` it does
+//!    nothing.
 //! 4. **The default tone curve** of the DNG reference rendering (measured
 //!    node by node; it is the DNG SDK's default curve).
 //!
@@ -33,16 +33,27 @@
 //!
 //! Then: ProPhoto → Rec.709 primaries, clipped to 0..1, sRGB encoding.
 //!
-//! **Shadows and Highlights** are a gain on the signal the default black
-//! has already been taken off, the same for the three channels, and it is
-//! local: `gain = curve(base)`, where `base` is the pixel's level smoothed
-//! across what surrounds it without crossing strong edges (a bilateral
-//! grid of log₂ luminance: cells [`BASE_CELL`] of the frame's long side by
+//! **Shadows and Highlights** are a gain between the default black and the
+//! white point (measured with exposure series: the gain is on the signal
+//! the default black has been taken off, ahead of the white point's
+//! shoulder), the same for the three channels, and it is local:
+//! `gain = curve(base)`, where `base` is the pixel's level smoothed across
+//! what surrounds it without crossing strong edges (a bilateral grid of
+//! log₂ luminance: cells [`BASE_CELL`] of the frame's long side by
 //! [`BASE_RANGE`] stops), so texture keeps its contrast and an object is
-//! lifted as a whole. The curve belongs to the frame: Camera Raw derives it
-//! from a reduced copy of the picture ([`FrameStats::levels`]), and
-//! [`local_curves`] reproduces what it derives. The gain is linear in the
-//! slider (measured: half the slider is half the gain, in stops).
+//! lifted as a whole. The curves belong to the frame: Camera Raw derives
+//! them from a reduced copy of the picture ([`FrameStats::levels`]), and
+//! [`local_curves`] reproduces what it derives ([`LocalCurves`] has the
+//! rules by which the two sliders combine). Two more things follow the
+//! gain:
+//!
+//! - the **white point** is that of the frame with the gain in (twice its
+//!   brightest value, within the same bounds), so pulling the highlights
+//!   down relaxes the shoulder and raising them tightens it;
+//! - a gain above zero is **limited toward the white point**: with `r`
+//!   stops between the pixel and the white point, a gain up to `r/2` is
+//!   taken whole and a larger gain `G` becomes `r − r²/(4G)`, so nothing is
+//!   pushed through white ([`limit_gain`]).
 
 use crate::raw_color::{apply, prophoto_luma, prophoto_to_rec709, xy_from_temperature, RawCamera, Xy, M3};
 pub use crate::raw_local::local_curves;
@@ -73,13 +84,15 @@ impl Default for RawSettings {
     }
 }
 
-/// What the rendering reads off the frame itself, on a reduced copy 128
-/// cells along the frame's longer side, in scene values at exposure 0.
+/// What the rendering reads off the frame itself, on a reduced copy some
+/// 126 cells along the frame's longer side, in scene values at exposure 0.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ToneKeys {
     /// The brightest channel of any cell.
     pub max: f32,
-    /// The 0.1th percentile of the cells' luminance: the frame's darkest level.
+    /// The luminance of the darkest cell: the frame's darkest level.
+    /// (Measured on frames: the default black follows the darkest cell, not
+    /// a low percentile of the cells — half a stop to a stop lower.)
     pub dark: f32,
 }
 
@@ -96,12 +109,7 @@ impl ToneKeys {
         }
         let luma = prophoto_luma().map(|v| v as f32);
         let max = cells.iter().flat_map(|c| c.iter().copied()).fold(0f32, f32::max);
-        let mut y: Vec<f32> = cells.iter().map(|c| (c[0] * luma[0] + c[1] * luma[1] + c[2] * luma[2]).max(0.0)).collect();
-        y.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        // Linear between the two cells the rank falls between.
-        let rank = 0.001 * (y.len() - 1) as f32;
-        let (i, f) = (rank.floor() as usize, rank.fract());
-        let dark = y[i] * (1.0 - f) + y[(i + 1).min(y.len() - 1)] * f;
+        let dark = cells.iter().map(|c| (c[0] * luma[0] + c[1] * luma[1] + c[2] * luma[2]).max(0.0)).fold(f32::MAX, f32::min);
         Some(Self { max, dark })
     }
 }
@@ -115,12 +123,19 @@ pub struct FrameStats {
     /// frame's long side, averaged in log), at exposure 0, sorted rising.
     /// Empty when nothing was measured.
     pub levels: std::sync::Arc<[f32]>,
+    /// The brightest value at each level: for sample `i` of a local curve
+    /// ([`LOCAL_SAMPLES`] of them), the brightest channel of the key cells
+    /// whose own level is nearest to that sample's, 0 where there is none;
+    /// scene values at exposure 0. What the white point of the frame with
+    /// Shadows / Highlights in is found from. Empty when nothing was
+    /// measured.
+    pub peaks: std::sync::Arc<[f32]>,
 }
 
 impl FrameStats {
     /// A frame nothing is known about.
     pub fn unknown() -> Self {
-        Self { keys: ToneKeys::UNKNOWN, levels: Vec::new().into() }
+        Self { keys: ToneKeys::UNKNOWN, levels: Vec::new().into(), peaks: Vec::new().into() }
     }
 }
 
@@ -148,62 +163,111 @@ pub const LOCAL_PER_STOP: f32 = 16.0;
 pub const LOCAL_SAMPLES: usize = 321;
 
 /// The frame's Shadows / Highlights curves: log₂ gain at full slider over
-/// the base level, [`LOCAL_SAMPLES`] samples from [`LOCAL_LO`].
+/// the base level ([`LOCAL_SAMPLES`] samples from [`LOCAL_LO`]), and what the
+/// two sliders do to each other.
 ///
-/// The two sliders do not simply add in Camera Raw: moved together they
-/// give their own curve (Shadows +100 with Highlights −100 is less than the
-/// two alone, with Highlights +100 more), which along the diagonal scales
-/// with the amount like the single ones do.
+/// Measured on Camera Raw with every pair of settings (charts whose levels
+/// are spread like a frame's):
+///
+/// - Either slider alone is linear in the slider, in stops. Shadows −100 is
+///   the negative of +100. Highlights +100 has its own curve near the
+///   frame's top (the −100 one levels off there, the +100 one does not);
+///   it is kept here as it is before the white limiter ([`limit_gain`]).
+/// - The two curves share a pivot: the level at which Shadows +100 and
+///   Highlights −100 cancel.
+/// - **Both the same way** (both up, or both down): the sum of the two,
+///   plus one constant over the whole range ([`Self::shift`], about twice
+///   the gain at the pivot): the picture as a whole goes further.
+/// - **In opposition** (one up, one down): the sum, plus a tilt about the
+///   pivot — two straight lines, from nothing at the pivot to
+///   [`Self::tilt_top`] at the frame's top and [`Self::tilt_bottom`] at its
+///   black end: each slider alone holds its far end still, together they
+///   let go of it.
+/// - Away from the corners these additions scale with the smaller of the
+///   two amounts, bent toward the larger (see [`Self::gain`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalCurves {
     /// Shadows +100 (−100 is its negative).
     pub shadows: Vec<f32>,
     /// Highlights −100.
     pub highlights: Vec<f32>,
-    /// Highlights +100.
+    /// Highlights +100, before the white limiter.
     pub highlights_up: Vec<f32>,
-    /// Shadows +100 with Highlights −100.
-    pub both_down: Vec<f32>,
-    /// Shadows +100 with Highlights +100.
-    pub both_up: Vec<f32>,
+    /// What Shadows +100 with Highlights −100 add to their sum at the
+    /// frame's top and at its black end, in stops.
+    pub tilt_top: f32,
+    pub tilt_bottom: f32,
+    /// What Shadows +100 with Highlights +100 add to their sum, in stops.
+    pub shift: f32,
+    /// The frame's own range: the levels (log₂) of its top and of its black
+    /// end.
+    pub top: f32,
+    pub bottom: f32,
 }
 
 impl LocalCurves {
     /// No gain anywhere.
     pub fn flat() -> Self {
         let z = || vec![0.0; LOCAL_SAMPLES];
-        Self { shadows: z(), highlights: z(), highlights_up: z(), both_down: z(), both_up: z() }
+        Self { shadows: z(), highlights: z(), highlights_up: z(), tilt_top: 0.0, tilt_bottom: 0.0, shift: 0.0, top: 0.0, bottom: 0.0 }
     }
 
-    /// Curves from the three single-slider ones: together the sliders add.
-    pub fn additive(shadows: Vec<f32>, highlights: Vec<f32>, highlights_up: Vec<f32>) -> Self {
-        let both_down = shadows.iter().zip(&highlights).map(|(a, b)| a + b).collect();
-        let both_up = shadows.iter().zip(&highlights_up).map(|(a, b)| a + b).collect();
-        Self { shadows, highlights, highlights_up, both_down, both_up }
+    /// The level (log₂) at which Shadows +100 and Highlights −100 cancel;
+    /// the middle of the frame's range when they never do.
+    pub fn pivot(&self) -> f32 {
+        let sum = |i: usize| self.shadows[i] + self.highlights[i];
+        let crossings: Vec<f32> = (0..LOCAL_SAMPLES - 1).filter(|&i| sum(i) > 0.0 && sum(i + 1) <= 0.0)
+            .map(|i| LOCAL_LO + (i as f32 + sum(i) / (sum(i) - sum(i + 1))) / LOCAL_PER_STOP).collect();
+        crossings.get(crossings.len() / 2).copied().unwrap_or(0.5 * (self.top + self.bottom))
     }
 
-    /// The gain curve of the settings: `shadows`, `highlights` in −100..100.
+    /// The gain curve of the settings, before the white limiter: `shadows`,
+    /// `highlights` in −100..100.
     ///
-    /// What the two sliders have in common (the smaller of the two
-    /// amounts) is taken at the curve of both together, the rest at the
-    /// single slider's: exact on either slider alone and on the diagonals.
-    /// Shadows below zero is the negative of above (measured); the pairs
-    /// with Shadows below zero mirror the measured ones.
+    /// With `s`, `h` the two amounts (0..1) and `m` the smaller of them:
+    /// the same way, the shift comes in as `m · (m / larger)^¼`; in
+    /// opposition, the tilt comes in above the pivot as
+    /// `min(s, √(s·h))` and below it as `min(h, √(s·h))` — the far end a
+    /// slider holds still is let go as soon as the other one moves at all.
+    /// (Measured on a 9 × 9 grid of settings: within 0.02–0.04 stops; the
+    /// four quadrants mirror each other.)
     pub fn gain(&self, shadows: f32, highlights: f32) -> Vec<f32> {
         let (s, h) = (shadows / 100.0, highlights / 100.0);
-        let m = s.abs().min(h.abs());
-        let (rest_s, rest_h) = (s.abs() - m, h.abs() - m);
-        // Signs: Shadows' own, and of the common part.
+        let (sa, ha) = (s.abs(), h.abs());
+        let single = if h < 0.0 { &self.highlights } else { &self.highlights_up };
+        let plain = |i: usize| s * self.shadows[i] + ha * single[i];
+        if sa == 0.0 || ha == 0.0 {
+            return (0..LOCAL_SAMPLES).map(plain).collect();
+        }
         let sign = if s < 0.0 { -1.0 } else { 1.0 };
-        // The pair's curve: with Shadows up, Highlights down or up as set;
-        // with Shadows down, the mirror of the opposite pair.
-        let down_pair = (s >= 0.0) == (h < 0.0);
+        let (least, most) = (sa.min(ha), sa.max(ha));
+        if (s > 0.0) == (h > 0.0) {
+            let add = sign * self.shift * least * (least / most).powf(0.25);
+            return (0..LOCAL_SAMPLES).map(|i| plain(i) + add).collect();
+        }
+        let pivot = self.pivot();
+        let mean = (sa * ha).sqrt();
+        let (above, below) = (sa.min(mean), ha.min(mean));
         (0..LOCAL_SAMPLES).map(|i| {
-            let single_h = if h < 0.0 { self.highlights[i] } else { self.highlights_up[i] };
-            let pair = if down_pair { self.both_down[i] } else { self.both_up[i] };
-            sign * rest_s * self.shadows[i] + rest_h * single_h + sign * m * pair
+            let level = (LOCAL_LO + i as f32 / LOCAL_PER_STOP).clamp(self.bottom, self.top);
+            let tilt = if level >= pivot {
+                above * self.tilt_top * (level - pivot) / (self.top - pivot).max(1e-3)
+            } else {
+                below * self.tilt_bottom * (pivot - level) / (pivot - self.bottom).max(1e-3)
+            };
+            plain(i) + sign * tilt
         }).collect()
     }
+}
+
+/// A gain of `gain` stops where `room` stops are left below the white point:
+/// taken whole up to half the room, beyond that `room − room² / (4·gain)`,
+/// which approaches the room and never passes it. Gains of zero or less are
+/// not touched. (Measured on Camera Raw: Highlights +100 and both sliders up
+/// on charts reaching white, exact to a hundredth of a stop.)
+pub fn limit_gain(gain: f32, room: f32) -> f32 {
+    let room = room.max(0.0);
+    if gain <= 0.5 * room { gain } else { room - room * room / (4.0 * gain) }
 }
 
 /// When the frame's keys are measured.
@@ -263,27 +327,52 @@ impl RawDevelop {
             return k;
         }
         let gain = 2f64.powf(self.exposure());
+        let (plain_white, dark_key) = (k.white_point as f64, k.dark_key as f64);
         let derived;
         let curves = match curves {
             Some(c) => c,
             None => {
                 let shift = gain.log2() as f32;
                 let levels: Vec<f32> = stats.levels.iter().map(|l| l + shift).collect();
-                derived = local_curves(&levels);
+                // How far the frame's top is below its white point.
+                let headroom = levels.last().map_or(0.0, |top| {
+                    let lit = default_black(2f64.powf(*top as f64), dark_key).max(1e-9);
+                    (plain_white / lit).log2() as f32
+                });
+                derived = local_curves(&levels, headroom);
                 &derived
             }
         };
-        let (white_point, dark_key) = (k.white_point as f64, k.dark_key as f64);
-        let pre: Vec<f32> = (0..CURVE_SAMPLES).map(|i| {
-            let x = 2f64.powf(CURVE_LO + (k.curve_hi as f64 - CURVE_LO) * i as f64 / (CURVE_SAMPLES - 1) as f64);
-            default_black(default_white(x, white_point), dark_key).clamp(0.0, 1.0) as f32
+        let log_gain = curves.gain(self.settings.shadows, self.settings.highlights);
+        let sensor_white = self.sensor_white(gain);
+        let white = gained_white(stats, &log_gain, gain, dark_key, plain_white, sensor_white);
+        let black_hi = sensor_white.log2().max(0.0);
+        let black: Vec<f32> = (0..CURVE_SAMPLES).map(|i| {
+            let x = 2f64.powf(CURVE_LO + (black_hi - CURVE_LO) * i as f64 / (CURVE_SAMPLES - 1) as f64);
+            default_black(x, dark_key) as f32
         }).collect();
+        let out_hi = white.log2().max(0.0);
         let out: Vec<f32> = (0..CURVE_SAMPLES).map(|i| {
-            let x = 2f64.powf(OUT_LO * (1.0 - i as f64 / (CURVE_SAMPLES - 1) as f64));
-            default_curve(x) as f32
+            let v = 2f64.powf(OUT_LO + (out_hi - OUT_LO) * i as f64 / (CURVE_SAMPLES - 1) as f64);
+            default_curve(default_white(v, white).clamp(0.0, 1.0)) as f32
         }).collect();
-        k.local = Some(LocalTone { gain: curves.gain(self.settings.shadows, self.settings.highlights).into(), pre: pre.into(), out: out.into(), long_side: 0 });
+        k.local = Some(LocalTone {
+            gain: log_gain.into(),
+            black: black.into(),
+            black_hi: black_hi as f32,
+            out: out.into(),
+            out_hi: out_hi as f32,
+            white: white as f32,
+            long_side: 0,
+        });
         k
+    }
+
+    /// The sensor's white at an exposure gain: where a neutral's last
+    /// channel clips.
+    fn sensor_white(&self, gain: f64) -> f64 {
+        let lowest = self.geometry().neutral.iter().cloned().fold(f32::MAX, f32::min).max(1e-3) as f64;
+        gain / lowest
     }
 
     /// Everything the stage needs for one frame with the keys `keys`
@@ -292,11 +381,8 @@ impl RawDevelop {
     pub fn constants(&self, keys: ToneKeys) -> DevelopConstants {
         let geometry = self.geometry();
         let gain = 2f64.powf(self.exposure());
-        // The sensor's white: where a neutral's last channel clips.
-        let lowest = geometry.neutral.iter().cloned().fold(f32::MAX, f32::min).max(1e-3) as f64;
-        let sensor_white = gain / lowest;
         let frame_max = keys.max as f64 * gain;
-        let white_point = sensor_white.min(2.0 * frame_max).max(1.0);
+        let white_point = white_point_of(frame_max, self.sensor_white(gain));
         let dark_key = (keys.dark as f64 * gain).max(2f64.powi(-30)).log2();
         let hi = white_point.log2().max(0.0);
         let curve: Vec<f32> = (0..CURVE_SAMPLES).map(|i| {
@@ -305,6 +391,46 @@ impl RawDevelop {
         }).collect();
         DevelopConstants { geometry, gain: gain as f32, curve: curve.into(), curve_hi: hi as f32, white_point: white_point as f32, dark_key: dark_key as f32, local: None }
     }
+}
+
+/// The white point of a frame whose brightest value is `frame_max`: twice
+/// that, at least 1, at most the sensor's white.
+fn white_point_of(frame_max: f64, sensor_white: f64) -> f64 {
+    sensor_white.min(2.0 * frame_max).max(1.0)
+}
+
+/// The white point of the frame with the Shadows / Highlights gain
+/// `log_gain` in. The frame's brightest value then depends on the gain at
+/// its level, and for gains above zero on the limiter, which depends on the
+/// white point: found by starting from the white point of the gain taken
+/// whole (an upper bound) and letting the two settle.
+fn gained_white(stats: &FrameStats, log_gain: &[f32], exposure_gain: f64, dark_key: f64, plain: f64, sensor_white: f64) -> f64 {
+    if stats.peaks.is_empty() {
+        return plain;
+    }
+    let shift = exposure_gain.log2();
+    // Per level the frame has: its brightest value, the black-subtracted
+    // luminance of that level, the gain there.
+    let cells: Vec<(f64, f64, f64)> = stats.peaks.iter().enumerate().filter(|(_, p)| **p > 0.0).map(|(i, p)| {
+        let level = LOCAL_LO as f64 + i as f64 / LOCAL_PER_STOP as f64 + shift;
+        let g = sample_curve(log_gain, (level as f32 - LOCAL_LO) * LOCAL_PER_STOP) as f64;
+        (*p as f64 * exposure_gain, default_black(2f64.powf(level), dark_key).max(1e-12), g)
+    }).collect();
+    let white_of = |limited_to: Option<f64>| -> f64 {
+        let top = cells.iter().map(|(peak, lit, g)| {
+            let g = match limited_to {
+                Some(w) => limit_gain(*g as f32, (w / lit).log2() as f32) as f64,
+                None => *g,
+            };
+            peak * 2f64.powf(g)
+        }).fold(0.0, f64::max);
+        white_point_of(top, sensor_white)
+    };
+    let mut white = white_of(None);
+    for _ in 0..8 {
+        white = white_of(Some(white));
+    }
+    white
 }
 
 fn to_f32(m: &M3) -> [[f32; 3]; 3] {
@@ -429,10 +555,10 @@ pub fn default_white(x: f64, white: f64) -> f64 {
     row(i) * (1.0 - f) + row(i + 1) * f
 }
 
-/// The whole default rendering of a scene value: white point, default
-/// black, tone curve → output light.
+/// The whole default rendering of a scene value: default black, white
+/// point, tone curve → output light.
 pub fn default_render(x: f64, white_point: f64, dark_key: f64) -> f64 {
-    default_curve(default_black(default_white(x, white_point), dark_key).clamp(0.0, 1.0))
+    default_curve(default_white(default_black(x, dark_key), white_point).clamp(0.0, 1.0))
 }
 
 /// Samples of the per-frame curve.
@@ -461,31 +587,64 @@ pub struct DevelopConstants {
     pub local: Option<LocalTone>,
 }
 
-/// log₂ of the black-subtracted value of the first sample of
-/// [`LocalTone::out`]; below it the output shrinks with the value.
+/// log₂ of the gained value of the first sample of [`LocalTone::out`];
+/// below it the output shrinks with the value.
 pub const OUT_LO: f64 = -18.0;
 
 /// The Shadows / Highlights stage of one frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalTone {
-    /// log₂ gain over the base level: [`LOCAL_SAMPLES`] samples from
-    /// [`LOCAL_LO`], [`LOCAL_PER_STOP`] per stop.
+    /// log₂ gain over the base level, before the white limiter:
+    /// [`LOCAL_SAMPLES`] samples from [`LOCAL_LO`], [`LOCAL_PER_STOP`] per
+    /// stop.
     pub gain: CurveSamples,
-    /// The black-subtracted value over log₂(scene), sampled as
-    /// [`DevelopConstants::curve`] (white point and default black).
-    pub pre: CurveSamples,
-    /// Output light over log₂ of the black-subtracted value, from
-    /// [`OUT_LO`] to 0: the default tone curve.
+    /// The black-subtracted value over log₂(scene): [`CURVE_SAMPLES`]
+    /// equally spaced samples from [`CURVE_LO`] to `black_hi` (the sensor's
+    /// white).
+    pub black: CurveSamples,
+    pub black_hi: f32,
+    /// Output light over log₂ of the gained value, from [`OUT_LO`] to
+    /// `out_hi` (the white point): the white point's shoulder, then the
+    /// default tone curve.
     pub out: CurveSamples,
+    pub out_hi: f32,
+    /// The white point of the frame with the gain in.
+    pub white: f32,
     /// The long side, in pixels, of the frame the eyes belong to (two eyes
     /// side by side count as one frame); 0 = the eye's own.
     pub long_side: u32,
 }
 
 impl LocalTone {
-    /// The gain (log₂) at a base level.
+    /// The gain (log₂) at a base level, before the white limiter.
     pub fn gain_at(&self, base: f32) -> f32 {
         sample_curve(&self.gain, (base - LOCAL_LO) * LOCAL_PER_STOP)
+    }
+
+    /// The black-subtracted value of the scene value `x`.
+    pub fn black_of(&self, x: f32) -> f32 {
+        if x <= 0.0 { return 0.0; }
+        let lo = CURVE_LO as f32;
+        let u = x.log2();
+        if u <= lo { return self.black[0] * x / 2f32.powf(lo); }
+        sample_curve(&self.black, (u - lo) / (self.black_hi - lo) * (self.black.len() - 1) as f32)
+    }
+
+    /// Output light of the gained value `v`.
+    pub fn out_of(&self, v: f32) -> f32 {
+        if v <= 0.0 { return 0.0; }
+        let lo = OUT_LO as f32;
+        let u = v.log2();
+        if u <= lo { return self.out[0] * v / 2f32.powf(lo); }
+        sample_curve(&self.out, (u - lo) / (self.out_hi - lo) * (self.out.len() - 1) as f32)
+    }
+
+    /// The gain (linear) of a pixel whose base level is `base` and whose own
+    /// luminance (scene value) is `luminance`: the curve's, limited by the
+    /// room the pixel has below the white point.
+    pub fn gain_of(&self, base: f32, luminance: f32) -> f32 {
+        let lit = self.black_of(luminance).max(1e-12);
+        2f32.powf(limit_gain(self.gain_at(base), self.white.log2() - lit.log2()))
     }
 }
 
@@ -525,28 +684,16 @@ impl DevelopConstants {
         (scene[0] * luma[0] + scene[1] * luma[1] + scene[2] * luma[2]).max(BASE_FLOOR)
     }
 
-    /// Develop one pixel whose base level (log₂) is `base`: as
-    /// [`Self::develop`], with the Shadows / Highlights gain of that level
-    /// on the black-subtracted signal. The GPU stage computes the same.
+    /// Develop one pixel whose base level (log₂) is `base`: the default
+    /// black, the Shadows / Highlights gain of that level (limited toward
+    /// the white point), the white point of the gained frame, the tone
+    /// curve. The GPU stage computes the same.
     pub fn develop_local(&self, camera: [f32; 3], base: f32) -> [f32; 3] {
         let Some(local) = &self.local else { return self.develop(camera) };
-        let g = 2f32.powf(local.gain_at(base));
-        let lo_u = CURVE_LO as f32;
-        let pre = |x: f32| -> f32 {
-            if x <= 0.0 { return 0.0; }
-            let u = x.log2();
-            if u <= lo_u { return local.pre[0] * x / 2f32.powf(lo_u); }
-            sample_curve(&local.pre, (u - lo_u) / (self.curve_hi - lo_u) * (local.pre.len() - 1) as f32)
-        };
-        let out = |p: f32| -> f32 {
-            if p <= 0.0 { return 0.0; }
-            let u = p.log2();
-            let lo = OUT_LO as f32;
-            if u <= lo { return local.out[0] * p / 2f32.powf(lo); }
-            sample_curve(&local.out, (1.0 - u / lo) * (local.out.len() - 1) as f32)
-        };
-        let tone = |x: f32| out((g * pre(x)).min(1.0));
         let scene = self.geometry.scene(camera).map(|v| (v * self.gain).max(0.0));
+        let luma = prophoto_luma().map(|v| v as f32);
+        let g = local.gain_of(base, scene[0] * luma[0] + scene[1] * luma[1] + scene[2] * luma[2]);
+        let tone = |x: f32| local.out_of(g * local.black_of(x));
         let hi = scene.iter().cloned().fold(f32::MIN, f32::max);
         let lo = scene.iter().cloned().fold(f32::MAX, f32::min);
         let (thi, tlo) = (tone(hi), tone(lo));
@@ -593,10 +740,10 @@ mod tests {
             (0.004, 1.0, -9.0, 0.001791),
             (0.004, 1.0, -5.0, 0.000000),
             (0.02, 1.0, -5.0, 0.014140),
-            (0.5, 2.0, -14.0, 0.773082),
-            (1.0, 2.49, -11.3, 0.927377),
-            (2.0, 4.0, -14.0, 0.982925),
-            (3.0, 9.96, -8.25, 0.990487),
+            (0.5, 2.0, -14.0, 0.773778),
+            (1.0, 2.49, -11.3, 0.927975),
+            (2.0, 4.0, -14.0, 0.983006),
+            (3.0, 9.96, -8.25, 0.990551),
             (0.02, 2.49, -10.5, 0.018183),
             (0.0001, 1.0, -14.0, 0.000031),
         ];
@@ -629,8 +776,8 @@ mod tests {
         cells[77] = [1.4, 0.3, 0.2];
         let k = ToneKeys::from_cells(&cells).unwrap();
         assert_eq!(k.max, 1.4);
-        // The 0.1th percentile: two cells up from the darkest.
-        assert!((k.dark - 0.0012).abs() < 2e-5, "{}", k.dark);
+        // The darkest cell.
+        assert!((k.dark - 0.001).abs() < 1e-6, "{}", k.dark);
     }
 
     #[test]
@@ -682,6 +829,76 @@ mod tests {
         }
         assert_eq!(k.tone(0.0), 0.0);
         assert!((k.tone(50.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_gain_is_limited_toward_white() {
+        // Taken whole up to half the room, then bent; never past the room.
+        assert_eq!(limit_gain(0.4, 1.0), 0.4);
+        assert_eq!(limit_gain(0.5, 1.0), 0.5);
+        assert!((limit_gain(1.0, 1.0) - 0.75).abs() < 1e-6 && (limit_gain(2.0, 1.0) - 0.875).abs() < 1e-6);
+        assert!((limit_gain(100.0, 1.3) - 1.3).abs() < 0.01 && limit_gain(100.0, 1.3) < 1.3);
+        // Nothing is left at white; gains at or below zero pass.
+        assert_eq!(limit_gain(1.0, 0.0), 0.0);
+        assert_eq!(limit_gain(1.0, -0.5), 0.0);
+        assert_eq!((limit_gain(-2.0, 0.3), limit_gain(0.0, 0.0)), (-2.0, 0.0));
+    }
+
+    /// A frame whose levels are spread evenly from 2⁻⁹ to `top` stops, grey.
+    fn spread_frame(top: f32) -> FrameStats {
+        let levels: Vec<f32> = (0..441).map(|i| -9.0 + (top + 9.0) * i as f32 / 440.0).collect();
+        let mut peaks = vec![0f32; LOCAL_SAMPLES];
+        for l in &levels {
+            peaks[((l - LOCAL_LO) * LOCAL_PER_STOP).round() as usize] = 2f32.powf(*l);
+        }
+        FrameStats { keys: ToneKeys { max: 2f32.powf(top), dark: 2f32.powf(-9.0) }, levels: levels.into(), peaks: peaks.into() }
+    }
+
+    #[test]
+    fn the_white_point_follows_the_gained_frame() {
+        let stats = spread_frame(0.0);
+        let stage = |exposure: f32, highlights: f32, shadows: f32| x6(RawSettings { exposure, highlights, shadows, ..Default::default() });
+        // Highlights curves by hand: a stop down (or up) from two stops below the top.
+        let level = |i: usize| LOCAL_LO + i as f32 / LOCAL_PER_STOP;
+        let ramp = |sign: f32, top: f32| -> Vec<f32> { (0..LOCAL_SAMPLES).map(|i| sign * ((level(i).min(top) - (top - 2.0)) / 2.0).clamp(0.0, 1.0)).collect() };
+        let curves = |top: f32| LocalCurves { shadows: vec![0.0; LOCAL_SAMPLES], highlights: ramp(-1.0, top), highlights_up: ramp(1.0, top), tilt_top: 0.0, tilt_bottom: 0.0, shift: 0.0, top, bottom: top - 9.0 };
+        // Three stops of exposure: the frame's top is at 8, the white point
+        // at twice that (the sensor's white is further up, at 19.9).
+        let plain = stage(3.0, 0.0, 0.0).constants(stats.keys);
+        assert!((plain.white_point - 16.0).abs() < 0.01, "{}", plain.white_point);
+        // Highlights −100 takes the top down a stop: twice the gained top.
+        let down = stage(3.0, -100.0, 0.0).constants_for(&stats, Some(&curves(3.0)));
+        let local = down.local.as_ref().unwrap();
+        assert!((local.white - 8.0).abs() < 0.05 && (local.out_hi - 3.0).abs() < 0.01, "{}", local.white);
+        // The stage: black, gain, that white point, the curve.
+        for x in [0.02f32, 0.3, 2.0, 7.9] {
+            let base = x.log2();
+            let g = 2f64.powf(local.gain_at(base) as f64);
+            let want = default_curve(default_white(g * default_black(x as f64, down.dark_key as f64), local.white as f64).clamp(0.0, 1.0)) as f32;
+            let n = RawCamera::X6.as_shot_neutral.map(|v| v as f32);
+            let got = down.develop_local(n.map(|v| v * x / down.gain), base);
+            // A grey: every channel the tone of its level (sRGB-encoded).
+            let enc = if want <= 0.003_130_8 { 12.92 * want } else { 1.055 * want.powf(1.0 / 2.4) - 0.055 };
+            assert!((got[1] - enc).abs() < 3e-3, "x {x}: {} vs {enc}", got[1]);
+        }
+        // Highlights +100 at exposure 0: the top would go a stop past the
+        // sensor's first clipped channel; twice the gained top is past the
+        // sensor's white (2.49), which is then the white point, and the
+        // gain is limited to the room below it.
+        let up = stage(0.0, 100.0, 0.0).constants_for(&stats, Some(&curves(0.0)));
+        let local = up.local.as_ref().unwrap();
+        let sensor = 1.0 / 0.4013671875f32;
+        assert!((local.white - sensor).abs() < 0.01, "{}", local.white);
+        // At the frame's top: one stop wanted, 1.32 stops of room.
+        let top_gain = local.gain_of(0.0, 1.0).log2();
+        assert!((top_gain - limit_gain(1.0, sensor.log2())).abs() < 0.01 && top_gain < 0.9, "{top_gain}");
+        // The curves the frame gets by itself are of its own range.
+        let own = stage(0.0, 0.0, 60.0).constants_for(&stats, None);
+        let g = &own.local.as_ref().unwrap().gain;
+        assert!(g[((-7.0 - LOCAL_LO) * LOCAL_PER_STOP) as usize] > 0.8 && g[((-0.5 - LOCAL_LO) * LOCAL_PER_STOP) as usize].abs() < 0.2);
+        // Nothing measured: the plain white point.
+        let blind = stage(3.0, -100.0, 0.0).constants_for(&FrameStats::unknown(), Some(&curves(3.0)));
+        assert_eq!(blind.local.as_ref().unwrap().white, blind.white_point);
     }
 
     #[test]

@@ -17,7 +17,7 @@ const RAW_DEVELOP_LOCAL_WGSL: &str = include_str!("shaders/raw_develop_local.wgs
 use crate::raw_color::prophoto_luma;
 use crate::raw_tone::{
     DevelopConstants, DevelopGeometry, FrameStats, LocalCurves, LocalTone, Measure, RawDevelop, ToneKeys, BASE_FALLBACK, BASE_FLOOR,
-    BASE_LO, BASE_RANGE, CLIP_FROM, CLIP_TO, CURVE_LO, LOCAL_LO, LOCAL_PER_STOP, OUT_LO,
+    BASE_LO, BASE_RANGE, CLIP_FROM, CLIP_TO, CURVE_LO, LOCAL_LO, LOCAL_PER_STOP, LOCAL_SAMPLES, OUT_LO,
 };
 use std::sync::{Arc, Mutex};
 
@@ -125,7 +125,7 @@ struct DevelopLocalParams {
     neutral: [f32; 4],
     cam_to_work: [[f32; 4]; 3],
     work_to_out: [[f32; 4]; 3],
-    pre: [f32; 4],
+    black: [f32; 4],
     outc: [f32; 4],
     gains: [f32; 4],
     clip: [f32; 4],
@@ -574,7 +574,13 @@ fn stats_from_cells(bytes: &[u8], cx: usize, cy: usize) -> Option<FrameStats> {
         }
     }
     levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    Some(FrameStats { keys, levels: levels.into() })
+    // The brightest channel of the cells at each level.
+    let mut peaks = vec![0f32; LOCAL_SAMPLES];
+    for (cell, level) in cells.iter().zip(&logs) {
+        let at = (((level - LOCAL_LO) * LOCAL_PER_STOP).round().max(0.0) as usize).min(LOCAL_SAMPLES - 1);
+        peaks[at] = peaks[at].max(cell[0].max(cell[1]).max(cell[2]));
+    }
+    Some(FrameStats { keys, levels: levels.into(), peaks: peaks.into() })
 }
 
 /// Two measurements say the same about a frame (nothing to draw again for).
@@ -847,22 +853,22 @@ impl Device {
     fn record_raw_develop_local(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, dst: &wgpu::Texture, k: &DevelopConstants, local: &LocalTone) {
         let (grid, cell_px) = self.record_raw_base(encoder, src, k, local);
         let lo = CURVE_LO as f32;
-        let last = (local.pre.len() - 1) as f32;
+        let last = (local.black.len() - 1) as f32;
         let out_lo = OUT_LO as f32;
         let out_last = (local.out.len() - 1) as f32;
         let params = self.write_uniform("raw_develop_local_params", &DevelopLocalParams {
             neutral: [k.geometry.neutral[0], k.geometry.neutral[1], k.geometry.neutral[2], k.gain],
             cam_to_work: k.geometry.camera_to_work.map(row4),
             work_to_out: k.geometry.work_to_out.map(row4),
-            pre: [lo, last / (k.curve_hi - lo), last, 2f32.powf(lo)],
-            outc: [out_lo, out_last / -out_lo, out_last, 2f32.powf(out_lo)],
+            black: [lo, last / (local.black_hi - lo), last, 2f32.powf(lo)],
+            outc: [out_lo, out_last / (local.out_hi - out_lo), out_last, 2f32.powf(out_lo)],
             gains: [LOCAL_LO, LOCAL_PER_STOP, (local.gain.len() - 1) as f32, 0.0],
             clip: [CLIP_FROM, CLIP_TO, BASE_FLOOR, BASE_FALLBACK],
             luma: luma4(cell_px),
-            grid: [BASE_LO, 1.0 / BASE_RANGE, 0.0, 0.0],
+            grid: [BASE_LO, 1.0 / BASE_RANGE, local.white.log2(), 0.0],
         });
         let (pre, outc, gains) = (
-            self.curve_buffer("raw_develop_pre", &local.pre),
+            self.curve_buffer("raw_develop_black", &local.black),
             self.curve_buffer("raw_develop_out", &local.out),
             self.curve_buffer("raw_develop_gains", &local.gain),
         );
@@ -1121,10 +1127,15 @@ mod tests {
         let right = eye(&|_, _| 0.2);
         let stats = dev.raw_frame_stats(&[&left, &right], &stage);
         let keys = stats.keys;
-        // 7938 cells; the brightest is the 0.6 one, and the 0.1th
-        // percentile falls among the twelve dark ones.
+        // 7938 cells; the brightest is the 0.6 one, the darkest one of the
+        // twelve dark ones.
         assert!((keys.max - 0.6).abs() < 2e-3, "max {}", keys.max);
         assert!((keys.dark - 0.01).abs() < 5e-4, "dark {}", keys.dark);
+        // The brightest value at each level: the grey's, the bright cell's
+        // and the dark cells', each at its own level.
+        let peak_at = |level: f32| stats.peaks[((level.log2() - LOCAL_LO) * LOCAL_PER_STOP).round() as usize];
+        assert!((peak_at(0.2) - 0.2).abs() < 1e-3 && (peak_at(0.6) - keys.max).abs() < 1e-6 && (peak_at(0.01) - 0.01).abs() < 1e-4 && peak_at(0.05) == 0.0);
+        assert_eq!(stats.peaks.iter().filter(|p| **p > 0.0).count(), 3);
         // The levels the curves come from: blocks of 3 × 3 cells averaged
         // in log, 21 × 21 an eye, sorted. Nearly all are the grey's.
         assert_eq!(stats.levels.len(), 2 * 21 * 21);
