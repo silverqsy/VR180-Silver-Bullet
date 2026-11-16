@@ -9,6 +9,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod audio;
+pub mod bayer;
 pub mod braw_imu;
 pub mod circles;
 pub mod decode;

@@ -2646,10 +2646,49 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      decoder, checked against reference pixels of three sample takes);
      `vr180-pipeline::x6_raw` (one index per take, cached on disk under the
      settings folder; frame timeline from the exposure stamps; lens and gyro
-     poses; `X6RawIter` hands out pairs demosaiced on the GPU —
-     `raw_gpu.rs`, `bayer_demosaic.wgsl` — as camera-linear `Rgba16Unorm`
-     eyes, binned to half size for the preview). Raw clips take the 16-bit
-     stacks only; video export is forced to 10-bit.
+     poses; `X6RawIter` hands out pairs demosaiced on the GPU as
+     camera-linear `Rgba16Unorm` eyes, at half size for the preview). Raw
+     clips take the 16-bit stacks only; video export is forced to 10-bit.
+   - **Demosaic** (2026-11-16; `bayer.rs` = the specification and the CPU
+     twin, `Device::demosaic_bayer` = three passes: `bayer_measure` →
+     `Rg32Float`, `bayer_green` → `R32Float`, `bayer_demosaic` → the eye;
+     the two work planes are kept in `RawPipelines::demosaic_work`). It
+     replaced Malvar-He-Cutler (zipper along every edge, colour in it) and,
+     for the preview, a 2×2 binning (colour fringes: red and blue were
+     taken a site apart). It is shaped after Camera Raw's own demosaic,
+     found by measuring it: the same mosaic developed there from a CFA DNG
+     and from the linear DNGs of our candidates, Camera Raw's result taken
+     back to camera values through the development's Jacobian (three more
+     renders with one channel raised 2 %, one Newton step and a check
+     render; scripts `~/vr180-internal/x6raw-acr/dem*.py`, `dem4.py` does
+     the inversion, `dem7.py` is the final numpy twin). What fits: (1) the
+     interpolation is done on the mosaic WHITE-BALANCED by the camera's
+     neutral (`BayerLayout::neutral`; without it red and blue are two to
+     four times further off); (2) green at a red / blue site = the row's
+     estimate and the column's, each the two neighbours' mean + 1/8 of the
+     site's own second difference (the fit is sharp at 1/8: 1/16 and 3/16
+     are 40 to 90 % worse), mixed by `B² / (A² + B²)` with A, B = the sum
+     over 5×5 of |neighbour − neighbour| + ½ |second difference| along the
+     row / the column (window and power scanned; a decision made on the
+     colour difference after interpolating fits worse); (3) red and blue =
+     green + their difference from green carried bilinearly (kernels
+     fitted freely to Camera Raw's result come out bilinear). Against
+     Camera Raw in camera values ×1000 (level ≈ 30 / 45 / 15), three takes
+     and both eyes: 0.24–0.40 / 0.19–0.26 / 0.11–0.36 against Malvar's
+     0.55–0.78 / 0.33–0.53 / 0.69–0.98; developed, mean |difference| of
+     255: 0.25 / 0.11 / 0.38 against 0.93 / 0.33 / 2.67; at clipped
+     highlights (a frame raised three stops) 0.2–0.4. Cost: 3.1 ms an eye
+     at full size, 2.5 ms at half (the half-size eye is the mean of each
+     2×2 of the full result), M5 Max. Camera Raw's flat-ground response
+     to single samples (`dem3.py`) says the same: green = four neighbours'
+     mean + a second-difference term of 0.115–0.12 in balanced units. NOT
+     done: what Camera Raw's default colour noise reduction (25) does on
+     top (it leaves luminance alone and takes the colour's fine part down
+     to 20–35 % at 0.25 cycles a pixel, 50–70 % at 0.09): that is why a
+     DNG opened there with its defaults shows no colour in fine lines
+     where its own demosaic, and ours, still has a little. Stills
+     (`raw_develop::mhc`) still use the old kernels. WINDOWS: `Rg32Float`
+     and `R32Float` as storage textures, read back with `textureLoad`.
    - **Development** is the first stage of `record_color_stack_16`
      (`ColorStackPlan::raw_develop`). `raw_tone.rs`'s header is the
      specification; `RawDevelop::constants_for(stats, curves)` is the one

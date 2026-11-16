@@ -72,7 +72,13 @@ pub fn demosaic_pair(dev: &Device, pair: &FisheyePair) -> Result<(wgpu::Texture,
 }
 
 /// The mosaic of a take's frames.
-pub const BAYER: BayerLayout = BayerLayout { cfa: x6b::CFA, black: x6b::BLACK_LEVEL as f32, white: x6b::WHITE_LEVEL as f32 };
+pub const BAYER: BayerLayout = BayerLayout {
+    cfa: x6b::CFA,
+    black: x6b::BLACK_LEVEL as f32,
+    white: x6b::WHITE_LEVEL as f32,
+    // `RawCamera::X6`'s as-shot neutral (a test in `bayer` holds them equal).
+    neutral: [0.565_429_7, 1.0, 0.401_367_2],
+};
 
 /// A take, opened: its description and its pairs in request order.
 #[derive(Debug)]
@@ -596,29 +602,18 @@ impl X6RawIter {
     }
 
     fn cpu_pair(&self) -> (Vec<u8>, Vec<u8>) {
-        use crate::raw_develop::{develop_linear, Half, RawParams};
-        // The CPU demosaic develops one half of a side-by-side frame.
-        let w = EYE_SIDE;
-        let mut sbs = vec![0u16; 2 * EYE_SAMPLES];
-        for y in 0..w {
-            sbs[y * 2 * w..y * 2 * w + w].copy_from_slice(&self.samples[y * w..(y + 1) * w]);
-            sbs[y * 2 * w + w..(y + 1) * 2 * w].copy_from_slice(&self.samples[EYE_SAMPLES + y * w..EYE_SAMPLES + (y + 1) * w]);
-        }
-        let params = RawParams {
-            width: 2 * w as u32, height: w as u32, cfa: BAYER.cfa, white_level: BAYER.white,
-            black_level: [BAYER.black; 4], as_shot_neutral: [1.0; 3],
-        };
-        let eye = |half: Half| -> Vec<u8> {
-            let lin = develop_linear(&sbs, &params, &[], half, self.half);
-            let mut bytes = Vec::with_capacity(lin.rgba.len() * 2);
-            for px in lin.rgba.chunks_exact(4) {
-                for v in [px[0], px[1], px[2], u16::MAX] {
-                    bytes.extend_from_slice(&v.to_le_bytes());
+        // The GPU demosaic's twin, one channel at a time.
+        let eye = |channel: usize| -> Vec<u8> {
+            let rgb = crate::bayer::demosaic(&self.samples[channel * EYE_SAMPLES..(channel + 1) * EYE_SAMPLES], EYE_SIDE, EYE_SIDE, &BAYER, self.half);
+            let mut bytes = Vec::with_capacity(rgb.len() * 8);
+            for px in &rgb {
+                for v in [px[0], px[1], px[2], 1.0] {
+                    bytes.extend_from_slice(&((v * 65535.0).round() as u16).to_le_bytes());
                 }
             }
             bytes
         };
-        let (c0, c1) = (eye(Half::Left), eye(Half::Right));
+        let (c0, c1) = (eye(0), eye(1));
         if self.swap_eyes { (c1, c0) } else { (c0, c1) }
     }
 }

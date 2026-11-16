@@ -31,6 +31,17 @@ converter's controls for it, and every frame can be had as a DNG.
     slider and coarser beyond it;
   - a grade with every slider in use lands within one to two steps for
     moderate amounts, three to five at the extremes.
+- **Demosaic.** The step that makes a full-colour picture of the sensor's
+  mosaic is a new one, shaped after Camera Raw's: the same frames were
+  developed there and here, and the method that reproduces its result was
+  kept. Edges come out clean, with no alternating pattern along them and
+  no purple and yellow in fine lines; the preview, which used to merge
+  2×2 sites and showed colour fringes for it, now shows the full method's
+  picture reduced. Developed, a frame differs from Camera Raw's by a
+  quarter of an 8-bit step on average where it was one to three before.
+  Camera Raw opened with its defaults also runs its colour noise reduction
+  (25), which this app does not have yet: fine lines there are free of the
+  last bit of colour that its own demosaic, and this one, leave in them.
 - **Sharpening.** The detail panel's four controls, Amount, Radius, Detail
   and Masking, on the developed picture, done the way Camera Raw does it:
   on the luminance alone, fading out toward black and toward white, held

@@ -6,6 +6,8 @@
 use crate::gpu::{Device, EquirectRotation, FisheyeCalib};
 use crate::{Error, Result};
 
+const BAYER_MEASURE_WGSL: &str = include_str!("shaders/bayer_measure.wgsl");
+const BAYER_GREEN_WGSL: &str = include_str!("shaders/bayer_green.wgsl");
 const BAYER_DEMOSAIC_WGSL: &str = include_str!("shaders/bayer_demosaic.wgsl");
 const RAW_DEVELOP_WGSL: &str = include_str!("shaders/raw_develop.wgsl");
 const RAW_MEASURE_WGSL: &str = include_str!("shaders/raw_measure.wgsl");
@@ -32,6 +34,10 @@ pub struct BayerLayout {
     pub cfa: [u8; 4],
     pub black: f32,
     pub white: f32,
+    /// The camera's values of a neutral (green = 1): what the mosaic is
+    /// balanced by while it is interpolated (see [`crate::bayer`]). The
+    /// result is not white balanced by it.
+    pub neutral: [f32; 3],
 }
 
 impl BayerLayout {
@@ -48,8 +54,14 @@ impl BayerLayout {
 /// Pipelines of the raw path, built on first use.
 #[derive(Debug)]
 pub(crate) struct RawPipelines {
+    demosaic_measure: wgpu::ComputePipeline,
+    demosaic_measure_layout: wgpu::BindGroupLayout,
+    demosaic_green: wgpu::ComputePipeline,
+    demosaic_green_layout: wgpu::BindGroupLayout,
     demosaic: wgpu::ComputePipeline,
     demosaic_layout: wgpu::BindGroupLayout,
+    /// The demosaic's work planes, kept from frame to frame.
+    demosaic_work: Mutex<Option<DemosaicWork>>,
     develop: wgpu::ComputePipeline,
     develop_layout: wgpu::BindGroupLayout,
     measure: wgpu::ComputePipeline,
@@ -221,62 +233,44 @@ struct DemosaicParams {
     src_h: i32,
     half: u32,
     _pad: u32,
+    /// 1 / the neutral's red and blue, then the two themselves.
+    balance: [f32; 4],
+}
+
+/// The demosaic's two work planes for a mosaic of `size`: the measures of
+/// the first pass (`Rg32Float`) and the green of the second (`R32Float`).
+#[derive(Debug)]
+struct DemosaicWork {
+    size: (u32, u32),
+    measure: wgpu::Texture,
+    green: wgpu::Texture,
 }
 
 impl RawPipelines {
     fn create(device: &wgpu::Device) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("bayer_demosaic"),
-            source: wgpu::ShaderSource::Wgsl(BAYER_DEMOSAIC_WGSL.into()),
+        use wgpu::TextureViewDimension::{D2, D3};
+        let mosaic = wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: D2, multisampled: false },
+            count: None,
+        };
+        let demosaic_params = bgl_uniform(2, std::mem::size_of::<DemosaicParams>());
+        let demosaic_measure_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bayer_measure_bgl"),
+            entries: &[mosaic, bgl_storage(1, wgpu::TextureFormat::Rg32Float, D2), demosaic_params],
         });
+        let demosaic_measure = compute_pipeline(device, "bayer_measure", BAYER_MEASURE_WGSL, "main", &demosaic_measure_layout);
+        let demosaic_green_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bayer_green_bgl"),
+            entries: &[mosaic, bgl_storage(1, wgpu::TextureFormat::R32Float, D2), demosaic_params, bgl_texture(3, D2, false)],
+        });
+        let demosaic_green = compute_pipeline(device, "bayer_green", BAYER_GREEN_WGSL, "main", &demosaic_green_layout);
         let demosaic_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bayer_demosaic_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Uint,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba16Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<DemosaicParams>() as u64),
-                    },
-                    count: None,
-                },
-            ],
+            entries: &[mosaic, bgl_storage(1, wgpu::TextureFormat::Rgba16Unorm, D2), demosaic_params, bgl_texture(3, D2, false)],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("bayer_demosaic_pll"),
-            bind_group_layouts: &[Some(&demosaic_layout)],
-            immediate_size: 0,
-        });
-        let demosaic = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("bayer_demosaic_pipeline"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let demosaic = compute_pipeline(device, "bayer_demosaic", BAYER_DEMOSAIC_WGSL, "main", &demosaic_layout);
         let develop_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raw_develop"),
             source: wgpu::ShaderSource::Wgsl(RAW_DEVELOP_WGSL.into()),
@@ -393,7 +387,6 @@ impl RawPipelines {
         });
         // Shadows / Highlights: the reduced copy, its bilateral grid, and
         // the development that reads the base from it.
-        use wgpu::TextureViewDimension::{D2, D3};
         let reduce_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("raw_reduce_bgl"),
             entries: &[
@@ -486,7 +479,8 @@ impl RawPipelines {
             ..Default::default()
         });
         Self {
-            demosaic, demosaic_layout, develop, develop_layout, measure, measure_layout,
+            demosaic_measure, demosaic_measure_layout, demosaic_green, demosaic_green_layout,
+            demosaic, demosaic_layout, demosaic_work: Mutex::new(None), develop, develop_layout, measure, measure_layout,
             reduce, reduce_layout, grid_build, grid_build_layout, grid_blur, grid_blur_layout,
             develop_local, develop_local_layout, grid_sampler,
             sharpen_level, sharpen_edge, sharpen_level_layout, sharpen_blur, sharpen_blur_layout, sharpen_apply, sharpen_apply_layout,
@@ -602,9 +596,10 @@ impl Device {
     }
 
     /// Demosaic `bayer` into `out`: at the mosaic's own size (`out` = the
-    /// mosaic's size, Malvar-He-Cutler) or at half size (`out` = half the
-    /// mosaic's size, one pixel per 2×2 site group). The result is the
-    /// camera's linear RGB with the sensor's white level at 1.0.
+    /// mosaic's size) or at half size (`out` = half the mosaic's size, each
+    /// pixel the mean of the 2×2 it covers). The result is the camera's
+    /// linear RGB with the sensor's white level at 1.0. The method is
+    /// [`crate::bayer`]'s: three passes (measure, green, colour).
     pub fn demosaic_bayer(&self, bayer: &wgpu::Texture, layout: &BayerLayout, out: &wgpu::Texture) -> Result<()> {
         let (sw, sh) = (bayer.width(), bayer.height());
         let half = match (out.width(), out.height()) {
@@ -616,6 +611,7 @@ impl Device {
             return Err(Error::Ffmpeg(format!("demosaic: {:?} is not a Bayer pattern", layout.cfa)));
         };
         let span = (layout.white - layout.black).max(1.0);
+        let (nr, nb) = (layout.neutral[0].max(1e-3), layout.neutral[2].max(1e-3));
         let params = self.write_uniform("bayer_demosaic_params", &DemosaicParams {
             black: layout.black,
             scale: 1.0 / span,
@@ -625,25 +621,60 @@ impl Device {
             src_h: sh as i32,
             half,
             _pad: 0,
+            balance: [1.0 / nr, 1.0 / nb, nr, nb],
         });
         let pipes = self.raw_pipelines();
-        let src_view = bayer.create_view(&Default::default());
-        let dst_view = out.create_view(&Default::default());
-        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        // The work planes of a mosaic this size, made once.
+        let mut work = pipes.demosaic_work.lock().map_err(|_| Error::Ffmpeg("demosaic: work planes poisoned".into()))?;
+        if work.as_ref().map(|w| w.size) != Some((sw, sh)) {
+            let plane = |label: &str, format: wgpu::TextureFormat| self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            *work = Some(DemosaicWork {
+                size: (sw, sh),
+                measure: plane("bayer_measure", wgpu::TextureFormat::Rg32Float),
+                green: plane("bayer_green", wgpu::TextureFormat::R32Float),
+            });
+        }
+        let planes = work.as_ref().expect("made above");
+        let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let (src_v, dst_v, measure_v, green_v) = (view(bayer), view(out), view(&planes.measure), view(&planes.green));
+        fn tex<'a>(binding: u32, v: &'a wgpu::TextureView) -> wgpu::BindGroupEntry<'a> {
+            wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) }
+        }
+        let uniform = wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() };
+        let measure_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bayer_measure_bg"),
+            layout: &pipes.demosaic_measure_layout,
+            entries: &[tex(0, &src_v), tex(1, &measure_v), uniform.clone()],
+        });
+        let green_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bayer_green_bg"),
+            layout: &pipes.demosaic_green_layout,
+            entries: &[tex(0, &src_v), tex(1, &green_v), uniform.clone(), tex(3, &measure_v)],
+        });
+        let colour_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bayer_demosaic_bg"),
             layout: &pipes.demosaic_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&dst_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
-            ],
+            entries: &[tex(0, &src_v), tex(1, &dst_v), uniform, tex(3, &green_v)],
         });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bayer_demosaic") });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("bayer_demosaic"), timestamp_writes: None });
-            pass.set_pipeline(&pipes.demosaic);
-            pass.set_bind_group(0, Some(&bind), &[]);
-            pass.dispatch_workgroups(out.width().div_ceil(8), out.height().div_ceil(8), 1);
+        for (label, pipeline, bind, (w, h)) in [
+            ("bayer_measure", &pipes.demosaic_measure, &measure_bind, (sw, sh)),
+            ("bayer_green", &pipes.demosaic_green, &green_bind, (sw, sh)),
+            ("bayer_demosaic", &pipes.demosaic, &colour_bind, (out.width(), out.height())),
+        ] {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, Some(bind), &[]);
+            pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
         }
         self.queue.submit(Some(encoder.finish()));
         Ok(())
@@ -1566,7 +1597,7 @@ mod tests {
 
     #[test]
     fn the_red_site_of_a_pattern() {
-        let l = |cfa| BayerLayout { cfa, black: 64.0, white: 15408.0 };
+        let l = |cfa| BayerLayout { cfa, black: 64.0, white: 15408.0, neutral: [1.0; 3] };
         assert_eq!(l([1, 2, 0, 1]).red_site(), Some((0, 1)), "GBRG: red at the start of the second row");
         assert_eq!(l([0, 1, 1, 2]).red_site(), Some((0, 0)), "RGGB");
         assert_eq!(l([1, 0, 2, 1]).red_site(), Some((1, 0)), "GRBG");
@@ -1577,47 +1608,70 @@ mod tests {
 
     /// The GPU kernels against the CPU demosaic of the stills path
     /// (`raw_develop`), on a random mosaic.
+    /// What a frame's demosaic costs at the X6's size (prints; run with
+    /// `--include-ignored --nocapture`).
     #[test]
-    #[ignore = "needs a GPU"]
+    #[ignore]
+    fn demosaic_timing() {
+        let dev = Device::new().expect("device");
+        let side = 3840u32;
+        let mut s = 99u32;
+        let mosaic: Vec<u16> = (0..side * side).map(|i| { s ^= s << 13; s ^= s >> 17; s ^= s << 5; (1000 + (i % side) + s % 900) as u16 }).collect();
+        let tex = dev.new_bayer_texture(side, side);
+        dev.write_bayer_texture(&tex, &mosaic);
+        for half in [false, true] {
+            let out_side = if half { side / 2 } else { side };
+            let out = dev.new_linear_eye_texture(out_side, out_side);
+            // Once to build the pipelines and the work planes, then timed.
+            dev.demosaic_bayer(&tex, &crate::x6_raw::BAYER, &out).unwrap();
+            let _ = dev.read_texture_rgba64(&out, 8, 8).unwrap();
+            let t = std::time::Instant::now();
+            let n = 20;
+            for _ in 0..n {
+                dev.demosaic_bayer(&tex, &crate::x6_raw::BAYER, &out).unwrap();
+            }
+            let _ = dev.read_texture_rgba64(&out, 8, 8).unwrap();
+            eprintln!("demosaic of one {side}x{side} eye, half {half}: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+        }
+    }
+
+    #[test]
     fn gpu_demosaic_matches_the_cpu_one() {
-        use crate::raw_develop::{develop_linear, Half, RawParams};
         let dev = Device::new().expect("device");
         let (w, h) = (256u32, 128u32);
         let mut s = 12345u32;
         let mut next = move || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; s };
+        // A slope with noise, a bright band across it and one down it, and
+        // a patch that reaches the white level.
         let mosaic: Vec<u16> = (0..w * h).map(|i| {
             let (x, y) = (i % w, i / w);
-            (2000 + x * 20 + y * 31 + next() % 700) as u16
+            let band = if (40..44).contains(&y) || (100..103).contains(&x) { 4000 } else { 0 };
+            let top = if x > 200 && y > 90 { 9000 } else { 0 };
+            (2000 + x * 20 + y * 31 + next() % 700 + band + top).min(16383) as u16
         }).collect();
-        let layout = BayerLayout { cfa: [1, 2, 0, 1], black: 64.0, white: 15408.0 };
-        // The CPU path develops one half of a side-by-side frame: put the
-        // mosaic in the left half.
-        let mut sbs = vec![64u16; (2 * w * h) as usize];
-        for y in 0..h as usize {
-            sbs[y * 2 * w as usize..y * 2 * w as usize + w as usize].copy_from_slice(&mosaic[y * w as usize..(y + 1) * w as usize]);
-        }
-        let params = RawParams { width: 2 * w, height: h, cfa: layout.cfa, white_level: layout.white, black_level: [layout.black; 4], as_shot_neutral: [1.0; 3] };
         let tex = dev.new_bayer_texture(w, h);
         dev.write_bayer_texture(&tex, &mosaic);
-        for half in [false, true] {
-            let cpu = develop_linear(&sbs, &params, &[], Half::Left, half);
-            let (ow, oh) = if half { (w / 2, h / 2) } else { (w, h) };
-            assert_eq!((cpu.width, cpu.height), (ow, oh));
-            let out = dev.new_linear_eye_texture(ow, oh);
-            dev.demosaic_bayer(&tex, &layout, &out).unwrap();
-            let gpu = dev.read_texture_rgba64(&out, ow, oh).unwrap();
-            let gpu: Vec<u16> = gpu.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-            let mut worst = 0i32;
-            for (px, (g, c)) in gpu.chunks_exact(4).zip(cpu.rgba.chunks_exact(4)).enumerate() {
-                // The CPU half reflects at the seam of its side-by-side
-                // frame exactly as the GPU does at the edge of its eye.
-                for ch in 0..3 {
-                    let d = (g[ch] as i32 - c[ch] as i32).abs();
-                    if d > worst { worst = d; }
-                    assert!(d <= 2, "half {half} pixel {px} channel {ch}: gpu {} cpu {}", g[ch], c[ch]);
+        for layout in [crate::x6_raw::BAYER, BayerLayout { cfa: [0, 1, 1, 2], black: 256.0, white: 16000.0, neutral: [0.47, 1.0, 0.61] }] {
+            for half in [false, true] {
+                let cpu = crate::bayer::demosaic(&mosaic, w as usize, h as usize, &layout, half);
+                let (ow, oh) = if half { (w / 2, h / 2) } else { (w, h) };
+                assert_eq!(cpu.len(), (ow * oh) as usize);
+                let out = dev.new_linear_eye_texture(ow, oh);
+                dev.demosaic_bayer(&tex, &layout, &out).unwrap();
+                let gpu = dev.read_texture_rgba64(&out, ow, oh).unwrap();
+                let gpu: Vec<u16> = gpu.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+                let mut worst = 0i32;
+                for (px, (g, c)) in gpu.chunks_exact(4).zip(&cpu).enumerate() {
+                    for ch in 0..3 {
+                        let d = (g[ch] as i32 - (c[ch] * 65535.0).round() as i32).abs();
+                        if d > worst { worst = d; }
+                        assert!(d <= 2, "{:?} half {half} pixel {px} channel {ch}: gpu {} cpu {}", layout.cfa, g[ch], c[ch] * 65535.0);
+                    }
+                    assert_eq!(g[3], u16::MAX);
                 }
+                eprintln!("{:?} half {half}: worst difference {worst} of 65535", layout.cfa);
             }
-            eprintln!("half {half}: worst difference {worst} of 65535");
         }
     }
+
 }
