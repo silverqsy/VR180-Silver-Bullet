@@ -28,45 +28,66 @@ sensor recorded, ahead of the tone controls and the LUT.
   and software encoder, ProRes) land within one 10-bit code of it on
   average.
 
-### Insta360 X6 Crop clips: a lens-frame export for Apple Vision Pro
+### A lens-frame export for Apple Vision Pro
 
-A Crop clip covers about 97° or 126°. Exported as VR180 it sits in the
-middle of a 180° canvas that is half to two thirds black, and the canvas has
-to be far larger than the recording to keep its detail: 13120 × 6560 for a
-recording of 9824 × 4912. The Format window now has **Lens frame for Apple
-Vision Pro**: each eye is written the way the camera recorded it, in a lens
+A VR180 file is a 180° canvas. A fisheye that sees more than that, as the
+lenses of a 360 camera do, loses what lies past the canvas's edge. A Crop
+clip of the Insta360 X6, which covers about 97° or 126°, sits in the middle
+of a canvas that is half to two thirds black, and the canvas has to be far
+larger than the recording to keep its detail: 13120 × 6560 for a recording
+of 9824 × 4912. The Format window now has **Lens frame for Apple Vision
+Pro**: each eye is written the way the camera recorded it, in a lens
 projection, and the file states that lens (Apple Projected Media Profile,
 parametric immersive projection), so the headset shows every pixel at its
 own angle.
 
-- **No black canvas.** The whole frame is picture, at the density it was
-  recorded: 9824 × 4912 for a 10K Crop clip (56 % of the pixels of its 180°
-  canvas), 7424 × 3712 for a 7.4K Crop clip (32 %), each with all of its
-  detail. The 8K choice writes a reduced copy of the same frame.
+- **Every video source**: Insta360 X6 in all of its recording modes, DJI
+  Osmo 360, QooCam 3 Ultra, Blackmagic RAW, GoPro `.360`, and a
+  side-by-side file whose halves are fisheye images. A side-by-side file
+  that is already VR180 has no lens, and exports as VR180.
+- **The lens's whole view.** A full fisheye frame keeps its field past
+  180°: about 200° across the frame of an X6 at 8K or of an Osmo 360, 213°
+  for an X6 at 10K, and more towards the frame's corners. A GoPro `.360`
+  holds 184.5° per lens; its frame is a fisheye of that field at the
+  file's own pixel density. Around the picture the frame is black.
+- **No black canvas for a Crop clip.** The whole frame is picture, at the
+  density it was recorded: 9824 × 4912 for a 10K Crop clip (56 % of the
+  pixels of its 180° canvas), 7424 × 3712 for a 7.4K Crop clip (32 %), each
+  with all of its detail.
+- **The clip's own size.** A lens frame is as large as the recording
+  (7680 × 3840 for an 8K X6 or an Osmo 360) and is never enlarged; the 8K
+  choice writes a reduced copy of a frame that is larger than that.
 - **Everything else as before**: stabilization, rolling-shutter correction,
   eye alignment, the crop mask and colour are applied the same way. Both
   eyes are rendered into one common lens with the camera lens's own radial
-  law, so the picture is resampled at very nearly one to one.
+  law, so the picture is resampled at very nearly one to one. The profile
+  describes one family of lenses; a camera whose lens record is of another
+  kind gets the lens of that family that follows it most closely (within
+  three pixels over the whole field of an Osmo 360).
 - **Stabilization has no spare canvas here**, so a stabilized frame is 5 %
-  larger on each side than the recording: 8160 × 4080 for a 7.4K Crop
-  clip, 10800 × 5400 for a 10K Crop clip, the same for every clip of a
-  mode. Where the picture does not reach, the frame is black, as around
-  the picture of a VR180 export; a shift beyond the margin is cut at the
-  frame's edge (under 4 seconds of a rough one-minute hand-held walk).
-  With stabilization off the frame is the recorded one. An 8K copy keeps
-  its size and scales the picture instead. A crop mask is measured from
-  the frame's own edge (the larger one, on a stabilized clip): its window
-  can be as wide as the frame, and gives a steady edge once it is small
-  enough to stay inside the moving picture. Camera lock suits a camera
-  that stays put.
+  larger on each side than the recording: 8448 × 4224 for an 8K X6 or an
+  Osmo 360 clip, 8160 × 4080 for a 7.4K Crop clip, 10800 × 5400 for a 10K
+  Crop clip, the same for every clip of a mode. Where the picture does not
+  reach, the frame is black, as around the picture of a VR180 export; a
+  shift beyond the margin is cut at the frame's edge (under 4 seconds of a
+  rough one-minute hand-held walk on a 7.4K Crop clip). With stabilization
+  off the frame is the recorded one. An 8K copy keeps its size and scales
+  the picture instead. A crop mask is measured from the frame's own edge
+  (the larger one, on a stabilized clip): its window can be as wide as the
+  frame, and gives a steady edge once it is small enough to stay inside
+  the moving picture. Camera lock suits a camera that stays put.
 - **Apple Vision Pro only** (visionOS 26 or later). No other headset and
   not YouTube read this form, so the VR180 export stays the default and is
   unchanged: export a clip both ways and you get `…_SBS` and `…_Lens`.
-- **Checked**: the system's own playback mesh, built from the lens in the
-  file, lands within a thousandth of a pixel of what the app rendered; the
-  picture agrees with the VR180 export of the same frames, re-projected
-  independently, to 0.2 of a pixel; the lens boxes are byte for byte what
-  Apple's writer produces. Every existing export is frame-identical.
+  The preview keeps showing the VR180 view, and the Fisheye view still
+  exports its own disc.
+- **Checked**: for every source kind, the system's own playback mesh,
+  built from the lens in the file, lands within a thousandth of a pixel of
+  what the app rendered, out to 113° off the axis; the picture agrees with
+  the VR180 export of the same frames, re-projected independently, to 0.2
+  of a pixel; the lens boxes are byte for byte what Apple's writer
+  produces. Every existing export is frame-identical. Crop clips have been
+  watched on the headset; a frame wider than 180° has not yet.
 
 ### macOS: the preview can match QuickTime
 

@@ -1,25 +1,32 @@
 //! Lens frame: an export whose frame is the image of a lens, with the lens
 //! stated in the file.
 //!
-//! A source whose frame is a crop of its lens's view (the Insta360 X6 Crop
-//! modes) covers ~97° or ~126°. Written as VR180, it sits in the middle of a
-//! 180° canvas that is half to two thirds black, and the canvas has to be far
-//! larger than the recording to keep its detail. A lens frame writes the eye
-//! the way the camera recorded it instead: through a lens with the camera
-//! lens's own radial law, so the frame is full and the pixel density is the
-//! recording's everywhere. Apple's Projected Media Profile can state such a
-//! lens (its parametric immersive projection, see
+//! A VR180 frame is a 180° canvas. A source whose frame is a crop of its
+//! lens's view (the Insta360 X6 Crop modes, ~97° or ~126°) sits in the middle
+//! of it, half to two thirds of the canvas black, and the canvas has to be
+//! far larger than the recording to keep its detail. A source whose lens sees
+//! more than 180° (every fisheye of a 360 camera does: 200° and more) loses
+//! what lies past the canvas's edge. A lens frame writes the eye the way the
+//! camera recorded it instead: through a lens with the camera lens's own
+//! radial law, so the frame is the recording's — all of its field, at the
+//! recording's pixel density everywhere. Apple's Projected Media Profile can
+//! state such a lens (its parametric immersive projection, see
 //! [`crate::spherical_inject::inject_apmp_lens`]), and an Apple Vision Pro
 //! then shows every pixel at its own angle.
 //!
 //! The lens is not the camera's, though. A player builds one surface for
 //! both views, from the first lens in the file, and the profile holds nine
-//! numbers where a factory calibration holds more. So both eyes are rendered
-//! into ONE lens ([`LensFrame`]): the radially symmetric part of the source
-//! lenses, centred in the frame. Everything that is particular to an eye —
+//! numbers where a factory calibration holds more — and they are the numbers
+//! of ONE lens family (Mei and Rives' unified model), which is the Insta360's
+//! but not the Kannala-Brandt polynomial of a DJI, a QooCam or a lens preset.
+//! So both eyes are rendered into ONE lens ([`LensFrame`]): the radially
+//! symmetric part of the source lenses, centred in the frame, in that family
+//! ([`LensFrame::from_sources`]). Everything that is particular to an eye —
 //! its off-centre axis, its tangential and prism terms, its mount, the
 //! stabilization — is resolved by the projection, exactly as for a VR180
-//! frame, and the file's lens is exact by construction.
+//! frame, and the file's lens is exact by construction. A source that is no
+//! lens image at all (a GoPro `.360`'s cube map) gets a plain fisheye of this
+//! family ([`LensFrame::equidistant`]).
 
 use crate::gpu::FisheyeCalib;
 use crate::spherical_inject::ApmpLens;
@@ -40,11 +47,32 @@ pub struct LensFrame {
     /// Pixels at the frame's border that stay black: what a player repeats
     /// past the frame's edge is then black, not the picture's last column.
     pub rim_px: f32,
+    /// How far off the axis the picture goes in this frame at most, degrees:
+    /// the file states the lens no further ([`Self::apmp`]). `180` = wherever
+    /// the frame's own corner is — what a frame that the stabilizer moves the
+    /// picture in is given, and what every constructor here returns.
+    pub picture_deg: f32,
 }
 
 /// How far off the axis the fit of [`LensFrame::from_sources`] looks, at
-/// most: short of where this lens family folds back (114° for the X6).
+/// most: short of where this lens family folds back (114° for the X6), and
+/// as far as the fisheyes of the 360 cameras see (100° to 105°).
 const FIT_LIMIT_DEG: f64 = 105.0;
+
+/// A lens fitted to a radial law of another family ([`fit_law`]) folds back
+/// at least this far past the last angle it was fitted to: room for the
+/// picture a stabilizer turns outward.
+const FOLD_CLEARANCE_DEG: f64 = 5.0;
+
+/// Where no lens of the family follows a radial law over all of its reach,
+/// the fit looks this much less far, again and again, down to the floor.
+const FIT_RETREAT_DEG: f64 = 2.5;
+const FIT_FLOOR_DEG: f64 = 45.0;
+
+/// The ξ a lens fitted to a radial law of another family may take
+/// ([`fit_law`]): from just above the stereographic projection (ξ = 1, which
+/// never folds but runs away towards 180°) to past the X6's 2.46.
+const XI_RANGE: (f64, f64) = (1.05, 3.0);
 
 /// What a stabilized lens frame adds at each border to hold the picture the
 /// stabilizer shifts, as a fraction of the recorded frame's shorter side
@@ -74,61 +102,77 @@ impl LensFrame {
     /// out to its corner, at the scale that keeps the smaller side of the
     /// source frame on the smaller side of this one.
     ///
-    /// `None` unless every source is a unified-camera-model lens: that is
-    /// the family the file's lens belongs to, and the only one for which the
-    /// refit is a refit and not a change of projection.
+    /// Sources of the file's own lens family (the unified camera model: the
+    /// Insta360's factory calibration) keep their ξ, and the refit only folds
+    /// their higher radial terms into two. Any other fisheye — a
+    /// Kannala-Brandt polynomial, with or without the kernels' rim extension
+    /// — gets the lens of this family that follows its radial law most
+    /// closely, ξ included ([`fit_law`]): ξ ≈ 2.4 for a DJI Osmo 360 or a
+    /// QooCam 3 Ultra, within three pixels over their field; ξ ≈ 1.2 to 1.4
+    /// for a lens that is close to equidistant, within a fraction of one.
+    ///
+    /// `None` for a source that is no lens image (a half-equirect input).
     pub fn from_sources(sources: &[&FisheyeCalib], width: u32, height: u32) -> Option<Self> {
         let first = sources.first()?;
-        if width == 0 || height == 0 || sources.iter().any(|c| !(c.xi > 0.0) || c.src_proj > 0.5) {
+        if width == 0 || height == 0 || sources.iter().any(|c| c.src_proj > 0.5) {
             return None;
         }
-        let n = sources.len() as f64;
-        let xi = sources.iter().map(|c| c.xi as f64).sum::<f64>() / n;
-        // Image radius (source pixels) of the plane radius `m`, averaged.
-        let radius = |m: f64| -> f64 {
-            sources.iter().map(|c| {
-                let m2 = m * m;
-                let d = 1.0 + m2 * (c.k[0] as f64 + m2 * (c.k[1] as f64 + m2 * (c.k[2] as f64
-                    + m2 * (c.k[3] as f64 + m2 * c.k5 as f64))));
-                0.5 * (c.fx as f64 + c.fy as f64) * m * d
-            }).sum::<f64>() / n
-        };
         let (src_w, src_h) = (first.src_w as f64, first.src_h as f64);
         if !(src_w > 0.0 && src_h > 0.0) {
             return None;
         }
-        // The plane radius the frame's corner reaches, capped by the limit.
+        let n = sources.len() as f64;
+        // The source frame's corner, from its centre.
         let corner = 0.5 * (src_w * src_w + src_h * src_h).sqrt();
-        let m_cap = {
-            let t = FIT_LIMIT_DEG.to_radians();
-            t.sin() / (xi + t.cos())
-        };
-        let m_max = if radius(m_cap) <= corner {
-            m_cap
+        let (xi, [a, b, c]) = if sources.iter().all(|c| c.xi > 0.0) {
+            let xi = sources.iter().map(|c| c.xi as f64).sum::<f64>() / n;
+            // Image radius (source pixels) of the plane radius `m`, averaged.
+            let radius = |m: f64| -> f64 {
+                sources.iter().map(|c| {
+                    let m2 = m * m;
+                    let d = 1.0 + m2 * (c.k[0] as f64 + m2 * (c.k[1] as f64 + m2 * (c.k[2] as f64
+                        + m2 * (c.k[3] as f64 + m2 * c.k5 as f64))));
+                    0.5 * (c.fx as f64 + c.fy as f64) * m * d
+                }).sum::<f64>() / n
+            };
+            // The plane radius the frame's corner reaches, capped by the limit.
+            let m_cap = {
+                let t = FIT_LIMIT_DEG.to_radians();
+                t.sin() / (xi + t.cos())
+            };
+            let m_max = if radius(m_cap) <= corner {
+                m_cap
+            } else {
+                let (mut lo, mut hi) = (0.0_f64, m_cap);
+                for _ in 0..64 {
+                    let mid = 0.5 * (lo + hi);
+                    if radius(mid) < corner { lo = mid } else { hi = mid }
+                }
+                0.5 * (lo + hi)
+            };
+            // Least squares for a·m + b·m³ + c·m⁵ over (0, m_max].
+            let fit = least_squares((1..=FIT_SAMPLES).map(|i| {
+                let m = m_max * i as f64 / FIT_SAMPLES as f64;
+                (m, radius(m))
+            }))?;
+            (xi, fit)
         } else {
-            let (mut lo, mut hi) = (0.0_f64, m_cap);
-            for _ in 0..64 {
-                let mid = 0.5 * (lo + hi);
-                if radius(mid) < corner { lo = mid } else { hi = mid }
-            }
-            0.5 * (lo + hi)
-        };
-        // Least squares for a·m + b·m³ + c·m⁵ over (0, m_max].
-        const SAMPLES: usize = 512;
-        let mut ata = [[0.0_f64; 3]; 3];
-        let mut atb = [0.0_f64; 3];
-        for i in 1..=SAMPLES {
-            let m = m_max * i as f64 / SAMPLES as f64;
-            let basis = [m, m * m * m, m * m * m * m * m];
-            let r = radius(m);
-            for (row, bi) in basis.iter().enumerate() {
-                atb[row] += bi * r;
-                for (col, bj) in basis.iter().enumerate() {
-                    ata[row][col] += bi * bj;
+            let law = |theta: f64| sources.iter().map(|c| source_radius(c, theta)).sum::<f64>() / n;
+            // As far out as a lens of this family follows the law: all of
+            // the reach where it can, less where the law levels off faster
+            // than the family does (a preset's rim extension, which ends
+            // level at the frame's rim).
+            let mut reach = fit_reach(&law, corner)?;
+            loop {
+                if let Some(fit) = fit_law(&law, reach) {
+                    break fit;
+                }
+                reach -= FIT_RETREAT_DEG.to_radians();
+                if reach < FIT_FLOOR_DEG.to_radians() {
+                    return None;
                 }
             }
-        }
-        let [a, b, c] = solve3(ata, atb)?;
+        };
         if !(a > 0.0) || !a.is_finite() || !b.is_finite() || !c.is_finite() {
             return None;
         }
@@ -142,6 +186,31 @@ impl LensFrame {
             k1: (b / a) as f32,
             k2: (c / a) as f32,
             rim_px: (side / 614.0).round().max(4.0) as f32,
+            picture_deg: 180.0,
+        })
+    }
+
+    /// The lens frame of `width × height` pixels for a source that is no
+    /// lens image (a cube map): a fisheye that spreads `half_fov_deg` evenly
+    /// over half the frame's shorter side — an equidistant fisheye, as nearly
+    /// as this lens family goes (a fraction of a pixel, [`fit_law`]).
+    pub fn equidistant(width: u32, height: u32, half_fov_deg: f64) -> Option<Self> {
+        let half = half_fov_deg.to_radians();
+        if width == 0 || height == 0 || !(half > 0.0) {
+            return None;
+        }
+        let side = width.min(height) as f64;
+        let focal = 0.5 * side / half;
+        let (xi, [a, b, c]) = fit_law(&|theta: f64| focal * theta, half.min(FIT_LIMIT_DEG.to_radians()))?;
+        Some(Self {
+            width,
+            height,
+            xi: xi as f32,
+            focal: a as f32,
+            k1: (b / a) as f32,
+            k2: (c / a) as f32,
+            rim_px: (side / 614.0).round().max(4.0) as f32,
+            picture_deg: 180.0,
         })
     }
 
@@ -234,10 +303,34 @@ impl LensFrame {
         }
     }
 
+    /// Whether every pixel of the frame has an angle or lies past the fold:
+    /// the radius `m·(1 + k1·m² + k2·m⁴)` keeps rising out to the frame's
+    /// corner. The kernels solve it for `m` by Newton's method; had it
+    /// turned back before the corner, the pixels beyond the turn would have
+    /// no solution, and show whatever the iteration lands on.
+    pub fn reaches_its_corner(&self) -> bool {
+        let (k1, k2) = (self.k1 as f64, self.k2 as f64);
+        // Where the slope 1 + 3·k1·u + 5·k2·u² first reaches zero, u = m².
+        let turn = if k2.abs() < 1e-12 {
+            (k1 < 0.0).then(|| -1.0 / (3.0 * k1))
+        } else {
+            let disc = 9.0 * k1 * k1 - 20.0 * k2;
+            (disc >= 0.0).then(|| {
+                let root = disc.sqrt();
+                [(-3.0 * k1 - root) / (10.0 * k2), (-3.0 * k1 + root) / (10.0 * k2)]
+                    .into_iter().filter(|u| *u > 0.0).fold(f64::INFINITY, f64::min)
+            }).filter(|u| u.is_finite())
+        };
+        let Some(u) = turn else { return true };
+        let corner = 0.5 * (self.width as f64).hypot(self.height as f64) / self.focal as f64;
+        u.sqrt() * (1.0 + u * (k1 + u * k2)) > corner
+    }
+
     /// The lens as the file states it: the frame's own numbers, stated out
-    /// to the next whole degree past its corner.
+    /// to the next whole degree past its corner — or past the last of the
+    /// picture ([`picture_deg`](Self::picture_deg)), where that is nearer.
     pub fn apmp(&self) -> ApmpLens {
-        let limit = ((self.reach_deg() as f64 + 0.5).ceil()).min(self.fold_deg() - 1.0);
+        let limit = ((self.reach_deg().min(self.picture_deg) as f64 + 0.5).ceil()).min(self.fold_deg() - 1.0);
         ApmpLens {
             width: self.width,
             height: self.height,
@@ -248,6 +341,145 @@ impl LensFrame {
             limit_deg: limit as f32,
         }
     }
+}
+
+/// Samples of a radial law a lens is fitted to.
+const FIT_SAMPLES: usize = 512;
+
+/// Least squares for `a·m + b·m³ + c·m⁵` through `(m, radius)` points.
+fn least_squares(points: impl Iterator<Item = (f64, f64)>) -> Option<[f64; 3]> {
+    let mut ata = [[0.0_f64; 3]; 3];
+    let mut atb = [0.0_f64; 3];
+    for (m, r) in points {
+        let basis = [m, m * m * m, m * m * m * m * m];
+        for (row, bi) in basis.iter().enumerate() {
+            atb[row] += bi * r;
+            for (col, bj) in basis.iter().enumerate() {
+                ata[row][col] += bi * bj;
+            }
+        }
+    }
+    solve3(ata, atb)
+}
+
+/// Image radius (source pixels, at the mean of the two focal lengths) of a
+/// ray `theta` radians off a source lens's axis, as the kernels place it:
+/// the unified-camera-model curve, or the Kannala-Brandt polynomial with the
+/// kernels' rim extension where the calibration has one (`kb_radius` in the
+/// shaders; level past its end).
+fn source_radius(c: &FisheyeCalib, theta: f64) -> f64 {
+    let k = [c.k[0] as f64, c.k[1] as f64, c.k[2] as f64, c.k[3] as f64, c.k5 as f64];
+    let even = |x2: f64| 1.0 + x2 * (k[0] + x2 * (k[1] + x2 * (k[2] + x2 * (k[3] + x2 * k[4]))));
+    let focal = 0.5 * (c.fx as f64 + c.fy as f64);
+    if c.xi > 0.0 {
+        let m = theta.sin() / (c.xi as f64 + theta.cos());
+        return focal * m * even(m * m);
+    }
+    let kb = |t: f64| t * even(t * t);
+    let (trans, max) = (c.theta_trans as f64, c.theta_max as f64);
+    if theta <= trans || max <= trans {
+        return focal * kb(theta);
+    }
+    let span = max - trans;
+    let u = ((theta - trans) / span).clamp(0.0, 1.0);
+    let t2 = trans * trans;
+    let slope = 1.0 + t2 * (3.0 * k[0] + t2 * (5.0 * k[1] + t2 * (7.0 * k[2] + t2 * (9.0 * k[3] + t2 * 11.0 * k[4]))));
+    let (h00, h10, h01) = (
+        2.0 * u * u * u - 3.0 * u * u + 1.0,
+        u * u * u - 2.0 * u * u + u,
+        -2.0 * u * u * u + 3.0 * u * u,
+    );
+    focal * (h00 * kb(trans) + h10 * span * slope) + h01 * c.r_max as f64 * focal / (c.fx as f64).max(1e-9)
+}
+
+/// How far off the axis (radians) a radial law is fitted: to where it
+/// reaches `corner` pixels, to where it stops rising, or to
+/// [`FIT_LIMIT_DEG`], whichever comes first. `None` for a law that covers
+/// next to nothing.
+fn fit_reach(law: &dyn Fn(f64) -> f64, corner: f64) -> Option<f64> {
+    let limit = FIT_LIMIT_DEG.to_radians();
+    let step = 0.25_f64.to_radians();
+    let (mut reach, mut r_reach) = (0.0_f64, 0.0_f64);
+    while reach < limit {
+        let t = (reach + step).min(limit);
+        let r = law(t);
+        if !(r > r_reach) {
+            break;
+        }
+        if r >= corner {
+            let (mut lo, mut hi) = (reach, t);
+            for _ in 0..48 {
+                let mid = 0.5 * (lo + hi);
+                if law(mid) < corner { lo = mid } else { hi = mid }
+            }
+            reach = 0.5 * (lo + hi);
+            break;
+        }
+        reach = t;
+        r_reach = r;
+    }
+    (reach > 10.0_f64.to_radians()).then_some(reach)
+}
+
+/// The lens of the file's family that follows a radial law of another
+/// family most closely over `(0, reach]` radians off the axis: `(ξ, [a, b,
+/// c])` with the law's radius ≈ `a·m + b·m³ + c·m⁵` at the plane radius
+/// `m = sin θ / (cos θ + ξ)`.
+///
+/// For each ξ the three terms are a least-squares fit; ξ is the one whose
+/// fit strays least from the law at its worst sample (a coarse scan of
+/// [`XI_RANGE`], then a golden-section search around the best, to four
+/// decimals). A ξ is out when the lens it gives folds back within
+/// [`FOLD_CLEARANCE_DEG`] of `reach`, or when the radius it gives does not
+/// rise with `m` everywhere: the kernels find a pixel's angle by Newton's
+/// method on that radius, and a frame has pixels past the lens's fold (its
+/// corners) for which the solve must still land past the fold, where they
+/// are black — it does only if the radius never turns back
+/// ([`LensFrame::reaches_its_corner`]).
+///
+/// An equidistant fisheye comes out at ξ ≈ 1.4, a quarter of a pixel off
+/// over 104° at 3840 pixels a side, folding at 135°. The lens of a DJI Osmo
+/// 360 — whose pixel density falls from 18 per degree at the centre to 11 at
+/// its rim, much as the X6's does — at ξ ≈ 2.4, three pixels off at worst.
+fn fit_law(law: &dyn Fn(f64) -> f64, reach: f64) -> Option<(f64, [f64; 3])> {
+    let at = |xi: f64| -> Option<([f64; 3], f64)> {
+        let fold = if xi > 1.0 { (-1.0 / xi).acos() } else { std::f64::consts::PI };
+        if reach + FOLD_CLEARANCE_DEG.to_radians() >= fold {
+            return None;
+        }
+        let plane = |t: f64| t.sin() / (t.cos() + xi);
+        let sample = |i: usize| reach * i as f64 / FIT_SAMPLES as f64;
+        let [a, b, c] = least_squares((1..=FIT_SAMPLES).map(|i| (plane(sample(i)), law(sample(i)))))?;
+        if !(a > 0.0) || !a.is_finite() || !b.is_finite() || !c.is_finite() {
+            return None;
+        }
+        // The slope a + 3·b·m² + 5·c·m⁴ has to stay positive for every m.
+        if !(c >= 0.0 && (b >= 0.0 || 9.0 * b * b < 20.0 * a * c)) {
+            return None;
+        }
+        let worst = (1..=FIT_SAMPLES).map(|i| {
+            let m = plane(sample(i));
+            (m * (a + m * m * (b + m * m * c)) - law(sample(i))).abs()
+        }).fold(0.0_f64, f64::max);
+        Some(([a, b, c], worst))
+    };
+    let cost = |xi: f64| at(xi).map_or(f64::INFINITY, |(_, worst)| worst);
+    const STEP: f64 = 0.05;
+    let steps = ((XI_RANGE.1 - XI_RANGE.0) / STEP).round() as usize;
+    let coarse = (0..=steps)
+        .map(|i| XI_RANGE.0 + STEP * i as f64)
+        .map(|xi| (xi, cost(xi)))
+        .filter(|(_, w)| w.is_finite())
+        .min_by(|p, q| p.1.total_cmp(&q.1))?;
+    let (mut lo, mut hi) = ((coarse.0 - STEP).max(XI_RANGE.0), (coarse.0 + STEP).min(XI_RANGE.1));
+    let ratio = 0.5 * (5.0_f64.sqrt() - 1.0);
+    for _ in 0..40 {
+        let (p, q) = (hi - ratio * (hi - lo), lo + ratio * (hi - lo));
+        if cost(p) <= cost(q) { hi = q } else { lo = p }
+    }
+    let fine = ((0.5 * (lo + hi)) * 1e4).round() / 1e4;
+    let xi = if cost(fine) <= coarse.1 { fine } else { coarse.0 };
+    at(xi).map(|(fit, _)| (xi, fit))
 }
 
 /// Solve a 3 × 3 linear system (Gaussian elimination with pivoting).
@@ -283,6 +515,18 @@ impl FisheyeCalib {
     /// `frame`'s lens over the whole frame instead of their equidistant
     /// disc. The calibration keeps describing the SOURCE; `frame` must be
     /// the size of the texture projected into.
+    pub fn with_lens_frame(mut self, frame: &LensFrame) -> Self {
+        self.out_lens = [frame.xi, frame.focal, frame.k1, frame.k2];
+        self.out_rim = frame.rim_px;
+        self
+    }
+}
+
+impl crate::gpu::EacLensAdjust {
+    /// Lens-frame output of a cube-map source: the fisheye-output kernel
+    /// writes the image of `frame`'s lens over the whole frame instead of
+    /// its equidistant disc, black where the cube map holds no picture.
+    /// Independent of the lens re-dewarp, which stays whatever it was.
     pub fn with_lens_frame(mut self, frame: &LensFrame) -> Self {
         self.out_lens = [frame.xi, frame.focal, frame.k1, frame.k2];
         self.out_rim = frame.rim_px;
@@ -468,14 +712,281 @@ mod tests {
         assert!((tall.focal as f64 / small.focal as f64 - 0.8).abs() < 1e-6);
     }
 
-    /// Only a unified-camera-model source has such a lens.
+    /// The two lenses of a DJI Osmo 360 as its file states them: a
+    /// Kannala-Brandt polynomial of five terms over 3840 × 3840.
+    fn osmo_360() -> (FisheyeCalib, FisheyeCalib) {
+        let lens = |f: f32, cx: f32, cy: f32, k: [f32; 5]| {
+            let mut c = FisheyeCalib::new_pure_kb(f, f, cx, cy, [k[0], k[1], k[2], k[3]], 3840.0, 3840.0);
+            c.k5 = k[4];
+            c
+        };
+        (
+            lens(1047.42, 1916.4, 1915.8, [0.067321, -0.014563, 0.013371, -0.008182, 0.001192]),
+            lens(1043.10, 1914.2, 1923.7, [0.073225, -0.021113, 0.016638, -0.008891, 0.001242]),
+        )
+    }
+
+    /// The kernels' own solve for the ray of a pixel (`lens_frame_ray.wgsl`,
+    /// without its rim): single precision, eight Newton steps from the
+    /// distorted radius.
+    fn kernel_ray(frame: &LensFrame, px: f32, py: f32) -> Option<[f32; 3]> {
+        let (xi, k1, k2) = (frame.xi, frame.k1, frame.k2);
+        let dx = px - frame.width as f32 * 0.5;
+        let dy = frame.height as f32 * 0.5 - py;
+        let r = (dx * dx + dy * dy).sqrt();
+        let rd = r / frame.focal;
+        let mut m = rd;
+        for _ in 0..8 {
+            let m2 = m * m;
+            m = m - (m * (1.0 + m2 * (k1 + k2 * m2)) - rd) / (1.0 + m2 * (3.0 * k1 + 5.0 * k2 * m2));
+        }
+        let mm = m * m;
+        let disc = 1.0 + (1.0 - xi * xi) * mm;
+        if disc < 0.0 {
+            return None;
+        }
+        let g = (xi + disc.sqrt()) / (mm + 1.0);
+        let (ux, uy) = if r > 1e-6 { (dx / r, dy / r) } else { (0.0, 0.0) };
+        Some([g * m * ux, g * m * uy, g - xi])
+    }
+
+    /// Frame radius (pixels) at which a lens folds back.
+    fn fold_radius(frame: &LensFrame) -> f64 {
+        let xi = frame.xi as f64;
+        let m = 1.0 / (xi * xi - 1.0).sqrt();
+        frame.focal as f64 * m * (1.0 + m * m * (frame.k1 as f64 + m * m * frame.k2 as f64))
+    }
+
+    /// A fisheye of another lens family gets the lens of the file's family
+    /// that follows its radial law: a DJI Osmo 360's Kannala-Brandt lenses
+    /// come out within four pixels over their whole field, at a ξ close to
+    /// the X6's — the two cameras spread their pixels much alike.
     #[test]
-    fn other_lens_families_have_no_lens_frame() {
-        let kb = FisheyeCalib::new_pure_kb(1044.0, 1044.0, 1920.0, 1920.0, [0.08, -0.02, 0.001, 0.0], 3840.0, 3840.0);
-        assert!(LensFrame::from_sources(&[&kb], 3840, 3840).is_none());
+    fn a_lens_of_another_family_gets_one_that_follows_it() {
+        let (l, r) = osmo_360();
+        let frame = LensFrame::from_sources(&[&l, &r], 3840, 3840).expect("a lens");
+        assert_eq!((frame.width, frame.height, frame.rim_px, frame.picture_deg), (3840, 3840, 6.0, 180.0));
+        assert!(frame.xi > 2.2 && frame.xi < 2.6, "xi {}", frame.xi);
+        // ξ to four decimals: the same lens wherever the search runs.
+        assert!((frame.xi as f64 * 1e4 - (frame.xi as f64 * 1e4).round()).abs() < 1e-2, "xi {}", frame.xi);
+        assert!(frame.k1 > 0.0 && frame.k2 >= 0.0, "k1 {} k2 {}", frame.k1, frame.k2);
+        assert!(frame.reaches_its_corner());
+        let mean = |theta: f64| 0.5 * (l.radius_pure(theta as f32) as f64 + r.radius_pure(theta as f32) as f64);
+        let mut worst = 0.0_f64;
+        for i in 1..=210 {
+            let theta = (i as f64 * 0.5).to_radians();
+            let p = frame.project([theta.sin(), 0.0, theta.cos()]);
+            worst = worst.max((p[0] - 1920.0 - mean(theta)).abs());
+        }
+        assert!(worst < 4.0, "radial law off by {worst} px");
+        // The paraxial scale is the source lenses' own: 18.2 pixels a degree.
+        let centre = (frame.focal as f64 / (1.0 + frame.xi as f64)).to_radians();
+        assert!((centre - 18.24).abs() < 0.15, "{centre} px per degree at the centre");
+        // The frame's sides are 99° off the axis: all of the lens's field.
+        let [hx, hy] = frame.half_angles();
+        assert!((hx - hy).abs() < 1e-6 && (hx.to_degrees() - 99.3).abs() < 0.7, "{}", hx.to_degrees());
+        // Its corners lie past the fold: no ray there, and the lens is
+        // stated a degree short of the fold.
+        assert!(frame.ray(0.5, 0.5).is_none());
+        let fold = (-1.0 / frame.xi as f64).acos().to_degrees();
+        assert!(fold > 110.0 + FOLD_CLEARANCE_DEG - 1.0, "fold {fold}");
+        assert!((frame.apmp().limit_deg as f64 - (fold - 1.0)).abs() < 1e-3);
+        // One eye alone, and a frame at another scale, give the same lens.
+        let one = LensFrame::from_sources(&[&l], 3840, 3840).unwrap();
+        assert!((one.focal / frame.focal - 1.0).abs() < 0.01 && (one.xi - frame.xi).abs() < 0.15);
+        let small = LensFrame::from_sources(&[&l, &r], 2048, 2048).unwrap();
+        assert!((small.focal as f64 / frame.focal as f64 - 2048.0 / 3840.0).abs() < 1e-6);
+        assert_eq!((small.xi, small.k1, small.k2), (frame.xi, frame.k1, frame.k2));
+    }
+
+    /// A source that is no lens image gets an equidistant fisheye: the
+    /// angle spread evenly over the frame's shorter side, to a fraction of a
+    /// pixel, in a lens that folds far beyond it.
+    #[test]
+    fn a_cube_map_gets_an_equidistant_fisheye() {
+        let frame = LensFrame::equidistant(3936, 3936, 92.5).expect("a lens");
+        assert_eq!((frame.width, frame.height, frame.rim_px, frame.picture_deg), (3936, 3936, 6.0, 180.0));
+        assert!(frame.xi > 1.2 && frame.xi < 1.6, "xi {}", frame.xi);
+        assert!(frame.reaches_its_corner());
+        let focal = 1968.0 / 92.5_f64.to_radians();
+        let mut worst = 0.0_f64;
+        for i in 1..=185 {
+            let theta = (i as f64 * 0.5).to_radians();
+            let p = frame.project([theta.sin(), 0.0, theta.cos()]);
+            worst = worst.max((p[0] - 1968.0 - focal * theta).abs());
+        }
+        assert!(worst < 0.5, "equidistant law off by {worst} px");
+        let [hx, hy] = frame.half_angles();
+        assert!((hx.to_degrees() - 92.5).abs() < 0.05 && (hy.to_degrees() - 92.5).abs() < 0.05, "{} {}", hx.to_degrees(), hy.to_degrees());
+        assert!((-1.0 / frame.xi as f64).acos().to_degrees() > 125.0);
+        // A frame that is not square holds the field on its shorter side.
+        let wide = LensFrame::equidistant(4000, 3000, 92.5).unwrap();
+        assert!((wide.half_angles()[1].to_degrees() - 92.5).abs() < 0.05);
+        assert!((wide.focal as f64 / frame.focal as f64 - 3000.0 / 3936.0).abs() < 2e-3);
+        assert!(LensFrame::equidistant(0, 3000, 92.5).is_none() && LensFrame::equidistant(3000, 3000, 0.0).is_none());
+    }
+
+    /// A generic fisheye (a preset: equidistant, with the kernels' rim
+    /// extension past 80°) gets a lens that follows the law the kernels
+    /// place it by, extension included.
+    #[test]
+    fn a_generic_fisheye_with_the_rim_extension_gets_a_lens() {
+        let fx = 3840.0 / 195.0_f32.to_radians();
+        let c = FisheyeCalib::new(fx, fx, 1920.0, 1920.0, [0.0; 4], 3840.0, 3840.0, 1920.0);
+        // The law: the polynomial to 80°, then a cubic that reaches the
+        // frame's rim (1920 px) at 110° and stays there.
+        assert!((source_radius(&c, 60.0_f64.to_radians()) - fx as f64 * 60.0_f64.to_radians()).abs() < 1e-3);
+        assert!((source_radius(&c, 110.0_f64.to_radians()) - 1920.0).abs() < 1e-3);
+        assert!((source_radius(&c, 125.0_f64.to_radians()) - 1920.0).abs() < 1e-3);
+        let mid = source_radius(&c, 95.0_f64.to_radians());
+        assert!(mid > source_radius(&c, 80.0_f64.to_radians()) && mid < 1920.0);
+        let frame = LensFrame::from_sources(&[&c, &c], 3840, 3840).expect("a lens");
+        assert!(frame.reaches_its_corner());
+        let mut worst = 0.0_f64;
+        for i in 1..=210 {
+            let theta = (i as f64 * 0.5).to_radians();
+            let p = frame.project([theta.sin(), 0.0, theta.cos()]);
+            worst = worst.max((p[0] - 1920.0 - source_radius(&c, theta)).abs());
+        }
+        assert!(worst < 6.0, "radial law off by {worst} px");
+    }
+
+    /// The catch-all preset (180° across the frame, no distortion terms):
+    /// its rim extension levels off at the frame's rim, faster than any lens
+    /// of the family does. The lens follows the law as far out as it can,
+    /// and keeps rising past that.
+    #[test]
+    fn a_law_that_levels_off_at_the_rim_still_gets_a_lens() {
+        let fx = 2048.0 / std::f32::consts::PI;
+        let c = FisheyeCalib::new(fx, fx, 1024.0, 1024.0, [0.0; 4], 2048.0, 2048.0, 1024.0);
+        let frame = LensFrame::from_sources(&[&c, &c], 2048, 2048).expect("a lens");
+        assert!(frame.reaches_its_corner() && frame.k2 >= 0.0, "{frame:?}");
+        assert!(frame.xi > 2.5, "a law this flat at the rim takes a large xi: {}", frame.xi);
+        let mut worst = 0.0_f64;
+        for i in 1..=180 {
+            let theta = (i as f64 * 0.5).to_radians();
+            let p = frame.project([theta.sin(), 0.0, theta.cos()]);
+            worst = worst.max((p[0] - 1024.0 - source_radius(&c, theta)).abs());
+        }
+        // Over the hemisphere the preset stands for: the extension bends the
+        // law at 80°, and two terms round that bend off by half a percent
+        // of the frame.
+        assert!(worst < 13.0, "radial law off by {worst} px to 90°");
+        // The frame's side is a little past the hemisphere's edge.
+        let [hx, _] = frame.half_angles();
+        assert!(hx.to_degrees() > 90.0 && hx.to_degrees() < 100.0, "{}", hx.to_degrees());
+    }
+
+    /// A pair of lenses of two families (one eye with a manual override)
+    /// still gets one lens; a half-equirect input, which has no lens, none.
+    #[test]
+    fn sources_without_a_lens_have_no_lens_frame() {
         let (l, _) = crop_10k();
-        assert!(LensFrame::from_sources(&[&l, &kb], 4912, 4912).is_none());
+        let (kb, _) = osmo_360();
+        let kb = FisheyeCalib { fx: l.fx, fy: l.fy, src_w: 4912.0, src_h: 4912.0, ..kb };
+        assert!(LensFrame::from_sources(&[&l, &kb], 4912, 4912).is_some());
         assert!(LensFrame::from_sources(&[], 4912, 4912).is_none());
         assert!(LensFrame::from_sources(&[&l.with_equirect_input()], 4912, 4912).is_none());
+        assert!(LensFrame::from_sources(&[&kb.with_equirect_input(), &kb], 3840, 3840).is_none());
+        assert!(LensFrame::from_sources(&[&l], 0, 4912).is_none());
+    }
+
+    /// With the stabilizer off the picture ends where the source's does,
+    /// and the file states the lens no further than that; a frame the
+    /// picture moves in is stated to its corner, as ever.
+    #[test]
+    fn the_file_states_the_lens_as_far_as_the_picture_goes() {
+        let (l, r) = osmo_360();
+        let frame = LensFrame::from_sources(&[&l, &r], 3840, 3840).unwrap();
+        let fold = (-1.0 / frame.xi as f64).acos().to_degrees() as f32;
+        // The corner is past the fold: a degree short of it.
+        assert!((frame.apmp().limit_deg - (fold - 1.0)).abs() < 1e-3);
+        // A picture that ends at 106.2°: the next whole degree past it.
+        assert_eq!(LensFrame { picture_deg: 106.2, ..frame }.apmp().limit_deg, 107.0);
+        // Never past the frame's own corner, nor past the fold.
+        let (cl, cr) = crop_10k();
+        let crop = LensFrame::from_sources(&[&cl, &cr], 4912, 4912).unwrap();
+        assert_eq!(LensFrame { picture_deg: 95.0, ..crop }.apmp().limit_deg, 89.0);
+        assert_eq!(LensFrame { picture_deg: 70.2, ..crop }.apmp().limit_deg, 71.0);
+        assert!((LensFrame { picture_deg: 160.0, ..frame }.apmp().limit_deg - (fold - 1.0)).abs() < 1e-3);
+        // Growing or fitting a frame keeps what was said of its picture.
+        assert_eq!(LensFrame { picture_deg: 95.0, ..crop }.grown(10, 10).picture_deg, 95.0);
+        assert_eq!(LensFrame { picture_deg: 95.0, ..crop }.fitted(2048, 2048).picture_deg, 95.0);
+    }
+
+    /// Every pixel of a frame — its far corners and a stabilized frame's
+    /// margin included — either has the ray the lens gives it, found by the
+    /// kernels' own short single-precision solve, or lies past the fold and
+    /// is black. No pixel is left to whatever the solve lands on.
+    #[test]
+    fn the_kernels_solve_finds_every_pixel_or_none() {
+        let (cl, cr) = crop_10k();
+        let (ol, or) = osmo_360();
+        let full_x6 = {
+            // The same two lenses over a full-view frame (3840 × 3840).
+            let scale = |c: &FisheyeCalib| FisheyeCalib::new_omni(
+                c.fx * 0.5, c.fy * 0.5, 1911.7, 1926.3, c.xi, [c.k[0], c.k[1], c.k[2], c.k[3], c.k5],
+                c.tangential, c.prism, 3840.0, 3840.0,
+            );
+            LensFrame::from_sources(&[&scale(&cl), &scale(&cr)], 3840, 3840).unwrap()
+        };
+        let frames = [
+            LensFrame::from_sources(&[&cl, &cr], 4912, 4912).unwrap(),
+            full_x6,
+            LensFrame::from_sources(&[&ol, &or], 3840, 3840).unwrap(),
+            LensFrame::equidistant(3936, 3936, 92.5).unwrap(),
+        ];
+        for frame in frames {
+            let m = frame.margin_px();
+            for f in [frame, frame.grown(m, m)] {
+                assert!(f.reaches_its_corner(), "{f:?}");
+                let fold = fold_radius(&f);
+                let (w, h) = (f.width as f32, f.height as f32);
+                let (mut seen, mut dark) = (0, 0);
+                for iy in 0..=64 {
+                    for ix in 0..=64 {
+                        let (px, py) = (0.5 + (w - 1.0) * ix as f32 / 64.0, 0.5 + (h - 1.0) * iy as f32 / 64.0);
+                        let r = ((px - w * 0.5) as f64).hypot((py - h * 0.5) as f64);
+                        // At the fold itself the two precisions may differ.
+                        if (r - fold).abs() < 2.0 {
+                            continue;
+                        }
+                        match (f.ray(px as f64, py as f64), kernel_ray(&f, px, py)) {
+                            (Some(a), Some(b)) => {
+                                let off = (0..3).map(|i| (a[i] - b[i] as f64).powi(2)).sum::<f64>().sqrt();
+                                // A fiftieth of a pixel at the centre's scale.
+                                let px_rad = (1.0 + f.xi as f64) / f.focal as f64;
+                                assert!(off < 0.02 * px_rad, "({px}, {py}) of {f:?}: {off} rad apart");
+                                assert!(r < fold);
+                                seen += 1;
+                            }
+                            (None, None) => {
+                                assert!(r > fold, "({px}, {py}) of {f:?}: dark inside the fold");
+                                dark += 1;
+                            }
+                            (a, b) => panic!("({px}, {py}) of {f:?}: lens {a:?}, kernel {b:?}"),
+                        }
+                    }
+                }
+                assert!(seen > 2000, "{seen} pixels with a ray, {dark} past the fold: {f:?}");
+            }
+        }
+    }
+
+    /// A lens whose radius turned back inside the frame would leave pixels
+    /// without an angle: such a frame is told apart.
+    #[test]
+    fn a_lens_that_turns_back_inside_its_frame_is_refused() {
+        let (l, r) = crop_10k();
+        let frame = LensFrame::from_sources(&[&l, &r], 4912, 4912).unwrap();
+        assert!(frame.reaches_its_corner());
+        // k2 < 0: the radius peaks at m = 0.93, 5200 px out — past this
+        // frame's corner (3473 px), inside a frame twice the size.
+        let bent = LensFrame { k1: 0.0, k2: -0.27, ..frame };
+        assert!(bent.reaches_its_corner());
+        assert!(!LensFrame { width: 9824, height: 9824, ..bent }.reaches_its_corner());
+        // k1 < 0 alone turns back too; a slope that never reaches zero does not.
+        assert!(!LensFrame { k1: -3.0, k2: 0.0, ..frame }.reaches_its_corner());
+        assert!(LensFrame { k1: -0.2, k2: 0.2, width: 20000, height: 20000, ..frame }.reaches_its_corner());
     }
 }

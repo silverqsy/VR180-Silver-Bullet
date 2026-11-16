@@ -2371,14 +2371,106 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      conversion is 8-bit in, 8-bit out with egui's dither, like the image
      path it replaces.
 
-33. **Lens-frame export of Crop clips (2026-11-14, Mac; UNRELEASED,
-    Windows not built).** A Crop clip's VR180 export can be written as a
-    LENS FRAME instead of a half-equirect: each eye through a lens, the
-    whole frame full, the lens stated in the file (APMP, projection `prim`
-    with a lens collection). Format window ▸ **Lens frame for Apple Vision
+33. **Lens-frame export (2026-11-14 for Crop clips, 2026-11-15 for every
+    source; Mac; UNRELEASED, Windows not built).** A clip's VR180 export can
+    be written as a LENS FRAME instead of a half-equirect: each eye through a
+    lens, the frame the recording's own, the lens stated in the file (APMP,
+    projection `prim` with a lens collection). A Crop clip then fills its
+    frame instead of sitting in a mostly black 180° canvas; a clip that holds
+    the lens's whole view keeps what lies past 180° (the fisheyes of the 360
+    cameras see 200° and more). Format window ▸ **Lens frame for Apple Vision
     Pro**; `ExportOptions::lens_frame` (one choice for the list, applied
-    where `lens_frame_for` says: a cropped video clip in the VR180 view).
-    Default off; the half-equirect export is untouched.
+    where `lens_frame_for` says: a video with a lens, `lens_frame_possible`,
+    in the VR180 view). Default off; the half-equirect export is untouched.
+   - **Every source (2026-11-15)**: the X6's full-view modes, DJI Osmo 360,
+     QooCam 3 Ultra, Blackmagic RAW, a generic side-by-side file whose
+     halves are fisheye images (dewarp on), and GoPro `.360`. Not a
+     side-by-side file that is already VR180 (no lens: the export refuses,
+     the GUI does not offer it), not a still. What it took:
+     - `LensFrame::from_sources` takes any lens. Sources of the file's own
+       family (unified camera model: the X6) go through the code they went
+       through before, to the last bit. Any other radial law (Kannala-Brandt,
+       with or without the kernels' rim extension, `source_radius`) is fitted
+       by `fit_law`: for each ξ a least-squares a·m + b·m³ + c·m⁵, the ξ
+       whose fit strays least at its worst sample (coarse scan 1.05 … 3.0,
+       golden-section refinement, rounded to four decimals so every machine
+       states the same lens). A ξ is out when its lens folds within 5° of
+       the fitted reach, or when its radius does not rise with m EVERYWHERE
+       (slope a + 3b·m² + 5c·m⁴ > 0 for all m): a frame has pixels past the
+       fold (its corners), the kernels solve the radius for m by Newton's
+       method, and only a radius that never turns back sends those pixels
+       past the fold (black) instead of to whatever the iteration lands on.
+       `LensFrame::reaches_its_corner` checks the same for the X6 fits (whose
+       k2 can be negative, turning back far outside any frame) and the
+       export refuses a frame that fails. Where no ξ qualifies over the whole
+       reach (a preset's rim extension ends level at the frame's rim) the
+       fit looks 2.5° less far, repeatedly.
+     - Measured lenses (per-eye frame, ξ, focal, k1, k2; worst deviation
+       from the source law): Osmo 360 3840² → 2.4309, 3566.92, 1.2118,
+       0.2848 (3 px over 105°: its lens is nothing like equidistant, the
+       density falls from 18 px/° at the centre to 11 at the rim, and it
+       comes out next to the X6's); X6 8K 3840² → 2.45543 (the file's),
+       3617.93, 1.1348, 0.4645, the same k for 7.4K and 10K; QooCam 3840² →
+       2.4502, 4089.27, 0.1637, 0.7619; Blackmagic (preset, near
+       equidistant) → 1.2366; the catch-all 180° preset → 3.0 (the range's
+       end; 11 px off inside 90°, the extension's bend).
+     - GoPro `.360` has no lens image: its frame is an equidistant fisheye
+       of 92.5° half field over the cross's side (`LensFrame::equidistant`,
+       `EAC_LENS_FRAME_HALF_FOV_DEG` = the disc kernel's own
+       `FISHEYE_HALF_FOV`; ξ 1.4506, within 0.3 px, fold at 134°), at the
+       cube map's own density when the frame is as large as the cross (3936
+       on a MAX). `export_eac` resolves it (`resolve_eac_lens_frame`),
+       `resolve_eac_lens_pair` hands it to the kernel through
+       `EacLensAdjust::{out_lens, out_rim}` (uniform 80 → 96 bytes; the two
+       existing kernels declare less and read none of it), and
+       `gpu::eac_lens_frame_wgsl` splices the variant of
+       `eac_to_fisheye.wgsl`: the shared `lens_frame_ray.wgsl` with `cal.`
+       → `lens.`, and a `cover` term that blackens rays past the strip of a
+       side face the cross carries (the disc kernel's "edge fill" repeats
+       the last column there). No arm of `export_eac` was edited: all three
+       project through `project_cross_texture_to_fisheye_texture[_16]`,
+       which pick the variant by `lens.out_lens`.
+     - **Black, not the repeated rim**: a full-view source repeats its rim
+       past the image circle in the half-equirect and the disc (the user's
+       choice there: it covers the gaps stabilization opens). A lens frame
+       shows the frame's border all the time, so there it is black:
+       `FisheyeCalib::with_frame_edge` (applied in `resolve_calib_pair`'s
+       lens arm) = `with_frame_crop` for a lens model without the rim
+       extension (θ clamp at the frame's far corner, capped 110°) and only
+       `frame_mask` for a calibration that has the extension (its clamp and
+       its law kept). The crop mask of that arm now applies to Crop sources
+       alone, as everywhere else — a full-view clip can carry mask values
+       it has no sliders for (one settings class with the Crop clips).
+     - `resolve_lens_frame` reads the eye's size per source kind
+       (`source_eye_dims`: the stream for dual-stream files, the split of a
+       side-by-side or stacked frame, the Blackmagic layout), and no longer
+       the first stream's.
+     - **The stated limit**: unstabilized, the picture ends where the
+       source's does, so the lens is stated to `LensFrame::picture_deg` =
+       the source's θ clamp + the view adjust's tilt of the forward axis +
+       2° (mounts), where that is short of the frame's corner: 113° for the
+       full-view sources (clamp 110°), 95° for a `.360`. Stabilized, to the
+       frame's corner or one degree short of the fold, as before (the
+       picture may be anywhere in the frame): 113° X6 / Osmo / QooCam, 133°
+       `.360`. Crop frames state what they stated before.
+     - GUI: `lens_frame_possible(kind, settings)`; the frame's size is the
+       clip's own resolution choice (`lens_frame_eye_dims(.., cropped)`: a
+       full-view clip no longer reads the Crop clips' choice), never an
+       enlargement (the 8K choice of a 3840² eye is 3840², of a 4864² one
+       4096²); `.360` takes its cross (`native_eye` in `build_export_cfg`).
+       The crop-mask sentence of the stabilizer note is its own note, shown
+       on Crop clips.
+     - Verified (macOS 27.2): the 26 + 8 regression exports frame-identical;
+       every earlier lens-frame case states the lens and limit it stated; 27 lens files of all source kinds and
+       paths (zero-copy 10 / 8-bit, portable, libx265 10 / 8-bit, ProRes,
+       stabilized, reduced copies) read by the system as parametric
+       immersive, its mesh within 0.001 px of the written lens out to 95° …
+       133°; pictures against the half-equirect of the same frames at
+       400 Mbps: within 0.15 px for X6, Osmo, QooCam, Blackmagic and `.360`
+       (cells at the hemisphere's edge excepted: the reference ends there).
+       Tests: `lens_frame::tests` (15), `gpu::lens_frame_kernel_tests` (8),
+       `fisheye_export::lens_frame_tests` (3), GUI `export_size_tests`.
+       **Nothing wider than 180° has been seen on a headset.**
    - **Pipeline**: `FisheyeExportConfig::lens_frame: LensFrameOut` on the
      `Fisheye` projection. `export_fisheye` (the one entry of every fisheye
      path, all platforms) calls `resolve_lens_frame`: lenses only (no gyro)
@@ -2393,9 +2485,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      factory's four: within 1 px to the frame's edges, 3 px in the far
      corners). Frame = the source eye's own size (the fisheye view's square
      rule is skipped), or a reduced copy with the longer side 4096 for the
-     8K choice. A source without a
-     unified-camera-model lens record has no lens frame (export fails with a
-     message; the GUI only offers it on cropped X6 clips).
+     8K choice. (Sources of other lens families: "Every source" above.)
    - **Kernels**: the five `fisheye_*_to_fisheye*.wgsl` files are NOT
      edited. `gpu::lens_frame_wgsl` splices `shaders/lens_frame_ray.wgsl`
      into each (anchors asserted) to make a variant, compiled on first use
@@ -2459,7 +2549,9 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      Vulkan, a lens-frame export through NVENC (9824 wide falls to libx265
      as the 13120 canvas does) and through the GPU-resident path.
    - Not done: no preview of the lens frame (the preview stays VR180), no
-     MV-HEVC lens frame, full-view modes not offered, no automatic mask
+     MV-HEVC lens frame, the Fisheye view still writes its disc (the lens
+     frame replaces the VR180 export only), no crop mask on a full-view
+     clip, no automatic mask
      sized to the stabilizer's corrections.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`

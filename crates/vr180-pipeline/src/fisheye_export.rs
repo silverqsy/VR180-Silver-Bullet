@@ -67,16 +67,19 @@ pub const FISHEYE_OUT_FULL_FOV_DEG: f32 = 195.0;
 
 /// What the [`FisheyeExportProjection::Fisheye`] projection writes: its
 /// equidistant disc, or a LENS FRAME — each eye as the image of a lens with
-/// the source lens's own radial law, the whole frame full, and that lens
-/// stated in the file (Apple Projected Media Profile, parametric immersive).
-/// See [`crate::lens_frame`].
+/// the source lens's own radial law, the frame the recording's (all of the
+/// lens's field, at the recorded density), and that lens stated in the file
+/// (Apple Projected Media Profile, parametric immersive). Every source with
+/// a lens has one: the fisheye sources of [`export_fisheye`] (not a generic
+/// side-by-side file that is already a half-equirect) and the cube map of
+/// [`export_eac`]. See [`crate::lens_frame`].
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum LensFrameOut {
     /// The equidistant disc.
     #[default]
     Off,
-    /// A lens frame: [`export_fisheye`] derives the lens from the source's
-    /// lens record before the first frame. What a caller asks for.
+    /// A lens frame: the export derives the lens from the source's lens
+    /// record before the first frame. What a caller asks for.
     FromSource,
     /// The lens, derived. Set by the export itself.
     Resolved(crate::lens_frame::LensFrame),
@@ -1228,18 +1231,92 @@ pub fn export_fisheye(
     let lens_frame = resolve_lens_frame(&mut cfg)?;
     let out = cfg.output_path.clone();
     export_fisheye_inner(pipeline, cfg, progress_cb, cancel)?;
-    if let Some((frame, stereo)) = lens_frame {
-        if out.is_file() {
-            let lens = frame.apmp();
-            crate::spherical_inject::inject_apmp_lens(&out, &lens, stereo)?;
-            tracing::info!(
-                "fisheye_export: lens frame stated in the file — {}x{} per view, focal {:.2} px, xi {:.5}, k1 {:.5}, k2 {:.5}, to {:.0}°, {}",
-                lens.width, lens.height, lens.focal, lens.xi, lens.k1, lens.k2, lens.limit_deg,
-                if stereo { "two views side by side" } else { "one view" },
-            );
-        }
+    state_lens_frame(&out, lens_frame)
+}
+
+/// State the lens of a finished lens-frame export in its file (`lens`: the
+/// frame and whether it holds two views; `None` for every other export).
+fn state_lens_frame(out: &std::path::Path, lens: Option<(crate::lens_frame::LensFrame, bool)>) -> Result<()> {
+    let Some((frame, stereo)) = lens else { return Ok(()) };
+    if out.is_file() {
+        let lens = frame.apmp();
+        crate::spherical_inject::inject_apmp_lens(out, &lens, stereo)?;
+        tracing::info!(
+            "fisheye_export: lens frame stated in the file — {}x{} per view, focal {:.2} px, xi {:.5}, k1 {:.5}, k2 {:.5}, to {:.0}°, {}",
+            lens.width, lens.height, lens.focal, lens.xi, lens.k1, lens.k2, lens.limit_deg,
+            if stereo { "two views side by side" } else { "one view" },
+        );
     }
     Ok(())
+}
+
+/// One eye's frame in the source, pixels — what the export's decoders report
+/// as their `eye_dims` — without opening one.
+fn source_eye_dims(cfg: &FisheyeExportConfig) -> Result<(u32, u32)> {
+    let path = cfg.segments.first().unwrap_or(&cfg.source_path);
+    if cfg.source_kind == SourceKind::BlackmagicRaw {
+        let info = vr180_braw::BrawInfo::probe(path).map_err(|e| Error::Ffmpeg(format!("braw info: {e}")))?;
+        return Ok(crate::braw_imu::braw_layout(path, &info).eye_dims(&info));
+    }
+    let probe = crate::decode::probe_video(path)?;
+    Ok(if cfg.source_kind.is_single_stream_pair() {
+        cfg.source_kind.eye_layout().eye_dims(probe.width, probe.height)
+    } else {
+        (probe.width, probe.height)
+    })
+}
+
+/// How far a rotation (row-major) turns the forward axis, degrees: by that
+/// much, at most, it moves a ray's angle off the axis.
+fn axis_tilt_deg(m: &[f32; 9]) -> f32 {
+    m[8].clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// What a lens frame's picture may be turned by with the stabilizer off, on
+/// top of the view adjust, degrees: the lenses' mounts and the rounding of
+/// the sources' own reach.
+const LENS_FRAME_PICTURE_SLACK_DEG: f32 = 2.0;
+
+/// The frame of a lens-frame export, sized for the export. A stabilized
+/// frame carries a margin for the picture the stabilizer shifts
+/// (`lens_frame::STABILIZER_MARGIN`), the same for every clip; a reduced copy
+/// (`reduced_to`: the size asked for, when that is smaller than the source's
+/// frame) keeps its size and holds the wider field at a smaller scale. With
+/// the stabilizer off the picture stays where the source's is: the frame's
+/// lens is then stated only as far as `reach_deg`, the last angle the source
+/// has a picture at, and what the view adjust turns it by.
+///
+/// An error for a lens whose image does not hold the frame
+/// ([`LensFrame::reaches_its_corner`](crate::lens_frame::LensFrame::reaches_its_corner)).
+fn size_lens_frame(
+    frame: crate::lens_frame::LensFrame,
+    stabilized: bool,
+    view_adjust: &crate::panomap::ViewAdjust,
+    reduced_to: Option<(u32, u32)>,
+    reach_deg: f32,
+) -> Result<crate::lens_frame::LensFrame> {
+    let sized = if !stabilized {
+        let (v_l, v_r) = view_adjust.per_eye_matrices();
+        let turned = axis_tilt_deg(&v_l).max(axis_tilt_deg(&v_r));
+        crate::lens_frame::LensFrame { picture_deg: reach_deg + turned + LENS_FRAME_PICTURE_SLACK_DEG, ..frame }
+    } else {
+        let m = frame.margin_px();
+        let grown = frame.grown(m, m);
+        let held = match reduced_to {
+            Some((w, h)) => grown.fitted(w, h),
+            None => grown,
+        };
+        tracing::info!(
+            "fisheye_export: stabilized lens frame — {} px added at each border of {}x{}: {}x{} per view{}",
+            m, frame.width, frame.height, held.width, held.height,
+            if reduced_to.is_some() { " (a reduced copy: the frame keeps its size, the picture is scaled)" } else { "" },
+        );
+        held
+    };
+    if !sized.reaches_its_corner() {
+        return Err(Error::Ffmpeg("this source's lens cannot be written as a lens frame of this size — export it as VR180".into()));
+    }
+    Ok(sized)
 }
 
 /// A lens-frame export ([`LensFrameOut::FromSource`]): derive the frame's
@@ -1260,32 +1337,25 @@ fn resolve_lens_frame(cfg: &mut FisheyeExportConfig) -> Result<Option<(crate::le
     let mut lenses_only = cfg.clone();
     lenses_only.stabilize = false;
     lenses_only.lens_frame = LensFrameOut::Off;
-    let path = cfg.segments.first().unwrap_or(&cfg.source_path);
-    let (src_w, src_h) = crate::decode::probe_video(path).map(|p| (p.width, p.height))?;
+    let (src_w, src_h) = source_eye_dims(cfg)?;
     let imu = resolve_export_imu(&lenses_only);
     let (left, right) = resolve_calib_pair(&lenses_only, src_w, src_h, imu.as_ref());
     let mono = single_eye_source(cfg);
     let sources: Vec<&FisheyeCalib> = if mono { vec![&left] } else { vec![&left, &right] };
-    let mut frame = crate::lens_frame::LensFrame::from_sources(&sources, cfg.eye_w, cfg.eye_h).ok_or_else(|| Error::Ffmpeg(
-        "this source has no lens record a lens frame can be made from — export it as VR180".into()))?;
-    // A stabilized frame carries a margin for the picture the stabilizer
-    // shifts (`lens_frame::STABILIZER_MARGIN`): the same for every clip. A
-    // reduced copy keeps its size, and holds the wider field at a smaller
-    // scale.
-    if cfg.stabilize {
-        let m = frame.margin_px();
-        let grown = frame.grown(m, m);
-        let reduced = cfg.eye_w.min(cfg.eye_h) < src_w.min(src_h);
-        let held = if reduced { grown.fitted(cfg.eye_w, cfg.eye_h) } else { grown };
+    let frame = crate::lens_frame::LensFrame::from_sources(&sources, cfg.eye_w, cfg.eye_h).ok_or_else(|| Error::Ffmpeg(
+        "no lens frame can be made for this source (a file that is already VR180 has no lens) — export it as VR180".into()))?;
+    for (eye, c) in ["left", "right"].iter().zip(&sources) {
         tracing::info!(
-            "fisheye_export: stabilized lens frame — {} px added at each border of {}x{}: {}x{} per view{}",
-            m, frame.width, frame.height, held.width, held.height,
-            if reduced { " (a reduced copy: the frame keeps its size, the picture is scaled)" } else { "" },
+            "fisheye_export: lens frame from the {eye} source lens — focal {:.2} / {:.2} px, xi {:.5}, k [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}] over {}x{}",
+            c.fx, c.fy, c.xi, c.k[0], c.k[1], c.k[2], c.k[3], c.k5, c.src_w, c.src_h,
         );
-        frame = held;
-        cfg.eye_w = frame.width;
-        cfg.eye_h = frame.height;
     }
+    // The last angle a source has a picture at: where its frame ends.
+    let reach = sources.iter().map(|c| c.with_frame_edge().theta_max.to_degrees()).fold(0.0_f32, f32::max);
+    let reduced = (cfg.eye_w.min(cfg.eye_h) < src_w.min(src_h)).then_some((cfg.eye_w, cfg.eye_h));
+    let frame = size_lens_frame(frame, cfg.stabilize, &cfg.view_adjust, reduced, reach)?;
+    cfg.eye_w = frame.width;
+    cfg.eye_h = frame.height;
     cfg.lens_frame = LensFrameOut::Resolved(frame);
     cfg.inject_apmp = false;
     cfg.inject_youtube_vr180 = false;
@@ -2114,6 +2184,10 @@ pub(crate) fn resolve_eac_lens_pair(cfg: &FisheyeExportConfig) -> (crate::gpu::E
     if let Some((hfov_deg, defish)) = cfg.projection.reframe() {
         let aspect = cfg.eye_w as f32 / cfg.eye_h.max(1) as f32;
         (l.with_reframe(hfov_deg, defish, aspect), r.with_reframe(hfov_deg, defish, aspect))
+    } else if let (FisheyeExportProjection::Fisheye, LensFrameOut::Resolved(frame)) = (cfg.projection, cfg.lens_frame) {
+        // A lens frame: the fisheye-output kernel writes the lens's image
+        // over the whole frame instead of its disc.
+        (l.with_lens_frame(&frame), r.with_lens_frame(&frame))
     } else {
         (l, r)
     }
@@ -2171,11 +2245,51 @@ pub fn export_eac(
         cfg.inject_apmp = false;
         cfg.inject_youtube_vr180 = false;
     }
-    if cfg.lens_frame != LensFrameOut::Off {
-        return Err(Error::Ffmpeg("a lens frame needs a source with its own lens record — a .360 file is exported as VR180".into()));
-    }
     prepare_spatial(&mut cfg)?;
-    export_eac_inner(pipeline, cfg, per_eye, progress_cb, cancel)
+    // A lens frame: as in `export_fisheye`, its lens is fixed before the
+    // first frame and stated in the file once the file is whole.
+    let lens_frame = resolve_eac_lens_frame(&mut cfg)?;
+    let out = cfg.output_path.clone();
+    export_eac_inner(pipeline, cfg, per_eye, progress_cb, cancel)?;
+    state_lens_frame(&out, lens_frame)
+}
+
+/// Half the field of view of the fisheye a `.360` lens frame is the image
+/// of, degrees: the fisheye-output kernel's own disc (`FISHEYE_HALF_FOV` in
+/// `eac_to_fisheye.wgsl`), which spreads this angle evenly over half the
+/// frame's side — the cube map's pixel density, 1920 pixels to 90°, when the
+/// frame is as large as the lens's cross.
+pub const EAC_LENS_FRAME_HALF_FOV_DEG: f64 = 92.5;
+
+/// A lens-frame export of a `.360` file ([`LensFrameOut::FromSource`]): the
+/// counterpart of [`resolve_lens_frame`] for a source that is a cube map,
+/// not a lens image. Its lens is an equidistant fisheye of
+/// [`EAC_LENS_FRAME_HALF_FOV_DEG`] over the frame's shorter side
+/// ([`crate::lens_frame::LensFrame::equidistant`]); [`resolve_eac_lens_pair`]
+/// hands it to the fisheye-output kernel. Returns the lens and that the frame
+/// holds two views; `None` for every other export.
+fn resolve_eac_lens_frame(cfg: &mut FisheyeExportConfig) -> Result<Option<(crate::lens_frame::LensFrame, bool)>> {
+    if cfg.lens_frame == LensFrameOut::Off {
+        return Ok(None);
+    }
+    if cfg.projection != FisheyeExportProjection::Fisheye || cfg.spatial.is_some() {
+        return Err(Error::Ffmpeg("a lens frame is written by the fisheye projection, as a side-by-side frame".into()));
+    }
+    let path = cfg.segments.first().unwrap_or(&cfg.source_path);
+    let dims = crate::decode::probe_video(path).map(|p| vr180_core::eac::Dims::new(p.width, p.height))?;
+    let frame = crate::lens_frame::LensFrame::equidistant(cfg.eye_w, cfg.eye_h, EAC_LENS_FRAME_HALF_FOV_DEG)
+        .ok_or_else(|| Error::Ffmpeg("no lens frame of this size".into()))?;
+    // The cross holds the front face and, of each side face, the strip of
+    // `tile_w` pixels next to it: that far off the axis there is a picture.
+    let reach = 45.0 + 90.0 * dims.tile_w() as f32 / vr180_core::eac::CENTER_W as f32;
+    let reduced = (cfg.eye_w.min(cfg.eye_h) < dims.cross_w()).then_some((cfg.eye_w, cfg.eye_h));
+    let frame = size_lens_frame(frame, cfg.stabilize, &cfg.view_adjust, reduced, reach)?;
+    cfg.eye_w = frame.width;
+    cfg.eye_h = frame.height;
+    cfg.lens_frame = LensFrameOut::Resolved(frame);
+    cfg.inject_apmp = false;
+    cfg.inject_youtube_vr180 = false;
+    Ok(Some((frame, true)))
 }
 
 fn export_eac_inner(
@@ -4607,13 +4721,18 @@ pub(crate) fn resolve_calib_pair(
                 // own edge, not from the recorded picture's: a stabilized
                 // frame is larger than the recording, and the window may be
                 // as large as the frame (the picture's own border, which
-                // moves, then shows inside it).
-                let (l, r) = match cfg.crop_mask.window(frame.half_angles()) {
+                // moves, then shows inside it). Only a source whose frame is
+                // a crop of the image circle has that mask, as in every
+                // other output.
+                let cropped = l.frame_mask > 0.5 || r.frame_mask > 0.5;
+                let (l, r) = match cfg.crop_mask.window(frame.half_angles()).filter(|_| cropped) {
                     Some((half, round, feather)) =>
                         (l.with_view_mask(half, round, feather), r.with_view_mask(half, round, feather)),
                     None => (l, r),
                 };
-                (l.with_lens_frame(&frame), r.with_lens_frame(&frame))
+                // A lens frame shows the source frame's border, whole image
+                // circle or not: black past it, never the repeated rim.
+                (l.with_frame_edge().with_lens_frame(&frame), r.with_frame_edge().with_lens_frame(&frame))
             }
             _ => (l, r),
         }
@@ -4911,6 +5030,63 @@ fn apply_color_stack_rgb8_sbs(
         out[o + half..o + row].copy_from_slice(&r[y * half..(y + 1) * half]);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod lens_frame_tests {
+    use super::{axis_tilt_deg, size_lens_frame, LENS_FRAME_PICTURE_SLACK_DEG};
+    use crate::lens_frame::LensFrame;
+    use crate::panomap::ViewAdjust;
+
+    fn frame() -> LensFrame {
+        LensFrame::equidistant(3936, 3936, super::EAC_LENS_FRAME_HALF_FOV_DEG).expect("a lens")
+    }
+
+    /// A turn of the view moves the picture by as much as it tilts the
+    /// forward axis; a roll about that axis moves no ray off it.
+    #[test]
+    fn a_turn_moves_the_picture_by_its_tilt() {
+        let tilt = |v: ViewAdjust| { let (l, r) = v.per_eye_matrices(); axis_tilt_deg(&l).max(axis_tilt_deg(&r)) };
+        assert!(tilt(ViewAdjust::IDENTITY) < 1e-3);
+        assert!((tilt(ViewAdjust { pano_yaw_deg: 10.0, ..ViewAdjust::IDENTITY }) - 10.0).abs() < 1e-3);
+        assert!((tilt(ViewAdjust { pano_pitch_deg: -6.0, ..ViewAdjust::IDENTITY }) - 6.0).abs() < 1e-3);
+        assert!(tilt(ViewAdjust { pano_roll_deg: 30.0, upside_down: true, ..ViewAdjust::IDENTITY }) < 0.05);
+        // The eyes' own offsets add to the one they turn further.
+        assert!((tilt(ViewAdjust { pano_yaw_deg: 10.0, stereo_yaw_deg: 0.5, ..ViewAdjust::IDENTITY }) - 10.5).abs() < 1e-3);
+    }
+
+    /// With the stabilizer off the frame is the one asked for, and its lens
+    /// is stated as far as the source's picture goes, the view adjust's turn
+    /// included. A stabilized frame carries its margin and is stated to its
+    /// corner; a reduced copy keeps its size and scales the lens instead.
+    #[test]
+    fn the_frame_is_sized_for_the_export() {
+        let f = frame();
+        let still = size_lens_frame(f, false, &ViewAdjust::IDENTITY, None, 92.25).unwrap();
+        assert_eq!((still.width, still.height, still.focal), (3936, 3936, f.focal));
+        assert!((still.picture_deg - (92.25 + LENS_FRAME_PICTURE_SLACK_DEG)).abs() < 1e-3);
+        assert_eq!(still.apmp().limit_deg, 95.0);
+        let turned = size_lens_frame(f, false, &ViewAdjust { pano_yaw_deg: 8.0, ..ViewAdjust::IDENTITY }, None, 92.25).unwrap();
+        assert_eq!(turned.apmp().limit_deg, 103.0);
+        // A reduced copy with the stabilizer off is simply the smaller frame.
+        let small = LensFrame::equidistant(2048, 2048, super::EAC_LENS_FRAME_HALF_FOV_DEG).unwrap();
+        assert_eq!(size_lens_frame(small, false, &ViewAdjust::IDENTITY, Some((2048, 2048)), 92.25).unwrap().width, 2048);
+
+        let moved = size_lens_frame(f, true, &ViewAdjust::IDENTITY, None, 92.25).unwrap();
+        assert_eq!((moved.width, moved.height), crate::lens_frame::stabilized_dims(3936, 3936));
+        assert_eq!((moved.width, moved.focal, moved.picture_deg), (4328, f.focal, 180.0));
+        let copy = size_lens_frame(small, true, &ViewAdjust::IDENTITY, Some((2048, 2048)), 92.25).unwrap();
+        assert_eq!((copy.width, copy.height), (2048, 2048));
+        assert!((copy.focal / small.focal - 2048.0 / 2252.0).abs() < 1e-6, "{}", copy.focal / small.focal);
+    }
+
+    /// A lens whose image would not hold the frame is refused, not written.
+    #[test]
+    fn a_lens_that_does_not_hold_its_frame_is_refused() {
+        let bent = LensFrame { k1: -3.0, k2: 0.0, ..frame() };
+        assert!(size_lens_frame(bent, false, &ViewAdjust::IDENTITY, None, 92.25).is_err());
+        assert!(size_lens_frame(bent, true, &ViewAdjust::IDENTITY, None, 92.25).is_err());
+    }
 }
 
 #[cfg(test)]

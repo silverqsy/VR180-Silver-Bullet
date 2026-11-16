@@ -2004,6 +2004,14 @@ pub struct EacLensAdjust {
     pub defish_k: f32,
     pub edge_x: f32,
     pub edge_y: f32,
+    /// Lens-frame output of the fisheye-output kernel: `[ξ, focal in output
+    /// pixels, k1, k2]` of the centred Mei-Rives lens whose image the output
+    /// frame is. Focal 0 = off (the equidistant disc). Set by
+    /// [`with_lens_frame`](Self::with_lens_frame); the same numbers as
+    /// [`FisheyeCalib::out_lens`].
+    pub out_lens: [f32; 4],
+    /// Lens-frame output: how many pixels at the frame's border stay black.
+    pub out_rim: f32,
 }
 
 impl EacLensAdjust {
@@ -2013,6 +2021,7 @@ impl EacLensAdjust {
         fx_u: 1.0, cx_u: 0.0, cy_u: 0.0, k_u: [0.0; 4],
         fx_n: 1.0, cx_n: 0.0, cy_n: 0.0, k_n: [0.0; 4],
         proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
+        out_lens: [0.0; 4], out_rim: 0.0,
     };
 
     /// Reframed-view output for the EAC kernel — same parameters as
@@ -2064,22 +2073,29 @@ impl EacLensAdjust {
             cy_n: cal_dim * 0.5 + ctry,
             k_n,
             proj_mode: 0.0, defish_k: 1.0, edge_x: 0.0, edge_y: 0.0,
+            out_lens: [0.0; 4], out_rim: 0.0,
         }
     }
 }
 
 /// std140 layout matching the WGSL `LensUniforms` in
-/// `eac_to_equirect.wgsl` (20 × f32 = 80 bytes; `eac_to_fisheye.wgsl`
-/// declares only the first 16 and ignores the trailing vec4).
+/// `eac_to_equirect.wgsl` (its 20 × f32 = 80 bytes; `eac_to_fisheye.wgsl`
+/// declares only the first 16, and only the lens-frame variant of that
+/// kernel declares all 24 — a buffer larger than a kernel's struct is fine).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct EacLensUniforms {
     fx_u: f32, cx_u: f32, cy_u: f32, enabled: f32,
     ku1: f32, ku2: f32, ku3: f32, ku4: f32,
-    fx_n: f32, cx_n: f32, cy_n: f32, _pad0: f32,
+    // `out_rim`: black rim of a lens-frame output, in output pixels (a slot
+    // the two kernels themselves declare as padding).
+    fx_n: f32, cx_n: f32, cy_n: f32, out_rim: f32,
     kn1: f32, kn2: f32, kn3: f32, kn4: f32,
     // vec4 #4 — reframed-view output (proj_mode 1), see `EacLensAdjust`.
     proj_mode: f32, defish_k: f32, edge_x: f32, edge_y: f32,
+    // vec4 #5 — lens-frame output of the fisheye-output kernel's variant
+    // (ξ, focal in output pixels, k1, k2), see `EacLensAdjust::out_lens`.
+    out_lens: [f32; 4],
 }
 
 impl EacLensUniforms {
@@ -2088,9 +2104,10 @@ impl EacLensUniforms {
             fx_u: l.fx_u, cx_u: l.cx_u, cy_u: l.cy_u,
             enabled: if l.enabled { 1.0 } else { 0.0 },
             ku1: l.k_u[0], ku2: l.k_u[1], ku3: l.k_u[2], ku4: l.k_u[3],
-            fx_n: l.fx_n, cx_n: l.cx_n, cy_n: l.cy_n, _pad0: 0.0,
+            fx_n: l.fx_n, cx_n: l.cx_n, cy_n: l.cy_n, out_rim: l.out_rim,
             kn1: l.k_n[0], kn2: l.k_n[1], kn3: l.k_n[2], kn4: l.k_n[3],
             proj_mode: l.proj_mode, defish_k: l.defish_k, edge_x: l.edge_x, edge_y: l.edge_y,
+            out_lens: l.out_lens,
         }
     }
 }
@@ -2631,6 +2648,25 @@ impl FisheyeCalib {
         self
     }
 
+    /// For an output that shows the source frame's own border (a lens
+    /// frame): rays the frame has no picture for render black, as for a
+    /// frame that is a crop of the image circle
+    /// ([`with_frame_crop`](Self::with_frame_crop)), instead of repeating
+    /// the rim — repeated there, the rim would be smeared from the image
+    /// circle to the frame's edge. The lens model alone reaches out to the
+    /// frame's far corner; a calibration with the kernels' rim extension
+    /// keeps it, and its clamp. A frame already marked as a crop, and a
+    /// half-equirect input, are returned as they are.
+    pub fn with_frame_edge(self) -> Self {
+        if self.frame_mask > 0.5 || self.src_proj > 0.5 {
+            return self;
+        }
+        if self.theta_trans > self.theta_max {
+            return self.with_frame_crop();
+        }
+        Self { frame_mask: 1.0, ..self }
+    }
+
     /// Angular half-extents (radians) of the frame around the lens axis,
     /// measured from the frame's centre along x and y — what a cropped
     /// frame covers.
@@ -2749,9 +2785,76 @@ fn lens_frame_wgsl(kernel: &str) -> String {
     out
 }
 
-/// The lens-frame variants of the six fisheye-output kernels
-/// ([`lens_frame_wgsl`]), each compiled the first time a lens frame is
-/// projected through it. Chosen by [`FisheyeCalib::out_lens`].
+/// The lens-frame variant of the cube-map fisheye-output kernel
+/// (`eac_to_fisheye.wgsl`, a GoPro `.360`): [`lens_frame_wgsl`]'s
+/// counterpart for the kernel family that has no lens of its own. The disc
+/// ray generator is replaced by [`LENS_FRAME_RAY_WGSL`], reading the lens
+/// from the `LensUniforms` rows that [`EacLensAdjust::out_lens`] /
+/// [`EacLensAdjust::out_rim`] fill, and a ray the cube map holds no picture
+/// for is BLACK: the disc kernel repeats the last captured column there (its
+/// "edge fill"), which a lens frame, whose picture ends inside the frame,
+/// would show as a smear around it. The cross carries the front face and,
+/// of each side face, the strip next to it; `past` is how far (radians) a
+/// ray lies beyond that strip, and the edge is soft over one output pixel.
+///
+/// The disc kernel's source stays as it is; each splice must find its anchor
+/// exactly once.
+fn eac_lens_frame_wgsl(kernel: &str) -> String {
+    const DISC: &str = "    let half = min(f32(out_dim.x), f32(out_dim.y)) * 0.5;
+    let dx = (f32(gid.x) + 0.5) - f32(out_dim.x) * 0.5;
+    let dy = f32(out_dim.y) * 0.5 - (f32(gid.y) + 0.5);
+    let r_norm = sqrt(dx * dx + dy * dy) / max(half, 1.0);
+    if (r_norm > 1.0) {
+        textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)),
+                     vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    let phi_out = atan2(dy, dx);
+    let theta_out = r_norm * FISHEYE_HALF_FOV;
+    let s_t = sin(theta_out);
+    // Unit direction in the OUTPUT frame (X=right, Y=up, Z=forward),
+    // rotated into the camera frame by R below — same as the equirect
+    // variant from here on (RS + EAC face sampling are identical).
+    let dir_world = vec3<f32>(
+        s_t * cos(phi_out),
+        s_t * sin(phi_out),
+        cos(theta_out),
+    );
+";
+    const LENS: &str = "    let ray = lens_frame_ray(gid.xy, out_dim);
+    if (ray.w < 0.0) {
+        textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)),
+                     vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    let dir_world = ray.xyz;
+";
+    const STORE: &str = "    textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), color);\n}";
+    const COVERED: &str = "    let past = atan2(-zn, max(ax, ay)) - ((tw - 1.0) / CENTER_W - 0.5) * HALF_PI;
+    let cover = clamp(0.5 - past / ray.w, 0.0, 1.0);
+    textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(color.rgb * cover, color.a));\n}";
+    let splices: [(&str, String); 4] = [
+        (DISC, LENS.to_string()),
+        ("    fx_n: f32, cx_n: f32, cy_n: f32, _pad0: f32,\n    kn1: f32, kn2: f32, kn3: f32, kn4: f32,\n}",
+         "    fx_n: f32, cx_n: f32, cy_n: f32, out_rim: f32,\n    kn1: f32, kn2: f32, kn3: f32, kn4: f32,\n    \
+          proj_mode: f32, defish_k: f32, edge_x: f32, edge_y: f32,\n    out_lens: vec4<f32>,\n}".to_string()),
+        ("@compute @workgroup_size(8, 8)\nfn main(",
+         format!("{}@compute @workgroup_size(8, 8)\nfn main(", LENS_FRAME_RAY_WGSL.replace("cal.", "lens."))),
+        (STORE, COVERED.to_string()),
+    ];
+    let mut out = kernel.to_string();
+    for (anchor, with) in &splices {
+        assert_eq!(out.matches(anchor).count(), 1, "lens-frame variant: anchor not found exactly once: {anchor:?}");
+        out = out.replacen(anchor, with, 1);
+    }
+    out
+}
+
+/// The lens-frame variants of the fisheye-output kernels: the six of the
+/// fisheye family ([`lens_frame_wgsl`], chosen by [`FisheyeCalib::out_lens`])
+/// and the two of the cube-map family ([`eac_lens_frame_wgsl`], chosen by
+/// [`EacLensAdjust::out_lens`]), each compiled the first time a lens frame is
+/// projected through it.
 #[derive(Default, Debug)]
 struct LensFramePipelines {
     to_fisheye: std::sync::OnceLock<FisheyeToHequirectPipeline>,
@@ -2760,6 +2863,8 @@ struct LensFramePipelines {
     to_fisheye_rs_16: std::sync::OnceLock<FisheyeToHequirectRsPipeline>,
     p010_to_fisheye_16: std::sync::OnceLock<FisheyeP010ToHequirectPipeline>,
     p010_to_fisheye_rs_16: std::sync::OnceLock<FisheyeP010ToHequirectRsPipeline>,
+    eac_to_fisheye: std::sync::OnceLock<EacToEquirectPipeline>,
+    eac_to_fisheye_16: std::sync::OnceLock<EacToEquirectPipeline>,
 }
 
 impl Device {
@@ -2804,6 +2909,24 @@ impl Device {
             })
         } else {
             &self.fisheye_to_fisheye_rs_16
+        }
+    }
+
+    fn eac_fisheye_out_8(&self, lens: &EacLensAdjust) -> &EacToEquirectPipeline {
+        if lens.out_lens[1] > 0.0 {
+            self.lens_frame.eac_to_fisheye.get_or_init(|| EacToEquirectPipeline::create_with_wgsl(
+                &self.device, wgpu::TextureFormat::Rgba8Unorm, &eac_lens_frame_wgsl(EAC_TO_FISHEYE_WGSL)))
+        } else {
+            &self.eac_to_fisheye
+        }
+    }
+
+    fn eac_fisheye_out_16(&self, lens: &EacLensAdjust) -> &EacToEquirectPipeline {
+        if lens.out_lens[1] > 0.0 {
+            self.lens_frame.eac_to_fisheye_16.get_or_init(|| EacToEquirectPipeline::create_with_wgsl(
+                &self.device, wgpu::TextureFormat::Rgba16Unorm, &eac_lens_frame_wgsl(EAC_TO_FISHEYE_WGSL)))
+        } else {
+            &self.eac_to_fisheye_16
         }
     }
 
@@ -5659,7 +5782,8 @@ impl Device {
         Ok(output_tex)
     }
 
-    /// EAC cross → equidistant-fisheye output (Rgba8Unorm).
+    /// EAC cross → equidistant-fisheye output (Rgba8Unorm) — or, when `lens`
+    /// asks for one ([`EacLensAdjust::out_lens`]), a lens frame.
     pub fn project_cross_texture_to_fisheye_texture(
         &self,
         cross_tex: &wgpu::Texture,
@@ -5676,13 +5800,14 @@ impl Device {
             label: Some("eac_fisheye_enc"),
         });
         self.record_equirect_project_with(
-            &mut encoder, &self.eac_to_fisheye,
+            &mut encoder, self.eac_fisheye_out_8(lens),
             cross_tex, &output_tex, out_w, out_h, rotation, rs, lens);
         self.queue.submit(Some(encoder.finish()));
         Ok(output_tex)
     }
 
-    /// 16-bit EAC cross → equidistant-fisheye output (Rgba16Unorm).
+    /// 16-bit EAC cross → equidistant-fisheye output (Rgba16Unorm), or a
+    /// lens frame, as [`Self::project_cross_texture_to_fisheye_texture`].
     pub fn project_cross_texture_to_fisheye_texture_16(
         &self,
         cross_tex: &wgpu::Texture,
@@ -5706,7 +5831,7 @@ impl Device {
             label: Some("eac_fisheye_enc_16"),
         });
         self.record_equirect_project_with(
-            &mut encoder, &self.eac_to_fisheye_16,
+            &mut encoder, self.eac_fisheye_out_16(lens),
             cross_tex, &output_tex, out_w, out_h, rotation, rs, lens);
         self.queue.submit(Some(encoder.finish()));
         Ok(output_tex)
@@ -10400,6 +10525,255 @@ mod lens_frame_kernel_tests {
         }
     }
 
+    /// A source that holds its whole image circle (a Kannala-Brandt lens
+    /// with tangential terms, as a DJI Osmo 360's): every lens-frame pixel
+    /// shows what its ray hits in the source, and where the source's frame
+    /// has no picture for the ray, the lens frame is black — where the disc
+    /// and the half-equirect of the same source repeat its rim.
+    #[test]
+    fn a_whole_circle_source_ends_in_black_not_in_its_repeated_rim() {
+        let dev = Device::new().expect("device");
+        let (sw, sh) = (800u32, 800u32);
+        let mut src = Vec::with_capacity((sw * sh * 4) as usize);
+        for y in 0..sh {
+            for x in 0..sw {
+                src.extend_from_slice(&[
+                    (((x as f32 + 0.5) / sw as f32) * 65535.0).round() as u16,
+                    (((y as f32 + 0.5) / sh as f32) * 65535.0).round() as u16,
+                    30000, 65535,
+                ]);
+            }
+        }
+        let mut source = FisheyeCalib::new_pure_kb(218.0, 218.0, 396.0, 404.0, [0.07, -0.018, 0.015, -0.0085], sw as f32, sh as f32);
+        source.k5 = 0.0012;
+        source.p1 = 3.0e-4;
+        source.p2 = 5.0e-4;
+        // As the source is resolved, its rim repeats; a lens frame marks its
+        // frame's edge, and looks as far as the model goes.
+        let edged = source.with_frame_edge();
+        assert!(source.frame_mask < 0.5 && edged.frame_mask > 0.5 && edged.theta_max > source.theta_max);
+        assert_eq!(edged.with_frame_edge().theta_max, edged.theta_max);
+        // A frame whose lens reaches well past the source's field (118° at
+        // its sides, folding at 135°), so that the end of the picture lies
+        // inside it on every side.
+        let (w, h) = (640u32, 640u32);
+        assert!(LensFrame::from_sources(&[&source, &source], w, h).is_some());
+        let frame = LensFrame { rim_px: 0.0, ..LensFrame::equidistant(w, h, 118.0).expect("a lens") };
+        let run = |calib: FisheyeCalib| -> Vec<u16> {
+            let tex = dev.project_fisheye_to_fisheye_texture_16(
+                bytemuck::cast_slice(&src), 16, sw, sh, w, h, EquirectRotation::IDENTITY, calib.with_lens_frame(&frame)).unwrap();
+            bytemuck::cast_slice::<u8, u16>(&dev.read_texture_rgba64(&tex, w, h).unwrap()).to_vec()
+        };
+        let out = run(edged);
+        let rim = run(source);
+        // The source lens on the CPU (the kernels' Kannala-Brandt branch).
+        let project = |d: [f64; 3]| -> (f64, f64, f64) {
+            let theta = d[2].clamp(-1.0, 1.0).acos();
+            let t2 = theta * theta;
+            let k = source.k.map(|v| v as f64);
+            let td = theta * (1.0 + t2 * (k[0] + t2 * (k[1] + t2 * (k[2] + t2 * (k[3] + t2 * source.k5 as f64)))));
+            let s = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-12);
+            let (u, v) = (td * d[0] / s, td * d[1] / s);
+            let r2 = u * u + v * v;
+            let (p1, p2) = (source.p1 as f64, source.p2 as f64);
+            let ut = u + 2.0 * p1 * u * v + p2 * (r2 + 2.0 * u * u);
+            let vt = v + p1 * (r2 + 2.0 * v * v) + 2.0 * p2 * u * v;
+            (source.cx as f64 + source.fx as f64 * ut, source.cy as f64 - source.fy as f64 * vt, theta)
+        };
+        let clamp = edged.theta_max as f64;
+        let (mut shown, mut dark, mut repeated, mut worst_px) = (0, 0, 0, 0.0_f64);
+        for y in (2..h).step_by(11) {
+            for x in (2..w).step_by(13) {
+                let i = ((y * w + x) * 4) as usize;
+                let black = |v: &[u16]| v[i..i + 3] == [0, 0, 0];
+                let hit = frame.ray(x as f64 + 0.5, y as f64 + 0.5).map(project);
+                match hit {
+                    // Inside the source frame and the model, away from their edges.
+                    Some((sx, sy, theta)) if theta < clamp - 0.01 && sx > 2.0 && sx < sw as f64 - 2.0 && sy > 2.0 && sy < sh as f64 - 2.0 => {
+                        let (gx, gy) = (out[i] as f64 / 65535.0 * sw as f64, out[i + 1] as f64 / 65535.0 * sh as f64);
+                        worst_px = worst_px.max((gx - sx).abs()).max((gy - sy).abs());
+                        shown += 1;
+                    }
+                    // Past the frame's edge or the model's last angle, by a clear margin; or past the lens's fold.
+                    Some((sx, sy, theta)) if theta < clamp + 0.01 && sx > -2.0 && sx < sw as f64 + 2.0 && sy > -2.0 && sy < sh as f64 + 2.0 => {}
+                    Some(_) => {
+                        assert!(black(&out), "({x}, {y}) has no picture and is not black");
+                        // The same pixel of the source as resolved: its rim, repeated.
+                        if !black(&rim) {
+                            repeated += 1;
+                        }
+                        dark += 1;
+                    }
+                    None => {
+                        assert!(black(&out) && black(&rim), "({x}, {y}) lies past the fold and is not black");
+                    }
+                }
+            }
+        }
+        assert!(shown > 1000 && dark > 300, "{shown} pixels of picture, {dark} black");
+        assert!(repeated == dark, "{repeated} of {dark} pixels past the picture repeat the rim without the frame's edge");
+        assert!(worst_px < 0.05, "a lens-frame pixel is {worst_px} source pixels from where its ray lands");
+    }
+
+    /// The cube-map kernel has its variant too: the same ray generator,
+    /// reading the lens from its own uniform, and black where the cross
+    /// holds no picture. The disc kernel's source carries none of it, and
+    /// the fisheye a `.360` lens frame is stated as is that kernel's disc.
+    #[test]
+    fn the_cube_map_kernel_has_a_lens_frame_variant() {
+        let src = EAC_TO_FISHEYE_WGSL;
+        assert!(!src.contains("lens_frame_ray") && !src.contains("out_lens") && !src.contains("out_rim"));
+        let v = eac_lens_frame_wgsl(src);
+        assert!(v.contains("fn lens_frame_ray(") && v.contains("out_lens: vec4<f32>,") && v.contains("cy_n: f32, out_rim: f32,"));
+        assert!(v.contains("let dir_world = ray.xyz;") && !v.contains("let theta_out"));
+        assert!(v.contains("lens.out_lens.y") && v.contains("< lens.out_rim") && !v.contains("cal."));
+        assert!(v.contains("vec4<f32>(color.rgb * cover, color.a)"));
+        // The edge fill itself is the kernel's own, untouched.
+        assert!(v.contains("let edge = tw - 1.0;") && v.contains("clamp(u_eac * CENTER_W, 0.0, edge)"));
+        assert!(src.contains("const FISHEYE_HALF_FOV: f32 = 1.61442956;"));
+        let half = crate::fisheye_export::EAC_LENS_FRAME_HALF_FOV_DEG.to_radians();
+        assert!((half - 1.61442956).abs() < 1e-7, "{half}");
+        // The uniform holds every row the variant declares.
+        assert_eq!(std::mem::size_of::<EacLensUniforms>(), 96);
+    }
+
+    /// A cube-map cross (the front face and `tw` pixels of each side face)
+    /// whose colour is the direction each texel looks in:
+    /// `0.5 + 0.5 · (x, y, z)`; the corners the cross does not have stay 0.
+    fn direction_cross(tw: u32) -> (u32, Vec<u16>) {
+        let cw = 1920 + 2 * tw;
+        let t = tw as f64;
+        // Face coordinate (pixels across a 1920 face) → angle from its centre.
+        let ang = |c: f64| (c / 1920.0 - 0.5) * std::f64::consts::FRAC_PI_2;
+        let mut px = vec![0u16; (cw * cw * 4) as usize];
+        for j in 0..cw {
+            for i in 0..cw {
+                let (fi, fj) = (i as f64, j as f64);
+                let (in_x, in_y) = (i >= tw && i < tw + 1920, j >= tw && j < tw + 1920);
+                let d = if in_x && in_y {
+                    [ang(fi - t).tan(), -ang(fj - t).tan(), 1.0]
+                } else if in_y && i >= tw + 1920 {
+                    [1.0, -ang(fj - t).tan(), -ang(fi - t - 1920.0).tan()]
+                } else if in_y {
+                    [-1.0, -ang(fj - t).tan(), ang(fi + 1920.0 - t).tan()]
+                } else if in_x && j < tw {
+                    [ang(fi - t).tan(), 1.0, ang(fj + 1920.0 - t).tan()]
+                } else if in_x {
+                    [ang(fi - t).tan(), -1.0, -ang(fj - t - 1920.0).tan()]
+                } else {
+                    continue;
+                };
+                let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                let o = ((j * cw + i) * 4) as usize;
+                for c in 0..3 {
+                    px[o + c] = ((0.5 + 0.5 * d[c] / n) * 65535.0).round() as u16;
+                }
+                px[o + 3] = 65535;
+            }
+        }
+        (cw, px)
+    }
+
+    /// From a cube map, every pixel of the lens frame shows what its ray —
+    /// the CPU twin's, turned by the frame's rotation — hits in the cross,
+    /// and is black where the cross holds no picture for it: past the strip
+    /// of a side face, in the frame's rim, past the lens's fold.
+    #[test]
+    fn a_cube_map_lens_frame_pixel_shows_what_its_ray_hits() {
+        let dev = Device::new().expect("device");
+        let tw = 96u32;
+        let (cw, cross) = direction_cross(tw);
+        let cross_tex = dev.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("direction_cross"),
+            size: wgpu::Extent3d { width: cw, height: cw, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        dev.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &cross_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&cross),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(cw * 8), rows_per_image: Some(cw) },
+            wgpu::Extent3d { width: cw, height: cw, depth_or_array_layers: 1 },
+        );
+        let (w, h) = (640u32, 512u32);
+        let frame = LensFrame { width: w, height: h, rim_px: 3.0, ..LensFrame::equidistant(512, 512, 92.5).unwrap() };
+        let lens = EacLensAdjust::DISABLED.with_lens_frame(&frame);
+        // A turn of 7° about the vertical axis and 4° about the horizontal one.
+        let (sy, cy) = 7.0_f64.to_radians().sin_cos();
+        let (sp, cp) = 4.0_f64.to_radians().sin_cos();
+        let rot = [[cy, 0.0, sy], [sp * sy, cp, -sp * cy], [-cp * sy, sp, cp * cy]];
+        let rotation = EquirectRotation([
+            rot[0][0] as f32, rot[0][1] as f32, rot[0][2] as f32,
+            rot[1][0] as f32, rot[1][1] as f32, rot[1][2] as f32,
+            rot[2][0] as f32, rot[2][1] as f32, rot[2][2] as f32,
+        ]);
+        let tex = dev.project_cross_texture_to_fisheye_texture_16(&cross_tex, w, h, rotation, EquirectRsParams::DISABLED, &lens).unwrap();
+        let out = dev.read_texture_rgba64(&tex, w, h).unwrap();
+        let out16: &[u16] = bytemuck::cast_slice(&out);
+        let px_rad = (1.0 + frame.xi as f64) / frame.focal as f64;
+        // How far past the strip of its side face a camera-frame ray lies.
+        let strip = ((tw as f64 - 1.0) / 1920.0 - 0.5) * std::f64::consts::FRAC_PI_2;
+        let past = |d: [f64; 3]| (-d[2]).atan2(d[0].abs().max(d[1].abs())) - strip;
+        let (mut shown, mut dark, mut worst) = (0, 0, 0.0_f64);
+        for y in (0..h).step_by(7) {
+            for x in (0..w).step_by(9) {
+                let i = ((y * w + x) * 4) as usize;
+                let got = [out16[i] as f64 / 65535.0, out16[i + 1] as f64 / 65535.0, out16[i + 2] as f64 / 65535.0];
+                let in_rim = x < 3 || y < 3 || x >= w - 3 || y >= h - 3;
+                let ray = frame.ray(x as f64 + 0.5, y as f64 + 0.5).filter(|_| !in_rim);
+                let cam = ray.map(|d| [
+                    rot[0][0] * d[0] + rot[0][1] * d[1] + rot[0][2] * d[2],
+                    rot[1][0] * d[0] + rot[1][1] * d[1] + rot[1][2] * d[2],
+                    rot[2][0] * d[0] + rot[2][1] * d[1] + rot[2][2] * d[2],
+                ]);
+                match cam {
+                    Some(c) if past(c) < -1.5 * px_rad => {
+                        for k in 0..3 {
+                            worst = worst.max((got[k] - (0.5 + 0.5 * c[k])).abs());
+                        }
+                        shown += 1;
+                    }
+                    Some(c) if past(c) < 1.5 * px_rad => {} // the soft edge
+                    _ => {
+                        assert_eq!(got, [0.0; 3], "({x}, {y}) has no picture and is not black");
+                        dark += 1;
+                    }
+                }
+            }
+        }
+        assert!(shown > 1000 && dark > 1000, "{shown} pixels of picture, {dark} black");
+        // Within one texel of the cross (90° / 1920: the kernel's own
+        // sampling at a face's seam), a twelfth of an output pixel here.
+        assert!(worst < 4.2e-4, "a pixel shows a direction {worst} off its ray's");
+
+        // The 8-bit kernel is the same map.
+        let cross8: Vec<u8> = cross.iter().map(|v| (v >> 8) as u8).collect();
+        let cross8_tex = make_rw_texture(&dev.device, "direction_cross_8", cw, cw,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        dev.upload_rgba(&cross8_tex, &cross8, cw, cw);
+        let tex8 = dev.project_cross_texture_to_fisheye_texture(&cross8_tex, w, h, rotation, EquirectRsParams::DISABLED, &lens).unwrap();
+        let out8 = dev.read_texture_rgb8(&tex8, w, h).unwrap();
+        let mut off8 = 0;
+        for (a, b) in out16.chunks_exact(4).zip(out8.chunks_exact(3)) {
+            for c in 0..3 {
+                off8 = off8.max(((a[c] >> 8) as i32 - b[c] as i32).abs());
+            }
+        }
+        assert!(off8 <= 2, "the 8-bit lens frame differs from the 16-bit one by {off8} of 255");
+
+        // Without a lens the same call writes the kernel's disc: black
+        // outside the inscribed circle, picture at the frame's centre.
+        let disc = dev.project_cross_texture_to_fisheye_texture_16(&cross_tex, w, h, EquirectRotation::IDENTITY, EquirectRsParams::DISABLED, &EacLensAdjust::DISABLED).unwrap();
+        let disc = dev.read_texture_rgba64(&disc, w, h).unwrap();
+        let disc16: &[u16] = bytemuck::cast_slice(&disc);
+        assert_eq!(&disc16[0..3], &[0, 0, 0]);
+        let c = (((h / 2) * w + w / 2) * 4) as usize;
+        assert!(disc16[c + 2] > 65000, "the disc's centre looks forward");
+    }
+
     /// A smooth picture with detail in both directions, `w × h`, 16 bits.
     fn picture(w: u32, h: u32) -> Vec<u16> {
         let mut px = Vec::with_capacity((w * h * 4) as usize);
@@ -10441,7 +10815,7 @@ mod lens_frame_kernel_tests {
         let src = picture(w, h);
         let bytes: &[u8] = bytemuck::cast_slice(&src);
         let (xi, f, k1, k2) = (2.45543_f32, 940.0_f32, 1.19_f32, 0.11_f32);
-        let frame = LensFrame { width: w, height: h, xi, focal: f, k1, k2, rim_px: 0.0 };
+        let frame = LensFrame { width: w, height: h, xi, focal: f, k1, k2, rim_px: 0.0, picture_deg: 180.0 };
         let lens = FisheyeCalib::new_omni(
             f, f, w as f32 * 0.5, h as f32 * 0.5, xi, [k1, k2, 0.0, 0.0, 0.0], [0.0; 4], [0.0; 4], w as f32, h as f32,
         ).with_frame_crop();
@@ -10490,7 +10864,7 @@ mod lens_frame_kernel_tests {
         let src = picture(w, h);
         let bytes: &[u8] = bytemuck::cast_slice(&src);
         let (xi, f, k1, k2) = (2.45543_f32, 940.0_f32, 1.19_f32, 0.11_f32);
-        let frame = LensFrame { width: w, height: h, xi, focal: f, k1, k2, rim_px: 0.0 };
+        let frame = LensFrame { width: w, height: h, xi, focal: f, k1, k2, rim_px: 0.0, picture_deg: 180.0 };
         let lens = FisheyeCalib::new_omni(
             f, f, w as f32 * 0.5, h as f32 * 0.5, xi, [k1, k2, 0.0, 0.0, 0.0], [0.0; 4], [0.0; 4], w as f32, h as f32,
         ).with_frame_crop();
@@ -10552,7 +10926,7 @@ mod lens_frame_kernel_tests {
             sw as f32, sh as f32,
         ).with_frame_crop();
         let (w, h) = (512u32, 384u32);
-        let frame = LensFrame { width: w, height: h, xi: 2.45543, focal: 900.0, k1: 1.19, k2: 0.11, rim_px: 0.0 };
+        let frame = LensFrame { width: w, height: h, xi: 2.45543, focal: 900.0, k1: 1.19, k2: 0.11, rim_px: 0.0, picture_deg: 180.0 };
         let tex = dev.project_fisheye_to_fisheye_texture_16(
             bytemuck::cast_slice(&src), 16, sw, sh, w, h, EquirectRotation::IDENTITY, source.with_lens_frame(&frame)).unwrap();
         let out = dev.read_texture_rgba64(&tex, w, h).unwrap();

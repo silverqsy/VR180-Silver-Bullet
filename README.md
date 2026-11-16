@@ -64,11 +64,12 @@ Studio).
   Windows). Audio is muxed inline — stereo, ambisonic, or APAC spatial on
   macOS. Multi-segment recordings join frame-exact. Optional BeyondVR hack
   for headset clarity.
-- **Lens frame** for X6 Crop clips: instead of a 180° canvas that is mostly
-  black, each eye is written the way it was recorded, with the lens stated
-  in the file (APMP parametric immersive) — all of the clip's detail in a
-  third to half of the pixels. Plays on Apple Vision Pro; the VR180 export
-  stays available for everything else.
+- **Lens frame**: instead of a 180° canvas, each eye is written the way it
+  was recorded, with the lens stated in the file (APMP parametric
+  immersive). A full fisheye keeps the whole view of its lens, past 180°;
+  an X6 Crop clip holds all of its detail in a third to half of the
+  pixels. For every video source. Plays on Apple Vision Pro; the VR180
+  export stays available for everything else.
 - **Spatial video** (macOS): export the reframed view as an Apple spatial
   video — MV-HEVC with the field of view you framed — for Vision Pro. The
   export format tells you when a view is wider than the headset shows at
