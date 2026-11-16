@@ -263,6 +263,10 @@ pub struct FisheyeExportConfig {
     /// Frames found there replace the capture's, at their own size; `None`
     /// uses the capture. Other sources ignore it.
     pub raw_enhanced_dir: Option<PathBuf>,
+    /// The per-eye size of the output when the export does read enhanced
+    /// frames; `eye_w × eye_h` is its size when it reads the capture.
+    /// Settled before the first frame ([`Self::settle_raw_enhanced`]).
+    pub raw_enhanced_eye: Option<(u32, u32)>,
 }
 
 impl FisheyeExportConfig {
@@ -272,6 +276,34 @@ impl FisheyeExportConfig {
         self.raw_enhanced_dir.as_ref().map(|dir| crate::x6_raw::EnhancedSource {
             dir: dir.clone(), t_in: self.trim_in_s, t_out: self.trim_out_s,
         })
+    }
+
+    /// Decide, before anything is sized, whether this export reads a raw
+    /// take's enhanced frames for the stretch `t_in..t_out`: where the
+    /// folder has some, the output takes [`Self::raw_enhanced_eye`]; where
+    /// it has none (or the source is no raw take), the folder is dropped and
+    /// the export is the plain one at `eye_w × eye_h`. Returns whether
+    /// enhanced frames are in use.
+    pub fn settle_raw_enhanced(&mut self, t_in: Option<f64>, t_out: Option<f64>) -> bool {
+        let larger = self.raw_enhanced_eye.take();
+        let Some(dir) = self.raw_enhanced_dir.clone().filter(|_| self.source_kind.is_raw_video()) else {
+            self.raw_enhanced_dir = None;
+            return false;
+        };
+        let source = crate::x6_raw::EnhancedSource { dir, t_in, t_out };
+        if crate::x6_raw::enhanced_side(&self.source_path, &source).is_none() {
+            if let Some((w, h)) = larger.filter(|l| *l != (self.eye_w, self.eye_h)) {
+                tracing::info!("raw take: no enhanced frame for this stretch in {}: written at {} × {} per eye, not {w} × {h}",
+                    source.dir.display(), self.eye_w, self.eye_h);
+            }
+            self.raw_enhanced_dir = None;
+            return false;
+        }
+        if let Some((w, h)) = larger {
+            self.eye_w = w;
+            self.eye_h = h;
+        }
+        true
     }
 }
 
@@ -1283,6 +1315,16 @@ pub fn export_fisheye(
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     set_export_path_note(None); // fresh export — no slow-path note yet
+    // A raw take's enhanced frames: used, and the output sized for them,
+    // only where this stretch has some. A larger size that was asked for
+    // and is not written is said in the export bar.
+    let larger = cfg.raw_enhanced_eye;
+    if !cfg.settle_raw_enhanced(cfg.trim_in_s, cfg.trim_out_s) {
+        if let Some((w, h)) = larger.filter(|l| *l != (cfg.eye_w, cfg.eye_h)) {
+            append_export_path_note(&format!(
+                "no enhanced frames for this stretch: written at {} × {} per eye, not {w} × {h}", cfg.eye_w, cfg.eye_h));
+        }
+    }
     // A reframed view is not VR180 — never tag it as one.
     if cfg.projection.is_reframe() {
         cfg.inject_apmp = false;

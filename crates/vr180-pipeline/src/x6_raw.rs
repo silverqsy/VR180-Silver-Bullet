@@ -572,6 +572,54 @@ fn enhanced_candidates(listing: &[Vec<(u32, u64)>; 2], wanted: impl Fn(u32) -> b
     (count, out)
 }
 
+/// What an enhanced-frames folder holds for a stretch of a take.
+struct EnhancedFind {
+    listing: [Vec<(u32, u64)>; 2],
+    /// Frames of the stretch, the files the folder has for them, and how
+    /// many of those were opened.
+    frames: usize,
+    files: usize,
+    looked: usize,
+    /// The first enhanced picture met.
+    picture: Option<crate::enhanced_dng::EnhancedPicture>,
+}
+
+impl EnhancedFind {
+    /// The side of the enhanced pictures, where they can stand in for the
+    /// take's frames: square, a whole multiple of the mosaic's side.
+    fn side(&self) -> Option<u32> {
+        self.picture.as_ref().filter(|p| p.width == p.height && p.width as usize % EYE_SIDE == 0 && p.width > 0).map(|p| p.width)
+    }
+}
+
+/// Look through `source`'s folder for the enhanced pictures of its stretch
+/// of the take: from the frame shown at the stretch's start to the one
+/// shown at its end.
+fn find_enhanced(index: &TakeIndex, source: &EnhancedSource) -> EnhancedFind {
+    let listing = enhanced_listing(&source.dir);
+    let frames = index.pairs.len();
+    let first = source.t_in.map(|t| index.frame_at(t.max(0.0))).unwrap_or(0);
+    let last = source.t_out.map(|t| index.frame_at(t.max(0.0))).unwrap_or(frames).min(frames.saturating_sub(1));
+    let wanted: HashSet<u32> = index.pairs.iter().skip(first).take((last + 1).saturating_sub(first)).map(|p| p.request).collect();
+    let (files, candidates) = enhanced_candidates(&listing, |request| wanted.contains(&request));
+    let picture = candidates.iter().find_map(|&(channel, request)|
+        crate::enhanced_dng::find(&source.dir.join(crate::sensor_dng::frame_file(channel, request))).ok().flatten());
+    EnhancedFind { listing, frames: wanted.len(), files, looked: candidates.len(), picture }
+}
+
+/// The side of the enhanced pictures an export of `source`'s stretch of the
+/// take at `path` reads its frames from, or `None` when it reads the
+/// capture: what [`X6RawIter::with_enhanced_frames`] goes by, for a caller
+/// that sizes the export before opening it.
+pub fn enhanced_side(path: &Path, source: &EnhancedSource) -> Option<u32> {
+    // No folder: nothing to open the take for.
+    if !(0..2).any(|channel| source.dir.join(crate::sensor_dng::channel_dir(channel)).is_dir()) {
+        return None;
+    }
+    let index = open(path).ok()?;
+    find_enhanced(&index, source).side()
+}
+
 /// The frames of a raw take as fisheye pairs.
 ///
 /// `swap_eyes` has the dual-stream iterators' meaning: `true` puts channel 1
@@ -641,30 +689,21 @@ impl X6RawIter {
     pub fn with_enhanced_frames(mut self, source: Option<&EnhancedSource>) -> Self {
         let Some(source) = source else { return self };
         let dir = &source.dir;
-        let listing = enhanced_listing(dir);
-        // The frames of the stretch: from the one shown at its start to the
-        // one shown at its end.
-        let frames = self.index.pairs.len();
-        let first = source.t_in.map(|t| self.index.frame_at(t.max(0.0))).unwrap_or(0);
-        let last = source.t_out.map(|t| self.index.frame_at(t.max(0.0))).unwrap_or(frames).min(frames.saturating_sub(1));
-        let wanted: HashSet<u32> = self.index.pairs.iter().skip(first).take((last + 1).saturating_sub(first)).map(|p| p.request).collect();
-        let (count, candidates) = enhanced_candidates(&listing, |request| wanted.contains(&request));
-        let found = candidates.iter().find_map(|&(channel, request)|
-            crate::enhanced_dng::find(&dir.join(crate::sensor_dng::frame_file(channel, request))).ok().flatten());
-        match found {
-            Some(p) if p.width == p.height && p.width as usize % EYE_SIDE == 0 => {
-                tracing::info!("raw take {}: enhanced frames of {}x{} in {} ({count} files for the {} frames of this stretch)",
-                    self.index.take.dir.display(), p.width, p.height, dir.display(), wanted.len());
+        let found = find_enhanced(&self.index, source);
+        match (found.side(), &found.picture) {
+            (Some(side), _) => {
+                tracing::info!("raw take {}: enhanced frames of {side}x{side} in {} ({} files for the {} frames of this stretch)",
+                    self.index.take.dir.display(), dir.display(), found.files, found.frames);
                 self.enhanced = Some(EnhancedFrames {
-                    dir: dir.clone(), side: p.width as usize,
-                    held: listing.map(|files| files.into_iter().map(|f| f.0).collect()),
+                    dir: dir.clone(), side: side as usize,
+                    held: found.listing.map(|files| files.into_iter().map(|f| f.0).collect()),
                     used: 0, missing: 0,
                 });
                 self.half = false;
             }
-            Some(p) => tracing::warn!("raw take: the enhanced frames in {} are {}x{}, not a whole multiple of the take's: not used", dir.display(), p.width, p.height),
-            None if count > 0 => tracing::warn!("raw take: none of the {count} files of this stretch in {} holds an enhanced picture ({} looked at): the capture's frames are used", dir.display(), candidates.len()),
-            None => tracing::info!("raw take: {} holds no frame of this stretch: the capture's frames are used", dir.display()),
+            (None, Some(p)) => tracing::warn!("raw take: the enhanced frames in {} are {}x{}, not a whole multiple of the take's: not used", dir.display(), p.width, p.height),
+            (None, None) if found.files > 0 => tracing::warn!("raw take: none of the {} files of this stretch in {} holds an enhanced picture ({} looked at): the capture's frames are used", found.files, dir.display(), found.looked),
+            (None, None) => tracing::info!("raw take: {} holds no frame of this stretch: the capture's frames are used", dir.display()),
         }
         self
     }
@@ -1032,6 +1071,9 @@ mod tests {
             .with_enhanced_frames(Some(&EnhancedSource { dir: dir.clone(), t_in: Some(t_in), t_out: Some(t_out) })).eye_dims();
         let dt = 1.0 / 50.0;
         assert_eq!(stretch(t - 0.1, t + 0.1), (7680, 7680));
+        let side = |t_in: f64, t_out: f64| enhanced_side(&take, &EnhancedSource { dir: dir.clone(), t_in: Some(t_in), t_out: Some(t_out) });
+        assert_eq!((side(t - 0.1, t + 0.1), side(t + dt, t + 2.0)), (Some(7680), None));
+        assert_eq!(enhanced_side(&take, &whole(&dir)), Some(7680));
         assert_eq!(stretch(t, t), (7680, 7680));
         assert_eq!(stretch(t + dt, t + 2.0), (3840, 3840));
         assert_eq!(stretch(0.0, t - dt), (3840, 3840));

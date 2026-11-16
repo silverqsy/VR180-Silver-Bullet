@@ -311,6 +311,8 @@ pub struct App {
     /// A raw video clip's snapshot also writes the frame as a linear DNG, on
     /// its own thread: the file and where its outcome arrives.
     frame_dng_job: Option<(PathBuf, crossbeam_channel::Receiver<std::result::Result<(), String>>)>,
+    /// The loaded raw take's enhanced frames, as last looked up.
+    enhanced_probe: EnhancedProbe,
     /// Key (frame+settings) the current `full_res_display` was rendered for.
     full_res_key: u64,
     /// Key (frame+settings) we currently *want* a still for. While this
@@ -514,15 +516,21 @@ fn lens_frame_reduced_dims(eye_w: u32, eye_h: u32) -> Option<(u32, u32)> {
 /// (`π × the lens' centre focal`: 6560² per eye → 13120 × 6560 on the X6).
 /// Offered only for such a clip, whose choice is kept apart from every
 /// other clip's ([`ExportOptions::resolution_for`]).
+///
+/// `R13k` and `R16k` exist for a raw take read from frames a raw converter
+/// enhanced (7680² an eye): such frames hold more than 8192 × 4096 shows,
+/// and these two canvases (6560² and 8192² per eye) keep it. Offered only
+/// where the take's enhanced frames are found, with a choice of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExportResolution { Native, R8k, Sharp }
+enum ExportResolution { Native, R8k, Sharp, R13k, R16k }
 
 impl ExportResolution {
     fn label(self) -> &'static str {
         match self {
             ExportResolution::Native => "7680 × 3840",
             ExportResolution::R8k    => "8192 × 4096",
-            ExportResolution::Sharp  => "13120 × 6560",
+            ExportResolution::Sharp | ExportResolution::R13k => "13120 × 6560",
+            ExportResolution::R16k   => "16384 × 8192",
         }
     }
 
@@ -532,10 +540,69 @@ impl ExportResolution {
         match (self, single_eye) {
             (ExportResolution::Native, true) => "3840 × 3840",
             (ExportResolution::R8k, true)    => "4096 × 4096",
-            (ExportResolution::Sharp, true)  => "6560 × 6560",
+            (ExportResolution::Sharp | ExportResolution::R13k, true) => "6560 × 6560",
+            (ExportResolution::R16k, true)   => "8192 × 8192",
             (r, false) => r.label(),
         }
     }
+
+    /// Per-eye side of the canvases that exist for enhanced frames.
+    fn enhanced_side(self) -> Option<u32> {
+        match self {
+            ExportResolution::R13k => Some(6560),
+            ExportResolution::R16k => Some(8192),
+            _ => None,
+        }
+    }
+}
+
+/// Which list of sizes a clip picks from. Each list has a choice of its
+/// own, so a size picked on one sort of clip never changes what a clip of
+/// another sort exports at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SizeList {
+    /// The clip's own size or 8192 × 4096: every clip but the two below.
+    Plain,
+    /// A clip whose frame is a crop of the lens' view: its native sharpness too.
+    Crop,
+    /// A raw take read from enhanced frames: the two larger canvases too.
+    Enhanced,
+}
+
+impl SizeList {
+    /// `cropped`: the clip has a native-sharpness size (`sharp_eye` is
+    /// `Some`). `enhanced`: it is a raw take whose enhanced frames the
+    /// export reads (never a cropped one).
+    fn of(cropped: bool, enhanced: bool) -> Self {
+        if enhanced { Self::Enhanced } else if cropped { Self::Crop } else { Self::Plain }
+    }
+}
+
+/// What is known of a raw video clip's enhanced frames (the folder of its
+/// camera-original DNGs beside it), for the stretch the clip is trimmed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnhancedFrames {
+    /// The folder is being looked through.
+    Looking,
+    /// No enhanced frame there for this stretch (or no folder).
+    Absent,
+    /// Enhanced pictures of this many pixels a side per eye.
+    Found(u32),
+}
+
+/// A take and its trim, as an enhanced-frames lookup is asked for them.
+type EnhancedKey = (PathBuf, Option<u64>, Option<u64>);
+
+/// The loaded raw take's enhanced frames, looked up on a thread: listing a
+/// folder of thousands of files on a share is not for the UI thread.
+#[derive(Default)]
+struct EnhancedProbe {
+    /// What the lookup in flight, or the last one, was asked for.
+    key: Option<EnhancedKey>,
+    /// The last answer for the take of `key`.
+    side: Option<Option<u32>>,
+    asked_at: Option<std::time::Instant>,
+    rx: Option<crossbeam_channel::Receiver<(EnhancedKey, Option<u32>)>>,
 }
 
 /// Per-eye size of a reframed export (the side-by-side frame is twice as
@@ -675,6 +742,9 @@ struct ExportOptions {
     /// sort: "its own size" means something else on either side (the whole
     /// canvas for one, a smaller canvas than was recorded for the other).
     crop_resolution: ExportResolution,
+    /// The same choice for a raw take read from enhanced frames (Native /
+    /// 8192×4096 / 13120×6560 / 16384×8192): its own for the same reason.
+    enhanced_resolution: ExportResolution,
     /// H.265 average bitrate in Mbps for VR180 output. Range 20..=1000
     /// (a native 12K export wants the top of it; the slider is logarithmic
     /// so the everyday 50–300 Mbps band keeps its resolution).
@@ -741,7 +811,7 @@ mod file_info_tests {
 
 #[cfg(test)]
 mod export_size_tests {
-    use super::{App, ExportOptions, ExportResolution, X6ClipInfo};
+    use super::{App, EnhancedFrames, ExportOptions, ExportResolution, SizeList, X6ClipInfo};
     use super::{oversize_export_hint, tr_zh, ExportCodec};
 
     /// The note for an oversize video names the encoder that runs on this
@@ -819,8 +889,8 @@ mod export_size_tests {
             (Native, Native, 7680, 4912),
         ] {
             let opts = ExportOptions { resolution: general, crop_resolution: crop_choice, ..Default::default() };
-            assert_eq!(opts.resolution_for(false), general);
-            assert_eq!(opts.resolution_for(true), crop_choice);
+            assert_eq!(opts.resolution_for(SizeList::Plain), general);
+            assert_eq!(opts.resolution_for(SizeList::Crop), crop_choice);
             assert_eq!(eye_dims_with(&opts, full.0, full.1), (full_side, full_side), "{general:?} / {crop_choice:?}");
             assert_eq!(eye_dims_with(&opts, crop.0, crop.1), (crop_side, crop_side), "{general:?} / {crop_choice:?}");
         }
@@ -842,6 +912,12 @@ mod export_size_tests {
 
     /// The same, saying whether that clip is stabilized.
     fn panel_text_lens(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, lens_space: Option<crate::decoder::LensSpaceLens>, stabilized: bool, single_eye: bool) -> String {
+        panel_text_full(opts, native, sharp, lens_space, stabilized, single_eye, None)
+    }
+
+    /// The same, for a raw video clip whose enhanced frames are `raw`
+    /// (`None`: no raw video).
+    fn panel_text_full(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, lens_space: Option<crate::decoder::LensSpaceLens>, stabilized: bool, single_eye: bool, raw: Option<EnhancedFrames>) -> String {
         fn collect(shape: &egui::Shape, out: &mut String) {
             match shape {
                 egui::Shape::Text(text) => { out.push_str(text.galley.text()); out.push('\n'); }
@@ -858,12 +934,100 @@ mod export_size_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, lens_space, stabilized, single_eye, false);
+                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, lens_space, stabilized, single_eye, raw);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
         }
         text
+    }
+
+    /// A raw take read from enhanced frames has two larger canvases and a
+    /// choice of its own; without enhanced frames, and on every other clip,
+    /// those sizes do not exist.
+    #[test]
+    fn enhanced_frames_have_their_own_sizes() {
+        use ExportResolution::{Native, R13k, R16k, R8k, Sharp};
+        let opts = ExportOptions { resolution: Native, crop_resolution: Sharp, enhanced_resolution: R16k, ..Default::default() };
+        assert_eq!((opts.resolution_for(SizeList::Plain), opts.resolution_for(SizeList::Crop), opts.resolution_for(SizeList::Enhanced)), (Native, Sharp, R16k));
+        // A size from another list means 8192 × 4096.
+        let odd = ExportOptions { resolution: R16k, crop_resolution: R13k, enhanced_resolution: Sharp, ..Default::default() };
+        assert_eq!((odd.resolution_for(SizeList::Plain), odd.resolution_for(SizeList::Crop), odd.resolution_for(SizeList::Enhanced)), (R8k, R8k, R8k));
+        assert_eq!(ExportOptions::default().enhanced_resolution, R8k);
+        assert_eq!((SizeList::of(false, false), SizeList::of(true, false), SizeList::of(false, true)), (SizeList::Plain, SizeList::Crop, SizeList::Enhanced));
+        // The canvases, per eye.
+        let dims = |r| ExportOptions { enhanced_resolution: r, ..Default::default() }.enhanced_eye_dims((3840, 3840));
+        assert_eq!((dims(Native), dims(R8k), dims(R13k), dims(R16k)), ((3840, 3840), (4096, 4096), (6560, 6560), (8192, 8192)));
+        assert_eq!((R13k.frame_label(false), R16k.frame_label(false), R16k.frame_label(true)), ("13120 × 6560", "16384 × 8192", "8192 × 8192"));
+
+        // The Format window of a raw take: with enhanced frames found it shows
+        // their choice and says so; without, the usual one.
+        let mut opts = ExportOptions { resolution: Native, enhanced_resolution: R16k, ..Default::default() };
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Found(7680)));
+        assert!(text.contains("16384 × 8192") && !text.contains("7680 × 3840 (native)"), "{text}");
+        assert!(text.contains("Enhanced frames found: 7680 × 7680 per eye"), "{text}");
+        assert!(text.contains("the two larger sizes keep it"), "{text}");
+        assert!(text.contains("Above 8192 × 4096"), "{text}");
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Absent));
+        assert!(text.contains("7680 × 3840 (native)") && !text.contains("16384"), "{text}");
+        assert!(text.contains("No enhanced frame found for this clip"), "{text}");
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Looking));
+        assert!(text.contains("Looking for enhanced frames") && !text.contains("16384"), "{text}");
+        // The option off: the usual list, and no word of what the folder holds.
+        opts.raw_use_enhanced = false;
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Found(7680)));
+        assert!(text.contains("7680 × 3840 (native)") && !text.contains("16384") && !text.contains("Enhanced frames found"), "{text}");
+        // Showing either list changed neither choice.
+        assert_eq!((opts.resolution, opts.enhanced_resolution), (Native, R16k));
+        // Another clip never sees those sizes.
+        let text = panel_text(&mut opts, (7680, 3840), None, false);
+        assert!(!text.contains("16384") && !text.contains("enhanced"), "{text}");
+    }
+
+    /// The export of a raw take carries both sizes: the one picked without
+    /// enhanced frames, and the one picked for them, which it takes where
+    /// its stretch has some.
+    #[test]
+    fn a_raw_export_carries_the_enhanced_size() {
+        use crate::decoder::{FisheyeOutputMode, Settings};
+        use ExportResolution::{Native, R13k, R16k};
+        let root = std::env::temp_dir().join(format!("vr180-enhanced-size-{}", std::process::id()));
+        let take = root.join("TAKE");
+        std::fs::create_dir_all(root.join("TAKE_OriginalDNG/CAM0")).unwrap();
+        let cfg = |opts: &ExportOptions, settings: &Settings, source: &std::path::Path| App::build_export_cfg(
+            source, std::path::Path::new("/nonexistent/out.mov"), 50.0, vr180_pipeline::SourceKind::X6Raw,
+            3840, 3840, 3840, 3840, None, settings, opts, Vec::new());
+        let vr = Settings::default();
+        let big = ExportOptions { enhanced_resolution: R16k, ..Default::default() };
+        let c = cfg(&big, &vr, &take);
+        assert_eq!(((c.eye_w, c.eye_h), c.raw_enhanced_eye), ((4096, 4096), Some((8192, 8192))));
+        assert_eq!(c.raw_enhanced_dir.as_deref(), Some(root.join("TAKE_OriginalDNG").as_path()));
+        let c = cfg(&ExportOptions { enhanced_resolution: R13k, resolution: Native, ..big }, &vr, &take);
+        assert_eq!(((c.eye_w, c.eye_h), c.raw_enhanced_eye), ((3840, 3840), Some((6560, 6560))));
+        let c = cfg(&ExportOptions { enhanced_resolution: Native, ..big }, &vr, &take);
+        assert_eq!(c.raw_enhanced_eye, Some((3840, 3840)));
+        // The option off, or no folder beside the take: the plain export.
+        let c = cfg(&ExportOptions { raw_use_enhanced: false, ..big }, &vr, &take);
+        assert_eq!((c.raw_enhanced_dir.clone(), c.raw_enhanced_eye), (None, None));
+        let c = cfg(&big, &vr, &root.join("OTHER"));
+        assert_eq!((c.raw_enhanced_dir.clone(), c.raw_enhanced_eye), (None, None));
+        // A reframed view keeps its own size: enhanced frames, no other canvas.
+        let reframed = Settings { fisheye_output_mode: FisheyeOutputMode::Reframe, ..Settings::default() };
+        let c = cfg(&big, &reframed, &take);
+        assert!(c.raw_enhanced_dir.is_some() && c.raw_enhanced_eye.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // The sample take with one enhanced frame (skipped when it is not
+        // there): a stretch that holds it is written large, another is not.
+        let sample = std::path::Path::new("/Volumes/Database/x6/1115 raw video/RAWVIDEO-20261116-011723");
+        let enhanced = sample.with_file_name("RAWVIDEO-20261116-011723_OriginalDNG").join("CAM0/000000364.dng");
+        if !cfg!(target_os = "macos") || !sample.is_dir() || std::fs::metadata(&enhanced).map(|m| m.len() < 30_000_000).unwrap_or(true) { return; }
+        let mut c = cfg(&big, &vr, sample);
+        assert!(c.settle_raw_enhanced(Some(4.9), Some(5.1)));
+        assert_eq!(((c.eye_w, c.eye_h), c.raw_enhanced_eye, c.raw_enhanced_dir.is_some()), ((8192, 8192), None, true));
+        let mut c = cfg(&big, &vr, sample);
+        assert!(!c.settle_raw_enhanced(Some(8.0), Some(9.0)));
+        assert_eq!(((c.eye_w, c.eye_h), c.raw_enhanced_eye, c.raw_enhanced_dir.is_some()), ((4096, 4096), None, false));
     }
 
     /// The Format window shows each sort of clip its own choice, and
@@ -1450,7 +1614,7 @@ mod spatial_export_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, None, false, false, false);
+                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, None, false, false, None);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -1549,21 +1713,34 @@ mod reframe_bitrate_tests {
 }
 
 impl ExportOptions {
-    /// The resolution choice that applies to a clip. `cropped`: its frame
-    /// is a crop of the lens' view, the one sort with a native-sharpness
-    /// size (`sharp_eye` is `Some`).
-    fn resolution_for(&self, cropped: bool) -> ExportResolution {
-        match (cropped, self.resolution) {
-            (true, _) => self.crop_resolution,
-            // No such size outside a Crop clip.
-            (false, ExportResolution::Sharp) => ExportResolution::R8k,
-            (false, r) => r,
+    /// The resolution choice that applies to a clip picking from `list`. A
+    /// size its list does not hold means 8192 × 4096 there.
+    fn resolution_for(&self, list: SizeList) -> ExportResolution {
+        use ExportResolution::{Native, R13k, R16k, R8k, Sharp};
+        match list {
+            SizeList::Plain => match self.resolution { Native => Native, _ => R8k },
+            SizeList::Crop => match self.crop_resolution { r @ (Native | Sharp) => r, _ => R8k },
+            SizeList::Enhanced => match self.enhanced_resolution { r @ (Native | R13k | R16k) => r, _ => R8k },
         }
     }
 
     /// The choice [`Self::resolution_for`] reads, for the control that edits it.
-    fn resolution_for_mut(&mut self, cropped: bool) -> &mut ExportResolution {
-        if cropped { &mut self.crop_resolution } else { &mut self.resolution }
+    fn resolution_for_mut(&mut self, list: SizeList) -> &mut ExportResolution {
+        match list {
+            SizeList::Plain => &mut self.resolution,
+            SizeList::Crop => &mut self.crop_resolution,
+            SizeList::Enhanced => &mut self.enhanced_resolution,
+        }
+    }
+
+    /// Per-eye size of the canvas a raw take is written on when the export
+    /// reads its enhanced frames: the size picked for those. `native_eye`:
+    /// the take's own eye.
+    fn enhanced_eye_dims(&self, native_eye: (u32, u32)) -> (u32, u32) {
+        match self.resolution_for(SizeList::Enhanced) {
+            ExportResolution::Native => native_eye,
+            r => { let side = r.enhanced_side().unwrap_or(4096); (side, side) }
+        }
     }
 
     /// Per-eye size of a lens frame for a clip whose eye is `eye_w × eye_h`:
@@ -1573,9 +1750,9 @@ impl ExportOptions {
     /// ([`lens_frame_reduced_dims`]; a frame no larger than that is never
     /// enlarged). The choice is the clip's own ([`Self::resolution_for`]).
     fn lens_frame_eye_dims(&self, eye_w: u32, eye_h: u32, cropped: bool) -> (u32, u32) {
-        match self.resolution_for(cropped) {
+        match self.resolution_for(SizeList::of(cropped, false)) {
             ExportResolution::R8k => lens_frame_reduced_dims(eye_w, eye_h).unwrap_or((eye_w, eye_h)),
-            ExportResolution::Native | ExportResolution::Sharp => (eye_w, eye_h),
+            _ => (eye_w, eye_h),
         }
     }
 
@@ -1626,6 +1803,7 @@ impl Default for ExportOptions {
             still_format: StillFormatChoice::Png16,
             resolution: ExportResolution::R8k,
             crop_resolution: ExportResolution::R8k,
+            enhanced_resolution: ExportResolution::R8k,
             h265_bitrate_mbps: 200,
             reframe_bitrate_mbps: 35,
             reframe_bitrate_custom: false,
@@ -1812,6 +1990,10 @@ fn tr_zh(en: &'static str) -> &'static str {
         "DNG sequence" => "DNG 序列",
         "Developed view" => "显影后的画面",
         "Use enhanced frames" => "使用增强后的帧",
+        "Enhanced frames found:" => "已找到增强后的帧：",
+        "No enhanced frame found for this clip: it exports from the capture." => "没有找到这个片段的增强帧：导出取自采集文件。",
+        "Looking for enhanced frames…" => "正在查找增强后的帧…",
+        "This clip's enhanced frames hold more than 8192 × 4096 shows: the two larger sizes keep it. A stretch without enhanced frames exports at the size picked without them." => "这个片段的增强帧包含的细节多于 8192 × 4096 能呈现的：两档更大的尺寸可以保留这些细节。没有增强帧的区段按未使用增强帧时所选的尺寸导出。",
         "When the folder of Camera original DNGs is beside the take and a raw converter has enhanced its frames in place (Camera Raw's Super Resolution), each frame is taken from there, at the enhanced size. A frame that was not enhanced comes from the capture." => "素材旁边有相机原片 DNG 文件夹，并且其中的帧已在 RAW 转换软件里原地增强过时（Camera Raw 的超分辨率），每一帧从那里读取，按增强后的尺寸处理。没有增强过的帧仍取自采集文件。",
         "Camera original" => "相机原片",
         "camera original" => "相机原片",
@@ -2729,6 +2911,7 @@ impl App {
             snapshot_status: None,
             snapshot_pending: None,
             frame_dng_job: None,
+            enhanced_probe: EnhancedProbe::default(),
             full_res_key: 0,
             full_res_desired_key: 0,
             full_res_rendered_at: std::time::Instant::now(),
@@ -3037,12 +3220,87 @@ impl App {
     }
 
     /// The export option that takes a raw clip's frames from the folder of
-    /// its camera-original DNGs where a raw converter has enhanced them.
-    fn enhanced_frames_ui(ui: &mut egui::Ui, opts: &mut ExportOptions) {
+    /// its camera-original DNGs where a raw converter has enhanced them, and
+    /// what that folder was found to hold.
+    fn enhanced_frames_ui(ui: &mut egui::Ui, opts: &mut ExportOptions, found: EnhancedFrames) {
         ui.checkbox(&mut opts.raw_use_enhanced, tr("Use enhanced frames"));
         ui.label(RichText::new(tr("When the folder of Camera original DNGs is beside the take and a raw converter has enhanced its frames in place (Camera Raw's Super Resolution), each frame is taken from there, at the enhanced size. A frame that was not enhanced comes from the capture."))
             .small().color(Color32::GRAY));
+        if opts.raw_use_enhanced {
+            let (text, color) = match found {
+                EnhancedFrames::Found(side) => (format!("{} {side} × {side} {}", tr("Enhanced frames found:"), tr("per eye")), Color32::from_rgb(120, 190, 130)),
+                EnhancedFrames::Absent => (tr("No enhanced frame found for this clip: it exports from the capture.").to_string(), Color32::GRAY),
+                EnhancedFrames::Looking => (tr("Looking for enhanced frames…").to_string(), Color32::GRAY),
+            };
+            ui.label(RichText::new(text).small().color(color));
+        }
         ui.add_space(8.0);
+    }
+
+    /// The loaded raw take's enhanced frames (`None` for any other clip), as
+    /// last looked up. Asks again, on a thread, when the take or its trim
+    /// changed and every few seconds while the Format window is open, so
+    /// frames enhanced meanwhile show up.
+    fn enhanced_frames(&mut self, ctx: &egui::Context) -> Option<EnhancedFrames> {
+        if !self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) {
+            return None;
+        }
+        let path = self.loaded_path.clone()?;
+        if !self.export_opts.raw_use_enhanced {
+            return Some(EnhancedFrames::Absent);
+        }
+        let key: EnhancedKey = (path.clone(), self.settings.trim_in_s.map(f64::to_bits), self.settings.trim_out_s.map(f64::to_bits));
+        let refresh = std::time::Duration::from_secs(4);
+        let probe = &mut self.enhanced_probe;
+        if let Some(rx) = &probe.rx {
+            match rx.try_recv() {
+                Ok((asked, side)) => {
+                    if asked.0 == path {
+                        probe.side = Some(side);
+                    }
+                    probe.rx = None;
+                    ctx.request_repaint();
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => probe.rx = None,
+            }
+        }
+        let other_take = probe.key.as_ref().map(|k| &k.0) != Some(&path);
+        if other_take {
+            probe.side = None;
+        }
+        let due = probe.key.as_ref() != Some(&key)
+            || (self.show_export_settings && probe.asked_at.map_or(true, |t| t.elapsed() > refresh));
+        if due && probe.rx.is_none() {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let asked = key.clone();
+            let source = vr180_pipeline::x6_raw::EnhancedSource {
+                dir: Self::default_frames_dir_for(&path, true),
+                t_in: self.settings.trim_in_s, t_out: self.settings.trim_out_s,
+            };
+            let repaint = ctx.clone();
+            std::thread::spawn(move || {
+                let side = vr180_pipeline::x6_raw::enhanced_side(&asked.0, &source);
+                let _ = tx.send((asked, side));
+                repaint.request_repaint();
+            });
+            probe.key = Some(key);
+            probe.asked_at = Some(std::time::Instant::now());
+            probe.rx = Some(rx);
+        }
+        Some(match probe.side {
+            None => EnhancedFrames::Looking,
+            Some(None) => EnhancedFrames::Absent,
+            Some(Some(side)) => EnhancedFrames::Found(side),
+        })
+    }
+
+    /// The side of the loaded raw take's enhanced frames where an export
+    /// would read them now: the last lookup's answer, the option on.
+    fn enhanced_in_use(&self) -> Option<u32> {
+        let raw = self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
+        let same_take = self.enhanced_probe.key.as_ref().map(|k| &k.0) == self.loaded_path.as_ref();
+        if raw && same_take && self.export_opts.raw_use_enhanced { self.enhanced_probe.side.flatten() } else { None }
     }
 
     /// Build the full `FisheyeExportConfig` for one (source, output) pair
@@ -3107,10 +3365,10 @@ impl App {
         // Native sharpness (`sharp_eye`: a clip whose frame is a crop of
         // the lens' view): the 180° canvas at the frame's own centre
         // density. Such a clip has its own choice; no other has that size.
-        match (opts.resolution_for(sharp_eye.is_some()), sharp_eye) {
+        match (opts.resolution_for(SizeList::of(sharp_eye.is_some(), false)), sharp_eye) {
             (ExportResolution::Sharp, Some(side)) => { eye_w = side; eye_h = side; }
-            (ExportResolution::R8k | ExportResolution::Sharp, _) => { eye_w = 4096; eye_h = 4096; }
             (ExportResolution::Native, _) => {}
+            _ => { eye_w = 4096; eye_h = 4096; }
         }
 
         // The Lens Space view through the camera's lens is a lens frame: the
@@ -3153,6 +3411,20 @@ impl App {
             eye_w = side;
             eye_h = side;
         }
+        // A raw take's enhanced frames (the folder of its camera-original
+        // DNGs beside it, when it is there and the option is on) and the
+        // canvas they are written on: the size picked for enhanced frames,
+        // which the export takes where its stretch has some. A lens frame
+        // and a reframed view keep the size they have.
+        let raw_enhanced_dir = (source_kind.is_raw_video() && opts.raw_use_enhanced)
+            .then(|| Self::default_frames_dir_for(source_path, true))
+            .filter(|dir| dir.join("CAM0").is_dir());
+        let raw_enhanced_eye = raw_enhanced_dir.as_ref()
+            .filter(|_| !lens_frame_on && !projection.is_reframe())
+            .map(|_| {
+                let (w, h) = opts.enhanced_eye_dims(native_eye);
+                if projection == vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye { (w.min(h), w.min(h)) } else { (w, h) }
+            });
         let mut color_stack = settings.build_color_stack();
         // Automatic eye-exposure matching is an X6 feature (independent
         // per-sensor AE); never let the persisted flag leak onto other sources.
@@ -3268,9 +3540,8 @@ impl App {
             trim_out_s: settings.trim_out_s,
             // A raw take's enhanced frames: the folder of its camera-original
             // DNGs beside it, when it is there and the option is on.
-            raw_enhanced_dir: (source_kind.is_raw_video() && opts.raw_use_enhanced)
-                .then(|| Self::default_frames_dir_for(source_path, true))
-                .filter(|dir| dir.join("CAM0").is_dir()),
+            raw_enhanced_dir,
+            raw_enhanced_eye,
             color_stack,
             projection,
             lens_frame,
@@ -5588,7 +5859,7 @@ impl App {
     fn maybe_push_settings(&mut self) {
         // What a raw clip's sharpening counts its radius in: the width of
         // one eye of the frame an export would write now.
-        self.settings.export_eye_w = if self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) { self.export_eye_dims().0 } else { 0 };
+        self.settings.export_eye_w = if self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) { self.raw_export_eye_w() } else { 0 };
         if self.settings == self.last_pushed_settings {
             return;
         }
@@ -5661,11 +5932,14 @@ impl App {
         let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
         // A single-eye clip's frame is its one eye, not two side by side.
         let single_eye = self.clip_single_eye();
-        // The loaded clip's own choice (a Crop clip has one apart).
+        // The loaded clip's own choice (a Crop clip has one apart, and so
+        // has a raw take whose enhanced frames were found).
         let sharp_eye = self.clip.as_ref().and_then(|c| c.sharp_eye(self.settings.insv_view));
-        let resolution = self.export_opts.resolution_for(sharp_eye.is_some());
         let lens_frame = self.clip.as_ref()
             .is_some_and(|c| self.settings.lens_frame_view(c.source_kind));
+        let enhanced = self.enhanced_frames(ctx);
+        let enhanced_sizes = matches!(enhanced, Some(EnhancedFrames::Found(_))) && self.export_opts.raw_use_enhanced && !lens_frame;
+        let resolution = self.export_opts.resolution_for(SizeList::of(sharp_eye.is_some(), enhanced_sizes));
         let res_label = match (self.settings.reframe_aspect_if_active(), resolution, sharp_eye) {
             // Lens Space through the camera's lens: the eye as recorded (or
             // its 8K copy), named as such.
@@ -5687,6 +5961,8 @@ impl App {
             // A Crop clip's native-sharpness canvas.
             (None, ExportResolution::Sharp, Some(side)) =>
                 format!("{} × {side}", if single_eye { side } else { side * 2 }),
+            // The canvases of a raw take's enhanced frames.
+            (None, r @ (ExportResolution::R13k | ExportResolution::R16k), _) => r.frame_label(single_eye).to_string(),
             (None, _, _) => ExportResolution::R8k.frame_label(single_eye).to_string(),
         };
         let h265_mbps = self.export_opts.effective_h265_mbps(
@@ -5862,7 +6138,8 @@ impl App {
             let mut open = true;
             let clip_fps = self.clip.as_ref().map(|c| c.fps).unwrap_or(30.0);
             let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
-            let raw_video = self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
+            // A raw video clip, and what is known of its enhanced frames.
+            let raw_video = enhanced;
             let native_dims = self.native_sbs_dims();
             let single_eye = self.clip_single_eye();
             // A Crop clip's native-sharpness canvas (side by side, or the one
@@ -5913,8 +6190,10 @@ impl App {
         // The clip holds ONE eye: its frame is that eye (sizes and rates
         // follow), and nothing that needs two eyes is offered.
         single_eye: bool,
-        // The clip is a raw video: it can also leave as a folder of DNG frames.
-        raw_video: bool,
+        // The clip is a raw video (it can also leave as a folder of DNG
+        // frames), and what is known of its enhanced frames; `None` for any
+        // other clip.
+        raw_video: Option<EnhancedFrames>,
     ) {
         // Spatial video is offered for the reframed view on macOS. Selected
         // on a clip it does not exist for, the choice shows (and exports) as
@@ -5972,7 +6251,12 @@ impl App {
                 Some((w, h)) => format!("{w} × {h} ({})", tr("native + margin")),
                 None => native_label,
             };
-            let shown = opts.resolution_for(cropped);
+            // A raw take whose enhanced frames were found picks from the
+            // list that holds the two larger canvases (not for a lens frame,
+            // which is the recorded frame whatever is picked).
+            let enhanced_sizes = matches!(raw_video, Some(EnhancedFrames::Found(_))) && opts.raw_use_enhanced && !lens_frame && !is_still;
+            let list = SizeList::of(cropped, enhanced_sizes);
+            let shown = opts.resolution_for(list);
             // The 8K choice of a lens frame is its reduced copy, listed only
             // where the frame is larger than that.
             let lens_reduced: Option<String> = native_dims.filter(|_| lens_frame).and_then(|(w, h)| {
@@ -5989,10 +6273,11 @@ impl App {
                 (ExportResolution::Native, _) => &native_label,
                 (ExportResolution::Sharp, Some(_)) if lens_frame => &native_label,
                 (ExportResolution::Sharp, Some(l)) => l,
+                (ExportResolution::R13k | ExportResolution::R16k, _) => shown.frame_label(single_eye),
                 (ExportResolution::R8k, _) if !r8k_listed => &native_label,
                 _ => &r8k_label,
             };
-            let choice = opts.resolution_for_mut(cropped);
+            let choice = opts.resolution_for_mut(list);
             *choice = shown;
             egui::ComboBox::from_id_source(format!("{id_prefix}_resolution"))
                 .selected_text(sel_label)
@@ -6006,6 +6291,11 @@ impl App {
                     if let Some(l) = sharp_label.as_ref().filter(|_| !lens_frame) {
                         ui.selectable_value(choice, ExportResolution::Sharp, l.clone());
                     }
+                    if list == SizeList::Enhanced {
+                        for size in [ExportResolution::R13k, ExportResolution::R16k] {
+                            ui.selectable_value(choice, size, size.frame_label(single_eye));
+                        }
+                    }
                 });
             if lens_frame {
                 ui.label(RichText::new(tr(LENS_FRAME_NOTE)).small().color(Color32::GRAY));
@@ -6013,15 +6303,20 @@ impl App {
             } else if sharp_label.is_some() {
                 ui.label(RichText::new(tr("Native sharpness: the 180° canvas at the pixel density of the Crop frame's centre, so nothing recorded is scaled down. The clip's own size puts the same frame on a smaller canvas."))
                     .small().color(Color32::GRAY));
+            } else if list == SizeList::Enhanced {
+                ui.label(RichText::new(tr("This clip's enhanced frames hold more than 8192 × 4096 shows: the two larger sizes keep it. A stretch without enhanced frames exports at the size picked without them."))
+                    .small().color(Color32::GRAY));
             }
             // Beyond 8192×4096 (a 12K BRAW, a Crop clip's native-sharpness
             // canvas): what the platform's encoder does with the frame —
             // see `oversize_export_hint`.
             let native_out = grown_dims.or(native_dims);
-            let out_dims = match opts.resolution_for(cropped) {
+            let out_dims = match opts.resolution_for(list) {
                 ExportResolution::Native => native_out,
                 ExportResolution::Sharp if lens_frame => native_out,
                 ExportResolution::Sharp => sharp_dims,
+                r @ (ExportResolution::R13k | ExportResolution::R16k) =>
+                    r.enhanced_side().map(|side| (if single_eye { side } else { side * 2 }, side)),
                 ExportResolution::R8k if !r8k_listed => native_out,
                 ExportResolution::R8k => None,
             };
@@ -6053,7 +6348,7 @@ impl App {
             return;
         }
 
-        if raw_video {
+        if let Some(found) = raw_video {
             ui.checkbox(&mut opts.raw_dng_sequence, tr("DNG sequence"));
             if opts.raw_dng_sequence {
                 ui.radio_value(&mut opts.raw_dng_original, false, tr("Developed view"));
@@ -6064,14 +6359,14 @@ impl App {
                     .small().color(Color32::GRAY));
                 ui.add_space(8.0);
                 if !opts.raw_dng_original {
-                    Self::enhanced_frames_ui(ui, opts);
+                    Self::enhanced_frames_ui(ui, opts, found);
                 }
                 return;
             }
             ui.label(RichText::new(tr("Every frame as a DNG in a folder: the developed view, or the sensor's own frames."))
                 .small().color(Color32::GRAY));
             ui.add_space(8.0);
-            Self::enhanced_frames_ui(ui, opts);
+            Self::enhanced_frames_ui(ui, opts, found);
         }
 
         ui.label(RichText::new(tr("Codec")).strong());
@@ -7425,6 +7720,23 @@ impl App {
         })
     }
 
+    /// Width of one eye of the frame an export of the loaded raw take would
+    /// write now: [`Self::export_eye_dims`], or the canvas picked for its
+    /// enhanced frames where those were found (a view on a canvas only).
+    fn raw_export_eye_w(&self) -> u32 {
+        let plain = self.export_eye_dims();
+        let Some(clip) = self.clip.as_ref() else { return plain.0; };
+        let canvas = !self.settings.lens_frame_view(clip.source_kind)
+            && self.settings.fisheye_output_mode != crate::decoder::FisheyeOutputMode::Reframe;
+        match self.enhanced_in_use() {
+            Some(_) if canvas => {
+                let (w, h) = self.export_opts.enhanced_eye_dims((clip.fisheye_eye_w, clip.fisheye_eye_h));
+                if self.settings.fisheye_output_mode == crate::decoder::FisheyeOutputMode::Fisheye { w.min(h) } else { w }
+            }
+            _ => plain.0,
+        }
+    }
+
     fn export_eye_dims(&self) -> (u32, u32) {
         let Some(clip) = self.clip.as_ref() else { return (0, 0); };
         let kind = clip.source_kind;
@@ -7442,10 +7754,10 @@ impl App {
         if self.settings.lens_frame_view(kind) {
             return self.export_opts.lens_frame_out_dims(ew, eh, sharp_eye.is_some(), self.settings.stabilize);
         }
-        match (self.export_opts.resolution_for(sharp_eye.is_some()), sharp_eye) {
+        match (self.export_opts.resolution_for(SizeList::of(sharp_eye.is_some(), false)), sharp_eye) {
             (ExportResolution::Sharp, Some(side)) => { ew = side; eh = side; }
-            (ExportResolution::R8k | ExportResolution::Sharp, _) => { ew = 4096; eh = 4096; }
             (ExportResolution::Native, _) => {}
+            _ => { ew = 4096; eh = 4096; }
         }
         match self.settings.fisheye_output_mode {
             crate::decoder::FisheyeOutputMode::Reframe =>
@@ -7570,10 +7882,14 @@ impl App {
         if self.frame_dng_job.is_some() {
             return;
         }
-        let cfg = Self::build_export_cfg(
+        let mut cfg = Self::build_export_cfg(
             &item.path, &out, item.fps, item.source_kind,
             item.fisheye_eye_w, item.fisheye_eye_h, item.width, item.height, item.sharp_eye(),
             &self.worker_settings(), &self.export_opts, self.clip_segments(&item.path));
+        // The snapshot's picture is the preview's, at the size picked without
+        // enhanced frames: its DNG keeps that size (an enhanced frame, where
+        // there is one, still gives it its pixels).
+        cfg.raw_enhanced_eye = None;
         let pipeline = self.export_device();
         let (tx, rx) = crossbeam_channel::bounded(1);
         let path = out.clone();

@@ -2916,8 +2916,31 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      (hardware H.265 Main 10, M5 Max, ten pairs with the start-up):
      8192×4096 0.45 s a pair, 4.2 GB peak; 13120×6560 0.60 s, 5.7 GB;
      15360×7680 0.66 s, 6.6 GB; 16384×8192 0.69 s, 7.2 GB: all four
-     encode and decode. The GUI still offers a raw take only its present
-     sizes.
+     encode and decode.
+     SIZES FOR ENHANCED FRAMES (the user: both of 13120×6560 and
+     16384×8192): `ExportResolution::{R13k, R16k}` (6560² / 8192² an
+     eye), picked from a list of their own (`SizeList::Enhanced`,
+     `ExportOptions::enhanced_resolution`, beside `Plain` and `Crop`:
+     a size picked on one sort of clip never changes another's). An
+     export carries BOTH sizes: `eye_w × eye_h` = the one picked without
+     enhanced frames, `FisheyeExportConfig::raw_enhanced_eye` = the one
+     picked for them (canvas views only: not a lens frame, not a
+     reframed view), and the PIPELINE decides before anything is sized
+     (`settle_raw_enhanced(t_in, t_out)`, first thing in
+     `export_fisheye` and in `raw_export::FrameSource::open`; it goes by
+     `x6_raw::enhanced_side`, the iterator's own search): enhanced
+     frames in the stretch → the larger size; none → the folder is
+     dropped, the plain size stays, and the export bar says so when a
+     larger one was asked for. So a batch item, a different trim or a
+     folder that changed since the list was shown cannot write an
+     upscaled capture. The GUI lists the two sizes only when a lookup
+     found enhanced frames for the loaded take's trim
+     (`App::enhanced_frames`: `enhanced_side` on a thread, asked again
+     when the take or trim changes and every 4 s while Export format is
+     open; `EnhancedFrames::{Looking, Absent, Found(side)}` is also the
+     line under "Use enhanced frames"). The preview's sharpening scale
+     follows the size an export would write (`raw_export_eye_w`); the
+     snapshot and its frame DNG stay at the plain size.
      The harness: `X6_ENHANCED=<folder>`. CFG: `#[cfg(target_os =
      "macos")] mod jxl_macos` in `lib.rs` and ONE gated pair of blocks in
      `enhanced_dng::decode_tile` (the other arm returns an error); nothing

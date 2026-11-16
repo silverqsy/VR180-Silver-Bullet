@@ -132,6 +132,9 @@ impl FrameSource {
         // and a frame is no spatial video, whatever the clip's export is.
         let mut cfg = cfg.clone();
         cfg.spatial = None;
+        // Enhanced frames, and the size that goes with them, where this
+        // stretch has some.
+        cfg.settle_raw_enhanced(stretch.0, stretch.1);
         match crate::fisheye_export::resolve_lens_frame(&mut cfg) {
             Ok(Some((frame, _))) => tracing::debug!(
                 "raw frames: lens frame {}x{}, focal {:.3} px, xi {:.5}, k1 {:.6}, k2 {:.6}",

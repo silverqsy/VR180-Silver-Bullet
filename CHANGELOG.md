@@ -118,6 +118,13 @@ converter's controls for it, and every frame can be had as a DNG.
   the capture, enlarged to match, where it has not. An export whose
   stretch of the take holds no enhanced frame runs on the capture as
   before, and the export bar says when enhanced frames are in use.
+  Enhanced frames hold more than 8192×4096 shows, so a take that has
+  them gets two larger sizes, **13120×6560** and **16384×8192**, with a
+  choice of their own: Export format lists them once the frames are
+  found and says what it found, and a stretch without enhanced frames
+  exports at the size picked without them. Both sizes encode in hardware
+  on Apple silicon (0.60 and 0.69 s a frame pair, 5.7 and 7.2 GB); like
+  every size above 8192×4096 they are beyond what most players decode.
   Preview, grading and stabilization stay on the capture; lens, timing
   and sound are the take's. So the whole round trip is: export Camera
   original, enhance the folder in Camera Raw, export the video. Read from
