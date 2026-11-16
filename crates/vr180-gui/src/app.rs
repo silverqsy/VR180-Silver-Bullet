@@ -466,23 +466,18 @@ impl StillFormatChoice {
     }
 }
 
-/// The lens-frame choice of the Format window (see `ExportOptions::lens_frame`).
-const LENS_FRAME_LABEL: &str = "Lens frame for Apple Vision Pro (the lens's whole view)";
-const LENS_FRAME_HOVER: &str = "Instead of a 180° canvas, each eye is written the way the camera recorded it, through one lens that the file describes (Apple Projected Media Profile, parametric immersive projection). A fisheye clip keeps everything its lens saw, past 180° where the lens goes that far; a Crop clip fills its frame instead of sitting in a canvas that is mostly black. Stabilization, rolling shutter, eye alignment, the crop mask and colour are applied as always. Off: the usual VR180 half-equirect, which every headset and YouTube read.";
-const LENS_FRAME_NOTE: &str = "Lens frame: the frame is the recording's own, at the density it was recorded, so the clip's own size already holds all of its detail, and nothing the lens saw is cut off at 180°. The preview keeps showing the VR180 view. It plays immersively on Apple Vision Pro (visionOS 26 or later) and nowhere else: for other headsets and YouTube, export the clip once more with this off. The file is named …_Lens.";
+/// The Lens Space view's two lenses ([`crate::decoder::LensSpaceLens`]), as
+/// the Output panel explains them.
+const LENS_SPACE_CAMERA_HOVER: &str = "Each eye is written the way the camera recorded it, through one lens that the file describes (Apple Projected Media Profile, parametric immersive projection). A fisheye clip keeps everything its lens saw, past 180° where the lens goes that far; a Crop clip fills its frame instead of sitting in a canvas that is mostly black. Stabilization, rolling shutter, eye alignment, the crop mask and colour are applied as always. Apple Vision Pro plays it; other headsets and YouTube need the VR180 format.";
+const LENS_SPACE_EQUIDISTANT_HOVER: &str = "An ideal equidistant fisheye: a disc in a square frame, the form that players and tools for fisheye video expect. With the Apple Vision Pro metadata on, the file states this lens too, and the headset shows the disc at its true angles.";
+const LENS_SPACE_CAMERA_NOTE: &str = "The recording's own frame through the camera's lens: its whole field of view, for Apple Vision Pro.";
+const LENS_SPACE_DISC_NOTE: &str = "equidistant disc, for players and tools that take fisheye video.";
+/// What the Format window says of a lens frame (the Lens Space view through
+/// the camera's lens).
+const LENS_FRAME_NOTE: &str = "Lens Space, camera lens: the frame is the recording's own, at the density it was recorded, so the clip's own size already holds all of its detail, and nothing the lens saw is cut off at 180°. It plays immersively on Apple Vision Pro (visionOS 26 or later) and nowhere else: for other headsets and YouTube, export the clip in the VR180 format as well. The file is named …_Lens.";
 const LENS_FRAME_STAB_NOTE: &str = "Stabilization: the frame has no spare canvas, so a stabilized frame is 5 % larger on each side than the recording, the same for every clip (an 8K copy keeps its size and scales the picture instead). Where the picture does not reach, the frame is black, as around the picture of a VR180 export; a shift beyond the margin is cut at the frame's edge. With camera lock the picture leaves the frame as the camera turns: keep that for a camera that stays put.";
-const LENS_FRAME_MASK_NOTE: &str = "Crop mask: it is measured from this larger frame's edge, so its window is about a tenth wider than the preview shows: large enough to stay inside the moving picture, it gives a steady edge.";
-const LENS_FRAME_METADATA_NOTE: &str = "A lens frame carries its own metadata: the lens, for Apple Vision Pro. The choice of VR180 metadata applies to the clips that export as VR180.";
-
-/// Whether a clip of `kind` has a lens a lens frame can be written from:
-/// every video the app exports, but for a generic side-by-side file that is
-/// already VR180 (its fisheye dewarp off), which has none.
-fn lens_frame_possible(kind: vr180_pipeline::SourceKind, settings: &crate::decoder::Settings) -> bool {
-    match kind {
-        vr180_pipeline::SourceKind::SbsFisheye => settings.sbs_dewarp_fisheye,
-        k => k.is_fisheye() || k.is_eac(),
-    }
-}
+const LENS_FRAME_METADATA_NOTE: &str = "A Lens Space file through the camera's lens carries its own metadata: the lens, for Apple Vision Pro. The choice of VR180 metadata applies to the clips that export as VR180.";
+const LENS_SPACE_DISC_METADATA_NOTE: &str = "This clip exports an equidistant disc, which is not VR180: with Apple Vision Pro chosen the file states the disc's own lens instead, and for YouTube, which has no fisheye form, nothing is written.";
 
 /// The reduced size of a lens frame (the 8K choice): the frame scaled so
 /// that its longer side is 4096, its shape kept, each side a multiple of 4.
@@ -663,14 +658,6 @@ struct ExportOptions {
     /// sort: "its own size" means something else on either side (the whole
     /// canvas for one, a smaller canvas than was recorded for the other).
     crop_resolution: ExportResolution,
-    /// Write a Crop clip's VR180 export as a LENS FRAME: each eye the way it
-    /// was recorded, through one lens that the file states (Apple Projected
-    /// Media Profile, parametric immersive), instead of the 180° canvas the
-    /// frame only half fills. One choice for the list; it takes effect where
-    /// it can ([`ExportOptions::lens_frame_for`]) and every other clip
-    /// exports as before. Apple Vision Pro reads such a file; other headsets
-    /// and YouTube need the half-equirect form.
-    lens_frame: bool,
     /// H.265 average bitrate in Mbps for VR180 output. Range 20..=1000
     /// (a native 12K export wants the top of it; the slider is logarithmic
     /// so the everyday 50–300 Mbps band keeps its resolution).
@@ -827,16 +814,17 @@ mod export_size_tests {
 
     /// Every piece of text the Format window paints for a VR180 clip.
     fn panel_text(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, single_eye: bool) -> String {
-        panel_text_with(opts, native, sharp, false, single_eye)
+        panel_text_with(opts, native, sharp, None, single_eye)
     }
 
-    /// The same, for a clip that may (`lens_offered`) be written as a lens frame.
-    fn panel_text_with(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, lens_offered: bool, single_eye: bool) -> String {
-        panel_text_lens(opts, native, sharp, lens_offered, false, single_eye)
+    /// The same, for a clip in the Lens Space view (`lens_space`: the lens
+    /// that view writes for it).
+    fn panel_text_with(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, lens_space: Option<crate::decoder::LensSpaceLens>, single_eye: bool) -> String {
+        panel_text_lens(opts, native, sharp, lens_space, false, single_eye)
     }
 
     /// The same, saying whether that clip is stabilized.
-    fn panel_text_lens(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, lens_offered: bool, stabilized: bool, single_eye: bool) -> String {
+    fn panel_text_lens(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, lens_space: Option<crate::decoder::LensSpaceLens>, stabilized: bool, single_eye: bool) -> String {
         fn collect(shape: &egui::Shape, out: &mut String) {
             match shape {
                 egui::Shape::Text(text) => { out.push_str(text.galley.text()); out.push('\n'); }
@@ -853,7 +841,7 @@ mod export_size_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, lens_offered, stabilized, single_eye);
+                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, lens_space, stabilized, single_eye);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -879,11 +867,12 @@ mod export_size_tests {
         assert_eq!((opts.resolution, opts.crop_resolution), (Native, Sharp));
     }
 
-    /// A lens frame stands in for a clip's VR180 export, at the size and
-    /// shape the eye was recorded, and nowhere else.
+    /// The Lens Space view through the camera's lens exports a lens frame,
+    /// at the size and shape the eye was recorded; its equidistant lens and
+    /// every other view export as they always did.
     #[test]
     fn a_lens_frame_is_the_recorded_frame() {
-        use crate::decoder::{FisheyeOutputMode, Settings};
+        use crate::decoder::{FisheyeOutputMode, LensSpaceLens, Settings};
         use vr180_pipeline::fisheye_export::{FisheyeExportProjection, LensFrameOut};
         use vr180_pipeline::SourceKind;
         let cfg = |opts: &ExportOptions, settings: &Settings, kind, eye: (u32, u32), sharp_eye| App::build_export_cfg(
@@ -891,144 +880,214 @@ mod export_size_tests {
             29.97, kind, eye.0, eye.1, eye.0, eye.1, sharp_eye, settings, opts, Vec::new(),
         );
         let vr = Settings::default();
+        // The Lens Space view; the camera's lens is its default.
+        let lens = Settings { fisheye_output_mode: FisheyeOutputMode::Fisheye, ..Default::default() };
+        assert_eq!(lens.lens_space, LensSpaceLens::Camera);
         let insv = SourceKind::Insta360Insv;
-        let on = ExportOptions { lens_frame: true, crop_resolution: ExportResolution::Sharp, ..Default::default() };
+        let on = ExportOptions { crop_resolution: ExportResolution::Sharp, ..Default::default() };
 
         // A square Crop frame: its own size, whatever the VR180 canvas would be.
-        let c = cfg(&on, &vr, insv, (4912, 4912), Some(6560));
+        let c = cfg(&on, &lens, insv, (4912, 4912), Some(6560));
         assert_eq!((c.projection, c.lens_frame), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource));
         assert_eq!((c.eye_w, c.eye_h), (4912, 4912));
         // A frame that is not square keeps its shape.
         for eye in [(6000, 3968), (3840, 3008)] {
-            let c = cfg(&on, &vr, insv, eye, Some(6560));
+            let c = cfg(&on, &lens, insv, eye, Some(6560));
             assert_eq!((c.eye_w, c.eye_h, c.lens_frame), (eye.0, eye.1, LensFrameOut::FromSource), "{eye:?}");
         }
         // The clip's own size and its native sharpness are the same frame here.
         let native = ExportOptions { crop_resolution: ExportResolution::Native, ..on };
-        assert_eq!((cfg(&native, &vr, insv, (4912, 4912), Some(6560)).eye_w), 4912);
+        assert_eq!((cfg(&native, &lens, insv, (4912, 4912), Some(6560)).eye_w), 4912);
         // The 8K choice is a reduced copy of the same shape, never an enlargement.
         let small = ExportOptions { crop_resolution: ExportResolution::R8k, ..on };
-        let c = cfg(&small, &vr, insv, (4912, 4912), Some(6560));
+        let c = cfg(&small, &lens, insv, (4912, 4912), Some(6560));
         assert_eq!((c.eye_w, c.eye_h), (4096, 4096));
-        let c = cfg(&small, &vr, insv, (6000, 3968), Some(6560));
+        let c = cfg(&small, &lens, insv, (6000, 3968), Some(6560));
         assert_eq!((c.eye_w, c.eye_h), (4096, 2708));
-        let c = cfg(&small, &vr, insv, (3712, 3712), Some(6560));
+        let c = cfg(&small, &lens, insv, (3712, 3712), Some(6560));
         assert_eq!((c.eye_w, c.eye_h), (3712, 3712));
         assert_eq!(super::lens_frame_reduced_dims(3840, 3008), None);
+        // What is written: the stabilizer's margin on a frame at its own
+        // size, none on a reduced copy.
+        assert_eq!(native.lens_frame_out_dims(4912, 4912, true, true), (5400, 5400));
+        assert_eq!(native.lens_frame_out_dims(4912, 4912, true, false), (4912, 4912));
+        assert_eq!(small.lens_frame_out_dims(4912, 4912, true, true), (4096, 4096));
+        assert_eq!(small.lens_frame_out_dims(3712, 3712, true, true), (4080, 4080));
 
         // A clip that holds the lens's whole view: its own frame too, by
         // its own resolution choice (not the Crop clips'). At 8K — the
         // default — a frame no larger than that is not enlarged.
-        let c = cfg(&on, &vr, insv, (3840, 3840), None);
+        let c = cfg(&on, &lens, insv, (3840, 3840), None);
         assert_eq!((c.projection, c.lens_frame, c.eye_w, c.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource, 3840, 3840));
-        let c = cfg(&on, &vr, insv, (4864, 4864), None);
+        let c = cfg(&on, &lens, insv, (4864, 4864), None);
         assert_eq!((c.lens_frame, c.eye_w, c.eye_h), (LensFrameOut::FromSource, 4096, 4096));
         let full = ExportOptions { resolution: ExportResolution::Native, crop_resolution: ExportResolution::R8k, ..on };
-        let c = cfg(&full, &vr, insv, (4864, 4864), None);
+        let c = cfg(&full, &lens, insv, (4864, 4864), None);
         assert_eq!((c.lens_frame, c.eye_w, c.eye_h), (LensFrameOut::FromSource, 4864, 4864));
         // Every camera's video: a DJI, a QooCam, a Blackmagic frame that is
         // not square, a generic fisheye file.
         for (kind, eye) in [(SourceKind::DjiOsv, (3840, 3840)), (SourceKind::KandaoQoocam, (3840, 3840)), (SourceKind::BlackmagicRaw, (6144, 8040))] {
-            let c = cfg(&full, &vr, kind, eye, None);
+            let c = cfg(&full, &lens, kind, eye, None);
             assert_eq!((c.projection, c.lens_frame, c.eye_w, c.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource, eye.0, eye.1), "{kind:?}");
         }
-        assert_eq!({ let c = cfg(&on, &vr, SourceKind::BlackmagicRaw, (6144, 8040), None); (c.eye_w, c.eye_h) }, (3132, 4096));
-        let fisheye_file = Settings { sbs_dewarp_fisheye: true, ..Default::default() };
+        assert_eq!({ let c = cfg(&on, &lens, SourceKind::BlackmagicRaw, (6144, 8040), None); (c.eye_w, c.eye_h) }, (3132, 4096));
+        let fisheye_file = Settings { sbs_dewarp_fisheye: true, ..lens.clone() };
         assert_eq!(cfg(&full, &fisheye_file, SourceKind::SbsFisheye, (4096, 4096), None).lens_frame, LensFrameOut::FromSource);
         // A GoPro `.360` has no eye frame of its own: its lens's cross
         // (5952-wide streams: 3936) is the frame.
         let gopro = App::build_export_cfg(
             std::path::Path::new("/nonexistent/in.360"), std::path::Path::new("/nonexistent/out.mp4"),
-            29.97, SourceKind::GoProEac, 0, 0, 5952, 1920, None, &vr, &on, Vec::new(),
+            29.97, SourceKind::GoProEac, 0, 0, 5952, 1920, None, &lens, &on, Vec::new(),
         );
         assert_eq!((gopro.projection, gopro.lens_frame, gopro.eye_w, gopro.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource, 3936, 3936));
 
-        // Off, a file that is already VR180, a still, another view: as before.
-        let off = ExportOptions { lens_frame: false, ..on };
-        let c = cfg(&off, &vr, insv, (4912, 4912), Some(6560));
+        // The VR180 view is VR180, whatever the lens choice says.
+        let c = cfg(&on, &vr, insv, (4912, 4912), Some(6560));
         assert_eq!((c.projection, c.lens_frame, c.eye_w), (FisheyeExportProjection::HalfEquirect, LensFrameOut::Off, 6560));
-        let c = cfg(&off, &vr, insv, (3840, 3840), None);
+        let c = cfg(&on, &vr, insv, (3840, 3840), None);
         assert_eq!((c.projection, c.lens_frame, c.eye_w), (FisheyeExportProjection::HalfEquirect, LensFrameOut::Off, 4096));
-        let c = cfg(&on, &vr, SourceKind::SbsFisheye, (4096, 4096), None);
-        assert_eq!((c.projection, c.lens_frame), (FisheyeExportProjection::HalfEquirect, LensFrameOut::Off));
-        for still in [SourceKind::Insta360Dng, SourceKind::KandaoDng] {
-            assert_eq!(cfg(&on, &vr, still, (7760, 7760), None).lens_frame, LensFrameOut::Off, "{still:?}");
-        }
-        // The fisheye view keeps writing its disc, in a square frame.
-        let disc = Settings { fisheye_output_mode: FisheyeOutputMode::Fisheye, ..Default::default() };
+        // The equidistant lens: the disc, in a square frame. So is a clip
+        // with no lens record (a file that is already VR180, a still).
+        let disc = Settings { lens_space: LensSpaceLens::Equidistant, ..lens.clone() };
         let c = cfg(&native, &disc, insv, (6000, 3968), Some(6560));
         assert_eq!((c.projection, c.lens_frame, c.eye_w, c.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::Off, 3968, 3968));
+        let c = cfg(&full, &lens, SourceKind::SbsFisheye, (4096, 4096), None);
+        assert_eq!((c.projection, c.lens_frame), (FisheyeExportProjection::Fisheye, LensFrameOut::Off));
+        for still in [SourceKind::Insta360Dng, SourceKind::KandaoDng] {
+            assert_eq!(cfg(&on, &lens, still, (7760, 7760), None).lens_frame, LensFrameOut::Off, "{still:?}");
+        }
         let flat = Settings { fisheye_output_mode: FisheyeOutputMode::Reframe, ..Default::default() };
         assert_eq!(cfg(&on, &flat, insv, (4912, 4912), Some(6560)).lens_frame, LensFrameOut::Off);
-        assert!(on.lens_frame_for(&vr, insv) && on.lens_frame_for(&vr, SourceKind::GoProEac));
-        assert!(!on.lens_frame_for(&vr, SourceKind::Insta360Dng) && !on.lens_frame_for(&vr, SourceKind::Unknown));
-        assert!(!on.lens_frame_for(&flat, insv) && !off.lens_frame_for(&vr, insv));
-        assert!(super::lens_frame_possible(SourceKind::SbsFisheye, &fisheye_file) && !super::lens_frame_possible(SourceKind::SbsFisheye, &vr));
+        assert!(lens.lens_frame_view(insv) && lens.lens_frame_view(SourceKind::GoProEac));
+        assert!(!lens.lens_frame_view(SourceKind::Insta360Dng) && !lens.lens_frame_view(SourceKind::Unknown));
+        assert!(!flat.lens_frame_view(insv) && !vr.lens_frame_view(insv) && !disc.lens_frame_view(insv));
+        assert!(crate::decoder::lens_frame_possible(SourceKind::SbsFisheye, &fisheye_file)
+            && !crate::decoder::lens_frame_possible(SourceKind::SbsFisheye, &lens));
+        // Settings saved before the lens choice existed read as the camera's.
+        let old: Settings = serde_json::from_str(r#"{"fisheye_output_mode":"Fisheye"}"#).unwrap();
+        assert!(old.lens_frame_view(insv));
     }
 
-    /// The Format window offers the lens frame on a clip that has a lens,
-    /// in the VR180 view, and its sizes are the frame's own.
+    /// The Format window follows the Lens Space view: through the camera's
+    /// lens its sizes are the frame's own and the notes say where the file
+    /// plays; the disc and every other view keep the usual sizes.
     #[test]
-    fn the_format_window_offers_the_lens_frame() {
-        use super::{tr_zh, LENS_FRAME_HOVER, LENS_FRAME_LABEL, LENS_FRAME_MASK_NOTE, LENS_FRAME_METADATA_NOTE, LENS_FRAME_NOTE, LENS_FRAME_STAB_NOTE};
+    fn the_format_window_follows_the_lens_space_view() {
+        use super::{tr_zh, LENS_FRAME_METADATA_NOTE, LENS_FRAME_NOTE, LENS_FRAME_STAB_NOTE, LENS_SPACE_CAMERA_HOVER,
+            LENS_SPACE_CAMERA_NOTE, LENS_SPACE_DISC_METADATA_NOTE, LENS_SPACE_DISC_NOTE, LENS_SPACE_EQUIDISTANT_HOVER};
+        use crate::decoder::LensSpaceLens::{Camera, Equidistant};
         let mut opts = ExportOptions { crop_resolution: ExportResolution::Sharp, ..Default::default() };
-        // Offered and off: the usual sizes, and the box to tick.
-        let text = panel_text_with(&mut opts, (9824, 4912), Some((13120, 6560)), true, false);
-        assert!(text.contains(LENS_FRAME_LABEL) && text.contains("13120 × 6560 (native sharpness)"), "{text}");
-        assert!(!text.contains("Lens frame: the frame is"), "{text}");
-        // Not offered (another clip, another view): no trace of it.
-        let text = panel_text_with(&mut opts, (9824, 4912), Some((13120, 6560)), false, false);
-        assert!(!text.contains(LENS_FRAME_LABEL), "{text}");
-        // On: the clip's own size stands for its native sharpness, and the
-        // note says where the file plays.
-        opts.lens_frame = true;
-        let text = panel_text_with(&mut opts, (9824, 4912), Some((13120, 6560)), true, false);
+        // Another view: the usual sizes, and no word of a lens.
+        let text = panel_text_with(&mut opts, (9824, 4912), Some((13120, 6560)), None, false);
+        assert!(text.contains("13120 × 6560 (native sharpness)"), "{text}");
+        assert!(!text.contains("Lens Space") && !text.contains("equidistant disc"), "{text}");
+        // Through the camera's lens: the clip's own size stands for its
+        // native sharpness, and the notes say where the file plays.
+        let text = panel_text_with(&mut opts, (9824, 4912), Some((13120, 6560)), Some(Camera), false);
         assert!(text.contains("9824 × 4912 (native)") && !text.contains("13120"), "{text}");
         assert!(text.contains(LENS_FRAME_NOTE) && text.contains(LENS_FRAME_METADATA_NOTE), "{text}");
-        assert!(text.contains(LENS_FRAME_STAB_NOTE) && text.contains(LENS_FRAME_MASK_NOTE), "{text}");
+        assert!(text.contains(LENS_FRAME_STAB_NOTE), "{text}");
         assert!(!text.contains("YouTube (Spherical V2"), "{text}");
         // The stored choices are untouched by the look.
         assert_eq!(opts.crop_resolution, ExportResolution::Sharp);
         // A frame that is not square, one eye.
-        let text = panel_text_with(&mut opts, (6000, 3968), Some((6560, 6560)), true, true);
+        let text = panel_text_with(&mut opts, (6000, 3968), Some((6560, 6560)), Some(Camera), true);
         assert!(text.contains("6000 × 3968 (native)"), "{text}");
-        // On a clip it does not apply to, the choice shows nothing and stays.
-        let text = panel_text_with(&mut opts, (7680, 3840), None, false, false);
-        assert!(!text.contains("Lens frame"), "{text}");
-        assert!(opts.lens_frame);
-        for s in [LENS_FRAME_LABEL, LENS_FRAME_HOVER, LENS_FRAME_NOTE, LENS_FRAME_STAB_NOTE, LENS_FRAME_MASK_NOTE, LENS_FRAME_METADATA_NOTE, "Lens frame", "native + margin"] {
+        // The equidistant disc: the usual sizes and the metadata choice,
+        // with what that choice means for a disc.
+        let text = panel_text_with(&mut opts, (7680, 3840), None, Some(Equidistant), false);
+        assert!(text.contains(LENS_SPACE_DISC_METADATA_NOTE) && text.contains("YouTube (Spherical V2"), "{text}");
+        assert!(!text.contains(LENS_FRAME_NOTE) && text.contains("\n8192 × 4096\n"), "{text}");
+        for s in [LENS_SPACE_CAMERA_HOVER, LENS_SPACE_EQUIDISTANT_HOVER, LENS_SPACE_CAMERA_NOTE, LENS_SPACE_DISC_NOTE,
+                  LENS_FRAME_NOTE, LENS_FRAME_STAB_NOTE, LENS_FRAME_METADATA_NOTE, LENS_SPACE_DISC_METADATA_NOTE,
+                  "Lens Space", "Lens", "Camera lens", "Equidistant", "native + margin"] {
             assert_ne!(tr_zh(s), s, "no Chinese text for: {s}");
         }
         // A clip that holds the lens's whole view (an Osmo 360, an X6 at 8K):
-        // offered too, at its own size by its own choice, with no word of a
-        // crop mask it does not have. Its 8K choice has no smaller copy to
-        // offer, and shows the frame as it is.
-        let mut whole = ExportOptions { lens_frame: true, resolution: ExportResolution::Native, ..Default::default() };
-        let text = panel_text_with(&mut whole, (7680, 3840), None, true, false);
-        assert!(text.contains(LENS_FRAME_LABEL) && text.contains("7680 × 3840 (native)"), "{text}");
-        assert!(text.contains(LENS_FRAME_NOTE) && !text.contains(LENS_FRAME_MASK_NOTE), "{text}");
-        let text = panel_text_lens(&mut whole, (7680, 3840), None, true, true, false);
+        // its own size by its own choice. Its 8K choice has no smaller copy
+        // to offer, and shows the frame as it is.
+        let mut whole = ExportOptions { resolution: ExportResolution::Native, ..Default::default() };
+        let text = panel_text_with(&mut whole, (7680, 3840), None, Some(Camera), false);
+        assert!(text.contains("7680 × 3840 (native)") && text.contains(LENS_FRAME_NOTE), "{text}");
+        let text = panel_text_lens(&mut whole, (7680, 3840), None, Some(Camera), true, false);
         assert!(text.contains("8448 × 4224 (native + margin)"), "{text}");
-        let mut at_8k = ExportOptions { lens_frame: true, ..Default::default() };
-        let text = panel_text_lens(&mut at_8k, (7680, 3840), None, true, true, false);
+        let mut at_8k = ExportOptions::default();
+        let text = panel_text_lens(&mut at_8k, (7680, 3840), None, Some(Camera), true, false);
         assert!(text.contains("8448 × 4224 (native + margin)") && !text.contains("\n8192 × 4096\n"), "{text}");
         assert_eq!(at_8k.resolution, ExportResolution::R8k);
         // A larger one (an X6 at 10K) does have its 8K copy.
-        let text = panel_text_with(&mut at_8k, (9728, 4864), None, true, false);
+        let text = panel_text_with(&mut at_8k, (9728, 4864), None, Some(Camera), false);
         assert!(text.contains("\n8192 × 4096\n"), "{text}");
         // A stabilized clip: the size shown is the one written, the recorded
         // frame plus the stabilizer's margin; the 8K copy keeps its size.
-        let text = panel_text_lens(&mut opts, (9824, 4912), Some((13120, 6560)), true, true, false);
+        let text = panel_text_lens(&mut opts, (9824, 4912), Some((13120, 6560)), Some(Camera), true, false);
         assert!(text.contains("10800 × 5400 (native + margin)") && !text.contains("9824 × 4912"), "{text}");
-        let text = panel_text_lens(&mut opts, (6000, 3968), Some((6560, 6560)), true, true, true);
+        let text = panel_text_lens(&mut opts, (6000, 3968), Some((6560, 6560)), Some(Camera), true, true);
         assert!(text.contains("6396 × 4364 (native + margin)"), "{text}");
-        let mut copy = ExportOptions { lens_frame: true, crop_resolution: ExportResolution::R8k, ..Default::default() };
-        let text = panel_text_lens(&mut copy, (9824, 4912), Some((13120, 6560)), true, true, false);
+        let mut copy = ExportOptions { crop_resolution: ExportResolution::R8k, ..Default::default() };
+        let text = panel_text_lens(&mut copy, (9824, 4912), Some((13120, 6560)), Some(Camera), true, false);
         assert!(text.contains("8192 × 4096"), "{text}");
         // The margin the note names is the pipeline's.
         let margin = (vr180_pipeline::lens_frame::STABILIZER_MARGIN * 100.0).round() as u32;
         assert!(LENS_FRAME_STAB_NOTE.contains(&format!("{margin} % larger on each side")), "{LENS_FRAME_STAB_NOTE}");
         assert!(tr_zh(LENS_FRAME_STAB_NOTE).contains(&format!("每边比拍摄画幅大 {margin}%")));
+    }
+
+    /// The Output panel offers the lens choice on a clip that has a lens
+    /// record, in the Lens Space view, and says what each lens writes.
+    #[test]
+    fn the_output_panel_offers_the_lens_of_the_lens_space_view() {
+        use super::{LENS_SPACE_CAMERA_NOTE, LENS_SPACE_DISC_NOTE};
+        use crate::decoder::{FisheyeOutputMode, LensSpaceLens, Settings};
+        use vr180_pipeline::SourceKind;
+        fn collect(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => { out.push_str(text.galley.text()); out.push('\n'); }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let panel = |s: &mut Settings, kind: Option<SourceKind>| -> String {
+            let ctx = egui::Context::default();
+            let mut text = String::new();
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0))),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(input, |ui| App::lens_space_ui(ui, s, kind));
+                text.clear();
+                out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
+            }
+            text
+        };
+        let mut lens = Settings { fisheye_output_mode: FisheyeOutputMode::Fisheye, ..Default::default() };
+        // A clip with a lens: the choice, and the camera's lens to start with.
+        let text = panel(&mut lens, Some(SourceKind::Insta360Insv));
+        assert!(text.contains("Lens\n") && text.contains("Camera lens") && text.contains("Equidistant"), "{text}");
+        assert!(text.contains(LENS_SPACE_CAMERA_NOTE) && !text.contains(LENS_SPACE_DISC_NOTE), "{text}");
+        assert_eq!(lens.lens_space, LensSpaceLens::Camera);
+        // The equidistant lens: the disc of the source's field.
+        let mut disc = Settings { lens_space: LensSpaceLens::Equidistant, ..lens.clone() };
+        let text = panel(&mut disc, Some(SourceKind::DjiOsv));
+        assert!(text.contains("Camera lens") && text.contains(&format!("195° {LENS_SPACE_DISC_NOTE}")), "{text}");
+        let text = panel(&mut disc, Some(SourceKind::GoProEac));
+        assert!(text.contains(&format!("185° {LENS_SPACE_DISC_NOTE}")), "{text}");
+        // No lens record (a still, a file that is already VR180): no choice,
+        // the disc, and the stored choice left alone.
+        for kind in [SourceKind::Insta360Dng, SourceKind::SbsFisheye] {
+            let text = panel(&mut lens, Some(kind));
+            assert!(!text.contains("Camera lens") && text.contains(&format!("195° {LENS_SPACE_DISC_NOTE}")), "{kind:?}: {text}");
+        }
+        assert_eq!(lens.lens_space, LensSpaceLens::Camera);
+        // A generic file whose halves are fisheye images has a lens.
+        let mut file = Settings { sbs_dewarp_fisheye: true, ..lens.clone() };
+        assert!(panel(&mut file, Some(SourceKind::SbsFisheye)).contains("Camera lens"));
+        // The other views say nothing of it.
+        for mode in [FisheyeOutputMode::HalfEquirect, FisheyeOutputMode::Reframe] {
+            let mut other = Settings { fisheye_output_mode: mode, ..Default::default() };
+            assert_eq!(panel(&mut other, Some(SourceKind::Insta360Insv)), "", "{mode:?}");
+        }
     }
 
     /// "Apply settings to all" stays inside one settings class: a clip that
@@ -1374,7 +1433,7 @@ mod spatial_export_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, false, false, false);
+                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, None, false, false);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -1490,16 +1549,6 @@ impl ExportOptions {
         if cropped { &mut self.crop_resolution } else { &mut self.resolution }
     }
 
-    /// Whether an export of a clip of `kind` with `settings` really is a
-    /// lens frame: the choice, on a clip that has a lens
-    /// ([`lens_frame_possible`]) and whose output is VR180 — the lens frame
-    /// takes the place of the 180° canvas, nothing else. The choice itself
-    /// stays put, so a list of mixed clips exports each as it can.
-    fn lens_frame_for(&self, settings: &crate::decoder::Settings, kind: vr180_pipeline::SourceKind) -> bool {
-        self.lens_frame && lens_frame_possible(kind, settings)
-            && matches!(settings.fisheye_output_mode, crate::decoder::FisheyeOutputMode::HalfEquirect)
-    }
-
     /// Per-eye size of a lens frame for a clip whose eye is `eye_w × eye_h`:
     /// the frame as it was recorded, whatever its shape — for a Crop clip
     /// (`cropped`) that is its native sharpness, so that choice means the
@@ -1510,6 +1559,20 @@ impl ExportOptions {
         match self.resolution_for(cropped) {
             ExportResolution::R8k => lens_frame_reduced_dims(eye_w, eye_h).unwrap_or((eye_w, eye_h)),
             ExportResolution::Native | ExportResolution::Sharp => (eye_w, eye_h),
+        }
+    }
+
+    /// Per-eye size a lens-frame export is WRITTEN at:
+    /// [`Self::lens_frame_eye_dims`], and for a stabilized clip at its own
+    /// size the stabilizer's margin on top (`vr180_pipeline::lens_frame`; a
+    /// reduced copy keeps its size). What the export bar shows and a
+    /// snapshot renders.
+    fn lens_frame_out_dims(&self, eye_w: u32, eye_h: u32, cropped: bool, stabilized: bool) -> (u32, u32) {
+        let (w, h) = self.lens_frame_eye_dims(eye_w, eye_h, cropped);
+        if stabilized && (w, h) == (eye_w, eye_h) {
+            vr180_pipeline::lens_frame::stabilized_dims(w, h)
+        } else {
+            (w, h)
         }
     }
 
@@ -1543,7 +1606,6 @@ impl Default for ExportOptions {
             still_format: StillFormatChoice::Png16,
             resolution: ExportResolution::R8k,
             crop_resolution: ExportResolution::R8k,
-            lens_frame: false,
             h265_bitrate_mbps: 200,
             reframe_bitrate_mbps: 35,
             reframe_bitrate_custom: false,
@@ -1789,18 +1851,26 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Bit depth" => "位深",
         "ProRes profile" => "ProRes 配置",
         "VR180 metadata" => "VR180 元数据",
-        "Lens frame" => "镜头画幅",
-        "Lens frame for Apple Vision Pro (the lens's whole view)" => "镜头画幅，供 Apple Vision Pro 使用（保留镜头的完整视角）",
-        "Instead of a 180° canvas, each eye is written the way the camera recorded it, through one lens that the file describes (Apple Projected Media Profile, parametric immersive projection). A fisheye clip keeps everything its lens saw, past 180° where the lens goes that far; a Crop clip fills its frame instead of sitting in a canvas that is mostly black. Stabilization, rolling shutter, eye alignment, the crop mask and colour are applied as always. Off: the usual VR180 half-equirect, which every headset and YouTube read."
-            => "不再写成 180° 画布，而是按相机拍摄时的样子写出每只眼，并在文件里写明所用的同一个镜头（Apple Projected Media Profile 的参数化沉浸投影）。鱼眼片段保留镜头拍到的全部视角，镜头超过 180° 的部分也在；Crop 片段则填满画幅，不再放在大半是黑色的画布中央。防抖、卷帘快门校正、双眼对齐、裁切遮罩和调色照常生效。关闭：常规的 VR180 半等距柱状投影，所有头显和 YouTube 都能读取。",
-        "Lens frame: the frame is the recording's own, at the density it was recorded, so the clip's own size already holds all of its detail, and nothing the lens saw is cut off at 180°. The preview keeps showing the VR180 view. It plays immersively on Apple Vision Pro (visionOS 26 or later) and nowhere else: for other headsets and YouTube, export the clip once more with this off. The file is named …_Lens."
-            => "镜头画幅：画幅就是拍摄时的画幅，密度与拍摄时相同，所以片段自身的尺寸已经包含全部细节，镜头拍到的内容也不会在 180° 处被裁掉。预览仍然显示 VR180 视图。只有 Apple Vision Pro（visionOS 26 或更高版本）能沉浸播放；其他头显和 YouTube 请关闭此项再导出一次。文件名以 _Lens 结尾。",
+        "Lens Space" => "镜头空间",
+        "Lens" => "镜头",
+        "Camera lens" => "相机镜头",
+        "Equidistant" => "等距",
+        "Each eye is written the way the camera recorded it, through one lens that the file describes (Apple Projected Media Profile, parametric immersive projection). A fisheye clip keeps everything its lens saw, past 180° where the lens goes that far; a Crop clip fills its frame instead of sitting in a canvas that is mostly black. Stabilization, rolling shutter, eye alignment, the crop mask and colour are applied as always. Apple Vision Pro plays it; other headsets and YouTube need the VR180 format."
+            => "按相机拍摄时的样子写出每只眼，并在文件里写明所用的同一个镜头（Apple Projected Media Profile 的参数化沉浸投影）。鱼眼片段保留镜头拍到的全部视角，镜头超过 180° 的部分也在；Crop 片段则填满画幅，不再放在大半是黑色的画布中央。防抖、卷帘快门校正、双眼对齐、裁切遮罩和调色照常生效。Apple Vision Pro 可以播放；其他头显和 YouTube 需要 VR180 格式。",
+        "An ideal equidistant fisheye: a disc in a square frame, the form that players and tools for fisheye video expect. With the Apple Vision Pro metadata on, the file states this lens too, and the headset shows the disc at its true angles."
+            => "理想的等距鱼眼：正方形画幅里的一个圆盘，支持鱼眼视频的播放器和后期工具认的就是这种形式。开启 Apple Vision Pro 元数据时，文件里也会写明这个镜头，头显按真实角度显示圆盘。",
+        "The recording's own frame through the camera's lens: its whole field of view, for Apple Vision Pro."
+            => "透过相机镜头的拍摄画幅本身：保留镜头的完整视角，供 Apple Vision Pro 使用。",
+        "equidistant disc, for players and tools that take fisheye video."
+            => "等距圆盘，供支持鱼眼视频的播放器和后期工具使用。",
+        "Lens Space, camera lens: the frame is the recording's own, at the density it was recorded, so the clip's own size already holds all of its detail, and nothing the lens saw is cut off at 180°. It plays immersively on Apple Vision Pro (visionOS 26 or later) and nowhere else: for other headsets and YouTube, export the clip in the VR180 format as well. The file is named …_Lens."
+            => "镜头空间，相机镜头：画幅就是拍摄时的画幅，密度与拍摄时相同，所以片段自身的尺寸已经包含全部细节，镜头拍到的内容也不会在 180° 处被裁掉。只有 Apple Vision Pro（visionOS 26 或更高版本）能沉浸播放；其他头显和 YouTube 请再用 VR180 格式导出一次。文件名以 _Lens 结尾。",
         "Stabilization: the frame has no spare canvas, so a stabilized frame is 5 % larger on each side than the recording, the same for every clip (an 8K copy keeps its size and scales the picture instead). Where the picture does not reach, the frame is black, as around the picture of a VR180 export; a shift beyond the margin is cut at the frame's edge. With camera lock the picture leaves the frame as the camera turns: keep that for a camera that stays put."
             => "防抖：画幅没有多余的画布，所以开启防抖时画幅每边比拍摄画幅大 5%，每条片段都一样（8K 缩小版保持尺寸不变，改为缩小画面）。画面没有覆盖到的地方是黑色，和 VR180 导出里画面四周一样；超出余量的偏移会在画幅边缘被裁掉。开启相机锁定时，相机一转画面就会移出画幅，只适合机位不动的镜头。",
-        "Crop mask: it is measured from this larger frame's edge, so its window is about a tenth wider than the preview shows: large enough to stay inside the moving picture, it gives a steady edge."
-            => "裁切遮罩：从这个扩大后的画幅边缘算起，所以窗口比预览里显示的宽约一成；遮罩大到始终落在移动的画面以内时，边缘才固定不动。",
-        "A lens frame carries its own metadata: the lens, for Apple Vision Pro. The choice of VR180 metadata applies to the clips that export as VR180."
-            => "镜头画幅自带元数据：写给 Apple Vision Pro 的镜头定义。VR180 元数据的选择只作用于按 VR180 导出的片段。",
+        "A Lens Space file through the camera's lens carries its own metadata: the lens, for Apple Vision Pro. The choice of VR180 metadata applies to the clips that export as VR180."
+            => "透过相机镜头写出的镜头空间文件自带元数据：写给 Apple Vision Pro 的镜头定义。VR180 元数据的选择只作用于按 VR180 导出的片段。",
+        "This clip exports an equidistant disc, which is not VR180: with Apple Vision Pro chosen the file states the disc's own lens instead, and for YouTube, which has no fisheye form, nothing is written."
+            => "这条片段导出的是等距圆盘，不是 VR180：选择 Apple Vision Pro 时，文件里写的是圆盘自己的镜头定义；YouTube 没有鱼眼格式，选它时不写任何元数据。",
         "H.265 bitrate" => "H.265 码率",
         "Spatial video (MV-HEVC)" => "空间视频 (MV-HEVC)",
         "per eye" => "每眼",
@@ -2922,10 +2992,10 @@ impl App {
             (ExportResolution::Native, _) => {}
         }
 
-        // A lens frame takes the place of the clip's 180° canvas: the
+        // The Lens Space view through the camera's lens is a lens frame: the
         // fisheye projection, writing the lens's image instead of its disc,
         // at the size the eye was recorded (or the 8K copy).
-        let lens_frame_on = opts.lens_frame_for(settings, source_kind);
+        let lens_frame_on = settings.lens_frame_view(source_kind);
         let lens_frame = if lens_frame_on {
             (eye_w, eye_h) = opts.lens_frame_eye_dims(native_eye.0, native_eye.1, sharp_eye.is_some());
             vr180_pipeline::fisheye_export::LensFrameOut::FromSource
@@ -2933,8 +3003,6 @@ impl App {
             vr180_pipeline::fisheye_export::LensFrameOut::Off
         };
         let projection = match settings.fisheye_output_mode {
-            crate::decoder::FisheyeOutputMode::HalfEquirect if lens_frame_on =>
-                vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye,
             crate::decoder::FisheyeOutputMode::HalfEquirect =>
                 vr180_pipeline::fisheye_export::FisheyeExportProjection::HalfEquirect,
             crate::decoder::FisheyeOutputMode::Fisheye =>
@@ -3799,7 +3867,7 @@ impl App {
             Self::default_still_output_for(&item.path, opts.still_format)
         } else {
             Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye(),
-                opts.lens_frame_for(&item.settings, item.source_kind))
+                item.settings.lens_frame_view(item.source_kind))
         };
         if let Some(dir) = &self.batch_out_dir {
             if let Some(name) = out.file_name() {
@@ -5421,22 +5489,18 @@ impl App {
         let sharp_eye = self.clip.as_ref().and_then(|c| c.sharp_eye(self.settings.insv_view));
         let resolution = self.export_opts.resolution_for(sharp_eye.is_some());
         let lens_frame = self.clip.as_ref()
-            .is_some_and(|c| self.export_opts.lens_frame_for(&self.settings, c.source_kind));
+            .is_some_and(|c| self.settings.lens_frame_view(c.source_kind));
         let res_label = match (self.settings.reframe_aspect_if_active(), resolution, sharp_eye) {
-            // A lens frame: the eye as recorded (or its 8K copy), named as such.
+            // Lens Space through the camera's lens: the eye as recorded (or
+            // its 8K copy), named as such.
             _ if lens_frame => {
                 // The clip's own eye: its native frame is that eye, or two side by side.
                 let (ew, eh) = self.native_sbs_dims()
                     .map(|(w, h)| (if single_eye { w } else { w / 2 }, h)).unwrap_or((0, 0));
-                let (w, h) = self.export_opts.lens_frame_eye_dims(ew, eh, sharp_eye.is_some());
                 // A stabilized frame carries the stabilizer's margin; a
                 // reduced copy keeps its size.
-                let (w, h) = if self.settings.stabilize && (w, h) == (ew, eh) {
-                    vr180_pipeline::lens_frame::stabilized_dims(w, h)
-                } else {
-                    (w, h)
-                };
-                format!("{} {} × {h}", tr("Lens frame"), if single_eye { w } else { w * 2 })
+                let (w, h) = self.export_opts.lens_frame_out_dims(ew, eh, sharp_eye.is_some(), self.settings.stabilize);
+                format!("{} {} × {h}", tr("Lens Space"), if single_eye { w } else { w * 2 })
             }
             (Some(aspect), _, _) => self.export_opts.reframe_size.frame_label(aspect, single_eye),
             // Native = the clip's own size (a 12K BRAW: 12288 × 6144).
@@ -5622,10 +5686,8 @@ impl App {
             let sharp_dims = self.clip.as_ref()
                 .and_then(|c| c.sharp_eye(self.settings.insv_view))
                 .map(|side| (if single_eye { side } else { side * 2 }, side));
-            // A lens frame stands in for the VR180 export of a clip that
-            // has a lens, and for nothing else.
-            let lens_frame_offered = self.clip.as_ref().is_some_and(|c| lens_frame_possible(c.source_kind, &self.settings))
-                && matches!(self.settings.fisheye_output_mode, crate::decoder::FisheyeOutputMode::HalfEquirect);
+            // The Lens Space view: a lens frame, or the equidistant disc.
+            let lens_space = self.lens_space_out();
             egui::Window::new(tr("Export format"))
                 .collapsible(false)
                 .resizable(false)
@@ -5636,7 +5698,7 @@ impl App {
                     Self::export_options_ui(ui, &mut self.export_opts, "export",
                         self.settings.reframe_aspect_if_active(),
                         (self.settings.reframe_hfov_deg, self.settings.reframe_defish),
-                        clip_fps, is_still, native_dims, sharp_dims, lens_frame_offered,
+                        clip_fps, is_still, native_dims, sharp_dims, lens_space,
                         self.settings.stabilize, single_eye);
                 });
             self.show_export_settings = open;
@@ -5657,10 +5719,10 @@ impl App {
         is_still: bool,
         native_dims: Option<(u32, u32)>,
         sharp_dims: Option<(u32, u32)>,
-        // The loaded clip can be exported as a lens frame (a clip with a
-        // lens, in the VR180 view): the choice is shown, and applies when
-        // ticked.
-        lens_frame_offered: bool,
+        // The loaded clip is in the Lens Space view, and which lens that
+        // writes for it: the camera's (a lens frame) or the equidistant
+        // disc. `None` in every other view.
+        lens_space: Option<crate::decoder::LensSpaceLens>,
         // The loaded clip is stabilized: its lens frame then carries the
         // stabilizer's margin, and the sizes shown include it.
         lens_frame_stabilized: bool,
@@ -5710,11 +5772,9 @@ impl App {
             let sharp_label: Option<String> = sharp_dims.filter(|_| !is_still)
                 .map(|(w, h)| format!("{w} × {h} ({})", tr("native sharpness")));
             let cropped = sharp_label.is_some();
-            // A lens frame instead of the 180° canvas (see `ExportOptions::lens_frame`).
-            if lens_frame_offered {
-                ui.checkbox(&mut opts.lens_frame, tr(LENS_FRAME_LABEL)).on_hover_text(tr(LENS_FRAME_HOVER));
-            }
-            let lens_frame = lens_frame_offered && opts.lens_frame;
+            // Lens Space through the camera's lens: a lens frame, the
+            // recording's own frame instead of a canvas.
+            let lens_frame = lens_space == Some(crate::decoder::LensSpaceLens::Camera);
             // A stabilized lens frame is the recorded frame plus the
             // stabilizer's margin (`vr180_pipeline::lens_frame`): the size
             // it is written at.
@@ -5764,10 +5824,6 @@ impl App {
             if lens_frame {
                 ui.label(RichText::new(tr(LENS_FRAME_NOTE)).small().color(Color32::GRAY));
                 ui.label(RichText::new(tr(LENS_FRAME_STAB_NOTE)).small().color(Color32::GRAY));
-                // Only a Crop clip has a crop mask.
-                if cropped {
-                    ui.label(RichText::new(tr(LENS_FRAME_MASK_NOTE)).small().color(Color32::GRAY));
-                }
             } else if sharp_label.is_some() {
                 ui.label(RichText::new(tr("Native sharpness: the 180° canvas at the pixel density of the Crop frame's centre, so nothing recorded is scaled down. The clip's own size puts the same frame on a smaller canvas."))
                     .small().color(Color32::GRAY));
@@ -5944,7 +6000,7 @@ impl App {
             }
         }
 
-        if reframe.is_none() && lens_frame_offered && opts.lens_frame {
+        if reframe.is_none() && lens_space == Some(crate::decoder::LensSpaceLens::Camera) {
             // A lens frame is not a half-equirect: it carries its own
             // metadata, and the VR180 choice below is for the other clips.
             ui.add_space(10.0);
@@ -5979,6 +6035,10 @@ impl App {
              only one can be active per file. Re-run the export \
              with the other target if you need a second copy."
         )).small().color(Color32::GRAY));
+        // The equidistant disc of the Lens Space view is no half-equirect.
+        if lens_space == Some(crate::decoder::LensSpaceLens::Equidistant) {
+            ui.label(RichText::new(tr(LENS_SPACE_DISC_METADATA_NOTE)).small().color(Color32::GRAY));
+        }
         }
 
         // The BeyondVR eye-scale hack is a half-equirect (VR180) fix-up of
@@ -7133,8 +7193,23 @@ impl App {
         // Two eyes side by side, or the one eye of a single-eye clip.
         let eyes = if clip.single_eye() { 1 } else { 2 };
         Some(match self.settings.fisheye_output_mode {
-            crate::decoder::FisheyeOutputMode::Fisheye => { let side = ew.min(eh); (side * eyes, side) }
+            // A lens frame is the recorded frame; the disc sits in a square.
+            crate::decoder::FisheyeOutputMode::Fisheye if !self.settings.lens_frame_view(kind) => {
+                let side = ew.min(eh);
+                (side * eyes, side)
+            }
             _ => (ew * eyes, eh),
+        })
+    }
+
+    /// What the Lens Space view of the loaded clip writes — the camera's
+    /// lens (a lens frame) or the equidistant disc, which is also what a
+    /// clip without a lens record gets; `None` in every other view.
+    fn lens_space_out(&self) -> Option<crate::decoder::LensSpaceLens> {
+        use crate::decoder::{FisheyeOutputMode, LensSpaceLens};
+        let clip = self.clip.as_ref()?;
+        (self.settings.fisheye_output_mode == FisheyeOutputMode::Fisheye).then(|| {
+            if self.settings.lens_frame_view(clip.source_kind) { LensSpaceLens::Camera } else { LensSpaceLens::Equidistant }
         })
     }
 
@@ -7151,6 +7226,10 @@ impl App {
         };
         // Same rule as `build_export_cfg`.
         let sharp_eye = clip.sharp_eye(self.settings.insv_view);
+        // A lens frame: the frame the export writes, its margin included.
+        if self.settings.lens_frame_view(kind) {
+            return self.export_opts.lens_frame_out_dims(ew, eh, sharp_eye.is_some(), self.settings.stabilize);
+        }
         match (self.export_opts.resolution_for(sharp_eye.is_some()), sharp_eye) {
             (ExportResolution::Sharp, Some(side)) => { ew = side; eh = side; }
             (ExportResolution::R8k | ExportResolution::Sharp, _) => { ew = 4096; eh = 4096; }
@@ -8301,6 +8380,36 @@ impl App {
         }
     }
 
+    /// The Lens Space part of the Output panel: the lens the picture of a
+    /// clip of `kind` is written through — the camera's own (a lens frame)
+    /// or an ideal equidistant one, the disc (185° for the cube map of a
+    /// GoPro `.360`, 195° for a fisheye) — and what each is for. A clip with
+    /// no lens record (a still, a file that is already VR180) has no choice
+    /// to make: it is the disc. Nothing in the other views.
+    fn lens_space_ui(ui: &mut egui::Ui, s: &mut crate::decoder::Settings, kind: Option<vr180_pipeline::SourceKind>) {
+        use crate::decoder::LensSpaceLens;
+        if !matches!(s.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Fisheye) {
+            return;
+        }
+        let lens_possible = kind.is_some_and(|k| crate::decoder::lens_frame_possible(k, s));
+        if lens_possible {
+            ui.horizontal(|ui| {
+                ui.label(tr("Lens"));
+                ui.selectable_value(&mut s.lens_space, LensSpaceLens::Camera, tr(LensSpaceLens::Camera.as_str()))
+                    .on_hover_text(tr(LENS_SPACE_CAMERA_HOVER));
+                ui.selectable_value(&mut s.lens_space, LensSpaceLens::Equidistant, tr(LensSpaceLens::Equidistant.as_str()))
+                    .on_hover_text(tr(LENS_SPACE_EQUIDISTANT_HOVER));
+            });
+        }
+        let note = if lens_possible && s.lens_space == LensSpaceLens::Camera {
+            tr(LENS_SPACE_CAMERA_NOTE).to_string()
+        } else {
+            let fov = if kind.is_some_and(|k| k.is_eac()) { "185°" } else { "195°" };
+            format!("{fov} {}", tr(LENS_SPACE_DISC_NOTE))
+        };
+        ui.label(RichText::new(note).small().color(Color32::GRAY));
+    }
+
     /// Output panel for fisheye sources — projection target + L↔R swap.
     fn draw_fisheye_output_panel(&mut self, ui: &mut egui::Ui) {
         // Dual-fisheye sources (and the X6 still): 195° lens, eye swap +
@@ -8321,6 +8430,7 @@ impl App {
             .map_or(false, |g| g.cropped);
         // A single-eye clip: the same three outputs, one eye wide.
         let single_eye = self.clip_single_eye();
+        let kind = self.clip.as_ref().map(|c| c.source_kind);
         let s = &mut self.settings;
 
         ui.horizontal(|ui| {
@@ -8369,13 +8479,7 @@ impl App {
             });
         }
 
-        // Show the actual output FOV for the current source — the GoPro
-        // Max `.360` captures 185°, the DJI/OSV lens 195°.
-        if matches!(s.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Fisheye) {
-            let fov = if is_osv { "195°" } else { "185°" };
-            ui.label(RichText::new(format!("{fov} equidistant — source lens FOV"))
-                .small().color(Color32::GRAY));
-        }
+        Self::lens_space_ui(ui, s, kind);
 
         if is_osv {
             ui.add_space(4.0);

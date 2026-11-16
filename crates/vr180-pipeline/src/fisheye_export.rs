@@ -157,10 +157,14 @@ pub struct FisheyeExportConfig {
     /// Ignored unless `encoder` is a ProRes backend.
     pub prores_profile: i32,
     /// Inject APMP (Apple Projected Media Profile) metadata for
-    /// Vision Pro VR180 playback. Default true for fisheye SBS.
+    /// Vision Pro VR180 playback. Default true for fisheye SBS. A fisheye
+    /// disc is no VR180 frame: with this on its file states the disc's own
+    /// lens instead (`resolve_disc_lens`). A lens frame states its lens
+    /// whatever this says.
     pub inject_apmp: bool,
     /// Inject Spatial Media V2 metadata (st3d + sv3d) for YouTube
-    /// VR180 playback. Default true for fisheye SBS.
+    /// VR180 playback. Default true for fisheye SBS. Half-equirect exports
+    /// only: the format has no fisheye form, so a disc gets nothing.
     pub inject_youtube_vr180: bool,
     /// Stabilization on/off. Calibration / preset come from below.
     pub stabilize: bool,
@@ -197,9 +201,9 @@ pub struct FisheyeExportConfig {
     /// Output projection. `HalfEquirect` = standard VR180 (default).
     /// `Fisheye` = raw fisheye pass-through SBS, no equirect projection.
     pub projection: FisheyeExportProjection,
-    /// `Fisheye` projection only: write a lens frame instead of the
-    /// equidistant disc ([`LensFrameOut`]). The VR180 metadata flags are
-    /// then ignored: the file gets the lens's own.
+    /// `Fisheye` projection only (the GUI's Lens Space view): write a lens
+    /// frame instead of the equidistant disc ([`LensFrameOut`]). The VR180
+    /// metadata flags are then ignored: the file gets the lens's own.
     pub lens_frame: LensFrameOut,
     /// `Some` → write an Apple spatial video (MV-HEVC `.mov`) instead of a
     /// side-by-side frame. Needs a rectilinear reframed `projection` and
@@ -1227,11 +1231,56 @@ pub fn export_fisheye(
     }
     prepare_spatial(&mut cfg)?;
     // A lens frame: fix its lens before the first frame, and state it in the
-    // file once the file is whole (after the audio, which rewrites it).
-    let lens_frame = resolve_lens_frame(&mut cfg)?;
+    // file once the file is whole (after the audio, which rewrites it). The
+    // disc states its own lens the same way.
+    let lens_frame = match resolve_lens_frame(&mut cfg)? {
+        Some(lens) => Some(lens),
+        None => {
+            let stereo = !single_eye_source(&cfg);
+            resolve_disc_lens(&mut cfg, FISHEYE_OUT_FULL_FOV_DEG as f64 * 0.5, stereo)
+        }
+    };
     let out = cfg.output_path.clone();
     export_fisheye_inner(pipeline, cfg, progress_cb, cancel)?;
     state_lens_frame(&out, lens_frame)
+}
+
+/// The metadata of a fisheye-disc export ([`FisheyeExportProjection::Fisheye`]
+/// without a lens frame). A disc is no half-equirect, so the VR180 flags
+/// never tag it as one. Where the Apple one was asked for, the file states
+/// the disc's own lens instead — a fisheye that spreads `half_fov_deg` evenly
+/// over half the frame's side, in the lens family the profile holds
+/// ([`crate::lens_frame::LensFrame::equidistant`]) — out to the disc's edge,
+/// and an Apple Vision Pro shows every pixel of the disc at its own angle.
+/// Returns that lens and whether the frame holds two views (`stereo`); `None`
+/// for every other export, which this leaves as it is.
+fn resolve_disc_lens(cfg: &mut FisheyeExportConfig, half_fov_deg: f64, stereo: bool) -> Option<(crate::lens_frame::LensFrame, bool)> {
+    if cfg.projection != FisheyeExportProjection::Fisheye || cfg.lens_frame != LensFrameOut::Off {
+        return None;
+    }
+    let apple = cfg.inject_apmp;
+    cfg.inject_apmp = false;
+    cfg.inject_youtube_vr180 = false;
+    if !apple {
+        return None;
+    }
+    let Some(frame) = disc_lens(cfg.eye_w, cfg.eye_h, half_fov_deg) else {
+        tracing::warn!("fisheye_export: no lens can be stated for a disc of {}x{} — the file gets no projection metadata", cfg.eye_w, cfg.eye_h);
+        return None;
+    };
+    tracing::info!(
+        "fisheye_export: equidistant disc of {half_fov_deg}° to its edge over {}x{} — its lens goes in the file for Apple Vision Pro",
+        cfg.eye_w, cfg.eye_h,
+    );
+    Some((frame, stereo))
+}
+
+/// The lens a fisheye disc of `half_fov_deg` in a frame of `eye_w × eye_h`
+/// states ([`resolve_disc_lens`]): the disc's own equidistant law in the
+/// profile's lens family, stated as far as the disc's edge.
+fn disc_lens(eye_w: u32, eye_h: u32, half_fov_deg: f64) -> Option<crate::lens_frame::LensFrame> {
+    let frame = crate::lens_frame::LensFrame::equidistant(eye_w, eye_h, half_fov_deg)?;
+    Some(crate::lens_frame::LensFrame { picture_deg: half_fov_deg as f32, ..frame })
 }
 
 /// State the lens of a finished lens-frame export in its file (`lens`: the
@@ -1301,7 +1350,7 @@ fn size_lens_frame(
         crate::lens_frame::LensFrame { picture_deg: reach_deg + turned + LENS_FRAME_PICTURE_SLACK_DEG, ..frame }
     } else {
         let m = frame.margin_px();
-        let grown = frame.grown(m, m);
+        let grown = frame.with_stabilizer_margin();
         let held = match reduced_to {
             Some((w, h)) => grown.fitted(w, h),
             None => grown,
@@ -2247,8 +2296,12 @@ pub fn export_eac(
     }
     prepare_spatial(&mut cfg)?;
     // A lens frame: as in `export_fisheye`, its lens is fixed before the
-    // first frame and stated in the file once the file is whole.
-    let lens_frame = resolve_eac_lens_frame(&mut cfg)?;
+    // first frame and stated in the file once the file is whole; the disc
+    // states its own.
+    let lens_frame = match resolve_eac_lens_frame(&mut cfg)? {
+        Some(lens) => Some(lens),
+        None => resolve_disc_lens(&mut cfg, EAC_LENS_FRAME_HALF_FOV_DEG, true),
+    };
     let out = cfg.output_path.clone();
     export_eac_inner(pipeline, cfg, per_eye, progress_cb, cancel)?;
     state_lens_frame(&out, lens_frame)
@@ -4716,24 +4769,7 @@ pub(crate) fn resolve_calib_pair(
         // A lens frame: the same kernels write the lens's image over the
         // whole frame instead of the disc.
         match cfg.lens_frame {
-            LensFrameOut::Resolved(frame) => {
-                // The crop mask of a lens frame is measured from the frame's
-                // own edge, not from the recorded picture's: a stabilized
-                // frame is larger than the recording, and the window may be
-                // as large as the frame (the picture's own border, which
-                // moves, then shows inside it). Only a source whose frame is
-                // a crop of the image circle has that mask, as in every
-                // other output.
-                let cropped = l.frame_mask > 0.5 || r.frame_mask > 0.5;
-                let (l, r) = match cfg.crop_mask.window(frame.half_angles()).filter(|_| cropped) {
-                    Some((half, round, feather)) =>
-                        (l.with_view_mask(half, round, feather), r.with_view_mask(half, round, feather)),
-                    None => (l, r),
-                };
-                // A lens frame shows the source frame's border, whole image
-                // circle or not: black past it, never the repeated rim.
-                (l.with_frame_edge().with_lens_frame(&frame), r.with_frame_edge().with_lens_frame(&frame))
-            }
+            LensFrameOut::Resolved(frame) => lens_frame_calib_pair(l, r, &frame, cfg.crop_mask),
             _ => (l, r),
         }
     } else if let Some((hfov_deg, defish)) = cfg.projection.reframe() {
@@ -4746,6 +4782,58 @@ pub(crate) fn resolve_calib_pair(
     } else {
         (calib_l, calib_r)
     }
+}
+
+/// The calibrations that write the lens frame `frame`: `l` and `r` as the
+/// fisheye output resolves them for its disc, drawing the image of the
+/// frame's lens over the whole frame instead. The export and the preview of
+/// a lens frame both come through here.
+///
+/// The crop mask of a lens frame is measured from the frame's own edge, not
+/// from the recorded picture's: a stabilized frame is larger than the
+/// recording, and the window may be as large as the frame (the picture's own
+/// border, which moves, then shows inside it). Only a source whose frame is
+/// a crop of the image circle has that mask, as in every other output.
+pub fn lens_frame_calib_pair(
+    l: FisheyeCalib,
+    r: FisheyeCalib,
+    frame: &crate::lens_frame::LensFrame,
+    crop_mask: crate::gpu::CropMask,
+) -> (FisheyeCalib, FisheyeCalib) {
+    let cropped = l.frame_mask > 0.5 || r.frame_mask > 0.5;
+    let (l, r) = match crop_mask.window(frame.half_angles()).filter(|_| cropped) {
+        Some((half, round, feather)) =>
+            (l.with_view_mask(half, round, feather), r.with_view_mask(half, round, feather)),
+        None => (l, r),
+    };
+    // A lens frame shows the source frame's border, whole image circle or
+    // not: black past it, never the repeated rim.
+    (l.with_frame_edge().with_lens_frame(frame), r.with_frame_edge().with_lens_frame(frame))
+}
+
+/// The lens frame of a source seen through `sources` (one calibration per
+/// eye, as the fisheye output resolves them, at whatever size they were
+/// resolved for), at the source's own size: the frame an export of the clip
+/// is written in — with the stabilizer's margin when `stabilized`. A preview
+/// draws it scaled ([`LensFrame::scaled_to`](crate::lens_frame::LensFrame::scaled_to),
+/// or `fitted` to an export's exact size). `None` where an export has no
+/// lens frame to write (a source without a lens, a lens that does not hold
+/// its frame).
+pub fn source_lens_frame(sources: &[&FisheyeCalib], stabilized: bool) -> Option<crate::lens_frame::LensFrame> {
+    let first = sources.first()?;
+    let frame = crate::lens_frame::LensFrame::from_sources(
+        sources, first.src_w.round() as u32, first.src_h.round() as u32)?;
+    let frame = if stabilized { frame.with_stabilizer_margin() } else { frame };
+    frame.reaches_its_corner().then_some(frame)
+}
+
+/// [`source_lens_frame`] for a `.360` clip, whose lens frame is a fisheye of
+/// [`EAC_LENS_FRAME_HALF_FOV_DEG`]: in a square of `side` pixels, which a
+/// stabilized frame keeps (the wider field at a smaller scale).
+pub fn eac_lens_frame(stabilized: bool, side: u32) -> Option<crate::lens_frame::LensFrame> {
+    let frame = crate::lens_frame::LensFrame::equidistant(side, side, EAC_LENS_FRAME_HALF_FOV_DEG)?;
+    let frame = if stabilized { frame.with_stabilizer_margin().fitted(side, side) } else { frame };
+    frame.reaches_its_corner().then_some(frame)
 }
 
 // (CPU compose test removed — GPU compose has no per-byte invariants
@@ -5086,6 +5174,108 @@ mod lens_frame_tests {
         let bent = LensFrame { k1: -3.0, k2: 0.0, ..frame() };
         assert!(size_lens_frame(bent, false, &ViewAdjust::IDENTITY, None, 92.25).is_err());
         assert!(size_lens_frame(bent, true, &ViewAdjust::IDENTITY, None, 92.25).is_err());
+    }
+
+    /// A fisheye source's two lenses (a DJI Osmo 360's record), 3840² each.
+    fn fisheye_lenses() -> (crate::gpu::FisheyeCalib, crate::gpu::FisheyeCalib) {
+        let lens = |fx: f32, fy: f32, cx: f32, cy: f32, k: [f32; 4], k5: f32| {
+            let mut c = crate::gpu::FisheyeCalib::new_pure_kb(fx, fy, cx, cy, k, 3840.0, 3840.0);
+            c.k5 = k5;
+            c
+        };
+        (lens(1047.42, 1047.42, 1916.4, 1915.8, [0.067321, -0.014563, 0.013371, -0.008182], 0.001192),
+         lens(1043.10, 1043.10, 1914.2, 1923.7, [0.073225, -0.021113, 0.016638, -0.008891], 0.001242))
+    }
+
+    /// What a preview draws is the frame the export writes: the source's
+    /// own frame through the lens fitted to it, the stabilizer's margin with
+    /// it, whatever size the calibrations were resolved for.
+    #[test]
+    fn a_preview_draws_the_frame_the_export_writes() {
+        let (l, r) = fisheye_lenses();
+        let fitted = LensFrame::from_sources(&[&l, &r], 3840, 3840).expect("a lens frame");
+        // As the export sizes it (`resolve_lens_frame` hands it the same fit).
+        let export = size_lens_frame(fitted, true, &ViewAdjust::IDENTITY, None, 104.0).unwrap();
+        let shown = super::source_lens_frame(&[&l, &r], true).expect("a lens frame");
+        assert_eq!((shown.width, shown.height, shown.focal, shown.xi, shown.k1, shown.k2),
+                   (export.width, export.height, export.focal, export.xi, export.k1, export.k2));
+        assert_eq!((shown.width, shown.height), (4224, 4224));
+        assert_eq!(super::source_lens_frame(&[&l, &r], false), Some(fitted));
+        // Scaled for the screen it covers the same field.
+        let small = shown.scaled_to(1024);
+        assert_eq!((small.width, small.height), (1024, 1024));
+        let (a, b) = (shown.half_angles(), small.half_angles());
+        assert!((a[0] - b[0]).abs() < 2e-4 && (a[1] - b[1]).abs() < 2e-4, "{a:?} against {b:?}");
+        // Calibrations resolved for a smaller decode give the same lens.
+        let half = |c: &crate::gpu::FisheyeCalib| {
+            let mut h = crate::gpu::FisheyeCalib::new_pure_kb(c.fx * 0.5, c.fy * 0.5, c.cx * 0.5, c.cy * 0.5, c.k, 1920.0, 1920.0);
+            h.k5 = c.k5;
+            h
+        };
+        let from_half = super::source_lens_frame(&[&half(&l), &half(&r)], true).expect("a lens frame").scaled_to(1024);
+        assert!((from_half.focal / small.focal - 1.0).abs() < 1e-3 && (from_half.xi - small.xi).abs() < 1e-3,
+            "{from_half:?} against {small:?}");
+        // One eye alone, and a source that is no lens image.
+        assert!(super::source_lens_frame(&[&l], false).is_some());
+        assert_eq!(super::source_lens_frame(&[&l.with_equirect_input(), &r.with_equirect_input()], false), None);
+        assert_eq!(super::source_lens_frame(&[], false), None);
+
+        // A `.360` clip: the square the preview draws holds the field of the
+        // export's frame, margin included (the margin is a whole number of
+        // pixel pairs at either size: a fifth of a degree at this one).
+        let export = size_lens_frame(frame(), true, &ViewAdjust::IDENTITY, None, 92.25).unwrap();
+        let shown = super::eac_lens_frame(true, 1024).expect("a lens frame");
+        assert_eq!((shown.width, shown.height), (1024, 1024));
+        let (a, b) = (export.half_angles(), shown.half_angles());
+        assert!((a[0] - b[0]).abs() < 5e-3 && (a[1] - b[1]).abs() < 5e-3, "{a:?} against {b:?}");
+        let at_size = super::eac_lens_frame(true, export.width).expect("a lens frame").half_angles();
+        assert!((a[0] - at_size[0]).abs() < 5e-4, "{a:?} against {at_size:?}");
+        let plain = super::eac_lens_frame(false, 1024).expect("a lens frame");
+        assert!((plain.half_angles()[0] - frame().half_angles()[0]).abs() < 1e-4);
+        assert!(shown.half_angles()[0] > plain.half_angles()[0]);
+    }
+
+    /// The crop mask of a lens frame is taken from the frame's own edge, by
+    /// the one function the export and the preview share; a source that is
+    /// no crop has none.
+    #[test]
+    fn a_lens_frame_takes_its_mask_from_its_own_edge() {
+        let (l, r) = fisheye_lenses();
+        let frame = super::source_lens_frame(&[&l, &r], false).expect("a lens frame");
+        let mask = crate::gpu::CropMask { amount: 0.2, feather: 0.1, round: 0.5 };
+        // A whole-circle source: the lens goes in, no mask.
+        let (wl, wr) = super::lens_frame_calib_pair(l, r, &frame, mask);
+        assert_eq!(wl.out_lens, [frame.xi, frame.focal, frame.k1, frame.k2]);
+        assert_eq!((wl.out_lens, wl.out_rim), (wr.out_lens, wr.out_rim));
+        assert_eq!((wl.mask_half, wr.mask_half), (l.mask_half, r.mask_half));
+        // A Crop source: the window is measured from the frame's half angles.
+        let (cl, cr) = crate::gpu::apply_frame_crop(l, r, crate::gpu::CropMask::default());
+        let (ml, mr) = super::lens_frame_calib_pair(cl, cr, &frame, mask);
+        let (half, round, feather) = mask.window(frame.half_angles()).expect("a window");
+        let want = cl.with_view_mask(half, round, feather);
+        assert_eq!((ml.mask_half, ml.mask_round, ml.mask_feather), (want.mask_half, want.mask_round, want.mask_feather));
+        assert!(ml.mask_half[0] > 0.0 && ml.mask_half == mr.mask_half);
+        assert!(ml.frame_mask > 0.5 && ml.out_lens[1] > 0.0);
+    }
+
+    /// The equidistant disc states its own lens: within a fraction of a
+    /// pixel of the disc the kernel draws, and no further than its edge.
+    #[test]
+    fn a_disc_states_its_own_lens() {
+        for (side, half_deg) in [(3840u32, 97.5f64), (3936, super::EAC_LENS_FRAME_HALF_FOV_DEG), (1024, 97.5)] {
+            let lens = super::disc_lens(side, side, half_deg).expect("a lens");
+            assert_eq!((lens.width, lens.height), (side, side));
+            assert_eq!(lens.apmp().limit_deg, (half_deg + 0.5).ceil() as f32);
+            // The disc: radius = half the side · θ / half-FOV.
+            let px_per_rad = 0.5 * side as f64 / half_deg.to_radians();
+            let worst = (1..=390).map(|i| {
+                let theta = (i as f64 * 0.25).min(half_deg).to_radians();
+                let p = lens.project([theta.sin(), 0.0, theta.cos()]);
+                (p[0] - 0.5 * side as f64 - px_per_rad * theta).abs()
+            }).fold(0.0_f64, f64::max);
+            assert!(worst < 0.35 * side as f64 / 3840.0 + 0.02, "{side} px, {half_deg}°: {worst:.3} px off the disc");
+        }
+        assert!(super::disc_lens(0, 3840, 97.5).is_none());
     }
 }
 

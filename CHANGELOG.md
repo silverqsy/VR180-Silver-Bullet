@@ -28,18 +28,18 @@ sensor recorded, ahead of the tone controls and the LUT.
   and software encoder, ProRes) land within one 10-bit code of it on
   average.
 
-### A lens-frame export for Apple Vision Pro
+### Lens Space: the camera's own lens, for Apple Vision Pro
 
 A VR180 file is a 180° canvas. A fisheye that sees more than that, as the
 lenses of a 360 camera do, loses what lies past the canvas's edge. A Crop
 clip of the Insta360 X6, which covers about 97° or 126°, sits in the middle
 of a canvas that is half to two thirds black, and the canvas has to be far
 larger than the recording to keep its detail: 13120 × 6560 for a recording
-of 9824 × 4912. The Format window now has **Lens frame for Apple Vision
-Pro**: each eye is written the way the camera recorded it, in a lens
-projection, and the file states that lens (Apple Projected Media Profile,
-parametric immersive projection), so the headset shows every pixel at its
-own angle.
+of 9824 × 4912. The **Fisheye** output format is now **Lens Space**, and
+writes each eye the way the camera recorded it: in the camera lens's own
+projection, in the recording's own frame, with that lens stated in the file
+(Apple Projected Media Profile, parametric immersive projection), so the
+headset shows every pixel at its own angle.
 
 - **Every video source**: Insta360 X6 in all of its recording modes, DJI
   Osmo 360, QooCam 3 Ultra, Blackmagic RAW, GoPro `.360`, and a
@@ -76,18 +76,31 @@ own angle.
   (the larger one, on a stabilized clip): its window can be as wide as the
   frame, and gives a steady edge once it is small enough to stay inside
   the moving picture. Camera lock suits a camera that stays put.
+- **The preview is the export.** In Lens Space the preview draws the
+  frame that is written: its shape, the stabilizer's margin, the crop mask
+  where the export has it.
 - **Apple Vision Pro only** (visionOS 26 or later). No other headset and
-  not YouTube read this form, so the VR180 export stays the default and is
-  unchanged: export a clip both ways and you get `…_SBS` and `…_Lens`.
-  The preview keeps showing the VR180 view, and the Fisheye view still
-  exports its own disc.
+  not YouTube read this form, so VR180 stays the default format and is
+  unchanged: export a clip in both and you get `…_SBS` and `…_Lens`.
+- **The equidistant disc is still there.** Lens Space has a **Lens**
+  choice per clip: **Camera lens** (the default, everything above) or
+  **Equidistant**, the 195° disc in a square frame (185° for a GoPro
+  `.360`) that players and tools for fisheye video expect, as the Fisheye
+  format wrote it. With the Apple Vision Pro metadata on, a disc now
+  states its own lens too: it used to be tagged as a half-equirect, which
+  the headset showed with the wrong geometry. YouTube's metadata has no
+  fisheye form, so nothing is written for it on a disc. A clip whose
+  settings were saved in the Fisheye format opens with the camera's lens:
+  pick Equidistant to get the disc back.
 - **Checked**: for every source kind, the system's own playback mesh,
   built from the lens in the file, lands within a thousandth of a pixel of
   what the app rendered, out to 113° off the axis; the picture agrees with
   the VR180 export of the same frames, re-projected independently, to 0.2
   of a pixel; the lens boxes are byte for byte what Apple's writer
-  produces. Every existing export is frame-identical. Crop clips have been
-  watched on the headset; a frame wider than 180° has not yet.
+  produces. Every existing export is frame-identical, and so is every
+  preview outside Lens Space; a Lens Space preview lies on the exported
+  frame, margin and mask included. Crop clips have been watched on the
+  headset; a frame wider than 180° has not yet.
 
 ### macOS: the preview can match QuickTime
 

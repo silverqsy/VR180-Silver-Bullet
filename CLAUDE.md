@@ -2371,17 +2371,102 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      conversion is 8-bit in, 8-bit out with egui's dither, like the image
      path it replaces.
 
-33. **Lens-frame export (2026-11-14 for Crop clips, 2026-11-15 for every
-    source; Mac; UNRELEASED, Windows not built).** A clip's VR180 export can
-    be written as a LENS FRAME instead of a half-equirect: each eye through a
-    lens, the frame the recording's own, the lens stated in the file (APMP,
-    projection `prim` with a lens collection). A Crop clip then fills its
-    frame instead of sitting in a mostly black 180° canvas; a clip that holds
-    the lens's whole view keeps what lies past 180° (the fisheyes of the 360
-    cameras see 200° and more). Format window ▸ **Lens frame for Apple Vision
-    Pro**; `ExportOptions::lens_frame` (one choice for the list, applied
-    where `lens_frame_for` says: a video with a lens, `lens_frame_possible`,
-    in the VR180 view). Default off; the half-equirect export is untouched.
+33. **Lens Space view and its lens-frame export (2026-11-14 for Crop
+    clips, 2026-11-15 for every source and as a view of its own; Mac;
+    UNRELEASED, Windows not built).** A clip can be written as a LENS FRAME
+    instead of a half-equirect: each eye through a lens, the frame the
+    recording's own, the lens stated in the file (APMP, projection `prim`
+    with a lens collection). A Crop clip then fills its frame instead of
+    sitting in a mostly black 180° canvas; a clip that holds the lens's
+    whole view keeps what lies past 180° (the fisheyes of the 360 cameras
+    see 200° and more). Output ▸ Format **Lens Space**, lens **Camera
+    lens**: see the next block. The half-equirect export is untouched.
+   - **Lens Space is a view (2026-11-15, the user's call: "这个 lens 的 APMP
+     导出似乎应该取代鱼眼导出", then "要么整个换个名字吧")**. The lens frame
+     began as a tick box in the Format window of the VR180 view, next to a
+     Fisheye view that wrote its own disc: two fisheye outputs in two
+     places, and a preview (VR180) that was not the export. Now the former
+     Fisheye view IS the lens output, under the name the immersive tools
+     use for footage kept in the camera's own geometry:
+     - `FisheyeOutputMode::Fisheye` shows as **Lens Space (fisheye SBS)**
+       (the variant keeps its name: saved settings hold it). Per clip, in
+       it, `Settings::lens_space: LensSpaceLens` picks the lens the picture
+       is written through: `Camera` (default; a lens frame) or
+       `Equidistant` (the old disc: 195° in a square, 185° for a `.360`,
+       what players and tools for fisheye video expect).
+       `Settings::lens_frame_view(kind)` = that view, that lens, a clip
+       with a lens (`decoder::lens_frame_possible`); everything asks it —
+       `build_export_cfg`, the file name (`_Lens`), the export bar, the
+       Format window (`App::lens_space_out`), the snapshot size
+       (`ExportOptions::lens_frame_out_dims`), the preview.
+       `ExportOptions::lens_frame` and its tick box are gone; the VR180
+       view always exports VR180. A clip without a lens record (a still, a
+       file that is already VR180) has no lens choice and gets the disc.
+       Settings saved in the Fisheye view before this read as the camera's
+       lens: such a template now exports lens frames (intended).
+     - **The preview draws the export's frame.** `decoder::
+       resolve_fisheye_view` (the three fisheye workers and the zoom /
+       snapshot still call it in place of `resolve_fisheye_calib_pair`)
+       builds the clip's lens frame with the export's own steps —
+       `fisheye_export::source_lens_frame` (`LensFrame::from_sources` at
+       the source's size, `with_stabilizer_margin` when stabilized,
+       refused where the export refuses) and `lens_frame_calib_pair` (the
+       mask from the frame's own edge, `with_frame_edge`,
+       `with_lens_frame`; `resolve_calib_pair` calls the same function) —
+       scaled to the working size (`LensFrame::scaled_to`, sides in pairs
+       of pixels) or `fitted` to the export's exact size for a snapshot
+       (`LensViewSize`). It returns the frame's size with the calibrations
+       (`FisheyeView::lens_dims`), which `view_out_dims` hands the
+       fisheye-output projection in place of the disc's square. A `.360`:
+       `resolve_eac_lens_pair(s, geoc, out_side)` attaches
+       `fisheye_export::eac_lens_frame` (a stabilized frame keeps the
+       square and holds the wider field). No projection function changed:
+       all of them already pick the lens-frame kernel by `out_lens`. So
+       the crop mask is what-you-see (the Format window's old note about
+       it is gone), the stabilizer's margin shows, and a Crop clip fills
+       the preview. A lens no frame can be made of previews as the disc;
+       the export says why.
+     - **The disc states its own lens.** A fisheye disc is no
+       half-equirect, yet with the Vision Pro metadata on it used to be
+       tagged as one (`ProjectionKind` half-equirectangular). Now
+       `export_fisheye` / `export_eac` call `resolve_disc_lens` for a
+       `Fisheye` export without a lens frame: both VR180 flags are cleared
+       (YouTube's metadata has no fisheye form: nothing is written for
+       it), and where the Apple one was asked for the file states the
+       disc's equidistant law in the profile's lens family
+       (`LensFrame::equidistant` over the square, `picture_deg` = the
+       disc's half field: stated to 98°, 93° for a `.360`; within 0.35 px
+       of the disc at 3840). The disc's pixels are what they were.
+     - Windows: `run_fisheye_zerocopy` got the same three substitutions as
+       the macOS zero-copy worker (`resolve_fisheye_view` twice,
+       `view_out_dims` once) and `run_eac_zerocopy` the third argument of
+       `resolve_eac_lens_pair`, by text, uncompiled. No gate added or
+       moved.
+     - **Verified, Lens Space (macOS 27.2)**. Exports: the 26 + 8
+       regression cases frame-identical; the 44 lens-frame / twin files of
+       the every-source run frame-identical to what `408f6e2` wrote.
+       Previews, through the refactor branch's headless probe (put into
+       this tree and into a checkout of `408f6e2` for the run, then taken
+       out again): 65 preview lines, 27 zoom stills and 21 `.360` lines
+       identical before and after with the equidistant lens, so nothing
+       outside the camera-lens view moved. The camera-lens view itself:
+       frames of an X6 8K clip, a 10K Crop clip (with a mask), an Osmo 360
+       and a `.360` looked at; the native zoom still
+       against the export of the same frame (X6 8K plain; stabilized, its
+       4224² export scaled to the still; 10K Crop masked + stabilized):
+       every textured cell of a 5 × 5 grid at the same (−0.5, −0.5) px,
+       which is what the VR180 still and its export differ by as well (the
+       still decodes in software; older than this) — no scale or position
+       error from the margin or the mask. Discs with the Apple flag (X6
+       zero-copy, Osmo ProRes, libx265 8-bit, `.360`): parametric
+       immersive to the system, its mesh within 0.0005 px of the written
+       lens, the frame's edge at 97.5° / 92.5°, the picture within 0.15 px
+       of the half-equirect twin in textured cells; a disc with the YouTube
+       flag or none carries no projection box; VR180 exports keep theirs.
+       Tests: pipeline lib 152, GUI 33 and its 3 GPU ones.
+       **Not seen: the GUI itself** (the running app holds the user's
+       clips; the Output panel's and the Format window's texts are tested
+       headless), a disc with its lens on a headset, Windows.
    - **Every source (2026-11-15)**: the X6's full-view modes, DJI Osmo 360,
      QooCam 3 Ultra, Blackmagic RAW, a generic side-by-side file whose
      halves are fisheye images (dewarp on), and GoPro `.360`. Not a
@@ -2458,8 +2543,6 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
        full-view clip no longer reads the Crop clips' choice), never an
        enlargement (the 8K choice of a 3840² eye is 3840², of a 4864² one
        4096²); `.360` takes its cross (`native_eye` in `build_export_cfg`).
-       The crop-mask sentence of the stabilizer note is its own note, shown
-       on Crop clips.
      - Verified (macOS 27.2): the 26 + 8 regression exports frame-identical;
        every earlier lens-frame case states the lens and limit it stated; 27 lens files of all source kinds and
        paths (zero-copy 10 / 8-bit, portable, libx265 10 / 8-bit, ProRes,
@@ -2526,9 +2609,9 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      over the one `apply_frame_crop` set from the recorded picture), so on a
      stabilized frame it can be as wide as the larger frame; the picture's
      moving border then shows inside it (the user's call). Without
-     stabilization the two measures agree to 0.1°. The preview still draws
-     the mask against the recorded picture, about a tenth further in: the
-     Format window's note says so.
+     stabilization the two measures agree to 0.1°. The preview draws the
+     same frame through the same function, so the mask shows where the
+     export has it.
    - **File conventions, measured against the system's player mesh** (not
      what the model's textbook form suggests): the projection offset is
      stored NEGATED; the principal point counts from the view's edges; the
@@ -2548,11 +2631,11 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      P010 kernels). To check there: the spliced WGSL compiles on D3D12 /
      Vulkan, a lens-frame export through NVENC (9824 wide falls to libx265
      as the 13120 canvas does) and through the GPU-resident path.
-   - Not done: no preview of the lens frame (the preview stays VR180), no
-     MV-HEVC lens frame, the Fisheye view still writes its disc (the lens
-     frame replaces the VR180 export only), no crop mask on a full-view
-     clip, no automatic mask
-     sized to the stabilizer's corrections.
+   - Not done: no MV-HEVC lens frame, no crop mask on a full-view clip, no
+     automatic mask sized to the stabilizer's corrections; the sharpen
+     stage still fades towards the top and bottom rows of a lens frame
+     (`SharpenParams::apply_lat_weight` is on for every plan, a
+     half-equirect's weight; the user has been told, their call).
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

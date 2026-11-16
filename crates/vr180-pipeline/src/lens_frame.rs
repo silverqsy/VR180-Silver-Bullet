@@ -95,6 +95,15 @@ fn margin_px(width: u32, height: u32) -> u32 {
     (STABILIZER_MARGIN * width.min(height) as f64 / 2.0).floor() as u32 * 2
 }
 
+/// `width × height` at the scale that puts its longer side on `long_side`
+/// pixels, each side in pairs of pixels: the size a preview draws a frame of
+/// that shape at ([`LensFrame::scaled_to`]).
+pub fn scaled_dims(width: u32, height: u32, long_side: u32) -> (u32, u32) {
+    let scale = long_side as f64 / width.max(height).max(1) as f64;
+    let side = |v: u32| (((v as f64 * scale) / 2.0).round() as u32 * 2).max(2);
+    (side(width), side(height))
+}
+
 impl LensFrame {
     /// The lens frame of `width × height` pixels for a source seen through
     /// `sources` (one calibration per eye, in the source's own pixels): their
@@ -275,6 +284,21 @@ impl LensFrame {
             rim_px: (width.min(height) as f64 / 614.0).round().max(4.0) as f32,
             ..*self
         }
+    }
+
+    /// This frame with the stabilizer's margin at each border
+    /// ([`STABILIZER_MARGIN`]): the frame a stabilized export is written in.
+    pub fn with_stabilizer_margin(&self) -> Self {
+        let m = self.margin_px();
+        self.grown(m, m)
+    }
+
+    /// This frame, all of its field, at the size that puts its longer side
+    /// on `long_side` pixels ([`scaled_dims`]): what a preview draws of the
+    /// frame an export writes.
+    pub fn scaled_to(&self, long_side: u32) -> Self {
+        let (w, h) = scaled_dims(self.width, self.height, long_side);
+        self.fitted(w, h)
     }
 
     /// Angle off the axis, degrees, where this lens family stops (the plane
@@ -971,6 +995,27 @@ mod tests {
                 assert!(seen > 2000, "{seen} pixels with a ray, {dark} past the fold: {f:?}");
             }
         }
+    }
+
+    /// A frame scaled for a preview keeps its shape and its field; the
+    /// stabilizer's margin is the one the stabilized size names.
+    #[test]
+    fn a_frame_scaled_for_a_preview_keeps_its_shape_and_field() {
+        assert_eq!(scaled_dims(4140, 3308, 1920), (1920, 1534));
+        assert_eq!(scaled_dims(3008, 3840, 1920), (1504, 1920));
+        assert_eq!(scaled_dims(3840, 3840, 1024), (1024, 1024));
+        assert_eq!(scaled_dims(4912, 4912, 4912), (4912, 4912));
+        assert_eq!(scaled_dims(8000, 3, 16), (16, 2));
+        let (l, r) = crop_10k();
+        let frame = LensFrame::from_sources(&[&l, &r], 4912, 4912).expect("a lens frame");
+        let grown = frame.with_stabilizer_margin();
+        assert_eq!((grown.width, grown.height), stabilized_dims(4912, 4912));
+        assert_eq!((grown.focal, grown.xi), (frame.focal, frame.xi));
+        let small = grown.scaled_to(1350);
+        assert_eq!((small.width, small.height), (1350, 1350));
+        assert!((small.focal / grown.focal - 0.25).abs() < 1e-6);
+        let (a, b) = (grown.half_angles(), small.half_angles());
+        assert!((a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5, "{a:?} against {b:?}");
     }
 
     /// A lens whose radius turned back inside the frame would leave pixels
