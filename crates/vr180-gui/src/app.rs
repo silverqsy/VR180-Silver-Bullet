@@ -313,6 +313,11 @@ pub struct App {
     frame_dng_job: Option<(PathBuf, crossbeam_channel::Receiver<std::result::Result<(), String>>)>,
     /// The loaded raw take's enhanced frames, as last looked up.
     enhanced_probe: EnhancedProbe,
+    /// A raw clip's Camera Raw settings being read from its camera-original
+    /// DNGs, on a thread: the take they are for and where the outcome arrives.
+    raw_settings_job: Option<(PathBuf, crossbeam_channel::Receiver<std::result::Result<Option<vr180_pipeline::x6_raw::CameraRawSettings>, String>>)>,
+    /// What the last such read came to, and the take it was for.
+    raw_settings_status: Option<(PathBuf, String)>,
     /// Key (frame+settings) the current `full_res_display` was rendered for.
     full_res_key: u64,
     /// Key (frame+settings) we currently *want* a still for. While this
@@ -2326,6 +2331,35 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Sharpening of the developed picture, as a raw converter's detail panel does it: the same numbers give the same edges there. The radius is in pixels of the exported frame, so judge it in the zoom view or on a snapshot; the preview shows the export's picture reduced." => "对显影后的画面做锐化，与 RAW 转换软件“细节”面板的做法一致：同样的数值在那里得到同样的边缘。半径以导出画面的像素计，请在放大视图或快照上判断；预览显示的是导出画面缩小后的样子。",
         "Keeps the sharpening to edges: the higher, the stronger an edge has to be." => "把锐化限制在边缘上：数值越高，边缘要越强才会被锐化。",
         "Reset raw development" => "重置 RAW 显影",
+        "Read from Camera Raw" => "从 Camera Raw 读取",
+        "Reading…" => "正在读取…",
+        "Read from" => "已读取自",
+        "Not carried over:" => "未带回：",
+        "Takes the white balance, tone, sharpening and colour noise reduction a frame was left with in Camera Raw. They are read from the Camera original DNG of the frame on screen, or of the nearest frame that has settings, in the folder beside the take. Whatever else was set there is named below and stays there."
+            => "读取某一帧在 Camera Raw 里留下的白平衡、影调、锐化和颜色降噪。来源是素材旁边文件夹里当前画面那一帧的相机原片 DNG，该帧没有设置时取最近的有设置的一帧。在那里做的其他调整会在下面列出，不会带回。",
+        "No Camera Raw settings found: the folder of Camera original DNGs beside this take has none, or is not there."
+            => "没有找到 Camera Raw 设置：素材旁边的相机原片 DNG 文件夹里没有，或者文件夹不存在。",
+        "The other eye's file has other settings: these are channel 0's." => "另一眼的文件设置不同：这里用的是通道 0 的。",
+        "Texture" => "纹理",
+        "Clarity" => "清晰度",
+        "Dehaze" => "去除薄雾",
+        "Vibrance" => "自然饱和度",
+        "Luminance noise reduction" => "明亮度降噪",
+        "Color noise reduction detail" => "颜色降噪的细节",
+        "Color noise reduction smoothness" => "颜色降噪的平滑度",
+        "Grain" => "颗粒",
+        "Tone curve" => "曲线",
+        "Color mixer" => "混色器",
+        "Color grading" => "颜色分级",
+        "Calibration" => "校准",
+        "Vignette" => "晕影",
+        "Lens corrections" => "镜头校正",
+        "Geometry" => "几何",
+        "Crop" => "裁剪",
+        "Black & white" => "黑白",
+        "Masks" => "蒙版",
+        "Healing" => "修复",
+        "Profile" => "配置文件",
         "The white the frame is developed for, as a colour temperature in kelvin and a tint, the way a raw converter states it." => "显影所用的白点，以色温（开尔文）和色调表示，与 RAW 转换软件的写法一致。",
         "The take records no white balance of its own: As shot is the camera's reference white." => "该素材没有记录自己的白平衡：“原始设置”是相机的参考白点。",
         "No gyro stabilization available for this source yet." => "此素材暂无陀螺仪防抖。",
@@ -2912,6 +2946,8 @@ impl App {
             snapshot_pending: None,
             frame_dng_job: None,
             enhanced_probe: EnhancedProbe::default(),
+            raw_settings_job: None,
+            raw_settings_status: None,
             full_res_key: 0,
             full_res_desired_key: 0,
             full_res_rendered_at: std::time::Instant::now(),
@@ -6685,6 +6721,7 @@ impl eframe::App for App {
         self.poll_full_res(ctx);
         self.poll_snapshot(ctx);
         self.poll_frame_dng(ctx);
+        self.poll_raw_settings(ctx);
         // Import merge/individual prompt (shown when a multi-file recording
         // is picked). Modal-ish: it sits on top until resolved.
         self.draw_import_prompt(ctx);
@@ -7900,6 +7937,40 @@ impl App {
         self.frame_dng_job = Some((out, rx));
     }
 
+    /// Take over a raw clip's Camera Raw settings once they are read: they
+    /// become the clip's raw development when it is still the clip loaded.
+    fn poll_raw_settings(&mut self, ctx: &egui::Context) {
+        let Some((take, rx)) = self.raw_settings_job.as_ref() else { return; };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                return;
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.raw_settings_job = None;
+                return;
+            }
+        };
+        let take = take.clone();
+        self.raw_settings_job = None;
+        let text = match outcome {
+            Ok(found) => {
+                if let (Some(f), true) = (&found, self.loaded_path.as_ref() == Some(&take)) {
+                    tracing::info!("raw development read from {}: {:?}; not carried: {:?}", f.file.display(), f.develop.settings, f.develop.not_carried);
+                    self.settings.raw = f.develop.settings;
+                }
+                camera_raw_status(&found)
+            }
+            Err(e) => {
+                tracing::warn!("raw development: reading Camera Raw settings failed: {e}");
+                e
+            }
+        };
+        self.raw_settings_status = Some((take, text));
+        ctx.request_repaint();
+    }
+
     /// Report the frame DNG of a snapshot once it is written.
     fn poll_frame_dng(&mut self, ctx: &egui::Context) {
         let Some((path, rx)) = self.frame_dng_job.as_ref() else { return; };
@@ -8410,10 +8481,30 @@ impl App {
         let is_raw = matches!(kind, Some(k) if k.is_raw_video());
         let braw_info = if is_braw { self.clip.as_ref().and_then(|c| c.braw_color.clone()) } else { None };
         let braw_lut = if is_braw { self.clip.as_ref().and_then(|c| c.braw_lut.clone()) } else { None };
+        // What the last read of the take's Camera Raw settings came to.
+        let raw_status: Option<String> = self.raw_settings_status.as_ref()
+            .filter(|(take, _)| Some(take) == self.loaded_path.as_ref()).map(|(_, text)| text.clone());
+        let raw_reading = self.raw_settings_job.is_some();
         let s = &mut self.settings;
 
         if is_raw {
-            draw_raw_develop_section(ui, &mut s.raw, vr180_pipeline::raw_color::RawCamera::X6);
+            let read = draw_raw_develop_section(ui, &mut s.raw, vr180_pipeline::raw_color::RawCamera::X6,
+                if raw_reading { Some(tr("Reading…")) } else { raw_status.as_deref() }, !raw_reading);
+            // Read the settings a frame was left with in Camera Raw: the
+            // frame on screen, from the folder of camera-original DNGs
+            // beside the take. On a thread: the folder may be on a share.
+            if let (true, Some(take)) = (read, self.loaded_path.clone()) {
+                let t_s = self.current_display.as_ref().map_or(0.0, |d| d.timestamp_s as f64);
+                let dir = Self::default_frames_dir_for(&take, true);
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let (path, repaint) = (take.clone(), ui.ctx().clone());
+                std::thread::spawn(move || {
+                    let found = vr180_pipeline::x6_raw::camera_raw_settings(&path, &dir, t_s).map_err(|e| e.to_string());
+                    let _ = tx.send(found);
+                    repaint.request_repaint();
+                });
+                self.raw_settings_job = Some((take, rx));
+            }
             ui.separator();
         }
         if let Some(info) = braw_info.as_deref() {
@@ -9476,15 +9567,24 @@ fn draw_eye_lens(
 /// raw video clip, in a raw converter's own terms (kelvin and tint; stops;
 /// −100..100). The white balance shows the effective value: the camera's
 /// until the user moves it.
+///
+/// `status`: what the last read of the clip's Camera Raw settings came to,
+/// shown under its button; `can_read`: no such read is under way. Returns
+/// whether that button was pressed.
 fn draw_raw_develop_section(
     ui: &mut egui::Ui,
     raw: &mut vr180_pipeline::raw_tone::RawSettings,
     camera: vr180_pipeline::raw_color::RawCamera,
-) {
+    status: Option<&str>,
+    can_read: bool,
+) -> bool {
     ui.label(RichText::new(tr("Raw development")).strong());
     let (shot_k, shot_tint) = camera.as_shot_temperature();
-    let mut kelvin = raw.temperature.unwrap_or(shot_k as f32);
-    let mut tint = raw.tint.unwrap_or(shot_tint as f32);
+    // Whole numbers, as the sliders show them: a slider handed a fraction
+    // writes the rounded value back and reports a change nobody made, which
+    // turned "as shot" into a custom white the moment the section was drawn.
+    let mut kelvin = raw.temperature.unwrap_or(shot_k as f32).round();
+    let mut tint = raw.tint.unwrap_or(shot_tint as f32).round();
     let hover = tr("The white the frame is developed for, as a colour temperature in kelvin and a tint, the way a raw converter states it.");
     if ui.add(egui::Slider::new(&mut kelvin, 2000.0..=50000.0).logarithmic(true).text(tr("Temperature (K)")).fixed_decimals(0))
         .on_hover_text(hover).changed()
@@ -9529,8 +9629,102 @@ fn draw_raw_develop_section(
     ui.label(tr("Noise reduction"));
     ui.add(egui::Slider::new(&mut raw.color_noise, 0.0..=100.0).step_by(1.0).text(tr("Color noise")).fixed_decimals(0))
         .on_hover_text(tr("Colour noise reduction, as a raw converter's: the picture's colour is smoothed and its luminance left alone, which takes the coloured speckle out of noise and the colour out of fine lines. 25 is a raw converter's default; 0 turns it off."));
-    if ui.button(tr("Reset raw development")).clicked() {
-        *raw = Default::default();
+    let mut read = false;
+    ui.horizontal(|ui| {
+        if ui.button(tr("Reset raw development")).clicked() {
+            *raw = Default::default();
+        }
+        read = ui.add_enabled(can_read, egui::Button::new(tr("Read from Camera Raw")))
+            .on_hover_text(tr("Takes the white balance, tone, sharpening and colour noise reduction a frame was left with in Camera Raw. They are read from the Camera original DNG of the frame on screen, or of the nearest frame that has settings, in the folder beside the take. Whatever else was set there is named below and stays there."))
+            .clicked();
+    });
+    if let Some(text) = status {
+        ui.label(RichText::new(text).small().color(Color32::GRAY));
+    }
+    read
+}
+
+/// What a read of a take's Camera Raw settings came to, for the line under
+/// its button.
+fn camera_raw_status(found: &Option<vr180_pipeline::x6_raw::CameraRawSettings>) -> String {
+    let Some(found) = found else {
+        return tr("No Camera Raw settings found: the folder of Camera original DNGs beside this take has none, or is not there.").to_string();
+    };
+    // The file, as the folder names it: its channel folder and its name.
+    let name = found.file.iter().rev().take(2).collect::<Vec<_>>().into_iter().rev()
+        .map(|part| part.to_string_lossy().to_string()).collect::<Vec<_>>().join("/");
+    let mut text = format!("{} {name}", tr("Read from"));
+    if !found.develop.not_carried.is_empty() {
+        let list = found.develop.not_carried.iter()
+            .map(|&(what, ref value)| if value.is_empty() { tr(what).to_string() } else { format!("{} {value}", tr(what)) })
+            .collect::<Vec<_>>().join(", ");
+        text.push_str(&format!(". {} {list}", tr("Not carried over:")));
+    }
+    if found.eyes_differ {
+        text.push_str(&format!(". {}", tr("The other eye's file has other settings: these are channel 0's.")));
+    }
+    text
+}
+
+#[cfg(test)]
+mod camera_raw_tests {
+    use super::{camera_raw_status, draw_raw_develop_section, tr_zh};
+    use std::path::PathBuf;
+    use vr180_pipeline::raw_export::ReadDevelop;
+    use vr180_pipeline::x6_raw::CameraRawSettings;
+
+    /// What a read came to is said in one line: the file, what stayed in
+    /// Camera Raw, and a word when the two eyes were left differently.
+    #[test]
+    fn the_outcome_of_a_read_is_said_under_its_button() {
+        assert!(camera_raw_status(&None).starts_with("No Camera Raw settings found"));
+        let found = |not_carried: Vec<(&'static str, String)>, eyes_differ: bool| Some(CameraRawSettings {
+            file: PathBuf::from("/takes/TAKE_OriginalDNG/CAM0/000000364.dng"),
+            develop: ReadDevelop { settings: Default::default(), not_carried },
+            eyes_differ,
+        });
+        assert_eq!(camera_raw_status(&found(Vec::new(), false)), "Read from CAM0/000000364.dng");
+        let text = camera_raw_status(&found(vec![("Texture", "+20".into()), ("Tone curve", String::new()), ("Profile", "Adobe Vivid".into())], true));
+        assert_eq!(text, "Read from CAM0/000000364.dng. Not carried over: Texture +20, Tone curve, Profile Adobe Vivid. \
+            The other eye's file has other settings: these are channel 0's.");
+        // Every name a read can come back with has its Chinese.
+        for name in ["Texture", "Clarity", "Dehaze", "Vibrance", "Saturation", "Luminance noise reduction", "Color noise reduction detail",
+            "Color noise reduction smoothness", "Grain", "Tone curve", "Color mixer", "Color grading", "Calibration", "Vignette",
+            "Lens corrections", "Geometry", "Crop", "Black & white", "Masks", "Healing", "Profile", "Read from Camera Raw", "Not carried over:"] {
+            assert_ne!(tr_zh(name), name, "{name} has no translation");
+        }
+    }
+
+    /// The raw development section has the button, shows the line under it,
+    /// and leaves the settings alone until something is pressed.
+    #[test]
+    fn the_raw_section_offers_the_read() {
+        fn collect(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => { out.push_str(text.galley.text()); out.push('\n'); }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut raw = vr180_pipeline::raw_tone::RawSettings { shadows: 30.0, ..Default::default() };
+        let before = raw;
+        let mut text = String::new();
+        let mut pressed = false;
+        for _ in 0..2 {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 2000.0))), ..Default::default() };
+            let out = ctx.run_ui(input, |ui| {
+                pressed |= draw_raw_develop_section(ui, &mut raw, vr180_pipeline::raw_color::RawCamera::X6, Some("Read from CAM0/000000364.dng"), true);
+            });
+            text.clear();
+            out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
+        }
+        assert!(text.contains("Read from Camera Raw") && text.contains("Reset raw development"), "{text}");
+        assert!(text.contains("Read from CAM0/000000364.dng"), "{text}");
+        // Drawing the section changes nothing: a white balance left as shot
+        // stays as shot (it used to become a custom one of the same kelvin).
+        assert!(!pressed, "nothing was pressed");
+        assert_eq!(raw, before);
     }
 }
 

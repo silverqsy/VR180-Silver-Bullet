@@ -144,6 +144,16 @@ converter's controls for it, and every frame can be had as a DNG.
   them the far-field shake of a locked export fell from 1.5 to 0.4 pixels
   a frame at 1024 pixels an eye (2.6 without stabilization). Takes of the
   earlier build have neither and stabilize as before.
+- **Settings from Camera Raw.** Raw development has **Read from Camera
+  Raw**: the white balance, the six tone controls, the sharpening and the
+  colour noise reduction a frame was left with in Camera Raw become the
+  clip's. They are read from the Camera original DNG of the frame on
+  screen, or of the nearest frame that has settings, in the folder beside
+  the take. Whatever else was set there (texture, clarity, a curve, the
+  colour mixer, masks, a crop, another profile and so on) is named under
+  the button and stays in Camera Raw. The section also no longer turns an
+  as-shot white balance into a custom one of the same value just by being
+  shown.
 - **Noise reduction.** The Noise Reduction section (macOS) works on raw
   takes. The filter is a video filter, 10-bit and with colour at half
   resolution, so a take's frames pass it white-balanced and on a

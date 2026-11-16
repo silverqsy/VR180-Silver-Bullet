@@ -237,6 +237,44 @@ pub fn find(path: &Path) -> Result<Option<EnhancedPicture>> {
     Ok(Some(EnhancedPicture { width, height, tile_w, tile_h, tiles, channels }))
 }
 
+/// The XMP packet of the DNG at `path`: what a raw converter wrote of its
+/// settings for the frame, in the file itself or, when the file has none,
+/// in a sidecar of the same name beside it. `None` when there is neither.
+pub fn read_xmp(path: &Path) -> Result<Option<String>> {
+    let embedded = (|| -> Result<Option<String>> {
+        let mut file = File::open(path)?;
+        let size = file.metadata()?.len();
+        let head = read_at(&mut file, 0, 8.min(size as usize))?;
+        let little = match head.get(..4) {
+            Some([b'I', b'I', 42, 0]) => true,
+            Some([b'M', b'M', 0, 42]) => false,
+            _ => return Ok(None),
+        };
+        let at = if little { u32::from_le_bytes([head[4], head[5], head[6], head[7]]) } else { u32::from_be_bytes([head[4], head[5], head[6], head[7]]) } as u64;
+        if at + 2 > size {
+            return Ok(None);
+        }
+        let count = read_at(&mut file, at, 2)?;
+        let n = if little { u16::from_le_bytes([count[0], count[1]]) } else { u16::from_be_bytes([count[0], count[1]]) } as usize;
+        let mut tiff = head.clone();
+        tiff[4..8].copy_from_slice(&if little { 8u32.to_le_bytes() } else { 8u32.to_be_bytes() });
+        tiff.extend_from_slice(&read_at(&mut file, at, 2 + 12 * n)?);
+        let Some(ifd0) = first_ifd(&tiff) else { return Ok(None) };
+        let Some((_, len, xmp_at)) = ifd0.array(TAG_XMP) else { return Ok(None) };
+        if len == 0 || len > 64 << 20 || xmp_at as u64 + len as u64 > size {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8_lossy(&read_at(&mut file, xmp_at as u64, len as usize)?).into_owned()))
+    })()?;
+    if embedded.is_some() {
+        return Ok(embedded);
+    }
+    match std::fs::read(path.with_extension("xmp")) {
+        Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+        Err(_) => Ok(None),
+    }
+}
+
 /// One JPEG XL codestream of 16-bit RGB samples: `(width, height, samples)`.
 fn decode_tile(bytes: &[u8]) -> Result<(usize, usize, Vec<u16>)> {
     #[cfg(target_os = "macos")]

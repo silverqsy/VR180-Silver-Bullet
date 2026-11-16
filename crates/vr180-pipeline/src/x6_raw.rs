@@ -680,6 +680,56 @@ pub fn enhanced_side(path: &Path, source: &EnhancedSource) -> Option<u32> {
     find_enhanced(&index, source).side()
 }
 
+/// A take's Camera Raw settings, found in the folder of its camera-original
+/// DNGs ([`camera_raw_settings`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CameraRawSettings {
+    /// The file they were read from.
+    pub file: PathBuf,
+    pub develop: crate::raw_export::ReadDevelop,
+    /// The same frame's other eye has settings of its own that are not these.
+    pub eyes_differ: bool,
+}
+
+/// How many of the nearest frames' files are opened for settings.
+const SETTINGS_SEARCH: usize = 12;
+
+/// The Camera Raw settings a raw converter left for the take at `path`, in
+/// the folder `dir` of its camera-original DNGs: those of the frame shown at
+/// `t_s` (channel 0's file, then channel 1's), or, when that frame has no
+/// file with settings, of the nearest frame that has. `Ok(None)`: the
+/// folder holds no file with such settings near that frame.
+pub fn camera_raw_settings(path: &Path, dir: &Path, t_s: f64) -> Result<Option<CameraRawSettings>> {
+    let listing = enhanced_listing(dir);
+    if listing.iter().all(|files| files.is_empty()) {
+        return Ok(None);
+    }
+    let index = open(path)?;
+    let wanted = index.pairs.get(index.frame_at(t_s.max(0.0))).map_or(0, |p| p.request);
+    // Every listed frame, nearest first; channel 0 before channel 1.
+    let mut requests: Vec<u32> = listing.iter().flat_map(|files| files.iter().map(|f| f.0)).collect();
+    requests.sort_unstable();
+    requests.dedup();
+    requests.sort_by_key(|r| r.abs_diff(wanted));
+    let read = |channel: usize, request: u32| -> Option<(PathBuf, crate::raw_export::ReadDevelop)> {
+        if !listing[channel].iter().any(|f| f.0 == request) {
+            return None;
+        }
+        let file = dir.join(crate::sensor_dng::frame_file(channel, request));
+        let xmp = crate::enhanced_dng::read_xmp(&file).ok().flatten()?;
+        Some((file, crate::raw_export::read_develop_xmp(&xmp)?))
+    };
+    for &request in requests.iter().take(SETTINGS_SEARCH) {
+        for channel in 0..2 {
+            if let Some((file, develop)) = read(channel, request) {
+                let eyes_differ = channel == 0 && read(1, request).is_some_and(|(_, other)| other.settings != develop.settings);
+                return Ok(Some(CameraRawSettings { file, develop, eyes_differ }));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The frames of a raw take as fisheye pairs.
 ///
 /// `swap_eyes` has the dual-stream iterators' meaning: `true` puts channel 1
@@ -1224,6 +1274,38 @@ mod tests {
         // Channel 1 was not enhanced: the capture's frame, enlarged — the same scene, about as bright.
         let other = px(&pair.right, 4100, 2500);
         assert!(other[1] > 1500 && other[1] < 20000, "{other:?}");
+    }
+
+    /// The frame Camera Raw enhanced also carries the settings it was left
+    /// with there (skipped when the sample is not there): they are read for
+    /// that frame and, the folder holding no other file with settings, for
+    /// any other time of the take.
+    #[test]
+    fn a_takes_camera_raw_settings_are_read_from_its_frames() {
+        let take = Path::new(SAMPLES).join("RAWVIDEO-20261116-011723");
+        let dir = Path::new(SAMPLES).join("RAWVIDEO-20261116-011723_OriginalDNG");
+        let file = dir.join("CAM0/000000364.dng");
+        let Ok(Some(xmp)) = crate::enhanced_dng::read_xmp(&file) else { return };
+        if !take.exists() || !xmp.contains("crs:Exposure2012") { return; }
+        // The other eye's file was never opened in a raw converter: no packet.
+        assert_eq!(crate::enhanced_dng::read_xmp(&dir.join("CAM1/000000364.dng")).unwrap(), None);
+        let index = open(&take).unwrap();
+        let t = index.pts_s(index.pairs.iter().position(|p| p.request == 364).unwrap());
+        for at in [t, 0.0, t + 6.0] {
+            let found = camera_raw_settings(&take, &dir, at).unwrap().expect("settings in the folder");
+            assert_eq!(found.file, file);
+            assert!(!found.eyes_differ);
+            let s = found.develop.settings;
+            // As it was left in Camera Raw: as shot, Shadows +100, the detail panel's defaults.
+            assert_eq!((s.temperature, s.tint, s.exposure, s.shadows, s.highlights), (None, None, 0.0, 100.0, 0.0));
+            assert_eq!((s.sharpen.amount, s.sharpen.radius, s.sharpen.detail, s.sharpen.masking, s.color_noise), (40.0, 1.0, 25.0, 0.0, 25.0));
+            assert!(found.develop.not_carried.is_empty(), "{:?}", found.develop.not_carried);
+        }
+        // A folder with no frames: nothing.
+        let empty = std::env::temp_dir().join(format!("vr180-no-settings-{}", std::process::id()));
+        std::fs::create_dir_all(empty.join("CAM0")).unwrap();
+        assert_eq!(camera_raw_settings(&take, &empty, t).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     /// The sample takes (skipped when the volume is not mounted): they open,

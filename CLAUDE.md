@@ -3001,6 +3001,42 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      (the GPU stages against their CPU twins, the tables and families
      against Camera Raw's numbers, the keys read off the reduced copy,
      the sharpening's kernel and limits).
+   - **Settings read back from Camera Raw** (2026-11-16, the user: yes to
+     reading them back; `raw_export::read_develop_xmp` = the inverse of
+     `develop_xmp`, `enhanced_dng::read_xmp`, `x6_raw::camera_raw_settings`,
+     GUI button "Read from Camera Raw" in `draw_raw_develop_section`,
+     `App::raw_settings_job` / `poll_raw_settings`). The enhanced picture
+     in a DNG is pre-development, so nothing done in Camera Raw's panels
+     reaches the export by itself; this takes the part this development
+     has controls for: `WhiteBalance` ("As Shot" = as shot, else
+     `Temperature` / `Tint`), `Exposure2012`, `Contrast2012`,
+     `Highlights2012`, `Shadows2012`, `Whites2012`, `Blacks2012`,
+     `Sharpness` / `SharpenRadius` / `SharpenDetail` /
+     `SharpenEdgeMasking`, `ColorNoiseReduction`, each held to the
+     slider's range. Camera Raw 18.7 writes all of them as ATTRIBUTES of
+     the packet's first `rdf:Description` (124 there in the sample; later
+     descriptions belong to the Enhance filter and are not read); plain
+     elements are read too. A packet without `Exposure2012` (another
+     process version, or no settings) gives nothing. What else is set away
+     from Camera Raw's defaults comes back as names (`not_carried`:
+     Texture, Clarity, Dehaze, Vibrance, Saturation, Luminance noise
+     reduction, the colour noise reduction's Detail / Smoothness, Grain,
+     Tone curve (named, points, parametric), Color mixer, Color grading,
+     Calibration, Vignette, Lens corrections, Geometry, Crop, Black &
+     white, Masks, Healing, Profile other than Embedded) and shows under
+     the button. Which file: the frame on screen's, channel 0 then 1, in
+     `<take>_OriginalDNG`, else the nearest of the 12 nearest frames that
+     has settings; a sidecar `.xmp` of the same name counts when the DNG
+     has no packet; `eyes_differ` when channel 1 of that frame was left
+     differently. The read runs on a thread; the result replaces
+     `settings.raw` only if that take is still the one loaded. Checked on
+     the user's sample: as shot, Shadows +100, sharpening 40 / 1.0 / 25 /
+     0, colour noise 25, nothing uncarried. (Camera Raw states that
+     frame's as-shot white as 3750 K, +27; this app's model says 3730.)
+     FOUND ON THE WAY: the section's Temperature and Tint sliders were
+     handed the as-shot values unrounded, wrote the rounded ones back and
+     reported a change, so merely showing the section turned "as shot"
+     into a custom white; the values are rounded before the sliders now.
    - **Noise reduction** (2026-11-16; `fisheye_decode::LinearCoding`,
      `DenoisingFisheyeIter::with_linear_source`). The filter wrapper takes
      frames IN MEMORY; a raw take hands out GPU pairs with empty buffers,

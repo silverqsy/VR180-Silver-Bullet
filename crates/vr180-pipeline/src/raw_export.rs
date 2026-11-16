@@ -63,6 +63,186 @@ pub fn develop_xmp(settings: &RawSettings, camera: &RawCamera) -> String {
     )
 }
 
+/// A frame's Camera Raw settings read back ([`read_develop_xmp`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadDevelop {
+    /// The controls this development has, at the packet's values.
+    pub settings: RawSettings,
+    /// What the packet sets away from Camera Raw's defaults that this
+    /// development has no control for: the control's name in Camera Raw,
+    /// and its value where it is a single number or name (else empty).
+    pub not_carried: Vec<(&'static str, String)>,
+}
+
+/// The Camera Raw properties of an XMP packet, by name without the prefix:
+/// the attributes of its first description that has any, and after them
+/// what is written as plain elements.
+fn crs_properties(xmp: &str) -> std::collections::HashMap<String, String> {
+    let unescape = |v: &str| v.replace("&quot;", "\"").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+    let mut out = std::collections::HashMap::new();
+    // The opening tag of each description, to its closing bracket outside quotes.
+    let mut from = 0;
+    while let Some(at) = xmp[from..].find("<rdf:Description") {
+        let start = from + at;
+        let mut quote: Option<char> = None;
+        let mut end = xmp.len();
+        for (i, c) in xmp[start..].char_indices() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (None, '"') | (None, '\'') => quote = Some(c),
+                (None, '>') => { end = start + i; break; }
+                _ => {}
+            }
+        }
+        let tag = &xmp[start..end];
+        let mut rest = tag;
+        while let Some(i) = rest.find("crs:") {
+            let after = &rest[i + 4..];
+            let name_len = after.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(after.len());
+            let (name, tail) = after.split_at(name_len);
+            rest = tail;
+            let Some(tail) = tail.strip_prefix('=') else { continue };
+            let Some(q) = tail.chars().next().filter(|c| *c == '"' || *c == '\'') else { continue };
+            let Some(close) = tail[1..].find(q) else { break };
+            out.entry(name.to_string()).or_insert_with(|| unescape(&tail[1..1 + close]));
+            rest = &tail[2 + close..];
+        }
+        if !out.is_empty() {
+            break;
+        }
+        from = end;
+    }
+    // Plain elements (`<crs:Name>value</crs:Name>`), where the attribute is not there.
+    let mut rest = xmp;
+    while let Some(i) = rest.find("<crs:") {
+        let after = &rest[i + 5..];
+        let name_len = after.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(after.len());
+        let (name, tail) = after.split_at(name_len);
+        rest = tail;
+        let Some(tail) = tail.strip_prefix('>') else { continue };
+        let Some(close) = tail.find('<') else { break };
+        if tail[close..].starts_with(&format!("</crs:{name}>")) {
+            out.entry(name.to_string()).or_insert_with(|| unescape(tail[..close].trim()));
+        }
+    }
+    out
+}
+
+/// The points of a tone curve element (`<crs:Name><rdf:Seq><rdf:li>x, y</rdf:li>…`), if the packet has it.
+fn crs_curve(xmp: &str, name: &str) -> Option<Vec<(f32, f32)>> {
+    let open = format!("<crs:{name}>");
+    let body = &xmp[xmp.find(&open)? + open.len()..];
+    let body = &body[..body.find(&format!("</crs:{name}>"))?];
+    Some(body.split("<rdf:li>").skip(1).filter_map(|li| {
+        let text = &li[..li.find('<')?];
+        let mut xy = text.split(',').map(|v| v.trim().parse::<f32>());
+        Some((xy.next()?.ok()?, xy.next()?.ok()?))
+    }).collect())
+}
+
+/// Read a frame's Camera Raw settings from its XMP packet: the inverse of
+/// [`develop_xmp`] for the controls this development has (white balance,
+/// the six tone controls of process version 2012, sharpening, colour noise
+/// reduction), and a list of what else the packet sets away from Camera
+/// Raw's defaults. `None` when the packet holds no such settings.
+pub fn read_develop_xmp(xmp: &str) -> Option<ReadDevelop> {
+    let p = crs_properties(xmp);
+    let num = |k: &str| p.get(k).and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite());
+    let flag = |k: &str| p.get(k).is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    // The tone controls of process version 2012 are what this development's
+    // are: a packet without them is of another kind.
+    let exposure = num("Exposure2012")?;
+    let mut settings = RawSettings { exposure: exposure.clamp(-5.0, 5.0), ..RawSettings::default() };
+    let amount = |k: &str| num(k).map_or(0.0, |v| v.clamp(-100.0, 100.0));
+    settings.contrast = amount("Contrast2012");
+    settings.highlights = amount("Highlights2012");
+    settings.shadows = amount("Shadows2012");
+    settings.whites = amount("Whites2012");
+    settings.blacks = amount("Blacks2012");
+    // "As Shot" is the file's own white; anything else is stated in kelvin and tint.
+    let as_shot = p.get("WhiteBalance").map_or(true, |v| v.eq_ignore_ascii_case("As Shot"));
+    if !as_shot {
+        settings.temperature = num("Temperature").map(|k| k.clamp(2000.0, 50000.0));
+        settings.tint = num("Tint").map(|t| t.clamp(-150.0, 150.0));
+    }
+    settings.sharpen = crate::raw_sharpen::RawSharpen {
+        amount: num("Sharpness").map_or(0.0, |v| v.clamp(0.0, 150.0)),
+        radius: num("SharpenRadius").map_or(1.0, |v| v.clamp(0.5, 3.0)),
+        detail: num("SharpenDetail").map_or(25.0, |v| v.clamp(0.0, 100.0)),
+        masking: num("SharpenEdgeMasking").map_or(0.0, |v| v.clamp(0.0, 100.0)),
+    };
+    settings.color_noise = num("ColorNoiseReduction").map_or(crate::raw_tone::DEFAULT_COLOR_NOISE, |v| v.clamp(0.0, 100.0));
+
+    // What else is set.
+    let mut not_carried: Vec<(&'static str, String)> = Vec::new();
+    let signed = |v: f32| if v == v.round() { format!("{:+.0}", v) } else { format!("{:+.2}", v) };
+    let mut note = |name: &'static str, value: String| not_carried.push((name, value));
+    for (name, key, default) in [
+        ("Texture", "Texture", 0.0), ("Clarity", "Clarity2012", 0.0), ("Dehaze", "Dehaze", 0.0),
+        ("Vibrance", "Vibrance", 0.0), ("Saturation", "Saturation", 0.0),
+        ("Luminance noise reduction", "LuminanceSmoothing", 0.0),
+        ("Color noise reduction detail", "ColorNoiseReductionDetail", 50.0),
+        ("Color noise reduction smoothness", "ColorNoiseReductionSmoothness", 50.0),
+        ("Grain", "GrainAmount", 0.0),
+    ] {
+        if let Some(v) = num(key).filter(|v| (*v - default).abs() > 1e-3) {
+            note(name, if default == 0.0 { signed(v) } else { format!("{v:.0}") });
+        }
+    }
+    // Groups of controls: named once when any of theirs is set.
+    let any = |keys: &[&str], default: f32| keys.iter().any(|k| num(k).is_some_and(|v| (v - default).abs() > 1e-3));
+    let any_prefixed = |prefixes: &[&str]| p.iter().any(|(k, v)| prefixes.iter().any(|pre| k.starts_with(pre)) && v.trim().parse::<f32>().is_ok_and(|v| v.abs() > 1e-3));
+    let linear = |name: &str| crs_curve(xmp, name).map_or(true, |c| c.is_empty() || c == [(0.0, 0.0), (255.0, 255.0)]);
+    let curve_named = p.get("ToneCurveName2012").is_some_and(|n| !n.eq_ignore_ascii_case("Linear"));
+    if curve_named || !["ToneCurvePV2012", "ToneCurvePV2012Red", "ToneCurvePV2012Green", "ToneCurvePV2012Blue"].iter().all(|n| linear(n))
+        || any(&["ParametricShadows", "ParametricDarks", "ParametricLights", "ParametricHighlights"], 0.0)
+    {
+        note("Tone curve", String::new());
+    }
+    if any_prefixed(&["HueAdjustment", "SaturationAdjustment", "LuminanceAdjustment"]) {
+        note("Color mixer", String::new());
+    }
+    if any(&["SplitToningShadowSaturation", "SplitToningHighlightSaturation", "ColorGradeMidtoneSat", "ColorGradeGlobalSat",
+             "ColorGradeShadowLum", "ColorGradeMidtoneLum", "ColorGradeHighlightLum", "ColorGradeGlobalLum"], 0.0) {
+        note("Color grading", String::new());
+    }
+    if any(&["ShadowTint", "RedHue", "RedSaturation", "GreenHue", "GreenSaturation", "BlueHue", "BlueSaturation"], 0.0) {
+        note("Calibration", String::new());
+    }
+    if any(&["PostCropVignetteAmount", "VignetteAmount"], 0.0) {
+        note("Vignette", String::new());
+    }
+    if any(&["LensProfileEnable", "LensManualDistortionAmount", "AutoLateralCA", "DefringePurpleAmount", "DefringeGreenAmount"], 0.0) {
+        note("Lens corrections", String::new());
+    }
+    if any(&["PerspectiveUpright", "PerspectiveVertical", "PerspectiveHorizontal", "PerspectiveRotate", "PerspectiveAspect", "PerspectiveX", "PerspectiveY"], 0.0)
+        || any(&["PerspectiveScale"], 100.0)
+    {
+        note("Geometry", String::new());
+    }
+    if flag("HasCrop") {
+        note("Crop", String::new());
+    }
+    if flag("ConvertToGrayscale") {
+        note("Black & white", String::new());
+    }
+    if ["<crs:MaskGroupBasedCorrections", "<crs:GradientBasedCorrections", "<crs:CircularGradientBasedCorrections", "<crs:PaintBasedCorrections"]
+        .iter().any(|tag| xmp.contains(tag))
+    {
+        note("Masks", String::new());
+    }
+    if xmp.contains("<crs:RetouchAreas") || xmp.contains("<crs:RetouchInfo") {
+        note("Healing", String::new());
+    }
+    // The profile: the file's own unless another is named.
+    if let Some(profile) = p.get("CameraProfile").filter(|n| !n.eq_ignore_ascii_case("Embedded") && !n.is_empty()) {
+        note("Profile", profile.clone());
+    } else if xmp.contains("<crs:Look") {
+        note("Profile", String::new());
+    }
+    Some(ReadDevelop { settings, not_carried })
+}
+
 /// The DNG's camera and colour metadata for a frame of `camera` developed
 /// with `settings`.
 fn frame_meta(camera: &RawCamera, settings: &RawSettings, mono: bool, description: String) -> LinearDngMeta {
@@ -354,5 +534,63 @@ mod tests {
         assert!(x.contains(&format!(r#"crs:Tint="{:+.0}""#, tint)), "{x}");
         assert!(x.contains(r#"crs:Exposure2012="-1.25""#) && x.contains(r#"crs:Shadows2012="+40""#) && x.contains(r#"crs:Highlights2012="-65""#), "{x}");
         assert_eq!(sequence_frame_path(Path::new("/out"), "TAKE", 42), PathBuf::from("/out/TAKE_000042.dng"));
+    }
+
+    /// What the app writes for a raw converter reads back as it was.
+    #[test]
+    fn settings_come_back_from_the_converters_packet() {
+        let cam = RawCamera::X6;
+        for s in [
+            RawSettings::default(),
+            RawSettings { temperature: Some(5200.0), tint: Some(-12.0), exposure: -1.25, contrast: 15.0, highlights: -65.0, shadows: 40.0, whites: 8.0, blacks: -22.0,
+                sharpen: crate::raw_sharpen::RawSharpen { amount: 55.0, radius: 1.4, detail: 30.0, masking: 20.0 }, color_noise: 60.0 },
+            RawSettings { exposure: 2.5, shadows: 100.0, color_noise: 0.0, ..Default::default() },
+        ] {
+            let back = read_develop_xmp(&develop_xmp(&s, &cam)).expect("settings in the packet");
+            assert_eq!(back.settings, s);
+            assert!(back.not_carried.is_empty(), "{:?}", back.not_carried);
+        }
+        // A packet without Camera Raw settings, and one of an older process.
+        assert!(read_develop_xmp("<x:xmpmeta><rdf:RDF><rdf:Description rdf:about=\"\" dc:format=\"image/dng\"/></rdf:RDF></x:xmpmeta>").is_none());
+        assert!(read_develop_xmp(r#"<rdf:Description crs:ProcessVersion="5.7" crs:Exposure="+0.50" crs:Shadows="5"/>"#).is_none());
+    }
+
+    /// A packet as Camera Raw writes it: the controls this development has
+    /// are taken, held to their ranges, and everything else that is set is
+    /// named.
+    #[test]
+    fn a_converters_packet_is_read_and_the_rest_is_named() {
+        let packet = |attrs: &str, children: &str| format!(
+            concat!(r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">"#,
+                r#"<rdf:Description rdf:about="" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:Version="18.7" crs:ProcessVersion="15.4" {}>"#,
+                "{}</rdf:Description></rdf:RDF></x:xmpmeta>"), attrs, children);
+        let linear = "<crs:ToneCurvePV2012><rdf:Seq><rdf:li>0, 0</rdf:li><rdf:li>255, 255</rdf:li></rdf:Seq></crs:ToneCurvePV2012>";
+        // As the sample frame has it: as shot (its kelvin and tint are stated all the same), Shadows +100, the detail panel's defaults.
+        let plain = r#"crs:WhiteBalance="As Shot" crs:Temperature="3750" crs:Tint="+27" crs:Exposure2012="0.00" crs:Contrast2012="0" crs:Highlights2012="0" crs:Shadows2012="+100" crs:Whites2012="0" crs:Blacks2012="0" crs:Texture="0" crs:Clarity2012="0" crs:Dehaze="0" crs:Vibrance="0" crs:Saturation="0" crs:Sharpness="40" crs:SharpenRadius="+1.0" crs:SharpenDetail="25" crs:SharpenEdgeMasking="0" crs:LuminanceSmoothing="0" crs:ColorNoiseReduction="25" crs:ColorNoiseReductionDetail="50" crs:ColorNoiseReductionSmoothness="50" crs:HueAdjustmentRed="0" crs:PerspectiveScale="100" crs:DefringePurpleHueLo="30" crs:ColorGradeBlending="50" crs:ConvertToGrayscale="False" crs:ToneCurveName2012="Linear" crs:CameraProfile="Embedded" crs:HasSettings="True" crs:HasCrop="False""#;
+        let nested = r#"<crs:FilterList rdf:parseType="Resource"><crs:Filters><rdf:Seq><rdf:li><rdf:Description crs:Name="Enhance" crs:Exposure2012="+4.00" crs:Texture="+99"/></rdf:li></rdf:Seq></crs:Filters></crs:FilterList>"#;
+        let r = read_develop_xmp(&packet(plain, &format!("{linear}{nested}"))).unwrap();
+        let want = RawSettings { shadows: 100.0, sharpen: crate::raw_sharpen::RawSharpen { amount: 40.0, radius: 1.0, detail: 25.0, masking: 0.0 }, ..Default::default() };
+        assert_eq!(r.settings, want);
+        assert!(r.not_carried.is_empty(), "{:?}", r.not_carried);
+        // A custom white, values past the ranges, and controls this development has not.
+        let busy = r#"crs:WhiteBalance="Custom" crs:Temperature="6100" crs:Tint="-8" crs:Exposure2012="+7.50" crs:Contrast2012="+30" crs:Highlights2012="-200" crs:Shadows2012="+55" crs:Whites2012="-10" crs:Blacks2012="+12" crs:Texture="+20" crs:Clarity2012="-15" crs:Dehaze="0" crs:Vibrance="+10" crs:Saturation="0" crs:Sharpness="70" crs:SharpenRadius="+2.0" crs:SharpenDetail="10" crs:SharpenEdgeMasking="35" crs:LuminanceSmoothing="15" crs:ColorNoiseReduction="50" crs:ColorNoiseReductionDetail="50" crs:ColorNoiseReductionSmoothness="70" crs:HueAdjustmentOrange="+6" crs:ColorGradeShadowLum="-4" crs:GrainAmount="12" crs:PostCropVignetteAmount="-20" crs:LensProfileEnable="1" crs:PerspectiveScale="104" crs:RedHue="+3" crs:ConvertToGrayscale="False" crs:ToneCurveName2012="Custom" crs:CameraProfile="Adobe Vivid" crs:HasCrop="True""#;
+        let curved = "<crs:ToneCurvePV2012><rdf:Seq><rdf:li>0, 0</rdf:li><rdf:li>128, 140</rdf:li><rdf:li>255, 255</rdf:li></rdf:Seq></crs:ToneCurvePV2012><crs:MaskGroupBasedCorrections><rdf:Seq/></crs:MaskGroupBasedCorrections>";
+        let r = read_develop_xmp(&packet(busy, curved)).unwrap();
+        let s = r.settings;
+        assert_eq!((s.temperature, s.tint, s.exposure, s.contrast, s.highlights, s.shadows, s.whites, s.blacks), (Some(6100.0), Some(-8.0), 5.0, 30.0, -100.0, 55.0, -10.0, 12.0));
+        assert_eq!((s.sharpen.amount, s.sharpen.radius, s.sharpen.detail, s.sharpen.masking, s.color_noise), (70.0, 2.0, 10.0, 35.0, 50.0));
+        let names: Vec<&str> = r.not_carried.iter().map(|n| n.0).collect();
+        for name in ["Texture", "Clarity", "Vibrance", "Luminance noise reduction", "Color noise reduction smoothness", "Grain", "Tone curve",
+            "Color mixer", "Color grading", "Calibration", "Vignette", "Lens corrections", "Geometry", "Crop", "Masks", "Profile"] {
+            assert!(names.contains(&name), "{name} is not named in {names:?}");
+        }
+        assert!(!names.contains(&"Dehaze") && !names.contains(&"Saturation") && !names.contains(&"Black & white") && !names.contains(&"Color noise reduction detail"), "{names:?}");
+        let value = |name: &str| r.not_carried.iter().find(|n| n.0 == name).map(|n| n.1.as_str());
+        assert_eq!((value("Texture"), value("Clarity"), value("Luminance noise reduction"), value("Color noise reduction smoothness"), value("Profile")),
+            (Some("+20"), Some("-15"), Some("+15"), Some("70"), Some("Adobe Vivid")));
+        // Written as elements, as some tools do: read the same way.
+        let elements = "<rdf:Description rdf:about=\"\"><crs:ProcessVersion>15.4</crs:ProcessVersion><crs:WhiteBalance>Custom</crs:WhiteBalance><crs:Temperature>4800</crs:Temperature><crs:Tint>+5</crs:Tint><crs:Exposure2012>+0.35</crs:Exposure2012><crs:Shadows2012>-20</crs:Shadows2012><crs:Sharpness>25</crs:Sharpness></rdf:Description>";
+        let r = read_develop_xmp(elements).unwrap();
+        assert_eq!((r.settings.temperature, r.settings.tint, r.settings.exposure, r.settings.shadows, r.settings.sharpen.amount), (Some(4800.0), Some(5.0), 0.35, -20.0, 25.0));
     }
 }
