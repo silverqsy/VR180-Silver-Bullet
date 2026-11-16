@@ -1,8 +1,11 @@
 // The reduced copy a raw frame's tone keys are read from: every output
 // cell is the mean scene RGB (linear ProPhoto, exposure 0, clipped channels
 // rebuilt — the same `scene` as `raw_develop.wgsl`) of its part of the eye,
-// and in alpha the mean of log2(luminance) over the same part (luminance not
-// below the floor): the levels the Shadows / Highlights curves come from.
+// and in alpha the mean of log2(luminance) over the same part: the levels
+// the Shadows / Highlights curves come from. For those the luminance is of
+// the pixel brought down until none of its channels is above 1 (and not
+// below the floor): what the sensor's clipping left of a blown highlight
+// counts as white there, not as the brighter light rebuilt for the picture.
 //
 // Bindings:
 //   (0) src — the eye, camera-linear
@@ -53,7 +56,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let px = vec2<i32>(clamp(floor(at), vec2<f32>(0.0), last));
             let rgb = scene(textureLoad(src, px, 0).rgb);
             sum = sum + rgb;
-            levels = levels + log2(max(dot(p.luma.xyz, max(rgb, vec3<f32>(0.0))), p.luma.w));
+            let lit = max(rgb, vec3<f32>(0.0));
+            let over = max(max(lit.r, max(lit.g, lit.b)), 1.0);
+            levels = levels + log2(max(dot(p.luma.xyz, lit) / over, p.luma.w));
         }
     }
     let n = f32(taps * taps);

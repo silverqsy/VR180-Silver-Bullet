@@ -120,8 +120,9 @@ impl ToneKeys {
 pub struct FrameStats {
     pub keys: ToneKeys,
     /// log₂ luminance of the reduced copy's cells (each [`STAT_CELL`] of the
-    /// frame's long side, averaged in log), at exposure 0, sorted rising.
-    /// Empty when nothing was measured.
+    /// frame's long side, averaged in log), at exposure 0, sorted rising;
+    /// a pixel with a channel above 1 (a blown highlight, rebuilt) counts
+    /// with that channel at 1. Empty when nothing was measured.
     pub levels: std::sync::Arc<[f32]>,
     /// The brightest value at each level: for sample `i` of a local curve
     /// ([`LOCAL_SAMPLES`] of them), the brightest channel of the key cells
@@ -334,10 +335,12 @@ impl RawDevelop {
             None => {
                 let shift = gain.log2() as f32;
                 let levels: Vec<f32> = stats.levels.iter().map(|l| l + shift).collect();
-                // How far the frame's top is below its white point.
-                let headroom = levels.last().map_or(0.0, |top| {
-                    let lit = default_black(2f64.powf(*top as f64), dark_key).max(1e-9);
-                    (plain_white / lit).log2() as f32
+                // How far the frame's top is below the sensor's clipping,
+                // as shot: exposure moves the curves with the frame, it
+                // does not change them (measured with exposure series).
+                let headroom = stats.levels.last().map_or(0.0, |top| {
+                    let shot_key = (stats.keys.dark as f64).max(2f64.powi(-30)).log2();
+                    -(default_black(2f64.powf(*top as f64), shot_key).max(1e-9).log2()) as f32
                 });
                 derived = local_curves(&levels, headroom);
                 &derived

@@ -257,7 +257,7 @@ fn curve_nets() -> &'static [CurveNet] {
 
 /// The Shadows / Highlights curves of a frame whose reduced copy has the
 /// log₂ levels `levels` (sorted rising, exposure applied) and whose top
-/// level sits `headroom` stops below the white point.
+/// level sat `headroom` stops below the sensor's clipping when shot.
 ///
 /// Camera Raw's curves have one pivot for both sliders. Shadows: a gain at
 /// the pivot that falls linearly to zero at the frame's top and, below the
