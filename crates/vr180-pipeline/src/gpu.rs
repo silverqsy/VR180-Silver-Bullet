@@ -9160,6 +9160,7 @@ impl Device {
         lut_resources: &Option<Lut3DResources>,
         intermediates: &mut Vec<wgpu::Texture>,
         eye_offset: Option<(&EyeMatchState, u32)>,
+        raw: Option<&crate::raw_tone::DevelopConstants>,
     ) -> Option<usize> {
         let make_16 = |label: &str, w: u32, h: u32| {
             self.device.create_texture(&wgpu::TextureDescriptor {
@@ -9179,9 +9180,9 @@ impl Device {
 
         // R. Raw development — a raw source's camera-linear eyes become
         //    display-referred here, ahead of everything else.
-        if let Some(stage) = &plan.raw_develop {
+        if let Some(constants) = raw {
             let next = make_16("stack16_raw_out", w, h);
-            self.record_raw_develop(encoder, src, &next, stage);
+            self.record_raw_develop(encoder, src, &next, constants);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
@@ -9337,8 +9338,10 @@ impl Device {
             Some(self.upload_lut3d_resources(lut))
         } else { None };
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(12);
+        // A raw source: this frame's tone keys, read off the eye itself.
+        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[src], stage));
         let idx = self.record_color_stack_16(
-            &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates, None);
+            &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates, None, raw.as_ref());
         self.queue.submit(Some(encoder.finish()));
         Ok(idx.map(|i| intermediates.swap_remove(i)))
     }
@@ -9371,12 +9374,15 @@ impl Device {
         let matching = self.record_eye_match_if_enabled(
             &mut encoder, left, right, w, h, plan, eye_match);
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(24);
+        // A raw source: ONE set of tone keys for the frame, read off both
+        // eyes together, so the two are developed alike.
+        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[left, right], stage));
         let li = self.record_color_stack_16(
             &mut encoder, left, w, h, &plan.for_eye(true), &lut_resources, &mut intermediates,
-            matching.map(|s| (s, 0)));
+            matching.map(|s| (s, 0)), raw.as_ref());
         let ri = self.record_color_stack_16(
             &mut encoder, right, w, h, &plan.for_eye(false), &lut_resources, &mut intermediates,
-            matching.map(|s| (s, 1)));
+            matching.map(|s| (s, 1)), raw.as_ref());
         self.queue.submit(Some(encoder.finish()));
         // `wgpu::Texture` is a cheap handle clone; both indices may point into
         // the same Vec, so clone rather than swap_remove twice.

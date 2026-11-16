@@ -761,6 +761,7 @@ impl Settings {
             plan.raw_develop = Some(vr180_pipeline::raw_tone::RawDevelop {
                 camera: vr180_pipeline::raw_color::RawCamera::X6,
                 settings: self.raw,
+                measure: vr180_pipeline::raw_tone::Measure::Wait,
             });
         }
         // Exposure given beyond normal at the shoot, taken back out in the
@@ -1735,6 +1736,24 @@ pub fn start_decoder(
     let kind = vr180_pipeline::source_kind::detect(&cfg.path)
         .map_err(|e| { tracing::error!("decoder: source detect failed: {e}"); e })?;
     tracing::info!("decoder: source kind = {:?} ({})", kind, kind.display());
+
+    // This thread draws the live preview: a raw clip's tone keys must not
+    // be waited for here (see `compose_with_color_and_mode`). When a
+    // measurement lands that changes them, the frame on screen is drawn
+    // again, as on a settings change. Cleared with the worker.
+    LIVE_PREVIEW.with(|live| live.set(true));
+    struct RawToneNotifier(Arc<Device>);
+    impl Drop for RawToneNotifier {
+        fn drop(&mut self) { self.0.set_raw_tone_notifier(None); }
+    }
+    let _raw_tone = kind.is_raw_video().then(|| {
+        let control = control.clone();
+        pipeline.set_raw_tone_notifier(Some(Arc::new(move || {
+            control.settings_generation.fetch_add(1, Ordering::SeqCst);
+            control.wake_ui();
+        })));
+        RawToneNotifier(pipeline.clone())
+    });
 
     // Still photo (Insta360 X6 `.dng`): not a video — nothing to probe, no
     // timeline. One developed + projected frame, re-rendered on every
@@ -5802,6 +5821,12 @@ fn apply_view_adjust(
     )
 }
 
+thread_local! {
+    /// Set on a preview worker's thread: what it draws must not wait on the
+    /// GPU (the window's own renderer shares the device).
+    static LIVE_PREVIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn compose_with_color_and_mode(
     pipeline: &Device,
     s: &Settings,
@@ -5812,6 +5837,15 @@ fn compose_with_color_and_mode(
     eye_match: Option<(&vr180_pipeline::gpu::EyeMatchState, vr180_pipeline::gpu::EyeMatchFrame)>,
 ) -> anyhow::Result<(wgpu::Texture, u32, u32)> {
     let mut color_plan = s.build_color_stack();
+    // A raw clip's tone keys: the live preview takes the last measurement
+    // that came back; a still drawn on demand measures its own frame.
+    if let Some(stage) = color_plan.raw_develop.as_mut() {
+        stage.measure = if LIVE_PREVIEW.with(|live| live.get()) {
+            vr180_pipeline::raw_tone::Measure::Latest
+        } else {
+            vr180_pipeline::raw_tone::Measure::Wait
+        };
+    }
     // Automatic eye matching needs the pair state. Without one (a source
     // whose sensors expose together, or a caller that has none) the plan
     // must not claim it, or `any_active` would run an empty stack.

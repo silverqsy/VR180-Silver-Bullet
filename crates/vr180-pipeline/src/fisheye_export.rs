@@ -1038,7 +1038,7 @@ fn chain_segment_frames(path: &std::path::Path, fps: f32) -> usize {
 /// many output slots a frame holds across a hole left by dropped frames.
 /// `None` for sources without an MP4 sample table (BRAW, stills); the
 /// constant-rate arithmetic then stands, as it did before.
-fn export_timeline(cfg: &FisheyeExportConfig) -> Option<crate::frame_timeline::FrameTimeline> {
+pub(crate) fn export_timeline(cfg: &FisheyeExportConfig) -> Option<crate::frame_timeline::FrameTimeline> {
     if cfg.source_kind == SourceKind::BlackmagicRaw || cfg.source_kind.is_still() {
         return None;
     }
@@ -1069,7 +1069,7 @@ fn timeline_frames_or(tl: Option<&crate::frame_timeline::FrameTimeline>, fallbac
     tl.map(|t| t.len()).filter(|n| *n > 0).unwrap_or(fallback)
 }
 
-fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
+pub(crate) fn resolve_export_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
     if cfg.source_kind == SourceKind::Insta360Insv {
         return resolve_export_insv_imu(cfg);
     }
@@ -4902,7 +4902,7 @@ pub fn eac_lens_frame(stabilized: bool, side: u32) -> Option<crate::lens_frame::
 /// rgba16 kernels (the same ones the Windows readback path dispatches;
 /// slots 30/31 = export, distinct from preview 0/1). `None` keeps the
 /// legacy byte-path projections — byte-identical to before.
-fn build_eye_eq_16(
+pub(crate) fn build_eye_eq_16(
     pipeline: &Device,
     pair: &FisheyePair,
     src_w: u32, src_h: u32,
