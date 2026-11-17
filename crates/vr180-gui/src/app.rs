@@ -8848,6 +8848,7 @@ impl App {
                 | Some(vr180_pipeline::SourceKind::SbsFisheye)
                 | Some(vr180_pipeline::SourceKind::BlackmagicRaw)
                 | Some(vr180_pipeline::SourceKind::GoProEac)
+                | Some(vr180_pipeline::SourceKind::X6Raw)
         );
         let align_running = self.align_rx.is_some();
         let align_status = self.align_status.clone();

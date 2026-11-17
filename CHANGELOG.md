@@ -144,6 +144,12 @@ converter's controls for it, and every frame can be had as a DNG.
   them the far-field shake of a locked export fell from 1.5 to 0.4 pixels
   a frame at 1024 pixels an eye (2.6 without stabilization). Takes of the
   earlier build have neither and stabilize as before.
+- **Auto align.** The View adjustment panel's Auto align works on raw
+  takes: the two eyes' camera-linear frames are turned into a picture the
+  matcher can read (white-balanced, lifted, on a display curve) and
+  measured as any other clip's. On two takes of one camera it gives the
+  same pitch and roll to 0.01°, and a known offset put on the sliders
+  comes back in the measurement to 0.005°.
 - **Settings from Camera Raw.** Raw development has **Read from Camera
   Raw**: the white balance, the six tone controls, the sharpening and the
   colour noise reduction a frame was left with in Camera Raw become the

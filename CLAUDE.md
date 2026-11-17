@@ -3051,6 +3051,25 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      (the GPU stages against their CPU twins, the tables and families
      against Camera Raw's numbers, the keys read off the reduced copy,
      the sharpening's kernel and limits).
+   - **Stereo Auto align on a raw take** (2026-11-16, the user: "为什么raw
+     视频 auto align没有了"; it never was there: `align_ok` in
+     `draw_view_adjust_panel` did not list `X6Raw`, because
+     `stereo_align::measure_stereo_align` projects 8-bit eyes and a raw
+     take hands out 16-bit camera-linear ones). Now: the take is opened
+     at half size in memory (`X6RawIter::new(.., half = true, .., None)`),
+     its lens comes from `resolve_export_imu`, and each eye goes through
+     `stereo_align::linear_to_picture` (scaled to the camera's neutral,
+     lifted so that 99 % of the greens sit under 0.85, gamma 1/2.2,
+     RGBA8) before the usual projection and patch matching. Measured
+     (harness `X6_ALIGN=1`): takes 161426 and 161606 of the same camera
+     give pitch +0.053 / +0.058, roll −0.206 / −0.194, yaw +0.11 / +0.05,
+     residual 0.028°; a known offset on the sliders (yaw +0.30, pitch
+     +0.20, roll −0.25) changes the measurement by −0.201 pitch, +0.245
+     roll (yaw −0.41: the yaw is the far cluster's, as for every source);
+     the measurement's own correction applied brings pitch and roll to
+     0.000 / −0.004. A take full of motion blur (205643: 16 ms shutters at
+     night) gives a residual of 0.58° and values not to trust: the
+     residual says so.
    - **Settings read back from Camera Raw** (2026-11-16, the user: yes to
      reading them back; `raw_export::read_develop_xmp` = the inverse of
      `develop_xmp`, `enhanced_dng::read_xmp`, `x6_raw::camera_raw_settings`,
@@ -3124,7 +3143,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      have no shutter time, so their pose is sampled half a shutter (plus
      the gyro's lag) early (Motion and timing); the gyro's lag is not
      known for any take; takes of the earliest camera build have neither
-     readout nor accelerometer; raw clips are not in stereo auto-align; the
+     readout nor accelerometer; the
      development panel, the DNG snapshot and the DNG sequence option have
      not been seen running on a display yet.
    - **WINDOWS**: shared code; the only gate touched is the pair moved into
