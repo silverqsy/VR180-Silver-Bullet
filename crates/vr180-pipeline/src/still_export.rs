@@ -5,7 +5,7 @@
 //! = RIGHT eye). Each half is developed on the CPU
 //! ([`raw_develop::develop_linear`]: gain map, demosaic, camera-linear
 //! RGBA64), projected through the same UCM fisheye kernels the video path
-//! uses (16-bit, [`Device::project_fisheye_to_equirect_texture_16`]), read
+//! uses (16-bit, [`Device::project_eye`]), read
 //! back, and composed side by side on the CPU (a native 15520-wide SBS
 //! texture would exceed wgpu's default 8192 limit).
 //!
@@ -250,12 +250,10 @@ fn project_eye(
     calib: FisheyeCalib,
     projection: FisheyeExportProjection,
 ) -> Result<wgpu::Texture> {
-    let bytes: &[u8] = bytemuck::cast_slice(rgba64);
-    if projection == FisheyeExportProjection::Fisheye {
-        device.project_fisheye_to_fisheye_texture_16(bytes, 16, src_w, src_h, eye_w, eye_h, rot, calib)
-    } else {
-        device.project_fisheye_to_equirect_texture_16(bytes, src_w, src_h, eye_w, eye_h, rot, calib)
-    }
+    device.project_eye(&crate::gpu::EyeProjection::new(
+        crate::gpu::EyePicture::Bytes16 { bytes: bytemuck::cast_slice(rgba64), bit_depth: 16, w: src_w, h: src_h },
+        eye_w, eye_h, rot, calib,
+    ).wide().fisheye_out(projection == FisheyeExportProjection::Fisheye))
 }
 
 /// Compose two RGBA64LE eyes side by side into interleaved RGB16 (no alpha).

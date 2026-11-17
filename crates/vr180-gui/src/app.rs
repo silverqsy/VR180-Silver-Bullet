@@ -3683,12 +3683,11 @@ impl App {
                 disparity: opts.spatial_disparity_pct / 100.0,
             }),
             stabilize: settings.stabilize,
-            // Camera lock drives the pipeline's frame-0 lock via smooth_ms=0 and
-            // drops the correction cap (0 → ∞ at the export sites): fully locked
-            // no matter what the camera does. Soft-stab passes the window floored
-            // off 0 (the lock sentinel) and the user's cap.
-            dji_max_corr_deg: if settings.dji_camera_lock { 0.0 } else { settings.dji_max_corr_deg },
-            dji_smooth_ms: if settings.dji_camera_lock { 0.0 } else { settings.dji_smooth_ms.max(1.0) },
+            // The same cap and window the preview stabilizes with
+            // (`Settings::stab_cap_and_window`); the export's own form of
+            // "no cap" is 0.
+            dji_max_corr_deg: Some(settings.stab_cap_and_window().0).filter(|cap| cap.is_finite()).unwrap_or(0.0),
+            dji_smooth_ms: settings.stab_cap_and_window().1,
             dji_responsiveness: settings.dji_responsiveness,
             denoise_strength: settings.denoise_strength,
             view_adjust: settings.output_view_adjust(),

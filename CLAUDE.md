@@ -667,7 +667,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    test: exiftool -validate OK, sips/ImageIO decodes, Adobe DNG Converter
    17.3 accepts sample-identically; NOTE macOS ImageIO rejects Deflate and
    multi-strip LJPEG, and any DNG < 100 KiB), `vr180_pipeline::still_export`
-   (`export_still`: per half develop → `project_fisheye_to_equirect_texture_16`
+   (`export_still`: per half develop → `Device::project_eye`
    with `still_eye_calib` (= `stream_lens_calib(entry, crop, 7760, 7760)` →
    `FisheyeCalib::new_omni`) → readback → CPU SBS compose → PNG16 / JPEG /
    DNG; 0.6 s for 8192×4096 on the M5 Max), `SourceKind::Insta360Dng`
@@ -760,7 +760,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
    also the 3D LUT + Detail sections, and `Settings::still_dng_mode`
    (serde-skipped, set by the GUI each frame) makes `build_color_stack`
    drop LUT / sharpen / auto eye match so preview == DNG. Stills now take
-   `FisheyeExportProjection` (Fisheye → `project_fisheye_to_fisheye_texture_16`,
+   `FisheyeExportProjection` (Fisheye → `project_eye` with `fisheye_out`,
    Reframe → `with_reframe` on the equirect kernel, as `run_still` already
    did for the preview) and the per-eye lens Override via
    `StillLensOverride::from_export_cfg` (same formulas as the video
@@ -1353,7 +1353,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      Option<Arc<GpuPair>>` (textures + a `ZcSlotGuard` that releases the
      slot when the LAST Arc clone drops), `BrawZcIter` (macOS) hands such
      pairs out with the same step / seek / canvas semantics, and the
-     preview loop renders them with `Device::project_fisheye_from_texture`
+     preview loop renders them with `Device::project_eye`
      (one entry point for hequirect / fisheye-out × plain / RS — the same
      kernels, no upload) and keeps an Arc clone in
      `queue.on_submitted_work_done` so the slot is only returned after the
@@ -3384,6 +3384,84 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      stage-time line is written only by the arm that times its stages
      (`99516c2`): through the encoder's surfaces it logged three zeros
      beside the decode time.
+
+35. **The `refactor` branch on Windows (2026-11-17, Windows box; branch
+   only, nothing of it is on `main`).** `origin/refactor` @ `d95dd62` (one
+   projection kernel source, `project_eye`, `FramePose`, one colour-stack
+   recorder, `run_fisheye_frames` / `run_eac_frames`, `lens_model`, the
+   preview probe) had `main` up to `ec7de04` in it. Here `main` @ `8948361`
+   (the Windows work of items 30 to 34: seven commits) was merged in.
+   - **As pushed** it builds on Windows first try. Pipeline tests: 228 pass,
+     3 fail, all three known from `main` before its fixes: the two cube-map
+     lens-frame tests (the CRLF splice; the fisheye family no longer has
+     that problem, its builds are composed line by line and come out with
+     bare line feeds) and the 8-bit LUT bound (the GPU's rounding).
+   - **The merge** conflicted in `fisheye_export.rs` only, where `main`'s
+     portable loop had gained the plane feed, the encoder thread and the
+     per-stage timing while the branch had replaced that loop with
+     `run_fisheye_frames`. Ported into it: `PlaneFeed` is decided once the
+     sink is open and only for `FrameSink::Readback`; the 10-bit readback
+     arm composes and reads back planes or RGB48; the loop pulls its frame
+     inside the `decode` timer; `EncodeStage` wraps the encoder (the macOS
+     surface functions take `&mut ExportEncoder` and get it by deref).
+     Everything else merged by itself (`lens_frame_request`, the raw
+     read-ahead in the opener, `unix_lines`, the test bounds).
+   - **Exports: 61 files byte-identical, stream for stream, between the
+     `main` build and the merged branch's build** (two worktrees, the same
+     harness, `ab_run.ps1` / `ab_cmp.py` in the session scratchpad): Osmo,
+     X6 (dropped frames, Crop + mask), GoPro `.360`, QooCam, a raw take,
+     Blackmagic RAW; the portable loop (libx265, and NVENC / ProRes through
+     the plane feed), the D3D11 zero-copy readback arm, the GPU-resident
+     NVENC arms, the `.360` readback tail; half-equirect, disc, lens frame
+     (also the one held to 8192 × 4096), reframed; 8 and 10 bit; LUT +
+     ETTR + eye match; trim; stabilization on and off.
+   - **Previews: 36 probe cases print the same lines on both** (the
+     branch's `VR180_PREVIEW_PROBE`, put into a throwaway worktree of
+     `main` with its two hooks): X6, Osmo, QooCam, Crop and `.360` on the
+     Windows zero-copy workers, the same clips on the CPU worker
+     (`VR180_NO_HW_DECODE=1`), a raw take, Blackmagic RAW; half-equirect,
+     Lens Space with either lens, reframed, the view modes, LUT, ETTR,
+     auto eye match, crop mask, unstabilized, and the zoom still.
+     ONE FIX FOR THAT, on the branch: **the probe ran the CPU preview on
+     Windows.** Its device came from `Device::new()`, which does not ask for
+     the P010 texture format the Windows zero-copy gate requires (the app's
+     own device does, `main.rs`), so the worker edited by text was never
+     reached. On Windows the probe now takes
+     `Device::new_dedicated_from_adapter` on the same adapter; the Mac's
+     probe device is as it was. The probe has no zoom still for a `.360`
+     (both branches: "non-fisheye source").
+   - Tests on the merged branch: core 63, fisheye 70, braw 6, pipeline 243
+     (+ `projection_fingerprints`, which wants `VR180_FINGERPRINTS=<file>`
+     and is a tool, not a check), gui 42. On D3D12 (`VR180_BACKEND=dx12`)
+     pipeline 232 of 233, the one being the lens frame's outermost pixels,
+     as on `main`. `windows_adapter_smoke` passes on the RTX 4090 and on
+     the Intel UHD 770. The app starts, opens an X6 clip on the zero-copy
+     preview and plays at its cadence.
+   - A new worktree has no `helpers/bin` (ignored, built): copy
+     `braw_helper.exe` from the main checkout or run `build_braw.ps1`, or
+     every `.braw` probe fails.
+   - As the branch's commits say, the three Windows-only arms still call
+     the four `project_fisheye_rgba16_texture_*` wrappers and keep their
+     own per-frame pose: moving them onto `project_eye` / `FramePose` is
+     still to do, and this A/B set is the check for it.
+   - **MAC SIDE (2026-11-17, Mac):** the Mac had made the same merge of
+     `main` @ `8948361` within the hour and not pushed it. The two ports
+     of the loop came out the same but for the spelling of the sink test
+     (`!=` there, `matches!` here) and one comment, so the Mac dropped its
+     own and took this head, then merged the three Mac commits of `main`
+     (`99516c2`, `879331c`, `c171c06`) as `8093d7b`: the gate on the
+     stage-time line lands in `run_fisheye_frames` by itself. On that
+     head: it builds (the macOS-gated arms inside the shared loops were
+     never compiled on Windows; this is their compile), tests braw 6,
+     core 63, fisheye 69, gui 40, pipeline 235, and the Mac's stored sets
+     are the same as `main`'s: 65 exports (every encoder arm of both
+     loops, raw takes, lens frames, DNG frames) and 169 preview lines
+     (the workers, the zoom stills). With the macOS branches switched off
+     the workspace type-checks as `main` does, and the text of the
+     Windows-gated items is `main`'s but for the `stab_cap_and_window`
+     substitution in `run_fisheye_zerocopy`. With the A/B above the branch
+     gives `main`'s pictures on both machines; what is left before it
+     lands is the decision.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

@@ -30,6 +30,9 @@ use vr180_pipeline::gpu::{
 };
 #[allow(unused_imports)]
 use vr180_pipeline::gpu::ColorStackPlan;
+use vr180_pipeline::gpu::{EyePicture, EyeProjection};
+
+pub(crate) mod preview_probe;
 
 #[cfg(target_os = "macos")]
 use vr180_pipeline::{decode::ZeroCopyStreamPairIter, gpu::Lens};
@@ -687,6 +690,62 @@ impl Settings {
         s.preview_mode = PreviewMode::SingleEye;
         s.preview_eye_right = false;
         s
+    }
+
+    /// What decides the lens models of a `kind` clip under these settings
+    /// (see [`vr180_pipeline::lens_model`]). A reframed view's shape is the
+    /// chosen aspect.
+    pub fn lens_request(&self, kind: vr180_pipeline::SourceKind) -> vr180_pipeline::lens_model::LensRequest<'_> {
+        use vr180_pipeline::lens_model::{EyeLensOverride, LensOutput, LensRequest};
+        LensRequest {
+            kind,
+            preset: &self.fisheye_preset,
+            swap_eyes: self.effective_swap_eyes(),
+            left: EyeLensOverride {
+                on: self.fisheye_override_left,
+                fov_deg: self.fisheye_fov_deg_left,
+                cx_norm: self.fisheye_cx_norm_left,
+                cy_norm: self.fisheye_cy_norm_left,
+                k: self.fisheye_k_left,
+                k5: self.fisheye_k5_left,
+                p: self.fisheye_p_left,
+            },
+            right: EyeLensOverride {
+                on: self.fisheye_override_right,
+                fov_deg: self.fisheye_fov_deg_right,
+                cx_norm: self.fisheye_cx_norm_right,
+                cy_norm: self.fisheye_cy_norm_right,
+                k: self.fisheye_k_right,
+                k5: self.fisheye_k5_right,
+                p: self.fisheye_p_right,
+            },
+            crop_mask: self.crop_mask,
+            sbs_dewarp_fisheye: self.sbs_dewarp_fisheye,
+            output: match self.fisheye_output_mode {
+                FisheyeOutputMode::HalfEquirect => LensOutput::HalfEquirect,
+                FisheyeOutputMode::Fisheye => LensOutput::Fisheye,
+                FisheyeOutputMode::Reframe => LensOutput::Reframe {
+                    hfov_deg: self.reframe_hfov_deg,
+                    defish: self.reframe_defish,
+                    aspect: self.reframe_aspect.ratio(),
+                },
+            },
+        }
+    }
+
+    /// The stabilization's correction cap (degrees; infinite = none) and
+    /// smoothing window (ms; 0 = locked to the first frame) under these
+    /// settings, as `compute_dji_stabilization` takes them. Camera lock: no
+    /// window and no cap, fully locked whatever the camera does. Soft
+    /// stabilization: the window is kept off 0 (the lock's own value) and a
+    /// cap of 0 means none.
+    pub fn stab_cap_and_window(&self) -> (f32, f32) {
+        if self.dji_camera_lock {
+            (f32::INFINITY, 0.0)
+        } else {
+            let cap = if self.dji_max_corr_deg > 0.0 { self.dji_max_corr_deg } else { f32::INFINITY };
+            (cap, self.dji_smooth_ms.max(1.0))
+        }
     }
 
     /// The L↔R eye swap that should actually be applied: the manual
@@ -2305,18 +2364,8 @@ fn run_fisheye(
             | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw
             | vr180_pipeline::SourceKind::X6Raw => {
                 if let Some(osv) = dji_osv_imu {
-                    // Camera lock (toggle on) → smooth_ms = 0 drives the
-                    // pipeline's sharp frame-0 lock. Soft-stab (toggle off)
-                    // uses the smoothing window, floored off 0 so it never
-                    // trips the lock sentinel. Under camera lock the cap is
-                    // ignored (∞): fully locked no matter what the camera does.
                     let s = control.settings.read();
-                    let max_corr_deg = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock {
-                        s.dji_max_corr_deg
-                    } else {
-                        f32::INFINITY
-                    };
-                    let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
+                    let (max_corr_deg, smooth_ms) = s.stab_cap_and_window();
                     let responsiveness = s.dji_responsiveness;
                     drop(s);
                     match vr180_pipeline::dji_imu::compute_dji_stabilization(
@@ -2803,19 +2852,11 @@ fn run_fisheye(
             let s = control.settings.read();
             s.output_view_adjust()
         };
-        let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(
-            rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes);
-        let (rot_left, rot_right) = if view_adjust.is_identity() {
-            (rot_l0, rot_r0)
-        } else {
-            let (v_l, v_r) = view_adjust.per_eye_matrices();
-            (
-                vr180_pipeline::gpu::EquirectRotation(
-                    vr180_pipeline::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
-                vr180_pipeline::gpu::EquirectRotation(
-                    vr180_pipeline::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
-            )
-        };
+        // (This arm builds its per-row matrices itself, above, beside the
+        // diagnostics that read them.)
+        let vr180_pipeline::render::FramePose { rot_left, rot_right, .. } =
+            vr180_pipeline::render::FramePose::new(
+                rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes, &view_adjust, None);
         // Decide projection target: half-equirect VR180 (default) or
         // stabilized fisheye output. Both paths apply the per-frame stab
         // matrix composed with the per-eye view-adjust (so panomap +
@@ -2827,69 +2868,44 @@ fn run_fisheye(
             // A single-eye source: the left projection serves as both.
             let one_eye = s.single_eye || pair.single_eye();
             drop(s);
-            match mode {
-                FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => {
-                    // A reframed view keeps the working width and takes its aspect.
-                    let (eye_w, eye_h) = preview_out_dims(mode, aspect, eye_w, eye_h);
-                    if let Some(g) = pair.gpu.as_deref() {
-                        // Zero-copy source: the eyes are textures already.
-                        let l = project_gpu_eye(
-                            &pipeline, &g.left, eye_w, eye_h, rot_left, calib_left, rs_rows_l.as_deref(), false, 0)?;
-                        let r = if one_eye { l.clone() } else { project_gpu_eye(
-                            &pipeline, &g.right, eye_w, eye_h, rot_right, calib_right, rs_rows_r.as_deref(), false, 1)? };
-                        (l, r)
-                    } else if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                        let l = pipeline.project_fisheye_to_equirect_rs_texture(
-                            &pair.left, src_w, src_h, eye_w, eye_h, rot_left, calib_left, rs_l, 0,
-                        )?;
-                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_to_equirect_rs_texture(
-                            &pair.right, src_w, src_h, eye_w, eye_h, rot_right, calib_right, rs_r, 1,
-                        )? };
-                        (l, r)
-                    } else {
-                        let l = pipeline.project_fisheye_to_equirect_texture(
-                            &pair.left, src_w, src_h, eye_w, eye_h, rot_left, calib_left, 0,
-                        )?;
-                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_to_equirect_texture(
-                            &pair.right, src_w, src_h, eye_w, eye_h, rot_right, calib_right, 1,
-                        )? };
-                        (l, r)
-                    }
-                }
-                FisheyeOutputMode::Fisheye => {
-                    // The disc: min(eye_w, eye_h) on both axes, a circle
-                    // in a square frame whatever the half-equirect's shape.
-                    // A lens frame: its own size.
-                    let (fw, fh) = view_out_dims(mode, aspect, eye_w, eye_h, lens_dims);
-                    if let Some(g) = pair.gpu.as_deref() {
-                        let l = project_gpu_eye(
-                            &pipeline, &g.left, fw, fh, rot_left, calib_left, rs_rows_l.as_deref(), true, 0)?;
-                        let r = if one_eye { l.clone() } else { project_gpu_eye(
-                            &pipeline, &g.right, fw, fh, rot_right, calib_right, rs_rows_r.as_deref(), true, 1)? };
-                        (l, r)
-                    } else if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                        // Per-row rolling-shutter correction, same as the
-                        // half-equirect path — the RS warp operates on the
-                        // source-frame direction independent of the output
-                        // projection.
-                        let l = pipeline.project_fisheye_to_fisheye_rs_texture(
-                            &pair.left, src_w, src_h, fw, fh, rot_left, calib_left, rs_l,
-                        )?;
-                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_to_fisheye_rs_texture(
-                            &pair.right, src_w, src_h, fw, fh, rot_right, calib_right, rs_r,
-                        )? };
-                        (l, r)
-                    } else {
-                        let l = pipeline.project_fisheye_to_fisheye_texture(
-                            &pair.left, src_w, src_h, fw, fh, rot_left, calib_left,
-                        )?;
-                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_to_fisheye_texture(
-                            &pair.right, src_w, src_h, fw, fh, rot_right, calib_right,
-                        )? };
-                        (l, r)
-                    }
-                }
-            }
+            let fisheye_out = mode == FisheyeOutputMode::Fisheye;
+            // The disc: min(eye_w, eye_h) on both axes, a circle in a square
+            // frame whatever the half-equirect's shape. A lens frame: its
+            // own size. A reframed view keeps the working width and takes
+            // its aspect.
+            let (out_w, out_h) = view_out_dims(mode, aspect, eye_w, eye_h, lens_dims);
+            // Both projections take the per-row rolling-shutter correction:
+            // the warp works on the source-frame direction, whatever the
+            // output. A zero-copy source (its eyes are textures already)
+            // corrects each eye that has rows; decoded bytes correct both
+            // eyes or neither.
+            let gpu = pair.gpu.as_deref();
+            let (rows_l, rows_r) = if gpu.is_some() {
+                (rs_rows_l.as_deref().filter(|r| !r.is_empty()), rs_rows_r.as_deref().filter(|r| !r.is_empty()))
+            } else {
+                vr180_pipeline::gpu::rows_for_both(rs_rows_l.as_deref(), rs_rows_r.as_deref())
+            };
+            let views = gpu.map(|g| (g.left.create_view(&Default::default()), g.right.create_view(&Default::default())));
+            let (pic_l, pic_r) = match &views {
+                Some((l, r)) => (EyePicture::Rgba(l), EyePicture::Rgba(r)),
+                None => (
+                    EyePicture::Bytes8 { rgba: &pair.left, w: src_w, h: src_h, slot: 0 },
+                    EyePicture::Bytes8 { rgba: &pair.right, w: src_w, h: src_h, slot: 1 },
+                ),
+            };
+            let left = EyeProjection::new(pic_l, out_w, out_h, rot_left, calib_left)
+                .fisheye_out(fisheye_out).rs_rows(rows_l);
+            let right = EyeProjection::new(pic_r, out_w, out_h, rot_right, calib_right)
+                .fisheye_out(fisheye_out).rs_rows(rows_r);
+            // A 16-bit eye on the GPU (a raw take's demosaiced eye) goes
+            // through the 16-bit build, so its linear values reach the
+            // colour stack at full precision, into the outputs kept for
+            // slots 0 / 1. An 8-bit one (a zero-copy Blackmagic RAW slot)
+            // keeps the 8-bit build, as before.
+            let wide = |eye: &wgpu::Texture| eye.format() == wgpu::TextureFormat::Rgba16Unorm;
+            let left = if gpu.is_some_and(|g| wide(&g.left)) { left.wide().slot(0) } else { left };
+            let right = if gpu.is_some_and(|g| wide(&g.right)) { right.wide().slot(1) } else { right };
+            pipeline.project_eyes(&left, (!one_eye).then_some(&right))?
         };
         let (preview_eye_w, preview_eye_h) = (left_tex.width(), left_tex.height());
         let phase_project = phase_t2.elapsed();
@@ -2995,15 +3011,13 @@ fn project_gpu_eye(
     fisheye_out: bool,
     slot: u32,
 ) -> vr180_pipeline::Result<wgpu::Texture> {
-    if eye.format() != wgpu::TextureFormat::Rgba16Unorm {
-        return pipeline.project_fisheye_from_texture(eye, out_w, out_h, rot, calib, rs_rows, fisheye_out);
-    }
-    let (sw, sh) = (eye.width(), eye.height());
-    match (fisheye_out, rs_rows.filter(|r| !r.is_empty())) {
-        (false, Some(rows)) => pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(eye, sw, sh, out_w, out_h, rot, calib, rows, slot),
-        (false, None) => pipeline.project_fisheye_rgba16_texture_to_equirect_16(eye, sw, sh, out_w, out_h, rot, calib, slot),
-        (true, Some(rows)) => pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(eye, sw, sh, out_w, out_h, rot, calib, rows, slot),
-        (true, None) => pipeline.project_fisheye_rgba16_texture_to_fisheye_16(eye, sw, sh, out_w, out_h, rot, calib, slot),
+    let view = eye.create_view(&Default::default());
+    let request = EyeProjection::new(EyePicture::Rgba(&view), out_w, out_h, rot, calib)
+        .fisheye_out(fisheye_out).rs_rows(rs_rows.filter(|r| !r.is_empty()));
+    if eye.format() == wgpu::TextureFormat::Rgba16Unorm {
+        pipeline.project_eye(&request.wide().slot(slot))
+    } else {
+        pipeline.project_eye(&request)
     }
 }
 
@@ -3051,7 +3065,7 @@ fn retire_frame(
 /// sub-thread decodes both streams with `d3d11va` and shares each eye out as an
 /// NT-handle P010 texture (no CPU download, no swscale); this thread imports
 /// each into wgpu's Vulkan device (zero-copy memory alias) and projects the
-/// P010 planes directly via `project_fisheye_p010_planar_to_equirect_texture_16`.
+/// P010 planes directly (plane-aspect views into the projection kernel).
 ///
 /// Honors both output modes: `HalfEquirect` (RS-corrected when OSV stab is on)
 /// and `Fisheye` (raw stabilized fisheye SBS), each via the matching RGBA16
@@ -3160,8 +3174,7 @@ fn run_fisheye_zerocopy(
                         control: &DecoderControl| -> Option<Vec<EquirectRotation>> {
         let osv = osv?;
         let s = control.settings.read();
-        let max_corr_deg = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock { s.dji_max_corr_deg } else { f32::INFINITY };
-        let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
+        let (max_corr_deg, smooth_ms) = s.stab_cap_and_window();
         let responsiveness = s.dji_responsiveness;
         drop(s);
         match vr180_pipeline::dji_imu::compute_dji_stabilization(
@@ -3674,8 +3687,7 @@ fn run_fisheye_vt_zerocopy(
                         control: &DecoderControl| -> Option<Vec<EquirectRotation>> {
         let osv = osv?;
         let s = control.settings.read();
-        let max_corr_deg = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock { s.dji_max_corr_deg } else { f32::INFINITY };
-        let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
+        let (max_corr_deg, smooth_ms) = s.stab_cap_and_window();
         let responsiveness = s.dji_responsiveness;
         drop(s);
         match vr180_pipeline::dji_imu::compute_dji_stabilization(
@@ -3956,31 +3968,19 @@ fn run_fisheye_vt_zerocopy(
 
         // Per-row rolling-shutter correction (OSV; gated on stabilize, like the
         // CPU/paused-still path). `src_h` is the working-res fisheye height.
-        let swapped_eyes = control.settings.read().effective_swap_eyes();
-        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if control.settings.read().stabilize {
-            dji_osv_imu.as_ref().map(|osv| vr180_pipeline::dji_imu::per_eye_rs_rows(
-                osv, stab_idx,
-                vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0,
-                src_h, fps, swapped_eyes,
-            )).unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-        let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes);
-
-        let view_adjust = {
+        let (swapped_eyes, stabilize, view_adjust) = {
             let s = control.settings.read();
-            s.output_view_adjust()
+            (s.effective_swap_eyes(), s.stabilize, s.output_view_adjust())
         };
-        let (rot_left, rot_right) = if view_adjust.is_identity() {
-            (rot_l0, rot_r0)
-        } else {
-            let (v_l, v_r) = view_adjust.per_eye_matrices();
-            (
-                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
-                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
-            )
-        };
+        let vr180_pipeline::render::FramePose {
+            rot_left, rot_right, rows_left: rs_rows_l, rows_right: rs_rows_r,
+        } = vr180_pipeline::render::FramePose::new(
+            rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes, &view_adjust,
+            stabilize.then(|| vr180_pipeline::render::RowReadout {
+                readout_s: vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0,
+                src_h, fps,
+            }),
+        );
 
         let (left_tex, right_tex) = {
             let (mode, aspect) = {
@@ -3988,38 +3988,15 @@ fn run_fisheye_vt_zerocopy(
                 (s.fisheye_output_mode, s.reframe_aspect)
             };
             let (ow, oh) = view_out_dims(mode, aspect, eye_w, eye_h, lens_dims);
-            match mode {
-                FisheyeOutputMode::Fisheye => {
-                    if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                        let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                            &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs_l, 0)?;
-                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs_r, 1)? };
-                        (l, r)
-                    } else {
-                        let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                            &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, 0)?;
-                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1)? };
-                        (l, r)
-                    }
-                }
-                FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => {
-                    if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                        let l = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                            &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs_l, 0)?;
-                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs_r, 1)? };
-                        (l, r)
-                    } else {
-                        let l = pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                            &l_tex, src_w, src_h, ow, oh, rot_left, calib_left, 0)?;
-                        let r = if one_eye { l.clone() } else { pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                            &r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1)? };
-                        (l, r)
-                    }
-                }
-            }
+            let fisheye_out = mode == FisheyeOutputMode::Fisheye;
+            let (rows_l, rows_r) = vr180_pipeline::gpu::rows_for_both(rs_rows_l.as_deref(), rs_rows_r.as_deref());
+            let (view_l, view_r) = (l_tex.create_view(&Default::default()), r_tex.create_view(&Default::default()));
+            // Outputs kept in slots 0 / 1: the preview's two eyes.
+            let left = EyeProjection::new(EyePicture::Rgba(&view_l), ow, oh, rot_left, calib_left)
+                .wide().fisheye_out(fisheye_out).rs_rows(rows_l).slot(0);
+            let right = EyeProjection::new(EyePicture::Rgba(&view_r), ow, oh, rot_right, calib_right)
+                .wide().fisheye_out(fisheye_out).rs_rows(rows_r).slot(1);
+            pipeline.project_eyes(&left, (!one_eye).then_some(&right))?
         };
         let (pe_w, pe_h) = (left_tex.width(), left_tex.height());
         let auto_eye = control.settings.read().auto_eye_match;
@@ -4425,19 +4402,14 @@ fn run_still(
             let (w, h) = preview_out_dims(snap.fisheye_output_mode, snap.reframe_aspect, eye_w, eye_h);
             (w, h, 0, 1)
         };
-        let (left_tex, right_tex) = match snap.fisheye_output_mode {
-            FisheyeOutputMode::Fisheye => (
-                pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                    s_l, s_w, s_h, ow, oh, rot_l, calib_l, slot_l)?,
-                pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                    s_r, s_w, s_h, ow, oh, rot_r, calib_r, slot_r)?,
-            ),
-            FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => (
-                pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                    s_l, s_w, s_h, ow, oh, rot_l, calib_l, slot_l)?,
-                pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                    s_r, s_w, s_h, ow, oh, rot_r, calib_r, slot_r)?,
-            ),
+        let (left_tex, right_tex) = {
+            let fisheye_out = snap.fisheye_output_mode == FisheyeOutputMode::Fisheye;
+            let (view_l, view_r) = (s_l.create_view(&Default::default()), s_r.create_view(&Default::default()));
+            let left = EyeProjection::new(EyePicture::Rgba(&view_l), ow, oh, rot_l, calib_l)
+                .wide().fisheye_out(fisheye_out).slot(slot_l);
+            let right = EyeProjection::new(EyePicture::Rgba(&view_r), ow, oh, rot_r, calib_r)
+                .wide().fisheye_out(fisheye_out).slot(slot_r);
+            pipeline.project_eyes(&left, Some(&right))?
         };
         let (pe_w, pe_h) = (left_tex.width(), left_tex.height());
 
@@ -4492,23 +4464,19 @@ fn _check_pair_dims(
     }
 }
 
-/// Build per-eye `FisheyeCalib`s for the current settings + source +
-/// working resolution. Called once at decoder start, and again on
-/// every `settings_generation` bump.
+/// Per-eye lens models for the current settings, source and working
+/// resolution: [`vr180_pipeline::lens_model::resolve_lens_pair`], the
+/// resolver an export asks too, so the preview and the export of a clip
+/// cannot disagree about its lens. Called at decoder start and again on
+/// every `settings_generation` bump. Returns `(left, right)`.
 ///
-/// Returns `(calib_left, calib_right)`. For non-DJI sources both are
-/// identical. For DJI OSV, when a parsed protobuf is supplied, each
-/// eye gets its FULL per-lens factory calibration from the protobuf:
-/// fx/fy (→FOV), principal point (cx/cy), AND the KB k1–k4 distortion.
-/// The file's KB polynomial folds past ~89°, so it is valid only out
-/// to the 180°-VR180 edge (max sampled θ = 90°); for full-FOV output
-/// past 180° prefer the preset/override. Anything the file omits
-/// falls back to the preset.
-///
-/// Eye→lens mapping: DJI's stream-to-lens layout is stream 0 = Lens A
-/// = right eye, stream 1 = Lens B = left eye, AND we swap_eyes at
-/// the iter (see DualStreamFisheyeIter::new_with_swap). So after the
-/// swap: left output = Lens B, right output = Lens A.
+/// For a source whose file carries a per-lens calibration (`osv`), each
+/// eye gets the full factory model of its lens, scaled to the working
+/// size. A dual-stream camera's stream 0 is lens A = the RIGHT eye and the
+/// iterator swaps by default, so left output = lens B, right = lens A; the
+/// user's swap exchanges them and the calibration follows the stream.
+/// Anything the file omits falls back to the preset; Override replaces the
+/// file's model with the manual fields.
 pub(crate) fn resolve_fisheye_calib_pair(
     s: &Settings,
     kind: vr180_pipeline::SourceKind,
@@ -4516,7 +4484,7 @@ pub(crate) fn resolve_fisheye_calib_pair(
     src_h: u32,
     osv: Option<&vr180_fisheye::DjiOsvImu>,
 ) -> (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib) {
-    fisheye_view_calib_pair(s, resolve_fisheye_source_calib_pair(s, kind, src_w, src_h, osv))
+    vr180_pipeline::lens_model::resolve_lens_pair(&s.lens_request(kind), src_w, src_h, osv)
 }
 
 /// The two eyes' calibrations before the output view is put on them
@@ -4529,221 +4497,17 @@ pub(crate) fn resolve_fisheye_source_calib_pair(
     src_h: u32,
     osv: Option<&vr180_fisheye::DjiOsvImu>,
 ) -> (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib) {
-    use vr180_fisheye::presets;
-
-    // Pick a preset. Explicit name wins; else fall back to the
-    // source-kind default.
-    let preset = if !s.fisheye_preset.is_empty() && s.fisheye_preset != "Auto" {
-        presets::find(&s.fisheye_preset)
-    } else {
-        None
-    }
-    .unwrap_or_else(|| {
-        let auto_name = match kind {
-            vr180_pipeline::SourceKind::DjiOsv         => "DJI Osmo 360",
-            vr180_pipeline::SourceKind::Insta360Insv
-            | vr180_pipeline::SourceKind::X6Raw
-            | vr180_pipeline::SourceKind::Insta360Dng  => "Insta360 X6",
-            vr180_pipeline::SourceKind::KandaoQoocam
-            | vr180_pipeline::SourceKind::KandaoDng    => vr180_pipeline::kandao_imu::KANDAO_PRESET_NAME,
-            vr180_pipeline::SourceKind::BlackmagicRaw  => vr180_pipeline::braw_imu::BRAW_PRESET_NAME,
-            _                                          => "Custom",
-        };
-        presets::find(auto_name).unwrap_or(&presets::presets()[7])
-    });
-
-    // Preset-derived auto fx (used when override is off and the
-    // protobuf doesn't supply fx, or for non-OSV sources).
-    let fx_auto = if preset.calib.fx > 0.0 && preset.calib.calib_w > 0 {
-        (preset.calib.fx as f32) * (src_w as f32) / (preset.calib.calib_w as f32)
-    } else {
-        let half = (preset.default_fov_deg as f32).to_radians() * 0.5;
-        (src_w as f32) / (2.0 * half)
-    };
-    let preset_k = [preset.calib.k[0] as f32, preset.calib.k[1] as f32,
-                    preset.calib.k[2] as f32, preset.calib.k[3] as f32];
-    // Manual fx from a per-eye FOV (degrees). fx = w / (2·half_fov).
-    let fx_from_fov = |fov_deg: f32| -> f32 {
-        let half = fov_deg.max(1.0).to_radians() * 0.5;
-        (src_w as f32) / (2.0 * half)
-    };
-
-    // For OSV: per-lens protobuf fx/fy/cx/cy + pure-KB projection. After
-    // the DJI iter's default swap: left = Lens B, right = Lens A.
-    // The X6 STILL takes this arm too: `run_still` hands in a calib-only
-    // carrier (lens_b = left half, lens_a = right half) built from the
-    // DNG's factory lens strings at the preview size.
-    let (calib_l, calib_r) = match (kind, osv) {
-        (vr180_pipeline::SourceKind::DjiOsv
-         | vr180_pipeline::SourceKind::Insta360Insv
-         | vr180_pipeline::SourceKind::X6Raw
-         | vr180_pipeline::SourceKind::Insta360Dng
-         | vr180_pipeline::SourceKind::KandaoQoocam
-         | vr180_pipeline::SourceKind::KandaoDng
-         | vr180_pipeline::SourceKind::BlackmagicRaw, Some(imu)) => {
-            let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
-            let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
-            let eye = |output: usize, lens: &vr180_fisheye::DjiLensCalib,
-                       ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4], km5: f32,
-                       km_p: [f32; 2]|
-                -> vr180_pipeline::gpu::FisheyeCalib
-            {
-                // Auto + an exact factory model (Insta360): use it as is —
-                // the KB fields only seed the override UI. Override drops
-                // to KB (the manual fields describe a KB lens). Must match
-                // the export resolver exactly so preview == export.
-                if !ov {
-                    if let Some(o) = lens.omni {
-                        let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
-                        let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
-                        return vr180_pipeline::gpu::FisheyeCalib::new_omni(
-                            o.fx * scale_x, o.fy * scale_y, cx, cy, o.xi,
-                            o.radial, o.tangential, o.prism, src_w as f32, src_h as f32,
-                        );
-                    }
-                }
-                let (fx, fy, cx, cy, k, k5) = if ov {
-                    // Manual: fx from FOV, absolute cx/cy from normalized,
-                    // manual k1–k4 (preset if all-zero) + manual k5 (km5).
-                    let fx = fx_from_fov(fov);
-                    let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
-                    (fx, fx, cxn * src_w as f32, cyn * src_h as f32, k, km5)
-                } else {
-                    // Auto: load the per-lens FACTORY calibration from the
-                    // OSV protobuf — principal point (cx/cy), focal length
-                    // (fx/fy → FOV) AND the KB k1–k4 distortion. fx/fy/cx/cy
-                    // are stored at the calib resolution (lens.width/height),
-                    // so scale to the working res. k is dimensionless (no
-                    // scale). Anything the file omits falls back to the
-                    // preset (fx_auto / preset_k).
-                    //
-                    // FOV note: the optical FOV is implied by fx (theta_max =
-                    // max_r/fx in new_pure_kb), NOT by the file's nominal
-                    // "half_fov" field — that reads ~90° and does NOT match
-                    // fx·image-circle (~106° half). So loading fx loads FOV.
-                    //
-                    // k-fold note: this lens's KB polynomial peaks near θ≈89°
-                    // then folds, so it is valid only out to ~88°. For 180°
-                    // VR180 output (max sampled θ = 90°) we sit right at that
-                    // edge, where the factory k is both safe and more accurate
-                    // than the smoothed preset. Output past 180° would sample
-                    // the folded region — use the preset/override there.
-                    let cx = lens.cx.map(|v| v * scale_x).unwrap_or(src_w as f32 * 0.5);
-                    let cy = lens.cy.map(|v| v * scale_y).unwrap_or(src_h as f32 * 0.5);
-                    let fx = lens.fx.map(|v| v * scale_x).unwrap_or(fx_auto);
-                    let fy = lens.fy.map(|v| v * scale_y).unwrap_or(fx);
-                    let k = match (lens.k1, lens.k2, lens.k3, lens.k4) {
-                        (Some(a), Some(b), Some(c), Some(d)) => [a, b, c, d],
-                        _ => preset_k,
-                    };
-                    // Blackmagic: the seed is the image circle + the DEFAULT
-                    // preset's FOV / k; the Camera combo's choice re-scales the
-                    // focal to its FOV and takes its k (same as the export).
-                    let (fx, fy, cx, cy, k) = if kind == vr180_pipeline::SourceKind::BlackmagicRaw {
-                        let (sx, sk) = vr180_pipeline::braw_imu::preset_rescale(preset, src_w, src_h);
-                        let (cx, cy) = vr180_pipeline::braw_imu::preset_principal_point(
-                            preset, output, s.effective_swap_eyes(), src_w as f32, src_h as f32).unwrap_or((cx, cy));
-                        (fx * sx, fy * sx, cx, cy, sk.unwrap_or(k))
-                    } else { (fx, fy, cx, cy, k) };
-                    // k5 (protobuf field 15) — DJI's 5th radial KB coeff.
-                    // Keeps the projection monotonic past ~90° out to the full
-                    // lens FOV. 0 when the file omits it (4-coeff fallback).
-                    (fx, fy, cx, cy, k, lens.k5.unwrap_or(0.0))
-                };
-                let mut calib = vr180_pipeline::gpu::FisheyeCalib::new_pure_kb(
-                    fx, fy, cx, cy, k, src_w as f32, src_h as f32,
-                );
-                calib.k5 = k5;
-                // Brown-Conrady tangential (field 20). Auto loads it per-lens
-                // from the file; override uses the manual [p1, p2] (km_p),
-                // seeded from the file so toggling override doesn't drop it.
-                calib.p1 = if ov { km_p[0] } else { lens.p1.unwrap_or(0.0) };
-                calib.p2 = if ov { km_p[1] } else { lens.p2.unwrap_or(0.0) };
-                calib
-            };
-            // The factory calib must follow the STREAM, not the output
-            // slot: with the user swap on, the left output carries Lens A,
-            // so it must be dewarped with Lens A's calib (and vice versa).
-            let (lens_l, lens_r) = if s.effective_swap_eyes() {
-                (&imu.lens_a, &imu.lens_b)
-            } else {
-                (&imu.lens_b, &imu.lens_a)
-            };
-            let pair = (
-                eye(0, lens_l, s.fisheye_override_left, s.fisheye_fov_deg_left,
-                    s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left,
-                    s.fisheye_k5_left, s.fisheye_p_left),
-                eye(1, lens_r, s.fisheye_override_right, s.fisheye_fov_deg_right,
-                    s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right,
-                    s.fisheye_k5_right, s.fisheye_p_right),
-            );
-            // A frame that is a crop of the image circle (the X6 Crop
-            // modes): black outside the frame, corners kept, plus the
-            // user's mask window. Same call as the export resolver.
-            if lens_l.frame_crop || lens_r.frame_crop {
-                vr180_pipeline::gpu::apply_frame_crop(pair.0, pair.1, s.crop_mask)
-            } else {
-                pair
-            }
-        }
-        _ => {
-            // Non-OSV: Hermite-default constructor, per-eye. No protobuf,
-            // so "auto" = preset; override = manual fov/cx/cy/k.
-            let r_max = (src_w.min(src_h) as f32) * 0.5;
-            let eye = |ov: bool, fov: f32, cxn: f32, cyn: f32, km: [f32; 4]|
-                -> vr180_pipeline::gpu::FisheyeCalib
-            {
-                let (fx, cx, cy, k) = if ov {
-                    let k = if km.iter().any(|c| c.abs() > 1e-9) { km } else { preset_k };
-                    (fx_from_fov(fov), cxn * src_w as f32, cyn * src_h as f32, k)
-                } else {
-                    (fx_auto, src_w as f32 * 0.5, src_h as f32 * 0.5, preset_k)
-                };
-                vr180_pipeline::gpu::FisheyeCalib::new(
-                    fx, fx, cx, cy, k, src_w as f32, src_h as f32, r_max,
-                )
-            };
-            (
-                eye(s.fisheye_override_left, s.fisheye_fov_deg_left,
-                    s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left),
-                eye(s.fisheye_override_right, s.fisheye_fov_deg_right,
-                    s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right),
-            )
-        }
-    };
-
-    // Generic SBS with the fisheye dewarp off: the halves are already
-    // half-equirect — bypass the lens model (mirrors the export resolver).
-    if kind == vr180_pipeline::SourceKind::SbsFisheye && !s.sbs_dewarp_fisheye {
-        (calib_l.with_equirect_input(), calib_r.with_equirect_input())
-    } else {
-        (calib_l, calib_r)
-    }
+    vr180_pipeline::lens_model::resolve_source_lens_pair(&s.lens_request(kind), src_w, src_h, osv)
 }
 
 /// The calibrations of [`resolve_fisheye_source_calib_pair`] for the output
 /// view the settings ask for.
 pub(crate) fn fisheye_view_calib_pair(
     s: &Settings,
-    (calib_l, calib_r): (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib),
+    kind: vr180_pipeline::SourceKind,
+    source: (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib),
 ) -> (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib) {
-    // Equidistant FISHEYE output target: set the output half-FOV so the
-    // fisheye shaders map the inscribed circle to a clean normalized
-    // fisheye (matches the export path). Equirect keeps the default 90°.
-    if matches!(s.fisheye_output_mode, FisheyeOutputMode::Fisheye) {
-        let hfov = (vr180_pipeline::fisheye_export::FISHEYE_OUT_FULL_FOV_DEG * 0.5).to_radians();
-        (calib_l.with_output_hfov(hfov), calib_r.with_output_hfov(hfov))
-    } else if matches!(s.fisheye_output_mode, FisheyeOutputMode::Reframe) {
-        // Reframed view — same parameters the export uses (aspect from the
-        // per-eye frame choice; the preview frame honours it).
-        let a = s.reframe_aspect.ratio();
-        (
-            calib_l.with_reframe(s.reframe_hfov_deg, s.reframe_defish, a),
-            calib_r.with_reframe(s.reframe_hfov_deg, s.reframe_defish, a),
-        )
-    } else {
-        (calib_l, calib_r)
-    }
+    vr180_pipeline::lens_model::view_lens_pair(&s.lens_request(kind), source)
 }
 
 /// The calibrations a fisheye source's view is drawn with and, where that
@@ -4786,7 +4550,7 @@ pub(crate) fn resolve_fisheye_view(
     size: LensViewSize,
 ) -> FisheyeView {
     let source = resolve_fisheye_source_calib_pair(s, kind, src_w, src_h, osv);
-    let (left, right) = fisheye_view_calib_pair(s, source);
+    let (left, right) = fisheye_view_calib_pair(s, kind, source);
     if !s.lens_frame_view(kind) {
         return FisheyeView { left, right, lens_dims: None, source };
     }
@@ -4870,59 +4634,27 @@ pub(crate) fn view_out_dims(
     }
 }
 
-/// Per-eye ".360 Lens calibration" Override → shader re-dewarp params.
-/// The FACTORY model comes from the file's GEOC atom (left eye = Lens B =
-/// BACK, right eye = Lens A = FRNT — same mapping as the RS path); the
-/// USER model from the same per-eye `fisheye_*` Override fields the OSV
-/// panel uses (independent per source kind via the settings-by-kind map).
-/// Override-off eyes / missing GEOC → the disabled sentinel (shader warp
-/// skipped entirely). Must mirror `fisheye_export::resolve_eac_lens_pair`
-/// so preview == export. `out_side`: the side of the square the
-/// fisheye-output kernel is asked for (read only by a lens frame).
+/// The per-eye `.360` lens re-dewarp for the current settings:
+/// [`vr180_pipeline::lens_model::resolve_eac_lens_pair`], the resolver an
+/// export asks too. `geoc` is the file's lens record, when it has one.
+/// `out_side`: the side of the square the fisheye-output kernel is asked
+/// for (read only by a lens frame).
 pub(crate) fn resolve_eac_lens_pair(
     s: &Settings,
     geoc: Option<&vr180_core::geoc::Geoc>,
     out_side: u32,
 ) -> (vr180_pipeline::gpu::EacLensAdjust, vr180_pipeline::gpu::EacLensAdjust) {
-    use vr180_pipeline::gpu::EacLensAdjust;
-    let (l, r) = match geoc {
-        None => (EacLensAdjust::DISABLED, EacLensAdjust::DISABLED),
-        Some(g) => {
-            let cal_dim = g.cal_dim as f32;
-            let mk = |cal: Option<&vr180_core::geoc::LensCal>, ov: bool,
-                      fov: f32, cxn: f32, cyn: f32, k: [f32; 4]| -> EacLensAdjust {
-                match (cal, ov) {
-                    (Some(c), true) => EacLensAdjust::from_geoc_override(
-                        c.klns, c.ctrx, c.ctry, cal_dim, fov, cxn, cyn, k),
-                    _ => EacLensAdjust::DISABLED,
-                }
-            };
-            (
-                mk(g.back.as_ref(), s.fisheye_override_left, s.fisheye_fov_deg_left,
-                   s.fisheye_cx_norm_left, s.fisheye_cy_norm_left, s.fisheye_k_left),
-                mk(g.front.as_ref(), s.fisheye_override_right, s.fisheye_fov_deg_right,
-                   s.fisheye_cx_norm_right, s.fisheye_cy_norm_right, s.fisheye_k_right),
-            )
+    use vr180_pipeline::lens_model::LensOutput;
+    let mut req = s.lens_request(vr180_pipeline::SourceKind::GoProEac);
+    // Lens Space through the camera's lens: the fisheye-output kernel
+    // writes the clip's lens frame — a square of `out_side` pixels, the
+    // frame the export writes — instead of its disc.
+    if req.output == LensOutput::Fisheye && s.lens_frame_view(vr180_pipeline::SourceKind::GoProEac) {
+        if let Some(frame) = vr180_pipeline::fisheye_export::eac_lens_frame(s.stabilize, out_side) {
+            req.output = LensOutput::LensFrame(frame);
         }
-    };
-    // Reframed view: the equirect kernel's ray generator takes the viewport.
-    if s.fisheye_output_mode == FisheyeOutputMode::Reframe {
-        let a = s.reframe_aspect.ratio();
-        (
-            l.with_reframe(s.reframe_hfov_deg, s.reframe_defish, a),
-            r.with_reframe(s.reframe_hfov_deg, s.reframe_defish, a),
-        )
-    } else if s.lens_frame_view(vr180_pipeline::SourceKind::GoProEac) {
-        // Lens Space through the camera's lens: the fisheye-output kernel
-        // writes the clip's lens frame — a square of `out_side` pixels, the
-        // frame the export writes — instead of its disc.
-        match vr180_pipeline::fisheye_export::eac_lens_frame(s.stabilize, out_side) {
-            Some(frame) => (l.with_lens_frame(&frame), r.with_lens_frame(&frame)),
-            None => (l, r),
-        }
-    } else {
-        (l, r)
     }
+    vr180_pipeline::lens_model::resolve_eac_lens_pair(&req, geoc)
 }
 
 /// Publish the GEOC factory lens calibration as the `.360` clip's
@@ -6137,11 +5869,7 @@ fn clip_timeline(cfg: &DecoderConfig, kind: vr180_pipeline::SourceKind)
     if let Some(t) = cached_timeline(&cfg.path) {
         return Some(t);
     }
-    let segs: Vec<PathBuf> = if cfg.segments.is_empty() { vec![cfg.path.clone()] } else { cfg.segments.clone() };
-    let tl = vr180_pipeline::frame_timeline::FrameTimeline::from_segments(&segs)?;
-    if tl.is_empty() {
-        return None;
-    }
+    let tl = vr180_pipeline::frame_timeline::FrameTimeline::for_clip(kind, &cfg.path, &cfg.segments)?;
     tracing::info!("decoder: frame timeline — {}", tl.summary());
     let arc = std::sync::Arc::new(tl);
     let mut c = timeline_cache().lock();
@@ -6152,12 +5880,8 @@ fn clip_timeline(cfg: &DecoderConfig, kind: vr180_pipeline::SourceKind)
     Some(arc)
 }
 
-/// Frames in the clip for sizing per-frame tables: the sample table's count
-/// when it is known (rows past the last frame would be identity poses the
-/// smoother bends toward), else `fallback` (duration × fps).
-fn timeline_frames_or(tl: Option<&vr180_pipeline::frame_timeline::FrameTimeline>, fallback: usize) -> usize {
-    tl.map(|t| t.len()).filter(|n| *n > 0).unwrap_or(fallback)
-}
+// Sizes the per-frame tables (the name the workers know it by).
+use vr180_pipeline::frame_timeline::frames_or as timeline_frames_or;
 
 /// The shown frame's own time for the UI (playhead, zoom-still key): its pts
 /// when the source stamps frames, else its row on the constant-rate grid.
@@ -6454,8 +6178,7 @@ fn compute_stab_for(
         vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv
         | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw
         | vr180_pipeline::SourceKind::X6Raw => imu.and_then(|osv| {
-            let max_corr = if s.dji_max_corr_deg > 0.0 && !s.dji_camera_lock { s.dji_max_corr_deg } else { f32::INFINITY };
-            let smooth_ms = if s.dji_camera_lock { 0.0 } else { s.dji_smooth_ms.max(1.0) };
+            let (max_corr, smooth_ms) = s.stab_cap_and_window();
             vr180_pipeline::dji_imu::compute_dji_stabilization(
                 osv, total, max_corr, smooth_ms, fps, s.dji_responsiveness)
                 .ok().map(|st| st.per_frame)
@@ -6529,70 +6252,56 @@ fn render_still_from_pair(
         .and_then(|v| v.get(stab_idx).copied())
         .unwrap_or(EquirectRotation::IDENTITY);
 
-    let view_adjust = s.output_view_adjust();
-    let swapped_eyes = s.effective_swap_eyes();
-    let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(rot, imu, stab_idx, swapped_eyes);
-    let (rot_left, rot_right) = if view_adjust.is_identity() { (rot_l0, rot_r0) } else {
-        let (vl, vr) = view_adjust.per_eye_matrices();
-        (EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_l0.0, &vl)),
-         EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_r0.0, &vr)))
-    };
-
-    let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if s.stabilize && stab_rotations.is_some() {
-        imu.map(|osv| vr180_pipeline::dji_imu::per_eye_rs_rows(
-            osv, stab_idx,
-            vr180_pipeline::dji_imu::readout_ms_for(kind, fps, imu) / 1000.0,
-            src_h, fps, swapped_eyes,
-        )).unwrap_or((None, None))
-    } else { (None, None) };
+    let vr180_pipeline::render::FramePose {
+        rot_left, rot_right, rows_left: rs_rows_l, rows_right: rs_rows_r,
+    } = vr180_pipeline::render::FramePose::new(
+        rot, imu, stab_idx, s.effective_swap_eyes(), &s.output_view_adjust(),
+        (s.stabilize && stab_rotations.is_some()).then(|| vr180_pipeline::render::RowReadout {
+            readout_s: vr180_pipeline::dji_imu::readout_ms_for(kind, fps, imu) / 1000.0,
+            src_h, fps,
+        }),
+    );
 
     // A raw source's still arrives as its two mosaics: demosaiced here, at
-    // full size, into camera-linear eyes for the rgba16 kernels.
+    // full size, into camera-linear eyes for the 16-bit build.
     let raw_eyes = if pair.bit_depth == vr180_pipeline::x6_raw::MOSAIC_BIT_DEPTH {
         Some(vr180_pipeline::x6_raw::demosaic_pair(pipeline, pair)?)
     } else { None };
-    // One eye through the kernel its source and the frame's rows ask for.
-    let project = |bytes: &[u8], eye: Option<&wgpu::Texture>, w: u32, h: u32, rot: EquirectRotation,
-                   calib: vr180_pipeline::gpu::FisheyeCalib, rows: Option<&[f32]>, fisheye_out: bool, slot: u32|
-        -> vr180_pipeline::Result<wgpu::Texture>
-    {
-        if let Some(eye) = eye {
-            return project_gpu_eye(pipeline, eye, w, h, rot, calib, rows, fisheye_out, slot);
-        }
-        match (fisheye_out, rows) {
-            (false, Some(rows)) => pipeline.project_fisheye_to_equirect_rs_texture(bytes, src_w, src_h, w, h, rot, calib, rows, slot),
-            (false, None) => pipeline.project_fisheye_to_equirect_texture(bytes, src_w, src_h, w, h, rot, calib, slot),
-            (true, Some(rows)) => pipeline.project_fisheye_to_fisheye_rs_texture(bytes, src_w, src_h, w, h, rot, calib, rows),
-            (true, None) => pipeline.project_fisheye_to_fisheye_texture(bytes, src_w, src_h, w, h, rot, calib),
-        }
-    };
-    // Per-row correction needs both eyes' rows, as before.
-    let (rs_l, rs_r) = match (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-        (Some(l), Some(r)) => (Some(l), Some(r)),
-        _ => (None, None),
-    };
     let (eye_l, eye_r) = (raw_eyes.as_ref().map(|e| &e.0), raw_eyes.as_ref().map(|e| &e.1));
-    let (left_tex, right_tex) = match s.fisheye_output_mode {
-        FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => {
-            // A reframed view keeps the working width and takes its aspect.
-            // A snapshot renders at the export's exact eye size instead.
-            let (oeq_w, oeq_h) = out_eye.unwrap_or_else(||
-                preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, oeq_w, oeq_h));
-            let l = project(&pair.left, eye_l, oeq_w, oeq_h, rot_left, calib_left, rs_l, false, 20)?;
-            let r = if one_eye { l.clone() } else {
-                project(&pair.right, eye_r, oeq_w, oeq_h, rot_right, calib_right, rs_r, false, 21)? };
-            (l, r)
-        }
-        FisheyeOutputMode::Fisheye => {
-            let (fw, fh) = view.lens_dims.unwrap_or_else(|| {
+    // Per-row correction needs both eyes' rows, as before.
+    let (rs_l, rs_r) = vr180_pipeline::gpu::rows_for_both(rs_rows_l.as_deref(), rs_rows_r.as_deref());
+    let (left_tex, right_tex) = {
+        let fisheye_out = s.fisheye_output_mode == FisheyeOutputMode::Fisheye;
+        let (out_w, out_h) = if fisheye_out {
+            // The disc, or a lens frame at its own size.
+            view.lens_dims.unwrap_or_else(|| {
                 let side = out_eye.map(|(w, h)| w.min(h)).unwrap_or(oside);
                 (side, side)
-            });
-            let l = project(&pair.left, eye_l, fw, fh, rot_left, calib_left, rs_l, true, 20)?;
-            let r = if one_eye { l.clone() } else {
-                project(&pair.right, eye_r, fw, fh, rot_right, calib_right, rs_r, true, 21)? };
-            (l, r)
-        }
+            })
+        } else {
+            // A reframed view keeps the working width and takes its aspect.
+            // A snapshot renders at the export's exact eye size instead.
+            out_eye.unwrap_or_else(||
+                preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, oeq_w, oeq_h))
+        };
+        // One eye through the build its source asks for: an eye already on
+        // the GPU (output slots 20 / 21), or the decoded bytes (upload slots
+        // 20 / 21: the still's own, apart from the preview's).
+        let project = |bytes: &[u8], eye: Option<&wgpu::Texture>, rot: EquirectRotation,
+                       calib: vr180_pipeline::gpu::FisheyeCalib, rows: Option<&[f32]>, slot: u32|
+            -> vr180_pipeline::Result<wgpu::Texture>
+        {
+            match eye {
+                Some(eye) => project_gpu_eye(pipeline, eye, out_w, out_h, rot, calib, rows, fisheye_out, slot),
+                None => pipeline.project_eye(&EyeProjection::new(
+                    EyePicture::Bytes8 { rgba: bytes, w: src_w, h: src_h, slot },
+                    out_w, out_h, rot, calib,
+                ).fisheye_out(fisheye_out).rs_rows(rows)),
+            }
+        };
+        let l = project(&pair.left, eye_l, rot_left, calib_left, rs_l, 20)?;
+        let r = if one_eye { l.clone() } else { project(&pair.right, eye_r, rot_right, calib_right, rs_r, 21)? };
+        (l, r)
     };
     let (ew, eh) = (left_tex.width(), left_tex.height());
     // A still is one frame: a fresh state measures it without history (the
@@ -7010,6 +6719,65 @@ pub(crate) fn build_per_eye_frames_multi(
             .unwrap_or((EquirectRsParams::DISABLED, EquirectRsParams::DISABLED));
         ((rl, sl), (rr, sr))
     }).collect())
+}
+
+#[cfg(test)]
+mod stab_params_tests {
+    use super::*;
+
+    #[test]
+    fn camera_lock_has_no_window_and_no_cap() {
+        let mut s = Settings::default();
+        (s.dji_max_corr_deg, s.dji_smooth_ms) = (12.0, 800.0);
+        assert_eq!(s.stab_cap_and_window(), (12.0, 800.0));
+        s.dji_camera_lock = true;
+        assert_eq!(s.stab_cap_and_window(), (f32::INFINITY, 0.0));
+        // Soft stabilization: a cap of 0 is no cap, and the window never
+        // reaches 0, which would mean the lock.
+        s.dji_camera_lock = false;
+        (s.dji_max_corr_deg, s.dji_smooth_ms) = (0.0, 0.0);
+        assert_eq!(s.stab_cap_and_window(), (f32::INFINITY, 1.0));
+    }
+}
+
+#[cfg(test)]
+mod lens_request_tests {
+    use super::*;
+    use vr180_pipeline::lens_model::LensOutput;
+
+    #[test]
+    fn the_settings_reach_the_resolver_field_for_field() {
+        let mut s = Settings::default();
+        s.fisheye_preset = "Custom".into();
+        s.fisheye_override_left = true;
+        s.fisheye_override_right = false;
+        (s.fisheye_fov_deg_left, s.fisheye_fov_deg_right) = (181.0, 182.0);
+        (s.fisheye_cx_norm_left, s.fisheye_cx_norm_right) = (0.41, 0.42);
+        (s.fisheye_cy_norm_left, s.fisheye_cy_norm_right) = (0.51, 0.52);
+        (s.fisheye_k_left, s.fisheye_k_right) = ([1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]);
+        (s.fisheye_k5_left, s.fisheye_k5_right) = (0.1, 0.2);
+        (s.fisheye_p_left, s.fisheye_p_right) = ([0.3, 0.4], [0.5, 0.6]);
+        s.sbs_dewarp_fisheye = true;
+        s.fisheye_output_mode = FisheyeOutputMode::Reframe;
+        s.reframe_hfov_deg = 77.0;
+        s.reframe_defish = 0.25;
+        s.reframe_aspect = ReframeAspect::Wide;
+        let r = s.lens_request(vr180_pipeline::SourceKind::DjiOsv);
+        assert_eq!((r.kind, r.preset, r.sbs_dewarp_fisheye), (vr180_pipeline::SourceKind::DjiOsv, "Custom", true));
+        assert_eq!((r.left.on, r.left.fov_deg, r.left.cx_norm, r.left.cy_norm, r.left.k, r.left.k5, r.left.p),
+                   (true, 181.0, 0.41, 0.51, [1.0, 2.0, 3.0, 4.0], 0.1, [0.3, 0.4]));
+        assert_eq!((r.right.on, r.right.fov_deg, r.right.cx_norm, r.right.cy_norm, r.right.k, r.right.k5, r.right.p),
+                   (false, 182.0, 0.42, 0.52, [5.0, 6.0, 7.0, 8.0], 0.2, [0.5, 0.6]));
+        assert_eq!(r.output, LensOutput::Reframe { hfov_deg: 77.0, defish: 0.25, aspect: ReframeAspect::Wide.ratio() });
+        // The swap the resolver sees is the effective one.
+        assert!(!r.swap_eyes);
+        s.camera_upside_down = true;
+        assert!(s.lens_request(vr180_pipeline::SourceKind::DjiOsv).swap_eyes);
+        s.fisheye_swap_eyes = true;
+        assert!(!s.lens_request(vr180_pipeline::SourceKind::DjiOsv).swap_eyes);
+        s.fisheye_output_mode = FisheyeOutputMode::Fisheye;
+        assert_eq!(s.lens_request(vr180_pipeline::SourceKind::DjiOsv).output, LensOutput::Fisheye);
+    }
 }
 
 #[cfg(test)]

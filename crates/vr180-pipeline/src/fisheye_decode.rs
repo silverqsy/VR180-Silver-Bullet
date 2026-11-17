@@ -1524,7 +1524,7 @@ impl DualStreamFisheyeIter {
 // slice is `CopySubresourceRegion`'d into a fresh shareable texture and
 // exported as an NT handle. The consumer imports those handles into
 // wgpu's Vulkan device (zero-copy memory alias) and projects the P010
-// planes directly via `project_fisheye_p010_planar_to_equirect_texture_16`.
+// planes directly (plane-aspect views into the projection kernel).
 //
 // Used by the GUI preview's `run_fisheye_zerocopy` path. Export still has
 // its own path; this is preview-only for now.
@@ -3317,7 +3317,7 @@ impl SegmentedD3d11SharedDualStreamIter {
 // upload (~840 MB/frame at native OSV res) — this iterator wraps each
 // VideoToolbox-decoded CVPixelBuffer's two planes (Y at full res, UV
 // at half res) as wgpu textures via the IOSurface bridge. Downstream
-// consumers (export's `project_fisheye_p010_to_equirect_texture_16`)
+// consumers (the export's plane-sourced projection, `EyePicture::Planes`)
 // read the planes directly and do YCbCr→RGB inline in the projection
 // shader.
 //

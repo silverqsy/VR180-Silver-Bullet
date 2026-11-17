@@ -1,32 +1,73 @@
-// P010 → stabilized fisheye output (Rgba16Unorm) WITH per-row rolling-
-// shutter correction. Zero-copy export path for OSV fisheye output at
-// 10-bit.
+// Fisheye projection kernel: one eye of a fisheye source → one eye of the
+// output, with the per-frame rotation (stabilization × view adjust) and,
+// optionally, the per-row rolling-shutter correction fused in.
 //
-// Combines the equidistant fisheye-output parametrisation of
-// `fisheye_p010_to_fisheye_16.wgsl` with the per-row RS warp of
-// `fisheye_p010_to_hequirect_rs.wgsl`. RS operates on the source-frame
-// direction after per-frame stab, independent of the output mapping.
+// ONE source for every build of the kernel. `shader_compose::compose`
+// assembles a build from the flags below; the lens models, the masks and
+// the ray generators exist once.
 //
-// Bindings:
-//   (0) fisheye_y  — R16Unorm  (full-res Y)
-//   (1) fisheye_uv — Rg16Unorm (half-res Cb/Cr)
-//   (2) fisheye_smp— bilinear sampler
-//   (3) out_tex    — Rgba16Unorm storage (fisheye output)
-//   (4) equ        — per-frame stab rotation
-//   (5) cal        — per-eye KB calibration
-//   (6) rs_rows    — storage buffer: array<RsRowR>, one per scanline
+//   YUV          the source is a Y plane + an interleaved CbCr plane (P010 in
+//                16 bits, or NV12 in 8) sampled in place and converted to RGB
+//                here; otherwise one RGBA texture.
+//   RS           per-row rolling-shutter correction from a storage buffer of
+//                one rotation per source scanline.
+//   FISHEYE_OUT  the output is an equidistant fisheye disk; otherwise a
+//                half-equirect frame or the reframed (flat) view, chosen by
+//                `cal.proj_mode`.
+//   RS_UPDATES_RAY
+//                after the per-row correction the corrected ray replaces the
+//                first one for the frame-cover test too (the YUV half-equirect
+//                build; the others keep the first ray there).
+//
+// Per output pixel:
+//   1. output pixel → unit ray in the output frame (Z forward, Y up, X right)
+//   2. rotate by the per-frame matrix (`equ`)
+//   3. project through the lens model to a source pixel (`PROJECT` below):
+//      Kannala-Brandt + rim extension + Brown-Conrady tangential, the unified
+//      camera model (Insta360's factory calibration), or a half-equirect
+//      source (no lens model)
+//   4. RS: the source row says when the sensor read that pixel — rotate the
+//      ray by that row's matrix and project again (one fixed-point step)
+//   5. sample, weight by the frame cover and the view mask, store
+//
+// The Kannala-Brandt forward is r = fx·θ·(1 + k1·θ² + … + k5·θ¹⁰). Past
+// θ_trans the polynomial is unreliable for ≥190° lenses, so a cubic Hermite
+// takes over that matches r and dr/dθ there and pins r_max at the image
+// circle (computed once on the CPU from cx/cy and the image size).
+//
+// "RS off" convention: a row whose matrix has R00 == 0.0 is skipped.
+//
+// Bindings (YUV | RGBA):
+//   source     0 Y plane + 1 CbCr plane | 0 RGBA texture
+//   sampler    2 | 1
+//   out_tex    3 (Rgba16Unorm) | 2 (Rgba8Unorm — the Rgba16Unorm pipelines
+//              swap the format in the composed text)
+//   equ        4 | 3   per-frame rotation
+//   cal        5 | 4   per-eye lens calibration and output parameters
+//   rs_rows    6 | 5   (RS) array<RsRowR>, one per source scanline
 
+
+//#if YUV
 @group(0) @binding(0) var fisheye_y:  texture_2d<f32>;
 @group(0) @binding(1) var fisheye_uv: texture_2d<f32>;
 @group(0) @binding(2) var fisheye_smp: sampler;
 @group(0) @binding(3) var out_tex: texture_storage_2d<rgba16unorm, write>;
+//#else
+@group(0) @binding(0) var fisheye_tex: texture_2d<f32>;
+@group(0) @binding(1) var fisheye_smp: sampler;
+@group(0) @binding(2) var out_tex: texture_storage_2d<rgba8unorm, write>;
+//#endif
 
 struct EquirectUniforms {
     r00: f32, r01: f32, r02: f32, _pad0: f32,
     r10: f32, r11: f32, r12: f32, _pad1: f32,
     r20: f32, r21: f32, r22: f32, _pad2: f32,
 }
+//#if YUV
 @group(0) @binding(4) var<uniform> equ: EquirectUniforms;
+//#else
+@group(0) @binding(3) var<uniform> equ: EquirectUniforms;
+//#endif
 
 struct FisheyeCalibUniforms {
     fx: f32, fy: f32, cx: f32, cy: f32,
@@ -47,7 +88,11 @@ struct FisheyeCalibUniforms {
     // View mask (see `view_mask`): half-extents (radians; 0 = off), corner radius, feather.
     mask_hx: f32, mask_hy: f32, mask_round: f32, mask_feather: f32,
 }
+//#if YUV
 @group(0) @binding(5) var<uniform> cal: FisheyeCalibUniforms;
+//#else
+@group(0) @binding(4) var<uniform> cal: FisheyeCalibUniforms;
+//#endif
 
 // Coverage of a source tap for a frame that is a crop of the image circle
 // (`frame_mask`): 1 inside the frame, 0 outside it, 0 for a ray past the
@@ -84,15 +129,24 @@ fn view_mask(dir: vec3<f32>, px_rad: f32) -> f32 {
     return 1.0 - smoothstep(-f, 0.0, sd);
 }
 
+//#if RS
+// Per-row rotation matrix in std430 layout: three vec4 rows, each
+// with the trailing lane unused. 12 f32 per row, fish_h rows total.
 struct RsRowR {
     r00: f32, r01: f32, r02: f32, _pad0: f32,
     r10: f32, r11: f32, r12: f32, _pad1: f32,
     r20: f32, r21: f32, r22: f32, _pad2: f32,
 }
+//#if YUV
 @group(0) @binding(6) var<storage, read> rs_rows: array<RsRowR>;
+//#else
+@group(0) @binding(5) var<storage, read> rs_rows: array<RsRowR>;
+//#endif
+//#endif
 
 const PI: f32 = 3.14159265359;
 
+//#if YUV
 // YUV → RGB with the matrix from `cal.yuv_mat` (BT.709, or BT.2020 for a
 // stream tagged so). The range expansion — P010 with 10 bits in the top of 16,
 // or NV12 in 8 bits, limited or full range — comes from `cal.yuv_range`
@@ -109,6 +163,7 @@ fn yuv_to_rgb_bt709_p010(y: f32, u: f32, v: f32) -> vec3<f32> {
     let b = y_l + cal.yuv_mat.w * u_l;
     return clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
 }
+//#endif
 
 fn kb_forward(theta: f32) -> f32 {
     let t2 = theta * theta;
@@ -142,7 +197,17 @@ fn kb_radius(theta: f32) -> f32 {
     if (theta <= cal.theta_trans) { return kb_forward(theta); }
     return kb_cubic_extension(theta);
 }
-fn project_kb(xn: f32, yn: f32, zn: f32) -> vec2<f32> {
+
+// The lens model: the rotated ray (xn, yn, zn) → the source pixel
+// (src_x, src_y). θ is clamped to theta_max, so a ray past the lens' field
+// samples the rim instead of a sentinel (the frame-cover test then decides
+// whether there is data). Used by `project_kb` (RS builds) and in line by
+// the others.
+//#define PROJECT
+    // Accept rz ∈ [-1, 1] (no behind-camera reject) and let the
+    // theta_max clamp keep us on the image circle. Matches the
+    // Python MLX kernel's `metal::acos(metal::clamp(rz, -1, 1))`
+    // pattern at `vr180_gui.py:1387`.
     let cos_theta = clamp(zn, -1.0, 1.0);
     var theta = acos(cos_theta);
     let sin_theta = sqrt(max(0.0, 1.0 - zn * zn));
@@ -200,14 +265,51 @@ fn project_kb(xn: f32, yn: f32, zn: f32) -> vec2<f32> {
         src_x = cal.cx + cal.fx * ut;
         src_y = cal.cy - cal.fy * vt;
     }
+//#enddef
+
+//#if RS
+fn project_kb(xn: f32, yn: f32, zn: f32) -> vec2<f32> {
+//#use PROJECT
     return vec2<f32>(src_x, src_y);
 }
+//#endif
+
+//#if !FISHEYE_OUT
+// Output pixel → unit ray in the output frame (Z forward, Y up, X right).
+//   proj_mode 0: half-equirect — lon/lat from `output_hfov_rad`.
+//   proj_mode 1: reframed view — a k-projection `r = k·tan(θ/k)` on a plane
+//                of half-extents (edge_x, edge_y): k = 1 rectilinear,
+//                k = 2 stereographic, large k → the equidistant fisheye
+//                look (the defish control). CPU twin: `gpu::reframe_ray`.
+fn output_ray(u: f32, v: f32) -> vec3<f32> {
+    if (cal.proj_mode > 0.5) {
+        let x = (2.0 * u - 1.0) * cal.edge_x;
+        let y = (1.0 - 2.0 * v) * cal.edge_y;
+        let r = sqrt(x * x + y * y);
+        if (r < 1e-6) {
+            return vec3<f32>(0.0, 0.0, 1.0);
+        }
+        let k = max(cal.defish_k, 1.0);
+        let theta = k * atan(r / k);
+        let s = sin(theta) / r;
+        return vec3<f32>(x * s, y * s, cos(theta));
+    }
+    let lon = (u - 0.5) * 2.0 * cal.output_hfov_rad;
+    let lat = (0.5 - v) * PI;
+    let cos_lat = cos(lat);
+    return vec3<f32>(cos_lat * sin(lon), sin(lat), cos_lat * cos(lon));
+}
+//#endif
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let out_dim = textureDimensions(out_tex);
     if (gid.x >= out_dim.x || gid.y >= out_dim.y) { return; }
 
+//#if FISHEYE_OUT
+    // Normalize output pixel position to (-1, +1) on each axis. The
+    // inscribed unit circle maps to the visible fisheye disk; r > 1
+    // produces black corners (real-fisheye look).
     // NORMALIZED equidistant circular-fisheye output: the inscribed circle
     // of the (square) output frame maps LINEARLY to ray angle, with the
     // circle edge at the output half-FOV (cal.output_hfov_rad). A canonical
@@ -229,13 +331,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let s_t = sin(theta_out);
     let c_t = cos(theta_out);
     let dir = vec3<f32>(s_t * cos(phi_out), s_t * sin(phi_out), c_t);
+//#else
+    // `output_hfov_rad` is the OUTPUT half-FOV (radians); π/2 = 180° VR180.
+    let u = (f32(gid.x) + 0.5) / f32(out_dim.x);
+    let v = (f32(gid.y) + 0.5) / f32(out_dim.y);
+    let dir = output_ray(u, v);
+//#endif
 
+//#if RS
+    // Per-frame rotation.
     var rx = equ.r00 * dir.x + equ.r01 * dir.y + equ.r02 * dir.z;
     var ry = equ.r10 * dir.x + equ.r11 * dir.y + equ.r12 * dir.z;
     var rz = equ.r20 * dir.x + equ.r21 * dir.y + equ.r22 * dir.z;
 
+    // First projection — to find which scanline this pixel maps to.
     var src = project_kb(rx, ry, rz);
 
+    // Per-row RS correction. Look up the row's rotation matrix; if
+    // its (0, 0) entry is 0.0 (the all-zeros sentinel for "RS disabled")
+    // skip the re-projection.
     let fish_h_i = i32(cal.src_h);
     let row_idx = clamp(i32(round(src.y)), 0, fish_h_i - 1);
     let rsm = rs_rows[row_idx];
@@ -243,9 +357,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let rsx = rsm.r00 * rx + rsm.r01 * ry + rsm.r02 * rz;
         let rsy = rsm.r10 * rx + rsm.r11 * ry + rsm.r12 * rz;
         let rsz = rsm.r20 * rx + rsm.r21 * ry + rsm.r22 * rz;
+//#if RS_UPDATES_RAY
+        let src2 = project_kb(rsx, rsy, rsz);
+        if (src2.x > -1.0e29) {
+            src = src2;
+            rx = rsx; ry = rsy; rz = rsz;
+        }
+//#else
         src = project_kb(rsx, rsy, rsz);
+//#endif
     }
+//#else
+    // Per-frame rotation, then the lens model in line.
+    let xn = equ.r00 * dir.x + equ.r01 * dir.y + equ.r02 * dir.z;
+    let yn = equ.r10 * dir.x + equ.r11 * dir.y + equ.r12 * dir.z;
+    let zn = equ.r20 * dir.x + equ.r21 * dir.y + equ.r22 * dir.z;
+//#use PROJECT
+//#endif
 
+//#if YUV
+    // Sample Y at full res, CbCr at half res.
     // Eye sub-rect: `src_w`/`src_h` are the EYE's dims (the lens model and
     // the half-equirect mapping normalise by them); the planes may be wider —
     // a generic side-by-side frame holds both eyes in ONE texture and this
@@ -257,7 +388,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // with eye == plane, so the clamp reduces to ClampToEdge: bit-identical.
     let sw = cal.src_w;
     let sh = cal.src_h;
+//#if RS
     let stream_xy = src;
+//#else
+    let stream_xy = vec2<f32>(src_x, src_y);
+//#endif
     let plane_y  = vec2<f32>(textureDimensions(fisheye_y));
     let plane_uv = vec2<f32>(textureDimensions(fisheye_uv));
     let y_px  = clamp(stream_xy + vec2<f32>(0.5),
@@ -268,13 +403,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
               + vec2<f32>(cal.src_x0 * 0.5, cal.src_y0 * 0.5);
     let y_uv  = y_px / plane_y;
     let uv_uv = uv_px / plane_uv;
-
     let y_sample  = textureSampleLevel(fisheye_y,  fisheye_smp, y_uv,  0.0).r;
     let uv_sample = textureSampleLevel(fisheye_uv, fisheye_smp, uv_uv, 0.0).rg;
     let rgb = yuv_to_rgb_bt709_p010(y_sample, uv_sample.r, uv_sample.g);
+//#else
+    // Out-of-frame coords are clamped by the ClampToEdge sampler.
+//#if RS
+    let uv = vec2<f32>(src.x / cal.src_w, src.y / cal.src_h);
+//#else
+    let uv = vec2<f32>(src_x / cal.src_w, src_y / cal.src_h);
+//#endif
+    let color = textureSampleLevel(fisheye_tex, fisheye_smp, uv, 0.0);
+//#endif
 
+    // One output pixel in radians, for the soft edges of the cover and the mask.
+//#if FISHEYE_OUT
     let px_rad = cal.output_hfov_rad / max(half, 1.0);
+//#else
+    let px_rad = 2.0 * cal.output_hfov_rad / f32(out_dim.x);
+//#endif
+//#if YUV
+//#if RS
     let cover = frame_cover(stream_xy, rz, px_rad) * view_mask(dir, px_rad);
+//#else
+    let cover = frame_cover(stream_xy, zn, px_rad) * view_mask(dir, px_rad);
+//#endif
     textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)),
                  vec4<f32>(rgb * cover, 1.0));
+//#else
+//#if RS
+    let cover = frame_cover(vec2<f32>(src.x, src.y), rz, px_rad) * view_mask(dir, px_rad);
+//#else
+    let cover = frame_cover(vec2<f32>(src_x, src_y), zn, px_rad) * view_mask(dir, px_rad);
+//#endif
+    textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(color.rgb * cover, color.a));
+//#endif
 }
