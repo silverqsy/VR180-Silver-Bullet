@@ -2,6 +2,186 @@
 
 ## Unreleased
 
+### Insta360 X6: raw video
+
+A raw take of the X6 is a folder: the sensor's own 14-bit Bayer data of both
+lenses for every frame, the gyro log, the factory lens record and the sound.
+The app opens such a folder as one clip (add the folder, the capture file in
+it, or a folder of takes) and treats it like any other video: preview, trim,
+stabilization, eye alignment, every output format. What is new is the
+developing: a raw clip has no look of its own, so the Color panel gets a raw
+converter's controls for it, and every frame can be had as a DNG.
+
+- **Raw development.** Temperature and Tint (or As shot), Exposure,
+  Contrast, Highlights, Shadows, Whites, Blacks, in a raw converter's own
+  terms. The rendering follows Adobe Camera Raw's, control by control, so a
+  frame graded here and the same frame's DNG opened there with the same
+  numbers look alike. It was measured there, on charts and on frames of
+  sample takes, not taken from a description:
+  - with nothing moved the two differ by a third of an 8-bit step on
+    average, and a white balance by a tenth to seven tenths;
+  - Shadows and Highlights are local, as there: they lift or hold back an
+    object as a whole and leave the texture inside it alone, they belong to
+    the frame (what counts as a shadow follows the frame's own levels), and
+    moved together they do not simply add. Half the slider is within about
+    one step, the whole slider within one and a half to two and a half;
+  - Blacks and Whites below zero are within half a step to one; Contrast
+    within about one step at half the slider and two at its ends; Whites
+    above zero within one to two and a half steps up to the middle of the
+    slider and coarser beyond it;
+  - a grade with every slider in use lands within one to two steps for
+    moderate amounts, three to five at the extremes.
+- **Demosaic.** The step that makes a full-colour picture of the sensor's
+  mosaic is a new one, shaped after Camera Raw's: the same frames were
+  developed there and here, and the method that reproduces its result was
+  kept. Edges come out clean, with no alternating pattern along them and
+  no purple and yellow in fine lines; the preview, which used to merge
+  2×2 sites and showed colour fringes for it, now shows the full method's
+  picture reduced. Developed, a frame differs from Camera Raw's by a
+  quarter of an 8-bit step on average where it was one to three before.
+- **Colour noise reduction.** A raw converter also smooths the picture's
+  colour by default, and that is what frees fine lines of the last colour
+  a demosaic leaves in them and takes the coloured speckle out of noise.
+  The Color panel has it now, under Noise reduction: one slider, 0 to 100,
+  starting at 25 as Camera Raw's does. Luminance is left exactly as it is;
+  a real colour edge is not smeared. It was fitted to Camera Raw's own
+  result at 10, 25, 50 and 100: it takes out 0.9 to 0.95 of what Camera
+  Raw takes out up to 50 and the two changes correlate at 0.88 to 0.95;
+  at 100 Camera Raw reaches further (it flattens faint colour over tens
+  of pixels). Costs about 10 ms a frame at 8192×4096. The setting travels
+  in the DNG. A clip graded before this gets the default 25.
+- **Sharpening.** The detail panel's four controls, Amount, Radius, Detail
+  and Masking, on the developed picture, done the way Camera Raw does it:
+  on the luminance alone, fading out toward black and toward white, held
+  back at strong edges. The kernel was read off Camera Raw itself for 1386
+  combinations of Amount, Radius and Detail. Low Detail holds halos back
+  as it does there: what the sharpening adds beyond the range of the
+  picture around a pixel is cut to a third at Detail 0, less and less up
+  to Detail 25 or so, while the steepening of an edge between its two
+  sides is kept whole. Measured on frames of sample takes as the change
+  each makes to the same frame:
+  - from Detail 25 up the two changes correlate at 0.96 to 0.99 and differ
+    by 12 to 34 % of their size (least at high Detail), with the overall
+    strength within a tenth;
+  - at Detail 0 to 20 they differ by 16 to 36 % with the strength within a
+    twentieth (a Radius of 3 at Detail 0: about 50 %);
+  - with Masking in use, 23 to 40 %;
+  - with any Amount above zero Camera Raw also smooths the finest texture a
+    little before it sharpens, most at low Detail and large radii. That
+    part is not reproduced, and it is most of what is left at low Detail:
+    the finest texture and noise stay a little crisper here.
+
+  The radius is in pixels of the exported frame, so the preview shows the
+  export's picture reduced: judge sharpening in the zoom view or on a
+  snapshot. It adds about half to the export time at full size. The
+  settings travel in the DNG.
+- **It follows the footage.** The frame's brightest and darkest levels and
+  the spread of its levels are measured on every frame, as a raw converter
+  does per picture; over three seconds of a sample take this adds no
+  flicker (the picture's mean changes from frame to frame by 0.18 of an
+  8-bit step with and without Shadows and Highlights, 0.22 with every
+  slider in use).
+- **One grade, one look, in every view.** A reframed view shows a part of
+  the scene and a Lens Space frame has a black border, so measured on their
+  own they would be developed differently from the VR180 picture (with
+  Shadows and Highlights in use, by as much as 13 steps). They are developed
+  from the half-equirect of the same frame instead, and the three views
+  agree to within about half a step. A raw converter given the DNG of such a view develops
+  it from that picture alone, so there the views still differ; the DNG of
+  the VR180 frame is the one that matches.
+- **Every frame is a DNG.** Snapshot writes a linear DNG beside the JPEG:
+  the projected frame in the camera's own linear colour, with the panel's
+  settings inside, so another raw converter opens it as it looks here. In
+  the export bar a raw clip can be written as a **DNG sequence** (a folder
+  of numbered frames) or as video; video is 10-bit.
+- **The camera's own frames as a DNG sequence.** The DNG sequence has a
+  second form, **Camera original**: every frame exactly as the sensor
+  recorded it, one 3840×3840 Bayer DNG per eye (`CAM0/000000094.dng`,
+  `CAM1/000000094.dng`, named by the camera's frame number), with no
+  projection, no stabilization and no grading in it. It is for work that
+  has to happen on the raw frames before anything else, such as running
+  every frame through a raw converter's enhancement. The files are
+  losslessly packed (about 12 MB a frame per eye at 30 fps, as much as the
+  capture itself), carry the camera's colour description, and open in
+  Adobe Camera Raw and in macOS. The take's small files (lens record,
+  gyro, sound) and a list of the frames with their exposure times are
+  written beside them. Trim points apply. From a fast disk a one-minute
+  30 fps take (1800 frame pairs, 43 GB) writes in about half a minute.
+- **Frames enhanced in a raw converter come back in.** Camera Raw's
+  Super Resolution can be run on the Camera original DNGs, and the export
+  then uses its result. Camera Raw 18 enhances a DNG in place: the file
+  keeps its mosaic and gains the enhanced picture, the frame demosaiced
+  and enlarged twofold (7680×7680 an eye) in the camera's own linear
+  values. With **Use enhanced frames** on (Export format, on by default)
+  and the folder of Camera original DNGs beside the take, every frame of
+  an export is taken from that picture where the folder has one, and from
+  the capture, enlarged to match, where it has not. An export whose
+  stretch of the take holds no enhanced frame runs on the capture as
+  before, and the export bar says when enhanced frames are in use.
+  Enhanced frames hold more than 8192×4096 shows, so a take that has
+  them gets two larger sizes, **13120×6560** and **16384×8192**, with a
+  choice of their own: Export format lists them once the frames are
+  found and says what it found, and a stretch without enhanced frames
+  exports at the size picked without them. Both sizes encode in hardware
+  on Apple silicon (0.60 and 0.69 s a frame pair, 5.7 and 7.2 GB); like
+  every size above 8192×4096 they are beyond what most players decode.
+  Preview, grading and stabilization stay on the capture; lens, timing
+  and sound are the take's. So the whole round trip is: export Camera
+  original, enhance the folder in Camera Raw, export the video. Read from
+  a frame enhanced by Camera Raw 18.7; its values agree with Camera Raw's
+  own demosaic of the frame to a part in a thousand. About 0.45 s a frame
+  pair and 4 GB of memory at 8192×4096. macOS only for now: the enhanced
+  picture is JPEG XL, which this build decodes through the system.
+- **Rolling shutter and the accelerometer.** Takes from the camera build
+  that records the sensor's row timing and the accelerometer use both.
+  Each frame's pose is taken where its centre row starts exposing (the
+  frame's stamp plus half the readout the take states: 14.6 ms at 30 and
+  60 fps, 15.4 ms at 50), every row is corrected for its own time, top
+  row first, and the poses are built with the accelerometer as the
+  camera's own video files' are, which keeps a long take from tilting.
+  Measured on six hand-held takes against the picture itself: the readout
+  the take states is the one the picture shows, and on the hardest of
+  them the far-field shake of a locked export fell from 1.5 to 0.4 pixels
+  a frame at 1024 pixels an eye (2.6 without stabilization). Takes of the
+  earlier build have neither and stabilize as before.
+- **Auto align.** The View adjustment panel's Auto align works on raw
+  takes: the two eyes' camera-linear frames are turned into a picture the
+  matcher can read (white-balanced, lifted, on a display curve) and
+  measured as any other clip's. On two takes of one camera it gives the
+  same pitch and roll to 0.01°, and a known offset put on the sliders
+  comes back in the measurement to 0.005°.
+- **Settings from Camera Raw.** Raw development has **Read from Camera
+  Raw**: the white balance, the six tone controls, the sharpening and the
+  colour noise reduction a frame was left with in Camera Raw become the
+  clip's. They are read from the Camera original DNG of the frame on
+  screen, or of the nearest frame that has settings, in the folder beside
+  the take. Whatever else was set there (texture, clarity, a curve, the
+  colour mixer, masks, a crop, another profile and so on) is named under
+  the button and stays in Camera Raw. The section also no longer turns an
+  as-shot white balance into a custom one of the same value just by being
+  shown.
+- **Noise reduction.** The Noise Reduction section (macOS) works on raw
+  takes. The filter is a video filter, 10-bit and with colour at half
+  resolution, so a take's frames pass it white-balanced and on a
+  logarithmic curve and come back as the camera's linear values: tone and
+  colour stay where they were (within 0.1 of 255 on a dusk take), grain in
+  flat areas halves at strength 0.7, the strongest edges keep 97 % of
+  their contrast and a clear sky gets no banding. It costs about 0.3 s a
+  frame pair.
+- **Shutter time.** A take that lists each frame's integration time
+  (`exposure.csv`, written by the camera build that follows the one
+  above) has its poses taken at the centre row's mid-exposure: half the
+  frame's own shutter time later than where the row starts. Its frames
+  are also timed by when the sensor read them out, which is even, and not
+  by when their exposures began, which moves with every change of
+  shutter: a take whose shutter dropped from 16.4 to 7.9 ms in one step
+  no longer reads as having lost a frame there. Takes without the list
+  are sampled where the row starts, as before, which on a hand-held take
+  leaves the 0.4 pixels above (0.06 with the 3 ms those takes turn out to
+  need).
+- **What a take does not carry.** No white balance of its own: As shot is
+  the camera's reference white.
+
 ### Insta360 X6: ETTR recovery for I-Log clips
 
 A clip exposed brighter than normal on purpose (exposing to the right: more
@@ -27,6 +207,80 @@ sensor recorded, ahead of the tone controls and the LUT.
   every input code, and exports through each path (10- and 8-bit, hardware
   and software encoder, ProRes) land within one 10-bit code of it on
   average.
+
+### Lens Space: the camera's own lens, for Apple Vision Pro
+
+A VR180 file is a 180° canvas. A fisheye that sees more than that, as the
+lenses of a 360 camera do, loses what lies past the canvas's edge. A Crop
+clip of the Insta360 X6, which covers about 97° or 126°, sits in the middle
+of a canvas that is half to two thirds black, and the canvas has to be far
+larger than the recording to keep its detail: 13120 × 6560 for a recording
+of 9824 × 4912. The **Fisheye** output format is now **Lens Space**, and
+writes each eye the way the camera recorded it: in the camera lens's own
+projection, in the recording's own frame, with that lens stated in the file
+(Apple Projected Media Profile, parametric immersive projection), so the
+headset shows every pixel at its own angle.
+
+- **Every video source**: Insta360 X6 in all of its recording modes, DJI
+  Osmo 360, QooCam 3 Ultra, Blackmagic RAW, GoPro `.360`, and a
+  side-by-side file whose halves are fisheye images. A side-by-side file
+  that is already VR180 has no lens, and exports as VR180.
+- **The lens's whole view.** A full fisheye frame keeps its field past
+  180°: about 200° across the frame of an X6 at 8K or of an Osmo 360, 213°
+  for an X6 at 10K, and more towards the frame's corners. A GoPro `.360`
+  holds 184.5° per lens; its frame is a fisheye of that field at the
+  file's own pixel density. Around the picture the frame is black.
+- **No black canvas for a Crop clip.** The whole frame is picture, at the
+  density it was recorded: 9824 × 4912 for a 10K Crop clip (56 % of the
+  pixels of its 180° canvas), 7424 × 3712 for a 7.4K Crop clip (32 %), each
+  with all of its detail.
+- **The clip's own size.** A lens frame is as large as the recording
+  (7680 × 3840 for an 8K X6 or an Osmo 360) and is never enlarged; the 8K
+  choice writes a reduced copy of a frame that is larger than that.
+- **Everything else as before**: stabilization, rolling-shutter correction,
+  eye alignment, the crop mask and colour are applied the same way. Both
+  eyes are rendered into one common lens with the camera lens's own radial
+  law, so the picture is resampled at very nearly one to one. The profile
+  describes one family of lenses; a camera whose lens record is of another
+  kind gets the lens of that family that follows it most closely (within
+  three pixels over the whole field of an Osmo 360).
+- **Stabilization has no spare canvas here**, so a stabilized frame is 5 %
+  larger on each side than the recording: 8448 × 4224 for an 8K X6 or an
+  Osmo 360 clip, 8160 × 4080 for a 7.4K Crop clip, 10800 × 5400 for a 10K
+  Crop clip, the same for every clip of a mode. Where the picture does not
+  reach, the frame is black, as around the picture of a VR180 export; a
+  shift beyond the margin is cut at the frame's edge (under 4 seconds of a
+  rough one-minute hand-held walk on a 7.4K Crop clip). With stabilization
+  off the frame is the recorded one. An 8K copy keeps its size and scales
+  the picture instead. A crop mask is measured from the frame's own edge
+  (the larger one, on a stabilized clip): its window can be as wide as the
+  frame, and gives a steady edge once it is small enough to stay inside
+  the moving picture. Camera lock suits a camera that stays put.
+- **The preview is the export.** In Lens Space the preview draws the
+  frame that is written: its shape, the stabilizer's margin, the crop mask
+  where the export has it.
+- **Apple Vision Pro only** (visionOS 26 or later). No other headset and
+  not YouTube read this form, so VR180 stays the default format and is
+  unchanged: export a clip in both and you get `…_SBS` and `…_Lens`.
+- **The equidistant disc is still there.** Lens Space has a **Lens**
+  choice per clip: **Camera lens** (the default, everything above) or
+  **Equidistant**, the 195° disc in a square frame (185° for a GoPro
+  `.360`) that players and tools for fisheye video expect, as the Fisheye
+  format wrote it. With the Apple Vision Pro metadata on, a disc now
+  states its own lens too: it used to be tagged as a half-equirect, which
+  the headset showed with the wrong geometry. YouTube's metadata has no
+  fisheye form, so nothing is written for it on a disc. A clip whose
+  settings were saved in the Fisheye format opens with the camera's lens:
+  pick Equidistant to get the disc back.
+- **Checked**: for every source kind, the system's own playback mesh,
+  built from the lens in the file, lands within a thousandth of a pixel of
+  what the app rendered, out to 113° off the axis; the picture agrees with
+  the VR180 export of the same frames, re-projected independently, to 0.2
+  of a pixel; the lens boxes are byte for byte what Apple's writer
+  produces. Every existing export is frame-identical, and so is every
+  preview outside Lens Space; a Lens Space preview lies on the exported
+  frame, margin and mask included. Crop clips have been watched on the
+  headset; a frame wider than 180° has not yet.
 
 ### macOS: the preview can match QuickTime
 
@@ -108,6 +362,14 @@ show the export.
   finished notification did not come, until the window was shown again: an
   unattended batch sat idle for as long as the window stayed covered. The
   hand-over to the next clip now runs whether or not the window is visible.
+- **A Crop clip's export size followed the other clips' choice.** The
+  export resolution was one choice for the whole list, so a list that held
+  X6 Crop clips next to full-view clips had no setting that gave each its
+  best: a full-view clip's own size put the Crop clips on the smaller canvas
+  of their own size, and a Crop clip's native sharpness sent the others to
+  8K. A Crop clip now keeps a choice of its own. The Format window edits it
+  while a Crop clip is open and the general one otherwise, and a batch
+  exports each clip at the size picked for its sort.
 
 ## 2.5.6 — 2026-11-13
 

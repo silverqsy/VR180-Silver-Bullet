@@ -294,6 +294,145 @@ pub fn encode_tile_rgb16_into(
 }
 
 // ---------------------------------------------------------------------------
+// Bayer mosaics
+// ---------------------------------------------------------------------------
+
+/// MSB-first bit packer for the mosaic encoder: a 64-bit accumulator emptied
+/// four bytes at a time, with JPEG byte stuffing.
+struct WideBits<'a> {
+    out: &'a mut Vec<u8>,
+    acc: u64,
+    n: u32,
+}
+
+impl WideBits<'_> {
+    /// Append the low `nbits` bits of `value` (`nbits` ≤ 32, `value` holds
+    /// nothing above them).
+    #[inline(always)]
+    fn put(&mut self, value: u32, nbits: u32) {
+        self.acc = (self.acc << nbits) | value as u64;
+        self.n += nbits;
+        if self.n >= 32 {
+            self.n -= 32;
+            let word = (self.acc >> self.n) as u32;
+            // No byte of the word is FF: the common case, written whole.
+            let inv = !word;
+            if inv.wrapping_sub(0x0101_0101) & !inv & 0x8080_8080 == 0 {
+                self.out.extend_from_slice(&word.to_be_bytes());
+            } else {
+                for b in word.to_be_bytes() {
+                    self.out.push(b);
+                    if b == 0xFF {
+                        self.out.push(0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write what is left, the last byte padded with 1-bits.
+    fn finish(mut self) {
+        while self.n >= 8 {
+            self.n -= 8;
+            let b = (self.acc >> self.n) as u8;
+            self.out.push(b);
+            if b == 0xFF {
+                self.out.push(0);
+            }
+        }
+        if self.n > 0 {
+            let pad = 8 - self.n;
+            let b = (((self.acc << pad) as u8) | ((1u16 << pad) - 1) as u8) as u8;
+            self.out.push(b);
+            if b == 0xFF {
+                self.out.push(0);
+            }
+        }
+    }
+}
+
+/// Encode one tile of a Bayer mosaic as a lossless JPEG stream: `width`
+/// sites a row (an even number), `height` rows, `precision` bits a sample
+/// (2..=16).
+///
+/// The two sites of a row's 2-site group are the two components of a frame
+/// `width / 2` wide, so every sample is predicted from the sample of its own
+/// colour two sites to its left (the first group of a row from the first
+/// group of the row above, the very first from 2^(precision−1)) — the
+/// layout raw converters expect of a mosaic in a DNG. Otherwise the stream
+/// is the one of [`encode_tile_rgb16_into`]: SOF3, a Huffman table per
+/// component from its own statistics, one scan, predictor 1.
+///
+/// `out` is cleared and filled with the complete stream.
+///
+/// # Panics
+/// On a size mismatch, an odd width or a dimension out of range.
+pub fn encode_tile_cfa_into(tile: &[u16], width: usize, height: usize, precision: u8, out: &mut Vec<u8>) {
+    assert!(
+        width % 2 == 0 && (2..=131070).contains(&width) && (1..=65535).contains(&height),
+        "ljpeg: mosaic tile dimensions {width}x{height} out of range"
+    );
+    assert!((2..=16).contains(&precision), "ljpeg: precision {precision} out of range");
+    assert_eq!(tile.len(), width * height, "ljpeg: mosaic tile has {} samples, expected {}x{}", tile.len(), width, height);
+
+    // The residual of every sample, row by row: `f(component, residual)`.
+    #[inline(always)]
+    fn residuals(tile: &[u16], width: usize, first: u16, mut f: impl FnMut(usize, i16)) {
+        let mut above = [first, first];
+        for row in tile.chunks_exact(width) {
+            f(0, row[0].wrapping_sub(above[0]) as i16);
+            f(1, row[1].wrapping_sub(above[1]) as i16);
+            above = [row[0], row[1]];
+            for (prev, cur) in row.chunks_exact(2).zip(row[2..].chunks_exact(2)) {
+                f(0, cur[0].wrapping_sub(prev[0]) as i16);
+                f(1, cur[1].wrapping_sub(prev[1]) as i16);
+            }
+        }
+    }
+    let first = 1u16 << (precision - 1);
+
+    // ---- pass 1: the SSSS histogram of each component ----------------------
+    let mut freq = [[0u64; 17]; 2];
+    residuals(tile, width, first, |c, d| freq[c][ssss_of(d) as usize] += 1);
+    let tabs = [canonical(&huff_lengths(&freq[0])), canonical(&huff_lengths(&freq[1]))];
+
+    // ---- headers ----------------------------------------------------------
+    out.clear();
+    out.reserve(tile.len() * 2 + 128);
+    out.extend_from_slice(&[0xFF, 0xD8]); // SOI
+    out.extend_from_slice(&[0xFF, 0xC3, 0, 14, precision]); // SOF3, Lf = 8 + 3·2
+    out.extend_from_slice(&(height as u16).to_be_bytes());
+    out.extend_from_slice(&((width / 2) as u16).to_be_bytes());
+    out.extend_from_slice(&[2, 0, 0x11, 0, 1, 0x11, 0]);
+    for (t, tab) in tabs.iter().enumerate() {
+        let lh = (2 + 17 + tab.huffval.len()) as u16;
+        out.extend_from_slice(&[0xFF, 0xC4]);
+        out.extend_from_slice(&lh.to_be_bytes());
+        out.push(t as u8);
+        out.extend_from_slice(&tab.bits[1..17]);
+        out.extend_from_slice(&tab.huffval);
+    }
+    // SOS: Ns = 2, (Cs, Td<<4), Ss = 1 (predictor 1), Se = 0, AhAl = 0.
+    out.extend_from_slice(&[0xFF, 0xDA, 0, 10, 2, 0, 0x00, 1, 0x10, 1, 0, 0]);
+
+    // ---- pass 2: entropy-coded data ---------------------------------------
+    let codes = [tabs[0].codes, tabs[1].codes];
+    let mut bits = WideBits { out, acc: 0, n: 0 };
+    residuals(tile, width, first, |c, d| {
+        let ssss = ssss_of(d);
+        let (code, len) = codes[c][ssss as usize];
+        if ssss == 0 || ssss == 16 {
+            bits.put(code as u32, len as u32);
+        } else {
+            let v = (if d > 0 { d as i32 } else { d as i32 - 1 }) as u32 & ((1u32 << ssss) - 1);
+            bits.put(((code as u32) << ssss) | v, len as u32 + ssss);
+        }
+    });
+    bits.finish();
+    out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+}
+
+// ---------------------------------------------------------------------------
 // Test support: an independent decoder (port of ljpeg_check.py) and the
 // reference synthetic image generator (port of lindng.py's synth_image), both
 // shared with the DNG writer tests.
@@ -654,6 +793,71 @@ mod tests {
         let l = huff_lengths(&freq);
         assert_eq!(l[5], 1);
         assert_eq!(l.iter().filter(|&&x| x > 0).count(), 1);
+    }
+
+    fn roundtrip_cfa(tile: &[u16], w: usize, h: usize, precision: u8) -> Vec<u8> {
+        let mut enc = vec![9, 9];
+        encode_tile_cfa_into(tile, w, h, precision, &mut enc);
+        let dec = ljpeg_decode(&enc);
+        assert_eq!((dec.height, dec.width, dec.ncomp), (h, w / 2, 2));
+        assert_eq!(dec.samples, tile, "mosaic round-trip mismatch for {w}x{h} at {precision} bits");
+        enc
+    }
+
+    #[test]
+    fn a_mosaic_tile_comes_back_sample_for_sample() {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        for &(w, h) in &[(2usize, 1usize), (2, 9), (8, 1), (6, 5), (64, 16), (3840, 160)] {
+            // Every 14-bit code, at random.
+            let noise: Vec<u16> = (0..w * h).map(|_| (rng.next_u32() & 0x3FFF) as u16).collect();
+            roundtrip_cfa(&noise, w, h, 14);
+            // A scene: two colours of a row that drift on their own, and a
+            // highlight now and then.
+            let mut scene = Vec::with_capacity(w * h);
+            let mut v = [900i32, 2400];
+            for i in 0..w * h {
+                let c = i % 2;
+                let step = (rng.next_u32() % 61) as i32 - 30;
+                v[c] = if rng.next_u32() % 211 == 0 { 15408 } else { (v[c] + step).clamp(0, 16383) };
+                scene.push(v[c] as u16);
+            }
+            let enc = roundtrip_cfa(&scene, w, h, 14);
+            if w * h >= 1024 {
+                assert!(enc.len() < w * h * 2, "a scene is no larger packed than loose: {} bytes for {} samples", enc.len(), w * h);
+            }
+        }
+        // The codes at the ends of the range and steps between them.
+        for &v in &[0u16, 1, 64, 8191, 8192, 15408, 16383] {
+            let enc = roundtrip_cfa(&vec![v; 32 * 8], 32, 8, 14);
+            assert!(enc.len() < 32 * 8 / 8 + 96, "a flat tile is tiny: {} bytes", enc.len());
+        }
+        let stripes: Vec<u16> = (0..64 * 4).map(|i| if (i / 2) % 2 == 0 { 0 } else { 16383 }).collect();
+        roundtrip_cfa(&stripes, 64, 4, 14);
+        // Sixteen bits: residuals of every size, the largest one included.
+        let wide: Vec<u16> = (0..128 * 6).map(|i| match i % 8 { 0 => 0, 1 => 65535, 2 => 32768, 3 => 1, 4 => 32768, 5 => 32769, _ => (rng.next_u32() & 0xFFFF) as u16 }).collect();
+        roundtrip_cfa(&wide, 128, 6, 16);
+    }
+
+    #[test]
+    fn a_mosaic_stream_is_two_components_half_as_wide() {
+        let tile: Vec<u16> = (0..3840 * 4).map(|i| ((i * 37) % 9001) as u16).collect();
+        let mut enc = Vec::new();
+        encode_tile_cfa_into(&tile, 3840, 4, 14, &mut enc);
+        // SOI, SOF3 with P = 14, Y = 4, X = 1920, Nf = 2, ids 0 / 1 with H = V = 1.
+        assert_eq!(&enc[..4], &[0xFF, 0xD8, 0xFF, 0xC3]);
+        assert_eq!(&enc[4..18], &[0x00, 0x0E, 14, 0, 4, 0x07, 0x80, 2, 0, 0x11, 0, 1, 0x11, 0]);
+        let mut pos = 18;
+        for t in 0..2u8 {
+            assert_eq!(&enc[pos..pos + 2], &[0xFF, 0xC4]);
+            let len = ((enc[pos + 2] as usize) << 8) | enc[pos + 3] as usize;
+            assert_eq!(enc[pos + 4], t);
+            pos += 2 + len;
+        }
+        assert_eq!(&enc[pos..pos + 12], &[0xFF, 0xDA, 0x00, 0x0A, 2, 0, 0x00, 1, 0x10, 1, 0, 0]);
+        assert_eq!(&enc[enc.len() - 2..], &[0xFF, 0xD9]);
+        // No marker inside the entropy data: every FF there is stuffed.
+        let data = &enc[pos + 12..enc.len() - 2];
+        assert!(data.windows(2).all(|p| p[0] != 0xFF || p[1] == 0x00), "an unstuffed FF in the scan");
     }
 
     #[test]

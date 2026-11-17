@@ -34,12 +34,12 @@ Studio).
 
 ## Features
 
-- **Two output modes.** **VR180 SBS** (half-equirect, or a fisheye
-  projection matched to the lens) with Vision Pro (APMP) or YouTube
-  metadata — or **Reframed (Flat 3D)**, a rectilinear side-by-side view for
-  AR glasses and 3D displays with zoom, pan / tilt / roll and a Defish
-  blend. Drag the preview to pan, scroll to zoom; export 2:1 up to
-  7680×3840 or 32:9 up to 7680×2160.
+- **Three output formats.** **VR180 SBS** (half-equirect) with Vision Pro
+  (APMP) or YouTube metadata; **Lens Space**, the picture kept as a
+  fisheye (see below); or **Reframed (Flat 3D)**, a rectilinear
+  side-by-side view for AR glasses and 3D displays with zoom, pan / tilt /
+  roll and a Defish blend. Drag the preview to pan, scroll to zoom; export
+  2:1 up to 7680×3840 or 32:9 up to 7680×2160.
 - **Real-time preview** of the exact 10-bit stack the export uses. SBS,
   anaglyph, 50% overlay and single-eye views, a native-resolution
   magnifier, audio playback. On macOS, **Match QuickTime** shows it with
@@ -64,6 +64,14 @@ Studio).
   Windows). Audio is muxed inline — stereo, ambisonic, or APAC spatial on
   macOS. Multi-segment recordings join frame-exact. Optional BeyondVR hack
   for headset clarity.
+- **Lens Space**: instead of a 180° canvas, each eye is written the way it
+  was recorded, through the camera's own lens, which the file states (APMP
+  parametric immersive). A full fisheye keeps the whole view of its lens,
+  past 180°; an X6 Crop clip holds all of its detail in a third to half of
+  the pixels. For every video source, and the preview shows the frame that
+  is exported. Plays on Apple Vision Pro; VR180 stays there for everything
+  else. The same format also writes an equidistant fisheye disc, for
+  players and tools that take one.
 - **Spatial video** (macOS): export the reframed view as an Apple spatial
   video — MV-HEVC with the field of view you framed — for Vision Pro. The
   export format tells you when a view is wider than the headset shows at

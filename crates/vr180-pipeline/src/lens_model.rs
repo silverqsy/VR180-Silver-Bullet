@@ -35,6 +35,10 @@ pub enum LensOutput {
     HalfEquirect,
     /// The equidistant fisheye disk.
     Fisheye,
+    /// A lens frame: the fisheye output's kernels write the image of this
+    /// lens over the whole frame instead of the disk (see
+    /// [`crate::lens_frame`]).
+    LensFrame(crate::lens_frame::LensFrame),
     /// A flat viewport `hfov_deg` wide, `aspect` = width / height, blended
     /// toward a fisheye by `defish`.
     Reframe { hfov_deg: f32, defish: f32, aspect: f32 },
@@ -68,6 +72,19 @@ pub fn resolve_lens_pair(
     src_h: u32,
     osv: Option<&vr180_fisheye::DjiOsvImu>,
 ) -> (FisheyeCalib, FisheyeCalib) {
+    view_lens_pair(req, resolve_source_lens_pair(req, src_w, src_h, osv))
+}
+
+/// The two eyes' lens models before the output is put on them
+/// ([`view_lens_pair`]): the source's lenses as the half-equirect is drawn
+/// through them. (What a raw clip's reference frame is drawn through,
+/// whatever view the clip is shown in.)
+pub fn resolve_source_lens_pair(
+    req: &LensRequest,
+    src_w: u32,
+    src_h: u32,
+    osv: Option<&vr180_fisheye::DjiOsvImu>,
+) -> (FisheyeCalib, FisheyeCalib) {
     use vr180_fisheye::presets;
 
     let preset = if !req.preset.is_empty() && req.preset != "Auto" {
@@ -78,6 +95,7 @@ pub fn resolve_lens_pair(
         let auto_name = match req.kind {
             SourceKind::DjiOsv        => "DJI Osmo 360",
             SourceKind::Insta360Insv
+            | SourceKind::X6Raw
             | SourceKind::Insta360Dng => "Insta360 X6",
             SourceKind::KandaoQoocam
             | SourceKind::KandaoDng   => crate::kandao_imu::KANDAO_PRESET_NAME,
@@ -109,7 +127,8 @@ pub fn resolve_lens_pair(
          | SourceKind::Insta360Dng
          | SourceKind::KandaoQoocam
          | SourceKind::KandaoDng
-         | SourceKind::BlackmagicRaw, Some(imu)) => {
+         | SourceKind::BlackmagicRaw
+         | SourceKind::X6Raw, Some(imu)) => {
             let scale_x = imu.lens_b.width.map(|w| (src_w as f32) / w).unwrap_or(1.0);
             let scale_y = imu.lens_b.height.map(|h| (src_h as f32) / h).unwrap_or(1.0);
             let eye = |output: usize, lens: &vr180_fisheye::DjiLensCalib,
@@ -215,20 +234,34 @@ pub fn resolve_lens_pair(
     // Generic SBS with the fisheye dewarp off: the halves are already
     // half-equirect — bypass the lens model (identity resample for the
     // default output, a correct (lon, lat) lookup for the reframed view).
-    let (calib_l, calib_r) = if req.kind == SourceKind::SbsFisheye && !req.sbs_dewarp_fisheye {
+    if req.kind == SourceKind::SbsFisheye && !req.sbs_dewarp_fisheye {
         (calib_l.with_equirect_input(), calib_r.with_equirect_input())
     } else {
         (calib_l, calib_r)
-    };
+    }
+}
 
+/// The lens models of [`resolve_source_lens_pair`] for the output the
+/// request names.
+pub fn view_lens_pair(
+    req: &LensRequest,
+    (calib_l, calib_r): (FisheyeCalib, FisheyeCalib),
+) -> (FisheyeCalib, FisheyeCalib) {
     // Equidistant FISHEYE output target: set the output half-FOV so the
     // shaders map the inscribed circle of the square frame to a clean
     // FISHEYE_OUT_FULL_FOV_DEG fisheye. (The equirect target keeps the
     // default 90° horizontal half-FOV.)
     match req.output {
-        LensOutput::Fisheye => {
+        LensOutput::Fisheye | LensOutput::LensFrame(_) => {
             let hfov = (crate::fisheye_export::FISHEYE_OUT_FULL_FOV_DEG * 0.5).to_radians();
-            (calib_l.with_output_hfov(hfov), calib_r.with_output_hfov(hfov))
+            let (l, r) = (calib_l.with_output_hfov(hfov), calib_r.with_output_hfov(hfov));
+            // A lens frame: the same kernels write the lens's image over the
+            // whole frame instead of the disk.
+            match req.output {
+                LensOutput::LensFrame(frame) =>
+                    crate::fisheye_export::lens_frame_calib_pair(l, r, &frame, req.crop_mask),
+                _ => (l, r),
+            }
         }
         // Reframed view: a flat viewport of this width and shape.
         LensOutput::Reframe { hfov_deg, defish, aspect } => (
@@ -270,6 +303,9 @@ pub fn resolve_eac_lens_pair(
             l.with_reframe(hfov_deg, defish, aspect),
             r.with_reframe(hfov_deg, defish, aspect),
         ),
+        // A lens frame: the fisheye-output kernel writes the lens's image
+        // over the whole frame instead of its disk.
+        LensOutput::LensFrame(frame) => (l.with_lens_frame(&frame), r.with_lens_frame(&frame)),
         _ => (l, r),
     }
 }

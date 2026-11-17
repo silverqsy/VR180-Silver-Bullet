@@ -804,6 +804,9 @@ pub fn probe_duration_via_moov(path: &Path) -> Result<f64> {
     if let Some(take) = crate::x6_pair::plan_for(path) {
         return Ok(take.timeline.duration_s());
     }
+    if crate::x6_raw::is_take(path) {
+        return Ok(crate::x6_raw::probe(path)?.duration_sec);
+    }
     let mut f = std::fs::File::open(path)?;
     let fsize = f.metadata()?.len();
     // Locate `moov` reading box headers only (seeks past the multi-GB `mdat`).
@@ -874,6 +877,9 @@ pub fn probe_video_duration_via_moov(path: &Path) -> Result<f64> {
     use std::io::{Read, Seek, SeekFrom};
     if let Some(take) = crate::x6_pair::plan_for(path) {
         return Ok(take.timeline.duration_s());
+    }
+    if crate::x6_raw::is_take(path) {
+        return Ok(crate::x6_raw::probe(path)?.duration_sec);
     }
     let mut f = std::fs::File::open(path)?;
     let fsize = f.metadata()?.len();
@@ -990,6 +996,10 @@ pub fn probe_video(path: &Path) -> Result<VideoProbe> {
 }
 
 pub fn probe_video_file(path: &Path) -> Result<VideoProbe> {
+    // A raw take: a folder, not a container.
+    if crate::x6_raw::is_take(path) {
+        return crate::x6_raw::probe(path);
+    }
     // Blackmagic RAW: not an ffmpeg format (ffprobe opens some files with
     // padded dimensions and fails on others) — the SDK helper's metadata is
     // the truth for size, rate and frame count, so every caller that sizes

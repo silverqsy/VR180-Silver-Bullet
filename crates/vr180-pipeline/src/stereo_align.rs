@@ -131,8 +131,13 @@ pub fn measure_stereo_align(
     } else {
         // ── fisheye family: same opener as the portable export, 8-bit ──
         let mut open = crate::fisheye_export::fisheye_export_opener(
-            cfg.source_kind, cfg.fisheye_swap_eyes, 8, cfg.braw_color.clone());
-        let mut decoder: Box<dyn FisheyePairIter> = if cfg.segments.len() > 1 {
+            cfg.source_kind, cfg.fisheye_swap_eyes, 8, cfg.braw_color.clone(), None, None);
+        let mut decoder: Box<dyn FisheyePairIter> = if cfg.source_kind.is_raw_video() {
+            // A raw take: its eyes at half size, in memory. They are the
+            // camera's linear values and become a picture to match below.
+            Box::new(crate::x6_raw::X6RawIter::new(
+                &cfg.source_path, cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes), true, 1, None)?)
+        } else if cfg.segments.len() > 1 {
             let durations: Vec<f64> = cfg.segments.iter()
                 .map(|p| crate::decode::probe_video_duration_via_moov(p).ok()
                     .or_else(|| crate::decode::probe_video(p).ok().map(|pr| pr.duration_sec))
@@ -171,6 +176,9 @@ pub fn measure_stereo_align(
                     crate::braw_imu::braw_calib_only(&i, w, h, layout.circles)
                 })
             })
+        } else if cfg.source_kind.is_raw_video() {
+            // The take's own lens record, as an export resolves it.
+            crate::fisheye_export::resolve_export_imu(cfg)
         } else {
             None
         };
@@ -181,8 +189,13 @@ pub fn measure_stereo_align(
                 return Err(Error::Ffmpeg("auto-align cancelled".into()));
             }
             if decoder.seek(ts).is_err() { continue; }
-            let Some(pair) = decoder.next_pair()? else { continue };
+            let Some(mut pair) = decoder.next_pair()? else { continue };
             let (src_w, src_h) = (pair.eye_w, pair.eye_h);
+            if cfg.source_kind.is_raw_video() && pair.bit_depth >= 16 {
+                let neutral = crate::x6_raw::BAYER.neutral;
+                pair.left = linear_to_picture(&pair.left, neutral);
+                pair.right = linear_to_picture(&pair.right, neutral);
+            }
             let (calib_l, calib_r) = *calib_pair.get_or_insert_with(|| {
                 crate::fisheye_export::resolve_calib_pair(cfg, src_w, src_h, osv.as_ref())
             });
@@ -292,6 +305,36 @@ fn solve_yaw(sorted_dx: &[f32]) -> Option<f32> {
     }
 }
 
+/// A camera-linear eye (RGBA64, little-endian, not white-balanced) as an
+/// 8-bit picture for the matcher: each channel scaled to the camera's
+/// neutral, the whole lifted so that its brightest percent sits near the
+/// top (a take is often dark, and the matcher passes over patches without
+/// contrast in 8 bits), and put on a display curve.
+fn linear_to_picture(rgba64: &[u8], neutral: [f32; 3]) -> Vec<u8> {
+    let sample = |px: &[u8], c: usize| u16::from_le_bytes([px[2 * c], px[2 * c + 1]]) as f32 / 65535.0;
+    // The level 99 % of the greens lie under, from every 97th pixel.
+    let mut greens: Vec<f32> = rgba64.chunks_exact(8).step_by(97).map(|px| sample(px, 1)).collect();
+    if greens.is_empty() {
+        return Vec::new();
+    }
+    let at = (greens.len() - 1) * 99 / 100;
+    greens.select_nth_unstable_by(at, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let gain = (0.85 / greens[at].max(1e-4)).clamp(1.0, 256.0);
+    let scale = [gain / neutral[0].max(1e-3), gain / neutral[1].max(1e-3), gain / neutral[2].max(1e-3)];
+    // One curve for every level a sample can have.
+    let curve: Vec<u8> = (0..=4096).map(|i| ((i as f32 / 4096.0).powf(1.0 / 2.2) * 255.0).round() as u8).collect();
+    let mut out = vec![255u8; rgba64.len() / 2];
+    crate::bayer::fill_rows(&mut out, 4096, |row, dst| {
+        let src = &rgba64[row * 8192..];
+        for (o, px) in dst.chunks_exact_mut(4).zip(src.chunks_exact(8)) {
+            for c in 0..3 {
+                o[c] = curve[((sample(px, c) * scale[c]).min(1.0) * 4096.0) as usize];
+            }
+        }
+    });
+    out
+}
+
 fn to_gray(rgb: &[u8]) -> Vec<f32> {
     rgb.chunks_exact(3)
         .map(|p| (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0)
@@ -391,4 +434,40 @@ fn ncc_disparity(l: &[f32], r: &[f32], n: usize, cx: usize, cy: usize) -> Option
         if d.abs() < 1e-6 { 0.0 } else { (0.5 * (m - p) / d).clamp(-1.0, 1.0) }
     };
     Some((bx as f32 + sub(xm, xc, xp), by as f32 + sub(ym, yc, yp)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A raw take's eye is camera-linear and often dark: for the matcher it
+    /// becomes an 8-bit picture in which a grey is grey and the brightest
+    /// part sits near the top, whatever the exposure was.
+    #[test]
+    fn a_camera_linear_eye_becomes_a_picture_to_match() {
+        let neutral = [0.565_429_7f32, 1.0, 0.401_367_2];
+        let (w, h) = (1024usize, 96usize);
+        // A grey ramp, three stops under: camera values in the neutral's ratio.
+        let eye = |level: f32| -> Vec<u8> {
+            (0..w * h).flat_map(|i| {
+                let v = level * (0.05 + 0.95 * (i % w) as f32 / (w - 1) as f32);
+                [v * neutral[0], v * neutral[1], v * neutral[2], 1.0].map(|c| ((c * 65535.0).round() as u16).to_le_bytes())
+            }).flatten().collect()
+        };
+        for level in [0.9f32, 0.11, 0.004] {
+            let out = linear_to_picture(&eye(level), neutral);
+            assert_eq!(out.len(), w * h * 4);
+            let px = |x: usize, y: usize| [out[(y * w + x) * 4], out[(y * w + x) * 4 + 1], out[(y * w + x) * 4 + 2], out[(y * w + x) * 4 + 3]];
+            // Grey stays grey (the darkest exposure has few sensor codes to go by), opaque, and the ramp rises.
+            let tol = if level < 0.01 { 14 } else { 3 };
+            for x in [40usize, 300, 700, 1000] {
+                let p = px(x, 50);
+                assert!(p[0].abs_diff(p[1]) <= tol && p[2].abs_diff(p[1]) <= tol && p[3] == 255, "level {level} x {x}: {p:?}");
+            }
+            assert!(px(1000, 10)[1] > px(300, 10)[1] && px(300, 10)[1] > px(40, 10)[1]);
+            // The bright end lands near the top of the range at every exposure.
+            assert!(px(1010, 90)[1] >= 225, "level {level}: {:?}", px(1010, 90));
+        }
+        assert!(linear_to_picture(&[], neutral).is_empty());
+    }
 }

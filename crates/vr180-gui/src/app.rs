@@ -105,6 +105,9 @@ pub struct App {
     /// while the disks wake — never freezes the GUI. `update` polls `rx`;
     /// `finish_load` applies the result. `None` when no load is in flight.
     load_pending: Option<LoadPending>,
+    /// Why something the user just opened was not taken (a raw take the
+    /// camera never closed, …). Shown in the Source panel until the next open.
+    import_notice: Option<String>,
     /// Monotonic load id. Bumped on every `load_file_inner`; a delivered
     /// `LoadedMeta` is applied only if its token still matches, so a newer
     /// load (clip switch mid-read) cleanly supersedes an older one.
@@ -305,6 +308,16 @@ pub struct App {
     snapshot_status: Option<(String, std::time::Instant)>,
     /// A snapshot waiting for the export-size still of the paused frame.
     snapshot_pending: Option<SnapshotReq>,
+    /// A raw video clip's snapshot also writes the frame as a linear DNG, on
+    /// its own thread: the file and where its outcome arrives.
+    frame_dng_job: Option<(PathBuf, crossbeam_channel::Receiver<std::result::Result<(), String>>)>,
+    /// The loaded raw take's enhanced frames, as last looked up.
+    enhanced_probe: EnhancedProbe,
+    /// A raw clip's Camera Raw settings being read from its camera-original
+    /// DNGs, on a thread: the take they are for and where the outcome arrives.
+    raw_settings_job: Option<(PathBuf, crossbeam_channel::Receiver<std::result::Result<Option<vr180_pipeline::x6_raw::CameraRawSettings>, String>>)>,
+    /// What the last such read came to, and the take it was for.
+    raw_settings_status: Option<(PathBuf, String)>,
     /// Key (frame+settings) the current `full_res_display` was rendered for.
     full_res_key: u64,
     /// Key (frame+settings) we currently *want* a still for. While this
@@ -466,6 +479,32 @@ impl StillFormatChoice {
     }
 }
 
+/// The Lens Space view's two lenses ([`crate::decoder::LensSpaceLens`]), as
+/// the Output panel explains them.
+const LENS_SPACE_CAMERA_HOVER: &str = "Each eye is written the way the camera recorded it, through one lens that the file describes (Apple Projected Media Profile, parametric immersive projection). A fisheye clip keeps everything its lens saw, past 180° where the lens goes that far; a Crop clip fills its frame instead of sitting in a canvas that is mostly black. Stabilization, rolling shutter, eye alignment, the crop mask and colour are applied as always. Apple Vision Pro plays it; other headsets and YouTube need the VR180 format.";
+const LENS_SPACE_EQUIDISTANT_HOVER: &str = "An ideal equidistant fisheye: a disc in a square frame, the form that players and tools for fisheye video expect. With the Apple Vision Pro metadata on, the file states this lens too, and the headset shows the disc at its true angles.";
+const LENS_SPACE_CAMERA_NOTE: &str = "The recording's own frame through the camera's lens: its whole field of view, for Apple Vision Pro.";
+const LENS_SPACE_DISC_NOTE: &str = "equidistant disc, for players and tools that take fisheye video.";
+/// What the Format window says of a lens frame (the Lens Space view through
+/// the camera's lens).
+const LENS_FRAME_NOTE: &str = "Lens Space, camera lens: the frame is the recording's own, at the density it was recorded, so the clip's own size already holds all of its detail, and nothing the lens saw is cut off at 180°. It plays immersively on Apple Vision Pro (visionOS 26 or later) and nowhere else: for other headsets and YouTube, export the clip in the VR180 format as well. The file is named …_Lens.";
+const LENS_FRAME_STAB_NOTE: &str = "Stabilization: the frame has no spare canvas, so a stabilized frame is 5 % larger on each side than the recording, the same for every clip (an 8K copy keeps its size and scales the picture instead). Where the picture does not reach, the frame is black, as around the picture of a VR180 export; a shift beyond the margin is cut at the frame's edge. With camera lock the picture leaves the frame as the camera turns: keep that for a camera that stays put.";
+const LENS_FRAME_METADATA_NOTE: &str = "A Lens Space file through the camera's lens carries its own metadata: the lens, for Apple Vision Pro. The choice of VR180 metadata applies to the clips that export as VR180.";
+const LENS_SPACE_DISC_METADATA_NOTE: &str = "This clip exports an equidistant disc, which is not VR180: with Apple Vision Pro chosen the file states the disc's own lens instead, and for YouTube, which has no fisheye form, nothing is written.";
+
+/// The reduced size of a lens frame (the 8K choice): the frame scaled so
+/// that its longer side is 4096, its shape kept, each side a multiple of 4.
+/// `None` for a frame no larger than that: a lens frame is never enlarged.
+fn lens_frame_reduced_dims(eye_w: u32, eye_h: u32) -> Option<(u32, u32)> {
+    let long = eye_w.max(eye_h);
+    if long <= 4096 || eye_w.min(eye_h) == 0 {
+        return None;
+    }
+    let scale = 4096.0 / long as f64;
+    let side = |v: u32| (((v as f64 * scale) / 4.0).round() as u32 * 4).max(16);
+    Some((side(eye_w), side(eye_h)))
+}
+
 /// Output resolution target for the export. `Native` renders at the
 /// source's per-eye dimensions — labeled by the OSV case (3840² per eye
 /// → 7680×3840 SBS); a `.360` source actually renders its cross-native
@@ -480,16 +519,23 @@ impl StillFormatChoice {
 /// ~126°, so a 180° canvas of the frame's own size scales it down. `Sharp`
 /// renders the 180° canvas at the pixel density of the frame's centre
 /// (`π × the lens' centre focal`: 6560² per eye → 13120 × 6560 on the X6).
-/// Offered only for such a clip; on any other it falls back to `R8k`.
+/// Offered only for such a clip, whose choice is kept apart from every
+/// other clip's ([`ExportOptions::resolution_for`]).
+///
+/// `R13k` and `R16k` exist for a raw take read from frames a raw converter
+/// enhanced (7680² an eye): such frames hold more than 8192 × 4096 shows,
+/// and these two canvases (6560² and 8192² per eye) keep it. Offered only
+/// where the take's enhanced frames are found, with a choice of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExportResolution { Native, R8k, Sharp }
+enum ExportResolution { Native, R8k, Sharp, R13k, R16k }
 
 impl ExportResolution {
     fn label(self) -> &'static str {
         match self {
             ExportResolution::Native => "7680 × 3840",
             ExportResolution::R8k    => "8192 × 4096",
-            ExportResolution::Sharp  => "13120 × 6560",
+            ExportResolution::Sharp | ExportResolution::R13k => "13120 × 6560",
+            ExportResolution::R16k   => "16384 × 8192",
         }
     }
 
@@ -499,10 +545,77 @@ impl ExportResolution {
         match (self, single_eye) {
             (ExportResolution::Native, true) => "3840 × 3840",
             (ExportResolution::R8k, true)    => "4096 × 4096",
-            (ExportResolution::Sharp, true)  => "6560 × 6560",
+            (ExportResolution::Sharp | ExportResolution::R13k, true) => "6560 × 6560",
+            (ExportResolution::R16k, true)   => "8192 × 8192",
             (r, false) => r.label(),
         }
     }
+
+    /// Per-eye side of the canvases that exist for enhanced frames.
+    fn enhanced_side(self) -> Option<u32> {
+        match self {
+            ExportResolution::R13k => Some(6560),
+            ExportResolution::R16k => Some(8192),
+            _ => None,
+        }
+    }
+}
+
+/// Whether an export of a clip runs the noise filter, which is what the
+/// export bar's "NR" says: a video file does when the clip's Noise Reduction
+/// is above zero; a folder of DNG frames (the developed view or the camera's
+/// own) and a still are written without it, whatever the clip's setting.
+fn export_runs_noise_filter(kind: vr180_pipeline::SourceKind, denoise_strength: f32, opts: &ExportOptions) -> bool {
+    denoise_strength > 0.0 && !kind.is_still() && !(kind.is_raw_video() && opts.raw_dng_sequence)
+}
+
+/// Which list of sizes a clip picks from. Each list has a choice of its
+/// own, so a size picked on one sort of clip never changes what a clip of
+/// another sort exports at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SizeList {
+    /// The clip's own size or 8192 × 4096: every clip but the two below.
+    Plain,
+    /// A clip whose frame is a crop of the lens' view: its native sharpness too.
+    Crop,
+    /// A raw take read from enhanced frames: the two larger canvases too.
+    Enhanced,
+}
+
+impl SizeList {
+    /// `cropped`: the clip has a native-sharpness size (`sharp_eye` is
+    /// `Some`). `enhanced`: it is a raw take whose enhanced frames the
+    /// export reads (never a cropped one).
+    fn of(cropped: bool, enhanced: bool) -> Self {
+        if enhanced { Self::Enhanced } else if cropped { Self::Crop } else { Self::Plain }
+    }
+}
+
+/// What is known of a raw video clip's enhanced frames (the folder of its
+/// camera-original DNGs beside it), for the stretch the clip is trimmed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnhancedFrames {
+    /// The folder is being looked through.
+    Looking,
+    /// No enhanced frame there for this stretch (or no folder).
+    Absent,
+    /// Enhanced pictures of this many pixels a side per eye.
+    Found(u32),
+}
+
+/// A take and its trim, as an enhanced-frames lookup is asked for them.
+type EnhancedKey = (PathBuf, Option<u64>, Option<u64>);
+
+/// The loaded raw take's enhanced frames, looked up on a thread: listing a
+/// folder of thousands of files on a share is not for the UI thread.
+#[derive(Default)]
+struct EnhancedProbe {
+    /// What the lookup in flight, or the last one, was asked for.
+    key: Option<EnhancedKey>,
+    /// The last answer for the take of `key`.
+    side: Option<Option<u32>>,
+    asked_at: Option<std::time::Instant>,
+    rx: Option<crossbeam_channel::Receiver<(EnhancedKey, Option<u32>)>>,
 }
 
 /// Per-eye size of a reframed export (the side-by-side frame is twice as
@@ -620,10 +733,31 @@ impl ProResProfile {
 #[derive(Debug, Clone, Copy)]
 struct ExportOptions {
     codec: ExportCodec,
+    /// A raw video clip exports as a folder of DNG frames instead of a
+    /// video file (used only when the source is a raw video).
+    raw_dng_sequence: bool,
+    /// The frames of that folder are the sensor's own (one Bayer DNG per
+    /// eye per frame: no projection, no stabilization, no grade) and not
+    /// the developed view.
+    raw_dng_original: bool,
+    /// A raw video clip's frames come from the folder of its camera-original
+    /// DNGs where a raw converter has enhanced them (the folder beside the
+    /// take, see `default_frames_dir_for`).
+    raw_use_enhanced: bool,
     /// Still-photo container (used only when the source is a still).
     still_format: StillFormatChoice,
-    /// Output resolution target (Native / 8192×4096 / a Crop clip's native sharpness).
+    /// Output resolution target (Native / 8192×4096) of every clip but a
+    /// Crop one. Read it through [`ExportOptions::resolution_for`].
     resolution: ExportResolution,
+    /// The same choice for a clip whose frame is a crop of the lens' view
+    /// (Native / 8192×4096 / its native sharpness). Its own, so a list that
+    /// holds both sorts exports each at the size picked on a clip of its
+    /// sort: "its own size" means something else on either side (the whole
+    /// canvas for one, a smaller canvas than was recorded for the other).
+    crop_resolution: ExportResolution,
+    /// The same choice for a raw take read from enhanced frames (Native /
+    /// 8192×4096 / 13120×6560 / 16384×8192): its own for the same reason.
+    enhanced_resolution: ExportResolution,
     /// H.265 average bitrate in Mbps for VR180 output. Range 20..=1000
     /// (a native 12K export wants the top of it; the slider is logarithmic
     /// so the everyday 50–300 Mbps band keeps its resolution).
@@ -690,7 +824,7 @@ mod file_info_tests {
 
 #[cfg(test)]
 mod export_size_tests {
-    use super::{App, ExportOptions, ExportResolution, X6ClipInfo};
+    use super::{export_runs_noise_filter, App, EnhancedFrames, ExportOptions, ExportResolution, SizeList, X6ClipInfo};
     use super::{oversize_export_hint, tr_zh, ExportCodec};
 
     /// The note for an oversize video names the encoder that runs on this
@@ -724,15 +858,22 @@ mod export_size_tests {
     }
     use vr180_fisheye::{InsvWindowCrop, X6ViewChoice};
 
-    fn eye_dims(resolution: ExportResolution, eye: u32, sharp_eye: Option<u32>) -> (u32, u32) {
-        let opts = ExportOptions { resolution, ..Default::default() };
+    /// Per-eye size of an export under `opts`: a clip of `eye` pixels a
+    /// side whose native-sharpness side is `sharp_eye` (a Crop clip's).
+    fn eye_dims_with(opts: &ExportOptions, eye: u32, sharp_eye: Option<u32>) -> (u32, u32) {
         let cfg = App::build_export_cfg(
             std::path::Path::new("/nonexistent/in.insv"), std::path::Path::new("/nonexistent/out.mp4"),
             29.97, vr180_pipeline::SourceKind::Insta360Insv,
             eye, eye, eye, eye, sharp_eye,
-            &crate::decoder::Settings::default(), &opts, Vec::new(),
+            &crate::decoder::Settings::default(), opts, Vec::new(),
         );
         (cfg.eye_w, cfg.eye_h)
+    }
+
+    /// The same with one choice made on both sorts of clip.
+    fn eye_dims(resolution: ExportResolution, eye: u32, sharp_eye: Option<u32>) -> (u32, u32) {
+        let opts = ExportOptions { resolution, crop_resolution: resolution, ..Default::default() };
+        eye_dims_with(&opts, eye, sharp_eye)
     }
 
     #[test]
@@ -744,6 +885,453 @@ mod export_size_tests {
         // Any other clip has no such size: the choice means 8K there.
         assert_eq!(eye_dims(ExportResolution::Sharp, 3840, None), (4096, 4096));
         assert_eq!(eye_dims(ExportResolution::Native, 3840, None), (3840, 3840));
+    }
+
+    /// One list, both sorts of clip: what is picked on a full-view clip
+    /// leaves a Crop clip's size alone, and the other way round.
+    #[test]
+    fn a_crop_clip_has_its_own_resolution_choice() {
+        use ExportResolution::{Native, R8k, Sharp};
+        let full = (7680, None);
+        let crop = (4912, Some(6560));
+        for (general, crop_choice, full_side, crop_side) in [
+            (Native, Sharp, 7680, 6560),
+            (Native, R8k, 7680, 4096),
+            (R8k, Sharp, 4096, 6560),
+            (R8k, Native, 4096, 4912),
+            (Native, Native, 7680, 4912),
+        ] {
+            let opts = ExportOptions { resolution: general, crop_resolution: crop_choice, ..Default::default() };
+            assert_eq!(opts.resolution_for(SizeList::Plain), general);
+            assert_eq!(opts.resolution_for(SizeList::Crop), crop_choice);
+            assert_eq!(eye_dims_with(&opts, full.0, full.1), (full_side, full_side), "{general:?} / {crop_choice:?}");
+            assert_eq!(eye_dims_with(&opts, crop.0, crop.1), (crop_side, crop_side), "{general:?} / {crop_choice:?}");
+        }
+        // Both start at 8K.
+        let d = ExportOptions::default();
+        assert_eq!((d.resolution, d.crop_resolution), (R8k, R8k));
+    }
+
+    /// Every piece of text the Format window paints for a VR180 clip.
+    fn panel_text(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, single_eye: bool) -> String {
+        panel_text_with(opts, native, sharp, None, single_eye)
+    }
+
+    /// The same, for a clip in the Lens Space view (`lens_space`: the lens
+    /// that view writes for it).
+    fn panel_text_with(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, lens_space: Option<crate::decoder::LensSpaceLens>, single_eye: bool) -> String {
+        panel_text_lens(opts, native, sharp, lens_space, false, single_eye)
+    }
+
+    /// The same, saying whether that clip is stabilized.
+    fn panel_text_lens(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, lens_space: Option<crate::decoder::LensSpaceLens>, stabilized: bool, single_eye: bool) -> String {
+        panel_text_full(opts, native, sharp, lens_space, stabilized, single_eye, None)
+    }
+
+    /// The same, for a raw video clip whose enhanced frames are `raw`
+    /// (`None`: no raw video).
+    fn panel_text_full(opts: &mut ExportOptions, native: (u32, u32), sharp: Option<(u32, u32)>, lens_space: Option<crate::decoder::LensSpaceLens>, stabilized: bool, single_eye: bool, raw: Option<EnhancedFrames>) -> String {
+        fn collect(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => { out.push_str(text.galley.text()); out.push('\n'); }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        // Two frames: a new context lays its first one out without sizes to go by.
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 3000.0))),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(input, |ui| {
+                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, lens_space, stabilized, single_eye, raw);
+            });
+            text.clear();
+            out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
+        }
+        text
+    }
+
+    /// A raw take read from enhanced frames has two larger canvases and a
+    /// choice of its own; without enhanced frames, and on every other clip,
+    /// those sizes do not exist.
+    #[test]
+    fn enhanced_frames_have_their_own_sizes() {
+        use ExportResolution::{Native, R13k, R16k, R8k, Sharp};
+        let opts = ExportOptions { resolution: Native, crop_resolution: Sharp, enhanced_resolution: R16k, ..Default::default() };
+        assert_eq!((opts.resolution_for(SizeList::Plain), opts.resolution_for(SizeList::Crop), opts.resolution_for(SizeList::Enhanced)), (Native, Sharp, R16k));
+        // A size from another list means 8192 × 4096.
+        let odd = ExportOptions { resolution: R16k, crop_resolution: R13k, enhanced_resolution: Sharp, ..Default::default() };
+        assert_eq!((odd.resolution_for(SizeList::Plain), odd.resolution_for(SizeList::Crop), odd.resolution_for(SizeList::Enhanced)), (R8k, R8k, R8k));
+        assert_eq!(ExportOptions::default().enhanced_resolution, R8k);
+        assert_eq!((SizeList::of(false, false), SizeList::of(true, false), SizeList::of(false, true)), (SizeList::Plain, SizeList::Crop, SizeList::Enhanced));
+        // The canvases, per eye.
+        let dims = |r| ExportOptions { enhanced_resolution: r, ..Default::default() }.enhanced_eye_dims((3840, 3840));
+        assert_eq!((dims(Native), dims(R8k), dims(R13k), dims(R16k)), ((3840, 3840), (4096, 4096), (6560, 6560), (8192, 8192)));
+        assert_eq!((R13k.frame_label(false), R16k.frame_label(false), R16k.frame_label(true)), ("13120 × 6560", "16384 × 8192", "8192 × 8192"));
+
+        // The Format window of a raw take: with enhanced frames found it shows
+        // their choice and says so; without, the usual one.
+        let mut opts = ExportOptions { resolution: Native, enhanced_resolution: R16k, ..Default::default() };
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Found(7680)));
+        assert!(text.contains("16384 × 8192") && !text.contains("7680 × 3840 (native)"), "{text}");
+        assert!(text.contains("Enhanced frames found: 7680 × 7680 per eye"), "{text}");
+        assert!(text.contains("the two larger sizes keep it"), "{text}");
+        assert!(text.contains("Above 8192 × 4096"), "{text}");
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Absent));
+        assert!(text.contains("7680 × 3840 (native)") && !text.contains("16384"), "{text}");
+        assert!(text.contains("No enhanced frame found for this clip"), "{text}");
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Looking));
+        assert!(text.contains("Looking for enhanced frames") && !text.contains("16384"), "{text}");
+        // The option off: the usual list, and no word of what the folder holds.
+        opts.raw_use_enhanced = false;
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Found(7680)));
+        assert!(text.contains("7680 × 3840 (native)") && !text.contains("16384") && !text.contains("Enhanced frames found"), "{text}");
+        // Showing either list changed neither choice.
+        assert_eq!((opts.resolution, opts.enhanced_resolution), (Native, R16k));
+        // Another clip never sees those sizes.
+        let text = panel_text(&mut opts, (7680, 3840), None, false);
+        assert!(!text.contains("16384") && !text.contains("enhanced"), "{text}");
+    }
+
+    /// The camera's own frames are written as they are: Export format shows
+    /// their size instead of a list to pick from, and the export bar's "NR"
+    /// is for exports that do run the noise filter.
+    #[test]
+    fn camera_original_frames_have_no_size_to_pick_and_no_noise_filter() {
+        use ExportResolution::Native;
+        let mut opts = ExportOptions { resolution: Native, raw_dng_sequence: true, raw_dng_original: true, ..Default::default() };
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Absent));
+        assert!(text.contains("3840 × 3840 per eye") && text.contains("sensor's own"), "{text}");
+        assert!(!text.contains("(native)") && !text.contains("8192 × 4096") && !text.contains("Use enhanced frames"), "{text}");
+        // The developed view is a picture of a size: its list is there.
+        opts.raw_dng_original = false;
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Absent));
+        assert!(text.contains("7680 × 3840 (native)") && text.contains("Use enhanced frames"), "{text}");
+        assert_eq!(opts.resolution, Native);
+
+        let raw = vr180_pipeline::SourceKind::X6Raw;
+        let video = ExportOptions::default();
+        let frames = ExportOptions { raw_dng_sequence: true, ..Default::default() };
+        let original = ExportOptions { raw_dng_sequence: true, raw_dng_original: true, ..Default::default() };
+        assert!(export_runs_noise_filter(raw, 0.71, &video));
+        assert!(!export_runs_noise_filter(raw, 0.0, &video));
+        assert!(!export_runs_noise_filter(raw, 0.71, &frames) && !export_runs_noise_filter(raw, 0.71, &original));
+        // Another clip in the same list is a video whatever the raw option says.
+        assert!(export_runs_noise_filter(vr180_pipeline::SourceKind::Insta360Insv, 0.5, &original));
+    }
+
+    /// The export of a raw take carries both sizes: the one picked without
+    /// enhanced frames, and the one picked for them, which it takes where
+    /// its stretch has some.
+    #[test]
+    fn a_raw_export_carries_the_enhanced_size() {
+        use crate::decoder::{FisheyeOutputMode, Settings};
+        use ExportResolution::{Native, R13k, R16k};
+        let root = std::env::temp_dir().join(format!("vr180-enhanced-size-{}", std::process::id()));
+        let take = root.join("TAKE");
+        std::fs::create_dir_all(root.join("TAKE_OriginalDNG/CAM0")).unwrap();
+        let cfg = |opts: &ExportOptions, settings: &Settings, source: &std::path::Path| App::build_export_cfg(
+            source, std::path::Path::new("/nonexistent/out.mov"), 50.0, vr180_pipeline::SourceKind::X6Raw,
+            3840, 3840, 3840, 3840, None, settings, opts, Vec::new());
+        let vr = Settings::default();
+        let big = ExportOptions { enhanced_resolution: R16k, ..Default::default() };
+        let c = cfg(&big, &vr, &take);
+        assert_eq!(((c.eye_w, c.eye_h), c.raw_enhanced_eye), ((4096, 4096), Some((8192, 8192))));
+        assert_eq!(c.raw_enhanced_dir.as_deref(), Some(root.join("TAKE_OriginalDNG").as_path()));
+        let c = cfg(&ExportOptions { enhanced_resolution: R13k, resolution: Native, ..big }, &vr, &take);
+        assert_eq!(((c.eye_w, c.eye_h), c.raw_enhanced_eye), ((3840, 3840), Some((6560, 6560))));
+        let c = cfg(&ExportOptions { enhanced_resolution: Native, ..big }, &vr, &take);
+        assert_eq!(c.raw_enhanced_eye, Some((3840, 3840)));
+        // The option off, or no folder beside the take: the plain export.
+        let c = cfg(&ExportOptions { raw_use_enhanced: false, ..big }, &vr, &take);
+        assert_eq!((c.raw_enhanced_dir.clone(), c.raw_enhanced_eye), (None, None));
+        let c = cfg(&big, &vr, &root.join("OTHER"));
+        assert_eq!((c.raw_enhanced_dir.clone(), c.raw_enhanced_eye), (None, None));
+        // A reframed view keeps its own size: enhanced frames, no other canvas.
+        let reframed = Settings { fisheye_output_mode: FisheyeOutputMode::Reframe, ..Settings::default() };
+        let c = cfg(&big, &reframed, &take);
+        assert!(c.raw_enhanced_dir.is_some() && c.raw_enhanced_eye.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // The sample take with one enhanced frame (skipped when it is not
+        // there): a stretch that holds it is written large, another is not.
+        let sample = std::path::Path::new("/Volumes/Database/x6/1115 raw video/RAWVIDEO-20261116-011723");
+        let enhanced = sample.with_file_name("RAWVIDEO-20261116-011723_OriginalDNG").join("CAM0/000000364.dng");
+        if !cfg!(target_os = "macos") || !sample.is_dir() || std::fs::metadata(&enhanced).map(|m| m.len() < 30_000_000).unwrap_or(true) { return; }
+        let mut c = cfg(&big, &vr, sample);
+        assert!(c.settle_raw_enhanced(Some(4.9), Some(5.1)));
+        assert_eq!(((c.eye_w, c.eye_h), c.raw_enhanced_eye, c.raw_enhanced_dir.is_some()), ((8192, 8192), None, true));
+        let mut c = cfg(&big, &vr, sample);
+        assert!(!c.settle_raw_enhanced(Some(8.0), Some(9.0)));
+        assert_eq!(((c.eye_w, c.eye_h), c.raw_enhanced_eye, c.raw_enhanced_dir.is_some()), ((4096, 4096), None, false));
+    }
+
+    /// The Format window shows each sort of clip its own choice, and
+    /// showing one never changes the other's.
+    #[test]
+    fn the_format_window_keeps_both_choices() {
+        use ExportResolution::{Native, Sharp};
+        let mut opts = ExportOptions { resolution: Native, crop_resolution: Sharp, ..Default::default() };
+        // A clip that holds one whole eye, at its own size.
+        let text = panel_text(&mut opts, (7680, 7680), None, true);
+        assert!(text.contains("7680 × 7680 (native)"), "{text}");
+        assert!(!text.contains("native sharpness"), "{text}");
+        assert_eq!((opts.resolution, opts.crop_resolution), (Native, Sharp));
+        // A 10K Crop clip in the same list.
+        let text = panel_text(&mut opts, (9824, 4912), Some((13120, 6560)), false);
+        assert!(text.contains("13120 × 6560 (native sharpness)"), "{text}");
+        assert!(!text.contains("9824 × 4912 (native)"), "{text}");
+        assert_eq!((opts.resolution, opts.crop_resolution), (Native, Sharp));
+    }
+
+    /// The Lens Space view through the camera's lens exports a lens frame,
+    /// at the size and shape the eye was recorded; its equidistant lens and
+    /// every other view export as they always did.
+    #[test]
+    fn a_lens_frame_is_the_recorded_frame() {
+        use crate::decoder::{FisheyeOutputMode, LensSpaceLens, Settings};
+        use vr180_pipeline::fisheye_export::{FisheyeExportProjection, LensFrameOut};
+        use vr180_pipeline::SourceKind;
+        let cfg = |opts: &ExportOptions, settings: &Settings, kind, eye: (u32, u32), sharp_eye| App::build_export_cfg(
+            std::path::Path::new("/nonexistent/in.insv"), std::path::Path::new("/nonexistent/out.mp4"),
+            29.97, kind, eye.0, eye.1, eye.0, eye.1, sharp_eye, settings, opts, Vec::new(),
+        );
+        let vr = Settings::default();
+        // The Lens Space view; the camera's lens is its default.
+        let lens = Settings { fisheye_output_mode: FisheyeOutputMode::Fisheye, ..Default::default() };
+        assert_eq!(lens.lens_space, LensSpaceLens::Camera);
+        let insv = SourceKind::Insta360Insv;
+        let on = ExportOptions { crop_resolution: ExportResolution::Sharp, ..Default::default() };
+
+        // A square Crop frame: its own size, whatever the VR180 canvas would be.
+        let c = cfg(&on, &lens, insv, (4912, 4912), Some(6560));
+        assert_eq!((c.projection, c.lens_frame), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource));
+        assert_eq!((c.eye_w, c.eye_h), (4912, 4912));
+        // A frame that is not square keeps its shape.
+        for eye in [(6000, 3968), (3840, 3008)] {
+            let c = cfg(&on, &lens, insv, eye, Some(6560));
+            assert_eq!((c.eye_w, c.eye_h, c.lens_frame), (eye.0, eye.1, LensFrameOut::FromSource), "{eye:?}");
+        }
+        // The clip's own size and its native sharpness are the same frame here.
+        let native = ExportOptions { crop_resolution: ExportResolution::Native, ..on };
+        assert_eq!((cfg(&native, &lens, insv, (4912, 4912), Some(6560)).eye_w), 4912);
+        // The 8K choice is a reduced copy of the same shape, never an enlargement.
+        let small = ExportOptions { crop_resolution: ExportResolution::R8k, ..on };
+        let c = cfg(&small, &lens, insv, (4912, 4912), Some(6560));
+        assert_eq!((c.eye_w, c.eye_h), (4096, 4096));
+        let c = cfg(&small, &lens, insv, (6000, 3968), Some(6560));
+        assert_eq!((c.eye_w, c.eye_h), (4096, 2708));
+        let c = cfg(&small, &lens, insv, (3712, 3712), Some(6560));
+        assert_eq!((c.eye_w, c.eye_h), (3712, 3712));
+        assert_eq!(super::lens_frame_reduced_dims(3840, 3008), None);
+        // What is written: the stabilizer's margin on a frame at its own
+        // size, none on a reduced copy.
+        assert_eq!(native.lens_frame_out_dims(4912, 4912, true, true), (5400, 5400));
+        assert_eq!(native.lens_frame_out_dims(4912, 4912, true, false), (4912, 4912));
+        assert_eq!(small.lens_frame_out_dims(4912, 4912, true, true), (4096, 4096));
+        assert_eq!(small.lens_frame_out_dims(3712, 3712, true, true), (4080, 4080));
+
+        // A clip that holds the lens's whole view: its own frame too, by
+        // its own resolution choice (not the Crop clips'). At 8K — the
+        // default — a frame no larger than that is not enlarged.
+        let c = cfg(&on, &lens, insv, (3840, 3840), None);
+        assert_eq!((c.projection, c.lens_frame, c.eye_w, c.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource, 3840, 3840));
+        let c = cfg(&on, &lens, insv, (4864, 4864), None);
+        assert_eq!((c.lens_frame, c.eye_w, c.eye_h), (LensFrameOut::FromSource, 4096, 4096));
+        let full = ExportOptions { resolution: ExportResolution::Native, crop_resolution: ExportResolution::R8k, ..on };
+        let c = cfg(&full, &lens, insv, (4864, 4864), None);
+        assert_eq!((c.lens_frame, c.eye_w, c.eye_h), (LensFrameOut::FromSource, 4864, 4864));
+        // Every camera's video: a DJI, a QooCam, a Blackmagic frame that is
+        // not square, a generic fisheye file.
+        for (kind, eye) in [(SourceKind::DjiOsv, (3840, 3840)), (SourceKind::KandaoQoocam, (3840, 3840)), (SourceKind::BlackmagicRaw, (6144, 8040))] {
+            let c = cfg(&full, &lens, kind, eye, None);
+            assert_eq!((c.projection, c.lens_frame, c.eye_w, c.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource, eye.0, eye.1), "{kind:?}");
+        }
+        assert_eq!({ let c = cfg(&on, &lens, SourceKind::BlackmagicRaw, (6144, 8040), None); (c.eye_w, c.eye_h) }, (3132, 4096));
+        let fisheye_file = Settings { sbs_dewarp_fisheye: true, ..lens.clone() };
+        assert_eq!(cfg(&full, &fisheye_file, SourceKind::SbsFisheye, (4096, 4096), None).lens_frame, LensFrameOut::FromSource);
+        // A GoPro `.360` has no eye frame of its own: its lens's cross
+        // (5952-wide streams: 3936) is the frame.
+        let gopro = App::build_export_cfg(
+            std::path::Path::new("/nonexistent/in.360"), std::path::Path::new("/nonexistent/out.mp4"),
+            29.97, SourceKind::GoProEac, 0, 0, 5952, 1920, None, &lens, &on, Vec::new(),
+        );
+        assert_eq!((gopro.projection, gopro.lens_frame, gopro.eye_w, gopro.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource, 3936, 3936));
+
+        // The VR180 view is VR180, whatever the lens choice says.
+        let c = cfg(&on, &vr, insv, (4912, 4912), Some(6560));
+        assert_eq!((c.projection, c.lens_frame, c.eye_w), (FisheyeExportProjection::HalfEquirect, LensFrameOut::Off, 6560));
+        let c = cfg(&on, &vr, insv, (3840, 3840), None);
+        assert_eq!((c.projection, c.lens_frame, c.eye_w), (FisheyeExportProjection::HalfEquirect, LensFrameOut::Off, 4096));
+        // The equidistant lens: the disc, in a square frame. So is a clip
+        // with no lens record (a file that is already VR180, a still).
+        let disc = Settings { lens_space: LensSpaceLens::Equidistant, ..lens.clone() };
+        let c = cfg(&native, &disc, insv, (6000, 3968), Some(6560));
+        assert_eq!((c.projection, c.lens_frame, c.eye_w, c.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::Off, 3968, 3968));
+        let c = cfg(&full, &lens, SourceKind::SbsFisheye, (4096, 4096), None);
+        assert_eq!((c.projection, c.lens_frame), (FisheyeExportProjection::Fisheye, LensFrameOut::Off));
+        for still in [SourceKind::Insta360Dng, SourceKind::KandaoDng] {
+            assert_eq!(cfg(&on, &lens, still, (7760, 7760), None).lens_frame, LensFrameOut::Off, "{still:?}");
+        }
+        let flat = Settings { fisheye_output_mode: FisheyeOutputMode::Reframe, ..Default::default() };
+        assert_eq!(cfg(&on, &flat, insv, (4912, 4912), Some(6560)).lens_frame, LensFrameOut::Off);
+        assert!(lens.lens_frame_view(insv) && lens.lens_frame_view(SourceKind::GoProEac));
+        assert!(!lens.lens_frame_view(SourceKind::Insta360Dng) && !lens.lens_frame_view(SourceKind::Unknown));
+        assert!(!flat.lens_frame_view(insv) && !vr.lens_frame_view(insv) && !disc.lens_frame_view(insv));
+        assert!(crate::decoder::lens_frame_possible(SourceKind::SbsFisheye, &fisheye_file)
+            && !crate::decoder::lens_frame_possible(SourceKind::SbsFisheye, &lens));
+        // Settings saved before the lens choice existed read as the camera's.
+        let old: Settings = serde_json::from_str(r#"{"fisheye_output_mode":"Fisheye"}"#).unwrap();
+        assert!(old.lens_frame_view(insv));
+    }
+
+    /// The Format window follows the Lens Space view: through the camera's
+    /// lens its sizes are the frame's own and the notes say where the file
+    /// plays; the disc and every other view keep the usual sizes.
+    #[test]
+    fn the_format_window_follows_the_lens_space_view() {
+        use super::{tr_zh, LENS_FRAME_METADATA_NOTE, LENS_FRAME_NOTE, LENS_FRAME_STAB_NOTE, LENS_SPACE_CAMERA_HOVER,
+            LENS_SPACE_CAMERA_NOTE, LENS_SPACE_DISC_METADATA_NOTE, LENS_SPACE_DISC_NOTE, LENS_SPACE_EQUIDISTANT_HOVER};
+        use crate::decoder::LensSpaceLens::{Camera, Equidistant};
+        let mut opts = ExportOptions { crop_resolution: ExportResolution::Sharp, ..Default::default() };
+        // Another view: the usual sizes, and no word of a lens.
+        let text = panel_text_with(&mut opts, (9824, 4912), Some((13120, 6560)), None, false);
+        assert!(text.contains("13120 × 6560 (native sharpness)"), "{text}");
+        assert!(!text.contains("Lens Space") && !text.contains("equidistant disc"), "{text}");
+        // Through the camera's lens: the clip's own size stands for its
+        // native sharpness, and the notes say where the file plays.
+        let text = panel_text_with(&mut opts, (9824, 4912), Some((13120, 6560)), Some(Camera), false);
+        assert!(text.contains("9824 × 4912 (native)") && !text.contains("13120"), "{text}");
+        assert!(text.contains(LENS_FRAME_NOTE) && text.contains(LENS_FRAME_METADATA_NOTE), "{text}");
+        assert!(text.contains(LENS_FRAME_STAB_NOTE), "{text}");
+        assert!(!text.contains("YouTube (Spherical V2"), "{text}");
+        // The stored choices are untouched by the look.
+        assert_eq!(opts.crop_resolution, ExportResolution::Sharp);
+        // A frame that is not square, one eye.
+        let text = panel_text_with(&mut opts, (6000, 3968), Some((6560, 6560)), Some(Camera), true);
+        assert!(text.contains("6000 × 3968 (native)"), "{text}");
+        // The equidistant disc: the usual sizes and the metadata choice,
+        // with what that choice means for a disc.
+        let text = panel_text_with(&mut opts, (7680, 3840), None, Some(Equidistant), false);
+        assert!(text.contains(LENS_SPACE_DISC_METADATA_NOTE) && text.contains("YouTube (Spherical V2"), "{text}");
+        assert!(!text.contains(LENS_FRAME_NOTE) && text.contains("\n8192 × 4096\n"), "{text}");
+        for s in [LENS_SPACE_CAMERA_HOVER, LENS_SPACE_EQUIDISTANT_HOVER, LENS_SPACE_CAMERA_NOTE, LENS_SPACE_DISC_NOTE,
+                  LENS_FRAME_NOTE, LENS_FRAME_STAB_NOTE, LENS_FRAME_METADATA_NOTE, LENS_SPACE_DISC_METADATA_NOTE,
+                  "Lens Space", "Lens", "Camera lens", "Equidistant", "native + margin"] {
+            assert_ne!(tr_zh(s), s, "no Chinese text for: {s}");
+        }
+        // A clip that holds the lens's whole view (an Osmo 360, an X6 at 8K):
+        // its own size by its own choice. Its 8K choice has no smaller copy
+        // to offer, and shows the frame as it is.
+        let mut whole = ExportOptions { resolution: ExportResolution::Native, ..Default::default() };
+        let text = panel_text_with(&mut whole, (7680, 3840), None, Some(Camera), false);
+        assert!(text.contains("7680 × 3840 (native)") && text.contains(LENS_FRAME_NOTE), "{text}");
+        let text = panel_text_lens(&mut whole, (7680, 3840), None, Some(Camera), true, false);
+        assert!(text.contains("8448 × 4224 (native + margin)"), "{text}");
+        let mut at_8k = ExportOptions::default();
+        let text = panel_text_lens(&mut at_8k, (7680, 3840), None, Some(Camera), true, false);
+        assert!(text.contains("8448 × 4224 (native + margin)") && !text.contains("\n8192 × 4096\n"), "{text}");
+        assert_eq!(at_8k.resolution, ExportResolution::R8k);
+        // A larger one (an X6 at 10K) does have its 8K copy.
+        let text = panel_text_with(&mut at_8k, (9728, 4864), None, Some(Camera), false);
+        assert!(text.contains("\n8192 × 4096\n"), "{text}");
+        // A stabilized clip: the size shown is the one written, the recorded
+        // frame plus the stabilizer's margin; the 8K copy keeps its size.
+        let text = panel_text_lens(&mut opts, (9824, 4912), Some((13120, 6560)), Some(Camera), true, false);
+        assert!(text.contains("10800 × 5400 (native + margin)") && !text.contains("9824 × 4912"), "{text}");
+        let text = panel_text_lens(&mut opts, (6000, 3968), Some((6560, 6560)), Some(Camera), true, true);
+        assert!(text.contains("6396 × 4364 (native + margin)"), "{text}");
+        let mut copy = ExportOptions { crop_resolution: ExportResolution::R8k, ..Default::default() };
+        let text = panel_text_lens(&mut copy, (9824, 4912), Some((13120, 6560)), Some(Camera), true, false);
+        assert!(text.contains("8192 × 4096"), "{text}");
+        // The margin the note names is the pipeline's.
+        let margin = (vr180_pipeline::lens_frame::STABILIZER_MARGIN * 100.0).round() as u32;
+        assert!(LENS_FRAME_STAB_NOTE.contains(&format!("{margin} % larger on each side")), "{LENS_FRAME_STAB_NOTE}");
+        assert!(tr_zh(LENS_FRAME_STAB_NOTE).contains(&format!("每边比拍摄画幅大 {margin}%")));
+    }
+
+    /// The Output panel offers the lens choice on a clip that has a lens
+    /// record, in the Lens Space view, and says what each lens writes.
+    #[test]
+    fn the_output_panel_offers_the_lens_of_the_lens_space_view() {
+        use super::{LENS_SPACE_CAMERA_NOTE, LENS_SPACE_DISC_NOTE};
+        use crate::decoder::{FisheyeOutputMode, LensSpaceLens, Settings};
+        use vr180_pipeline::SourceKind;
+        fn collect(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => { out.push_str(text.galley.text()); out.push('\n'); }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let panel = |s: &mut Settings, kind: Option<SourceKind>| -> String {
+            let ctx = egui::Context::default();
+            let mut text = String::new();
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0))),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(input, |ui| App::lens_space_ui(ui, s, kind));
+                text.clear();
+                out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
+            }
+            text
+        };
+        let mut lens = Settings { fisheye_output_mode: FisheyeOutputMode::Fisheye, ..Default::default() };
+        // A clip with a lens: the choice, and the camera's lens to start with.
+        let text = panel(&mut lens, Some(SourceKind::Insta360Insv));
+        assert!(text.contains("Lens\n") && text.contains("Camera lens") && text.contains("Equidistant"), "{text}");
+        assert!(text.contains(LENS_SPACE_CAMERA_NOTE) && !text.contains(LENS_SPACE_DISC_NOTE), "{text}");
+        assert_eq!(lens.lens_space, LensSpaceLens::Camera);
+        // The equidistant lens: the disc of the source's field.
+        let mut disc = Settings { lens_space: LensSpaceLens::Equidistant, ..lens.clone() };
+        let text = panel(&mut disc, Some(SourceKind::DjiOsv));
+        assert!(text.contains("Camera lens") && text.contains(&format!("195° {LENS_SPACE_DISC_NOTE}")), "{text}");
+        let text = panel(&mut disc, Some(SourceKind::GoProEac));
+        assert!(text.contains(&format!("185° {LENS_SPACE_DISC_NOTE}")), "{text}");
+        // No lens record (a still, a file that is already VR180): no choice,
+        // the disc, and the stored choice left alone.
+        for kind in [SourceKind::Insta360Dng, SourceKind::SbsFisheye] {
+            let text = panel(&mut lens, Some(kind));
+            assert!(!text.contains("Camera lens") && text.contains(&format!("195° {LENS_SPACE_DISC_NOTE}")), "{kind:?}: {text}");
+        }
+        assert_eq!(lens.lens_space, LensSpaceLens::Camera);
+        // A generic file whose halves are fisheye images has a lens.
+        let mut file = Settings { sbs_dewarp_fisheye: true, ..lens.clone() };
+        assert!(panel(&mut file, Some(SourceKind::SbsFisheye)).contains("Camera lens"));
+        // The other views say nothing of it.
+        for mode in [FisheyeOutputMode::HalfEquirect, FisheyeOutputMode::Reframe] {
+            let mut other = Settings { fisheye_output_mode: mode, ..Default::default() };
+            assert_eq!(panel(&mut other, Some(SourceKind::Insta360Insv)), "", "{mode:?}");
+        }
+    }
+
+    /// "Apply settings to all" stays inside one settings class: a clip that
+    /// keeps a setup of its own within a camera type is not overwritten.
+    #[test]
+    fn apply_to_all_stays_within_a_settings_class() {
+        use super::{BatchItem, BatchStatus};
+        use vr180_pipeline::SourceKind;
+        let item = |source_kind, x6| BatchItem {
+            path: "/nonexistent/in.insv".into(),
+            fps: 29.97, duration_sec: 10.0, source_kind,
+            fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
+            settings: Default::default(),
+            status: BatchStatus::Idle, selected: false, x6,
+        };
+        let x6 = |single_eye| Some(X6ClipInfo { window: None, ilog: Some(true), paraxial_native: 2086.97, single_lens: single_eye, single_eye });
+        let two = item(SourceKind::Insta360Insv, x6(false));
+        let one = item(SourceKind::Insta360Insv, x6(true));
+        assert_eq!(two.settings_class(), item(SourceKind::Insta360Insv, x6(false)).settings_class());
+        assert_eq!(one.settings_class(), item(SourceKind::Insta360Insv, x6(true)).settings_class());
+        assert_ne!(one.settings_class(), two.settings_class());
+        assert_ne!(two.settings_class(), item(SourceKind::DjiOsv, None).settings_class());
+        assert_eq!(item(SourceKind::DjiOsv, None).settings_class(), item(SourceKind::DjiOsv, None).settings_class());
     }
 
     #[test]
@@ -984,11 +1572,14 @@ mod spatial_export_tests {
     #[test]
     fn spatial_video_gets_its_own_file_name() {
         let src = std::path::Path::new("/clips/VID_0005.insv");
-        assert_eq!(App::default_output_for(src, ExportCodec::H265, false), std::path::Path::new("/clips/VID_0005_SBS.mp4"));
-        assert_eq!(App::default_output_for(src, ExportCodec::ProRes, false), std::path::Path::new("/clips/VID_0005_SBS.mov"));
-        assert_eq!(App::default_output_for(src, ExportCodec::Spatial, false), std::path::Path::new("/clips/VID_0005_Spatial.mov"));
-        assert_eq!(App::default_output_for(src, ExportCodec::H265, true), std::path::Path::new("/clips/VID_0005_Mono.mp4"));
-        assert_eq!(App::default_output_for(src, ExportCodec::ProRes, true), std::path::Path::new("/clips/VID_0005_Mono.mov"));
+        assert_eq!(App::default_output_for(src, ExportCodec::H265, false, false), std::path::Path::new("/clips/VID_0005_SBS.mp4"));
+        assert_eq!(App::default_output_for(src, ExportCodec::ProRes, false, false), std::path::Path::new("/clips/VID_0005_SBS.mov"));
+        assert_eq!(App::default_output_for(src, ExportCodec::Spatial, false, false), std::path::Path::new("/clips/VID_0005_Spatial.mov"));
+        assert_eq!(App::default_output_for(src, ExportCodec::H265, true, false), std::path::Path::new("/clips/VID_0005_Mono.mp4"));
+        assert_eq!(App::default_output_for(src, ExportCodec::ProRes, true, false), std::path::Path::new("/clips/VID_0005_Mono.mov"));
+        // A lens frame has its own name, next to the VR180 export of the same clip.
+        assert_eq!(App::default_output_for(src, ExportCodec::H265, false, true), std::path::Path::new("/clips/VID_0005_Lens.mp4"));
+        assert_eq!(App::default_output_for(src, ExportCodec::ProRes, true, true), std::path::Path::new("/clips/VID_0005_Lens.mov"));
     }
 
     #[test]
@@ -1063,7 +1654,7 @@ mod spatial_export_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, false);
+                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, None, false, false, None);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -1162,6 +1753,63 @@ mod reframe_bitrate_tests {
 }
 
 impl ExportOptions {
+    /// The resolution choice that applies to a clip picking from `list`. A
+    /// size its list does not hold means 8192 × 4096 there.
+    fn resolution_for(&self, list: SizeList) -> ExportResolution {
+        use ExportResolution::{Native, R13k, R16k, R8k, Sharp};
+        match list {
+            SizeList::Plain => match self.resolution { Native => Native, _ => R8k },
+            SizeList::Crop => match self.crop_resolution { r @ (Native | Sharp) => r, _ => R8k },
+            SizeList::Enhanced => match self.enhanced_resolution { r @ (Native | R13k | R16k) => r, _ => R8k },
+        }
+    }
+
+    /// The choice [`Self::resolution_for`] reads, for the control that edits it.
+    fn resolution_for_mut(&mut self, list: SizeList) -> &mut ExportResolution {
+        match list {
+            SizeList::Plain => &mut self.resolution,
+            SizeList::Crop => &mut self.crop_resolution,
+            SizeList::Enhanced => &mut self.enhanced_resolution,
+        }
+    }
+
+    /// Per-eye size of the canvas a raw take is written on when the export
+    /// reads its enhanced frames: the size picked for those. `native_eye`:
+    /// the take's own eye.
+    fn enhanced_eye_dims(&self, native_eye: (u32, u32)) -> (u32, u32) {
+        match self.resolution_for(SizeList::Enhanced) {
+            ExportResolution::Native => native_eye,
+            r => { let side = r.enhanced_side().unwrap_or(4096); (side, side) }
+        }
+    }
+
+    /// Per-eye size of a lens frame for a clip whose eye is `eye_w × eye_h`:
+    /// the frame as it was recorded, whatever its shape — for a Crop clip
+    /// (`cropped`) that is its native sharpness, so that choice means the
+    /// same here — or its reduced copy for the 8K choice
+    /// ([`lens_frame_reduced_dims`]; a frame no larger than that is never
+    /// enlarged). The choice is the clip's own ([`Self::resolution_for`]).
+    fn lens_frame_eye_dims(&self, eye_w: u32, eye_h: u32, cropped: bool) -> (u32, u32) {
+        match self.resolution_for(SizeList::of(cropped, false)) {
+            ExportResolution::R8k => lens_frame_reduced_dims(eye_w, eye_h).unwrap_or((eye_w, eye_h)),
+            _ => (eye_w, eye_h),
+        }
+    }
+
+    /// Per-eye size a lens-frame export is WRITTEN at:
+    /// [`Self::lens_frame_eye_dims`], and for a stabilized clip at its own
+    /// size the stabilizer's margin on top (`vr180_pipeline::lens_frame`; a
+    /// reduced copy keeps its size). What the export bar shows and a
+    /// snapshot renders.
+    fn lens_frame_out_dims(&self, eye_w: u32, eye_h: u32, cropped: bool, stabilized: bool) -> (u32, u32) {
+        let (w, h) = self.lens_frame_eye_dims(eye_w, eye_h, cropped);
+        if stabilized && (w, h) == (eye_w, eye_h) {
+            vr180_pipeline::lens_frame::stabilized_dims(w, h)
+        } else {
+            (w, h)
+        }
+    }
+
     /// The codec an export of a clip with `settings` really uses: spatial
     /// video only where it exists ([`spatial_video_available`], and never
     /// for a still); everywhere else that choice runs as H.265. The choice
@@ -1189,8 +1837,13 @@ impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             codec: ExportCodec::H265,
+            raw_dng_sequence: false,
+            raw_dng_original: false,
+            raw_use_enhanced: true,
             still_format: StillFormatChoice::Png16,
             resolution: ExportResolution::R8k,
+            crop_resolution: ExportResolution::R8k,
+            enhanced_resolution: ExportResolution::R8k,
             h265_bitrate_mbps: 200,
             reframe_bitrate_mbps: 35,
             reframe_bitrate_custom: false,
@@ -1258,12 +1911,19 @@ impl BatchItem {
         takes_ilog(self.source_kind, self.x6.as_ref())
     }
 
+    /// The settings bucket this entry belongs to (see
+    /// `App::settings_class_key`): "Apply settings to all" stays inside it.
+    fn settings_class(&self) -> &'static str {
+        App::settings_class_key(self.source_kind, self.single_eye())
+    }
+
     /// The settings this entry exports with: its own, taken as a single-eye
     /// source takes them when it is one, and told whether its picture is
     /// I-Log.
     fn export_settings(&self) -> crate::decoder::Settings {
         let mut s = if self.single_eye() { self.settings.for_single_eye() } else { self.settings.clone() };
         s.ilog_source = self.ilog();
+        s.raw_source = self.source_kind.is_raw_video();
         s
     }
 
@@ -1367,8 +2027,24 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Fisheye dewarp is off for this side-by-side file (Source ▸ Input) — the lens settings below are not applied." => "此左右格式文件已关闭鱼眼去畸变（素材 ▸ 输入）——下方镜头设置不生效。",
         "Output" => "输出",
         "View" => "视图",
+        "DNG sequence" => "DNG 序列",
+        "Developed view" => "显影后的画面",
+        "Use enhanced frames" => "使用增强后的帧",
+        "Camera original frames are the sensor's own: the view and its size, the grade, stabilization and noise reduction are not applied to them."
+            => "相机原片就是传感器记录的帧：视图及其尺寸、调色、防抖和降噪都不会作用到它们上面。",
+        "Enhanced frames found:" => "已找到增强后的帧：",
+        "No enhanced frame found for this clip: it exports from the capture." => "没有找到这个片段的增强帧：导出取自采集文件。",
+        "Looking for enhanced frames…" => "正在查找增强后的帧…",
+        "This clip's enhanced frames hold more than 8192 × 4096 shows: the two larger sizes keep it. A stretch without enhanced frames exports at the size picked without them." => "这个片段的增强帧包含的细节多于 8192 × 4096 能呈现的：两档更大的尺寸可以保留这些细节。没有增强帧的区段按未使用增强帧时所选的尺寸导出。",
+        "When the folder of Camera original DNGs is beside the take and a raw converter has enhanced its frames in place (Camera Raw's Super Resolution), each frame is taken from there, at the enhanced size. A frame that was not enhanced comes from the capture." => "素材旁边有相机原片 DNG 文件夹，并且其中的帧已在 RAW 转换软件里原地增强过时（Camera Raw 的超分辨率），每一帧从那里读取，按增强后的尺寸处理。没有增强过的帧仍取自采集文件。",
+        "Camera original" => "相机原片",
+        "camera original" => "相机原片",
+        "Every frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number. No projection, no stabilization, no grading — for running the frames through a raw converter first." => "每一帧按传感器记录的原样导出：每眼一个 Bayer DNG，以相机的帧号命名。不投影、不防抖、不调色，适合先把每一帧交给 RAW 转换软件处理。",
+        "Every frame as a DNG in a folder: the developed view, or the sensor's own frames." => "每一帧导出为文件夹里的一个 DNG：可以是显影后的画面，也可以是传感器原片。",
+        "Every frame as a linear DNG in a folder, with this clip's raw development settings inside each file." => "每一帧导出为一个线性 DNG，放进同一个文件夹，每个文件里带着这个片段的 RAW 显影设置。",
         "📷 Snapshot" => "📷 截图",
         "Save this frame as a JPEG in the export folder (S)" => "把当前帧存为 JPEG 到导出文件夹（S）",
+        "Save this frame as a JPEG and as a linear DNG in the export folder (S)" => "把当前帧存为 JPEG 和线性 DNG 到导出文件夹（S）",
         "Nothing to snapshot yet" => "还没有可截图的画面",
         "Saved" => "已保存",
         "Rendering snapshot" => "正在渲染截图",
@@ -1430,6 +2106,26 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Bit depth" => "位深",
         "ProRes profile" => "ProRes 配置",
         "VR180 metadata" => "VR180 元数据",
+        "Lens Space" => "镜头空间",
+        "Lens" => "镜头",
+        "Camera lens" => "相机镜头",
+        "Equidistant" => "等距",
+        "Each eye is written the way the camera recorded it, through one lens that the file describes (Apple Projected Media Profile, parametric immersive projection). A fisheye clip keeps everything its lens saw, past 180° where the lens goes that far; a Crop clip fills its frame instead of sitting in a canvas that is mostly black. Stabilization, rolling shutter, eye alignment, the crop mask and colour are applied as always. Apple Vision Pro plays it; other headsets and YouTube need the VR180 format."
+            => "按相机拍摄时的样子写出每只眼，并在文件里写明所用的同一个镜头（Apple Projected Media Profile 的参数化沉浸投影）。鱼眼片段保留镜头拍到的全部视角，镜头超过 180° 的部分也在；Crop 片段则填满画幅，不再放在大半是黑色的画布中央。防抖、卷帘快门校正、双眼对齐、裁切遮罩和调色照常生效。Apple Vision Pro 可以播放；其他头显和 YouTube 需要 VR180 格式。",
+        "An ideal equidistant fisheye: a disc in a square frame, the form that players and tools for fisheye video expect. With the Apple Vision Pro metadata on, the file states this lens too, and the headset shows the disc at its true angles."
+            => "理想的等距鱼眼：正方形画幅里的一个圆盘，支持鱼眼视频的播放器和后期工具认的就是这种形式。开启 Apple Vision Pro 元数据时，文件里也会写明这个镜头，头显按真实角度显示圆盘。",
+        "The recording's own frame through the camera's lens: its whole field of view, for Apple Vision Pro."
+            => "透过相机镜头的拍摄画幅本身：保留镜头的完整视角，供 Apple Vision Pro 使用。",
+        "equidistant disc, for players and tools that take fisheye video."
+            => "等距圆盘，供支持鱼眼视频的播放器和后期工具使用。",
+        "Lens Space, camera lens: the frame is the recording's own, at the density it was recorded, so the clip's own size already holds all of its detail, and nothing the lens saw is cut off at 180°. It plays immersively on Apple Vision Pro (visionOS 26 or later) and nowhere else: for other headsets and YouTube, export the clip in the VR180 format as well. The file is named …_Lens."
+            => "镜头空间，相机镜头：画幅就是拍摄时的画幅，密度与拍摄时相同，所以片段自身的尺寸已经包含全部细节，镜头拍到的内容也不会在 180° 处被裁掉。只有 Apple Vision Pro（visionOS 26 或更高版本）能沉浸播放；其他头显和 YouTube 请再用 VR180 格式导出一次。文件名以 _Lens 结尾。",
+        "Stabilization: the frame has no spare canvas, so a stabilized frame is 5 % larger on each side than the recording, the same for every clip (an 8K copy keeps its size and scales the picture instead). Where the picture does not reach, the frame is black, as around the picture of a VR180 export; a shift beyond the margin is cut at the frame's edge. With camera lock the picture leaves the frame as the camera turns: keep that for a camera that stays put."
+            => "防抖：画幅没有多余的画布，所以开启防抖时画幅每边比拍摄画幅大 5%，每条片段都一样（8K 缩小版保持尺寸不变，改为缩小画面）。画面没有覆盖到的地方是黑色，和 VR180 导出里画面四周一样；超出余量的偏移会在画幅边缘被裁掉。开启相机锁定时，相机一转画面就会移出画幅，只适合机位不动的镜头。",
+        "A Lens Space file through the camera's lens carries its own metadata: the lens, for Apple Vision Pro. The choice of VR180 metadata applies to the clips that export as VR180."
+            => "透过相机镜头写出的镜头空间文件自带元数据：写给 Apple Vision Pro 的镜头定义。VR180 元数据的选择只作用于按 VR180 导出的片段。",
+        "This clip exports an equidistant disc, which is not VR180: with Apple Vision Pro chosen the file states the disc's own lens instead, and for YouTube, which has no fisheye form, nothing is written."
+            => "这条片段导出的是等距圆盘，不是 VR180：选择 Apple Vision Pro 时，文件里写的是圆盘自己的镜头定义；YouTube 没有鱼眼格式，选它时不写任何元数据。",
         "H.265 bitrate" => "H.265 码率",
         "Spatial video (MV-HEVC)" => "空间视频 (MV-HEVC)",
         "per eye" => "每眼",
@@ -1555,6 +2251,7 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Toe shape of the darkest few percent only — lower = softer, which lifts the deepest shadows; higher = harder, which pushes them down. A subtle control by design; for a level change use Black level."
             => "只影响最暗几个百分点的趾部形状——数值越低越柔和（最深的暗部被抬起），越高越硬（暗部被压下）。设计上作用就很轻微；要改电平请用“黑电平”。",
         "native" => "原始",
+        "native + margin" => "原始 + 余量",
         "full" => "全尺寸",
         "Above 8192 × 4096 the Mac's hardware ProRes encoder refuses the frame — the software encoder takes over (several times slower)."
             => "超过 8192 × 4096 时 Mac 的硬件 ProRes 编码器不接受该画幅——改用软件编码器（慢数倍）。",
@@ -1655,6 +2352,53 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Stabilization (VQF 6D, BRAW)" => "防抖 (VQF 6D, BRAW)",
         "Stabilization (DJI camera quats)" => "防抖（DJI 相机四元数）",
         "Stabilization (Insta360 gyro)" => "防抖（Insta360 陀螺仪）",
+        "Raw development" => "RAW 显影",
+        "Temperature (K)" => "色温 (K)",
+        "Exposure" => "曝光",
+        "Whites" => "白色色阶",
+        "Blacks" => "黑色色阶",
+        "As shot" => "原始设置",
+        "Sharpening" => "锐化",
+        "Noise reduction" => "降噪",
+        "Color noise" => "颜色",
+        "Colour noise reduction, as a raw converter's: the picture's colour is smoothed and its luminance left alone, which takes the coloured speckle out of noise and the colour out of fine lines. 25 is a raw converter's default; 0 turns it off." => "颜色降噪，与 RAW 转换软件的做法一致：只平滑画面的颜色，亮度不动，用来去掉噪点里的彩色斑点和细线上的杂色。25 是 RAW 转换软件的默认值，0 为关闭。",
+        "How much of the finest detail is sharpened. Low values hold halos back, as a raw converter's do: a hard edge is sharpened less, a soft one keeps its steepening." => "最细的细节锐化多少。数值低时会像 RAW 转换软件那样抑制光晕：硬边锐化得少，柔和的边缘仍然变陡。",
+        "Amount" => "数量",
+        "Masking" => "蒙版",
+        "Sharpening of the developed picture, as a raw converter's detail panel does it: the same numbers give the same edges there. The radius is in pixels of the exported frame, so judge it in the zoom view or on a snapshot; the preview shows the export's picture reduced." => "对显影后的画面做锐化，与 RAW 转换软件“细节”面板的做法一致：同样的数值在那里得到同样的边缘。半径以导出画面的像素计，请在放大视图或快照上判断；预览显示的是导出画面缩小后的样子。",
+        "Keeps the sharpening to edges: the higher, the stronger an edge has to be." => "把锐化限制在边缘上：数值越高，边缘要越强才会被锐化。",
+        "Reset raw development" => "重置 RAW 显影",
+        "Read from Camera Raw" => "从 Camera Raw 读取",
+        "Reading…" => "正在读取…",
+        "Read from" => "已读取自",
+        "Not carried over:" => "未带回：",
+        "Takes the white balance, tone, sharpening and colour noise reduction a frame was left with in Camera Raw. They are read from the Camera original DNG of the frame on screen, or of the nearest frame that has settings, in the folder beside the take. Whatever else was set there is named below and stays there."
+            => "读取某一帧在 Camera Raw 里留下的白平衡、影调、锐化和颜色降噪。来源是素材旁边文件夹里当前画面那一帧的相机原片 DNG，该帧没有设置时取最近的有设置的一帧。在那里做的其他调整会在下面列出，不会带回。",
+        "No Camera Raw settings found: the folder of Camera original DNGs beside this take has none, or is not there."
+            => "没有找到 Camera Raw 设置：素材旁边的相机原片 DNG 文件夹里没有，或者文件夹不存在。",
+        "The other eye's file has other settings: these are channel 0's." => "另一眼的文件设置不同：这里用的是通道 0 的。",
+        "Texture" => "纹理",
+        "Clarity" => "清晰度",
+        "Dehaze" => "去除薄雾",
+        "Vibrance" => "自然饱和度",
+        "Luminance noise reduction" => "明亮度降噪",
+        "Color noise reduction detail" => "颜色降噪的细节",
+        "Color noise reduction smoothness" => "颜色降噪的平滑度",
+        "Grain" => "颗粒",
+        "Tone curve" => "曲线",
+        "Color mixer" => "混色器",
+        "Color grading" => "颜色分级",
+        "Calibration" => "校准",
+        "Vignette" => "晕影",
+        "Lens corrections" => "镜头校正",
+        "Geometry" => "几何",
+        "Crop" => "裁剪",
+        "Black & white" => "黑白",
+        "Masks" => "蒙版",
+        "Healing" => "修复",
+        "Profile" => "配置文件",
+        "The white the frame is developed for, as a colour temperature in kelvin and a tint, the way a raw converter states it." => "显影所用的白点，以色温（开尔文）和色调表示，与 RAW 转换软件的写法一致。",
+        "The take records no white balance of its own: As shot is the camera's reference white." => "该素材没有记录自己的白平衡：“原始设置”是相机的参考白点。",
         "No gyro stabilization available for this source yet." => "此素材暂无陀螺仪防抖。",
         "Camera" => "相机",
         "(Auto)" => "（自动）",
@@ -1983,6 +2727,50 @@ impl ClipInfo {
     }
 }
 
+/// A raw take without sound leaves its folder as the "audio path": there
+/// is nothing to open.
+fn take_audio_missing(audio_path: &std::path::Path) -> bool {
+    audio_path.is_dir()
+}
+
+/// Raw video takes are FOLDERS. Turn what the user opened into clip paths:
+/// a take's folder, or one of its own files, becomes the folder; any other
+/// folder stands for the takes directly inside it; everything else passes
+/// through. A take that cannot be opened (never closed by the camera, an
+/// incomplete copy, no frames) is left out and named in the returned note.
+fn resolve_raw_takes(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Option<String>) {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut take = |dir: PathBuf, out: &mut Vec<PathBuf>, notes: &mut Vec<String>| {
+        match vr180_pipeline::x6_raw::describe(&dir) {
+            Ok(_) => { if !out.contains(&dir) { out.push(dir); } }
+            Err(e) => {
+                let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                tracing::warn!("import: raw take {}: {e}", dir.display());
+                notes.push(format!("{name}: {}", e.to_string().trim_start_matches("ffmpeg: ").rsplit(": ").next().unwrap_or_default()));
+            }
+        }
+    };
+    for p in paths {
+        if let Some(dir) = vr180_pipeline::x6_raw::take_dir(&p) {
+            take(dir, &mut out, &mut notes);
+        } else if p.is_dir() {
+            let mut inside: Vec<PathBuf> = std::fs::read_dir(&p).into_iter().flatten().flatten()
+                .map(|e| e.path())
+                .filter(|c| c.is_dir() && vr180_pipeline::x6_raw::is_take(c))
+                .collect();
+            inside.sort();
+            if inside.is_empty() {
+                notes.push(format!("{}: no raw video takes in this folder", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+            }
+            for dir in inside { take(dir, &mut out, &mut notes); }
+        } else if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    (out, (!notes.is_empty()).then(|| notes.join("\n")))
+}
+
 /// An async clip load in flight (see `App::load_pending`). The worker
 /// thread does all the blocking source I/O and posts a [`LoadOutcome`]
 /// back on `rx`; the UI thread shows a "Loading…" state until it arrives.
@@ -2049,6 +2837,11 @@ struct LoadedMeta {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Raw takes: keep the list of a take's pairs between sessions (walking
+        // a take on a network volume takes seconds).
+        if let Some(dir) = crate::decoder::Settings::config_path().and_then(|p| p.parent().map(|d| d.join("raw-takes"))) {
+            vr180_pipeline::x6_raw::set_cache_dir(Some(dir));
+        }
         // Force dark visuals regardless of the OS appearance preference.
         // egui's dark theme reads better against the half-equirect
         // preview (which is typically dark imagery itself) and matches
@@ -2129,8 +2922,10 @@ impl App {
             match_apple_playback: Self::load_match_apple_playback(),
             preview_painter: None,
             loaded_path: None,
+            // Files, and folders: a raw video take is one (`open_paths`
+            // sorts out which folders are takes).
             pending_open: std::env::args_os().skip(1).map(PathBuf::from)
-                .filter(|p| p.is_file()).collect(),
+                .filter(|p| p.is_file() || p.is_dir()).collect(),
             eye_orientation_applied: (defaults.fisheye_swap_eyes, defaults.camera_upside_down),
             insv_view_applied: defaults.insv_view,
             clip: None,
@@ -2193,6 +2988,10 @@ impl App {
             three_d: ThreeDDisplay::default(),
             snapshot_status: None,
             snapshot_pending: None,
+            frame_dng_job: None,
+            enhanced_probe: EnhancedProbe::default(),
+            raw_settings_job: None,
+            raw_settings_status: None,
             full_res_key: 0,
             full_res_desired_key: 0,
             full_res_rendered_at: std::time::Instant::now(),
@@ -2202,6 +3001,7 @@ impl App {
             fisheye_last_seeded: None,
             suppress_reseed_once: false,
             load_pending: None,
+            import_notice: None,
             load_token: 0,
             play_when_ready: false,
         }
@@ -2462,11 +3262,13 @@ impl App {
     }
 
     /// `<source_stem>_SBS.<ext-for-codec>` next to the source; a spatial
-    /// video (one stream, not a side-by-side frame) is `<stem>_Spatial.mov`.
-    fn default_output_for(source: &std::path::Path, codec: ExportCodec, single_eye: bool) -> PathBuf {
+    /// video (one stream, not a side-by-side frame) is `<stem>_Spatial.mov`,
+    /// and a lens frame `<stem>_Lens.<ext>` — the same clip may well be
+    /// exported both ways, for two kinds of headset.
+    fn default_output_for(source: &std::path::Path, codec: ExportCodec, single_eye: bool, lens_frame: bool) -> PathBuf {
         let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
         // A single-eye source's frame is not side by side.
-        let frame = if single_eye { "Mono" } else { "SBS" };
+        let frame = if lens_frame { "Lens" } else if single_eye { "Mono" } else { "SBS" };
         let (tag, ext) = match codec {
             ExportCodec::H265 => (frame, "mp4"),
             ExportCodec::ProRes => (frame, "mov"), // ProRes is conventional in MOV
@@ -2478,6 +3280,16 @@ impl App {
             .join(format!("{stem}_{tag}.{ext}"))
     }
 
+    /// The folder of a raw video clip's DNG frames: `<source_stem>_DNG`
+    /// next to the source (a take is a folder: next to that folder).
+    fn default_frames_dir_for(source: &std::path::Path, original: bool) -> PathBuf {
+        let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+        source.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+            .join(format!("{stem}_{}", if original { "OriginalDNG" } else { "DNG" }))
+    }
+
     /// `<source_stem>_SBS.<png|jpg|dng>` next to the source (stills).
     fn default_still_output_for(source: &std::path::Path, format: StillFormatChoice) -> PathBuf {
         let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
@@ -2485,6 +3297,90 @@ impl App {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             .join(format!("{stem}_SBS.{}", format.extension()))
+    }
+
+    /// The export option that takes a raw clip's frames from the folder of
+    /// its camera-original DNGs where a raw converter has enhanced them, and
+    /// what that folder was found to hold.
+    fn enhanced_frames_ui(ui: &mut egui::Ui, opts: &mut ExportOptions, found: EnhancedFrames) {
+        ui.checkbox(&mut opts.raw_use_enhanced, tr("Use enhanced frames"));
+        ui.label(RichText::new(tr("When the folder of Camera original DNGs is beside the take and a raw converter has enhanced its frames in place (Camera Raw's Super Resolution), each frame is taken from there, at the enhanced size. A frame that was not enhanced comes from the capture."))
+            .small().color(Color32::GRAY));
+        if opts.raw_use_enhanced {
+            let (text, color) = match found {
+                EnhancedFrames::Found(side) => (format!("{} {side} × {side} {}", tr("Enhanced frames found:"), tr("per eye")), Color32::from_rgb(120, 190, 130)),
+                EnhancedFrames::Absent => (tr("No enhanced frame found for this clip: it exports from the capture.").to_string(), Color32::GRAY),
+                EnhancedFrames::Looking => (tr("Looking for enhanced frames…").to_string(), Color32::GRAY),
+            };
+            ui.label(RichText::new(text).small().color(color));
+        }
+        ui.add_space(8.0);
+    }
+
+    /// The loaded raw take's enhanced frames (`None` for any other clip), as
+    /// last looked up. Asks again, on a thread, when the take or its trim
+    /// changed and every few seconds while the Format window is open, so
+    /// frames enhanced meanwhile show up.
+    fn enhanced_frames(&mut self, ctx: &egui::Context) -> Option<EnhancedFrames> {
+        if !self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) {
+            return None;
+        }
+        let path = self.loaded_path.clone()?;
+        if !self.export_opts.raw_use_enhanced {
+            return Some(EnhancedFrames::Absent);
+        }
+        let key: EnhancedKey = (path.clone(), self.settings.trim_in_s.map(f64::to_bits), self.settings.trim_out_s.map(f64::to_bits));
+        let refresh = std::time::Duration::from_secs(4);
+        let probe = &mut self.enhanced_probe;
+        if let Some(rx) = &probe.rx {
+            match rx.try_recv() {
+                Ok((asked, side)) => {
+                    if asked.0 == path {
+                        probe.side = Some(side);
+                    }
+                    probe.rx = None;
+                    ctx.request_repaint();
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => probe.rx = None,
+            }
+        }
+        let other_take = probe.key.as_ref().map(|k| &k.0) != Some(&path);
+        if other_take {
+            probe.side = None;
+        }
+        let due = probe.key.as_ref() != Some(&key)
+            || (self.show_export_settings && probe.asked_at.map_or(true, |t| t.elapsed() > refresh));
+        if due && probe.rx.is_none() {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let asked = key.clone();
+            let source = vr180_pipeline::x6_raw::EnhancedSource {
+                dir: Self::default_frames_dir_for(&path, true),
+                t_in: self.settings.trim_in_s, t_out: self.settings.trim_out_s,
+            };
+            let repaint = ctx.clone();
+            std::thread::spawn(move || {
+                let side = vr180_pipeline::x6_raw::enhanced_side(&asked.0, &source);
+                let _ = tx.send((asked, side));
+                repaint.request_repaint();
+            });
+            probe.key = Some(key);
+            probe.asked_at = Some(std::time::Instant::now());
+            probe.rx = Some(rx);
+        }
+        Some(match probe.side {
+            None => EnhancedFrames::Looking,
+            Some(None) => EnhancedFrames::Absent,
+            Some(Some(side)) => EnhancedFrames::Found(side),
+        })
+    }
+
+    /// The side of the loaded raw take's enhanced frames where an export
+    /// would read them now: the last lookup's answer, the option on.
+    fn enhanced_in_use(&self) -> Option<u32> {
+        let raw = self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
+        let same_take = self.enhanced_probe.key.as_ref().map(|k| &k.0) == self.loaded_path.as_ref();
+        if raw && same_take && self.export_opts.raw_use_enhanced { self.enhanced_probe.side.flatten() } else { None }
     }
 
     /// Build the full `FisheyeExportConfig` for one (source, output) pair
@@ -2530,7 +3426,7 @@ impl App {
         // half-equirect VR180 we use the source eye dims (or fallback
         // for non-fisheye sources). For fisheye pass-through we use
         // the raw source eye dims since the projection is bypassed.
-        let (mut eye_w, mut eye_h) = if fisheye_eye_w > 0 {
+        let native_eye = if fisheye_eye_w > 0 {
             (fisheye_eye_w, fisheye_eye_h)
         } else if source_kind.is_eac() {
             // GoPro EAC: a SQUARE half-equirect per eye at the cross's
@@ -2541,19 +3437,30 @@ impl App {
         } else {
             (width.max(512), height.max(512))
         };
+        let (mut eye_w, mut eye_h) = native_eye;
         // 8K target: render the projection itself at 4096² per eye
         // (8192×4096 SBS). The projection samples the native source
         // directly into the 4096 grid — full resolution end-to-end,
         // not a last-step upscale.
         // Native sharpness (`sharp_eye`: a clip whose frame is a crop of
         // the lens' view): the 180° canvas at the frame's own centre
-        // density. Any other clip takes the 8K target instead.
-        match (opts.resolution, sharp_eye) {
+        // density. Such a clip has its own choice; no other has that size.
+        match (opts.resolution_for(SizeList::of(sharp_eye.is_some(), false)), sharp_eye) {
             (ExportResolution::Sharp, Some(side)) => { eye_w = side; eye_h = side; }
-            (ExportResolution::R8k | ExportResolution::Sharp, _) => { eye_w = 4096; eye_h = 4096; }
             (ExportResolution::Native, _) => {}
+            _ => { eye_w = 4096; eye_h = 4096; }
         }
 
+        // The Lens Space view through the camera's lens is a lens frame: the
+        // fisheye projection, writing the lens's image instead of its disc,
+        // at the size the eye was recorded (or the 8K copy).
+        let lens_frame_on = settings.lens_frame_view(source_kind);
+        let lens_frame = if lens_frame_on {
+            (eye_w, eye_h) = opts.lens_frame_eye_dims(native_eye.0, native_eye.1, sharp_eye.is_some());
+            vr180_pipeline::fisheye_export::LensFrameOut::FromSource
+        } else {
+            vr180_pipeline::fisheye_export::LensFrameOut::Off
+        };
         let projection = match settings.fisheye_output_mode {
             crate::decoder::FisheyeOutputMode::HalfEquirect =>
                 vr180_pipeline::fisheye_export::FisheyeExportProjection::HalfEquirect,
@@ -2578,11 +3485,26 @@ impl App {
         // so SBS becomes (2*side × side). For OSV (3840×3840) this is a
         // no-op; for non-square sources it picks the smaller side so
         // the fisheye disk fits.
-        if projection == vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye {
+        // (A lens frame is the recorded frame, of whatever shape.)
+        if projection == vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye && !lens_frame_on {
             let side = eye_w.min(eye_h);
             eye_w = side;
             eye_h = side;
         }
+        // A raw take's enhanced frames (the folder of its camera-original
+        // DNGs beside it, when it is there and the option is on) and the
+        // canvas they are written on: the size picked for enhanced frames,
+        // which the export takes where its stretch has some. A lens frame
+        // and a reframed view keep the size they have.
+        let raw_enhanced_dir = (source_kind.is_raw_video() && opts.raw_use_enhanced)
+            .then(|| Self::default_frames_dir_for(source_path, true))
+            .filter(|dir| dir.join("CAM0").is_dir());
+        let raw_enhanced_eye = raw_enhanced_dir.as_ref()
+            .filter(|_| !lens_frame_on && !projection.is_reframe())
+            .map(|_| {
+                let (w, h) = opts.enhanced_eye_dims(native_eye);
+                if projection == vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye { (w.min(h), w.min(h)) } else { (w, h) }
+            });
         let mut color_stack = settings.build_color_stack();
         // Automatic eye-exposure matching is an X6 feature (independent
         // per-sensor AE); never let the persisted flag leak onto other sources.
@@ -2614,8 +3536,9 @@ impl App {
                 // the user pinned one; VR180 takes the VR180 slider.
                 opts.effective_h265_mbps(settings.reframe_aspect_if_active(), fps, settings.single_eye)
                     .saturating_mul(1000),
-                // A spatial video is always Main10.
-                if codec == ExportCodec::Spatial { 10 } else { opts.h265_bit_depth },
+                // A spatial video is always Main10; so is a raw video clip
+                // (its eyes are 16-bit all the way through the grade).
+                if codec == ExportCodec::Spatial || source_kind.is_raw_video() { 10 } else { opts.h265_bit_depth },
             ),
             ExportCodec::ProRes => {
                 // The encoder ignores bitrate for ProRes but the config
@@ -2694,41 +3617,18 @@ impl App {
             braw_color: settings.braw_color.clone(),
             trim_in_s: settings.trim_in_s,
             trim_out_s: settings.trim_out_s,
+            // A raw take's enhanced frames: the folder of its camera-original
+            // DNGs beside it, when it is there and the option is on.
+            raw_enhanced_dir,
+            raw_enhanced_eye,
             color_stack,
             projection,
+            lens_frame,
         }
     }
 
-    /// Spawn the export worker thread for a prepared config and install
-    /// it as the (single) running `export_job`.
-    /// `eac_stab`: for a GoPro `.360` (EAC) export, the `(Settings,
-    /// n_frames)` needed to compute the per-eye stabilization (the
-    /// preview's `build_per_eye_frames`); `None` for fisheye sources,
-    /// which compute stab inside `export_fisheye`.
-    fn spawn_export_job(
-        &mut self,
-        cfg: vr180_pipeline::fisheye_export::FisheyeExportConfig,
-        eac_stab: Option<(crate::decoder::Settings, usize)>,
-    ) {
-        let output_path = cfg.output_path.clone();
-        let still_format = self.batch_opts.unwrap_or(self.export_opts).still_format;
-
-        // Stop preview playback when it reads the SAME file as the export
-        // (they'd race on the decoder / file). Previewing a DIFFERENT clip
-        // is fine — that's what lets you keep tuning clips mid-batch.
-        // A STILL is the exception: its preview thread read the DNG once
-        // and now holds only textures, and the export re-reads the file
-        // itself, so there is nothing to race on. Stopping it left the
-        // photo frozen on the last render with no transport to restart it
-        // (the still has no Play button) — the "UI stopped responding
-        // after exporting" report.
-        if self.loaded_path.as_ref() == Some(&cfg.source_path) && !cfg.source_kind.is_still() {
-            self.stop_playback();
-        }
-
-        let (progress_tx, progress_rx) = crossbeam_channel::bounded(256);
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancel_for_thread = cancel.clone();
+    /// The device a background export runs on.
+    fn export_device(&self) -> Arc<vr180_pipeline::gpu::Device> {
         // The export worker runs GPU work + RGB48 readback (`Maintain::Wait`)
         // on a background thread. Lesson #1: doing that on the device eframe
         // presents with can wedge the present queue. Export never hands a
@@ -2753,6 +3653,42 @@ impl App {
         };
         #[cfg(not(target_os = "windows"))]
         let pipeline = self.pipeline.clone();
+        pipeline
+    }
+
+    /// Spawn the export worker thread for a prepared config and install
+    /// it as the (single) running `export_job`.
+    /// `eac_stab`: for a GoPro `.360` (EAC) export, the `(Settings,
+    /// n_frames)` needed to compute the per-eye stabilization (the
+    /// preview's `build_per_eye_frames`); `None` for fisheye sources,
+    /// which compute stab inside `export_fisheye`.
+    fn spawn_export_job(
+        &mut self,
+        cfg: vr180_pipeline::fisheye_export::FisheyeExportConfig,
+        eac_stab: Option<(crate::decoder::Settings, usize)>,
+    ) {
+        let output_path = cfg.output_path.clone();
+        let still_format = self.batch_opts.unwrap_or(self.export_opts).still_format;
+        let raw_frames = cfg.source_kind.is_raw_video() && self.batch_opts.unwrap_or(self.export_opts).raw_dng_sequence;
+        let raw_original = raw_frames && self.batch_opts.unwrap_or(self.export_opts).raw_dng_original;
+
+        // Stop preview playback when it reads the SAME file as the export
+        // (they'd race on the decoder / file). Previewing a DIFFERENT clip
+        // is fine — that's what lets you keep tuning clips mid-batch.
+        // A STILL is the exception: its preview thread read the DNG once
+        // and now holds only textures, and the export re-reads the file
+        // itself, so there is nothing to race on. Stopping it left the
+        // photo frozen on the last render with no transport to restart it
+        // (the still has no Play button) — the "UI stopped responding
+        // after exporting" report.
+        if self.loaded_path.as_ref() == Some(&cfg.source_path) && !cfg.source_kind.is_still() {
+            self.stop_playback();
+        }
+
+        let (progress_tx, progress_rx) = crossbeam_channel::bounded(256);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_for_thread = cancel.clone();
+        let pipeline = self.export_device();
         let progress_tx2 = progress_tx.clone();
         let handle = std::thread::spawn(move || {
             if let Some((settings, n_frames)) = eac_stab {
@@ -2795,6 +3731,20 @@ impl App {
                         fps_avg: done as f32 / t0.elapsed().as_secs_f32().max(1e-3),
                     });
                 })
+            } else if raw_original {
+                // A raw video clip's frames as the sensor recorded them.
+                vr180_pipeline::sensor_dng::export_sensor_dng_sequence(
+                    &cfg.source_path, &cfg.output_path, cfg.trim_in_s, cfg.trim_out_s,
+                    move |p| { let _ = progress_tx2.try_send(p); },
+                    cancel_for_thread,
+                ).map(|_| ())
+            } else if raw_frames {
+                // A raw video clip as a folder of linear DNG frames.
+                vr180_pipeline::raw_export::export_dng_sequence(
+                    pipeline, cfg,
+                    move |p| { let _ = progress_tx2.try_send(p); },
+                    cancel_for_thread,
+                ).map(|_| ())
             } else {
                 vr180_pipeline::fisheye_export::export_fisheye(
                     pipeline, cfg,
@@ -3154,6 +4104,7 @@ impl App {
             // camera's two eyes (their alignment above all) is not its.
             K::Insta360Insv if single_eye => "insv_single_eye",
             K::Insta360Insv   => "insv",
+            K::X6Raw          => "x6raw",
             K::GoProEac       => "eac",
             K::SbsFisheye     => "sbs",
             K::BlackmagicRaw  => "braw",
@@ -3305,6 +4256,7 @@ impl App {
                 | vr180_pipeline::SourceKind::KandaoDng => (probe.width / 2, probe.height),
                 vr180_pipeline::SourceKind::KandaoQoocam => (probe.width, probe.height / 2),
                 vr180_pipeline::SourceKind::DjiOsv
+                | vr180_pipeline::SourceKind::X6Raw
                 | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
                 // The probe is the helper's own (`probe_video` routes `.braw`
                 // to it): the frame holds both eyes side by side, unless the
@@ -3414,8 +4366,11 @@ impl App {
     fn batch_output_for(&self, item: &BatchItem, opts: &ExportOptions) -> PathBuf {
         let mut out = if item.source_kind.is_still() {
             Self::default_still_output_for(&item.path, opts.still_format)
+        } else if item.source_kind.is_raw_video() && opts.raw_dng_sequence {
+            Self::default_frames_dir_for(&item.path, opts.raw_dng_original)
         } else {
-            Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye())
+            Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye(),
+                item.settings.lens_frame_view(item.source_kind))
         };
         if let Some(dir) = &self.batch_out_dir {
             if let Some(name) = out.file_name() {
@@ -3424,10 +4379,12 @@ impl App {
         }
         if out.exists() {
             let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("output").to_string();
-            let ext = out.extension().and_then(|s| s.to_str()).unwrap_or("mp4").to_string();
+            // A folder of frames has no extension to keep.
+            let ext = out.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+            let ext = if ext.is_empty() && !out.is_dir() { ".mp4".to_string() } else { ext };
             let dir = out.parent().map(|p| p.to_path_buf()).unwrap_or_default();
             for n in 2.. {
-                let cand = dir.join(format!("{stem} ({n}).{ext}"));
+                let cand = dir.join(format!("{stem} ({n}){ext}"));
                 if !cand.exists() { out = cand; break; }
             }
         }
@@ -3883,6 +4840,8 @@ impl App {
     /// (GoPro `.360` EAC) bypass the list and load directly, exactly as
     /// before — they aren't batchable.
     fn open_paths(&mut self, paths: Vec<PathBuf>) {
+        let (paths, notice) = resolve_raw_takes(paths);
+        self.import_notice = notice;
         if paths.is_empty() { return; }
         let first = paths[0].clone();
         let groups = self.group_imports(&paths);
@@ -4204,6 +5163,7 @@ impl App {
             | vr180_pipeline::SourceKind::KandaoDng => (probe.width / 2, probe.height),
             vr180_pipeline::SourceKind::KandaoQoocam => (probe.width, probe.height / 2),
             vr180_pipeline::SourceKind::DjiOsv
+            | vr180_pipeline::SourceKind::X6Raw
             | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
             vr180_pipeline::SourceKind::BlackmagicRaw => braw_eye_dims(&path, probe.width, probe.height),
             _ => (0, 0),
@@ -4285,8 +5245,14 @@ impl App {
 
         // X6 "360° Audio": a 4-channel AmbiX AAC instead of stereo. Header
         // read only; the worker is off the UI thread.
-        let foa_audio = source_kind == vr180_pipeline::SourceKind::Insta360Insv
-            && vr180_pipeline::audio::probe_foa_aac(&vr180_pipeline::x6_pair::audio_source(&path).0).ok().flatten().is_some();
+        let foa_audio = match source_kind {
+            vr180_pipeline::SourceKind::Insta360Insv =>
+                vr180_pipeline::audio::probe_foa_aac(&vr180_pipeline::x6_pair::audio_source(&path).0).ok().flatten().is_some(),
+            // A raw take's sound is its own file beside the capture.
+            vr180_pipeline::SourceKind::X6Raw => vr180_pipeline::x6_raw::audio_source(&path)
+                .is_some_and(|(file, _)| vr180_pipeline::audio::probe_foa_aac(&file).ok().flatten().is_some()),
+            _ => false,
+        };
         if foa_audio { tracing::info!("load: X6 360° Audio track (4-ch AmbiX) detected"); }
         // Kandao QooCam: a 4-channel AAC of its microphone capsules (not a
         // sound field) — mixed to stereo by the player and the export.
@@ -4384,6 +5350,7 @@ impl App {
             let auto = match source_kind {
                 vr180_pipeline::SourceKind::DjiOsv        => "DJI Osmo 360",
                 vr180_pipeline::SourceKind::Insta360Insv
+                | vr180_pipeline::SourceKind::X6Raw
                 | vr180_pipeline::SourceKind::Insta360Dng => "Insta360 X6",
                 vr180_pipeline::SourceKind::KandaoQoocam
                 | vr180_pipeline::SourceKind::KandaoDng   => vr180_pipeline::kandao_imu::KANDAO_PRESET_NAME,
@@ -4693,8 +5660,15 @@ impl App {
                 else if c.quad_audio { Some(vr180_pipeline::audio::StereoMix::Quad) }
                 else { None }
             });
-            let (audio_path, audio_base_s) = vr180_pipeline::x6_pair::audio_source(&audio_path);
-            self.audio_player = match crate::audio_player::AudioPlayer::open_at(
+            // A raw take: the sound file beside the capture, from the
+            // first frame's time in it (nothing to play when it has none).
+            let raw_take = self.clip.as_ref().is_some_and(|c| c.source_kind == vr180_pipeline::SourceKind::X6Raw);
+            let take_audio = if raw_take { vr180_pipeline::x6_raw::audio_source(&audio_path) } else { None };
+            let (audio_path, audio_base_s) = match take_audio {
+                Some(a) => a,
+                None => vr180_pipeline::x6_pair::audio_source(&audio_path),
+            };
+            self.audio_player = if raw_take && take_audio_missing(&audio_path) { None } else { match crate::audio_player::AudioPlayer::open_at(
                 audio_path, start_paused, mix, audio_base_s,
             ) {
                 Ok(Some(player)) => Some(player),
@@ -4703,7 +5677,7 @@ impl App {
                     tracing::warn!("audio_player: open failed: {e}");
                     None
                 }
-            };
+            } };
             tracing::info!("load_timing: AudioPlayer::open @ {:?}", t_audio.elapsed());
         }
     }
@@ -4954,6 +5928,7 @@ impl App {
     fn worker_settings(&self) -> Settings {
         let mut s = if self.clip_single_eye() { self.settings.for_single_eye() } else { self.settings.clone() };
         s.ilog_source = self.clip.as_ref().is_some_and(|c| c.ilog());
+        s.raw_source = self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
         s
     }
 
@@ -4961,6 +5936,9 @@ impl App {
     /// push to the shared control and bump the generation counter so
     /// the decoder rebuilds per-eye bundles on its next iteration.
     fn maybe_push_settings(&mut self) {
+        // What a raw clip's sharpening counts its radius in: the width of
+        // one eye of the frame an export would write now.
+        self.settings.export_eye_w = if self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) { self.raw_export_eye_w() } else { 0 };
         if self.settings == self.last_pushed_settings {
             return;
         }
@@ -5014,9 +5992,10 @@ impl App {
         // mutably borrows `self.export_opts` (egui disjoint-field capture).
         let running = self.batch_running;
         let run_progress = self.overall_run_progress();
+        let run_opts = self.batch_opts.unwrap_or(self.export_opts);
         let cur_nr = self.batch_current
             .and_then(|i| self.batch.get(i))
-            .map_or(false, |b| b.settings.denoise_strength > 0.0);
+            .map_or(false, |b| export_runs_noise_filter(b.source_kind, b.settings.denoise_strength, &run_opts));
         let n_all = self.batch.iter().filter(|b| matches!(b.status,
             BatchStatus::Idle | BatchStatus::Queued
             | BatchStatus::Failed(_) | BatchStatus::Skipped)).count();
@@ -5033,23 +6012,38 @@ impl App {
         let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
         // A single-eye clip's frame is its one eye, not two side by side.
         let single_eye = self.clip_single_eye();
-        let res_label = match self.settings.reframe_aspect_if_active() {
-            Some(aspect) => self.export_opts.reframe_size.frame_label(aspect, single_eye),
+        // The loaded clip's own choice (a Crop clip has one apart, and so
+        // has a raw take whose enhanced frames were found).
+        let sharp_eye = self.clip.as_ref().and_then(|c| c.sharp_eye(self.settings.insv_view));
+        let lens_frame = self.clip.as_ref()
+            .is_some_and(|c| self.settings.lens_frame_view(c.source_kind));
+        let enhanced = self.enhanced_frames(ctx);
+        let enhanced_sizes = matches!(enhanced, Some(EnhancedFrames::Found(_))) && self.export_opts.raw_use_enhanced && !lens_frame;
+        let resolution = self.export_opts.resolution_for(SizeList::of(sharp_eye.is_some(), enhanced_sizes));
+        let res_label = match (self.settings.reframe_aspect_if_active(), resolution, sharp_eye) {
+            // Lens Space through the camera's lens: the eye as recorded (or
+            // its 8K copy), named as such.
+            _ if lens_frame => {
+                // The clip's own eye: its native frame is that eye, or two side by side.
+                let (ew, eh) = self.native_sbs_dims()
+                    .map(|(w, h)| (if single_eye { w } else { w / 2 }, h)).unwrap_or((0, 0));
+                // A stabilized frame carries the stabilizer's margin; a
+                // reduced copy keeps its size.
+                let (w, h) = self.export_opts.lens_frame_out_dims(ew, eh, sharp_eye.is_some(), self.settings.stabilize);
+                format!("{} {} × {h}", tr("Lens Space"), if single_eye { w } else { w * 2 })
+            }
+            (Some(aspect), _, _) => self.export_opts.reframe_size.frame_label(aspect, single_eye),
             // Native = the clip's own size (a 12K BRAW: 12288 × 6144).
-            None if self.export_opts.resolution == ExportResolution::Native => {
-                match self.native_sbs_dims() {
-                    Some((w, h)) => format!("{w} × {h}"),
-                    None => self.export_opts.resolution.frame_label(single_eye).to_string(),
-                }
-            }
-            // A Crop clip's native-sharpness canvas; any other clip exports 8K.
-            None if self.export_opts.resolution == ExportResolution::Sharp => {
-                match self.clip.as_ref().and_then(|c| c.sharp_eye(self.settings.insv_view)) {
-                    Some(side) => format!("{} × {side}", if single_eye { side } else { side * 2 }),
-                    None => ExportResolution::R8k.frame_label(single_eye).to_string(),
-                }
-            }
-            None => self.export_opts.resolution.frame_label(single_eye).to_string(),
+            (None, ExportResolution::Native, _) => match self.native_sbs_dims() {
+                Some((w, h)) => format!("{w} × {h}"),
+                None => resolution.frame_label(single_eye).to_string(),
+            },
+            // A Crop clip's native-sharpness canvas.
+            (None, ExportResolution::Sharp, Some(side)) =>
+                format!("{} × {side}", if single_eye { side } else { side * 2 }),
+            // The canvases of a raw take's enhanced frames.
+            (None, r @ (ExportResolution::R13k | ExportResolution::R16k), _) => r.frame_label(single_eye).to_string(),
+            (None, _, _) => ExportResolution::R8k.frame_label(single_eye).to_string(),
         };
         let h265_mbps = self.export_opts.effective_h265_mbps(
             self.settings.reframe_aspect_if_active(), clip_fps, single_eye);
@@ -5065,9 +6059,16 @@ impl App {
             }
             _ => res_label,
         };
+        let raw_frames = self.export_opts.raw_dng_sequence
+            && self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
         let fmt_label = if is_still {
             // A still has no codec / bitrate: container + size only.
             format!("{} · {}", self.export_opts.still_format.label(), res_label)
+        } else if raw_frames && self.export_opts.raw_dng_original {
+            // The sensor's own frames: neither the view nor its size applies.
+            format!("{} · {} · 3840 × 3840 {}", tr("DNG sequence"), tr("camera original"), tr("per eye"))
+        } else if raw_frames {
+            format!("{} · {}", tr("DNG sequence"), res_label)
         } else { format!("{} · {}{}{}",
             bar_codec.label(),
             res_label,
@@ -5217,6 +6218,8 @@ impl App {
             let mut open = true;
             let clip_fps = self.clip.as_ref().map(|c| c.fps).unwrap_or(30.0);
             let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
+            // A raw video clip, and what is known of its enhanced frames.
+            let raw_video = enhanced;
             let native_dims = self.native_sbs_dims();
             let single_eye = self.clip_single_eye();
             // A Crop clip's native-sharpness canvas (side by side, or the one
@@ -5224,6 +6227,8 @@ impl App {
             let sharp_dims = self.clip.as_ref()
                 .and_then(|c| c.sharp_eye(self.settings.insv_view))
                 .map(|side| (if single_eye { side } else { side * 2 }, side));
+            // The Lens Space view: a lens frame, or the equidistant disc.
+            let lens_space = self.lens_space_out();
             egui::Window::new(tr("Export format"))
                 .collapsible(false)
                 .resizable(false)
@@ -5234,7 +6239,8 @@ impl App {
                     Self::export_options_ui(ui, &mut self.export_opts, "export",
                         self.settings.reframe_aspect_if_active(),
                         (self.settings.reframe_hfov_deg, self.settings.reframe_defish),
-                        clip_fps, is_still, native_dims, sharp_dims, single_eye);
+                        clip_fps, is_still, native_dims, sharp_dims, lens_space,
+                        self.settings.stabilize, single_eye, raw_video);
                 });
             self.show_export_settings = open;
         }
@@ -5254,9 +6260,20 @@ impl App {
         is_still: bool,
         native_dims: Option<(u32, u32)>,
         sharp_dims: Option<(u32, u32)>,
+        // The loaded clip is in the Lens Space view, and which lens that
+        // writes for it: the camera's (a lens frame) or the equidistant
+        // disc. `None` in every other view.
+        lens_space: Option<crate::decoder::LensSpaceLens>,
+        // The loaded clip is stabilized: its lens frame then carries the
+        // stabilizer's margin, and the sizes shown include it.
+        lens_frame_stabilized: bool,
         // The clip holds ONE eye: its frame is that eye (sizes and rates
         // follow), and nothing that needs two eyes is offered.
         single_eye: bool,
+        // The clip is a raw video (it can also leave as a folder of DNG
+        // frames), and what is known of its enhanced frames; `None` for any
+        // other clip.
+        raw_video: Option<EnhancedFrames>,
     ) {
         // Spatial video is offered for the reframed view on macOS. Selected
         // on a clip it does not exist for, the choice shows (and exports) as
@@ -5268,7 +6285,15 @@ impl App {
             ExportCodec::Spatial if !spatial_offered => ExportCodec::H265,
             c => c,
         };
-        if let Some(aspect) = reframe {
+        // The camera's own frames have no view and no size to pick: the list
+        // that would offer one is not shown for them.
+        let camera_original = raw_video.is_some() && !is_still && opts.raw_dng_sequence && opts.raw_dng_original;
+        if camera_original {
+            ui.label(RichText::new(tr("Resolution")).strong());
+            ui.label(format!("3840 × 3840 {}", tr("per eye")));
+            ui.label(RichText::new(tr("Camera original frames are the sensor's own: the view and its size, the grade, stabilization and noise reduction are not applied to them."))
+                .small().color(Color32::GRAY));
+        } else if let Some(aspect) = reframe {
             // Reframed view: the exact viewport at a per-eye size.
             ui.label(RichText::new(tr(if single_eye { "Size" } else { "Per-eye size" })).strong());
             opts.reframe_size = opts.reframe_size.clamped(is_still, aspect);
@@ -5294,40 +6319,93 @@ impl App {
                 None => ExportResolution::Native.frame_label(single_eye).to_string(),
             };
             // Native sharpness — only a clip whose frame is a crop of the
-            // lens' view has it (the X6 Crop modes). The choice sticks while
-            // such clips are open; on any other clip it means 8K, and shows so.
+            // lens' view has it (the X6 Crop modes). Such a clip edits its
+            // own choice, every other clip the general one: neither changes
+            // what a clip of the other sort exports at.
             let sharp_label: Option<String> = sharp_dims.filter(|_| !is_still)
                 .map(|(w, h)| format!("{w} × {h} ({})", tr("native sharpness")));
-            if opts.resolution == ExportResolution::Sharp && sharp_label.is_none() {
-                opts.resolution = ExportResolution::R8k;
-            }
-            let sel_label: &str = match (opts.resolution, sharp_label.as_deref()) {
-                (ExportResolution::Native, _) => &native_label,
-                (ExportResolution::Sharp, Some(l)) => l,
-                _ => ExportResolution::R8k.frame_label(single_eye),
+            let cropped = sharp_label.is_some();
+            // Lens Space through the camera's lens: a lens frame, the
+            // recording's own frame instead of a canvas.
+            let lens_frame = lens_space == Some(crate::decoder::LensSpaceLens::Camera);
+            // A stabilized lens frame is the recorded frame plus the
+            // stabilizer's margin (`vr180_pipeline::lens_frame`): the size
+            // it is written at.
+            let grown_dims = native_dims.filter(|_| lens_frame && lens_frame_stabilized).map(|(w, h)| {
+                let (ew, eh) = vr180_pipeline::lens_frame::stabilized_dims(if single_eye { w } else { w / 2 }, h);
+                (if single_eye { ew } else { ew * 2 }, eh)
+            });
+            let native_label = match grown_dims {
+                Some((w, h)) => format!("{w} × {h} ({})", tr("native + margin")),
+                None => native_label,
             };
+            // A raw take whose enhanced frames were found picks from the
+            // list that holds the two larger canvases (not for a lens frame,
+            // which is the recorded frame whatever is picked).
+            let enhanced_sizes = matches!(raw_video, Some(EnhancedFrames::Found(_))) && opts.raw_use_enhanced && !lens_frame && !is_still;
+            let list = SizeList::of(cropped, enhanced_sizes);
+            let shown = opts.resolution_for(list);
+            // The 8K choice of a lens frame is its reduced copy, listed only
+            // where the frame is larger than that.
+            let lens_reduced: Option<String> = native_dims.filter(|_| lens_frame).and_then(|(w, h)| {
+                let eye_w = if single_eye { w } else { w / 2 };
+                lens_frame_reduced_dims(eye_w, h)
+                    .map(|(rw, rh)| format!("{} × {rh}", if single_eye { rw } else { rw * 2 }))
+            });
+            let r8k_label: String = lens_reduced.clone()
+                .unwrap_or_else(|| ExportResolution::R8k.frame_label(single_eye).to_string());
+            let r8k_listed = !lens_frame || lens_reduced.is_some();
+            // In a lens frame the clip's own size IS its native sharpness:
+            // that choice shows as the native size and is not listed apart.
+            let sel_label: &str = match (shown, sharp_label.as_deref()) {
+                (ExportResolution::Native, _) => &native_label,
+                (ExportResolution::Sharp, Some(_)) if lens_frame => &native_label,
+                (ExportResolution::Sharp, Some(l)) => l,
+                (ExportResolution::R13k | ExportResolution::R16k, _) => shown.frame_label(single_eye),
+                (ExportResolution::R8k, _) if !r8k_listed => &native_label,
+                _ => &r8k_label,
+            };
+            let choice = opts.resolution_for_mut(list);
+            *choice = shown;
             egui::ComboBox::from_id_source(format!("{id_prefix}_resolution"))
                 .selected_text(sel_label)
                 .width(260.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut opts.resolution,
+                    ui.selectable_value(choice,
                         ExportResolution::Native, native_label.clone());
-                    ui.selectable_value(&mut opts.resolution,
-                        ExportResolution::R8k, ExportResolution::R8k.frame_label(single_eye));
-                    if let Some(l) = &sharp_label {
-                        ui.selectable_value(&mut opts.resolution, ExportResolution::Sharp, l.clone());
+                    if r8k_listed {
+                        ui.selectable_value(choice, ExportResolution::R8k, r8k_label.clone());
+                    }
+                    if let Some(l) = sharp_label.as_ref().filter(|_| !lens_frame) {
+                        ui.selectable_value(choice, ExportResolution::Sharp, l.clone());
+                    }
+                    if list == SizeList::Enhanced {
+                        for size in [ExportResolution::R13k, ExportResolution::R16k] {
+                            ui.selectable_value(choice, size, size.frame_label(single_eye));
+                        }
                     }
                 });
-            if sharp_label.is_some() {
+            if lens_frame {
+                ui.label(RichText::new(tr(LENS_FRAME_NOTE)).small().color(Color32::GRAY));
+                ui.label(RichText::new(tr(LENS_FRAME_STAB_NOTE)).small().color(Color32::GRAY));
+            } else if sharp_label.is_some() {
                 ui.label(RichText::new(tr("Native sharpness: the 180° canvas at the pixel density of the Crop frame's centre, so nothing recorded is scaled down. The clip's own size puts the same frame on a smaller canvas."))
+                    .small().color(Color32::GRAY));
+            } else if list == SizeList::Enhanced {
+                ui.label(RichText::new(tr("This clip's enhanced frames hold more than 8192 × 4096 shows: the two larger sizes keep it. A stretch without enhanced frames exports at the size picked without them."))
                     .small().color(Color32::GRAY));
             }
             // Beyond 8192×4096 (a 12K BRAW, a Crop clip's native-sharpness
             // canvas): what the platform's encoder does with the frame —
             // see `oversize_export_hint`.
-            let out_dims = match opts.resolution {
-                ExportResolution::Native => native_dims,
+            let native_out = grown_dims.or(native_dims);
+            let out_dims = match opts.resolution_for(list) {
+                ExportResolution::Native => native_out,
+                ExportResolution::Sharp if lens_frame => native_out,
                 ExportResolution::Sharp => sharp_dims,
+                r @ (ExportResolution::R13k | ExportResolution::R16k) =>
+                    r.enhanced_side().map(|side| (if single_eye { side } else { side * 2 }, side)),
+                ExportResolution::R8k if !r8k_listed => native_out,
                 ExportResolution::R8k => None,
             };
             if !is_still {
@@ -5356,6 +6434,27 @@ impl App {
             }
             ui.add_space(8.0);
             return;
+        }
+
+        if let Some(found) = raw_video {
+            ui.checkbox(&mut opts.raw_dng_sequence, tr("DNG sequence"));
+            if opts.raw_dng_sequence {
+                ui.radio_value(&mut opts.raw_dng_original, false, tr("Developed view"));
+                ui.label(RichText::new(tr("Every frame as a linear DNG in a folder, with this clip's raw development settings inside each file."))
+                    .small().color(Color32::GRAY));
+                ui.radio_value(&mut opts.raw_dng_original, true, tr("Camera original"));
+                ui.label(RichText::new(tr("Every frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number. No projection, no stabilization, no grading — for running the frames through a raw converter first."))
+                    .small().color(Color32::GRAY));
+                ui.add_space(8.0);
+                if !opts.raw_dng_original {
+                    Self::enhanced_frames_ui(ui, opts, found);
+                }
+                return;
+            }
+            ui.label(RichText::new(tr("Every frame as a DNG in a folder: the developed view, or the sensor's own frames."))
+                .small().color(Color32::GRAY));
+            ui.add_space(8.0);
+            Self::enhanced_frames_ui(ui, opts, found);
         }
 
         ui.label(RichText::new(tr("Codec")).strong());
@@ -5491,7 +6590,15 @@ impl App {
             }
         }
 
-        if reframe.is_none() {
+        if reframe.is_none() && lens_space == Some(crate::decoder::LensSpaceLens::Camera) {
+            // A lens frame is not a half-equirect: it carries its own
+            // metadata, and the VR180 choice below is for the other clips.
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(RichText::new(tr("VR180 metadata")).strong());
+            ui.label(RichText::new(tr(LENS_FRAME_METADATA_NOTE)).small().color(Color32::GRAY));
+        } else if reframe.is_none() {
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(4.0);
@@ -5518,6 +6625,10 @@ impl App {
              only one can be active per file. Re-run the export \
              with the other target if you need a second copy."
         )).small().color(Color32::GRAY));
+        // The equidistant disc of the Lens Space view is no half-equirect.
+        if lens_space == Some(crate::decoder::LensSpaceLens::Equidistant) {
+            ui.label(RichText::new(tr(LENS_SPACE_DISC_METADATA_NOTE)).small().color(Color32::GRAY));
+        }
         }
 
         // The BeyondVR eye-scale hack is a half-equirect (VR180) fix-up of
@@ -5661,6 +6772,8 @@ impl eframe::App for App {
         // Drive the full-res still for the zoom magnifier (and snapshots).
         self.poll_full_res(ctx);
         self.poll_snapshot(ctx);
+        self.poll_frame_dng(ctx);
+        self.poll_raw_settings(ctx);
         // Import merge/individual prompt (shown when a multi-file recording
         // is picked). Modal-ish: it sits on top until resolved.
         self.draw_import_prompt(ctx);
@@ -6127,7 +7240,11 @@ impl eframe::App for App {
                     if ui.button(tr("■ Stop")).clicked() { self.stop_playback(); }
                     let has_frame = self.current_display.is_some();
                     if ui.add_enabled(has_frame, egui::Button::new(tr("📷 Snapshot")))
-                        .on_hover_text(tr("Save this frame as a JPEG in the export folder (S)"))
+                        .on_hover_text(if self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) {
+                            tr("Save this frame as a JPEG and as a linear DNG in the export folder (S)")
+                        } else {
+                            tr("Save this frame as a JPEG in the export folder (S)")
+                        })
                         .clicked()
                     {
                         self.request_snapshot();
@@ -6672,9 +7789,41 @@ impl App {
         // Two eyes side by side, or the one eye of a single-eye clip.
         let eyes = if clip.single_eye() { 1 } else { 2 };
         Some(match self.settings.fisheye_output_mode {
-            crate::decoder::FisheyeOutputMode::Fisheye => { let side = ew.min(eh); (side * eyes, side) }
+            // A lens frame is the recorded frame; the disc sits in a square.
+            crate::decoder::FisheyeOutputMode::Fisheye if !self.settings.lens_frame_view(kind) => {
+                let side = ew.min(eh);
+                (side * eyes, side)
+            }
             _ => (ew * eyes, eh),
         })
+    }
+
+    /// What the Lens Space view of the loaded clip writes — the camera's
+    /// lens (a lens frame) or the equidistant disc, which is also what a
+    /// clip without a lens record gets; `None` in every other view.
+    fn lens_space_out(&self) -> Option<crate::decoder::LensSpaceLens> {
+        use crate::decoder::{FisheyeOutputMode, LensSpaceLens};
+        let clip = self.clip.as_ref()?;
+        (self.settings.fisheye_output_mode == FisheyeOutputMode::Fisheye).then(|| {
+            if self.settings.lens_frame_view(clip.source_kind) { LensSpaceLens::Camera } else { LensSpaceLens::Equidistant }
+        })
+    }
+
+    /// Width of one eye of the frame an export of the loaded raw take would
+    /// write now: [`Self::export_eye_dims`], or the canvas picked for its
+    /// enhanced frames where those were found (a view on a canvas only).
+    fn raw_export_eye_w(&self) -> u32 {
+        let plain = self.export_eye_dims();
+        let Some(clip) = self.clip.as_ref() else { return plain.0; };
+        let canvas = !self.settings.lens_frame_view(clip.source_kind)
+            && self.settings.fisheye_output_mode != crate::decoder::FisheyeOutputMode::Reframe;
+        match self.enhanced_in_use() {
+            Some(_) if canvas => {
+                let (w, h) = self.export_opts.enhanced_eye_dims((clip.fisheye_eye_w, clip.fisheye_eye_h));
+                if self.settings.fisheye_output_mode == crate::decoder::FisheyeOutputMode::Fisheye { w.min(h) } else { w }
+            }
+            _ => plain.0,
+        }
     }
 
     fn export_eye_dims(&self) -> (u32, u32) {
@@ -6689,10 +7838,15 @@ impl App {
             (clip.width.max(512), clip.height.max(512))
         };
         // Same rule as `build_export_cfg`.
-        match (self.export_opts.resolution, clip.sharp_eye(self.settings.insv_view)) {
+        let sharp_eye = clip.sharp_eye(self.settings.insv_view);
+        // A lens frame: the frame the export writes, its margin included.
+        if self.settings.lens_frame_view(kind) {
+            return self.export_opts.lens_frame_out_dims(ew, eh, sharp_eye.is_some(), self.settings.stabilize);
+        }
+        match (self.export_opts.resolution_for(SizeList::of(sharp_eye.is_some(), false)), sharp_eye) {
             (ExportResolution::Sharp, Some(side)) => { ew = side; eh = side; }
-            (ExportResolution::R8k | ExportResolution::Sharp, _) => { ew = 4096; eh = 4096; }
             (ExportResolution::Native, _) => {}
+            _ => { ew = 4096; eh = 4096; }
         }
         match self.settings.fisheye_output_mode {
             crate::decoder::FisheyeOutputMode::Reframe =>
@@ -6786,6 +7940,9 @@ impl App {
             enc.encode(&rgb, w, h, image::ExtendedColorType::Rgb8)?;
             Ok(())
         })();
+        if result.is_ok() {
+            self.spawn_frame_dng(path.with_extension("dng"));
+        }
         let msg = match result {
             Ok(()) => {
                 tracing::info!("snapshot: {} ({w}×{h}, preview_fallback={preview_fallback})", path.display());
@@ -6802,6 +7959,88 @@ impl App {
             }
         };
         self.snapshot_status = Some((msg, std::time::Instant::now()));
+    }
+
+    /// A raw video clip's snapshot: the frame on screen also as a linear DNG
+    /// at `out` (projected and stabilized as the export would, with the
+    /// clip's raw development settings inside), written on its own thread.
+    fn spawn_frame_dng(&mut self, out: PathBuf) {
+        let Some(src) = self.loaded_path.clone() else { return; };
+        let Some(t_s) = self.current_display.as_ref().map(|d| d.timestamp_s) else { return; };
+        let Some(item) = self.batch.iter().find(|b| b.path == src).filter(|b| b.source_kind.is_raw_video()) else { return; };
+        if self.frame_dng_job.is_some() {
+            return;
+        }
+        let mut cfg = Self::build_export_cfg(
+            &item.path, &out, item.fps, item.source_kind,
+            item.fisheye_eye_w, item.fisheye_eye_h, item.width, item.height, item.sharp_eye(),
+            &self.worker_settings(), &self.export_opts, self.clip_segments(&item.path));
+        // The snapshot's picture is the preview's, at the size picked without
+        // enhanced frames: its DNG keeps that size (an enhanced frame, where
+        // there is one, still gives it its pixels).
+        cfg.raw_enhanced_eye = None;
+        let pipeline = self.export_device();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let path = out.clone();
+        std::thread::spawn(move || {
+            let result = vr180_pipeline::raw_export::export_frame_dng(pipeline, &cfg, t_s as f64, &path).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.frame_dng_job = Some((out, rx));
+    }
+
+    /// Take over a raw clip's Camera Raw settings once they are read: they
+    /// become the clip's raw development when it is still the clip loaded.
+    fn poll_raw_settings(&mut self, ctx: &egui::Context) {
+        let Some((take, rx)) = self.raw_settings_job.as_ref() else { return; };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                return;
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.raw_settings_job = None;
+                return;
+            }
+        };
+        let take = take.clone();
+        self.raw_settings_job = None;
+        let text = match outcome {
+            Ok(found) => {
+                if let (Some(f), true) = (&found, self.loaded_path.as_ref() == Some(&take)) {
+                    tracing::info!("raw development read from {}: {:?}; not carried: {:?}", f.file.display(), f.develop.settings, f.develop.not_carried);
+                    self.settings.raw = f.develop.settings;
+                }
+                camera_raw_status(&found)
+            }
+            Err(e) => {
+                tracing::warn!("raw development: reading Camera Raw settings failed: {e}");
+                e
+            }
+        };
+        self.raw_settings_status = Some((take, text));
+        ctx.request_repaint();
+    }
+
+    /// Report the frame DNG of a snapshot once it is written.
+    fn poll_frame_dng(&mut self, ctx: &egui::Context) {
+        let Some((path, rx)) = self.frame_dng_job.as_ref() else { return; };
+        let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                tracing::info!("snapshot: {}", path.display());
+                self.snapshot_status = Some((format!("{} {name}", tr("Saved")), std::time::Instant::now()));
+                self.frame_dng_job = None;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("snapshot: frame DNG failed: {e}");
+                self.snapshot_status = Some((format!("{name}: {e}"), std::time::Instant::now()));
+                self.frame_dng_job = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => self.frame_dng_job = None,
+        }
     }
 
     fn draw_source_panel(&mut self, ui: &mut egui::Ui) {
@@ -6915,12 +8154,14 @@ impl App {
             }
         }
         if do_apply_all {
-            // SAME-KIND ONLY — never overwrite a different camera type's
-            // settings (OSV stab/calib means nothing to a .360 clip, etc.).
+            // SAME CLASS ONLY — never overwrite a different camera type's
+            // settings (OSV stab/calib means nothing to a .360 clip, etc.),
+            // nor those of a clip that keeps a setup of its own within the
+            // type (`settings_class_key`).
             self.sync_active_clip_settings();
-            if let Some(kind) = self.active_clip.and_then(|a| self.batch.get(a)).map(|b| b.source_kind) {
+            if let Some(class) = self.active_clip.and_then(|a| self.batch.get(a)).map(BatchItem::settings_class) {
                 for i in 0..self.batch.len() {
-                    if self.batch[i].source_kind == kind {
+                    if self.batch[i].settings_class() == class {
                         self.apply_current_settings_to_item(i);
                     }
                 }
@@ -7014,11 +8255,12 @@ impl App {
             .add_filter(
                 "All supported video",
                 &["360", "osv", "OSV", "insv", "INSV", "braw", "BRAW",
-                  "mp4", "MP4", "mov", "MOV", "dng", "DNG"],
+                  "mp4", "MP4", "mov", "MOV", "dng", "DNG", "x6b", "X6B"],
             )
             .add_filter("Camera still (.dng: Insta360 X6, Kandao QooCam 3 Ultra)", &["dng", "DNG"])
             .add_filter("DJI Osmo 360 (.osv)", &["osv", "OSV"])
             .add_filter("Insta360 (.insv)", &["insv", "INSV"])
+            .add_filter("Insta360 X6 raw video (capture.x6b in the take's folder)", &["x6b", "X6B"])
             .add_filter("Kandao QooCam 3 Ultra (.mp4)", &["mp4", "MP4"])
             .add_filter("Blackmagic RAW (.braw)", &["braw", "BRAW"])
             .add_filter("Side-by-side fisheye (.mp4 / .mov)",
@@ -7026,6 +8268,9 @@ impl App {
     }
 
     fn draw_source_info(&self, ui: &mut egui::Ui) {
+        if let Some(note) = &self.import_notice {
+            ui.label(RichText::new(note).small().color(Color32::from_rgb(255, 200, 120)));
+        }
         match (&self.loaded_path, &self.clip) {
             (Some(p), Some(c)) => {
                 let fname = p.file_name()
@@ -7283,10 +8528,37 @@ impl App {
         let is_braw = matches!(kind, Some(vr180_pipeline::SourceKind::BlackmagicRaw));
         // The ETTR recovery works in the source's log curve: I-Log clips only.
         let ilog = self.clip.as_ref().is_some_and(|c| c.ilog());
+        // Raw video: the frames are developed here (white balance, exposure,
+        // tone) before every display-referred control below.
+        let is_raw = matches!(kind, Some(k) if k.is_raw_video());
         let braw_info = if is_braw { self.clip.as_ref().and_then(|c| c.braw_color.clone()) } else { None };
         let braw_lut = if is_braw { self.clip.as_ref().and_then(|c| c.braw_lut.clone()) } else { None };
+        // What the last read of the take's Camera Raw settings came to.
+        let raw_status: Option<String> = self.raw_settings_status.as_ref()
+            .filter(|(take, _)| Some(take) == self.loaded_path.as_ref()).map(|(_, text)| text.clone());
+        let raw_reading = self.raw_settings_job.is_some();
         let s = &mut self.settings;
 
+        if is_raw {
+            let read = draw_raw_develop_section(ui, &mut s.raw, vr180_pipeline::raw_color::RawCamera::X6,
+                if raw_reading { Some(tr("Reading…")) } else { raw_status.as_deref() }, !raw_reading);
+            // Read the settings a frame was left with in Camera Raw: the
+            // frame on screen, from the folder of camera-original DNGs
+            // beside the take. On a thread: the folder may be on a share.
+            if let (true, Some(take)) = (read, self.loaded_path.clone()) {
+                let t_s = self.current_display.as_ref().map_or(0.0, |d| d.timestamp_s as f64);
+                let dir = Self::default_frames_dir_for(&take, true);
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let (path, repaint) = (take.clone(), ui.ctx().clone());
+                std::thread::spawn(move || {
+                    let found = vr180_pipeline::x6_raw::camera_raw_settings(&path, &dir, t_s).map_err(|e| e.to_string());
+                    let _ = tx.send(found);
+                    repaint.request_repaint();
+                });
+                self.raw_settings_job = Some((take, rx));
+            }
+            ui.separator();
+        }
         if let Some(info) = braw_info.as_deref() {
             draw_braw_color_section(ui, s, info, braw_lut.as_deref());
         } else if is_braw {
@@ -7582,6 +8854,7 @@ impl App {
                 | Some(vr180_pipeline::SourceKind::SbsFisheye)
                 | Some(vr180_pipeline::SourceKind::BlackmagicRaw)
                 | Some(vr180_pipeline::SourceKind::GoProEac)
+                | Some(vr180_pipeline::SourceKind::X6Raw)
         );
         let align_running = self.align_rx.is_some();
         let align_status = self.align_status.clone();
@@ -7740,7 +9013,7 @@ impl App {
         let is_osv  = matches!(kind, Some(vr180_pipeline::SourceKind::DjiOsv));
         // Insta360: raw gyro fused at load (VQF) — same stab controls as OSV,
         // no background quat load to gate on.
-        let is_insv = matches!(kind, Some(vr180_pipeline::SourceKind::Insta360Insv));
+        let is_insv = matches!(kind, Some(vr180_pipeline::SourceKind::Insta360Insv | vr180_pipeline::SourceKind::X6Raw));
         // Kandao QooCam: same raw-gyro fusion as the X6.
         let is_kandao = matches!(kind, Some(vr180_pipeline::SourceKind::KandaoQoocam));
         // DJI OSV loads the lens calib first (instant preview) and streams the
@@ -7837,6 +9110,36 @@ impl App {
         }
     }
 
+    /// The Lens Space part of the Output panel: the lens the picture of a
+    /// clip of `kind` is written through — the camera's own (a lens frame)
+    /// or an ideal equidistant one, the disc (185° for the cube map of a
+    /// GoPro `.360`, 195° for a fisheye) — and what each is for. A clip with
+    /// no lens record (a still, a file that is already VR180) has no choice
+    /// to make: it is the disc. Nothing in the other views.
+    fn lens_space_ui(ui: &mut egui::Ui, s: &mut crate::decoder::Settings, kind: Option<vr180_pipeline::SourceKind>) {
+        use crate::decoder::LensSpaceLens;
+        if !matches!(s.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Fisheye) {
+            return;
+        }
+        let lens_possible = kind.is_some_and(|k| crate::decoder::lens_frame_possible(k, s));
+        if lens_possible {
+            ui.horizontal(|ui| {
+                ui.label(tr("Lens"));
+                ui.selectable_value(&mut s.lens_space, LensSpaceLens::Camera, tr(LensSpaceLens::Camera.as_str()))
+                    .on_hover_text(tr(LENS_SPACE_CAMERA_HOVER));
+                ui.selectable_value(&mut s.lens_space, LensSpaceLens::Equidistant, tr(LensSpaceLens::Equidistant.as_str()))
+                    .on_hover_text(tr(LENS_SPACE_EQUIDISTANT_HOVER));
+            });
+        }
+        let note = if lens_possible && s.lens_space == LensSpaceLens::Camera {
+            tr(LENS_SPACE_CAMERA_NOTE).to_string()
+        } else {
+            let fov = if kind.is_some_and(|k| k.is_eac()) { "185°" } else { "195°" };
+            format!("{fov} {}", tr(LENS_SPACE_DISC_NOTE))
+        };
+        ui.label(RichText::new(note).small().color(Color32::GRAY));
+    }
+
     /// Output panel for fisheye sources — projection target + L↔R swap.
     fn draw_fisheye_output_panel(&mut self, ui: &mut egui::Ui) {
         // Dual-fisheye sources (and the X6 still): 195° lens, eye swap +
@@ -7845,6 +9148,7 @@ impl App {
             self.clip.as_ref().map(|c| c.source_kind),
             Some(vr180_pipeline::SourceKind::DjiOsv)
                 | Some(vr180_pipeline::SourceKind::Insta360Insv)
+                | Some(vr180_pipeline::SourceKind::X6Raw)
                 | Some(vr180_pipeline::SourceKind::Insta360Dng)
                 | Some(vr180_pipeline::SourceKind::KandaoQoocam)
                 | Some(vr180_pipeline::SourceKind::KandaoDng)
@@ -7857,6 +9161,7 @@ impl App {
             .map_or(false, |g| g.cropped);
         // A single-eye clip: the same three outputs, one eye wide.
         let single_eye = self.clip_single_eye();
+        let kind = self.clip.as_ref().map(|c| c.source_kind);
         let s = &mut self.settings;
 
         ui.horizontal(|ui| {
@@ -7905,13 +9210,7 @@ impl App {
             });
         }
 
-        // Show the actual output FOV for the current source — the GoPro
-        // Max `.360` captures 185°, the DJI/OSV lens 195°.
-        if matches!(s.fisheye_output_mode, crate::decoder::FisheyeOutputMode::Fisheye) {
-            let fov = if is_osv { "195°" } else { "185°" };
-            ui.label(RichText::new(format!("{fov} equidistant — source lens FOV"))
-                .small().color(Color32::GRAY));
-        }
+        Self::lens_space_ui(ui, s, kind);
 
         if is_osv {
             ui.add_space(4.0);
@@ -8317,6 +9616,171 @@ fn draw_eye_lens(
 /// slider. The trick: after egui maps the cursor position to a value, we
 /// keep only `1/zoom` of this frame's change, so the value creeps at
 /// `1/zoom` of cursor speed.
+/// Color panel ▸ Raw development: the white balance and tone controls of a
+/// raw video clip, in a raw converter's own terms (kelvin and tint; stops;
+/// −100..100). The white balance shows the effective value: the camera's
+/// until the user moves it.
+///
+/// `status`: what the last read of the clip's Camera Raw settings came to,
+/// shown under its button; `can_read`: no such read is under way. Returns
+/// whether that button was pressed.
+fn draw_raw_develop_section(
+    ui: &mut egui::Ui,
+    raw: &mut vr180_pipeline::raw_tone::RawSettings,
+    camera: vr180_pipeline::raw_color::RawCamera,
+    status: Option<&str>,
+    can_read: bool,
+) -> bool {
+    ui.label(RichText::new(tr("Raw development")).strong());
+    let (shot_k, shot_tint) = camera.as_shot_temperature();
+    // Whole numbers, as the sliders show them: a slider handed a fraction
+    // writes the rounded value back and reports a change nobody made, which
+    // turned "as shot" into a custom white the moment the section was drawn.
+    let mut kelvin = raw.temperature.unwrap_or(shot_k as f32).round();
+    let mut tint = raw.tint.unwrap_or(shot_tint as f32).round();
+    let hover = tr("The white the frame is developed for, as a colour temperature in kelvin and a tint, the way a raw converter states it.");
+    if ui.add(egui::Slider::new(&mut kelvin, 2000.0..=50000.0).logarithmic(true).text(tr("Temperature (K)")).fixed_decimals(0))
+        .on_hover_text(hover).changed()
+    {
+        raw.temperature = Some(kelvin.round());
+    }
+    if ui.add(egui::Slider::new(&mut tint, -150.0..=150.0).text(tr("Tint")).fixed_decimals(0))
+        .on_hover_text(hover).changed()
+    {
+        raw.tint = Some(tint.round());
+    }
+    ui.add_enabled_ui(raw.temperature.is_some() || raw.tint.is_some(), |ui| {
+        if ui.button(tr("As shot")).on_hover_text(tr("The take records no white balance of its own: As shot is the camera's reference white.")).clicked() {
+            raw.temperature = None;
+            raw.tint = None;
+        }
+    });
+    ui.add(egui::Slider::new(&mut raw.exposure, -5.0..=5.0).text(tr("Exposure")).fixed_decimals(2));
+    let amount = |ui: &mut egui::Ui, v: &mut f32, label: &'static str| {
+        ui.add(egui::Slider::new(v, -100.0..=100.0).text(tr(label)).fixed_decimals(0));
+    };
+    amount(ui, &mut raw.contrast, "Contrast");
+    amount(ui, &mut raw.highlights, "Highlights");
+    amount(ui, &mut raw.shadows, "Shadows");
+    amount(ui, &mut raw.whites, "Whites");
+    amount(ui, &mut raw.blacks, "Blacks");
+    // The detail panel's sharpening, in a raw converter's own terms.
+    ui.add_space(4.0);
+    ui.label(tr("Sharpening"));
+    let sharpen = &mut raw.sharpen;
+    ui.add(egui::Slider::new(&mut sharpen.amount, 0.0..=150.0).step_by(1.0).text(tr("Amount")).fixed_decimals(0))
+        .on_hover_text(tr("Sharpening of the developed picture, as a raw converter's detail panel does it: the same numbers give the same edges there. The radius is in pixels of the exported frame, so judge it in the zoom view or on a snapshot; the preview shows the export's picture reduced."));
+    ui.add_enabled_ui(sharpen.amount >= 0.5, |ui| {
+        ui.add(egui::Slider::new(&mut sharpen.radius, 0.5..=3.0).step_by(0.1).text(tr("Radius")).fixed_decimals(1));
+        ui.add(egui::Slider::new(&mut sharpen.detail, 0.0..=100.0).step_by(1.0).text(tr("Detail")).fixed_decimals(0))
+            .on_hover_text(tr("How much of the finest detail is sharpened. Low values hold halos back, as a raw converter's do: a hard edge is sharpened less, a soft one keeps its steepening."));
+        ui.add(egui::Slider::new(&mut sharpen.masking, 0.0..=100.0).step_by(1.0).text(tr("Masking")).fixed_decimals(0))
+            .on_hover_text(tr("Keeps the sharpening to edges: the higher, the stronger an edge has to be."));
+    });
+    // The detail panel's noise reduction: colour only.
+    ui.add_space(4.0);
+    ui.label(tr("Noise reduction"));
+    ui.add(egui::Slider::new(&mut raw.color_noise, 0.0..=100.0).step_by(1.0).text(tr("Color noise")).fixed_decimals(0))
+        .on_hover_text(tr("Colour noise reduction, as a raw converter's: the picture's colour is smoothed and its luminance left alone, which takes the coloured speckle out of noise and the colour out of fine lines. 25 is a raw converter's default; 0 turns it off."));
+    let mut read = false;
+    ui.horizontal(|ui| {
+        if ui.button(tr("Reset raw development")).clicked() {
+            *raw = Default::default();
+        }
+        read = ui.add_enabled(can_read, egui::Button::new(tr("Read from Camera Raw")))
+            .on_hover_text(tr("Takes the white balance, tone, sharpening and colour noise reduction a frame was left with in Camera Raw. They are read from the Camera original DNG of the frame on screen, or of the nearest frame that has settings, in the folder beside the take. Whatever else was set there is named below and stays there."))
+            .clicked();
+    });
+    if let Some(text) = status {
+        ui.label(RichText::new(text).small().color(Color32::GRAY));
+    }
+    read
+}
+
+/// What a read of a take's Camera Raw settings came to, for the line under
+/// its button.
+fn camera_raw_status(found: &Option<vr180_pipeline::x6_raw::CameraRawSettings>) -> String {
+    let Some(found) = found else {
+        return tr("No Camera Raw settings found: the folder of Camera original DNGs beside this take has none, or is not there.").to_string();
+    };
+    // The file, as the folder names it: its channel folder and its name.
+    let name = found.file.iter().rev().take(2).collect::<Vec<_>>().into_iter().rev()
+        .map(|part| part.to_string_lossy().to_string()).collect::<Vec<_>>().join("/");
+    let mut text = format!("{} {name}", tr("Read from"));
+    if !found.develop.not_carried.is_empty() {
+        let list = found.develop.not_carried.iter()
+            .map(|&(what, ref value)| if value.is_empty() { tr(what).to_string() } else { format!("{} {value}", tr(what)) })
+            .collect::<Vec<_>>().join(", ");
+        text.push_str(&format!(". {} {list}", tr("Not carried over:")));
+    }
+    if found.eyes_differ {
+        text.push_str(&format!(". {}", tr("The other eye's file has other settings: these are channel 0's.")));
+    }
+    text
+}
+
+#[cfg(test)]
+mod camera_raw_tests {
+    use super::{camera_raw_status, draw_raw_develop_section, tr_zh};
+    use std::path::PathBuf;
+    use vr180_pipeline::raw_export::ReadDevelop;
+    use vr180_pipeline::x6_raw::CameraRawSettings;
+
+    /// What a read came to is said in one line: the file, what stayed in
+    /// Camera Raw, and a word when the two eyes were left differently.
+    #[test]
+    fn the_outcome_of_a_read_is_said_under_its_button() {
+        assert!(camera_raw_status(&None).starts_with("No Camera Raw settings found"));
+        let found = |not_carried: Vec<(&'static str, String)>, eyes_differ: bool| Some(CameraRawSettings {
+            file: PathBuf::from("/takes/TAKE_OriginalDNG/CAM0/000000364.dng"),
+            develop: ReadDevelop { settings: Default::default(), not_carried },
+            eyes_differ,
+        });
+        assert_eq!(camera_raw_status(&found(Vec::new(), false)), "Read from CAM0/000000364.dng");
+        let text = camera_raw_status(&found(vec![("Texture", "+20".into()), ("Tone curve", String::new()), ("Profile", "Adobe Vivid".into())], true));
+        assert_eq!(text, "Read from CAM0/000000364.dng. Not carried over: Texture +20, Tone curve, Profile Adobe Vivid. \
+            The other eye's file has other settings: these are channel 0's.");
+        // Every name a read can come back with has its Chinese.
+        for name in ["Texture", "Clarity", "Dehaze", "Vibrance", "Saturation", "Luminance noise reduction", "Color noise reduction detail",
+            "Color noise reduction smoothness", "Grain", "Tone curve", "Color mixer", "Color grading", "Calibration", "Vignette",
+            "Lens corrections", "Geometry", "Crop", "Black & white", "Masks", "Healing", "Profile", "Read from Camera Raw", "Not carried over:"] {
+            assert_ne!(tr_zh(name), name, "{name} has no translation");
+        }
+    }
+
+    /// The raw development section has the button, shows the line under it,
+    /// and leaves the settings alone until something is pressed.
+    #[test]
+    fn the_raw_section_offers_the_read() {
+        fn collect(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => { out.push_str(text.galley.text()); out.push('\n'); }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut raw = vr180_pipeline::raw_tone::RawSettings { shadows: 30.0, ..Default::default() };
+        let before = raw;
+        let mut text = String::new();
+        let mut pressed = false;
+        for _ in 0..2 {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 2000.0))), ..Default::default() };
+            let out = ctx.run_ui(input, |ui| {
+                pressed |= draw_raw_develop_section(ui, &mut raw, vr180_pipeline::raw_color::RawCamera::X6, Some("Read from CAM0/000000364.dng"), true);
+            });
+            text.clear();
+            out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
+        }
+        assert!(text.contains("Read from Camera Raw") && text.contains("Reset raw development"), "{text}");
+        assert!(text.contains("Read from CAM0/000000364.dng"), "{text}");
+        // Drawing the section changes nothing: a white balance left as shot
+        // stays as shot (it used to become a custom one of the same kelvin).
+        assert!(!pressed, "nothing was pressed");
+        assert_eq!(raw, before);
+    }
+}
+
 /// Color panel ▸ Blackmagic RAW: the SDK's colour processing. Every control
 /// shows the EFFECTIVE value — the clip's own until the user moves it, then
 /// the override (marked with a dot); "Reset to clip" clears every override.

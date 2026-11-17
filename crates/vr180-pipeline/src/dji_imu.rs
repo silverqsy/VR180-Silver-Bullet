@@ -1126,6 +1126,10 @@ pub fn readout_ms_for(kind: crate::SourceKind, fps: f32, imu: Option<&vr180_fish
         // Blackmagic: the file's line time or nothing — never the Osmo
         // table (0 = per-row RS off, like the X6 before it was measured).
         crate::SourceKind::BlackmagicRaw => 0.0,
+        // A raw take's readout is its sensor record's, which arrives in
+        // `imu` (`x6_raw::capture_timing`); a take without the record gets
+        // no per-row correction.
+        crate::SourceKind::X6Raw => 0.0,
         _ => dji_osmo_readout_ms_for_fps(fps),
     }
 }

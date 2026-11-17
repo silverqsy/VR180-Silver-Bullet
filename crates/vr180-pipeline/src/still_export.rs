@@ -480,6 +480,7 @@ fn linear_dng_meta(still: &X6Still, l_max: f32, grade: Option<&GradeMeta>) -> Li
         exposure_compensation: e.exposure_compensation,
         shutter_speed_value: e.shutter_speed_value,
         image_description: Some("VR180 side-by-side (left | right), half-equirect per eye".into()),
+        xmp: None,
     }
 }
 

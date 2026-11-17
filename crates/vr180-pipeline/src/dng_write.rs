@@ -100,6 +100,9 @@ pub struct LinearDngMeta {
     pub exposure_compensation: Option<f64>,
     pub shutter_speed_value: Option<f64>,
     pub image_description: Option<String>,
+    /// An XMP packet (tag 700), e.g. a raw converter's own settings for the
+    /// picture (`crs:` properties), which it then opens the file with.
+    pub xmp: Option<String>,
 }
 
 /// `ProfileLookTable` payload — see [`LinearDngMeta::profile_look_table`].
@@ -174,6 +177,7 @@ mod tag {
     pub const PLANAR_CONFIGURATION: u16 = 284;
     pub const RESOLUTION_UNIT: u16 = 296;
     pub const SOFTWARE: u16 = 305;
+    pub const XMP: u16 = 700;
     pub const DATE_TIME: u16 = 306;
     pub const TILE_WIDTH: u16 = 322;
     pub const TILE_LENGTH: u16 = 323;
@@ -882,6 +886,9 @@ pub fn write_linear_dng_to<W: Write + Seek>(
     if let Some(d) = &meta.image_description {
         ifd0.set_ascii(tag::IMAGE_DESCRIPTION, d);
     }
+    if let Some(x) = &meta.xmp {
+        ifd0.set_byte(tag::XMP, x.as_bytes());
+    }
     ifd0.set_ascii(tag::MAKE, &meta.make);
     ifd0.set_ascii(tag::MODEL, &meta.model);
     ifd0.set_rational(tag::X_RESOLUTION, &[(72, 1)]);
@@ -1112,6 +1119,7 @@ mod tests {
             exposure_program: Some(2), metering_mode: Some(5), white_balance: Some(0),
             exposure_compensation: Some(0.0), shutter_speed_value: Some(12.31),
             image_description: Some("VR180 left eye".into()),
+            xmp: None,
         }
     }
 

@@ -95,10 +95,21 @@ struct ProjectionPipeline {
 
 impl ProjectionPipeline {
     fn create(device: &wgpu::Device, kernel: FisheyeKernel) -> Self {
-        let label = kernel.label();
+        Self::build(device, kernel, &kernel.label(), kernel.wgsl())
+    }
+
+    /// The lens-frame variant of a fisheye-output build
+    /// ([`super::lens_frame_wgsl`]): the same bindings, another ray
+    /// generator.
+    fn create_lens_frame(device: &wgpu::Device, kernel: FisheyeKernel) -> Self {
+        debug_assert!(kernel.fisheye_out, "only a fisheye-output build has a lens-frame variant");
+        Self::build(device, kernel, &format!("{}_lens_frame", kernel.label()), super::lens_frame_wgsl(&kernel.wgsl()))
+    }
+
+    fn build(device: &wgpu::Device, kernel: FisheyeKernel, label: &str, wgsl: String) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(&label),
-            source: wgpu::ShaderSource::Wgsl(kernel.wgsl().into()),
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
         });
         let uniform = |size: usize| wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
@@ -171,6 +182,9 @@ impl ProjectionPipeline {
 #[derive(Debug)]
 pub(super) struct ProjectionKernels {
     table: [Option<ProjectionPipeline>; 16],
+    /// The lens-frame variants of the fisheye-output builds, each compiled
+    /// the first time a lens frame is projected through it.
+    lens_frame: [std::sync::OnceLock<ProjectionPipeline>; 16],
 }
 
 impl ProjectionKernels {
@@ -179,11 +193,18 @@ impl ProjectionKernels {
         for kernel in FisheyeKernel::all() {
             table[kernel.index()] = Some(ProjectionPipeline::create(device, kernel));
         }
-        Self { table }
+        Self { table, lens_frame: Default::default() }
     }
 
-    fn get(&self, kernel: FisheyeKernel) -> Option<&ProjectionPipeline> {
-        self.table[kernel.index()].as_ref()
+    /// The pipeline of a build: the build itself or, for a fisheye-output
+    /// build asked for a lens frame, its lens-frame variant.
+    fn get(&self, device: &wgpu::Device, kernel: FisheyeKernel, lens_frame: bool) -> Option<&ProjectionPipeline> {
+        let build = self.table[kernel.index()].as_ref()?;
+        if lens_frame && kernel.fisheye_out {
+            Some(self.lens_frame[kernel.index()].get_or_init(|| ProjectionPipeline::create_lens_frame(device, kernel)))
+        } else {
+            Some(build)
+        }
     }
 }
 
@@ -240,7 +261,9 @@ pub struct EyeProjection<'a> {
     pub out_h: u32,
     /// Store 16 bits a channel (`Rgba16Unorm`) instead of 8.
     pub wide: bool,
-    /// Equidistant fisheye out instead of half-equirect / the reframed view.
+    /// Fisheye out instead of half-equirect / the reframed view: the
+    /// equidistant disc, or the lens frame the calibration describes
+    /// (`FisheyeCalib::out_lens`).
     pub fisheye_out: bool,
     pub rotation: EquirectRotation,
     pub calib: FisheyeCalib,
@@ -356,7 +379,9 @@ impl Device {
             fisheye_out: p.fisheye_out,
             wide: p.wide,
         };
-        let pl = self.projection.get(kernel)
+        // A fisheye output is the equidistant disc or, when the calibration
+        // asks for one (`FisheyeCalib::out_lens`), a lens frame.
+        let pl = self.projection.get(&self.device, kernel, p.calib.out_lens[1] > 0.0)
             .ok_or_else(|| Error::Wgpu(format!("no projection kernel for {kernel:?}")))?;
         let format = kernel.out_format();
         let out = match p.output {

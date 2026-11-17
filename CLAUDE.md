@@ -2005,7 +2005,12 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      per eye = 13120 × 6560 for both Crop modes (36.4 px/° vs 18.2 on the
      8K mode). Offered in the Resolution list only when the active clip's
      geometry is `cropped` (`ClipInfo::sharp_eye` / `BatchItem::sharp_eye`,
-     passed into `build_export_cfg`); any other clip in a batch takes 8K.
+     passed into `build_export_cfg`). A Crop clip's choice is its own field
+     (`ExportOptions::crop_resolution`, read through `resolution_for(cropped)`
+     everywhere): the Format window edits it while a Crop clip is open and
+     `resolution` otherwise, so one list exports each sort at the size picked
+     for it (it used to be one choice, and no value of it gave both their
+     best).
      Mac: VideoToolbox HEVC takes it on the zero-copy path (10 fps, level
      7.0; its ceiling is 16384 × 8192), hardware ProRes does not (software
      fallback, as for a 12K BRAW). **Windows: NVENC HEVC stops at 8192
@@ -2365,6 +2370,788 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      it as sRGB and it looks like the preview with the switch off; the
      conversion is 8-bit in, 8-bit out with egui's dither, like the image
      path it replaces.
+
+33. **Lens Space view and its lens-frame export (2026-11-14 for Crop
+    clips, 2026-11-15 for every source and as a view of its own; Mac;
+    UNRELEASED, Windows not built).** A clip can be written as a LENS FRAME
+    instead of a half-equirect: each eye through a lens, the frame the
+    recording's own, the lens stated in the file (APMP, projection `prim`
+    with a lens collection). A Crop clip then fills its frame instead of
+    sitting in a mostly black 180° canvas; a clip that holds the lens's
+    whole view keeps what lies past 180° (the fisheyes of the 360 cameras
+    see 200° and more). Output ▸ Format **Lens Space**, lens **Camera
+    lens**: see the next block. The half-equirect export is untouched.
+   - **Lens Space is a view (2026-11-15, the user's call: "这个 lens 的 APMP
+     导出似乎应该取代鱼眼导出", then "要么整个换个名字吧")**. The lens frame
+     began as a tick box in the Format window of the VR180 view, next to a
+     Fisheye view that wrote its own disc: two fisheye outputs in two
+     places, and a preview (VR180) that was not the export. Now the former
+     Fisheye view IS the lens output, under the name the immersive tools
+     use for footage kept in the camera's own geometry:
+     - `FisheyeOutputMode::Fisheye` shows as **Lens Space (fisheye SBS)**
+       (the variant keeps its name: saved settings hold it). Per clip, in
+       it, `Settings::lens_space: LensSpaceLens` picks the lens the picture
+       is written through: `Camera` (default; a lens frame) or
+       `Equidistant` (the old disc: 195° in a square, 185° for a `.360`,
+       what players and tools for fisheye video expect).
+       `Settings::lens_frame_view(kind)` = that view, that lens, a clip
+       with a lens (`decoder::lens_frame_possible`); everything asks it —
+       `build_export_cfg`, the file name (`_Lens`), the export bar, the
+       Format window (`App::lens_space_out`), the snapshot size
+       (`ExportOptions::lens_frame_out_dims`), the preview.
+       `ExportOptions::lens_frame` and its tick box are gone; the VR180
+       view always exports VR180. A clip without a lens record (a still, a
+       file that is already VR180) has no lens choice and gets the disc.
+       Settings saved in the Fisheye view before this read as the camera's
+       lens: such a template now exports lens frames (intended).
+     - **The preview draws the export's frame.** `decoder::
+       resolve_fisheye_view` (the three fisheye workers and the zoom /
+       snapshot still call it in place of `resolve_fisheye_calib_pair`)
+       builds the clip's lens frame with the export's own steps —
+       `fisheye_export::source_lens_frame` (`LensFrame::from_sources` at
+       the source's size, `with_stabilizer_margin` when stabilized,
+       refused where the export refuses) and `lens_frame_calib_pair` (the
+       mask from the frame's own edge, `with_frame_edge`,
+       `with_lens_frame`; `resolve_calib_pair` calls the same function) —
+       scaled to the working size (`LensFrame::scaled_to`, sides in pairs
+       of pixels) or `fitted` to the export's exact size for a snapshot
+       (`LensViewSize`). It returns the frame's size with the calibrations
+       (`FisheyeView::lens_dims`), which `view_out_dims` hands the
+       fisheye-output projection in place of the disc's square. A `.360`:
+       `resolve_eac_lens_pair(s, geoc, out_side)` attaches
+       `fisheye_export::eac_lens_frame` (a stabilized frame keeps the
+       square and holds the wider field). No projection function changed:
+       all of them already pick the lens-frame kernel by `out_lens`. So
+       the crop mask is what-you-see (the Format window's old note about
+       it is gone), the stabilizer's margin shows, and a Crop clip fills
+       the preview. A lens no frame can be made of previews as the disc;
+       the export says why.
+     - **The disc states its own lens.** A fisheye disc is no
+       half-equirect, yet with the Vision Pro metadata on it used to be
+       tagged as one (`ProjectionKind` half-equirectangular). Now
+       `export_fisheye` / `export_eac` call `resolve_disc_lens` for a
+       `Fisheye` export without a lens frame: both VR180 flags are cleared
+       (YouTube's metadata has no fisheye form: nothing is written for
+       it), and where the Apple one was asked for the file states the
+       disc's equidistant law in the profile's lens family
+       (`LensFrame::equidistant` over the square, `picture_deg` = the
+       disc's half field: stated to 98°, 93° for a `.360`; within 0.35 px
+       of the disc at 3840). The disc's pixels are what they were.
+     - Windows: `run_fisheye_zerocopy` got the same three substitutions as
+       the macOS zero-copy worker (`resolve_fisheye_view` twice,
+       `view_out_dims` once) and `run_eac_zerocopy` the third argument of
+       `resolve_eac_lens_pair`, by text, uncompiled. No gate added or
+       moved.
+     - **Verified, Lens Space (macOS 27.2)**. Exports: the 26 + 8
+       regression cases frame-identical; the 44 lens-frame / twin files of
+       the every-source run frame-identical to what `408f6e2` wrote.
+       Previews, through the refactor branch's headless probe (put into
+       this tree and into a checkout of `408f6e2` for the run, then taken
+       out again): 65 preview lines, 27 zoom stills and 21 `.360` lines
+       identical before and after with the equidistant lens, so nothing
+       outside the camera-lens view moved. The camera-lens view itself:
+       frames of an X6 8K clip, a 10K Crop clip (with a mask), an Osmo 360
+       and a `.360` looked at; the native zoom still
+       against the export of the same frame (X6 8K plain; stabilized, its
+       4224² export scaled to the still; 10K Crop masked + stabilized):
+       every textured cell of a 5 × 5 grid at the same (−0.5, −0.5) px,
+       which is what the VR180 still and its export differ by as well (the
+       still decodes in software; older than this) — no scale or position
+       error from the margin or the mask. Discs with the Apple flag (X6
+       zero-copy, Osmo ProRes, libx265 8-bit, `.360`): parametric
+       immersive to the system, its mesh within 0.0005 px of the written
+       lens, the frame's edge at 97.5° / 92.5°, the picture within 0.15 px
+       of the half-equirect twin in textured cells; a disc with the YouTube
+       flag or none carries no projection box; VR180 exports keep theirs.
+       Tests: pipeline lib 152, GUI 33 and its 3 GPU ones.
+       **Not seen: the GUI itself** (the running app holds the user's
+       clips; the Output panel's and the Format window's texts are tested
+       headless), a disc with its lens on a headset, Windows.
+   - **Every source (2026-11-15)**: the X6's full-view modes, DJI Osmo 360,
+     QooCam 3 Ultra, Blackmagic RAW, a generic side-by-side file whose
+     halves are fisheye images (dewarp on), and GoPro `.360`. Not a
+     side-by-side file that is already VR180 (no lens: the export refuses,
+     the GUI does not offer it), not a still. What it took:
+     - `LensFrame::from_sources` takes any lens. Sources of the file's own
+       family (unified camera model: the X6) go through the code they went
+       through before, to the last bit. Any other radial law (Kannala-Brandt,
+       with or without the kernels' rim extension, `source_radius`) is fitted
+       by `fit_law`: for each ξ a least-squares a·m + b·m³ + c·m⁵, the ξ
+       whose fit strays least at its worst sample (coarse scan 1.05 … 3.0,
+       golden-section refinement, rounded to four decimals so every machine
+       states the same lens). A ξ is out when its lens folds within 5° of
+       the fitted reach, or when its radius does not rise with m EVERYWHERE
+       (slope a + 3b·m² + 5c·m⁴ > 0 for all m): a frame has pixels past the
+       fold (its corners), the kernels solve the radius for m by Newton's
+       method, and only a radius that never turns back sends those pixels
+       past the fold (black) instead of to whatever the iteration lands on.
+       `LensFrame::reaches_its_corner` checks the same for the X6 fits (whose
+       k2 can be negative, turning back far outside any frame) and the
+       export refuses a frame that fails. Where no ξ qualifies over the whole
+       reach (a preset's rim extension ends level at the frame's rim) the
+       fit looks 2.5° less far, repeatedly.
+     - Measured lenses (per-eye frame, ξ, focal, k1, k2; worst deviation
+       from the source law): Osmo 360 3840² → 2.4309, 3566.92, 1.2118,
+       0.2848 (3 px over 105°: its lens is nothing like equidistant, the
+       density falls from 18 px/° at the centre to 11 at the rim, and it
+       comes out next to the X6's); X6 8K 3840² → 2.45543 (the file's),
+       3617.93, 1.1348, 0.4645, the same k for 7.4K and 10K; QooCam 3840² →
+       2.4502, 4089.27, 0.1637, 0.7619; Blackmagic (preset, near
+       equidistant) → 1.2366; the catch-all 180° preset → 3.0 (the range's
+       end; 11 px off inside 90°, the extension's bend).
+     - GoPro `.360` has no lens image: its frame is an equidistant fisheye
+       of 92.5° half field over the cross's side (`LensFrame::equidistant`,
+       `EAC_LENS_FRAME_HALF_FOV_DEG` = the disc kernel's own
+       `FISHEYE_HALF_FOV`; ξ 1.4506, within 0.3 px, fold at 134°), at the
+       cube map's own density when the frame is as large as the cross (3936
+       on a MAX). `export_eac` resolves it (`resolve_eac_lens_frame`),
+       `resolve_eac_lens_pair` hands it to the kernel through
+       `EacLensAdjust::{out_lens, out_rim}` (uniform 80 → 96 bytes; the two
+       existing kernels declare less and read none of it), and
+       `gpu::eac_lens_frame_wgsl` splices the variant of
+       `eac_to_fisheye.wgsl`: the shared `lens_frame_ray.wgsl` with `cal.`
+       → `lens.`, and a `cover` term that blackens rays past the strip of a
+       side face the cross carries (the disc kernel's "edge fill" repeats
+       the last column there). No arm of `export_eac` was edited: all three
+       project through `project_cross_texture_to_fisheye_texture[_16]`,
+       which pick the variant by `lens.out_lens`.
+     - **Black, not the repeated rim**: a full-view source repeats its rim
+       past the image circle in the half-equirect and the disc (the user's
+       choice there: it covers the gaps stabilization opens). A lens frame
+       shows the frame's border all the time, so there it is black:
+       `FisheyeCalib::with_frame_edge` (applied in `resolve_calib_pair`'s
+       lens arm) = `with_frame_crop` for a lens model without the rim
+       extension (θ clamp at the frame's far corner, capped 110°) and only
+       `frame_mask` for a calibration that has the extension (its clamp and
+       its law kept). The crop mask of that arm now applies to Crop sources
+       alone, as everywhere else — a full-view clip can carry mask values
+       it has no sliders for (one settings class with the Crop clips).
+     - `resolve_lens_frame` reads the eye's size per source kind
+       (`source_eye_dims`: the stream for dual-stream files, the split of a
+       side-by-side or stacked frame, the Blackmagic layout), and no longer
+       the first stream's.
+     - **The stated limit**: unstabilized, the picture ends where the
+       source's does, so the lens is stated to `LensFrame::picture_deg` =
+       the source's θ clamp + the view adjust's tilt of the forward axis +
+       2° (mounts), where that is short of the frame's corner: 113° for the
+       full-view sources (clamp 110°), 95° for a `.360`. Stabilized, to the
+       frame's corner or one degree short of the fold, as before (the
+       picture may be anywhere in the frame): 113° X6 / Osmo / QooCam, 133°
+       `.360`. Crop frames state what they stated before.
+     - GUI: `lens_frame_possible(kind, settings)`; the frame's size is the
+       clip's own resolution choice (`lens_frame_eye_dims(.., cropped)`: a
+       full-view clip no longer reads the Crop clips' choice), never an
+       enlargement (the 8K choice of a 3840² eye is 3840², of a 4864² one
+       4096²); `.360` takes its cross (`native_eye` in `build_export_cfg`).
+     - Verified (macOS 27.2): the 26 + 8 regression exports frame-identical;
+       every earlier lens-frame case states the lens and limit it stated; 27 lens files of all source kinds and
+       paths (zero-copy 10 / 8-bit, portable, libx265 10 / 8-bit, ProRes,
+       stabilized, reduced copies) read by the system as parametric
+       immersive, its mesh within 0.001 px of the written lens out to 95° …
+       133°; pictures against the half-equirect of the same frames at
+       400 Mbps: within 0.15 px for X6, Osmo, QooCam, Blackmagic and `.360`
+       (cells at the hemisphere's edge excepted: the reference ends there).
+       Tests: `lens_frame::tests` (15), `gpu::lens_frame_kernel_tests` (8),
+       `fisheye_export::lens_frame_tests` (3), GUI `export_size_tests`.
+       **Nothing wider than 180° has been seen on a headset.**
+   - **Pipeline**: `FisheyeExportConfig::lens_frame: LensFrameOut` on the
+     `Fisheye` projection. `export_fisheye` (the one entry of every fisheye
+     path, all platforms) calls `resolve_lens_frame`: lenses only (no gyro)
+     → `resolve_calib_pair` → `lens_frame::LensFrame::from_sources` → stored
+     as `LensFrameOut::Resolved`, which `resolve_calib_pair` turns into
+     `FisheyeCalib::with_lens_frame`; after the path returns it injects
+     `spherical_inject::inject_apmp_lens`. No path function was edited, the
+     Windows-only ones included.
+   - **The lens** (`lens_frame.rs`): Mei-Rives, centred, ONE for both eyes —
+     ξ from the source, focal / k1 / k2 a least-squares refit of the source
+     lenses' mean radial law out to the frame's corner (two terms for the
+     factory's four: within 1 px to the frame's edges, 3 px in the far
+     corners). Frame = the source eye's own size (the fisheye view's square
+     rule is skipped), or a reduced copy with the longer side 4096 for the
+     8K choice. (Sources of other lens families: "Every source" above.)
+   - **Kernels**: the five `fisheye_*_to_fisheye*.wgsl` files are NOT
+     edited. `gpu::lens_frame_wgsl` splices `shaders/lens_frame_ray.wgsl`
+     into each (anchors asserted) to make a variant, compiled on first use
+     (`LensFramePipelines`, `Device::fisheye_out_*` accessors chosen by
+     `FisheyeCalib::out_lens`). A branch inside the kernels was tried first:
+     it changed the disc's output at rounding level (the compiler optimises
+     the changed source differently) and failed the regression set. The
+     uniform grew to 13 vec4 (208 B): `out_lens` + `out_rim` in a spare slot;
+     the half-equirect kernels do not declare the new row.
+   - **Edge policy**: in a lens frame a ray that leaves the SOURCE frame is
+     black: the kernels' own `frame_cover`, as in the half-equirect (soft
+     over one output pixel). It repeated the edge at first, as the reframed
+     view does; on the headset the smeared band was an eyesore, so the
+     variant no longer splices `frame_cover`. The view mask applies;
+     `out_rim` (8 px at 4912) keeps the frame's own border black for players
+     that clamp.
+   - **Room for the stabilizer**: the recorded frame has no spare canvas, so
+     a STABILIZED lens frame is larger than the recording by
+     `lens_frame::STABILIZER_MARGIN` (5 % of the shorter side) at each
+     border: `resolve_lens_frame` → `LensFrame::grown` (same lens, wider
+     field), and `cfg.eye_w / eye_h` follow, so no path function knows about
+     it. One figure for every clip, so the clips of a recording mode come
+     out the same size (7.4K Crop 8160 × 4080, 10K Crop 10800 × 5400) and
+     the GUI shows it ahead of the export (`lens_frame::stabilized_dims`).
+     A shift beyond the margin is cut at the frame's edge. A reduced copy
+     (the 8K choice) keeps its size: `fitted` scales the grown frame back
+     into it. Stabilization off → the frame is the recorded one, byte for
+     byte as before. A frame sized to each clip's own largest shift (built
+     first, with a 5 % cap) gave every clip another size, which the user
+     did not want. Measured on hand-held walks with soft stabilization
+     (1.2 s, cap 15°): the picture leaves the recorded frame by 4 px at the
+     median and 164 px (3.9°) at worst of 4912 on a 10K Crop clip; 46 px and
+     343 px (8°) of 3712 on a 7.4K Crop 60 fps clip, whose frame is narrower
+     (97° across) — with its 184 px margin that one is still cut at a side
+     in 6 % of its frames (159 px at most).
+   - **Crop mask**: on a lens frame the window is sized from the frame's
+     OWN coverage (`LensFrame::half_angles`, applied in `resolve_calib_pair`
+     over the one `apply_frame_crop` set from the recorded picture), so on a
+     stabilized frame it can be as wide as the larger frame; the picture's
+     moving border then shows inside it (the user's call). Without
+     stabilization the two measures agree to 0.1°. The preview draws the
+     same frame through the same function, so the mask shows where the
+     export has it.
+   - **File conventions, measured against the system's player mesh** (not
+     what the model's textbook form suggests): the projection offset is
+     stored NEGATED; the principal point counts from the view's edges; the
+     player builds one mesh from the FIRST lens of the collection. Byte-exact
+     tests against AVFoundation's writer.
+   - **Verified** (macOS 27.2): 26 fisheye-export regression cases
+     frame-identical; lens frames through zero-copy 10 / 8-bit, the portable
+     loop, libx265 10 / 8-bit, ProRes, noise reduction, stabilization on and
+     off — each read by the system as parametric immersive, its mesh within
+     0.001 px of the written lens, its picture within 0.2 px of the same
+     frames' half-equirect re-projected by an independent script. GPU tests in
+     `gpu::lens_frame_kernel_tests`. Test clips of this form were viewed on
+     a headset (visionOS 27): immersive, placement and scale as the
+     half-equirect.
+   - **Windows: untested.** Shared code only (no new gates; two
+     `cfg_attr(not(macos), allow(dead_code))` on accessors of the macOS-only
+     P010 kernels). To check there: the spliced WGSL compiles on D3D12 /
+     Vulkan, a lens-frame export through NVENC (9824 wide falls to libx265
+     as the 13120 canvas does) and through the GPU-resident path.
+   - Not done: no MV-HEVC lens frame, no crop mask on a full-view clip, no
+     automatic mask sized to the stabilizer's corrections; the sharpen
+     stage still fades towards the top and bottom rows of a lens frame
+     (`SharpenParams::apply_lat_weight` is on for every plan, a
+     half-equirect's weight; the user has been told, their call).
+
+34. **Insta360 X6 raw video (2026-11-16, Mac; UNRELEASED).** A raw take —
+   a folder with `capture.x6b` (both lenses' 14-bit Bayer frames in pairs),
+   the gyro file, the factory lens string and the sound — opens as one clip
+   (`SourceKind::X6Raw`; import takes the folder, the capture file or a
+   folder of takes).
+   - **Reading**: `vr180-fisheye::x6b` (take description, pair scan, tile
+     decoder, checked against reference pixels of three sample takes);
+     `vr180-pipeline::x6_raw` (one index per take, cached on disk under the
+     settings folder; frame timeline from the exposure stamps; lens and gyro
+     poses; `X6RawIter` hands out pairs demosaiced on the GPU as
+     camera-linear `Rgba16Unorm` eyes, at half size for the preview). Raw
+     clips take the 16-bit stacks only; video export is forced to 10-bit.
+   - **Motion and timing** (2026-11-16, on the first takes that carry a
+     sensor record; `x6b::read_sensor_readout`, `read_accel`,
+     `x6_raw::capture_timing`, `build_imu`). `clip.json.sensor_metadata`
+     → `sensor-metadata.json`: per eye `line_period_ns` (3791.67 at 30 and
+     60p, 4000 at 50p) and `rolling_shutter_first_to_last_row_ns`
+     (14.556 / 15.356 / 14.556 ms: the camera's own video files state the
+     same numbers); `accel.csv` + `accel-info.json` beside `gyro.csv`
+     (m/s², gravity in it, the gyro's stamps; `status` other than `ok` =
+     none, one of the seven takes has it so). RULE (rule 7: from the
+     file, nothing tuned): a frame's stamp is the start of its first
+     row's exposure, so the pose is sampled at the centre row's start,
+     `stamp + readout / 2`, and the rows span the readout around it, top
+     row first (`readout_ms` reaches the shared per-row path through the
+     pose structure; `readout_ms_for` honours it). With an accelerometer
+     the poses are built as the camera's own video files' are (bias from a
+     6-axis pass, the integration, the 100 s trim); without one, as
+     before. A take without the record: pose at the stamp, no per-row
+     correction, as before.
+     MEASURED (`~/vr180-internal/x6raw-imu/raw_gyro_flow.py`: features
+     tracked in the binned mosaic against the gyro through the factory
+     lens model, per-row times; six hand-held takes): the gyro's axes are
+     the camera's own files' (the best of the 24 signed permutations, and
+     a free rotation moves it 1–2°); the accelerometer shares them (its
+     direction holds to 1–2° in the gyro-integrated frame through a
+     minute, and reads −1 g on x at rest as the camera's files' does);
+     readout 14.26–14.54 ms fitted for the record's 14.556 and 15.38 for
+     15.356, top row first; centre-row content 9.9–11.4 ms after the
+     stamp = half the readout + 2.7–3.6 ms. THAT REST IS NOT IN THE TAKE:
+     half the shutter time plus the gyro's own lag (the same hardware's
+     video files state 1.1 ms for the latter, which would make the
+     shutter about 1/200 s). It is not added (no tuned phase numbers).
+     What it costs, far-field shake of a locked export at 1024 px an eye,
+     the hardest take: unstabilized 2.60 px a frame; pose at the stamp
+     (before) 1.52; this rule 0.42; with 3 ms more 0.06. Per-row
+     correction, same take with those 3 ms: top of the frame 0.54 → 0.13,
+     middle 0.15 → 0.06, reversed 1.14. ASKED OF THE CAMERA SIDE: the
+     shutter time of every frame (and the gyro's lag if known).
+     ANSWERED the same evening (their note beside the takes): a later
+     camera build writes `exposure.csv` beside the capture, header
+     `request,cam0_exposure_ns,cam1_exposure_ns`, the integration time of
+     each eye in ns, rows only for pairs that were written, an eye's
+     value left empty when the sensor did not report it (`seal.json`
+     counts such pairs in `exposure_missing_pairs`); row `r`'s
+     mid-exposure = that eye's stamp + `r × line_period_ns` + half its
+     integration time; zero, empty or no file = unknown, the old rule.
+     Checked on their side against the sensor's own reported exposure
+     (58 eye frames, then 140 on a 50p take where it ran 8.66–12.60 ms).
+     IN THE APP: `x6b::read_exposures`, `build_imu` adds half the frame's
+     own time to `stamp + readout / 2` (channel 0's value, the other
+     eye's when that one is empty; nothing for a frame without one); the
+     log says the range in use or that there is no record. RUN ON A REAL
+     TAKE the same night (`1116 Raw Video/RAWVIDEO-20261116-205643`, 60p,
+     3050 pairs; `clip.json` names the list in `exposure_file`, which
+     `Take::exposure_file` honours; `seal.json` has `exposure_status` and
+     `exposure_missing_pairs`; sound is `audio.wav`, two channels): the
+     list has exactly the capture's requests, no empty value, the two
+     eyes equal, 6.617–16.430 ms in 27 distinct values. WHAT THE STAMP IS,
+     FROM THE NUMBERS ALONE: `stamp + integration time` ticks at the frame
+     period to 0.0000 ms rms through all 32 changes of shutter (request
+     809 → 810: 16.430 → 7.906 ms, the stamps 25.207 ms apart, the sums
+     16.6833), so the stamp is the first row's exposure START and the
+     list's values belong to their requests. THE FRAMES' TIMES
+     (`TakeIndex::new`, `shutter_ns`, `shutter_s`): where every pair has a
+     listed time, a pair's time is the stamp plus it (the first row's
+     readout, even to 8 µs over that take); on the stamps alone that take
+     read as "1 dropped in 1 hole" at request 810 and its frames wandered
+     up to 9.8 ms off an even clock. Takes without a complete list keep
+     the stamps. The user asked for no picture-based check on that take
+     (long shutters, much motion blur), so nothing was measured from its
+     pictures. STILL OPEN: the gyro's own lag
+     (their words: the sensor service's stamps, filter delay unmeasured;
+     the 1.1 ms of the camera's own files and this unit's fitted axes
+     are not to be taken as constants for every unit) — with a take that
+     has `exposure.csv` it can be measured as the fitted offset minus
+     half the shutter (`raw_gyro_flow.py`). For the takes already shot
+     they agree no shutter time can be recovered and no uniform 3 ms
+     should be filled in.
+     Diagnostics: `VR180_IMU_PHASE_OFFSET_MS`, `VR180_RS_SCALE`,
+     `VR180_INSV_BASIS`, `VR180_LOCK_REF_FRAME`.
+   - **Demosaic** (2026-11-16; `bayer.rs` = the specification and the CPU
+     twin, `Device::demosaic_bayer` = three passes: `bayer_measure` →
+     `Rg32Float`, `bayer_green` → `R32Float`, `bayer_demosaic` → the eye;
+     the two work planes are kept in `RawPipelines::demosaic_work`). It
+     replaced Malvar-He-Cutler (zipper along every edge, colour in it) and,
+     for the preview, a 2×2 binning (colour fringes: red and blue were
+     taken a site apart). It is shaped after Camera Raw's own demosaic,
+     found by measuring it: the same mosaic developed there from a CFA DNG
+     and from the linear DNGs of our candidates, Camera Raw's result taken
+     back to camera values through the development's Jacobian (three more
+     renders with one channel raised 2 %, one Newton step and a check
+     render; scripts `~/vr180-internal/x6raw-acr/dem*.py`, `dem4.py` does
+     the inversion, `dem7.py` is the final numpy twin). What fits: (1) the
+     interpolation is done on the mosaic WHITE-BALANCED by the camera's
+     neutral (`BayerLayout::neutral`; without it red and blue are two to
+     four times further off); (2) green at a red / blue site = the row's
+     estimate and the column's, each the two neighbours' mean + 1/8 of the
+     site's own second difference (the fit is sharp at 1/8: 1/16 and 3/16
+     are 40 to 90 % worse), mixed by `B² / (A² + B²)` with A, B = the sum
+     over 5×5 of |neighbour − neighbour| + ½ |second difference| along the
+     row / the column (window and power scanned; a decision made on the
+     colour difference after interpolating fits worse); (3) red and blue =
+     green + their difference from green carried bilinearly (kernels
+     fitted freely to Camera Raw's result come out bilinear). Against
+     Camera Raw in camera values ×1000 (level ≈ 30 / 45 / 15), three takes
+     and both eyes: 0.24–0.40 / 0.19–0.26 / 0.11–0.36 against Malvar's
+     0.55–0.78 / 0.33–0.53 / 0.69–0.98; developed, mean |difference| of
+     255: 0.25 / 0.11 / 0.38 against 0.93 / 0.33 / 2.67; at clipped
+     highlights (a frame raised three stops) 0.2–0.4. Cost: 3.1 ms an eye
+     at full size, 2.5 ms at half (the half-size eye is the mean of each
+     2×2 of the full result), M5 Max. Camera Raw's flat-ground response
+     to single samples (`dem3.py`) says the same: green = four neighbours'
+     mean + a second-difference term of 0.115–0.12 in balanced units.
+     Stills (`raw_develop::mhc`) still use the old kernels. WINDOWS:
+     `Rg32Float` and `R32Float` as storage textures, read back with
+     `textureLoad`.
+   - **Colour noise reduction** (2026-11-16; `RawSettings::color_noise`,
+     0–100, default 25 = Camera Raw's; `raw_chroma.rs` = the specification
+     and the CPU twin; `Device::record_raw_chroma`, first in
+     `record_color_stack_16`, AHEAD of the development, on the camera's
+     values: `raw_chroma_reduce` / `_smooth` (rows, columns) / `_apply`,
+     two half-size `Rgba16Float` planes). Camera Raw opened with its
+     defaults runs it, which is why a DNG there shows no colour in fine
+     lines where its own demosaic — and ours — still has a little.
+     Measured (`cnr1.py` … `cnr3.py`, `cnr_app.py`): it leaves luminance
+     alone (L* amplitude 1.00–1.02 at every frequency) and takes the
+     colour's fine part down (a* / b* to 0.2 / 0.33 at 0.25 cycles a
+     pixel, 0.51 / 0.71 at 0.09, on a frame at 25); it is a threshold, not
+     a blur (a 4 % grating in one channel goes grey at every period up to
+     100 px, a 32 % one keeps 80–90 %; the share left by level × period ×
+     amplitude × amount is in `data/cnr2.npz`); the luminance it keeps is
+     0.195 / 0.667 / 0.138 of the white-balanced camera R / G / B (not the
+     camera's CIE Y). The stage: balanced values at half size → a
+     separable bilateral there (spatial sigma / 2, colour distance `tau`,
+     the rows' result put back at the pixel's own luminance) → bilinear
+     back, each pixel taking the smoothed colour at its OWN luminance.
+     Amount → (sigma px of the export, tau): 10 → (4, 0.1), 25 → (6, 0.2),
+     50 → (12, 0.3), 100 → (16, 0.5), fitted to Camera Raw's result taken
+     back to camera values (`cnr3.py targets`) on take 011809 and checked
+     on 021546. Against it in balanced camera values ×1000 at 25: 0.90 /
+     0.33 / 0.76 with the stage, 1.77 / 0.49 / 1.51 without, floor (the
+     demosaics alone) 0.75 / 0.24 / 0.45. End to end on the app's projected
+     frame (`cnr_app.py`, the change each makes): strength 0.91–0.95 of
+     Camera Raw's at 10–25, 0.89 at 50, 0.80–0.86 at 100; correlation
+     0.88–0.95; error 32–51 % of the change (both leave a different faint
+     residue). Cost +10 ms a frame at 8192×4096 (+15 at amount 100). The
+     harness leaves it off unless `X6_RAW_CNR=<amount>` (the reference
+     renders of the other scripts have none). NOT done: Camera Raw's reach
+     at high amounts (multi-scale), its Detail / Smoothness sub-sliders
+     (written as 50 / 50 in the XMP), luminance noise reduction.
+   - **Development** is the first stage of `record_color_stack_16`
+     (`ColorStackPlan::raw_develop`). `raw_tone.rs`'s header is the
+     specification; `RawDevelop::constants_for(stats, curves)` is the one
+     entry. It reproduces Adobe Camera Raw (process version 15.4), measured
+     on Camera Raw 18.7 by developing charts and frames there:
+     exposure → default black (keyed to the frame's darkest cell) →
+     Shadows / Highlights (`gain = curve(base)`; base = a bilateral grid of
+     log₂ luminance, `raw_local.rs` + `raw_reduce` / `raw_grid_build` /
+     `raw_grid_blur.wgsl`; the frame's curves from networks fitted to
+     Camera Raw's own on 1400 distributions; `LocalCurves` holds how the two
+     sliders act on each other; gains above zero are limited toward the
+     white point, `limit_gain`) → white point of the frame WITH the gain in
+     (`gained_white`) → Whites → Blacks (`raw_global.rs`: tables; each a
+     gain keyed to the pixel's luminance or a curve per extreme channel, by
+     sign — `StageMap`) → the tone curve with Contrast in (a family of
+     maps + networks; Whites above zero is `a1·v + a2·v²` from networks).
+     Plain settings run `raw_develop.wgsl` (one curve); anything between
+     black and tone curve runs `raw_develop_local.wgsl` (the staged one).
+   - **Per frame**: `Device::raw_frame_stats` measures the frame as it is
+     graded (`raw_measure.wgsl`: 126 cells along the long side) —
+     `FrameStats { keys, levels, peaks }`. `Measure::Wait` for exports and
+     stills, `Measure::Latest` for the preview (uses the last measurement
+     that came back and asks for a redraw when it changes).
+   - **One look in every view** (2026-11-16): the measurement belongs to
+     the picture it is made on, so a reframed view (a part of the scene) or
+     a lens frame (a black border) came out in other colours than the
+     half-equirect — 8–13 of 255 with Shadows / Highlights at their ends.
+     Every view that is not the half-equirect is now developed from a
+     REFERENCE FRAME: the same frame's eyes drawn as half-equirects of
+     `RAW_REFERENCE_SIDE` (1008 px) with the view's own rotations and
+     per-row matrices (`raw_gpu::RawReference`, `Device::raw_reference`,
+     `ColorStackPlan::raw_reference`); the keys and curves are read off it,
+     and the local stage's cell is sized from `RawReference::long_side` =
+     eyes × π × `FisheyeCalib::center_px_per_rad` of the view, so its
+     neighbourhoods cover the same angle as in the half-equirect. Callers:
+     `fisheye_export::plan_with_raw_reference` (the export loop's two
+     10-bit arms, `raw_export`'s developed frame), `decoder.rs`
+     `raw_view_reference` (live preview, still). Both resolvers are split
+     for it: source calibrations (`resolve_source_calib_pair`,
+     `resolve_fisheye_source_calib_pair`) and the view put on them
+     (`view_calib_pair`, `fisheye_view_calib_pair`). Views against the
+     half-equirect at the same scene points (`~/vr180-internal/x6raw-acr/
+     viewcmp.py`, three frames, Shadows +100 / Highlights −100): disc 0.2–0.3
+     of 255, lens frame 0.3, reframe 90° 0.5–0.8, 40° 0.8–1.3 — the
+     resampling floor of that comparison is 0.2 / 0.2 / 0.3–0.4 / 0.6–1.0,
+     mean bias under 0.25. What is left: the base grid is still built on
+     the view's own picture, so at a strong zoom (20°) with both sliders at
+     their ends regions differ by about half a step (a few at most); the
+     cure would be a grid built on the reference and looked up through the
+     view's ray. The half-equirect itself is unchanged (its eyes are the
+     reference), and so is its match with Camera Raw; a DNG of another view
+     is developed by Camera Raw from that picture alone.
+   - **Sharpening** (2026-11-16): `RawSettings::sharpen` (`raw_sharpen.rs`:
+     Amount 0–150, Radius 0.5–3, Detail 0–100, Masking 0–100; off at
+     Amount 0) — Camera Raw's detail panel, measured there with charts
+     and frames (scripts `~/vr180-internal/x6raw-acr/sharp*.py`, data
+     `data/sharp_*.npz`). What was found, and what the stage does:
+     it works on the DEVELOPED picture (its fades follow the output level
+     whatever the tone settings), on `φ = Y^(1/1.8)` of the Rec.709
+     luminance, and scales a pixel's linear RGB by one gain. On a HARD
+     edge the change is a fixed kernel per (Amount, Radius, Detail), read
+     off the response to a small step for 14 × 9 × 11 settings and held as
+     five blurs (`data/raw_sharpen.f32`: `Δ = Σ cⱼ (φ − Gⱼ ∗ φ)`, σ = 0.5,
+     0.8, 1.3, 2.1, 3.4; taps within 0.0015). **Low Detail = halo
+     suppression** (found 2026-11-16 on edges of five softnesses over
+     882 settings, `sharp8.py`, `halo_b.py`): the sharpening is the step
+     kernel over a factor `h`, and of its change the part that keeps the
+     pixel within the range of the original around it (3×3) is kept, the
+     part beyond — the halo — is scaled by `h` (`raw_sharpen::halo_change`,
+     `halo_factor`; the table holds `h` beside the coefficients). A hard
+     step is all halo, so it gets the step kernel exactly; a soft edge
+     gets up to `1 / h` of it. `h` = 0.34 at Detail 0 for every Amount and
+     Radius, 0.5–0.75 at Detail 5–10, 1 from Detail 20–55 (later at large
+     radii), and it falls again above Amount 85 at Detail 5–25; below
+     Amount 10 the chart does not resolve it and Amount 10's is used. The
+     range is taken over one pixel of the EXPORTED frame
+     (`SharpenConstants::window` = the pixel scale rounded, 1 to 3). Then a
+     soft limit, a fade by the pixel's own level (none below φ 0.028, all
+     from 0.204 to 0.851, none above 0.969), limits on how far a pixel of
+     each level may be darkened or lightened (44 measured levels), and
+     Masking = one curve of (edge strength / threshold): the gradient's
+     size spread by a blur of 1.2 + 0.5·Radius px, the threshold a table
+     over Masking. GPU: `Device::record_raw_sharpen` right after the
+     development in `record_color_stack_16` (`raw_sharpen_level` / `_blur`
+     / `_apply.wgsl`, four `R32Float` planes, 12 to 15 passes an eye; the
+     apply pass reads the level plane's 3×3 for the range); CPU twin
+     `raw_sharpen::sharpen_picture`. The radius is in pixels of the
+     EXPORTED frame: `ColorStackPlan::raw_pixel_scale` (the GUI sets it
+     from `Settings::export_eye_w`, which `maybe_push_settings` keeps at
+     `export_eye_dims().0`) scales the blurs in a preview. The settings
+     go into the DNG's XMP. Against Camera Raw on three frames (the change
+     each makes; `sharp_app.py`): Detail 25 error 18–34 % of the change,
+     correlation 0.96–0.985; Detail 100 12–15 %, 0.99; Masking 40 / 80
+     23–40 %; Detail 0: Amount 40 29–36 %, Amount 100 19–24 %, Amount 150
+     16–20 % (before the halo rule 41–63 %, the app changing half as
+     much); Detail 5–20 at Amount 40 21–33 %; Radius 3 at Detail 0 44–52 %.
+     NOT reproduced: with any Amount above zero Camera Raw first smooths
+     the finest texture (edge-preserving, scale-free: it leaves a step
+     alone, takes a 1 px line down by 7 to 28 % without spreading it, acts
+     mostly on local extremes; the same for every Radius up to 1.4, growing
+     above; gone at Detail 100). Its size on the sample frames is 0.24/255
+     rms at Detail 0 (0.66 at Radius 3), 0.16 at Detail 25, against 1.2 of
+     the Amount 40 sharpening at Detail 0; running the model on Camera
+     Raw's own Amount 1 picture brings Detail 0 to 18–25 % and Detail 25
+     to 15–18 %, so it is most of what is left. At Amount 100+ the
+     limiting at big edges is 20–40 % off. Cost: +14 ms a frame at
+     4096×2048, +24 ms at 7680×3840 (Apple silicon).
+   - **DNG**: `raw_export.rs` — a frame as a linear DNG with the settings
+     as `crs:` XMP (written beside every Snapshot of a raw clip), and the
+     export option "DNG sequence" (`ExportOptions::raw_dng_sequence`,
+     folder `<stem>_DNG`). A Lens Space frame through the camera's lens is
+     the lens frame the video export writes (`FrameSource::open` resolves
+     it with `resolve_lens_frame`; before 2026-11-16 these frames held the
+     equidistant disc).
+   - **Sensor frames** (`sensor_dng.rs`, export option "DNG sequence" →
+     "Camera original", `ExportOptions::raw_dng_original`, folder
+     `<stem>_OriginalDNG`): the take's frames as recorded, one CFA DNG per
+     channel per pair, `CAM0/<request:09>.dng` + `CAM1/…`, no GPU and
+     nothing of the app's rendering. File = one little-endian IFD, 14-bit,
+     `PhotometricInterpretation` 32803, CFA `[1, 2, 0, 1]`, black 64,
+     white 15408 (codes above it kept), 3840×160 tiles of lossless JPEG
+     (`ljpeg::encode_tile_cfa_into`: two components, half the width, so a
+     sample is predicted from its own colour), `ColorMatrix1` /
+     `AsShotNeutral` of `RawCamera::X6`, `UniqueCameraModel` "Insta360 X6
+     Raw Video" (a name no converter has a profile for, so the file's own
+     matrix is used: the condition the raw development was matched under),
+     `ImageDescription` "CAM<n> request=<r> exposure_start_ns=<t>"
+     (`FrameTag`). Beside the frames: `frames.jsonl` (one line a pair:
+     request, both exposure starts, the record's signature, the files and
+     their sizes) and the take's small files copied (everything but the
+     capture and `seal.json`). One thread reads the capture front to back,
+     up to 12 workers unpack / pack / write, a file appears under its name
+     only when whole (`.part` + rename); a cancelled run keeps and lists
+     what it finished. Measured (M5 Max): 57 pairs a second from a cached
+     source (CPU-bound, 0.18 core-seconds a pair), 13 from the NAS (its
+     read speed); 12.0 MB per eye frame at 30 fps, 10 at 50, 8.7 at 60;
+     1.2–1.5 GB of memory. Checked: samples identical to the capture's
+     (test `a_stretch_of_a_sample_take`), `exiftool -validate` OK, opens
+     in ImageIO and in Camera Raw 18.7. A folder written this way is not
+     yet something the app opens: `x6b::read_take` names it
+     (`TakeProblem::FramesOnly`).
+     WHAT THE UI SAYS OF IT (2026-11-16, after the user asked whether a
+     Camera original export "still used NR" and a "native" resolution):
+     the export itself never did (`spawn_export_job` routes it to
+     `export_sensor_dng_sequence`: 1884 pairs in 57 s on the user's run),
+     but the export bar's "NR" followed the clip's Noise Reduction
+     slider and Export format still listed a Resolution. Now
+     `export_runs_noise_filter` says when an export runs the filter (a
+     video file; never a folder of DNG frames or a still), and Export
+     format shows "3840 × 3840 per eye" in place of the list for Camera
+     original.
+   - **Enhanced frames** (2026-11-16; `enhanced_dng.rs`, `jxl_macos.rs`,
+     `X6RawIter::with_enhanced_frames`, `FisheyeExportConfig::
+     raw_enhanced_dir`, GUI `ExportOptions::raw_use_enhanced` → the
+     `<stem>_OriginalDNG` folder beside the take when it has a `CAM0`).
+     Camera Raw 18.7 applies Super Resolution IN PLACE (no second file):
+     the DNG keeps IFD0 and its mosaic and gains three tags — `0xCD3C`
+     (16-byte digest), `0xCD3D` (offset), `0xCD3E` (length) — for a block
+     appended to it: a 60-byte header (5, 2, the digest, width, height,
+     planes 3, sample type 3, a length, 2, 1, 0, 0), then a TIFF of its own
+     (one IFD, 7680×7680, 3 × 16 bit, `Compression` 52546 = JPEG XL, 90
+     tiles of 768×864, each a bare codestream tagged BT.2020 / sRGB gamma;
+     32 MB for a frame: lossy). The codes are per-channel companded; the
+     XMP says how (`crs:FilterList` → the `Enhance` filter → `Images` →
+     `ColorVariations`: three `crs:MapPolynomial` of four fractions and
+     three `crs:Black="black,white"`): camera value = `c0 + c1·x + c2·x² +
+     c3·x³`, `x = (code − black) / (white − black)`, white level = 1 (in
+     the sample `c1·(x + 15x³)`, each channel scaled to its own maximum).
+     Checked against Camera Raw's own demosaic of that frame taken back
+     to camera values: 8×8 block means within 0.03 / 0.09 / 0.28 %. Other
+     settings in that XMP (the user's Shadows, sharpening …) are NOT in
+     the picture: it is pre-development. `find` parses, `decode_rgba16`
+     decodes (tile rows on threads) through ImageIO (`jxl_macos`: the
+     provider's bytes of the decoded `CGImage`, no colour conversion;
+     within 6 codes of `sips`). The iterator: eyes become the picture's
+     size, both channels decode side by side, a channel with no enhanced
+     picture is the capture's frame demosaiced on the CPU and enlarged
+     bilinearly (`enlarged`), pairs go to the GPU as `new_camera_eye_
+     texture` uploads so everything downstream (the reference frame, the
+     16-bit stack) sees an ordinary GPU pair; the lens scales itself (the
+     export scales the take's lens by eye size / lens canvas). Measured:
+     0.41 s a pair with both eyes enhanced at 8192×4096 output (capture:
+     0.07 s), 4 GB peak; render from the enhanced eye aligned to the
+     capture's (shift 0, 0), mean |difference| 0.5/255 (it is sharper).
+     WHICH FRAMES: the folder is listed once per export
+     (`enhanced_listing`: each channel's requests and file sizes; only
+     files named as `sensor_dng::frame_file` names them), and the export
+     says which stretch of the take it covers (`x6_raw::EnhancedSource {
+     dir, t_in, t_out }` from `FisheyeExportConfig::raw_enhanced()`; a
+     single-frame export passes that frame's time and a frame later).
+     Among the stretch's files the LARGEST are opened first
+     (`enhanced_candidates`: a file keeps its mosaic and gains the
+     picture, so an enhanced one is larger than a plain one wherever it
+     sits; 8 of them, then the stretch's first / middle / last). No
+     enhanced picture in the stretch → the iterator stays the plain one
+     (0.07 s a pair): a folder that holds a few test frames costs an
+     export nothing. (The first form probed the take's frames in order
+     and gave up after 600 files: frames enhanced past the first 300
+     pairs were not found.) Per frame the listing says whether a file is
+     there (no stat on the share). A frame of an enhanced stretch without
+     a picture: `bayer::demosaic` + `enlarged`, both on every core
+     (`bayer::fill_rows`): 0.38 s a pair (single-threaded it was 1.4 s).
+     The export bar's note says "frames from the enhanced DNGs, 7680 ×
+     7680 per eye". Output sizes from enhanced frames, measured
+     (hardware H.265 Main 10, M5 Max, ten pairs with the start-up):
+     8192×4096 0.45 s a pair, 4.2 GB peak; 13120×6560 0.60 s, 5.7 GB;
+     15360×7680 0.66 s, 6.6 GB; 16384×8192 0.69 s, 7.2 GB: all four
+     encode and decode.
+     SIZES FOR ENHANCED FRAMES (the user: both of 13120×6560 and
+     16384×8192): `ExportResolution::{R13k, R16k}` (6560² / 8192² an
+     eye), picked from a list of their own (`SizeList::Enhanced`,
+     `ExportOptions::enhanced_resolution`, beside `Plain` and `Crop`:
+     a size picked on one sort of clip never changes another's). An
+     export carries BOTH sizes: `eye_w × eye_h` = the one picked without
+     enhanced frames, `FisheyeExportConfig::raw_enhanced_eye` = the one
+     picked for them (canvas views only: not a lens frame, not a
+     reframed view), and the PIPELINE decides before anything is sized
+     (`settle_raw_enhanced(t_in, t_out)`, first thing in
+     `export_fisheye` and in `raw_export::FrameSource::open`; it goes by
+     `x6_raw::enhanced_side`, the iterator's own search): enhanced
+     frames in the stretch → the larger size; none → the folder is
+     dropped, the plain size stays, and the export bar says so when a
+     larger one was asked for. So a batch item, a different trim or a
+     folder that changed since the list was shown cannot write an
+     upscaled capture. The GUI lists the two sizes only when a lookup
+     found enhanced frames for the loaded take's trim
+     (`App::enhanced_frames`: `enhanced_side` on a thread, asked again
+     when the take or trim changes and every 4 s while Export format is
+     open; `EnhancedFrames::{Looking, Absent, Found(side)}` is also the
+     line under "Use enhanced frames"). The preview's sharpening scale
+     follows the size an export would write (`raw_export_eye_w`); the
+     snapshot and its frame DNG stay at the plain size.
+     The harness: `X6_ENHANCED=<folder>`. CFG: `#[cfg(target_os =
+     "macos")] mod jxl_macos` in `lib.rs` and ONE gated pair of blocks in
+     `enhanced_dng::decode_tile` (the other arm returns an error); nothing
+     else is gated, tests use `cfg!()`. NOT done: Windows (needs a JPEG XL
+     decoder crate), the preview and zoom view from enhanced frames,
+     export sizes above the present ones for a 7680 source, Camera Raw's
+     other in-place enhancements (Denoise, Raw Details: same container
+     presumably, 1× size; untested).
+   - **Against Camera Raw** (three frames, mean |difference| of 16-px block
+     means, of 255): default 0.33; white balance 0.1–0.7; Shadows /
+     Highlights ±50 0.7–1.4, ±100 1.3–2.5, both at their ends 2.9–4.6;
+     Blacks 0.3–0.8; Whites below zero 0.4; Contrast ±50 0.7–1.2, ±100
+     1.6–2.4; Whites +50 1.2–2.3, +100 5–16; six mixed grades 0.8–2 for
+     moderate ones, 3.4–5.0 at the extremes. What limits it: the networks
+     (0.03–0.15 stops on the curves), the base (Camera Raw's is not known;
+     small bright things get too much of Highlights), and which reading of
+     the frame's top Whites above zero goes by.
+   - **Tests**: `cargo test -p vr180-pipeline --lib raw_ -- --include-ignored`
+     (the GPU stages against their CPU twins, the tables and families
+     against Camera Raw's numbers, the keys read off the reduced copy,
+     the sharpening's kernel and limits).
+   - **Stereo Auto align on a raw take** (2026-11-16, the user: "为什么raw
+     视频 auto align没有了"; it never was there: `align_ok` in
+     `draw_view_adjust_panel` did not list `X6Raw`, because
+     `stereo_align::measure_stereo_align` projects 8-bit eyes and a raw
+     take hands out 16-bit camera-linear ones). Now: the take is opened
+     at half size in memory (`X6RawIter::new(.., half = true, .., None)`),
+     its lens comes from `resolve_export_imu`, and each eye goes through
+     `stereo_align::linear_to_picture` (scaled to the camera's neutral,
+     lifted so that 99 % of the greens sit under 0.85, gamma 1/2.2,
+     RGBA8) before the usual projection and patch matching. Measured
+     (harness `X6_ALIGN=1`): takes 161426 and 161606 of the same camera
+     give pitch +0.053 / +0.058, roll −0.206 / −0.194, yaw +0.11 / +0.05,
+     residual 0.028°; a known offset on the sliders (yaw +0.30, pitch
+     +0.20, roll −0.25) changes the measurement by −0.201 pitch, +0.245
+     roll (yaw −0.41: the yaw is the far cluster's, as for every source);
+     the measurement's own correction applied brings pitch and roll to
+     0.000 / −0.004. A take full of motion blur (205643: 16 ms shutters at
+     night) gives a residual of 0.58° and values not to trust: the
+     residual says so.
+   - **Settings read back from Camera Raw** (2026-11-16, the user: yes to
+     reading them back; `raw_export::read_develop_xmp` = the inverse of
+     `develop_xmp`, `enhanced_dng::read_xmp`, `x6_raw::camera_raw_settings`,
+     GUI button "Read from Camera Raw" in `draw_raw_develop_section`,
+     `App::raw_settings_job` / `poll_raw_settings`). The enhanced picture
+     in a DNG is pre-development, so nothing done in Camera Raw's panels
+     reaches the export by itself; this takes the part this development
+     has controls for: `WhiteBalance` ("As Shot" = as shot, else
+     `Temperature` / `Tint`), `Exposure2012`, `Contrast2012`,
+     `Highlights2012`, `Shadows2012`, `Whites2012`, `Blacks2012`,
+     `Sharpness` / `SharpenRadius` / `SharpenDetail` /
+     `SharpenEdgeMasking`, `ColorNoiseReduction`, each held to the
+     slider's range. Camera Raw 18.7 writes all of them as ATTRIBUTES of
+     the packet's first `rdf:Description` (124 there in the sample; later
+     descriptions belong to the Enhance filter and are not read); plain
+     elements are read too. A packet without `Exposure2012` (another
+     process version, or no settings) gives nothing. What else is set away
+     from Camera Raw's defaults comes back as names (`not_carried`:
+     Texture, Clarity, Dehaze, Vibrance, Saturation, Luminance noise
+     reduction, the colour noise reduction's Detail / Smoothness, Grain,
+     Tone curve (named, points, parametric), Color mixer, Color grading,
+     Calibration, Vignette, Lens corrections, Geometry, Crop, Black &
+     white, Masks, Healing, Profile other than Embedded) and shows under
+     the button. Which file: the frame on screen's, channel 0 then 1, in
+     `<take>_OriginalDNG`, else the nearest of the 12 nearest frames that
+     has settings; a sidecar `.xmp` of the same name counts when the DNG
+     has no packet; `eyes_differ` when channel 1 of that frame was left
+     differently. The read runs on a thread; the result replaces
+     `settings.raw` only if that take is still the one loaded. Checked on
+     the user's sample: as shot, Shadows +100, sharpening 40 / 1.0 / 25 /
+     0, colour noise 25, nothing uncarried. (Camera Raw states that
+     frame's as-shot white as 3750 K, +27; this app's model says 3730.)
+     FOUND ON THE WAY: the section's Temperature and Tint sliders were
+     handed the as-shot values unrounded, wrote the rounded ones back and
+     reported a change, so merely showing the section turned "as shot"
+     into a custom white; the values are rounded before the sliders now.
+   - **Noise reduction** (2026-11-16; `fisheye_decode::LinearCoding`,
+     `DenoisingFisheyeIter::with_linear_source`). The filter wrapper takes
+     frames IN MEMORY; a raw take hands out GPU pairs with empty buffers,
+     and the 16-bit copy in `VtDenoiser::build_source` read from the empty
+     `Vec`'s dangling pointer: the app died with SIGSEGV at address 1 the
+     moment an export of a raw take had Noise Reduction above zero (the
+     user's report). Now: `VtDenoiser::push` refuses a short frame;
+     `export_fisheye` opens a raw take WITHOUT the device when the filter
+     is on (`source_gpu`), so its eyes arrive in memory (CPU demosaic, on
+     every core); and since those eyes are camera-linear, not
+     white-balanced, they pass the filter coded: each channel scaled to
+     the camera's neutral (a grey then has nothing in the half-resolution
+     colour planes), then `log(1 + x / TOE) / log(1 + 1 / TOE)`, TOE =
+     1/1024 (4–9 ten-bit codes per 14-bit sensor code at black, 0.7 % of
+     full scale per code at white), decoded after. Measured on take
+     162217, strength 0.71: mean RGB within 0.10 / 255, every brightness
+     band within 0.2; grain in flat areas ×0.47; strongest 1 % of edges
+     ×0.97; a sky gradient as smooth as without it; 0.31 s a pair at
+     8192×4096 (0.065 without), 4.5 GB. Also runs on enhanced frames
+     (7680² an eye) and in a stabilized lens frame (the export that
+     crashed). Windows has no such filter (the wrapper is macOS-gated;
+     the new `denoising` flag is `false` there).
+     THE FILTERED FRAMES GO BACK ON THE GPU (`fisheye_decode::
+     CameraEyeUploader`, same day): `plan_with_raw_reference` draws the
+     reference frame a non-half-equirect view is developed from only for
+     a pair that HAS GPU eyes; the filter's pairs are buffers, so a Lens
+     Space (or reframed) export with the filter on was developed without
+     its reference and came out unlike the preview (the user: "颜色差很
+     多"; with Shadows +100 / Highlights −100 / Exposure +1.95 the mean
+     level of a frame was 73 against 95, mean difference 23 / 255). With
+     the eyes uploaded again after the filter the same frame differs by
+     0.9 / 255, the filter's own effect. Rule: whatever hands a raw
+     take's frames to the export must hand them as GPU pairs.
+   - **Not done**: takes shot before the camera wrote `exposure.csv`
+     have no shutter time, so their pose is sampled half a shutter (plus
+     the gyro's lag) early (Motion and timing); the gyro's lag is not
+     known for any take; takes of the earliest camera build have neither
+     readout nor accelerometer; the
+     development panel, the DNG snapshot and the DNG sequence option have
+     not been seen running on a display yet.
+   - **WINDOWS**: shared code; the only gate touched is the pair moved into
+     `export_device()` in `app.rs`. To check there: the raw shaders compile
+     on D3D12 / Vulkan (the staged one binds six storage buffers and a 3D
+     `Rgba16Float` texture; the measure pass writes `Rgba32Float`; the
+     sharpening writes `R32Float` storage textures and reads them with
+     `textureLoad`), and the `raw_` tests pass on that GPU.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

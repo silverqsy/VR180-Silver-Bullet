@@ -43,6 +43,7 @@ pub mod kandao;
 pub mod presets;
 pub mod projection;
 pub mod x6_pair;
+pub mod x6b;
 
 pub use calib::{FisheyeCalibration, GyroflowLensProfile};
 pub use dji_osv::{DjiLensCalib, DjiOsvImu, OmniLensModel, SampleAnchor};

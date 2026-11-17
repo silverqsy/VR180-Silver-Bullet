@@ -9,14 +9,24 @@
 #![warn(missing_debug_implementations)]
 
 pub mod audio;
+pub mod bayer;
 pub mod braw_imu;
 pub mod circles;
 pub mod decode;
 pub mod dji_imu;
+pub mod raw_chroma;
+pub mod raw_color;
 pub mod raw_develop;
+pub mod raw_export;
+pub mod raw_global;
+pub mod raw_gpu;
+pub mod raw_local;
+pub mod raw_sharpen;
+pub mod raw_tone;
 pub mod ljpeg;
 pub mod dng_write;
 pub mod encode;
+pub mod enhanced_dng;
 pub mod fisheye_decode;
 pub mod fisheye_export;
 pub mod frame_timeline;
@@ -27,14 +37,17 @@ pub mod imu;
 pub mod insv_imu;
 pub mod kandao_imu;
 pub mod lens_model;
+pub mod lens_frame;
 pub mod panomap;
 pub mod render;
 mod shader_compose;
+pub mod sensor_dng;
 pub mod source_kind;
 pub mod spherical_inject;
 pub mod still_export;
 mod swscale;
 pub mod x6_pair;
+pub mod x6_raw;
 
 pub use source_kind::SourceKind;
 
@@ -45,6 +58,11 @@ pub use interop_macos::{
     RetainedIOSurface, IOSurfaceNv12Descriptor, IOSurfacePlaneTexture,
     extract_iosurface_from_vt_frame, wgpu_texture_from_iosurface_plane,
 };
+
+// JPEG XL through ImageIO, for a raw converter's enhanced frames
+// (`enhanced_dng`); the one caller is gated the same way.
+#[cfg(target_os = "macos")]
+mod jxl_macos;
 
 // In-process VideoToolbox temporal noise reduction (objc2 FFI, no Swift
 // helper). macOS-only; the consuming paths are gated the same way.
