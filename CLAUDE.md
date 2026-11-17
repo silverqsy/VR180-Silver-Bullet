@@ -3551,6 +3551,11 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
        fisheye output sharing slots 30 / 31 costs nothing.
      - No line inside a macOS-gated item changed (two doc comments above
        such items did).
+     - The `refactor` branch is deleted, on the Mac and on the remote
+       (2026-11-17), with the Mac's second checkout. Every commit of it is
+       in `main`: its head `c31d03b` is the second parent of `275cb93`. A
+       checkout that still has the branch can drop it after
+       `git fetch --prune`.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
