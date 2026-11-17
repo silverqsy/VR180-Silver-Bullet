@@ -165,10 +165,14 @@ converter's controls for it, and every frame can be had as a DNG.
 - **Shutter time.** A take that lists each frame's integration time
   (`exposure.csv`, written by the camera build that follows the one
   above) has its poses taken at the centre row's mid-exposure: half the
-  frame's own shutter time later than where the row starts. Takes without
-  the list are sampled where the row starts, as before, which on a
-  hand-held take leaves the 0.4 pixels above (0.06 with the 3 ms those
-  takes turn out to need).
+  frame's own shutter time later than where the row starts. Its frames
+  are also timed by when the sensor read them out, which is even, and not
+  by when their exposures began, which moves with every change of
+  shutter: a take whose shutter dropped from 16.4 to 7.9 ms in one step
+  no longer reads as having lost a frame there. Takes without the list
+  are sampled where the row starts, as before, which on a hand-held take
+  leaves the 0.4 pixels above (0.06 with the 3 ms those takes turn out to
+  need).
 - **What a take does not carry.** No white balance of its own: As shot is
   the camera's reference white.
 

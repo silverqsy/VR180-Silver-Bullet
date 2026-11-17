@@ -89,16 +89,43 @@ pub struct TakeIndex {
     pub missing: Vec<u32>,
     /// Time of every pair in seconds from the first one.
     pub timeline: FrameTimeline,
+    /// Each pair's integration times (channel 0, channel 1), nanoseconds,
+    /// where the take lists them ([`x6b::read_exposures`]).
+    pub shutter_ns: Vec<[Option<u64>; 2]>,
+    /// Each pair's time on the take's counter, nanoseconds: see [`Self::new`].
+    time_ns: Vec<u64>,
     pts_s: Vec<f64>,
 }
 
 impl TakeIndex {
+    /// A pair's time is the middle of its two eyes' stamps, the start of
+    /// their first rows' exposures — unless the take lists every pair's
+    /// integration time, in which case that time is added: the moment the
+    /// first rows are read out. The sensor reads frames out at an even pace
+    /// whatever the exposure does, while the START of an exposure moves when
+    /// its length changes: on the stamps alone a frame after a shutter
+    /// change sits early or late, and after a change of more than half a
+    /// frame period it looks as if a frame were missing before it.
     fn new(take: Take, pairs: Vec<PairEntry>) -> Self {
-        let t0 = pairs.first().map_or(0, |p| p.time_ns());
-        let pts_s: Vec<f64> = pairs.iter().map(|p| (p.time_ns() - t0) as f64 * 1e-9).collect();
+        let listed = x6b::read_exposures(&take);
+        let shutter_ns: Vec<[Option<u64>; 2]> = pairs.iter().map(|p| listed.get(&p.request).copied().unwrap_or([None; 2])).collect();
+        let read_out: Option<Vec<u64>> = pairs.iter().zip(&shutter_ns)
+            .map(|(p, s)| Some(p.time_ns() + s[0].or(s[1])? / 2 + s[1].or(s[0])? / 2))
+            .collect();
+        let time_ns = read_out.filter(|t| !t.is_empty()).unwrap_or_else(|| pairs.iter().map(|p| p.time_ns()).collect());
+        let t0 = time_ns.first().copied().unwrap_or(0);
+        let pts_s: Vec<f64> = time_ns.iter().map(|t| t.saturating_sub(t0) as f64 * 1e-9).collect();
         let dt = 1.0 / take.nominal_fps();
         let missing = x6b::missing_requests(&take, &pairs);
-        Self { timeline: FrameTimeline::from_pts(pts_s.clone(), dt), take, pairs, missing, pts_s }
+        Self { timeline: FrameTimeline::from_pts(pts_s.clone(), dt), take, pairs, missing, shutter_ns, time_ns, pts_s }
+    }
+
+    /// Frame `i`'s integration time in seconds: channel `channel`'s, or the
+    /// other eye's when that one has none; `None` when the take lists
+    /// neither.
+    pub fn shutter_s(&self, i: usize, channel: usize) -> Option<f64> {
+        let eyes = self.shutter_ns.get(i)?;
+        eyes[channel.min(1)].or(eyes[1 - channel.min(1)]).map(|ns| ns as f64 * 1e-9)
     }
 
     /// Frames in the take.
@@ -118,7 +145,7 @@ impl TakeIndex {
 
     /// Time of the first frame on the take's counter, nanoseconds.
     pub fn t0_ns(&self) -> u64 {
-        self.pairs.first().map_or(0, |p| p.time_ns())
+        self.time_ns.first().copied().unwrap_or(0)
     }
 
     /// From the first frame to the end of the last one, seconds.
@@ -515,17 +542,13 @@ pub fn build_imu(index: &TakeIndex, stream_w: u32, stream_h: u32) -> DjiOsvImu {
     // Each frame's integration time, where the take lists it: half of it
     // takes the sample from the centre row's start to its mid-exposure. A
     // frame the list has no value for keeps the row's start.
-    let shutters = x6b::read_exposures(&take.dir);
-    let half_shutter_s = |p: &PairEntry, channel: usize| -> Option<f64> {
-        let eyes = shutters.get(&p.request)?;
-        eyes[channel].or(eyes[1 - channel]).map(|ns| ns as f64 * 0.5e-9)
-    };
+    let half_shutter_s = |i: usize, channel: usize| -> Option<f64> { index.shutter_s(i, channel).map(|s| s * 0.5) };
     let fill = |channel: usize, to: &mut DjiOsvImu| {
         to.frame_quats.clear();
         to.high_rate_quats.clear();
         to.gravity.clear();
-        for p in &index.pairs {
-            let tc = p.exposure_ns[channel] as f64 * 1e-9 + lead + half_shutter_s(p, channel).unwrap_or(0.0);
+        for (i, p) in index.pairs.iter().enumerate() {
+            let tc = p.exposure_ns[channel] as f64 * 1e-9 + lead + half_shutter_s(i, channel).unwrap_or(0.0);
             to.frame_quats.push(line.at(tc));
             let start = tc - frame_dur * 0.5;
             let n = crate::insv_imu::HR_PER_FRAME;
@@ -547,7 +570,7 @@ pub fn build_imu(index: &TakeIndex, stream_w: u32, stream_h: u32) -> DjiOsvImu {
             None => "no readout record".to_string(),
         });
     // The shutter times in use, or that the take has none.
-    let known: Vec<f64> = index.pairs.iter().filter_map(|p| half_shutter_s(p, 0)).map(|h| h * 2e3).collect();
+    let known: Vec<f64> = (0..index.pairs.len()).filter_map(|i| half_shutter_s(i, 0)).map(|h| h * 2e3).collect();
     if known.is_empty() {
         tracing::info!("raw take {}: no shutter record, the pose is sampled where the centre row starts exposing", take.dir.display());
     } else {
@@ -1071,7 +1094,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let take = Take {
             dir: dir.clone(), fps_setting: 60, width: 3840, height: 3840, clock_start: None,
-            audio_file: None, audio_timing: None, sensor_metadata: None,
+            audio_file: None, audio_timing: None, sensor_metadata: None, exposure_file: None,
             seal: x6b::Seal { fps_setting: 60, request_window: (10, 13), received_pairs: 3, pairs: 3, bytes: 3 * 8192 },
             capture_bytes: 3 * 8192,
         };
@@ -1150,7 +1173,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut take = Take {
             dir: dir.clone(), fps_setting: 30, width: 3840, height: 3840, clock_start: None,
-            audio_file: None, audio_timing: None, sensor_metadata: None,
+            audio_file: None, audio_timing: None, sensor_metadata: None, exposure_file: None,
             seal: x6b::Seal { fps_setting: 30, request_window: (1, 1), received_pairs: 1, pairs: 1, bytes: 8192 },
             capture_bytes: 8192,
         };
@@ -1181,7 +1204,7 @@ mod tests {
         let take = Take {
             dir: dir.clone(), fps_setting: 50, width: 3840, height: 3840,
             clock_start: Some(x6b::ClockAnchor { counter_ticks: 0, counter_hz: hz, ..Default::default() }),
-            audio_file: None, audio_timing: None, sensor_metadata: Some("sensor-metadata.json".into()),
+            audio_file: None, audio_timing: None, sensor_metadata: Some("sensor-metadata.json".into()), exposure_file: None,
             seal: x6b::Seal { fps_setting: 50, request_window: (10, 13), received_pairs: 4, pairs: 4, bytes: 4 * 8192 },
             capture_bytes: 4 * 8192,
         };
@@ -1189,7 +1212,8 @@ mod tests {
             request, offset: 0, len: 8192, profile: x6b::Profile::ALL[0],
             exposure_ns: [500_000_000 + 20_000_000 * (request as u64 - 10), 500_000_000 + 20_000_000 * (request as u64 - 10)],
         };
-        let index = TakeIndex::new(take, (10..14).map(pair).collect());
+        let index = TakeIndex::new(take.clone(), (10..14).map(pair).collect());
+        assert!(index.shutter_ns.iter().all(|s| *s == [None, None]) && index.shutter_s(0, 0).is_none());
         // How far the camera has turned at each frame's sample, radians.
         let turned = |imu: &DjiOsvImu| -> Vec<f64> { imu.frame_quats.iter().map(|q| 2.0 * (q.w as f64).abs().min(1.0).acos()).collect() };
         let plain = turned(&build_imu(&index, 3840, 3840));
@@ -1197,10 +1221,56 @@ mod tests {
         assert!((plain[0] - 0.507_678).abs() < 2e-4 && (plain[3] - plain[0] - 0.060).abs() < 2e-4, "{plain:?}");
         // Ten milliseconds for request 10, twelve for 11 (one eye only), none for 12, nothing listed for 13.
         std::fs::write(dir.join(x6b::EXPOSURE_FILE), "request,cam0_exposure_ns,cam1_exposure_ns\n10,10000000,10000000\n11,,12000000\n12,0,\n").unwrap();
+        let index = TakeIndex::new(take.clone(), (10..14).map(pair).collect());
+        assert_eq!((index.shutter_s(0, 0), index.shutter_s(1, 0), index.shutter_s(1, 1), index.shutter_s(2, 0), index.shutter_s(3, 1)), (Some(0.010), Some(0.012), Some(0.012), None, None));
         let listed = turned(&build_imu(&index, 3840, 3840));
         let later: Vec<f64> = listed.iter().zip(&plain).map(|(a, b)| a - b).collect();
         assert!((later[0] - 0.005).abs() < 2e-4 && (later[1] - 0.006).abs() < 2e-4 && later[2].abs() < 2e-4 && later[3].abs() < 2e-4, "{later:?}");
+        // Not every pair has a time: the frames' times stay the stamps' (20 ms apart here).
+        assert!((index.pts_s(1) - 0.020).abs() < 1e-9 && index.t0_ns() == 500_000_000);
+
+        // The sensor reads out at an even pace while a change of shutter moves
+        // the START of the exposure: a 50 fps take whose shutter drops from 18
+        // to 4 ms has the next stamp 14 ms late. On the stamps alone that reads
+        // as a frame missing (34 ms is nearer two periods than one); with the
+        // list, the frames are 20 ms apart, as they were taken.
+        let stamps = [500_000_000u64, 520_000_000, 554_000_000, 574_000_000];
+        let shutters = [18_000_000u64, 18_000_000, 4_000_000, 4_000_000];
+        let pairs: Vec<PairEntry> = stamps.iter().enumerate()
+            .map(|(i, t)| PairEntry { request: 10 + i as u32, offset: 0, len: 8192, profile: x6b::Profile::ALL[0], exposure_ns: [*t, *t] }).collect();
+        std::fs::remove_file(dir.join(x6b::EXPOSURE_FILE)).unwrap();
+        let bare = TakeIndex::new(take.clone(), pairs.clone());
+        assert_eq!((bare.timeline.dropped_frames(), bare.t0_ns()), (1, 500_000_000));
+        let list: String = std::iter::once("request,cam0_exposure_ns,cam1_exposure_ns\n".to_string())
+            .chain(shutters.iter().enumerate().map(|(i, s)| format!("{},{s},{s}\n", 10 + i))).collect();
+        std::fs::write(dir.join(x6b::EXPOSURE_FILE), list).unwrap();
+        let even = TakeIndex::new(take, pairs);
+        assert_eq!(even.timeline.dropped_frames(), 0);
+        assert!((0..4).all(|i| (even.pts_s(i) - 0.020 * i as f64).abs() < 1e-9), "{:?}", (0..4).map(|i| even.pts_s(i)).collect::<Vec<_>>());
+        assert_eq!(even.t0_ns(), 518_000_000);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A take of the camera build that lists its frames' integration times
+    /// (skipped when the volume is not mounted): every frame has one, the
+    /// frames are evenly spaced although the shutter changed 32 times, and
+    /// the poses are built with them.
+    #[test]
+    fn a_take_with_an_exposure_list_keeps_an_even_timeline() {
+        let dir = Path::new("/Volumes/Database/x6/1116 Raw Video/RAWVIDEO-20261116-205643");
+        if !dir.exists() { return; }
+        let index = open(dir).unwrap();
+        assert_eq!((index.frames(), index.take.exposure_file.as_deref()), (3050, Some("exposure.csv")));
+        assert!(index.shutter_ns.iter().all(|s| s[0].is_some() && s[0] == s[1]));
+        let (lo, hi) = index.shutter_ns.iter().fold((u64::MAX, 0), |(lo, hi), s| (lo.min(s[0].unwrap()), hi.max(s[0].unwrap())));
+        assert_eq!((lo, hi), (6_617_155, 16_429_989));
+        assert_eq!(index.timeline.dropped_frames(), 0);
+        // Even to a few microseconds over the whole take.
+        let dt = index.dt_s();
+        let worst = (0..index.frames()).map(|i| (index.pts_s(i) - i as f64 * dt).abs()).fold(0f64, f64::max);
+        assert!(worst < 30e-6, "{worst}");
+        let imu = build_imu(&index, 3840, 3840);
+        assert_eq!(imu.frame_quats.len(), 3050);
     }
 
     /// A take of the camera build that records the sensor's row timing and

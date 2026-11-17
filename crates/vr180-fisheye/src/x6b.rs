@@ -252,6 +252,10 @@ pub struct Take {
     /// timing and the motion streams. Takes of an earlier camera build have
     /// none.
     pub sensor_metadata: Option<String>,
+    /// The list of each pair's integration times (`clip.json` →
+    /// `exposure_file`); a take that does not name one may still have
+    /// [`EXPOSURE_FILE`] beside the capture.
+    pub exposure_file: Option<String>,
     pub seal: Seal,
     pub capture_bytes: u64,
 }
@@ -352,6 +356,7 @@ pub fn read_take(dir: &Path) -> Result<std::result::Result<Take, TakeProblem>> {
         audio_file: text("audio_file"),
         audio_timing: text("audio_timing"),
         sensor_metadata: text("sensor_metadata"),
+        exposure_file: text("exposure_file"),
         seal: Seal { fps_setting, request_window: (lo as u32, hi as u32), received_pairs: received, pairs, bytes },
         capture_bytes: meta.len(),
     }))
@@ -725,12 +730,13 @@ fn read_motion(file: &Path, counter_hz: u64) -> Result<Vec<GyroSample>> {
 }
 
 /// The integration time of every written pair's two eyes, nanoseconds, by
-/// request number: `exposure.csv` (`request,cam0_exposure_ns,
-/// cam1_exposure_ns`). An eye whose value is empty or zero is not known
-/// (`None`). Empty for a take without the file: takes of camera builds
-/// that did not record it.
-pub fn read_exposures(dir: &Path) -> std::collections::HashMap<u32, [Option<u64>; 2]> {
-    let Ok(text) = std::fs::read_to_string(dir.join(EXPOSURE_FILE)) else { return Default::default() };
+/// request number: the take's exposure list (the file `clip.json` names,
+/// else `exposure.csv`; `request,cam0_exposure_ns,cam1_exposure_ns`). An
+/// eye whose value is empty or zero is not known (`None`). Empty for a take
+/// without the file: takes of camera builds that did not record it.
+pub fn read_exposures(take: &Take) -> std::collections::HashMap<u32, [Option<u64>; 2]> {
+    let name = take.exposure_file.as_deref().unwrap_or(EXPOSURE_FILE);
+    let Ok(text) = std::fs::read_to_string(take.dir.join(name)) else { return Default::default() };
     let mut out = std::collections::HashMap::new();
     for line in text.lines() {
         let mut cols = line.split(',');
@@ -1141,9 +1147,13 @@ mod tests {
         assert!(read_sensor_readout(&take).is_none());
         take.sensor_metadata = None;
         // The integration times: by request, an eye left empty or at zero is unknown; no file, nothing.
-        assert!(read_exposures(&dir).is_empty());
+        assert!(take.exposure_file.is_none() && read_exposures(&take).is_empty());
         std::fs::write(dir.join(EXPOSURE_FILE), "request,cam0_exposure_ns,cam1_exposure_ns\n191,8660735,8660734\n192,12596735,\n193,0,9000000\nbroken,1,2\n194,5000000000,7\n").unwrap();
-        let e = read_exposures(&dir);
+        // A take that names another file has that one read, not the usual name.
+        take.exposure_file = Some("shutter.csv".into());
+        assert!(read_exposures(&take).is_empty());
+        take.exposure_file = None;
+        let e = read_exposures(&take);
         assert_eq!(e.len(), 4);
         assert_eq!((e[&191], e[&192], e[&193], e[&194]), ([Some(8_660_735), Some(8_660_734)], [Some(12_596_735), None], [None, Some(9_000_000)], [None, Some(7)]));
         take.audio_timing = Some("audio-info.json".into());

@@ -2699,9 +2699,26 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      IN THE APP: `x6b::read_exposures`, `build_imu` adds half the frame's
      own time to `stamp + readout / 2` (channel 0's value, the other
      eye's when that one is empty; nothing for a frame without one); the
-     log says the range in use or that there is no record. NOT YET RUN ON
-     A REAL TAKE: their two test takes (…-194416, …-194644) are on the
-     camera's card, not on the share. STILL OPEN: the gyro's own lag
+     log says the range in use or that there is no record. RUN ON A REAL
+     TAKE the same night (`1116 Raw Video/RAWVIDEO-20261116-205643`, 60p,
+     3050 pairs; `clip.json` names the list in `exposure_file`, which
+     `Take::exposure_file` honours; `seal.json` has `exposure_status` and
+     `exposure_missing_pairs`; sound is `audio.wav`, two channels): the
+     list has exactly the capture's requests, no empty value, the two
+     eyes equal, 6.617–16.430 ms in 27 distinct values. WHAT THE STAMP IS,
+     FROM THE NUMBERS ALONE: `stamp + integration time` ticks at the frame
+     period to 0.0000 ms rms through all 32 changes of shutter (request
+     809 → 810: 16.430 → 7.906 ms, the stamps 25.207 ms apart, the sums
+     16.6833), so the stamp is the first row's exposure START and the
+     list's values belong to their requests. THE FRAMES' TIMES
+     (`TakeIndex::new`, `shutter_ns`, `shutter_s`): where every pair has a
+     listed time, a pair's time is the stamp plus it (the first row's
+     readout, even to 8 µs over that take); on the stamps alone that take
+     read as "1 dropped in 1 hole" at request 810 and its frames wandered
+     up to 9.8 ms off an even clock. Takes without a complete list keep
+     the stamps. The user asked for no picture-based check on that take
+     (long shutters, much motion blur), so nothing was measured from its
+     pictures. STILL OPEN: the gyro's own lag
      (their words: the sensor service's stamps, filter delay unmeasured;
      the 1.1 ms of the camera's own files and this unit's fitted axes
      are not to be taken as constants for every unit) — with a take that
