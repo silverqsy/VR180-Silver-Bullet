@@ -3527,6 +3527,30 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
        feed and the encoder thread, so the D3D11 readback arm could become
        a `FrameFeed` of it; the GPU-resident arm's ring of shared frames
        has no counterpart there. Not started.
+   - **MAC SIDE PULLED IT (2026-11-17, Mac):** fast-forward to `9fd483d`:
+     the arms above (`dff754a`), then the held size of a lens frame going
+     by the frame as written (`9fd483d`; a Mac's encoder has no frame
+     limit, `hw_h265_side_limit`, so no size changes here). Three pieces
+     of the two commits are code a Mac compiles: `export_row_readout`
+     inside `run_fisheye_frames`, the `project_eye` request of
+     `raw_gpu::raw_reference`, the extra argument of the lens-frame size
+     functions in `app.rs`. It builds; tests braw 6, core 63, fisheye 69,
+     gui 40, pipeline 235; the stored sets are the same as before the
+     pull, 65 exports and 169 preview lines. Among them are raw takes
+     written as a lens frame, a disc and a reframed view, stabilized and
+     not: those draw their reference through `raw_reference`, with
+     per-row matrices and without.
+     - Read against the shared definitions, the Windows arms ask what they
+       asked before: `FramePose::new` is the rotation and row code they
+       carried; `resolve_calib_pair` is `view_calib_pair` of
+       `resolve_source_calib_pair`; `rows_for_both` is their test for both
+       eyes' rows; `resolve_export_imu` answers only for the five kinds
+       `has_frame_imu` names, so `export_row_readout` is on where
+       `cfg.stabilize` alone was. The output cache is kept per slot and
+       re-made when the size or format differs, so the GPU-resident arm's
+       fisheye output sharing slots 30 / 31 costs nothing.
+     - No line inside a macOS-gated item changed (two doc comments above
+       such items did).
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
