@@ -3385,8 +3385,9 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      (`99516c2`): through the encoder's surfaces it logged three zeros
      beside the decode time.
 
-35. **The `refactor` branch on Windows (2026-11-17, Windows box; branch
-   only, nothing of it is on `main`).** `origin/refactor` @ `d95dd62` (one
+35. **The `refactor` branch on Windows (2026-11-17, Windows box; written
+   while it was a branch only: it LANDED ON `main` the same day as
+   `275cb93`, last bullet).** `origin/refactor` @ `d95dd62` (one
    projection kernel source, `project_eye`, `FramePose`, one colour-stack
    recorder, `run_fisheye_frames` / `run_eac_frames`, `lens_model`, the
    preview probe) had `main` up to `ec7de04` in it. Here `main` @ `8948361`
@@ -3462,6 +3463,31 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      substitution in `run_fisheye_zerocopy`. With the A/B above the branch
      gives `main`'s pictures on both machines; what is left before it
      lands is the decision.
+   - **LANDED ON `main` (2026-11-17, Mac): `275cb93`**, a merge commit, so
+     that the first-parent history of `main` reads it as one step. `main`
+     @ `c171c06` was already in the branch, so the merge's tree is the
+     branch head's (`c31d03b`); since the head the Windows box compiled
+     (`a7c1ce1`) the code differs by the stage-time gate of `99516c2` and
+     the Chinese string of `879331c`. The branch's build was tried by eye
+     on the Mac first (70 minutes, three clips on the zero-copy preview
+     worker, no warning in its log). Built again in the main checkout and
+     run there: tests braw 6, core 63, fisheye 69, gui 40, pipeline 235;
+     the 65 exports and the 169 preview lines are the stored ones.
+     - From here the work is on `main`: the `refactor` branch has nothing
+       `main` lacks. First on the list is the Windows item above (the
+       three Windows-only arms onto `project_eye` / `FramePose`).
+     - Names the older items use for code that is gone:
+       `record_color_stack_16` is `record_color_stack`, which records
+       both depths (so do its stages, `record_cdl`, `record_lut3d` and the
+       rest); the nine `fisheye_*_to_*` projection shader files are builds
+       of `shaders/fisheye_project.wgsl` (`shader_compose.rs`,
+       `gpu/projection.rs`); the `project_fisheye_*` entry points are
+       `project_eye` / `project_eyes`, the four
+       `project_fisheye_rgba16_texture_*` wrappers staying for the Windows
+       arms; `timeline_frames_or` is `frame_timeline::frames_or`.
+     - The preview probe is part of the app (`VR180_PREVIEW_PROBE=<clip>`,
+       `decoder/preview_probe.rs`, taken in `main.rs` before the log
+       opens): comparing previews no longer means putting it into a tree.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
