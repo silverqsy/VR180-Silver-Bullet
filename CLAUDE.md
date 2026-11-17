@@ -2341,6 +2341,16 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      −0.003 after; video-range sources byte-identical. **MAC SIDE**: pull;
      the paused full-resolution still and any CPU-decoded QooCam picture
      get 0.29 % darker, onto the live preview's level.
+     **MAC SIDE PULLED IT (2026-11-17, Mac):** fast-forward to `8948361`,
+     `vr180-gui` builds, tests 6 / 63 / 69 / 38 / 225; the stored exports
+     (65) and preview frames (169 lines) are the same as before the pull,
+     none of them having a full-range source deeper than 8 bits. The fix
+     itself on this machine's FFmpeg: a flat-colour 10-bit full-range SBS
+     clip (eight colours) exported with the VideoToolbox zero-copy decode
+     and with the software decode (`VR180_NO_HW_DECODE=1`) through the same
+     hardware encoder gives the same code on every plane, on the exact
+     value (luma 512 of 1023 → 502 of the 10-bit video range where the old
+     scale gives 504; 940 → 869, not 871).
 
 32. **The preview as Apple's players show the export (2026-11-14, Mac;
    UNRELEASED).** A toolbar switch, **Match QuickTime**: macOS only, off by
@@ -3366,6 +3376,14 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      **MAC SIDE**: nothing changes there; the read-ahead and the encoder
      thread are plain Rust and could be switched on for the Mac's loops
      after a check on that machine.
+     **MAC FIGURES (2026-11-17):** the decode step of a raw frame (read,
+     unpack, upload, the demosaic's submit) takes 11 ms here and a graded
+     8192 × 4096 export through the P010 surface arm runs at 12.4 fps (81
+     ms a frame), so reading ahead could bring 15 % at most, and less with
+     the noise filter on, which sets the pace there: not switched on. The
+     stage-time line is written only by the arm that times its stages
+     (`99516c2`): through the encoder's surfaces it logged three zeros
+     beside the decode time.
 
 35. **The `refactor` branch on Windows (2026-11-17, Windows box; branch
    only, nothing of it is on `main`).** `origin/refactor` @ `d95dd62` (one
