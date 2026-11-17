@@ -2129,7 +2129,7 @@ fn tr_zh(en: &'static str) -> &'static str {
         "No enhanced frame found for this clip: it exports from the capture." => "没有找到这个片段的增强帧：导出取自采集文件。",
         "Looking for enhanced frames…" => "正在查找增强后的帧…",
         "This size is the stabilized frame scaled to fit the NVIDIA hardware encoder, which takes 8192 pixels a side: a few percent smaller than recorded, and many times faster to export as H.265 than the native size, which is encoded in software." => "这个尺寸是把防抖后的画幅缩小到 NVIDIA 硬件编码器能接受的范围（单边 8192 像素）：比拍摄时小百分之几，导出 H.265 比原生尺寸快很多倍（原生尺寸只能软件编码）。",
-        "Enhanced frames (a raw converter's Super Resolution, in the folder of Camera original DNGs) are read on macOS only for now: this clip exports from the capture." => "增强后的帧（raw 转换软件的超分辨率，位于相机原始 DNG 文件夹中）目前只有 macOS 能读取：这个片段从采集文件导出。",
+        "Enhanced frames (a raw converter's Super Resolution, in the folder of Camera original DNGs) are read on macOS only for now: this clip exports from the capture." => "增强后的帧（RAW 转换软件的超分辨率，位于相机原片 DNG 文件夹中）目前只有 macOS 能读取：这个片段从采集文件导出。",
         "This clip's enhanced frames hold more than 8192 × 4096 shows: the two larger sizes keep it. A stretch without enhanced frames exports at the size picked without them." => "这个片段的增强帧包含的细节多于 8192 × 4096 能呈现的：两档更大的尺寸可以保留这些细节。没有增强帧的区段按未使用增强帧时所选的尺寸导出。",
         "When the folder of Camera original DNGs is beside the take and a raw converter has enhanced its frames in place (Camera Raw's Super Resolution), each frame is taken from there, at the enhanced size. A frame that was not enhanced comes from the capture." => "素材旁边有相机原片 DNG 文件夹，并且其中的帧已在 RAW 转换软件里原地增强过时（Camera Raw 的超分辨率），每一帧从那里读取，按增强后的尺寸处理。没有增强过的帧仍取自采集文件。",
         "Camera original" => "相机原片",
