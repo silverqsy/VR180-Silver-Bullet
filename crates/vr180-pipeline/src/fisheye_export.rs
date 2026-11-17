@@ -1056,8 +1056,16 @@ pub(crate) fn fisheye_export_opener(
             }
             // Full size, every frame, camera-linear 16-bit eyes (on the GPU
             // when there is a device).
-            SourceKind::X6Raw => Box::new(crate::x6_raw::X6RawIter::new(
-                p, kind.dual_stream_iter_swap(swap_eyes), false, 1, gpu.clone())?.with_enhanced_frames(raw_enhanced.as_ref())),
+            SourceKind::X6Raw => {
+                let take = crate::x6_raw::X6RawIter::new(
+                    p, kind.dual_stream_iter_swap(swap_eyes), false, 1, gpu.clone())?.with_enhanced_frames(raw_enhanced.as_ref());
+                // An export takes every frame in order: on Windows the take
+                // is read and unpacked ahead of it on a thread of its own
+                // (`X6RawIter::with_read_ahead`; `VR180_RAW_READ_AHEAD=0`
+                // reads in line, for comparison). The frames are the same.
+                let ahead = cfg!(target_os = "windows") && std::env::var("VR180_RAW_READ_AHEAD").as_deref() != Ok("0");
+                Box::new(if ahead { take.with_read_ahead() } else { take })
+            }
             other => return Err(Error::Ffmpeg(format!(
                 "export_fisheye non-fisheye source: {other:?}"))),
         })
@@ -2122,7 +2130,52 @@ fn export_fisheye_inner(
         );
     }
 
-    while let Some(pair) = decoder.next_pair()? {
+    // What the 10-bit readback arm hands the encoder. An encoder that takes
+    // P010 (hevc_nvenc) or planar 4:2:2 (ProRes) gets the planes the GPU
+    // composed, as the Windows zero-copy readback arm does: half to a third
+    // of the bytes to read back and no RGB → Y'CbCr pass on the CPU (at
+    // 8192 × 4096 the RGB48 frame is 201 MB, and its readback and conversion
+    // were three quarters of a frame's time on this loop). Windows only: the
+    // Mac's encoders take their frames as surfaces, and its software
+    // fallbacks keep the route they were verified on. A single-eye frame
+    // has no such compose and stays on RGB48.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum PlaneFeed { Rgb48, P010, P210 }
+    let plane_feed = if !cfg!(target_os = "windows") || mono || cfg.bit_depth != 10 {
+        PlaneFeed::Rgb48
+    } else if encoder.wants_p010() {
+        PlaneFeed::P010
+    } else if encoder.wants_yuv422p10() {
+        PlaneFeed::P210
+    } else {
+        PlaneFeed::Rgb48
+    };
+    // With planes the encoder runs on a thread of its own (the copy into its
+    // frame, the encode and the mux overlap the next frame's GPU work);
+    // every other feed calls it in line, as before. `VR180_ENCODE_INLINE=1`
+    // keeps it in line with planes too, for comparison: the file is the same.
+    let encoder_threaded = plane_feed != PlaneFeed::Rgb48 && std::env::var("VR180_ENCODE_INLINE").as_deref() != Ok("1");
+    if plane_feed != PlaneFeed::Rgb48 {
+        tracing::info!("fisheye_export: encode input = {} planes composed on the GPU (no swscale), encoder {}",
+            if plane_feed == PlaneFeed::P010 { "P010" } else { "P210" },
+            if encoder_threaded { "on its own thread" } else { "in line" });
+    }
+    let mut encoder = if encoder_threaded {
+        crate::encode::EncodeStage::on_thread(encoder)?
+    } else {
+        crate::encode::EncodeStage::inline(encoder)
+    };
+    // Where a frame's time goes on this loop (logged every 30 frames): the
+    // source's decode, the GPU work up to the composed frame, its readback,
+    // and the encoder.
+    let (mut t_decode, mut t_gpu, mut t_read, mut t_encode) = (
+        std::time::Duration::ZERO, std::time::Duration::ZERO,
+        std::time::Duration::ZERO, std::time::Duration::ZERO,
+    );
+    loop {
+        let d0 = std::time::Instant::now();
+        let Some(pair) = decoder.next_pair()? else { break };
+        t_decode += d0.elapsed();
         // Cancellation check before doing any GPU work.
         if cancel.load(Ordering::SeqCst) {
             tracing::info!("fisheye_export: cancelled at frame {}", frame_idx);
@@ -2280,6 +2333,7 @@ fn export_fisheye_inner(
             // 10-bit non-zero-copy: texture-resident 16-bit projection +
             // RGB48 readback. This is libx265 Main10 AND ProRes (both
             // platforms) — per-row RS rides build_eye_eq_16's rs param.
+            let g0 = std::time::Instant::now();
             let (left_tex_16, right_tex_16) = build_eye_eq_16(
                 &*pipeline, &pair, src_w, src_h,
                 cfg.eye_w, cfg.eye_h,
@@ -2292,12 +2346,42 @@ fn export_fisheye_inner(
             let (l_final, r_final) = grade_eyes_16(
                 &pipeline, &left_tex_16, &right_tex_16, cfg.eye_w, cfg.eye_h, &frame_plan, eye_match(), mono,
             )?;
-            // One eye is the frame itself; two are composed side by side.
-            let sbs_tex_16 = if mono { l_final } else {
-                pipeline.compose_sbs_textures_16(&l_final, &r_final, cfg.eye_w, cfg.eye_h)?
-            };
-            let sbs_rgb48 = pipeline.read_texture_rgb48(&sbs_tex_16, sbs_w, sbs_h)?;
-            for _ in 0..fill.copies() { encoder.encode_frame_rgb48(&sbs_rgb48)?; }
+            match plane_feed {
+                PlaneFeed::P010 | PlaneFeed::P210 => {
+                    // Video range, as the encoder tags the stream. 4:2:0 for
+                    // HEVC, 4:2:2 (full vertical chroma) for ProRes.
+                    let p210 = plane_feed == PlaneFeed::P210;
+                    let (y_tex, uv_tex) = if p210 {
+                        pipeline.compose_sbs_to_p210_textures(&l_final, &r_final, cfg.eye_w, cfg.eye_h, false)?
+                    } else {
+                        pipeline.compose_sbs_to_p010_textures(&l_final, &r_final, cfg.eye_w, cfg.eye_h, false)?
+                    };
+                    t_gpu += g0.elapsed();
+                    let r0 = std::time::Instant::now();
+                    // The first readback waits for the frame's GPU work;
+                    // the second is the copy alone.
+                    let y = pipeline.read_texture_planar(&y_tex, sbs_w, sbs_h, 2)?;
+                    let uv = pipeline.read_texture_planar(&uv_tex, sbs_w / 2, if p210 { sbs_h } else { sbs_h / 2 }, 4)?;
+                    t_read += r0.elapsed();
+                    let e0 = std::time::Instant::now();
+                    let frame = if p210 { crate::encode::PlaneFrame::P210 { y, uv } } else { crate::encode::PlaneFrame::P010 { y, uv } };
+                    encoder.encode_planes(frame, fill.copies())?;
+                    t_encode += e0.elapsed();
+                }
+                PlaneFeed::Rgb48 => {
+                    // One eye is the frame itself; two are composed side by side.
+                    let sbs_tex_16 = if mono { l_final } else {
+                        pipeline.compose_sbs_textures_16(&l_final, &r_final, cfg.eye_w, cfg.eye_h)?
+                    };
+                    t_gpu += g0.elapsed();
+                    let r0 = std::time::Instant::now();
+                    let sbs_rgb48 = pipeline.read_texture_rgb48(&sbs_tex_16, sbs_w, sbs_h)?;
+                    t_read += r0.elapsed();
+                    let e0 = std::time::Instant::now();
+                    for _ in 0..fill.copies() { encoder.encode_frame_rgb48(&sbs_rgb48)?; }
+                    t_encode += e0.elapsed();
+                }
+            }
         } else {
             // 8-bit non-zero-copy fallback. Color stack happens via the
             // legacy CPU roundtrip on the SBS readback below (acceptable
@@ -2328,6 +2412,15 @@ fn export_fisheye_inner(
 
         frame_idx += 1;
         written += fill.copies();
+        if frame_idx % 30 == 0 {
+            let n = frame_idx as u32;
+            // `readback` holds the wait for the frame's GPU work; with the
+            // encoder on its own thread `encode` is the wait for its queue.
+            tracing::info!(
+                "export perf: f={} avg/frame: decode={:?} gpu={:?} readback={:?} encode={:?}",
+                frame_idx, t_decode / n, t_gpu / n, t_read / n, t_encode / n,
+            );
+        }
         let elapsed = t_start.elapsed().as_secs_f32().max(1e-3);
         let fps_avg = frame_idx as f32 / elapsed;
         progress_cb(ExportProgress {

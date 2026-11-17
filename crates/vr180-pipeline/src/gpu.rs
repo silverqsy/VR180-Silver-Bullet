@@ -8079,10 +8079,33 @@ impl Device {
             .map_err(|e| Error::Wgpu(format!("planar map: {e}")))?;
         let mapped = slice.get_mapped_range();
         let row = unpadded_row_bytes as usize;
+        let padded = padded_row_bytes as usize;
         let mut out = vec![0u8; row * h as usize];
-        for y in 0..h as usize {
-            let src = y * padded_row_bytes as usize;
-            out[y * row..y * row + row].copy_from_slice(&mapped[src..src + row]);
+        let src: &[u8] = &mapped;
+        // A plane of an 8K frame is 34 to 67 MB: a few threads copy it in a
+        // third of the time one takes (the copy is memory-bound, so more
+        // than a handful adds nothing). Small planes stay on this thread.
+        let threads = if out.len() >= (8 << 20) {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 4)
+        } else {
+            1
+        };
+        let rows_per = (h as usize).div_ceil(threads).max(1);
+        let copy_rows = |first: usize, chunk: &mut [u8]| {
+            for (i, dst) in chunk.chunks_exact_mut(row).enumerate() {
+                let s = (first + i) * padded;
+                dst.copy_from_slice(&src[s..s + row]);
+            }
+        };
+        if threads == 1 {
+            copy_rows(0, &mut out);
+        } else {
+            std::thread::scope(|scope| {
+                for (ci, chunk) in out.chunks_mut(rows_per * row).enumerate() {
+                    let copy_rows = &copy_rows;
+                    scope.spawn(move || copy_rows(ci * rows_per, chunk));
+                }
+            });
         }
         drop(mapped);
         staging.unmap();

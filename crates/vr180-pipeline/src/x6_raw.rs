@@ -805,6 +805,58 @@ pub struct X6RawIter {
     mosaics_out: bool,
     /// Frames a raw converter enhanced, used in place of the capture's.
     enhanced: Option<EnhancedFrames>,
+    /// Read and unpack the frames ahead of the consumer ([`ReadAhead`]).
+    read_ahead: bool,
+    ahead: Option<ReadAhead>,
+}
+
+/// A take's frames read from the capture and unpacked on a thread of their
+/// own, ahead of the consumer: reading a pair (22 MB at 60 fps, more at 30)
+/// and unpacking its two mosaics take 13 ms from a fast disk and 35 from a
+/// network share, which an export otherwise waits for between two frames'
+/// GPU work. The thread has its own handle on the capture and touches no
+/// GPU; the frames come out in order, each exactly as [`X6RawIter::decode_frame`]
+/// decodes it.
+struct ReadAhead {
+    /// The unpacked pairs, in order: the frame's index and its two mosaics.
+    frames: std::sync::mpsc::Receiver<Result<(usize, Vec<u16>)>>,
+    /// Buffers handed back for the next frames (59 MB each: not allocated
+    /// per frame).
+    spare: std::sync::mpsc::Sender<Vec<u16>>,
+    /// The frame the next message holds.
+    next: usize,
+}
+
+/// Pairs unpacked and waiting at most. With the one being unpacked and the
+/// one in use, four buffers of 59 MB.
+const READ_AHEAD_FRAMES: usize = 2;
+
+impl ReadAhead {
+    /// Start reading at frame `first`, every `step`-th frame, up to `end`.
+    fn start(index: &Arc<TakeIndex>, first: usize, step: usize, end: usize) -> Result<Self> {
+        let mut file = File::open(index.take.capture_path())?;
+        let (tx, frames) = std::sync::mpsc::sync_channel::<Result<(usize, Vec<u16>)>>(READ_AHEAD_FRAMES);
+        let (spare, spares) = std::sync::mpsc::channel::<Vec<u16>>();
+        let index = index.clone();
+        std::thread::Builder::new().name("raw-take-reader".into()).spawn(move || {
+            let mut record = Vec::new();
+            let mut i = first;
+            while i < end {
+                let Some(entry) = index.pairs.get(i).copied() else { break };
+                let mut samples = spares.try_recv().ok().filter(|b| b.len() == 2 * EYE_SAMPLES)
+                    .unwrap_or_else(|| vec![0u16; 2 * EYE_SAMPLES]);
+                let read = x6b::decode_pair(&mut file, &entry, index.take.fps_setting, Channels::Both, &mut record, &mut samples, 0)
+                    .map_err(take_err);
+                let failed = read.is_err();
+                // The consumer went away (the export's end, a seek): stop.
+                if tx.send(read.map(|()| (i, samples))).is_err() || failed {
+                    break;
+                }
+                i += step;
+            }
+        }).map_err(take_err)?;
+        Ok(Self { frames, spare, next: first })
+    }
 }
 
 impl Drop for X6RawIter {
@@ -837,7 +889,38 @@ impl X6RawIter {
             index, file, next: 0, step: step.max(1) as usize, swap_eyes, half, gpu,
             record: Vec::new(), samples: vec![0u16; 2 * EYE_SAMPLES], mosaics: None,
             pool: Arc::default(), frame_limit: 0, mosaics_out: false, enhanced: None,
+            read_ahead: false, ahead: None,
         })
+    }
+
+    /// Read and unpack the frames on a thread of their own, ahead of the
+    /// consumer ([`ReadAhead`]): for a consumer that takes every frame in
+    /// order (an export). The frames are the same; a seek starts over from
+    /// the new place.
+    pub fn with_read_ahead(mut self) -> Self {
+        self.read_ahead = true;
+        self
+    }
+
+    /// Frame `i`'s two mosaics into the iterator's buffer: from the reader
+    /// thread where one runs ([`Self::with_read_ahead`]), else decoded here.
+    fn fetch_frame(&mut self, i: usize) -> Result<()> {
+        if !self.read_ahead {
+            return self.decode_frame(i).map(|_| ());
+        }
+        if !self.ahead.as_ref().is_some_and(|a| a.next == i) {
+            let end = if self.frame_limit > 0 { self.frame_limit.min(self.index.frames()) } else { self.index.frames() };
+            self.ahead = Some(ReadAhead::start(&self.index, i, self.step, end)?);
+        }
+        let ahead = self.ahead.as_mut().expect("just started");
+        let (got, samples) = ahead.frames.recv().map_err(|_| take_err("the take's reader stopped early"))??;
+        if got != i {
+            return Err(take_err(format!("the take's reader handed frame {got} where {i} was due")));
+        }
+        let used = std::mem::replace(&mut self.samples, samples);
+        let _ = ahead.spare.send(used);
+        ahead.next = i + self.step;
+        Ok(())
     }
 
     /// Take the frames from `source`'s folder where a raw converter has
@@ -1057,7 +1140,7 @@ impl FisheyePairIter for X6RawIter {
             let bytes = |px: &[u16]| bytemuck::cast_slice::<u16, u8>(px).to_vec();
             return Ok(Some(FisheyePair { left: bytes(&left), right: bytes(&right), eye_w: side, eye_h: side, bit_depth: 16, pts_s, gpu: None }));
         }
-        self.decode_frame(i)?;
+        self.fetch_frame(i)?;
         self.next = i + self.step;
         if let Some(dev) = self.gpu.clone() {
             let pair = self.gpu_pair(&dev)?;

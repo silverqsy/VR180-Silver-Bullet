@@ -138,9 +138,9 @@ converter's controls for it, and every frame can be had as a DNG.
 - **Windows.** A raw take opens, previews and exports there as well
   (checked on an NVIDIA RTX 4090, on Vulkan and on Direct3D 12), and the
   Camera original DNGs it writes are byte for byte the ones a Mac writes.
-  An 8192×4096 export runs at about 3.5 frames a second through NVENC and
-  3.9 as ProRes: the picture is prepared on the GPU but handed to the
-  encoder through memory.
+  An 8192×4096 export runs at about 10 frames a second with tone and
+  sharpening in use and 15 with the default development, through NVENC
+  or as ProRes.
 - **Rolling shutter and the accelerometer.** Takes from the camera build
   that records the sensor's row timing and the accelerometer use both.
   Each frame's pose is taken where its centre row starts exposing (the
@@ -328,6 +328,23 @@ show the export.
 - **Off by default**, and remembered. Off is the preview as it always was,
   which is closer to how most players on Windows show the file.
 - macOS only.
+
+### Windows: faster exports of sources without a fast path
+
+Sources that have no zero-copy path on Windows (Insta360 X6 raw video,
+Blackmagic RAW, and any clip whose fast path is not available, such as on a
+card with too little memory for hardware decode) export on the general
+loop. For 10-bit H.265 through NVENC and for ProRes that loop took each
+frame off the GPU as a full RGB picture (201 MB at 8192×4096), converted
+it on the CPU and only then encoded it, one step after the other. It now
+has the GPU write the encoder's own planes, reads those back (half to a
+third of the bytes) and hands them to an encoder that runs alongside the
+next frame's work; a raw take is also read from disk ahead of the frame
+being worked on. On an RTX 4090 at 8192×4096: X6 raw with tone and
+sharpening 3.5 → 10 frames a second, with the default development 4.2 →
+15; a Blackmagic RAW clip at 4096×2048 4 → 10 (ProRes 16). The picture is
+the one the fast paths write (the same GPU conversion); software H.265
+and 8-bit output are unchanged.
 
 ### Fixes
 

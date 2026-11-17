@@ -3309,12 +3309,63 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      GPU fast path for this source type" in the export bar. It is the
      take's only path on every platform, with the GPU doing the demosaic,
      the projection and the grade: no note for a raw take now.
-     SPEED, 8192 × 4096 from the NAS, graded: NVENC 3.5 fps, ProRes HQ 3.9,
-     libx265 1.5 (the Mac: 15). The frame leaves the GPU as 268 MB of
-     RGBA64 and goes through swscale to the encoder, as on every portable
-     10-bit export on Windows: a P010 compose on the GPU with a plane
-     readback (what the zero-copy readback arm does) would be the way to
-     several times that. OPEN.
+     SPEED, 8192 × 4096 from the NAS, graded, as found: NVENC 3.5 fps,
+     ProRes HQ 3.9, libx265 1.5 (the Mac: 15).
+     **THE PORTABLE 10-BIT LOOP FEEDS PLANES ON WINDOWS (same day).** Where
+     a frame's time went (the loop now logs it every 30 frames, "export
+     perf: decode / gpu / readback / encode"): readback 145 to 173 ms (the
+     frame left the GPU as RGBA64, 268 MB, with a per-pixel alpha strip to
+     RGB48), encode 39 ms (swscale RGB48 → P010, then NVENC; ProRes 63),
+     decode 13 ms from the page cache and 33 from the NAS, GPU submits 12.
+     Three changes, all in `export_fisheye_inner`'s 10-bit readback arm and
+     what it calls, Windows only (`cfg!(target_os = "windows")`; the Mac's
+     arms and its software fallbacks are as they were):
+     (1) **Planes, not RGB48** (`PlaneFeed`): an encoder that takes P010
+     (hevc_nvenc) or planar 4:2:2 (ProRes, `prores_ks_vulkan` and the CPU
+     one) gets `compose_sbs_to_p010_textures` / `_p210_textures` (video
+     range) read back with `read_texture_planar` and fed through
+     `encode_frame_p010` / `encode_frame_yuv422p10_msb` — the Windows
+     zero-copy readback arm's own compose and encoder calls. libx265, 8-bit
+     and a single-eye frame keep RGB48 + swscale.
+     (2) **The encoder on its own thread** (`encode::EncodeStage::on_thread`,
+     fed `PlaneFrame`s with their fill count through a queue of two; it
+     derefs to the `ExportEncoder` when in line, so every other call in the
+     loop reads as before; `finish` joins it; a cancel closes the file as
+     in line). `VR180_ENCODE_INLINE=1` keeps it in line: same file.
+     (3) **A raw take is read ahead** (`X6RawIter::with_read_ahead`, on for
+     the export's opener on Windows; `VR180_RAW_READ_AHEAD=0` reads in
+     line): a thread with its own handle on the capture reads and unpacks
+     pairs two ahead (buffers recycled), `next_pair` only uploads and
+     demosaics; a seek starts it over. No GPU on that thread.
+     Also `read_texture_planar` copies a plane of 8 MB or more on up to
+     four threads (a 34 MB chroma plane: 7 → 3.7 ms; the zero-copy readback
+     arm uses it too; same bytes).
+     MEASURED, 8192 × 4096, same take: graded (tone + sharpening) NVENC
+     3.5 → 10.1 fps, ProRes HQ 3.5 → 10.1; default development NVENC 4.2 →
+     14.8. Per frame now, graded: decode 7 ms (upload + demosaic submit),
+     gpu 13, readback 60 (about 50 of it the wait for the frame's GPU work,
+     the raw grade itself), encode 0. Blackmagic RAW rides the same loop
+     (quarter-scale decode, 4096 × 2048): NVENC 10.3 fps and ProRes 15.8
+     where libx265 does 4.3; so does any source that falls off its
+     zero-copy arm (an Osmo clip forced there, 3072 × 1536: 6.9 fps with
+     NVENC, the software decode being its cost) and the D3D12 fallback.
+     CHECKED: the plane feed against the GPU-resident NVENC arm on an Osmo
+     clip and on the dropped-frame X6 clip, signed difference under 0.004
+     of 255 (the same compose); against the zero-copy ProRes arm under
+     0.002; a raw take against the RGB48 route it replaces +0.03 / 0.00 /
+     +0.05 (ProRes under 0.01); against the libx265 route −0.1 / −0.03 /
+     −0.1 on every source, the known distance between swscale and the GPU
+     compose. The dropped-frame clip: 100 frames at 50 fps, one pts delta,
+     audio in step. Raw lens frame and reframed view through the planes
+     (the reference frame is drawn as before). Encoder on its thread
+     against in line, and read-ahead against in-line reading: byte-identical
+     files. A cancel after 40 frames leaves a 40-frame file that decodes.
+     The regression matrix (every arm that does not ride this feed) is
+     byte-identical. NOT measured: a raw export from the GUI itself (the
+     harness runs the same `export_fisheye` on the app's dedicated device).
+     **MAC SIDE**: nothing changes there; the read-ahead and the encoder
+     thread are plain Rust and could be switched on for the Mac's loops
+     after a check on that machine.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
