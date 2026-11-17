@@ -2686,6 +2686,29 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      correction, same take with those 3 ms: top of the frame 0.54 → 0.13,
      middle 0.15 → 0.06, reversed 1.14. ASKED OF THE CAMERA SIDE: the
      shutter time of every frame (and the gyro's lag if known).
+     ANSWERED the same evening (their note beside the takes): a later
+     camera build writes `exposure.csv` beside the capture, header
+     `request,cam0_exposure_ns,cam1_exposure_ns`, the integration time of
+     each eye in ns, rows only for pairs that were written, an eye's
+     value left empty when the sensor did not report it (`seal.json`
+     counts such pairs in `exposure_missing_pairs`); row `r`'s
+     mid-exposure = that eye's stamp + `r × line_period_ns` + half its
+     integration time; zero, empty or no file = unknown, the old rule.
+     Checked on their side against the sensor's own reported exposure
+     (58 eye frames, then 140 on a 50p take where it ran 8.66–12.60 ms).
+     IN THE APP: `x6b::read_exposures`, `build_imu` adds half the frame's
+     own time to `stamp + readout / 2` (channel 0's value, the other
+     eye's when that one is empty; nothing for a frame without one); the
+     log says the range in use or that there is no record. NOT YET RUN ON
+     A REAL TAKE: their two test takes (…-194416, …-194644) are on the
+     camera's card, not on the share. STILL OPEN: the gyro's own lag
+     (their words: the sensor service's stamps, filter delay unmeasured;
+     the 1.1 ms of the camera's own files and this unit's fitted axes
+     are not to be taken as constants for every unit) — with a take that
+     has `exposure.csv` it can be measured as the fitted offset minus
+     half the shutter (`raw_gyro_flow.py`). For the takes already shot
+     they agree no shutter time can be recovered and no uniform 3 ms
+     should be filled in.
      Diagnostics: `VR180_IMU_PHASE_OFFSET_MS`, `VR180_RS_SCALE`,
      `VR180_INSV_BASIS`, `VR180_LOCK_REF_FRAME`.
    - **Demosaic** (2026-11-16; `bayer.rs` = the specification and the CPU
@@ -3080,10 +3103,11 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      the eyes uploaded again after the filter the same frame differs by
      0.9 / 255, the filter's own effect. Rule: whatever hands a raw
      take's frames to the export must hand them as GPU pairs.
-   - **Not done**: the shutter time is not in a take, so the pose is
-     sampled half a shutter (plus the gyro's lag) early (Motion and
-     timing); takes of the earlier camera build have neither readout nor
-     accelerometer; raw clips are not in stereo auto-align; the
+   - **Not done**: takes shot before the camera wrote `exposure.csv`
+     have no shutter time, so their pose is sampled half a shutter (plus
+     the gyro's lag) early (Motion and timing); the gyro's lag is not
+     known for any take; takes of the earliest camera build have neither
+     readout nor accelerometer; raw clips are not in stereo auto-align; the
      development panel, the DNG snapshot and the DNG sequence option have
      not been seen running on a display yet.
    - **WINDOWS**: shared code; the only gate touched is the pair moved into

@@ -398,6 +398,12 @@ pub struct CaptureTiming {
 /// after the stamp, that is 2.7–3.6 ms beyond half the readout. That rest
 /// is half the shutter time plus whatever the gyro's stamps lag by; the
 /// take states neither, so neither is added here.
+///
+/// Takes of a later camera build list each frame's integration time
+/// (`exposure.csv`, [`x6b::read_exposures`]). [`build_imu`] adds half of it,
+/// frame by frame, to the time above: the centre row's mid-exposure, which
+/// is the content time. What then remains is the gyro's own lag, which no
+/// file states.
 pub fn capture_timing(take: &Take) -> CaptureTiming {
     let readout_ms = x6b::read_sensor_readout(take).map(|eyes| (eyes[0].first_to_last_row_ns * 1e-6) as f32);
     CaptureTiming { readout_ms, stamp_to_content_ms: readout_ms.map_or(0.0, |r| r as f64 * 0.5) }
@@ -506,12 +512,20 @@ pub fn build_imu(index: &TakeIndex, stream_w: u32, stream_h: u32) -> DjiOsvImu {
     let line = crate::insv_imu::QuatTimeline { t_s: gyro.iter().map(|g| g.t_ns as f64 * 1e-9).collect(), quats: &quats };
     let frame_dur = index.dt_s();
     let lead = timing.stamp_to_content_ms * 1e-3;
+    // Each frame's integration time, where the take lists it: half of it
+    // takes the sample from the centre row's start to its mid-exposure. A
+    // frame the list has no value for keeps the row's start.
+    let shutters = x6b::read_exposures(&take.dir);
+    let half_shutter_s = |p: &PairEntry, channel: usize| -> Option<f64> {
+        let eyes = shutters.get(&p.request)?;
+        eyes[channel].or(eyes[1 - channel]).map(|ns| ns as f64 * 0.5e-9)
+    };
     let fill = |channel: usize, to: &mut DjiOsvImu| {
         to.frame_quats.clear();
         to.high_rate_quats.clear();
         to.gravity.clear();
         for p in &index.pairs {
-            let tc = p.exposure_ns[channel] as f64 * 1e-9 + lead;
+            let tc = p.exposure_ns[channel] as f64 * 1e-9 + lead + half_shutter_s(p, channel).unwrap_or(0.0);
             to.frame_quats.push(line.at(tc));
             let start = tc - frame_dur * 0.5;
             let n = crate::insv_imu::HR_PER_FRAME;
@@ -532,6 +546,15 @@ pub fn build_imu(index: &TakeIndex, stream_w: u32, stream_h: u32) -> DjiOsvImu {
             Some(r) => format!("readout {r:.3} ms, centre row {:.3} ms after the stamp", timing.stamp_to_content_ms),
             None => "no readout record".to_string(),
         });
+    // The shutter times in use, or that the take has none.
+    let known: Vec<f64> = index.pairs.iter().filter_map(|p| half_shutter_s(p, 0)).map(|h| h * 2e3).collect();
+    if known.is_empty() {
+        tracing::info!("raw take {}: no shutter record, the pose is sampled where the centre row starts exposing", take.dir.display());
+    } else {
+        let (lo, hi) = known.iter().fold((f64::MAX, 0f64), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+        tracing::info!("raw take {}: shutter {lo:.3}–{hi:.3} ms from the take for {} of {} frames, the pose is sampled at the centre row's mid-exposure",
+            take.dir.display(), known.len(), index.pairs.len());
+    }
     if first > f0 || last < f1 {
         tracing::warn!("raw take {}: the gyro does not cover every frame; the uncovered ones hold the nearest pose", take.dir.display());
     }
@@ -1137,6 +1160,46 @@ mod tests {
         take.sensor_metadata = Some("sensor-metadata.json".into());
         let t = capture_timing(&take);
         assert!((t.readout_ms.unwrap() - 14.556208).abs() < 1e-5 && (t.stamp_to_content_ms - 7.278104).abs() < 1e-5, "{t:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A take that lists its frames' integration times is sampled half a
+    /// shutter later than one that does not: the centre row's mid-exposure.
+    /// A frame the list has no value for keeps the row's start.
+    #[test]
+    fn a_listed_shutter_time_moves_the_sample_to_mid_exposure() {
+        let dir = std::env::temp_dir().join(format!("vr180-take-shutter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hz = 19_200_000u64;
+        // A camera turning at one radian a second about one axis, two seconds of it.
+        let gyro: String = std::iter::once("counter_ticks,x,y,z\n".to_string())
+            .chain((0..2000u64).map(|i| format!("{},1.0,0,0\n", i * hz / 1000))).collect();
+        std::fs::write(dir.join(x6b::GYRO_FILE), gyro).unwrap();
+        let eye = r#"{"bayer_output_wh":[3840,3840],"line_period_ns":4000.0,"rolling_shutter_first_to_last_row_ns":15356000}"#;
+        std::fs::write(dir.join("sensor-metadata.json"), format!(r#"{{"eyes":{{"CAM0":{eye},"CAM1":{eye}}}}}"#)).unwrap();
+        let take = Take {
+            dir: dir.clone(), fps_setting: 50, width: 3840, height: 3840,
+            clock_start: Some(x6b::ClockAnchor { counter_ticks: 0, counter_hz: hz, ..Default::default() }),
+            audio_file: None, audio_timing: None, sensor_metadata: Some("sensor-metadata.json".into()),
+            seal: x6b::Seal { fps_setting: 50, request_window: (10, 13), received_pairs: 4, pairs: 4, bytes: 4 * 8192 },
+            capture_bytes: 4 * 8192,
+        };
+        let pair = |request: u32| PairEntry {
+            request, offset: 0, len: 8192, profile: x6b::Profile::ALL[0],
+            exposure_ns: [500_000_000 + 20_000_000 * (request as u64 - 10), 500_000_000 + 20_000_000 * (request as u64 - 10)],
+        };
+        let index = TakeIndex::new(take, (10..14).map(pair).collect());
+        // How far the camera has turned at each frame's sample, radians.
+        let turned = |imu: &DjiOsvImu| -> Vec<f64> { imu.frame_quats.iter().map(|q| 2.0 * (q.w as f64).abs().min(1.0).acos()).collect() };
+        let plain = turned(&build_imu(&index, 3840, 3840));
+        // Half the readout after each stamp: 0.5 s + 7.678 ms, then 20 ms a frame.
+        assert!((plain[0] - 0.507_678).abs() < 2e-4 && (plain[3] - plain[0] - 0.060).abs() < 2e-4, "{plain:?}");
+        // Ten milliseconds for request 10, twelve for 11 (one eye only), none for 12, nothing listed for 13.
+        std::fs::write(dir.join(x6b::EXPOSURE_FILE), "request,cam0_exposure_ns,cam1_exposure_ns\n10,10000000,10000000\n11,,12000000\n12,0,\n").unwrap();
+        let listed = turned(&build_imu(&index, 3840, 3840));
+        let later: Vec<f64> = listed.iter().zip(&plain).map(|(a, b)| a - b).collect();
+        assert!((later[0] - 0.005).abs() < 2e-4 && (later[1] - 0.006).abs() < 2e-4 && later[2].abs() < 2e-4 && later[3].abs() < 2e-4, "{later:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

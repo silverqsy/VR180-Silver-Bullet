@@ -79,6 +79,7 @@ pub const GYRO_FILE: &str = "gyro.csv";
 pub const GYRO_INFO_FILE: &str = "gyro-info.json";
 pub const ACCEL_FILE: &str = "accel.csv";
 pub const ACCEL_INFO_FILE: &str = "accel-info.json";
+pub const EXPOSURE_FILE: &str = "exposure.csv";
 /// The index of a folder that holds a take's frames as DNG files (one line
 /// per pair) in place of the capture.
 pub const FRAMES_FILE: &str = "frames.jsonl";
@@ -723,6 +724,25 @@ fn read_motion(file: &Path, counter_hz: u64) -> Result<Vec<GyroSample>> {
     Ok(out)
 }
 
+/// The integration time of every written pair's two eyes, nanoseconds, by
+/// request number: `exposure.csv` (`request,cam0_exposure_ns,
+/// cam1_exposure_ns`). An eye whose value is empty or zero is not known
+/// (`None`). Empty for a take without the file: takes of camera builds
+/// that did not record it.
+pub fn read_exposures(dir: &Path) -> std::collections::HashMap<u32, [Option<u64>; 2]> {
+    let Ok(text) = std::fs::read_to_string(dir.join(EXPOSURE_FILE)) else { return Default::default() };
+    let mut out = std::collections::HashMap::new();
+    for line in text.lines() {
+        let mut cols = line.split(',');
+        let Some(Ok(request)) = cols.next().map(|v| v.trim().parse::<u32>()) else { continue };
+        // A second is far beyond any frame's exposure: such a value is no reading.
+        let mut eye = || cols.next().and_then(|v| v.trim().parse::<u64>().ok()).filter(|ns| *ns > 0 && *ns < 1_000_000_000);
+        let (cam0, cam1) = (eye(), eye());
+        out.insert(request, [cam0, cam1]);
+    }
+    out
+}
+
 /// One eye's row timing, as the take's sensor record states it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EyeReadout {
@@ -1120,6 +1140,12 @@ mod tests {
         std::fs::write(dir.join("sensor-metadata.json"), record(eye(4000.0, 15356000, 4096), eye(4000.0, 15356000, 3840))).unwrap();
         assert!(read_sensor_readout(&take).is_none());
         take.sensor_metadata = None;
+        // The integration times: by request, an eye left empty or at zero is unknown; no file, nothing.
+        assert!(read_exposures(&dir).is_empty());
+        std::fs::write(dir.join(EXPOSURE_FILE), "request,cam0_exposure_ns,cam1_exposure_ns\n191,8660735,8660734\n192,12596735,\n193,0,9000000\nbroken,1,2\n194,5000000000,7\n").unwrap();
+        let e = read_exposures(&dir);
+        assert_eq!(e.len(), 4);
+        assert_eq!((e[&191], e[&192], e[&193], e[&194]), ([Some(8_660_735), Some(8_660_734)], [Some(12_596_735), None], [None, Some(9_000_000)], [None, Some(7)]));
         take.audio_timing = Some("audio-info.json".into());
         std::fs::write(dir.join("audio-info.json"), r#"{"version":2,"file":"audio.aac","source":"ambisonic","channels":4,"codec_delay_samples":2048,"trailing_padding_samples":384,"sample_rate_hz":48000,"sample_frames":1142400,"first_sample_counter_ns":372569353830,"anchors":[{"sample_index":960,"counter_ns":372589353830}]}"#).unwrap();
         let t = read_audio_timing(&take).unwrap();
