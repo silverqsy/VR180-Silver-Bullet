@@ -2396,6 +2396,48 @@ fn open_zero_copy_sink(
     Ok((encoder, if ten_bit { FrameSink::WideSurface { p210: is_prores } } else { FrameSink::BgraSurface }))
 }
 
+/// The per-row rolling-shutter correction of an export: on whenever a source
+/// with a per-frame IMU is stabilized (per-frame stabilization alone cannot
+/// reach the shear inside a frame), with the readout the source states, or
+/// the one its frame rate implies (wrong readout → wrong phase → loose
+/// stabilization in fast motion). `src_h`: the rows of one eye as the
+/// projection samples it.
+fn export_row_readout(
+    cfg: &FisheyeExportConfig,
+    imu: Option<&vr180_fisheye::DjiOsvImu>,
+    src_h: u32,
+) -> Option<crate::render::RowReadout> {
+    let on = cfg.stabilize && cfg.source_kind.has_frame_imu() && imu.is_some();
+    on.then(|| crate::render::RowReadout {
+        readout_s: crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, imu) / 1000.0,
+        src_h,
+        fps: cfg.fps,
+    })
+}
+
+/// Both eyes of a frame whose pictures are 16-bit textures on the GPU (the
+/// Windows zero-copy decoders' eyes, imported), projected at 16 bits into
+/// the outputs kept for slots 30 / 31: an export's own, apart from a
+/// preview's 0 / 1.
+#[cfg(target_os = "windows")]
+fn project_texture_eyes_16(
+    pipeline: &Device,
+    left: &wgpu::Texture,
+    right: &wgpu::Texture,
+    job: &EyeJob,
+) -> Result<(wgpu::Texture, wgpu::Texture)> {
+    let (rows_l, rows_r) = job.rows();
+    let (view_l, view_r) = (left.create_view(&Default::default()), right.create_view(&Default::default()));
+    let eye = |view, rot, calib, rows, slot| {
+        EyeProjection::new(EyePicture::Rgba(view), job.eye_w, job.eye_h, rot, calib)
+            .wide().fisheye_out(job.fisheye_out()).rs_rows(rows).slot(slot)
+    };
+    pipeline.project_eyes(
+        &eye(&view_l, job.pose.rot_left, job.calib_left, rows_l, 30),
+        Some(&eye(&view_r, job.pose.rot_right, job.calib_right, rows_r, 31)),
+    )
+}
+
 /// The frame loop of a fisheye export, from the opened decoder to the
 /// finished file: calibration, stabilization, trim, the encoder, then for
 /// every frame its pose, both eyes projected, graded, composed and encoded,
@@ -2473,14 +2515,7 @@ fn run_fisheye_frames<F: FrameFeed>(
     );
 
     // ── Per-row rolling-shutter correction ───────────────────────
-    // On whenever a source with a per-frame IMU is stabilized: per-frame
-    // stabilization alone cannot reach the shear inside a frame. The
-    // readout follows the frame rate (wrong readout → wrong phase → loose
-    // stabilization in fast motion).
-    let rs_enabled = cfg.stabilize
-        && cfg.source_kind.has_frame_imu()
-        && dji_osv_imu.is_some();
-    let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
+    let row_readout = export_row_readout(cfg, dji_osv_imu.as_ref(), src_h);
 
     // ── Open the encoder ─────────────────────────────────────────
     // The frame: two eyes side by side, or the one eye of a single-eye source.
@@ -2493,7 +2528,7 @@ fn run_fisheye_frames<F: FrameFeed>(
     let one_pass = one_pass_audio_eligible(cfg);
     let video_tmp = if one_pass { cfg.output_path.clone() }
                     else { video_only_temp_path(&cfg.output_path) };
-    let (mut encoder, sink) = open_sink(&video_tmp, sbs_w, sbs_h, rs_enabled.then_some(readout_s))?;
+    let (mut encoder, sink) = open_sink(&video_tmp, sbs_w, sbs_h, row_readout.map(|r| r.readout_s))?;
 
     // Inline audio passthrough — must attach before the first frame.
     let one_pass_audio_tmp = if one_pass {
@@ -2607,8 +2642,7 @@ fn run_fisheye_frames<F: FrameFeed>(
         // stabilizing a source with an IMU, its per-row matrices (<200 KB
         // at 3840 rows, built on the CPU).
         let pose = crate::render::FramePose::new(
-            rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes, &cfg.view_adjust,
-            rs_enabled.then_some(crate::render::RowReadout { readout_s, src_h, fps: cfg.fps }),
+            rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes, &cfg.view_adjust, row_readout,
         );
         let job = EyeJob {
             src_w, src_h, eye_w: cfg.eye_w, eye_h: cfg.eye_h, pose: &pose,
@@ -4053,8 +4087,8 @@ fn export_fisheye_osv_zerocopy_d3d11(
 
     // ── Per-eye calib + stab from the OSV protobuf (same as portable) ──
     let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = resolve_export_imu(&cfg);
-    let (calib_left, calib_right) =
-        resolve_calib_pair(&cfg, src_w, src_h, dji_osv_imu.as_ref());
+    let source_calib = resolve_source_calib_pair(&cfg, src_w, src_h, dji_osv_imu.as_ref());
+    let (calib_left, calib_right) = view_calib_pair(&cfg, source_calib);
 
     // WHOLE-CHAIN frame count — a merged recording's stab table must cover
     // every segment (probing source_path alone = segment 0 only, which
@@ -4114,7 +4148,7 @@ fn export_fisheye_osv_zerocopy_d3d11(
     let color_plan = cfg.color_stack.clone();
     // Automatic eye-exposure matching (X6): GPU-resident state for this stream.
     let eye_match_state = pipeline.create_eye_match_state();
-    let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
+    let row_readout = export_row_readout(&cfg, dji_osv_imu.as_ref(), src_h);
 
     // ── 3-stage pipeline ───────────────────────────────────────────
     // The serial path summed decode + GPU + encode per frame; at native
@@ -4285,24 +4319,15 @@ fn export_fisheye_osv_zerocopy_d3d11(
             .as_ref()
             .and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(EquirectRotation::IDENTITY);
-        let (rot_l0, rot_r0) = crate::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes);
-        let (rot_left, rot_right) = if cfg.view_adjust.is_identity() {
-            (rot_l0, rot_r0)
-        } else {
-            let (v_l, v_r) = cfg.view_adjust.per_eye_matrices();
-            (
-                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
-                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
-            )
+        // Each eye's rotation (stab, then the view adjustment) and, when
+        // stabilizing, its per-row matrices.
+        let pose = crate::render::FramePose::new(
+            rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes, &cfg.view_adjust, row_readout,
+        );
+        let job = EyeJob {
+            src_w, src_h, eye_w: cfg.eye_w, eye_h: cfg.eye_h, pose: &pose,
+            calib_left, calib_right, source_calib, projection: cfg.projection, mono: false,
         };
-
-        // Per-row rolling-shutter matrices (only when stabilizing). Same
-        // lens_a mount quat for both eyes — matches the preview.
-        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if cfg.stabilize {
-            dji_osv_imu.as_ref().map(|osv| crate::dji_imu::per_eye_rs_rows(
-                osv, stab_idx, readout_s, src_h, cfg.fps, cfg.fisheye_swap_eyes,
-            )).unwrap_or((None, None))
-        } else { (None, None) };
 
         // All GPU work for this frame, errors captured so we can shut the
         // pipeline down cleanly rather than unwinding past the join.
@@ -4322,44 +4347,9 @@ fn export_fisheye_osv_zerocopy_d3d11(
                 }
             };
 
-            // KB projection (RS variant when stabilizing; same
-            // (projection, rs) split as the GPU-resident + macOS p010
-            // paths). Slots 30/31 keep the export's cached output
-            // textures distinct from preview 0/1.
-            let (left16, right16) = match (cfg.projection, rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, Some(rs_l), Some(rs_r)) => (
-                    pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 30,
-                    )?,
-                    pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 31,
-                    )?,
-                ),
-                (FisheyeExportProjection::HalfEquirect | FisheyeExportProjection::Reframe { .. }, _, _) => (
-                    pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30,
-                    )?,
-                    pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31,
-                    )?,
-                ),
-                (FisheyeExportProjection::Fisheye, Some(rs_l), Some(rs_r)) => (
-                    pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 30,
-                    )?,
-                    pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 31,
-                    )?,
-                ),
-                (FisheyeExportProjection::Fisheye, _, _) => (
-                    pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30,
-                    )?,
-                    pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31,
-                    )?,
-                ),
-            };
+            // Both eyes through the projection every arm uses (its per-row
+            // build when the pose has rows for both).
+            let (left16, right16) = project_texture_eyes_16(&pipeline, &l_tex, &r_tex, &job)?;
 
             // 16-bit color stack per eye.
             let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
@@ -4554,7 +4544,8 @@ fn export_fisheye_osv_gpu_resident(
     );
 
     let dji_osv_imu: Option<vr180_fisheye::DjiOsvImu> = resolve_export_imu(&cfg);
-    let (calib_left, calib_right) = resolve_calib_pair(&cfg, src_w, src_h, dji_osv_imu.as_ref());
+    let source_calib = resolve_source_calib_pair(&cfg, src_w, src_h, dji_osv_imu.as_ref());
+    let (calib_left, calib_right) = view_calib_pair(&cfg, source_calib);
 
     // WHOLE-CHAIN frame count — a merged recording's stab table must cover
     // every segment (probing source_path alone = segment 0 only, which
@@ -4637,7 +4628,7 @@ fn export_fisheye_osv_gpu_resident(
     let color_plan = cfg.color_stack.clone();
     // Automatic eye-exposure matching (X6): GPU-resident state for this stream.
     let eye_match_state = pipeline.create_eye_match_state();
-    let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, dji_osv_imu.as_ref()) / 1000.0;
+    let row_readout = export_row_readout(&cfg, dji_osv_imu.as_ref(), src_h);
 
     // Decode sub-thread (D3D11/NVDEC only — never touches CUDA/wgpu), so the
     // ~10 ms decode overlaps the GPU compose + NVENC encode on this thread.
@@ -4684,59 +4675,20 @@ fn export_fisheye_osv_gpu_resident(
             timeline.as_ref(), stab_idx, sp.pts_s, t_in, written, total_frames_to_write);
         let rot = stab_rotations.as_ref().and_then(|v| v.get(stab_idx).copied())
             .unwrap_or(EquirectRotation::IDENTITY);
-        let (rot_l0, rot_r0) = crate::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes);
-        let (rot_left, rot_right) = if cfg.view_adjust.is_identity() {
-            (rot_l0, rot_r0)
-        } else {
-            let (v_l, v_r) = cfg.view_adjust.per_eye_matrices();
-            (
-                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
-                EquirectRotation(crate::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
-            )
+        // Each eye's rotation (stab, then the view adjustment) and, when
+        // stabilizing, its per-row matrices.
+        let pose = crate::render::FramePose::new(
+            rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes, &cfg.view_adjust, row_readout,
+        );
+        let job = EyeJob {
+            src_w, src_h, eye_w: cfg.eye_w, eye_h: cfg.eye_h, pose: &pose,
+            calib_left, calib_right, source_calib, projection: cfg.projection, mono: false,
         };
-        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if cfg.stabilize {
-            dji_osv_imu.as_ref().map(|osv| crate::dji_imu::per_eye_rs_rows(
-                osv, stab_idx, readout_s, src_h, cfg.fps, cfg.fisheye_swap_eyes,
-            )).unwrap_or((None, None))
-        } else { (None, None) };
 
         // Import + project + color (same as the readback path).
         let l_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.left) };
         let r_tex = unsafe { ctx.import_rgba16(&pipeline.device, &sp.right) };
-        let (left16, right16) = if cfg.projection == FisheyeExportProjection::Fisheye {
-            // Normalized fisheye SBS output (slots 32/33 so the cache doesn't
-            // collide with the equirect slots). RS-corrected when stabilizing —
-            // same (projection, rs) split as the macOS p010 export path.
-            if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                (
-                    pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 32)?,
-                    pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 33)?,
-                )
-            } else {
-                (
-                    pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                        &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 32)?,
-                    pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                        &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 33)?,
-                )
-            }
-        } else if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-            (
-                pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                    &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, rs_l, 30)?,
-                pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                    &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, rs_r, 31)?,
-            )
-        } else {
-            (
-                pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                    &l_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_left, calib_left, 30)?,
-                pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                    &r_tex, src_w, src_h, cfg.eye_w, cfg.eye_h, rot_right, calib_right, 31)?,
-            )
-        };
+        let (left16, right16) = project_texture_eyes_16(&pipeline, &l_tex, &r_tex, &job)?;
         let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
             &left16, &right16, cfg.eye_w, cfg.eye_h, &color_plan,
             Some((&eye_match_state, EyeMatchFrame::default())),

@@ -3482,12 +3482,51 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
        rest); the nine `fisheye_*_to_*` projection shader files are builds
        of `shaders/fisheye_project.wgsl` (`shader_compose.rs`,
        `gpu/projection.rs`); the `project_fisheye_*` entry points are
-       `project_eye` / `project_eyes`, the four
-       `project_fisheye_rgba16_texture_*` wrappers staying for the Windows
-       arms; `timeline_frames_or` is `frame_timeline::frames_or`.
+       `project_eye` / `project_eyes` (the four
+       `project_fisheye_rgba16_texture_*` wrappers the Windows arms kept
+       are gone too, last bullet); `timeline_frames_or` is
+       `frame_timeline::frames_or`.
      - The preview probe is part of the app (`VR180_PREVIEW_PROBE=<clip>`,
        `decoder/preview_probe.rs`, taken in `main.rs` before the log
        opens): comparing previews no longer means putting it into a tree.
+   - **THE THREE WINDOWS ARMS MOVED (2026-11-17, Windows box, on `main`).**
+     First the pull: `main` @ `1d27309` builds, tests core 63, fisheye 69,
+     braw 6, pipeline 233, gui 39 (243 and 42 with the ignored GPU ones),
+     and the 61 exports of the A/B set are the stored ones, stream for
+     stream. Then the item left open above:
+     - The D3D11 zero-copy preview (`run_fisheye_zerocopy`) and the two
+       D3D11 exports (`export_fisheye_osv_zerocopy_d3d11`,
+       `export_fisheye_osv_gpu_resident`) pose a frame with
+       `render::FramePose::new` and project it with `project_eyes`, as the
+       Mac's zero-copy arms do. The two exports build the `EyeJob` the
+       shared loop builds (calibrations from `resolve_source_calib_pair` +
+       `view_calib_pair`) and share one helper,
+       `fisheye_export::project_texture_eyes_16` (an imported 16-bit eye
+       pair, outputs kept in slots 30 / 31; the GPU-resident arm's fisheye
+       output used 32 / 33, which made no difference to a picture).
+     - The rule for the per-row correction is one function,
+       `fisheye_export::export_row_readout` (a stabilized source with a
+       per-frame IMU, the readout from `readout_ms_for`), read by
+       `run_fisheye_frames` and by both arms. The arms asked `cfg.stabilize`
+       alone; the two say the same, since only the kinds with a per-frame
+       IMU get one from `resolve_export_imu`.
+     - `raw_gpu::raw_reference` asks `project_eye` as well, so the four
+       `project_fisheye_rgba16_texture_*` wrappers are deleted. No kernel,
+       no shader and no macOS-gated line was touched (one comment in
+       `p010_resolve_rgba16.wgsl`).
+     - CHECKED against the stored set and against the build before the
+       change: the 61 exports byte-identical per stream, with the same 38
+       engagements of a fast arm; the 36 preview-probe cases print the same
+       lines (the zero-copy workers engaged in both); tests pipeline 243,
+       gui 42, on D3D12 232 of 233 (the lens frame's outermost pixels, as
+       before); the app opens an X6 clip and an Osmo clip on the zero-copy
+       preview and plays them at its cadence.
+     - What the Windows arms still carry of their own: the three loops
+       themselves (decode thread, import, the encode tails), their
+       stabilization table and trim. `run_fisheye_frames` now has the plane
+       feed and the encoder thread, so the D3D11 readback arm could become
+       a `FrameFeed` of it; the GPU-resident arm's ring of shared frames
+       has no counterpart there. Not started.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

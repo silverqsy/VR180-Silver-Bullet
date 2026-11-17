@@ -5241,7 +5241,7 @@ impl Device {
     /// `crate::interop_macos::wgpu_texture_from_iosurface_plane`) instead of one
     /// combined P010 texture sampled through plane-aspect views. Same shader and
     /// box-downscale math — it's the macOS zero-copy preview prefilter, pairing
-    /// with the `project_fisheye_rgba16_texture_to_*` family so the projection
+    /// with the 16-bit projection (`project_eye` of an RGBA picture) so it
     /// minifies only mildly (no luma moiré / chroma fringing) at the working res.
     /// `src_w`/`src_h` are the native P010 (Y-plane) dims; `out_w`/`out_h` the
     /// working preview res.

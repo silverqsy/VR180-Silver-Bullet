@@ -3,7 +3,7 @@
 //! fisheye projection kernels sample like any other 16-bit source
 //! (`shaders/bayer_demosaic.wgsl`).
 
-use crate::gpu::{Device, EquirectRotation, FisheyeCalib};
+use crate::gpu::{Device, EquirectRotation, EyePicture, EyeProjection, FisheyeCalib};
 use crate::{Error, Result};
 
 const BAYER_MEASURE_WGSL: &str = include_str!("shaders/bayer_measure.wgsl");
@@ -978,14 +978,13 @@ impl Device {
         let side = RAW_REFERENCE_SIDE;
         let mut drawn = Vec::with_capacity(eyes.len());
         for (n, eye) in eyes.iter().enumerate() {
-            let (sw, sh) = (eye.src.width(), eye.src.height());
-            let slot = slot + n as u32;
-            drawn.push(match eye.rows.filter(|rows| !rows.is_empty()) {
-                Some(rows) => self.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                    eye.src, sw, sh, side, side, eye.rotation, eye.calib, rows, slot)?,
-                None => self.project_fisheye_rgba16_texture_to_equirect_16(
-                    eye.src, sw, sh, side, side, eye.rotation, eye.calib, slot)?,
-            });
+            let view = eye.src.create_view(&Default::default());
+            drawn.push(self.project_eye(
+                &EyeProjection::new(EyePicture::Rgba(&view), side, side, eye.rotation, eye.calib)
+                    .wide()
+                    .rs_rows(eye.rows.filter(|rows| !rows.is_empty()))
+                    .slot(slot + n as u32),
+            )?);
         }
         // A half-equirect eye is π radians wide; the frame is its eyes side by side.
         let long_side = (std::f32::consts::PI * view_px_per_rad * eyes.len() as f32).round().max(1.0) as u32;

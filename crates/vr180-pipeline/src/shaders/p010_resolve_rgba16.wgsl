@@ -9,7 +9,7 @@
 // chroma is resolved before it can alias.
 //
 // Output is a plain Rgba16Unorm fisheye image at `out_w × out_h`, which the
-// downstream `project_fisheye_rgba16_texture_to_equirect_16` then projects
+// downstream 16-bit projection (`project_eye` of an RGBA picture) then takes
 // with a single bilinear tap (the box prefilter here means the projection's
 // minification is small enough that one tap no longer aliases).
 //

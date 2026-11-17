@@ -3449,98 +3449,48 @@ fn run_fisheye_zerocopy(
             );
         }
 
-        // Per-row rolling-shutter correction for THIS frame (DJI OSV). Computed
-        // whenever stabilize is on — RS is part of the OSV stab (gated on
-        // `stabilize`, not `rs_correct`), matching the CPU/paused-still path.
-        // `src_h` is the working-res fisheye height the projection samples; the
-        // same per-row quats apply to both eyes (one IMU). Without this the OSV
-        // rolling-shutter jello is uncorrected (the "broken" stab).
-        let swapped_eyes = control.settings.read().effective_swap_eyes();
-        let (rs_rows_l, rs_rows_r): (Option<Vec<f32>>, Option<Vec<f32>>) = if control.settings.read().stabilize {
-            dji_osv_imu.as_ref().map(|osv| vr180_pipeline::dji_imu::per_eye_rs_rows(
-                osv, stab_idx,
-                vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0,
-                src_h, fps, swapped_eyes,
-            )).unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-        let (rot_l0, rot_r0) = vr180_pipeline::dji_imu::per_eye_rotations(rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes);
-
-        let view_adjust = {
+        // Each eye's rotation (stab, then the view adjustment) and its
+        // per-row matrices: the rolling-shutter correction is part of the
+        // stabilization (gated on `stabilize`, not `rs_correct`), as on the
+        // CPU and paused-still paths. `src_h` is the working-res height the
+        // projection samples.
+        let (swapped_eyes, stabilize, view_adjust) = {
             let s = control.settings.read();
-            s.output_view_adjust()
+            (s.effective_swap_eyes(), s.stabilize, s.output_view_adjust())
         };
-        let (rot_left, rot_right) = if view_adjust.is_identity() {
-            (rot_l0, rot_r0)
-        } else {
-            let (v_l, v_r) = view_adjust.per_eye_matrices();
-            (
-                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_l0.0, &v_l)),
-                EquirectRotation(vr180_pipeline::panomap::mat3_mul_row_major(&rot_r0.0, &v_r)),
-            )
-        };
+        let vr180_pipeline::render::FramePose {
+            rot_left, rot_right, rows_left: rs_rows_l, rows_right: rs_rows_r,
+        } = vr180_pipeline::render::FramePose::new(
+            rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes, &view_adjust,
+            stabilize.then(|| vr180_pipeline::render::RowReadout {
+                readout_s: vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0,
+                src_h, fps,
+            }),
+        );
 
         let (left_tex, right_tex) = {
-            let s = control.settings.read();
-            let mode = s.fisheye_output_mode;
-            let aspect = s.reframe_aspect;
-            drop(s);
+            let (mode, aspect) = {
+                let s = control.settings.read();
+                (s.fisheye_output_mode, s.reframe_aspect)
+            };
             // Fisheye output is a CIRCLE in a SQUARE frame (per eye) or a
             // lens frame of its own size; a reframed view keeps the working
             // width and takes its aspect.
             let (ow, oh) = view_out_dims(mode, aspect, eye_w, eye_h, lens_dims);
+            let fisheye_out = mode == FisheyeOutputMode::Fisheye;
+            // The per-row correction works on the source ray, so it is the
+            // same for every output; both eyes take it or neither.
+            let (rows_l, rows_r) = vr180_pipeline::gpu::rows_for_both(rs_rows_l.as_deref(), rs_rows_r.as_deref());
             // The imported textures are already RGBA16 at the working res (the
             // D3D11 side did P010→RGBA16 + downscale), so project single-tap
             // straight from them — no luma moiré, no chroma colour-fringing.
-            match mode {
-                // Normalized fisheye SBS — match the GPU-resident export's
-                // Fisheye path EXACTLY so the preview previews what the export
-                // writes. When OSV stab is on, the same per-row RS correction
-                // as half-equirect (parity with the macOS p010 + CPU-worker
-                // fisheye paths, which have always applied RS here).
-                FisheyeOutputMode::Fisheye => {
-                    if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                        let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                            &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs_l, 0,
-                        )?;
-                        let r = pipeline.project_fisheye_rgba16_texture_to_fisheye_rs_16(
-                            &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs_r, 1,
-                        )?;
-                        (l, r)
-                    } else {
-                        let l = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                            &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, 0,
-                        )?;
-                        let r = pipeline.project_fisheye_rgba16_texture_to_fisheye_16(
-                            &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1,
-                        )?;
-                        (l, r)
-                    }
-                }
-                // Half-equirect VR180: when OSV stab is on use the RS variant so
-                // per-row rolling shutter is corrected (kills the jello); same
-                // per-row quats for both eyes.
-                FisheyeOutputMode::HalfEquirect | FisheyeOutputMode::Reframe => {
-                    if let (Some(rs_l), Some(rs_r)) = (rs_rows_l.as_deref(), rs_rows_r.as_deref()) {
-                        let l = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                            &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, rs_l, 0,
-                        )?;
-                        let r = pipeline.project_fisheye_rgba16_texture_to_equirect_rs_16(
-                            &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, rs_r, 1,
-                        )?;
-                        (l, r)
-                    } else {
-                        let l = pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                            &fh.l_tex, src_w, src_h, ow, oh, rot_left, calib_left, 0,
-                        )?;
-                        let r = pipeline.project_fisheye_rgba16_texture_to_equirect_16(
-                            &fh.r_tex, src_w, src_h, ow, oh, rot_right, calib_right, 1,
-                        )?;
-                        (l, r)
-                    }
-                }
-            }
+            let (view_l, view_r) = (fh.l_tex.create_view(&Default::default()), fh.r_tex.create_view(&Default::default()));
+            // Outputs kept in slots 0 / 1: the preview's two eyes.
+            let left = EyeProjection::new(EyePicture::Rgba(&view_l), ow, oh, rot_left, calib_left)
+                .wide().fisheye_out(fisheye_out).rs_rows(rows_l).slot(0);
+            let right = EyeProjection::new(EyePicture::Rgba(&view_r), ow, oh, rot_right, calib_right)
+                .wide().fisheye_out(fisheye_out).rs_rows(rows_r).slot(1);
+            pipeline.project_eyes(&left, Some(&right))?
         };
         let (pe_w, pe_h) = (left_tex.width(), left_tex.height());
         let auto_eye = control.settings.read().auto_eye_match;
@@ -3611,8 +3561,8 @@ fn retire_vt_pair(
 /// eye's P010 IOSurface planes are wrapped as wgpu textures aliasing the
 /// surface (no host download, no swscale — the win over the CPU
 /// `DualStreamFisheyeIter` path), box-downscaled to the working res with
-/// `resolve_p010_planes_to_rgba16`, then projected via the same
-/// `project_fisheye_rgba16_texture_to_*` family the Windows path uses. Decode
+/// `resolve_p010_planes_to_rgba16`, then projected with the same
+/// `project_eyes` request the Windows path makes. Decode
 /// is inline (no worker sub-thread) so the IOSurface textures never cross a
 /// thread — matching the proven macOS EAC zero-copy loop [`run_zero_copy`].
 #[cfg(target_os = "macos")]
@@ -4086,8 +4036,8 @@ fn upload_rgba8_for_preview(
 }
 
 /// Upload RGBA64 (four `u16` per pixel, row-major) into an `Rgba16Unorm`
-/// texture with TEXTURE_BINDING + COPY_DST — the input the
-/// `project_fisheye_rgba16_texture_*` projections sample.
+/// texture with TEXTURE_BINDING + COPY_DST — the input the 16-bit
+/// projections (`project_eye` of an RGBA picture) sample.
 fn upload_rgba16_for_preview(
     pipeline: &Device,
     rgba64: &[u16],
