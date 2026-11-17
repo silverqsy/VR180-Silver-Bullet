@@ -268,10 +268,15 @@ headset shows every pixel at its own angle.
 - **On Windows**, the NVIDIA encoder takes frames up to 8192 pixels a
   side. A lens frame without stabilization fits for an 8K clip (7680 ×
   3840, about 30 frames a second on an RTX 4090); the stabilized frame of
-  the same clip is 8448 × 4224 (8656 × 4328 for a GoPro `.360`) and is
-  encoded in software when the codec is H.265, at about 2 frames a second,
-  which the export bar and Export format say. ProRes stays on the GPU at
-  that size (about 15 frames a second).
+  the same clip is 8448 × 4224 (8656 × 4328 for a GoPro `.360`), which it
+  refuses. So on Windows the 8K choice, the default, writes that frame
+  scaled to **8192 × 4096**: the whole stabilized field, 3 % smaller than
+  recorded (5 % for a `.360`), through NVENC at about 25 frames a second.
+  The clip's own size is still there and keeps every pixel: as H.265 it is
+  encoded in software, at about 2 frames a second, which the export bar
+  and Export format say; as ProRes it stays on the GPU (about 15 frames a
+  second). On a Mac the hardware encoder takes the frame and nothing
+  changes.
 - **The preview is the export.** In Lens Space the preview draws the
   frame that is written: its shape, the stabilizer's margin, the crop mask
   where the export has it.

@@ -2728,10 +2728,31 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      8448 × 4224 as H.265 falls to libx265 on the zero-copy readback arm,
      2.1 fps, with the export-bar note and the Format window's note saying
      so; as ProRes HQ it stays on the GPU (`prores_ks_vulkan`), 14.9 fps.
-     There is no size in the list that keeps a stabilized 3840² lens frame
-     on NVENC (its 8K choice shows the frame as it is): OPEN, the user's
-     call — a copy fitted to 8192 × 4096 on Windows would cost 3 % of the
-     scale and bring 14 times the speed.
+     **THE 8K CHOICE HOLDS THAT FRAME TO THE ENCODER, WINDOWS ONLY (same
+     day, the user's call).** Where the hardware H.265 encoder has a frame
+     limit (`app.rs::hw_h265_side_limit`: 8192 off macOS, none on a Mac) and
+     the stabilized frame of an eye no larger than 4096 is past it, the 8K
+     choice (the default) asks for `lens_frame_held_dims`: the frame with
+     its margin scaled to 4096 on its longer side (3840² and the `.360`'s
+     3936²: 4096², 8192 × 4096 written; 3712² fits as it is and is not
+     touched). The size asked is then LARGER than the recording, which the
+     pipeline never enlarges: `fisheye_export::lens_frame_request` builds
+     the frame at the recording's size and holds the stabilized frame to the
+     size asked (`size_lens_frame`'s `reduced_to`), and without
+     stabilization writes the recorded frame; `resolve_lens_frame` and
+     `resolve_eac_lens_frame` both go through it. The clip's own size stays
+     8448 × 4224 (software H.265 with its note, GPU ProRes). The Format
+     window lists "8192 × 4096" for such a clip and says what it is
+     (`LENS_FRAME_HELD_NOTE`); the export bar shows the size written. On a
+     Mac nothing changes: the 8K choice of a 3840² eye is the frame as it
+     is, as before (the two tests that say so now read the platform).
+     Measured: X6 8K stabilized at the 8K choice, 8192 × 4096 through the
+     GPU-resident NVENC arm at 25.6 fps (the native 8448 × 4224: 2.1); lens
+     stated at 4096 / 4224 of the recording's focal; against the native
+     export of the same frames scaled down, mean |Δ| 0.6 of 255 with no
+     shift and the same share of picture in the frame; a `.360` likewise
+     (4328² held to 4096²). Exports that ask for the recording's size or
+     less are byte-identical to before.
    - Not done: no MV-HEVC lens frame, no crop mask on a full-view clip, no
      automatic mask sized to the stabilizer's corrections; the sharpen
      stage still fades towards the top and bottom rows of a lens frame
