@@ -2412,7 +2412,9 @@ fn export_fisheye_inner(
 
         frame_idx += 1;
         written += fill.copies();
-        if frame_idx % 30 == 0 {
+        // Only the 10-bit readback arm times its stages: the encoder's
+        // surfaces (macOS) and the 8-bit readback would log three zeros.
+        if frame_idx % 30 == 0 && !(t_gpu + t_read + t_encode).is_zero() {
             let n = frame_idx as u32;
             // `readback` holds the wait for the frame's GPU work; with the
             // encoder on its own thread `encode` is the wait for its queue.
