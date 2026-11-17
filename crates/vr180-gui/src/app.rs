@@ -2592,13 +2592,6 @@ fn takes_ilog(kind: vr180_pipeline::SourceKind, x6: Option<&X6ClipInfo>) -> bool
     kind == vr180_pipeline::SourceKind::Insta360Insv && x6.map_or(true, |x| x.ilog != Some(false))
 }
 
-/// [`takes_ilog`] for a file on disk, for a caller that holds no clip info
-/// (the preview probe).
-pub(crate) fn file_takes_ilog(kind: vr180_pipeline::SourceKind, path: &std::path::Path) -> bool {
-    let x6 = (kind == vr180_pipeline::SourceKind::Insta360Insv).then(|| X6ClipInfo::read(path).0);
-    takes_ilog(kind, x6.as_ref())
-}
-
 /// What an Insta360 X6 clip's trailer says about how it was recorded.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct X6ClipInfo {

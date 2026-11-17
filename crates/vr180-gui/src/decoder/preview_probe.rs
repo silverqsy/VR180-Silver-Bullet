@@ -72,8 +72,27 @@ fn settings_for(path: &Path) -> anyhow::Result<Settings> {
         s.ettr_stops = stops.parse()?;
     }
     let kind = vr180_pipeline::source_kind::detect(path)?;
-    // What the app tells the copy of the settings its preview works from.
-    s.ilog_source = crate::app::file_takes_ilog(kind, path);
+    if switch("VR180_PROBE_LENS").as_deref() == Some("equidistant") {
+        s.lens_space = super::LensSpaceLens::Equidistant;
+    }
+    if let Some(m) = switch("VR180_PROBE_MASK") {
+        let v: Vec<f32> = m.split(',').filter_map(|x| x.parse().ok()).collect();
+        s.crop_mask = vr180_pipeline::gpu::CropMask { amount: v[0], feather: v[1], round: v[2] };
+    }
+    // VR180_PROBE_ILOG=1: the clip is I-Log footage (what the app works out from the file), so ETTR recovery applies.
+    s.ilog_source = switch("VR180_PROBE_ILOG").as_deref() == Some("1");
+    // A raw take: VR180_PROBE_RAWDEV=<exposure>,<contrast>,<highlights>,<shadows>,<whites>,<blacks>; VR180_PROBE_WB=<kelvin>,<tint>.
+    s.raw_source = kind.is_raw_video();
+    if let Some(v) = switch("VR180_PROBE_RAWDEV") {
+        let v: Vec<f32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+        let g = |i: usize| v.get(i).copied().unwrap_or(0.0);
+        s.raw = vr180_pipeline::raw_tone::RawSettings { exposure: g(0), contrast: g(1), highlights: g(2), shadows: g(3), whites: g(4), blacks: g(5), ..s.raw };
+    }
+    if let Some(v) = switch("VR180_PROBE_WB") {
+        let v: Vec<f32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+        s.raw.temperature = v.first().copied();
+        s.raw.tint = v.get(1).copied();
+    }
     Ok(if vr180_pipeline::source_kind::is_single_eye(kind, path) { s.for_single_eye() } else { s })
 }
 
@@ -116,7 +135,7 @@ fn frame_at(
 
 pub(crate) fn run(clip: &Path) -> anyhow::Result<()> {
     let path = PathBuf::from(clip);
-    anyhow::ensure!(path.is_file(), "{}: not a file", path.display());
+    anyhow::ensure!(path.is_file() || vr180_pipeline::x6_raw::is_take(&path), "{}: not a file", path.display());
     let times: Vec<f64> = switch("VR180_PROBE_TIMES").unwrap_or_else(|| "0.5,1.0,1.5,2.0".into())
         .split(',').map(|t| t.trim().parse()).collect::<Result<_, _>>()?;
     let eye_w: u32 = switch("VR180_PROBE_EYE").map(|v| v.parse()).transpose()?.unwrap_or(1024);
@@ -152,8 +171,7 @@ pub(crate) fn run(clip: &Path) -> anyhow::Result<()> {
         let px = pipeline.read_texture_rgb8(&frame.texture, w, h)?;
         println!("{label} frame={:<5} ts={:<9.4} {w}x{h} {:016x}", frame.frame_idx, frame.timestamp_s, fnv(&px));
         if jpeg_dir.is_some() || raw_dir.is_some() {
-            // The texture holds B, G, R.
-            let rgb: Vec<u8> = px.chunks_exact(3).flat_map(|p| [p[2], p[1], p[0]]).collect();
+            let rgb: Vec<u8> = px.clone();
             let name = label.trim().replace(' ', "_");
             if let Some(dir) = &jpeg_dir {
                 image::save_buffer(dir.join(format!("{name}.jpg")), &rgb, w, h, image::ColorType::Rgb8)?;
