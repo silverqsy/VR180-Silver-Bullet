@@ -830,8 +830,18 @@ mod tests {
                 encoding: PictureEncoding::Srgb,
             }.shape(ui.max_rect()));
         });
+        // The dither is just under half a code, so a GPU that rounds a colour
+        // to its target at one half returns every code. One that rounds later
+        // (Direct3D allows 0.6 of a code; an RTX 4090 goes to 0.562) turns the
+        // dither's lowest values into the code below, here and in egui's own
+        // image widget alike. The Mac, where this painter runs, is held to
+        // the exact picture.
+        let slack = if cfg!(target_os = "macos") { 0 } else { 1 };
         for (i, out) in px.iter().enumerate() {
-            assert_eq!(out[..], rgba[i * 4..][..4], "pixel {i}");
+            let src = &rgba[i * 4..][..4];
+            for c in 0..4 {
+                assert!((out[c] as i32 - src[c] as i32).abs() <= slack, "pixel {i}: {out:?} for {src:?}");
+            }
         }
     }
 
