@@ -524,8 +524,8 @@ fn hw_h265_side_limit() -> Option<u32> {
 /// The size is larger than the recording. The pipeline reads that as the room
 /// the stabilized frame may take, never as an enlargement
 /// (`fisheye_export::lens_frame_request`).
-fn lens_frame_held_dims(eye_w: u32, eye_h: u32) -> Option<(u32, u32)> {
-    let long = hw_h265_side_limit()? / 2;
+fn lens_frame_held_dims(eye_w: u32, eye_h: u32, single_eye: bool) -> Option<(u32, u32)> {
+    let long = hw_h265_side_limit()? / if single_eye { 1 } else { 2 };
     if eye_w.min(eye_h) == 0 {
         return None;
     }
@@ -1178,10 +1178,10 @@ mod export_size_tests {
         assert_eq!(super::lens_frame_reduced_dims(3840, 3008), None);
         // What is written: the stabilizer's margin on a frame at its own
         // size, none on a reduced copy.
-        assert_eq!(native.lens_frame_out_dims(4912, 4912, true, true), (5400, 5400));
-        assert_eq!(native.lens_frame_out_dims(4912, 4912, true, false), (4912, 4912));
-        assert_eq!(small.lens_frame_out_dims(4912, 4912, true, true), (4096, 4096));
-        assert_eq!(small.lens_frame_out_dims(3712, 3712, true, true), (4080, 4080));
+        assert_eq!(native.lens_frame_out_dims(4912, 4912, true, true, false), (5400, 5400));
+        assert_eq!(native.lens_frame_out_dims(4912, 4912, true, false, false), (4912, 4912));
+        assert_eq!(small.lens_frame_out_dims(4912, 4912, true, true, false), (4096, 4096));
+        assert_eq!(small.lens_frame_out_dims(3712, 3712, true, true, false), (4080, 4080));
 
         // A clip that holds the lens's whole view: its own frame too, by
         // its own resolution choice (not the Crop clips'). At 8K — the
@@ -1190,7 +1190,7 @@ mod export_size_tests {
         // a frame limit and the stabilized frame is past it, the size that
         // frame is held to.
         assert!(lens.stabilize);
-        let held = super::lens_frame_held_dims(3840, 3840);
+        let held = super::lens_frame_held_dims(3840, 3840, false);
         assert_eq!(held, super::hw_h265_side_limit().map(|_| (4096, 4096)));
         let asked = held.unwrap_or((3840, 3840));
         let c = cfg(&on, &lens, insv, (3840, 3840), None);
@@ -1202,14 +1202,17 @@ mod export_size_tests {
         let own = ExportOptions { resolution: ExportResolution::Native, ..on };
         assert_eq!((cfg(&own, &lens, insv, (3840, 3840), None).eye_w), 3840);
         // What is written at 8K: the held size, or the frame with its margin.
-        assert_eq!(on.lens_frame_out_dims(3840, 3840, false, true), held.unwrap_or((4224, 4224)));
-        assert_eq!(on.lens_frame_out_dims(3840, 3840, false, false), (3840, 3840));
-        assert_eq!(own.lens_frame_out_dims(3840, 3840, false, true), (4224, 4224));
+        assert_eq!(on.lens_frame_out_dims(3840, 3840, false, true, false), held.unwrap_or((4224, 4224)));
+        assert_eq!(on.lens_frame_out_dims(3840, 3840, false, false, false), (3840, 3840));
+        assert_eq!(own.lens_frame_out_dims(3840, 3840, false, true, false), (4224, 4224));
+        assert_eq!(super::lens_frame_held_dims(3840, 3840, true), None);
+        assert_eq!(on.lens_frame_out_dims(3840, 3840, false, true, true), (4224, 4224));
+        assert_eq!(on.lens_frame_out_dims(4864, 4864, false, true, true), (4096, 4096));
         // A frame whose margin fits needs no holding, a GoPro cross does, and
         // a frame that is not square keeps its shape.
-        assert_eq!(super::lens_frame_held_dims(3712, 3712), None);
-        assert_eq!(super::lens_frame_held_dims(3936, 3936), super::hw_h265_side_limit().map(|_| (4096, 4096)));
-        assert_eq!(super::lens_frame_held_dims(3840, 3008), super::hw_h265_side_limit().map(|_| (4096, 3272)));
+        assert_eq!(super::lens_frame_held_dims(3712, 3712, false), None);
+        assert_eq!(super::lens_frame_held_dims(3936, 3936, false), super::hw_h265_side_limit().map(|_| (4096, 4096)));
+        assert_eq!(super::lens_frame_held_dims(3840, 3008, false), super::hw_h265_side_limit().map(|_| (4096, 3272)));
         let c = cfg(&on, &lens, insv, (4864, 4864), None);
         assert_eq!((c.lens_frame, c.eye_w, c.eye_h), (LensFrameOut::FromSource, 4096, 4096));
         let full = ExportOptions { resolution: ExportResolution::Native, crop_resolution: ExportResolution::R8k, ..on };
@@ -1230,7 +1233,7 @@ mod export_size_tests {
             std::path::Path::new("/nonexistent/in.360"), std::path::Path::new("/nonexistent/out.mp4"),
             29.97, SourceKind::GoProEac, 0, 0, 5952, 1920, None, &lens, &on, Vec::new(),
         );
-        let asked = super::lens_frame_held_dims(3936, 3936).unwrap_or((3936, 3936));
+        let asked = super::lens_frame_held_dims(3936, 3936, false).unwrap_or((3936, 3936));
         assert_eq!((gopro.projection, gopro.lens_frame, gopro.eye_w, gopro.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource, asked.0, asked.1));
 
         // The VR180 view is VR180, whatever the lens choice says.
@@ -1322,6 +1325,8 @@ mod export_size_tests {
         } else {
             assert!(text.contains("8448 × 4224 (native + margin)") && !text.contains("\n8192 × 4096\n"), "{text}");
         }
+        let text = panel_text_lens(&mut at_8k, (3840, 3840), None, Some(Camera), true, true);
+        assert!(text.contains("4224 × 4224 (native + margin)") && !text.contains(super::LENS_FRAME_HELD_NOTE), "{text}");
         assert_eq!(at_8k.resolution, ExportResolution::R8k);
         // A larger one (an X6 at 10K) does have its 8K copy.
         let text = panel_text_with(&mut at_8k, (9728, 4864), None, Some(Camera), false);
@@ -1880,10 +1885,10 @@ impl ExportOptions {
     /// One more meaning of the 8K choice, for a `stabilized` frame where the
     /// hardware encoder has a frame limit: the size the frame with its margin
     /// is held to ([`lens_frame_held_dims`]).
-    fn lens_frame_eye_dims(&self, eye_w: u32, eye_h: u32, cropped: bool, stabilized: bool) -> (u32, u32) {
+    fn lens_frame_eye_dims(&self, eye_w: u32, eye_h: u32, cropped: bool, stabilized: bool, single_eye: bool) -> (u32, u32) {
         match self.resolution_for(SizeList::of(cropped, false)) {
             ExportResolution::R8k => lens_frame_reduced_dims(eye_w, eye_h)
-                .or_else(|| lens_frame_held_dims(eye_w, eye_h).filter(|_| stabilized))
+                .or_else(|| lens_frame_held_dims(eye_w, eye_h, single_eye).filter(|_| stabilized))
                 .unwrap_or((eye_w, eye_h)),
             _ => (eye_w, eye_h),
         }
@@ -1894,8 +1899,8 @@ impl ExportOptions {
     /// size the stabilizer's margin on top (`vr180_pipeline::lens_frame`; a
     /// reduced copy keeps its size). What the export bar shows and a
     /// snapshot renders.
-    fn lens_frame_out_dims(&self, eye_w: u32, eye_h: u32, cropped: bool, stabilized: bool) -> (u32, u32) {
-        let (w, h) = self.lens_frame_eye_dims(eye_w, eye_h, cropped, stabilized);
+    fn lens_frame_out_dims(&self, eye_w: u32, eye_h: u32, cropped: bool, stabilized: bool, single_eye: bool) -> (u32, u32) {
+        let (w, h) = self.lens_frame_eye_dims(eye_w, eye_h, cropped, stabilized, single_eye);
         if stabilized && (w, h) == (eye_w, eye_h) {
             vr180_pipeline::lens_frame::stabilized_dims(w, h)
         } else {
@@ -3553,7 +3558,7 @@ impl App {
         // at the size the eye was recorded (or the 8K copy).
         let lens_frame_on = settings.lens_frame_view(source_kind);
         let lens_frame = if lens_frame_on {
-            (eye_w, eye_h) = opts.lens_frame_eye_dims(native_eye.0, native_eye.1, sharp_eye.is_some(), settings.stabilize);
+            (eye_w, eye_h) = opts.lens_frame_eye_dims(native_eye.0, native_eye.1, sharp_eye.is_some(), settings.stabilize, settings.single_eye);
             vr180_pipeline::fisheye_export::LensFrameOut::FromSource
         } else {
             vr180_pipeline::fisheye_export::LensFrameOut::Off
@@ -6126,7 +6131,7 @@ impl App {
                     .map(|(w, h)| (if single_eye { w } else { w / 2 }, h)).unwrap_or((0, 0));
                 // A stabilized frame carries the stabilizer's margin; a
                 // reduced copy keeps its size.
-                let (w, h) = self.export_opts.lens_frame_out_dims(ew, eh, sharp_eye.is_some(), self.settings.stabilize);
+                let (w, h) = self.export_opts.lens_frame_out_dims(ew, eh, sharp_eye.is_some(), self.settings.stabilize, single_eye);
                 format!("{} {} × {h}", tr("Lens Space"), if single_eye { w } else { w * 2 })
             }
             (Some(aspect), _, _) => self.export_opts.reframe_size.frame_label(aspect, single_eye),
@@ -6449,7 +6454,7 @@ impl App {
             let lens_eye = native_dims.filter(|_| lens_frame).map(|(w, h)| (if single_eye { w } else { w / 2 }, h));
             let lens_held = lens_eye.filter(|_| lens_frame_stabilized)
                 .filter(|&(ew, eh)| lens_frame_reduced_dims(ew, eh).is_none())
-                .and_then(|(ew, eh)| lens_frame_held_dims(ew, eh));
+                .and_then(|(ew, eh)| lens_frame_held_dims(ew, eh, single_eye));
             let lens_reduced: Option<String> = lens_eye
                 .and_then(|(ew, eh)| lens_frame_reduced_dims(ew, eh).or(lens_held))
                 .map(|(rw, rh)| format!("{} × {rh}", if single_eye { rw } else { rw * 2 }));
@@ -7945,7 +7950,7 @@ impl App {
         let sharp_eye = clip.sharp_eye(self.settings.insv_view);
         // A lens frame: the frame the export writes, its margin included.
         if self.settings.lens_frame_view(kind) {
-            return self.export_opts.lens_frame_out_dims(ew, eh, sharp_eye.is_some(), self.settings.stabilize);
+            return self.export_opts.lens_frame_out_dims(ew, eh, sharp_eye.is_some(), self.settings.stabilize, clip.single_eye());
         }
         match (self.export_opts.resolution_for(SizeList::of(sharp_eye.is_some(), false)), sharp_eye) {
             (ExportResolution::Sharp, Some(side)) => { ew = side; eh = side; }
