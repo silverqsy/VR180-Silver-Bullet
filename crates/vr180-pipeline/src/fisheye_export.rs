@@ -1751,6 +1751,11 @@ fn export_fisheye_inner(
                             .unwrap_or_else(|| "CPU export path — GPU decode init failed".into())));
                 }
             }
+        } else if cfg.source_kind.is_raw_video() {
+            // A raw take has no video decoder to keep on the GPU: this loop
+            // is its path on every platform (frames unpacked on the CPU,
+            // demosaiced, projected and graded on the GPU), not a fallback,
+            // so there is nothing to warn of.
         } else if std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none() {
             // Landed on the portable serial loop — say WHY (the user-visible
             // symptom is just "export is slow with the GPU idle").

@@ -601,7 +601,12 @@ enum EnhancedFrames {
     Absent,
     /// Enhanced pictures of this many pixels a side per eye.
     Found(u32),
+    /// This build cannot decode enhanced pictures
+    /// (`enhanced_dng::decodable`): none is looked for.
+    Unreadable,
 }
+
+const ENHANCED_UNREADABLE_NOTE: &str = "Enhanced frames (a raw converter's Super Resolution, in the folder of Camera original DNGs) are read on macOS only for now: this clip exports from the capture.";
 
 /// A take and its trim, as an enhanced-frames lookup is asked for them.
 type EnhancedKey = (PathBuf, Option<u64>, Option<u64>);
@@ -980,12 +985,20 @@ mod export_size_tests {
         assert!(text.contains("16384 × 8192") && !text.contains("7680 × 3840 (native)"), "{text}");
         assert!(text.contains("Enhanced frames found: 7680 × 7680 per eye"), "{text}");
         assert!(text.contains("the two larger sizes keep it"), "{text}");
-        assert!(text.contains("Above 8192 × 4096"), "{text}");
+        // The note for a frame this size is the platform encoder's own.
+        let note = oversize_export_hint(opts.codec, 16384, 8192).expect("a note at this size");
+        assert!(text.contains(note), "{text}");
         let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Absent));
         assert!(text.contains("7680 × 3840 (native)") && !text.contains("16384"), "{text}");
         assert!(text.contains("No enhanced frame found for this clip"), "{text}");
         let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Looking));
         assert!(text.contains("Looking for enhanced frames") && !text.contains("16384"), "{text}");
+        // A build that cannot read enhanced frames says so, and offers neither
+        // the option nor the sizes.
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Unreadable));
+        assert!(text.contains(super::ENHANCED_UNREADABLE_NOTE) && !text.contains("Use enhanced frames") && !text.contains("16384"), "{text}");
+        assert!(text.contains("7680 × 3840 (native)"), "{text}");
+        assert_ne!(tr_zh(super::ENHANCED_UNREADABLE_NOTE), super::ENHANCED_UNREADABLE_NOTE);
         // The option off: the usual list, and no word of what the folder holds.
         opts.raw_use_enhanced = false;
         let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Found(7680)));
@@ -2035,6 +2048,7 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Enhanced frames found:" => "已找到增强后的帧：",
         "No enhanced frame found for this clip: it exports from the capture." => "没有找到这个片段的增强帧：导出取自采集文件。",
         "Looking for enhanced frames…" => "正在查找增强后的帧…",
+        "Enhanced frames (a raw converter's Super Resolution, in the folder of Camera original DNGs) are read on macOS only for now: this clip exports from the capture." => "增强后的帧（raw 转换软件的超分辨率，位于相机原始 DNG 文件夹中）目前只有 macOS 能读取：这个片段从采集文件导出。",
         "This clip's enhanced frames hold more than 8192 × 4096 shows: the two larger sizes keep it. A stretch without enhanced frames exports at the size picked without them." => "这个片段的增强帧包含的细节多于 8192 × 4096 能呈现的：两档更大的尺寸可以保留这些细节。没有增强帧的区段按未使用增强帧时所选的尺寸导出。",
         "When the folder of Camera original DNGs is beside the take and a raw converter has enhanced its frames in place (Camera Raw's Super Resolution), each frame is taken from there, at the enhanced size. A frame that was not enhanced comes from the capture." => "素材旁边有相机原片 DNG 文件夹，并且其中的帧已在 RAW 转换软件里原地增强过时（Camera Raw 的超分辨率），每一帧从那里读取，按增强后的尺寸处理。没有增强过的帧仍取自采集文件。",
         "Camera original" => "相机原片",
@@ -3296,6 +3310,11 @@ impl App {
     /// its camera-original DNGs where a raw converter has enhanced them, and
     /// what that folder was found to hold.
     fn enhanced_frames_ui(ui: &mut egui::Ui, opts: &mut ExportOptions, found: EnhancedFrames) {
+        if found == EnhancedFrames::Unreadable {
+            ui.label(RichText::new(tr(ENHANCED_UNREADABLE_NOTE)).small().color(Color32::GRAY));
+            ui.add_space(8.0);
+            return;
+        }
         ui.checkbox(&mut opts.raw_use_enhanced, tr("Use enhanced frames"));
         ui.label(RichText::new(tr("When the folder of Camera original DNGs is beside the take and a raw converter has enhanced its frames in place (Camera Raw's Super Resolution), each frame is taken from there, at the enhanced size. A frame that was not enhanced comes from the capture."))
             .small().color(Color32::GRAY));
@@ -3304,6 +3323,7 @@ impl App {
                 EnhancedFrames::Found(side) => (format!("{} {side} × {side} {}", tr("Enhanced frames found:"), tr("per eye")), Color32::from_rgb(120, 190, 130)),
                 EnhancedFrames::Absent => (tr("No enhanced frame found for this clip: it exports from the capture.").to_string(), Color32::GRAY),
                 EnhancedFrames::Looking => (tr("Looking for enhanced frames…").to_string(), Color32::GRAY),
+                EnhancedFrames::Unreadable => (tr(ENHANCED_UNREADABLE_NOTE).to_string(), Color32::GRAY),
             };
             ui.label(RichText::new(text).small().color(color));
         }
@@ -3319,6 +3339,9 @@ impl App {
             return None;
         }
         let path = self.loaded_path.clone()?;
+        if !vr180_pipeline::enhanced_dng::decodable() {
+            return Some(EnhancedFrames::Unreadable);
+        }
         if !self.export_opts.raw_use_enhanced {
             return Some(EnhancedFrames::Absent);
         }

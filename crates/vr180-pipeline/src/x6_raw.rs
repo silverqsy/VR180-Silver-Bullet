@@ -718,6 +718,10 @@ fn find_enhanced(index: &TakeIndex, source: &EnhancedSource) -> EnhancedFind {
 /// capture: what [`X6RawIter::with_enhanced_frames`] goes by, for a caller
 /// that sizes the export before opening it.
 pub fn enhanced_side(path: &Path, source: &EnhancedSource) -> Option<u32> {
+    // Pictures this build cannot decode are not there for it.
+    if !crate::enhanced_dng::decodable() {
+        return None;
+    }
     // No folder: nothing to open the take for.
     if !(0..2).any(|channel| source.dir.join(crate::sensor_dng::channel_dir(channel)).is_dir()) {
         return None;
@@ -845,6 +849,10 @@ impl X6RawIter {
     pub fn with_enhanced_frames(mut self, source: Option<&EnhancedSource>) -> Self {
         let Some(source) = source else { return self };
         let dir = &source.dir;
+        if !crate::enhanced_dng::decodable() {
+            tracing::info!("raw take: enhanced frames are not read on this system (no JPEG XL decoder in this build): the capture's frames are used");
+            return self;
+        }
         let found = find_enhanced(&self.index, source);
         match (found.side(), &found.picture) {
             (Some(side), _) => {
