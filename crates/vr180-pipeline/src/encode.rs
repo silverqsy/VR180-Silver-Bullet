@@ -1344,6 +1344,42 @@ impl ExportEncoder {
         }
     }
 
+    /// See [`H265Encoder::wants_p010`].
+    pub fn wants_p010(&self) -> bool {
+        match self {
+            Self::Ffmpeg(e) => e.wants_p010(),
+            #[cfg(target_os = "macos")]
+            Self::MvHevc(_) => false,
+        }
+    }
+
+    /// See [`H265Encoder::wants_yuv422p10`].
+    pub fn wants_yuv422p10(&self) -> bool {
+        match self {
+            Self::Ffmpeg(e) => e.wants_yuv422p10(),
+            #[cfg(target_os = "macos")]
+            Self::MvHevc(_) => false,
+        }
+    }
+
+    /// See [`H265Encoder::encode_frame_p010`].
+    pub fn encode_frame_p010(&mut self, y: &[u8], uv: &[u8]) -> Result<()> {
+        match self {
+            Self::Ffmpeg(e) => e.encode_frame_p010(y, uv),
+            #[cfg(target_os = "macos")]
+            Self::MvHevc(_) => Err(mvhevc_wrong_feed("P010 planes in memory")),
+        }
+    }
+
+    /// See [`H265Encoder::encode_frame_yuv422p10_msb`].
+    pub fn encode_frame_yuv422p10_msb(&mut self, y: &[u8], uv: &[u8]) -> Result<()> {
+        match self {
+            Self::Ffmpeg(e) => e.encode_frame_yuv422p10_msb(y, uv),
+            #[cfg(target_os = "macos")]
+            Self::MvHevc(_) => Err(mvhevc_wrong_feed("P210 planes in memory")),
+        }
+    }
+
     #[cfg(target_os = "macos")]
     pub fn encode_pixel_buffer(
         &mut self,
@@ -1373,6 +1409,137 @@ impl ExportEncoder {
             #[cfg(target_os = "macos")]
             Self::MvHevc(e) => e.finish(),
         }
+    }
+}
+
+/// One frame as the planes a GPU compose read back, 10 bits in the top of
+/// 16: P010 (4:2:0, for [`H265Encoder::encode_frame_p010`]) or P210 (4:2:2,
+/// for [`H265Encoder::encode_frame_yuv422p10_msb`]).
+pub enum PlaneFrame {
+    P010 { y: Vec<u8>, uv: Vec<u8> },
+    P210 { y: Vec<u8>, uv: Vec<u8> },
+}
+
+enum PlaneJob {
+    /// The frame, and how many times it is written (a frame before a hole
+    /// of dropped frames fills the hole).
+    Frame(PlaneFrame, u64),
+    Finish,
+}
+
+fn encode_planes(encoder: &mut ExportEncoder, frame: &PlaneFrame, copies: u64) -> Result<()> {
+    for _ in 0..copies {
+        match frame {
+            PlaneFrame::P010 { y, uv } => encoder.encode_frame_p010(y, uv)?,
+            PlaneFrame::P210 { y, uv } => encoder.encode_frame_yuv422p10_msb(y, uv)?,
+        }
+    }
+    Ok(())
+}
+
+/// The encoder of an export loop, either called in line (every loop as it
+/// was) or on a thread of its own, fed whole [`PlaneFrame`]s: the copy into
+/// the encoder's frame, the encode and the mux then overlap the next
+/// frame's GPU work instead of adding to it.
+///
+/// In line it is the [`ExportEncoder`] itself (it derefs to one, so a loop's
+/// calls read as before). On its thread only [`Self::encode_planes`] and
+/// [`Self::finish`] reach it: a loop that hands the encoder over feeds it
+/// nothing else.
+pub struct EncodeStage {
+    inline: Option<ExportEncoder>,
+    worker: Option<(std::sync::mpsc::SyncSender<PlaneJob>, std::thread::JoinHandle<Result<()>>)>,
+}
+
+/// Frames waiting for the encoder at most (each is 100 to 135 MB at
+/// 8192 × 4096): enough that neither side waits on the other's jitter.
+const ENCODE_STAGE_QUEUE: usize = 2;
+
+impl EncodeStage {
+    pub fn inline(encoder: ExportEncoder) -> Self {
+        Self { inline: Some(encoder), worker: None }
+    }
+
+    /// Move `encoder` to a thread of its own. It is used there and nowhere
+    /// else from here on.
+    pub fn on_thread(encoder: ExportEncoder) -> Result<Self> {
+        struct Handed(ExportEncoder);
+        // The encoder is moved once, whole, and only that thread touches it
+        // afterwards (ffmpeg's contexts are not tied to the thread that
+        // opened them).
+        unsafe impl Send for Handed {}
+        let handed = Handed(encoder);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PlaneJob>(ENCODE_STAGE_QUEUE);
+        let handle = std::thread::Builder::new().name("export-encode".into()).spawn(move || -> Result<()> {
+            let handed = handed;
+            let mut encoder = handed.0;
+            while let Ok(job) = rx.recv() {
+                match job {
+                    PlaneJob::Frame(frame, copies) => encode_planes(&mut encoder, &frame, copies)?,
+                    PlaneJob::Finish => return encoder.finish(),
+                }
+            }
+            // The loop went away without finishing (an error on its side):
+            // the output is left as an unfinished file, as in line.
+            Ok(())
+        }).map_err(|e| Error::Ffmpeg(format!("encode thread: {e}")))?;
+        Ok(Self { inline: None, worker: Some((tx, handle)) })
+    }
+
+    /// Write `frame` `copies` times. On the encoder's thread this returns as
+    /// soon as the frame is queued; an encoder error surfaces on a later
+    /// call or at [`Self::finish`].
+    pub fn encode_planes(&mut self, frame: PlaneFrame, copies: u64) -> Result<()> {
+        if let Some(encoder) = self.inline.as_mut() {
+            return encode_planes(encoder, &frame, copies);
+        }
+        let sent = match self.worker.as_ref() {
+            Some((tx, _)) => tx.send(PlaneJob::Frame(frame, copies)).is_ok(),
+            None => false,
+        };
+        if sent { Ok(()) } else { Err(self.worker_error()) }
+    }
+
+    /// Why the encoder's thread stopped taking frames.
+    fn worker_error(&mut self) -> Error {
+        match self.worker.take().map(|(tx, handle)| { drop(tx); handle.join() }) {
+            Some(Ok(Err(e))) => e,
+            Some(Err(_)) => Error::Ffmpeg("the encode thread panicked".into()),
+            _ => Error::Ffmpeg("the encode thread stopped".into()),
+        }
+    }
+
+    /// Flush and close the output.
+    pub fn finish(mut self) -> Result<()> {
+        if let Some(encoder) = self.inline.take() {
+            return encoder.finish();
+        }
+        match self.worker.take() {
+            Some((tx, handle)) => {
+                let told = tx.send(PlaneJob::Finish).is_ok();
+                drop(tx);
+                match handle.join() {
+                    Ok(Ok(())) if told => Ok(()),
+                    Ok(Ok(())) => Err(Error::Ffmpeg("the encode thread stopped before the file was closed".into())),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(Error::Ffmpeg("the encode thread panicked".into())),
+                }
+            }
+            None => Err(Error::Ffmpeg("the encoder was already closed".into())),
+        }
+    }
+}
+
+impl std::ops::Deref for EncodeStage {
+    type Target = ExportEncoder;
+    fn deref(&self) -> &ExportEncoder {
+        self.inline.as_ref().expect("the encoder is on its own thread: it takes planes only")
+    }
+}
+
+impl std::ops::DerefMut for EncodeStage {
+    fn deref_mut(&mut self) -> &mut ExportEncoder {
+        self.inline.as_mut().expect("the encoder is on its own thread: it takes planes only")
     }
 }
 

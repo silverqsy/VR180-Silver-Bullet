@@ -3,7 +3,7 @@
 Auto-loaded at session start. Read this first; deeper detail is in the
 `docs/` pointers at the bottom.
 
-## ⚡ Status: **2.5.6 macOS RELEASED 2026-11-13 — tag `v2.5.6` @ `d18c9fe`, DMG + app zip + darwin-only `latest.json` live, the feed serves 2.5.6; Windows build PENDING** (build at the tag, `make-latest-json.mjs --version 2.5.6` merges the Windows entry from the release, upload setup.exe + portable zip + `latest.json --clobber`; no bump commit needed — all four carriers are at 2.5.6). Cut found that the Swift / RAW helpers built without a deployment target take the build machine's macOS as their minimum (27.2 here; 2.5.5's APAC helper said 28.0), so they could not start on an older system: `d18c9fe` targets macOS 14 for `apac_encode` (like `mvhevc_encode`) and 26.0 for `braw_helper` (`MIN_MACOS` in `build_braw.sh`), the floor the bundled Homebrew libraries already set (their minos is 26.0, so the app as a whole needs macOS 26). 2.5.6 ships what follows: **(was UNRELEASED on `main`): Insta360 X6 7.4K / 7.4K Crop / 10K / 10K Crop recording modes + Crop mask + the few-dropped-frames rate fix (item 28) — Windows BUILT + VERIFIED 2026-11-12 (every mode on every arm, the masked shaders on Vulkan / D3D11 zero-copy / DX12; an oversize-export note fixed there); spatial video export of the reframed view, macOS only (item 29) — builds on Windows, never offered there.** **2.5.5 RELEASED 2026-11-07 on BOTH platforms — tag `v2.5.5` @ `90f11b7`, macOS and Windows live on the updater feed (item 27) — it ships everything since 2.5.2: X6 per-frame eye-exposure matching (item 15), GoPro exposure timing from SHUT (item 16), Kandao QooCam 3 Ultra (items 23/24), Blackmagic RAW rebuilt + on Windows (item 25), dropped-frame tables + pts-paced preview (item 26).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
+## ⚡ Status: **2.5.6 RELEASED 2026-11-13 on BOTH platforms — tag `v2.5.6` @ `d18c9fe`; macOS DMG + app zip first, Windows the same day; the feed serves 2.5.6 to both.** WINDOWS (Windows box): built at `30ac223` (= the tag + CLAUDE.md), exe file version 2.5.6; `braw_helper.exe` rebuilt by `build_braw.ps1` (CUDA blit; `d18c9fe` touched only the macOS build script); the export matrix byte-identical per stream to the 2026-11-12 baseline; bundle = exe + the seven FFmpeg DLLs the exe imports + the helper + README (now says NVENC stops at 8192 a side); the bundled exe loads its own DLLs and opens a BRAW clip on the zero-copy path with no console window. setup.exe 17 027 040 B (sha256 a0ff0176…), portable zip 21 739 462 B. `make-latest-json.mjs --version 2.5.6 --notes ""` (keeps the Mac's notes byte-identical — the release body from `gh` gains a trailing newline), darwin entry byte-identical; uploaded `--clobber` setup.exe + zip + merged `latest.json` (no .minisig); live assets sha-identical to local, the live installer verifies against the signature in the live manifest with the updater.rs pubkey, and the stable `releases/latest/download/latest.json` served the merged manifest within a minute this time. Cut found that the Swift / RAW helpers built without a deployment target take the build machine's macOS as their minimum (27.2 here; 2.5.5's APAC helper said 28.0), so they could not start on an older system: `d18c9fe` targets macOS 14 for `apac_encode` (like `mvhevc_encode`) and 26.0 for `braw_helper` (`MIN_MACOS` in `build_braw.sh`), the floor the bundled Homebrew libraries already set (their minos is 26.0, so the app as a whole needs macOS 26). 2.5.6 ships what follows: **(was UNRELEASED on `main`): Insta360 X6 7.4K / 7.4K Crop / 10K / 10K Crop recording modes + Crop mask + the few-dropped-frames rate fix (item 28) — Windows BUILT + VERIFIED 2026-11-12 (every mode on every arm, the masked shaders on Vulkan / D3D11 zero-copy / DX12; an oversize-export note fixed there); spatial video export of the reframed view, macOS only (item 29) — builds on Windows, never offered there.** **2.5.5 RELEASED 2026-11-07 on BOTH platforms — tag `v2.5.5` @ `90f11b7`, macOS and Windows live on the updater feed (item 27) — it ships everything since 2.5.2: X6 per-frame eye-exposure matching (item 15), GoPro exposure timing from SHUT (item 16), Kandao QooCam 3 Ultra (items 23/24), Blackmagic RAW rebuilt + on Windows (item 25), dropped-frame tables + pts-paced preview (item 26).** **2.5.2 RELEASED 2026-10-10 on BOTH platforms (item 21).** Previous: 2.5.1 — macOS RELEASED 2026-09-25 (tag v2.5.1 @ 7e345ee: DMG + mac app.zip + latest.json live, feed serves 2.5.1); **Windows RELEASED 2026-09-25, RESPUN same day with the version-free product name** (setup.exe + portable zip + MERGED latest.json live on v2.5.1; the installer, shortcuts, Add/Remove entry and exe now say "VR180 Silver Bullet" — AppId and the settings dir deliberately unchanged, `[InstallDelete]` clears the old-named shortcuts on upgrade; live manifest byte-identical to local, installer minisig verified against the updater.rs pubkey; feed serves BOTH platforms). Previous: 2.5.0 RELEASED 2026-09-13, macOS respun 2026-09-14 (adds 3D display output, Snapshot, generic-SBS input toggle, Flat 3D bitrate defaults; the 2.5.0 Windows respin was never done — superseded by 2.5.1) — reframed mode, file-derived stabilization timing, Insta360 X6
 
 VR180 Silver Bullet **2.0** is feature-complete and building/running on both
 **macOS (Apple Silicon)** and **Windows (NVIDIA)**. The Windows GPU-resident
@@ -2240,6 +2240,14 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      `cargo test -p vr180-pipeline --lib log_exposure` on the Windows GPU
      checks it on that backend; the arms to try are the same as for any
      colour stage (zero-copy D3D11, GPU-resident, portable).
+   - **WINDOWS VERIFIED (2026-11-17, Windows box, RTX 4090).**
+     `log_exposure_tests` pass on Vulkan and on D3D12. A real I-Log clip at
+     −1 stop through the portable loop, the D3D11 zero-copy readback arm and
+     the GPU-resident NVENC arm: the recovered export minus the curve
+     applied to the untouched export of the same frames averages +0.23 /
+     +0.24 / +0.21 of a 10-bit code (level 437 → 361, the curve says 361),
+     and the three arms agree with each other as they do without the stage
+     (cpu − zc 0.005 of 255 signed, either − nvenc under 0.09).
 
 31. **Colour precision of the export path (2026-11-14, Mac; UNRELEASED).**
    Three commits, each changing export pixels by what it corrects.
@@ -2289,6 +2297,50 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      swscale threads per stream; on this Mac they are faster than the
      single-threaded fast ones for 10-bit sources and slower for 8-bit
      sources, 10 ms against 2.5 for a 3840² frame).
+   - **WINDOWS VERIFIED (2026-11-17, Windows box, RTX 4090).** Export
+     matrix (OSV cpu / zc readback / GPU-resident NVENC, `.360` NVENC,
+     QooCam zc, the dropped-frame X6 clip on three arms): every arm engages,
+     frame counts and pts as before; bytes differ from the 2.5.6 baseline
+     as intended. **The software arms now match NVENC**: signed difference
+     from the GPU-resident NVENC export of the same frames, in 8-bit codes,
+     before → after: OSV portable R +0.94 G +0.51 B +0.28 → +0.11 / +0.03 /
+     +0.12, OSV zc readback (libx265) +1.40 / +0.93 / +0.69 → +0.10 / +0.03
+     / +0.12, X6 portable +0.06 / +0.27 / +0.81 → +0.11 / +0.03 / +0.11, X6
+     zc +0.47 / +0.68 / +1.28 → +0.11 / +0.03 / +0.11; portable and zc agree
+     to 0.01. With the X6 LUT on, 8-bit H.265 against 10-bit on the same
+     arm: within 0.05 (portable), 0.03 (zc), 0.13 (NVENC), level identical.
+     The NVENC arms themselves moved by R +0.3 G +0.06 B +0.35 (the compose
+     rounding). CPU preview speed (software decode forced, OSV): 128 ms a
+     pair on 2.5.6 and on this build — the two 3840² software decodes are
+     the cost, the conversion does not show.
+     TWO THINGS FOUND THERE:
+     (a) **The NVIDIA GPU rounds a float written to an 8-bit texel late**:
+     a compute shader storing a plain ramp into `rgba8unorm` flips to the
+     next code at up to 0.562 of the way there on the RTX 4090 (Vulkan and
+     D3D12 alike), 0.508 on the Intel UHD 770, 0.500 on WARP (gitignored
+     `examples/unorm_round_probe.rs`; Direct3D allows 0.6). So every 8-bit
+     store there can sit 0.06 of a code further from its value than exact
+     rounding, with a mean bias of −0.03 of a code: nothing to see, but
+     `lut_precision_tests::eight_bit_lut_stage_rounds_the_cube` read 0.562
+     against its 0.52 and `display_colour::tests::
+     a_photograph_is_drawn_as_it_is` got one code off where the dither
+     meets that rounding. Both tests keep the Mac's bound on macOS and take
+     0.62 / one code elsewhere; no shader was changed.
+     (b) **A full-range source deeper than 8 bits was 0.29 % bright on the
+     CPU decode path — FIXED, shared code** (`swscale::set_yuv_source` takes
+     the source's depth; test `a_full_range_ten_bit_source_keeps_its_scale`).
+     swscale's full range is the 8-bit one shifted up: for a 10-bit source
+     white is 1020, not 1023 (code 512 came out 32896 of 65535 where
+     512 / 1023 is 32800; codes 1021 to 1023 clipped), while the GPU kernels
+     read code / 1023. Before item 31 the missing 257 / 256 hid most of it
+     (net −0.1 % by the arithmetic); with the 16-bit scale fixed it showed
+     as +0.29 %. The only such source in the catalog is the QooCam 3 Ultra
+     (GoPro `.360` is read as video range on purpose). Measured on a QooCam
+     clip (the same lens-frame export, level 79 of 255), portable − zc
+     readback: R +0.30 G +0.33 B +0.42 of 255 before, +0.004 / +0.003 /
+     −0.003 after; video-range sources byte-identical. **MAC SIDE**: pull;
+     the paused full-resolution still and any CPU-decoded QooCam picture
+     get 0.29 % darker, onto the live preview's level.
 
 32. **The preview as Apple's players show the export (2026-11-14, Mac;
    UNRELEASED).** A toolbar switch, **Match QuickTime**: macOS only, off by
@@ -2626,11 +2678,81 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      `gpu::lens_frame_kernel_tests`. Test clips of this form were viewed on
      a headset (visionOS 27): immersive, placement and scale as the
      half-equirect.
-   - **Windows: untested.** Shared code only (no new gates; two
+   - **Windows: untested** when this was written; verified 2026-11-17, see
+     the Windows paragraph below. Shared code only (no new gates; two
      `cfg_attr(not(macos), allow(dead_code))` on accessors of the macOS-only
      P010 kernels). To check there: the spliced WGSL compiles on D3D12 /
      Vulkan, a lens-frame export through NVENC (9824 wide falls to libx265
      as the 13120 canvas does) and through the GPU-resident path.
+   - **WINDOWS VERIFIED (2026-11-17, Windows box, RTX 4090).**
+     **One real bug, fixed in shared code: every lens frame panicked on a
+     Windows checkout.** `core.autocrlf` hands `include_str!` the kernels
+     with `\r\n`, the splices' anchors of several lines are written with
+     `\n` (rustc normalises its own source, not an included file), so
+     `lens_frame_wgsl` / `eac_lens_frame_wgsl` asserted "anchor not found"
+     the first time a lens frame was projected: the preview worker or the
+     export thread died in the Lens Space view's default lens. The eight
+     `lens_frame_kernel_tests` caught it. `gpu::unix_lines` now normalises
+     the kernel and the spliced ray generator before the splices; nothing
+     else in the crate matches a multi-line pattern against an included
+     shader.
+     After the fix, lens frames from an X6 8K clip (stabilized and not), a
+     10K Crop clip with a crop mask, an Osmo `.osv`, a QooCam clip and a
+     GoPro `.360` through the portable loop, the D3D11 zero-copy readback
+     arm and the GPU-resident NVENC arm (`.360`: portable + its NVENC arm):
+     all engage, the lens stated matches the Mac's figures (Osmo ξ 2.4309
+     k 1.2118 / 0.2848, QooCam 2.4502 / 0.1637 / 0.7619, `.360` 1.4506 to
+     133°, X6 8K to 113°, 10K Crop to 101°), the files carry the lens boxes
+     (`prji prim`, `lnsc` with two `lens`), and the arms agree: portable −
+     zc under 0.01 of 255 signed, either − NVENC under 0.13, mean |Δ| 0.4 to
+     0.9 (encoder noise). A disc with the Apple flag states its lens (to
+     98°, `.360` 93°), a plain disc carries no projection box, a VR180
+     export keeps `hequ` + `hfov`. D3D12 (`VR180_BACKEND=dx12`, now also
+     honoured by `Device::new` as a diagnostic so the tests can run there):
+     the spliced kernels compile and export on all three kernel families;
+     231 of the 232 pipeline tests pass on D3D12, the one that does not is
+     `a_lens_frame_of_its_own_lens_is_the_source`: the interior is within 27
+     of 65535 (0 on Vulkan) and the frame's outermost row and column are up
+     to 0.5 % dim (320 of 65535), the HLSL build's arithmetic at the frame's
+     own edge. Left as it is (the test runs on Vulkan by default).
+     PREVIEW, in the app (window captured from the screen; `PrintWindow`
+     returned a blank window this time): the X6 clip and the Osmo clip on
+     the D3D11 zero-copy worker and the `.360` on the EAC zero-copy worker
+     draw the lens frame with the stabilizer's margin and play at their full
+     cadence; the edits made by text compile and run. No Match QuickTime
+     switch on Windows.
+     **NVENC stops at 8192 a side, and a stabilized lens frame of a 3840²
+     source is 8448 × 4224** (`.360`: 8656 × 4328; 10K Crop 10800 × 5400,
+     unstabilized 9824 × 4912). Measured from an X6 8K clip: unstabilized
+     7680 × 3840 through the GPU-resident NVENC arm 30 fps; stabilized
+     8448 × 4224 as H.265 falls to libx265 on the zero-copy readback arm,
+     2.1 fps, with the export-bar note and the Format window's note saying
+     so; as ProRes HQ it stays on the GPU (`prores_ks_vulkan`), 14.9 fps.
+     **THE 8K CHOICE HOLDS THAT FRAME TO THE ENCODER, WINDOWS ONLY (same
+     day, the user's call).** Where the hardware H.265 encoder has a frame
+     limit (`app.rs::hw_h265_side_limit`: 8192 off macOS, none on a Mac) and
+     the stabilized frame of an eye no larger than 4096 is past it, the 8K
+     choice (the default) asks for `lens_frame_held_dims`: the frame with
+     its margin scaled to 4096 on its longer side (3840² and the `.360`'s
+     3936²: 4096², 8192 × 4096 written; 3712² fits as it is and is not
+     touched). The size asked is then LARGER than the recording, which the
+     pipeline never enlarges: `fisheye_export::lens_frame_request` builds
+     the frame at the recording's size and holds the stabilized frame to the
+     size asked (`size_lens_frame`'s `reduced_to`), and without
+     stabilization writes the recorded frame; `resolve_lens_frame` and
+     `resolve_eac_lens_frame` both go through it. The clip's own size stays
+     8448 × 4224 (software H.265 with its note, GPU ProRes). The Format
+     window lists "8192 × 4096" for such a clip and says what it is
+     (`LENS_FRAME_HELD_NOTE`); the export bar shows the size written. On a
+     Mac nothing changes: the 8K choice of a 3840² eye is the frame as it
+     is, as before (the two tests that say so now read the platform).
+     Measured: X6 8K stabilized at the 8K choice, 8192 × 4096 through the
+     GPU-resident NVENC arm at 25.6 fps (the native 8448 × 4224: 2.1); lens
+     stated at 4096 / 4224 of the recording's focal; against the native
+     export of the same frames scaled down, mean |Δ| 0.6 of 255 with no
+     shift and the same share of picture in the frame; a `.360` likewise
+     (4328² held to 4096²). Exports that ask for the recording's size or
+     less are byte-identical to before.
    - Not done: no MV-HEVC lens frame, no crop mask on a full-view clip, no
      automatic mask sized to the stabilizer's corrections; the sharpen
      stage still fades towards the top and bottom rows of a lens frame
@@ -3152,6 +3274,98 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      `Rgba16Float` texture; the measure pass writes `Rgba32Float`; the
      sharpening writes `R32Float` storage textures and reads them with
      `textureLoad`), and the `raw_` tests pass on that GPU.
+   - **WINDOWS VERIFIED (2026-11-17, Windows box, RTX 4090).** The raw
+     tests pass on Vulkan and on D3D12, the GPU ones included (demosaic,
+     development, local tone, sharpening and the reference frame against
+     their CPU twins; demosaic 0.96 ms an eye at full size, 0.73 at half).
+     A take from the NAS opens in the app (1884 pairs listed in 0.5 s),
+     previews developed and plays at its 30 fps cadence (render mostly 1 to
+     7 ms),
+     and exports: default and graded (Shadows / Highlights at their ends,
+     sharpening 40), half-equirect, lens frame and reframed view. Vulkan
+     twice: byte-identical. Vulkan against D3D12, same encoder: signed
+     difference under 0.01 of 255, mean |Δ| 0.6 (default) to 0.9 (tone +
+     sharpening) on a dusk take, spread evenly: the demosaic's direction
+     weights and the sharpening on noise, through the encoder.
+     **Camera original DNGs written on Windows are byte-identical to the
+     Mac's** (three takes, five of six files; the sixth is the one Camera
+     Raw enhanced in place). Camera Raw's settings read back the same
+     (Shadows +100, sharpening 40 / 1.0 / 25 / 0, colour noise 25).
+     TWO THINGS FIXED THERE:
+     (a) **Enhanced frames made a Windows export fail.** The search is
+     platform-neutral and found the enhanced picture; the first frame then
+     asked for the JPEG XL decoder, which only the Mac build has, and the
+     export stopped with that error (with "Use enhanced frames" on, the
+     default, and an enhanced frame in the stretch). New
+     `enhanced_dng::decodable()` (`cfg!(macos)`); where it is false
+     `x6_raw::enhanced_side` answers none and `with_enhanced_frames` leaves
+     the iterator on the capture (one log line), so the export runs from
+     the capture at the plain size; the Format window shows one line in
+     place of the option (`EnhancedFrames::Unreadable`,
+     `ENHANCED_UNREADABLE_NOTE`, no lookup thread) and never lists the two
+     larger sizes. Reading Camera Raw's settings is untouched. Same take,
+     same stretch: failed before, 15 frames written after.
+     (b) The Windows path ladder called a raw export "CPU export path — no
+     GPU fast path for this source type" in the export bar. It is the
+     take's only path on every platform, with the GPU doing the demosaic,
+     the projection and the grade: no note for a raw take now.
+     SPEED, 8192 × 4096 from the NAS, graded, as found: NVENC 3.5 fps,
+     ProRes HQ 3.9, libx265 1.5 (the Mac: 15).
+     **THE PORTABLE 10-BIT LOOP FEEDS PLANES ON WINDOWS (same day).** Where
+     a frame's time went (the loop now logs it every 30 frames, "export
+     perf: decode / gpu / readback / encode"): readback 145 to 173 ms (the
+     frame left the GPU as RGBA64, 268 MB, with a per-pixel alpha strip to
+     RGB48), encode 39 ms (swscale RGB48 → P010, then NVENC; ProRes 63),
+     decode 13 ms from the page cache and 33 from the NAS, GPU submits 12.
+     Three changes, all in `export_fisheye_inner`'s 10-bit readback arm and
+     what it calls, Windows only (`cfg!(target_os = "windows")`; the Mac's
+     arms and its software fallbacks are as they were):
+     (1) **Planes, not RGB48** (`PlaneFeed`): an encoder that takes P010
+     (hevc_nvenc) or planar 4:2:2 (ProRes, `prores_ks_vulkan` and the CPU
+     one) gets `compose_sbs_to_p010_textures` / `_p210_textures` (video
+     range) read back with `read_texture_planar` and fed through
+     `encode_frame_p010` / `encode_frame_yuv422p10_msb` — the Windows
+     zero-copy readback arm's own compose and encoder calls. libx265, 8-bit
+     and a single-eye frame keep RGB48 + swscale.
+     (2) **The encoder on its own thread** (`encode::EncodeStage::on_thread`,
+     fed `PlaneFrame`s with their fill count through a queue of two; it
+     derefs to the `ExportEncoder` when in line, so every other call in the
+     loop reads as before; `finish` joins it; a cancel closes the file as
+     in line). `VR180_ENCODE_INLINE=1` keeps it in line: same file.
+     (3) **A raw take is read ahead** (`X6RawIter::with_read_ahead`, on for
+     the export's opener on Windows; `VR180_RAW_READ_AHEAD=0` reads in
+     line): a thread with its own handle on the capture reads and unpacks
+     pairs two ahead (buffers recycled), `next_pair` only uploads and
+     demosaics; a seek starts it over. No GPU on that thread.
+     Also `read_texture_planar` copies a plane of 8 MB or more on up to
+     four threads (a 34 MB chroma plane: 7 → 3.7 ms; the zero-copy readback
+     arm uses it too; same bytes).
+     MEASURED, 8192 × 4096, same take: graded (tone + sharpening) NVENC
+     3.5 → 10.1 fps, ProRes HQ 3.5 → 10.1; default development NVENC 4.2 →
+     14.8. Per frame now, graded: decode 7 ms (upload + demosaic submit),
+     gpu 13, readback 60 (about 50 of it the wait for the frame's GPU work,
+     the raw grade itself), encode 0. Blackmagic RAW rides the same loop
+     (quarter-scale decode, 4096 × 2048): NVENC 10.3 fps and ProRes 15.8
+     where libx265 does 4.3; so does any source that falls off its
+     zero-copy arm (an Osmo clip forced there, 3072 × 1536: 6.9 fps with
+     NVENC, the software decode being its cost) and the D3D12 fallback.
+     CHECKED: the plane feed against the GPU-resident NVENC arm on an Osmo
+     clip and on the dropped-frame X6 clip, signed difference under 0.004
+     of 255 (the same compose); against the zero-copy ProRes arm under
+     0.002; a raw take against the RGB48 route it replaces +0.03 / 0.00 /
+     +0.05 (ProRes under 0.01); against the libx265 route −0.1 / −0.03 /
+     −0.1 on every source, the known distance between swscale and the GPU
+     compose. The dropped-frame clip: 100 frames at 50 fps, one pts delta,
+     audio in step. Raw lens frame and reframed view through the planes
+     (the reference frame is drawn as before). Encoder on its thread
+     against in line, and read-ahead against in-line reading: byte-identical
+     files. A cancel after 40 frames leaves a 40-frame file that decodes.
+     The regression matrix (every arm that does not ride this feed) is
+     byte-identical. NOT measured: a raw export from the GUI itself (the
+     harness runs the same `export_fisheye` on the app's dedicated device).
+     **MAC SIDE**: nothing changes there; the read-ahead and the encoder
+     thread are plain Rust and could be switched on for the Mac's loops
+     after a check on that machine.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

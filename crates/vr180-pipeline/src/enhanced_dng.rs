@@ -275,6 +275,15 @@ pub fn read_xmp(path: &Path) -> Result<Option<String>> {
     }
 }
 
+/// Whether this build can decode an enhanced picture. Its tiles are JPEG XL,
+/// read through the system's decoder on macOS; elsewhere there is none yet,
+/// and a take's enhanced frames are left where they are: its frames come
+/// from the capture ([`crate::x6_raw::enhanced_side`]). A file's settings
+/// ([`read_xmp`]) are read everywhere.
+pub fn decodable() -> bool {
+    cfg!(target_os = "macos")
+}
+
 /// One JPEG XL codestream of 16-bit RGB samples: `(width, height, samples)`.
 fn decode_tile(bytes: &[u8]) -> Result<(usize, usize, Vec<u16>)> {
     #[cfg(target_os = "macos")]

@@ -131,7 +131,16 @@ converter's controls for it, and every frame can be had as a DNG.
   a frame enhanced by Camera Raw 18.7; its values agree with Camera Raw's
   own demosaic of the frame to a part in a thousand. About 0.45 s a frame
   pair and 4 GB of memory at 8192×4096. macOS only for now: the enhanced
-  picture is JPEG XL, which this build decodes through the system.
+  picture is JPEG XL, which this build decodes through the system. On
+  Windows the option is replaced by a line that says so and a take exports
+  from the capture; the settings Camera Raw left in the files are read
+  there as on a Mac.
+- **Windows.** A raw take opens, previews and exports there as well
+  (checked on an NVIDIA RTX 4090, on Vulkan and on Direct3D 12), and the
+  Camera original DNGs it writes are byte for byte the ones a Mac writes.
+  An 8192×4096 export runs at about 10 frames a second with tone and
+  sharpening in use and 15 with the default development, through NVENC
+  or as ProRes.
 - **Rolling shutter and the accelerometer.** Takes from the camera build
   that records the sensor's row timing and the accelerometer use both.
   Each frame's pose is taken where its centre row starts exposing (the
@@ -256,6 +265,18 @@ headset shows every pixel at its own angle.
   (the larger one, on a stabilized clip): its window can be as wide as the
   frame, and gives a steady edge once it is small enough to stay inside
   the moving picture. Camera lock suits a camera that stays put.
+- **On Windows**, the NVIDIA encoder takes frames up to 8192 pixels a
+  side. A lens frame without stabilization fits for an 8K clip (7680 ×
+  3840, about 30 frames a second on an RTX 4090); the stabilized frame of
+  the same clip is 8448 × 4224 (8656 × 4328 for a GoPro `.360`), which it
+  refuses. So on Windows the 8K choice, the default, writes that frame
+  scaled to **8192 × 4096**: the whole stabilized field, 3 % smaller than
+  recorded (5 % for a `.360`), through NVENC at about 25 frames a second.
+  The clip's own size is still there and keeps every pixel: as H.265 it is
+  encoded in software, at about 2 frames a second, which the export bar
+  and Export format say; as ProRes it stays on the GPU (about 15 frames a
+  second). On a Mac the hardware encoder takes the frame and nothing
+  changes.
 - **The preview is the export.** In Lens Space the preview draws the
   frame that is written: its shape, the stabilizer's margin, the crop mask
   where the export has it.
@@ -308,6 +329,23 @@ show the export.
   which is closer to how most players on Windows show the file.
 - macOS only.
 
+### Windows: faster exports of sources without a fast path
+
+Sources that have no zero-copy path on Windows (Insta360 X6 raw video,
+Blackmagic RAW, and any clip whose fast path is not available, such as on a
+card with too little memory for hardware decode) export on the general
+loop. For 10-bit H.265 through NVENC and for ProRes that loop took each
+frame off the GPU as a full RGB picture (201 MB at 8192×4096), converted
+it on the CPU and only then encoded it, one step after the other. It now
+has the GPU write the encoder's own planes, reads those back (half to a
+third of the bytes) and hands them to an encoder that runs alongside the
+next frame's work; a raw take is also read from disk ahead of the frame
+being worked on. On an RTX 4090 at 8192×4096: X6 raw with tone and
+sharpening 3.5 → 10 frames a second, with the default development 4.2 →
+15; a Blackmagic RAW clip at 4096×2048 4 → 10 (ProRes 16). The picture is
+the one the fast paths write (the same GPU conversion); software H.265
+and 8-bit output are unchanged.
+
 ### Fixes
 
 - **The 3D LUT was applied at 8-bit precision.** The cube was stored on the
@@ -339,6 +377,10 @@ show the export.
     once came out 0.39 % dark or bright.
   - Its fast **8-bit conversions run 2 of 255 dark**: an 8-bit software
     export of a 10-bit source was 1.8 codes darker than the hardware one.
+  - Its **full range stops short above 8 bits**: for a full-range 10-bit
+    source (a QooCam 3 Ultra clip) it takes code 1020 for white, not 1023,
+    so such a clip decoded on the CPU was 0.3 % brighter than the same
+    clip decoded on the GPU.
 
   Every such conversion now states its matrix, puts 16-bit pictures on one
   scale, and uses FFmpeg's exact arithmetic on a threaded context. Flat

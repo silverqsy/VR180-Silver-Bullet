@@ -13,6 +13,13 @@
 //!   unorm16, white = 65535. Decoding, a contrast of 257 / 256 puts white
 //!   on 65535; encoding, the picture is scaled by 65280 / 65535 on its way
 //!   into the frame (`encode::load_rgb16`).
+//! - **Full range above 8 bits.** swscale's full range is the 8-bit one
+//!   shifted up as well: for a 10-bit source white is 255 << 2 = 1020, not
+//!   1023 (measured: code 512 came out as 32896 of 65535 where 512 / 1023
+//!   is 32800, and codes 1021 to 1023 clipped). The GPU kernels read such
+//!   a source as code / 1023 (`gpu::yuv_range_constants`), so decoding, the
+//!   contrast also carries 1020 / 1023. A video-range source is exact as
+//!   swscale has it.
 //! - **The 8-bit output.** The fast converters to 8-bit RGB (the table
 //!   ones: anything from a 10-bit source, anything into RGB24, anything
 //!   with a width off a multiple of 16) come out about 2 of 255 dark on
@@ -112,7 +119,9 @@ impl Drop for ThreadedScaler {
 /// tagged so, Rec.709 otherwise (the same choice the GPU kernels make
 /// through `yuv_matrix_constants`); video range unless `full_range`. The
 /// RGB out is full range, and for a 16-bit output on the GPU's scale
-/// (white = 65535, see the module notes).
+/// (white = 65535, see the module notes). `src_bits` is the source's depth:
+/// a full-range source deeper than 8 bits is read with its last code as
+/// white (the module notes again).
 ///
 /// # Safety
 /// `ctx` is a live, initialised swscale context.
@@ -121,6 +130,7 @@ pub(crate) unsafe fn set_yuv_source(
     is_16bit: bool,
     full_range: bool,
     bt2020: bool,
+    src_bits: u32,
 ) {
     use ffmpeg::ffi::*;
     // sws_getCoefficients returns the Y'CbCr matrix coefficients for a
@@ -132,7 +142,12 @@ pub(crate) unsafe fn set_yuv_source(
     // The contrast term is a gain on the whole conversion: 257 / 256 of it
     // puts a 16-bit white on 65535 (255 × 257) where swscale's own scale
     // leaves it on 65280.
-    let contrast = if is_16bit { (1 << 16) * 257 / 256 } else { 1 << 16 };
+    let mut gain = if is_16bit { 257.0 / 256.0 } else { 1.0 };
+    if full_range && (9..=16).contains(&src_bits) {
+        // swscale's white for this source, over the source's own.
+        gain *= (255u32 << (src_bits - 8)) as f64 / ((1u32 << src_bits) - 1) as f64;
+    }
+    let contrast = (gain * 65536.0).round() as std::os::raw::c_int;
     // (ctx, inverse table, source range, table, destination range,
     //  brightness, contrast, saturation); ranges: 0 = video, 1 = full.
     let _ = sws_setColorspaceDetails(
@@ -161,6 +176,15 @@ pub(crate) unsafe fn set_rgb_to_rec709(ctx: *mut ffmpeg::ffi::SwsContext) {
     }
 }
 
+/// Bits of a pixel format's first component (luma): 8 when the format has
+/// no descriptor.
+fn luma_bits(fmt: Pixel) -> u32 {
+    unsafe {
+        let desc = ffmpeg::ffi::av_pix_fmt_desc_get(fmt.into());
+        if desc.is_null() { 8 } else { (*desc).comp[0].depth.max(1) as u32 }
+    }
+}
+
 /// A decoded frame's conversion to packed RGB for the GPU.
 pub(crate) enum YuvToRgb {
     /// The exact conversion, slice-threaded: every same-size conversion.
@@ -183,10 +207,11 @@ impl YuvToRgb {
         bt2020: bool,
     ) -> Result<Self> {
         let is_16bit = dst == Pixel::RGBA64LE;
+        let src_bits = luma_bits(src);
         let same_size = (src_w, src_h) == (dst_w, dst_h);
         if same_size {
             if let Some(mut t) = ThreadedScaler::build(src, src_w, src_h, dst, dst_w, dst_h, SWS_EXACT) {
-                unsafe { set_yuv_source(t.as_mut_ptr(), is_16bit, full_range, bt2020); }
+                unsafe { set_yuv_source(t.as_mut_ptr(), is_16bit, full_range, bt2020, src_bits); }
                 return Ok(Self::Threaded(t));
             }
         }
@@ -199,7 +224,7 @@ impl YuvToRgb {
         };
         let mut plain = ffmpeg::software::scaling::Context::get(src, src_w, src_h, dst, dst_w, dst_h, flags)
             .map_err(|e| Error::Ffmpeg(format!("scaler: {e}")))?;
-        unsafe { set_yuv_source(plain.as_mut_ptr(), is_16bit, full_range, bt2020); }
+        unsafe { set_yuv_source(plain.as_mut_ptr(), is_16bit, full_range, bt2020, src_bits); }
         Ok(Self::Plain(plain))
     }
 
@@ -304,5 +329,28 @@ mod tests {
         let want = ((126.0 - 16.0) / 219.0 + 1.4746 * (180.0 - 128.0) / 224.0) * 255.0;
         let got = out.data(0)[8 * out.stride(0) + 16 * 4] as f64;
         assert!((got - want).abs() <= 1.0, "BT.2020 red came out {got}, exact {want:.1}");
+    }
+
+    /// A full-range 10-bit source is read with code 1023 as white, as the
+    /// GPU kernels read it: into 8-bit RGB and into 16-bit.
+    #[test]
+    fn a_full_range_ten_bit_source_keeps_its_scale() {
+        crate::decode::init();
+        let (w, h) = (64u32, 32u32);
+        for src in [Pixel::YUV420P10LE, Pixel::P010LE] {
+            for (dst, bytes, scale, bound) in [(Pixel::RGBA, 1usize, 255.0, 0.6), (Pixel::RGBA64LE, 2, 65535.0, 40.0)] {
+                let mut conv = YuvToRgb::new(src, w, h, dst, w, h, ffmpeg::software::scaling::Flags::FAST_BILINEAR, true, false).expect("converter");
+                // `flat` takes 8-bit codes: the 10-bit code is four times each.
+                for y in [0u16, 16, 64, 128, 200, 235, 255] {
+                    let mut out = ffmpeg::frame::Video::empty();
+                    conv.run(&flat(src, w, h, y, 128, 128), &mut out).expect("run");
+                    let o = (h as usize / 2) * out.stride(0) + (w as usize / 2) * 4 * bytes;
+                    let d = out.data(0);
+                    let got = if bytes == 2 { u16::from_le_bytes([d[o], d[o + 1]]) as f64 } else { d[o] as f64 };
+                    let want = y as f64 * 4.0 / 1023.0 * scale;
+                    assert!((got - want).abs() <= bound, "{src:?} → {dst:?}: code {} came out {got}, exact {want:.1} (of {scale})", y * 4);
+                }
+            }
+        }
     }
 }

@@ -1168,8 +1168,16 @@ pub(crate) fn fisheye_export_opener(
             }
             // Full size, every frame, camera-linear 16-bit eyes (on the GPU
             // when there is a device).
-            SourceKind::X6Raw => Box::new(crate::x6_raw::X6RawIter::new(
-                p, kind.dual_stream_iter_swap(swap_eyes), false, 1, gpu.clone())?.with_enhanced_frames(raw_enhanced.as_ref())),
+            SourceKind::X6Raw => {
+                let take = crate::x6_raw::X6RawIter::new(
+                    p, kind.dual_stream_iter_swap(swap_eyes), false, 1, gpu.clone())?.with_enhanced_frames(raw_enhanced.as_ref());
+                // An export takes every frame in order: on Windows the take
+                // is read and unpacked ahead of it on a thread of its own
+                // (`X6RawIter::with_read_ahead`; `VR180_RAW_READ_AHEAD=0`
+                // reads in line, for comparison). The frames are the same.
+                let ahead = cfg!(target_os = "windows") && std::env::var("VR180_RAW_READ_AHEAD").as_deref() != Ok("0");
+                Box::new(if ahead { take.with_read_ahead() } else { take })
+            }
             other => return Err(Error::Ffmpeg(format!(
                 "export_fisheye non-fisheye source: {other:?}"))),
         })
@@ -1574,6 +1582,27 @@ fn size_lens_frame(
     Ok(sized)
 }
 
+/// What a lens-frame export that asks for `asked` pixels per eye makes of a
+/// source whose eye is `src`: the size the frame is built at, and the size
+/// the stabilized frame is held to ([`size_lens_frame`]'s `reduced_to`).
+///
+/// - The recording's own size: the frame as recorded (plus the stabilizer's
+///   margin).
+/// - A smaller size: a reduced copy, which keeps that size when stabilized.
+/// - A LARGER size is never an enlargement. It says how large the stabilized
+///   frame may be: the recorded frame with its margin where that fits, else
+///   scaled into the size asked for. (An encoder with a frame limit: NVENC
+///   takes 8192 pixels a side, and a 3840² eye with its margin is 4224².)
+///   Without stabilization it is the recorded frame.
+fn lens_frame_request(asked: (u32, u32), src: (u32, u32), stabilized: bool) -> ((u32, u32), Option<(u32, u32)>) {
+    if asked.0.min(asked.1) > src.0.min(src.1) {
+        let (gw, gh) = crate::lens_frame::stabilized_dims(src.0, src.1);
+        (src, (stabilized && (gw > asked.0 || gh > asked.1)).then_some(asked))
+    } else {
+        (asked, (asked.0.min(asked.1) < src.0.min(src.1)).then_some(asked))
+    }
+}
+
 /// A lens-frame export ([`LensFrameOut::FromSource`]): derive the frame's
 /// lens from the source's lens record and put it in `cfg` for the projection
 /// ([`resolve_calib_pair`]). Returns the lens and whether the frame holds two
@@ -1597,7 +1626,8 @@ pub(crate) fn resolve_lens_frame(cfg: &mut FisheyeExportConfig) -> Result<Option
     let (left, right) = resolve_calib_pair(&lenses_only, src_w, src_h, imu.as_ref());
     let mono = single_eye_source(cfg);
     let sources: Vec<&FisheyeCalib> = if mono { vec![&left] } else { vec![&left, &right] };
-    let frame = crate::lens_frame::LensFrame::from_sources(&sources, cfg.eye_w, cfg.eye_h).ok_or_else(|| Error::Ffmpeg(
+    let ((base_w, base_h), reduced) = lens_frame_request((cfg.eye_w, cfg.eye_h), (src_w, src_h), cfg.stabilize);
+    let frame = crate::lens_frame::LensFrame::from_sources(&sources, base_w, base_h).ok_or_else(|| Error::Ffmpeg(
         "no lens frame can be made for this source (a file that is already VR180 has no lens) — export it as VR180".into()))?;
     for (eye, c) in ["left", "right"].iter().zip(&sources) {
         tracing::info!(
@@ -1607,7 +1637,6 @@ pub(crate) fn resolve_lens_frame(cfg: &mut FisheyeExportConfig) -> Result<Option
     }
     // The last angle a source has a picture at: where its frame ends.
     let reach = sources.iter().map(|c| c.with_frame_edge().theta_max.to_degrees()).fold(0.0_f32, f32::max);
-    let reduced = (cfg.eye_w.min(cfg.eye_h) < src_w.min(src_h)).then_some((cfg.eye_w, cfg.eye_h));
     let frame = size_lens_frame(frame, cfg.stabilize, &cfg.view_adjust, reduced, reach)?;
     cfg.eye_w = frame.width;
     cfg.eye_h = frame.height;
@@ -1848,6 +1877,11 @@ fn export_fisheye_inner(
                             .unwrap_or_else(|| "CPU export path — GPU decode init failed".into())));
                 }
             }
+        } else if cfg.source_kind.is_raw_video() {
+            // A raw take has no video decoder to keep on the GPU: this loop
+            // is its path on every platform (frames unpacked on the CPU,
+            // demosaiced, projected and graded on the GPU), not a fallback,
+            // so there is nothing to warn of.
         } else if std::env::var_os("VR180_EXPORT_FORCE_CPU").is_none() {
             // Landed on the portable serial loop — say WHY (the user-visible
             // symptom is just "export is slow with the GPU idle").
@@ -2491,7 +2525,52 @@ fn run_fisheye_frames<F: FrameFeed>(
         p.any_active()
     };
 
-    while let Some(frame) = feed.pull(pipeline)? {
+    // What the 10-bit readback arm hands the encoder. An encoder that takes
+    // P010 (hevc_nvenc) or planar 4:2:2 (ProRes) gets the planes the GPU
+    // composed, as the Windows zero-copy readback arm does: half to a third
+    // of the bytes to read back and no RGB → Y'CbCr pass on the CPU (at
+    // 8192 × 4096 the RGB48 frame is 201 MB, and its readback and conversion
+    // were three quarters of a frame's time on this loop). Windows only: the
+    // Mac's encoders take their frames as surfaces, and its software
+    // fallbacks keep the route they were verified on. A single-eye frame
+    // has no such compose and stays on RGB48.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum PlaneFeed { Rgb48, P010, P210 }
+    let plane_feed = if !cfg!(target_os = "windows") || mono || cfg.bit_depth != 10 || !matches!(sink, FrameSink::Readback) {
+        PlaneFeed::Rgb48
+    } else if encoder.wants_p010() {
+        PlaneFeed::P010
+    } else if encoder.wants_yuv422p10() {
+        PlaneFeed::P210
+    } else {
+        PlaneFeed::Rgb48
+    };
+    // With planes the encoder runs on a thread of its own (the copy into its
+    // frame, the encode and the mux overlap the next frame's GPU work);
+    // every other feed calls it in line, as before. `VR180_ENCODE_INLINE=1`
+    // keeps it in line with planes too, for comparison: the file is the same.
+    let encoder_threaded = plane_feed != PlaneFeed::Rgb48 && std::env::var("VR180_ENCODE_INLINE").as_deref() != Ok("1");
+    if plane_feed != PlaneFeed::Rgb48 {
+        tracing::info!("{tag}: encode input = {} planes composed on the GPU (no swscale), encoder {}",
+            if plane_feed == PlaneFeed::P010 { "P010" } else { "P210" },
+            if encoder_threaded { "on its own thread" } else { "in line" });
+    }
+    let mut encoder = if encoder_threaded {
+        crate::encode::EncodeStage::on_thread(encoder)?
+    } else {
+        crate::encode::EncodeStage::inline(encoder)
+    };
+    // Where a frame's time goes on this loop (logged every 30 frames): the
+    // source's decode, the GPU work up to the composed frame, its readback,
+    // and the encoder.
+    let (mut t_decode, mut t_gpu, mut t_read, mut t_encode) = (
+        std::time::Duration::ZERO, std::time::Duration::ZERO,
+        std::time::Duration::ZERO, std::time::Duration::ZERO,
+    );
+    loop {
+        let d0 = std::time::Instant::now();
+        let Some(frame) = feed.pull(pipeline)? else { break };
+        t_decode += d0.elapsed();
         // Cancellation check before doing any GPU work.
         if cancel.load(Ordering::SeqCst) {
             tracing::info!("{tag}: cancelled at frame {}", frame_idx);
@@ -2588,19 +2667,51 @@ fn run_fisheye_frames<F: FrameFeed>(
             }
             FrameSink::Readback if cfg.bit_depth == 10 => {
                 // 10-bit readback: 16-bit projection and grade on the GPU,
-                // then RGB48 to the encoder. libx265 Main10 and software
+                // then the encoder's own planes where it takes them (see
+                // `PlaneFeed`), else RGB48: libx265 Main10 and software
                 // ProRes on both platforms.
+                let g0 = std::time::Instant::now();
                 let (left, right) = frame.project_16(pipeline, &job)?;
                 let frame_plan = frame.develop_plan(pipeline, color_plan, &job)?;
                 let (left, right) = grade_eyes_16(
                     pipeline, &left, &right, cfg.eye_w, cfg.eye_h, &frame_plan, eye_match(), mono,
                 )?;
-                // One eye is the frame itself; two are composed side by side.
-                let sbs_tex_16 = if mono { left } else {
-                    pipeline.compose_sbs_textures_16(&left, &right, cfg.eye_w, cfg.eye_h)?
-                };
-                let sbs_rgb48 = pipeline.read_texture_rgb48(&sbs_tex_16, sbs_w, sbs_h)?;
-                for _ in 0..fill.copies() { encoder.encode_frame_rgb48(&sbs_rgb48)?; }
+                match plane_feed {
+                    PlaneFeed::P010 | PlaneFeed::P210 => {
+                        // Video range, as the encoder tags the stream. 4:2:0 for
+                        // HEVC, 4:2:2 (full vertical chroma) for ProRes.
+                        let p210 = plane_feed == PlaneFeed::P210;
+                        let (y_tex, uv_tex) = if p210 {
+                            pipeline.compose_sbs_to_p210_textures(&left, &right, cfg.eye_w, cfg.eye_h, false)?
+                        } else {
+                            pipeline.compose_sbs_to_p010_textures(&left, &right, cfg.eye_w, cfg.eye_h, false)?
+                        };
+                        t_gpu += g0.elapsed();
+                        let r0 = std::time::Instant::now();
+                        // The first readback waits for the frame's GPU work;
+                        // the second is the copy alone.
+                        let y = pipeline.read_texture_planar(&y_tex, sbs_w, sbs_h, 2)?;
+                        let uv = pipeline.read_texture_planar(&uv_tex, sbs_w / 2, if p210 { sbs_h } else { sbs_h / 2 }, 4)?;
+                        t_read += r0.elapsed();
+                        let e0 = std::time::Instant::now();
+                        let planes = if p210 { crate::encode::PlaneFrame::P210 { y, uv } } else { crate::encode::PlaneFrame::P010 { y, uv } };
+                        encoder.encode_planes(planes, fill.copies())?;
+                        t_encode += e0.elapsed();
+                    }
+                    PlaneFeed::Rgb48 => {
+                        // One eye is the frame itself; two are composed side by side.
+                        let sbs_tex_16 = if mono { left } else {
+                            pipeline.compose_sbs_textures_16(&left, &right, cfg.eye_w, cfg.eye_h)?
+                        };
+                        t_gpu += g0.elapsed();
+                        let r0 = std::time::Instant::now();
+                        let sbs_rgb48 = pipeline.read_texture_rgb48(&sbs_tex_16, sbs_w, sbs_h)?;
+                        t_read += r0.elapsed();
+                        let e0 = std::time::Instant::now();
+                        for _ in 0..fill.copies() { encoder.encode_frame_rgb48(&sbs_rgb48)?; }
+                        t_encode += e0.elapsed();
+                    }
+                }
             }
             FrameSink::Readback => {
                 // 8-bit readback. The automatic eye-exposure offset runs on
@@ -2639,6 +2750,15 @@ fn run_fisheye_frames<F: FrameFeed>(
 
         frame_idx += 1;
         written += fill.copies();
+        if frame_idx % 30 == 0 {
+            let n = frame_idx as u32;
+            // `readback` holds the wait for the frame's GPU work; with the
+            // encoder on its own thread `encode` is the wait for its queue.
+            tracing::info!(
+                "export perf: f={} avg/frame: decode={:?} gpu={:?} readback={:?} encode={:?}",
+                frame_idx, t_decode / n, t_gpu / n, t_read / n, t_encode / n,
+            );
+        }
         let elapsed = t_start.elapsed().as_secs_f32().max(1e-3);
         let fps_avg = frame_idx as f32 / elapsed;
         progress_cb(ExportProgress {
@@ -2778,12 +2898,14 @@ fn resolve_eac_lens_frame(cfg: &mut FisheyeExportConfig) -> Result<Option<(crate
     }
     let path = cfg.segments.first().unwrap_or(&cfg.source_path);
     let dims = crate::decode::probe_video(path).map(|p| vr180_core::eac::Dims::new(p.width, p.height))?;
-    let frame = crate::lens_frame::LensFrame::equidistant(cfg.eye_w, cfg.eye_h, EAC_LENS_FRAME_HALF_FOV_DEG)
+    // The cross's side stands for the recording's size here.
+    let cross = dims.cross_w();
+    let ((base_w, base_h), reduced) = lens_frame_request((cfg.eye_w, cfg.eye_h), (cross, cross), cfg.stabilize);
+    let frame = crate::lens_frame::LensFrame::equidistant(base_w, base_h, EAC_LENS_FRAME_HALF_FOV_DEG)
         .ok_or_else(|| Error::Ffmpeg("no lens frame of this size".into()))?;
     // The cross holds the front face and, of each side face, the strip of
     // `tile_w` pixels next to it: that far off the axis there is a picture.
     let reach = 45.0 + 90.0 * dims.tile_w() as f32 / vr180_core::eac::CENTER_W as f32;
-    let reduced = (cfg.eye_w.min(cfg.eye_h) < dims.cross_w()).then_some((cfg.eye_w, cfg.eye_h));
     let frame = size_lens_frame(frame, cfg.stabilize, &cfg.view_adjust, reduced, reach)?;
     cfg.eye_w = frame.width;
     cfg.eye_h = frame.height;
@@ -5018,7 +5140,7 @@ fn apply_color_stack_rgb8_sbs(
 
 #[cfg(test)]
 mod lens_frame_tests {
-    use super::{axis_tilt_deg, size_lens_frame, LENS_FRAME_PICTURE_SLACK_DEG};
+    use super::{axis_tilt_deg, lens_frame_request, size_lens_frame, LENS_FRAME_PICTURE_SLACK_DEG};
     use crate::lens_frame::LensFrame;
     use crate::panomap::ViewAdjust;
 
@@ -5062,6 +5184,38 @@ mod lens_frame_tests {
         let copy = size_lens_frame(small, true, &ViewAdjust::IDENTITY, Some((2048, 2048)), 92.25).unwrap();
         assert_eq!((copy.width, copy.height), (2048, 2048));
         assert!((copy.focal / small.focal - 2048.0 / 2252.0).abs() < 1e-6, "{}", copy.focal / small.focal);
+    }
+
+    /// What a size asked of a lens frame means against the recording's own:
+    /// the same is the recorded frame, a smaller one a reduced copy, and a
+    /// larger one never an enlargement, only the room the stabilized frame
+    /// may take.
+    #[test]
+    fn a_size_beyond_the_recording_holds_the_stabilized_frame() {
+        let src = (3840, 3840);
+        // The recording's own size, and a reduced copy: as before.
+        assert_eq!(lens_frame_request(src, src, true), (src, None));
+        assert_eq!(lens_frame_request(src, src, false), (src, None));
+        assert_eq!(lens_frame_request((2048, 2048), src, true), ((2048, 2048), Some((2048, 2048))));
+        assert_eq!(lens_frame_request((2048, 2048), src, false), ((2048, 2048), Some((2048, 2048))));
+        // 4096 asked of a 3840 eye: the frame is built at 3840 either way;
+        // stabilized, its 4224 are held to 4096, and without, nothing is.
+        assert_eq!(lens_frame_request((4096, 4096), src, true), (src, Some((4096, 4096))));
+        assert_eq!(lens_frame_request((4096, 4096), src, false), (src, None));
+        // Room enough for the margin: the recorded frame with its margin.
+        assert_eq!(lens_frame_request((4096, 4096), (3712, 3712), true), ((3712, 3712), None));
+        assert_eq!(lens_frame_request((4224, 4224), src, true), (src, None));
+
+        // The frame that comes of it: 4096 a side, the whole stabilized field
+        // in it, 4096 / 4224 of the recording's scale.
+        let f = LensFrame::equidistant(3840, 3840, super::EAC_LENS_FRAME_HALF_FOV_DEG).unwrap();
+        let (base, held) = lens_frame_request((4096, 4096), src, true);
+        assert_eq!((base, f.width), (src, 3840));
+        let out = size_lens_frame(f, true, &ViewAdjust::IDENTITY, held, 92.25).unwrap();
+        assert_eq!((out.width, out.height), (4096, 4096));
+        assert!((out.focal / f.focal - 4096.0 / 4224.0).abs() < 1e-6, "{}", out.focal / f.focal);
+        let free = size_lens_frame(f, false, &ViewAdjust::IDENTITY, lens_frame_request((4096, 4096), src, false).1, 92.25).unwrap();
+        assert_eq!((free.width, free.height, free.focal), (3840, 3840, f.focal));
     }
 
     /// A lens whose image would not hold the frame is refused, not written.

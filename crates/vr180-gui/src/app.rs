@@ -505,6 +505,41 @@ fn lens_frame_reduced_dims(eye_w: u32, eye_h: u32) -> Option<(u32, u32)> {
     Some((side(eye_w), side(eye_h)))
 }
 
+/// The largest frame side the platform's hardware H.265 encoder takes, where
+/// an export can meet that limit: NVENC stops at 8192 (Windows; measured on
+/// an RTX 4090, see [`oversize_export_hint`]). VideoToolbox on a Mac takes
+/// every frame the app writes.
+fn hw_h265_side_limit() -> Option<u32> {
+    if cfg!(target_os = "macos") { None } else { Some(8192) }
+}
+
+/// What the 8K choice of a STABILIZED lens frame is held to where the
+/// hardware encoder has a frame limit ([`hw_h265_side_limit`]) and the
+/// recorded frame with the stabilizer's margin, two of them side by side, is
+/// past it (a 3840² eye: 4224², 8448 wide): that frame scaled so that its
+/// longer side is half the limit, each side a multiple of 4. `None` where the
+/// frame fits as it is, or nothing limits it: the 8K choice is then the
+/// frame itself.
+///
+/// The size is larger than the recording. The pipeline reads that as the room
+/// the stabilized frame may take, never as an enlargement
+/// (`fisheye_export::lens_frame_request`).
+fn lens_frame_held_dims(eye_w: u32, eye_h: u32) -> Option<(u32, u32)> {
+    let long = hw_h265_side_limit()? / 2;
+    if eye_w.min(eye_h) == 0 {
+        return None;
+    }
+    let (gw, gh) = vr180_pipeline::lens_frame::stabilized_dims(eye_w, eye_h);
+    if gw.max(gh) <= long {
+        return None;
+    }
+    let scale = long as f64 / gw.max(gh) as f64;
+    let side = |v: u32| (((v as f64 * scale) / 4.0).round() as u32 * 4).clamp(16, long);
+    Some((side(gw), side(gh)))
+}
+
+const LENS_FRAME_HELD_NOTE: &str = "This size is the stabilized frame scaled to fit the NVIDIA hardware encoder, which takes 8192 pixels a side: a few percent smaller than recorded, and many times faster to export as H.265 than the native size, which is encoded in software.";
+
 /// Output resolution target for the export. `Native` renders at the
 /// source's per-eye dimensions — labeled by the OSV case (3840² per eye
 /// → 7680×3840 SBS); a `.360` source actually renders its cross-native
@@ -601,7 +636,12 @@ enum EnhancedFrames {
     Absent,
     /// Enhanced pictures of this many pixels a side per eye.
     Found(u32),
+    /// This build cannot decode enhanced pictures
+    /// (`enhanced_dng::decodable`): none is looked for.
+    Unreadable,
 }
+
+const ENHANCED_UNREADABLE_NOTE: &str = "Enhanced frames (a raw converter's Super Resolution, in the folder of Camera original DNGs) are read on macOS only for now: this clip exports from the capture.";
 
 /// A take and its trim, as an enhanced-frames lookup is asked for them.
 type EnhancedKey = (PathBuf, Option<u64>, Option<u64>);
@@ -980,12 +1020,20 @@ mod export_size_tests {
         assert!(text.contains("16384 × 8192") && !text.contains("7680 × 3840 (native)"), "{text}");
         assert!(text.contains("Enhanced frames found: 7680 × 7680 per eye"), "{text}");
         assert!(text.contains("the two larger sizes keep it"), "{text}");
-        assert!(text.contains("Above 8192 × 4096"), "{text}");
+        // The note for a frame this size is the platform encoder's own.
+        let note = oversize_export_hint(opts.codec, 16384, 8192).expect("a note at this size");
+        assert!(text.contains(note), "{text}");
         let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Absent));
         assert!(text.contains("7680 × 3840 (native)") && !text.contains("16384"), "{text}");
         assert!(text.contains("No enhanced frame found for this clip"), "{text}");
         let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Looking));
         assert!(text.contains("Looking for enhanced frames") && !text.contains("16384"), "{text}");
+        // A build that cannot read enhanced frames says so, and offers neither
+        // the option nor the sizes.
+        let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Unreadable));
+        assert!(text.contains(super::ENHANCED_UNREADABLE_NOTE) && !text.contains("Use enhanced frames") && !text.contains("16384"), "{text}");
+        assert!(text.contains("7680 × 3840 (native)"), "{text}");
+        assert_ne!(tr_zh(super::ENHANCED_UNREADABLE_NOTE), super::ENHANCED_UNREADABLE_NOTE);
         // The option off: the usual list, and no word of what the folder holds.
         opts.raw_use_enhanced = false;
         let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Found(7680)));
@@ -1137,9 +1185,31 @@ mod export_size_tests {
 
         // A clip that holds the lens's whole view: its own frame too, by
         // its own resolution choice (not the Crop clips'). At 8K — the
-        // default — a frame no larger than that is not enlarged.
+        // default — a frame no larger than that is not enlarged: what is
+        // asked for is the frame itself, or, where the hardware encoder has
+        // a frame limit and the stabilized frame is past it, the size that
+        // frame is held to.
+        assert!(lens.stabilize);
+        let held = super::lens_frame_held_dims(3840, 3840);
+        assert_eq!(held, super::hw_h265_side_limit().map(|_| (4096, 4096)));
+        let asked = held.unwrap_or((3840, 3840));
         let c = cfg(&on, &lens, insv, (3840, 3840), None);
-        assert_eq!((c.projection, c.lens_frame, c.eye_w, c.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource, 3840, 3840));
+        assert_eq!((c.projection, c.lens_frame, c.eye_w, c.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource, asked.0, asked.1));
+        // Never without stabilization, and never for the clip's own size.
+        let still = Settings { stabilize: false, ..lens.clone() };
+        let c = cfg(&on, &still, insv, (3840, 3840), None);
+        assert_eq!((c.eye_w, c.eye_h), (3840, 3840));
+        let own = ExportOptions { resolution: ExportResolution::Native, ..on };
+        assert_eq!((cfg(&own, &lens, insv, (3840, 3840), None).eye_w), 3840);
+        // What is written at 8K: the held size, or the frame with its margin.
+        assert_eq!(on.lens_frame_out_dims(3840, 3840, false, true), held.unwrap_or((4224, 4224)));
+        assert_eq!(on.lens_frame_out_dims(3840, 3840, false, false), (3840, 3840));
+        assert_eq!(own.lens_frame_out_dims(3840, 3840, false, true), (4224, 4224));
+        // A frame whose margin fits needs no holding, a GoPro cross does, and
+        // a frame that is not square keeps its shape.
+        assert_eq!(super::lens_frame_held_dims(3712, 3712), None);
+        assert_eq!(super::lens_frame_held_dims(3936, 3936), super::hw_h265_side_limit().map(|_| (4096, 4096)));
+        assert_eq!(super::lens_frame_held_dims(3840, 3008), super::hw_h265_side_limit().map(|_| (4096, 3272)));
         let c = cfg(&on, &lens, insv, (4864, 4864), None);
         assert_eq!((c.lens_frame, c.eye_w, c.eye_h), (LensFrameOut::FromSource, 4096, 4096));
         let full = ExportOptions { resolution: ExportResolution::Native, crop_resolution: ExportResolution::R8k, ..on };
@@ -1160,7 +1230,8 @@ mod export_size_tests {
             std::path::Path::new("/nonexistent/in.360"), std::path::Path::new("/nonexistent/out.mp4"),
             29.97, SourceKind::GoProEac, 0, 0, 5952, 1920, None, &lens, &on, Vec::new(),
         );
-        assert_eq!((gopro.projection, gopro.lens_frame, gopro.eye_w, gopro.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource, 3936, 3936));
+        let asked = super::lens_frame_held_dims(3936, 3936).unwrap_or((3936, 3936));
+        assert_eq!((gopro.projection, gopro.lens_frame, gopro.eye_w, gopro.eye_h), (FisheyeExportProjection::Fisheye, LensFrameOut::FromSource, asked.0, asked.1));
 
         // The VR180 view is VR180, whatever the lens choice says.
         let c = cfg(&on, &vr, insv, (4912, 4912), Some(6560));
@@ -1234,7 +1305,23 @@ mod export_size_tests {
         assert!(text.contains("8448 × 4224 (native + margin)"), "{text}");
         let mut at_8k = ExportOptions::default();
         let text = panel_text_lens(&mut at_8k, (7680, 3840), None, Some(Camera), true, false);
-        assert!(text.contains("8448 × 4224 (native + margin)") && !text.contains("\n8192 × 4096\n"), "{text}");
+        if super::hw_h265_side_limit().is_some() {
+            // Where the hardware encoder stops at 8192 a side, the 8K choice
+            // of a stabilized frame is that frame held to it, and says so.
+            assert!(text.contains("\n8192 × 4096\n") && !text.contains("8448 × 4224"), "{text}");
+            assert!(text.contains(super::LENS_FRAME_HELD_NOTE), "{text}");
+            assert_ne!(tr_zh(super::LENS_FRAME_HELD_NOTE), super::LENS_FRAME_HELD_NOTE);
+            // Not without stabilization: the frame as it is, and no such note.
+            let text = panel_text_lens(&mut at_8k, (7680, 3840), None, Some(Camera), false, false);
+            assert!(text.contains("7680 × 3840 (native)") && !text.contains(super::LENS_FRAME_HELD_NOTE), "{text}");
+            // The clip's own size stays the frame with its margin, with the
+            // encoder's note.
+            let text = panel_text_lens(&mut whole, (7680, 3840), None, Some(Camera), true, false);
+            assert!(!text.contains(super::LENS_FRAME_HELD_NOTE), "{text}");
+            assert!(text.contains(oversize_export_hint(whole.codec, 8448, 4224).expect("a note past the encoder's frame")), "{text}");
+        } else {
+            assert!(text.contains("8448 × 4224 (native + margin)") && !text.contains("\n8192 × 4096\n"), "{text}");
+        }
         assert_eq!(at_8k.resolution, ExportResolution::R8k);
         // A larger one (an X6 at 10K) does have its 8K copy.
         let text = panel_text_with(&mut at_8k, (9728, 4864), None, Some(Camera), false);
@@ -1789,9 +1876,15 @@ impl ExportOptions {
     /// same here — or its reduced copy for the 8K choice
     /// ([`lens_frame_reduced_dims`]; a frame no larger than that is never
     /// enlarged). The choice is the clip's own ([`Self::resolution_for`]).
-    fn lens_frame_eye_dims(&self, eye_w: u32, eye_h: u32, cropped: bool) -> (u32, u32) {
+    ///
+    /// One more meaning of the 8K choice, for a `stabilized` frame where the
+    /// hardware encoder has a frame limit: the size the frame with its margin
+    /// is held to ([`lens_frame_held_dims`]).
+    fn lens_frame_eye_dims(&self, eye_w: u32, eye_h: u32, cropped: bool, stabilized: bool) -> (u32, u32) {
         match self.resolution_for(SizeList::of(cropped, false)) {
-            ExportResolution::R8k => lens_frame_reduced_dims(eye_w, eye_h).unwrap_or((eye_w, eye_h)),
+            ExportResolution::R8k => lens_frame_reduced_dims(eye_w, eye_h)
+                .or_else(|| lens_frame_held_dims(eye_w, eye_h).filter(|_| stabilized))
+                .unwrap_or((eye_w, eye_h)),
             _ => (eye_w, eye_h),
         }
     }
@@ -1802,7 +1895,7 @@ impl ExportOptions {
     /// reduced copy keeps its size). What the export bar shows and a
     /// snapshot renders.
     fn lens_frame_out_dims(&self, eye_w: u32, eye_h: u32, cropped: bool, stabilized: bool) -> (u32, u32) {
-        let (w, h) = self.lens_frame_eye_dims(eye_w, eye_h, cropped);
+        let (w, h) = self.lens_frame_eye_dims(eye_w, eye_h, cropped, stabilized);
         if stabilized && (w, h) == (eye_w, eye_h) {
             vr180_pipeline::lens_frame::stabilized_dims(w, h)
         } else {
@@ -2035,6 +2128,8 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Enhanced frames found:" => "已找到增强后的帧：",
         "No enhanced frame found for this clip: it exports from the capture." => "没有找到这个片段的增强帧：导出取自采集文件。",
         "Looking for enhanced frames…" => "正在查找增强后的帧…",
+        "This size is the stabilized frame scaled to fit the NVIDIA hardware encoder, which takes 8192 pixels a side: a few percent smaller than recorded, and many times faster to export as H.265 than the native size, which is encoded in software." => "这个尺寸是把防抖后的画幅缩小到 NVIDIA 硬件编码器能接受的范围（单边 8192 像素）：比拍摄时小百分之几，导出 H.265 比原生尺寸快很多倍（原生尺寸只能软件编码）。",
+        "Enhanced frames (a raw converter's Super Resolution, in the folder of Camera original DNGs) are read on macOS only for now: this clip exports from the capture." => "增强后的帧（raw 转换软件的超分辨率，位于相机原始 DNG 文件夹中）目前只有 macOS 能读取：这个片段从采集文件导出。",
         "This clip's enhanced frames hold more than 8192 × 4096 shows: the two larger sizes keep it. A stretch without enhanced frames exports at the size picked without them." => "这个片段的增强帧包含的细节多于 8192 × 4096 能呈现的：两档更大的尺寸可以保留这些细节。没有增强帧的区段按未使用增强帧时所选的尺寸导出。",
         "When the folder of Camera original DNGs is beside the take and a raw converter has enhanced its frames in place (Camera Raw's Super Resolution), each frame is taken from there, at the enhanced size. A frame that was not enhanced comes from the capture." => "素材旁边有相机原片 DNG 文件夹，并且其中的帧已在 RAW 转换软件里原地增强过时（Camera Raw 的超分辨率），每一帧从那里读取，按增强后的尺寸处理。没有增强过的帧仍取自采集文件。",
         "Camera original" => "相机原片",
@@ -3296,6 +3391,11 @@ impl App {
     /// its camera-original DNGs where a raw converter has enhanced them, and
     /// what that folder was found to hold.
     fn enhanced_frames_ui(ui: &mut egui::Ui, opts: &mut ExportOptions, found: EnhancedFrames) {
+        if found == EnhancedFrames::Unreadable {
+            ui.label(RichText::new(tr(ENHANCED_UNREADABLE_NOTE)).small().color(Color32::GRAY));
+            ui.add_space(8.0);
+            return;
+        }
         ui.checkbox(&mut opts.raw_use_enhanced, tr("Use enhanced frames"));
         ui.label(RichText::new(tr("When the folder of Camera original DNGs is beside the take and a raw converter has enhanced its frames in place (Camera Raw's Super Resolution), each frame is taken from there, at the enhanced size. A frame that was not enhanced comes from the capture."))
             .small().color(Color32::GRAY));
@@ -3304,6 +3404,7 @@ impl App {
                 EnhancedFrames::Found(side) => (format!("{} {side} × {side} {}", tr("Enhanced frames found:"), tr("per eye")), Color32::from_rgb(120, 190, 130)),
                 EnhancedFrames::Absent => (tr("No enhanced frame found for this clip: it exports from the capture.").to_string(), Color32::GRAY),
                 EnhancedFrames::Looking => (tr("Looking for enhanced frames…").to_string(), Color32::GRAY),
+                EnhancedFrames::Unreadable => (tr(ENHANCED_UNREADABLE_NOTE).to_string(), Color32::GRAY),
             };
             ui.label(RichText::new(text).small().color(color));
         }
@@ -3319,6 +3420,9 @@ impl App {
             return None;
         }
         let path = self.loaded_path.clone()?;
+        if !vr180_pipeline::enhanced_dng::decodable() {
+            return Some(EnhancedFrames::Unreadable);
+        }
         if !self.export_opts.raw_use_enhanced {
             return Some(EnhancedFrames::Absent);
         }
@@ -3449,7 +3553,7 @@ impl App {
         // at the size the eye was recorded (or the 8K copy).
         let lens_frame_on = settings.lens_frame_view(source_kind);
         let lens_frame = if lens_frame_on {
-            (eye_w, eye_h) = opts.lens_frame_eye_dims(native_eye.0, native_eye.1, sharp_eye.is_some());
+            (eye_w, eye_h) = opts.lens_frame_eye_dims(native_eye.0, native_eye.1, sharp_eye.is_some(), settings.stabilize);
             vr180_pipeline::fisheye_export::LensFrameOut::FromSource
         } else {
             vr180_pipeline::fisheye_export::LensFrameOut::Off
@@ -6339,12 +6443,16 @@ impl App {
             let list = SizeList::of(cropped, enhanced_sizes);
             let shown = opts.resolution_for(list);
             // The 8K choice of a lens frame is its reduced copy, listed only
-            // where the frame is larger than that.
-            let lens_reduced: Option<String> = native_dims.filter(|_| lens_frame).and_then(|(w, h)| {
-                let eye_w = if single_eye { w } else { w / 2 };
-                lens_frame_reduced_dims(eye_w, h)
-                    .map(|(rw, rh)| format!("{} × {rh}", if single_eye { rw } else { rw * 2 }))
-            });
+            // where the frame is larger than that — or, for a stabilized
+            // frame past the hardware encoder's limit, the size that frame
+            // is held to (`lens_frame_held_dims`).
+            let lens_eye = native_dims.filter(|_| lens_frame).map(|(w, h)| (if single_eye { w } else { w / 2 }, h));
+            let lens_held = lens_eye.filter(|_| lens_frame_stabilized)
+                .filter(|&(ew, eh)| lens_frame_reduced_dims(ew, eh).is_none())
+                .and_then(|(ew, eh)| lens_frame_held_dims(ew, eh));
+            let lens_reduced: Option<String> = lens_eye
+                .and_then(|(ew, eh)| lens_frame_reduced_dims(ew, eh).or(lens_held))
+                .map(|(rw, rh)| format!("{} × {rh}", if single_eye { rw } else { rw * 2 }));
             let r8k_label: String = lens_reduced.clone()
                 .unwrap_or_else(|| ExportResolution::R8k.frame_label(single_eye).to_string());
             let r8k_listed = !lens_frame || lens_reduced.is_some();
@@ -6381,6 +6489,9 @@ impl App {
             if lens_frame {
                 ui.label(RichText::new(tr(LENS_FRAME_NOTE)).small().color(Color32::GRAY));
                 ui.label(RichText::new(tr(LENS_FRAME_STAB_NOTE)).small().color(Color32::GRAY));
+                if lens_held.is_some() && opts.resolution_for(list) == ExportResolution::R8k {
+                    ui.label(RichText::new(tr(LENS_FRAME_HELD_NOTE)).small().color(Color32::GRAY));
+                }
             } else if sharp_label.is_some() {
                 ui.label(RichText::new(tr("Native sharpness: the 180° canvas at the pixel density of the Crop frame's centre, so nothing recorded is scaled down. The clip's own size puts the same frame on a smaller canvas."))
                     .small().color(Color32::GRAY));
