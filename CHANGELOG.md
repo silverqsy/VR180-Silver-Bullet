@@ -131,7 +131,16 @@ converter's controls for it, and every frame can be had as a DNG.
   a frame enhanced by Camera Raw 18.7; its values agree with Camera Raw's
   own demosaic of the frame to a part in a thousand. About 0.45 s a frame
   pair and 4 GB of memory at 8192×4096. macOS only for now: the enhanced
-  picture is JPEG XL, which this build decodes through the system.
+  picture is JPEG XL, which this build decodes through the system. On
+  Windows the option is replaced by a line that says so and a take exports
+  from the capture; the settings Camera Raw left in the files are read
+  there as on a Mac.
+- **Windows.** A raw take opens, previews and exports there as well
+  (checked on an NVIDIA RTX 4090, on Vulkan and on Direct3D 12), and the
+  Camera original DNGs it writes are byte for byte the ones a Mac writes.
+  An 8192×4096 export runs at about 3.5 frames a second through NVENC and
+  3.9 as ProRes: the picture is prepared on the GPU but handed to the
+  encoder through memory.
 - **Rolling shutter and the accelerometer.** Takes from the camera build
   that records the sensor's row timing and the accelerometer use both.
   Each frame's pose is taken where its centre row starts exposing (the
@@ -256,6 +265,13 @@ headset shows every pixel at its own angle.
   (the larger one, on a stabilized clip): its window can be as wide as the
   frame, and gives a steady edge once it is small enough to stay inside
   the moving picture. Camera lock suits a camera that stays put.
+- **On Windows**, the NVIDIA encoder takes frames up to 8192 pixels a
+  side. A lens frame without stabilization fits for an 8K clip (7680 ×
+  3840, about 30 frames a second on an RTX 4090); the stabilized frame of
+  the same clip is 8448 × 4224 (8656 × 4328 for a GoPro `.360`) and is
+  encoded in software when the codec is H.265, at about 2 frames a second,
+  which the export bar and Export format say. ProRes stays on the GPU at
+  that size (about 15 frames a second).
 - **The preview is the export.** In Lens Space the preview draws the
   frame that is written: its shape, the stabilizer's margin, the crop mask
   where the export has it.
@@ -339,6 +355,10 @@ show the export.
     once came out 0.39 % dark or bright.
   - Its fast **8-bit conversions run 2 of 255 dark**: an 8-bit software
     export of a 10-bit source was 1.8 codes darker than the hardware one.
+  - Its **full range stops short above 8 bits**: for a full-range 10-bit
+    source (a QooCam 3 Ultra clip) it takes code 1020 for white, not 1023,
+    so such a clip decoded on the CPU was 0.3 % brighter than the same
+    clip decoded on the GPU.
 
   Every such conversion now states its matrix, puts 16-bit pictures on one
   scale, and uses FFmpeg's exact arithmetic on a threaded context. Flat
