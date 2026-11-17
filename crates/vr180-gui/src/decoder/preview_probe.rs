@@ -147,7 +147,16 @@ pub(crate) fn run(clip: &Path) -> anyhow::Result<()> {
 
     let settings = settings_for(&path)?;
     let stabilized = settings.stabilize;
-    let pipeline = Arc::new(Device::new()?);
+    let pipeline = Device::new()?;
+    // On Windows the zero-copy preview is gated on the P010 texture format,
+    // which the app's own device asks for (main.rs) and `Device::new` does
+    // not: without it the probe would run that platform's CPU preview and
+    // never the worker the app runs. The same adapter, the app's features.
+    let pipeline = Arc::new(if cfg!(target_os = "windows") {
+        Device::new_dedicated_from_adapter(&pipeline.adapter)?
+    } else {
+        pipeline
+    });
     let control = Arc::new(DecoderControl {
         paused: true.into(),
         settings: parking_lot::RwLock::new(settings.clone()),
