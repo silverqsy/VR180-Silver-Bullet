@@ -3444,6 +3444,24 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      the four `project_fisheye_rgba16_texture_*` wrappers and keep their
      own per-frame pose: moving them onto `project_eye` / `FramePose` is
      still to do, and this A/B set is the check for it.
+   - **MAC SIDE (2026-11-17, Mac):** the Mac had made the same merge of
+     `main` @ `8948361` within the hour and not pushed it. The two ports
+     of the loop came out the same but for the spelling of the sink test
+     (`!=` there, `matches!` here) and one comment, so the Mac dropped its
+     own and took this head, then merged the three Mac commits of `main`
+     (`99516c2`, `879331c`, `c171c06`) as `8093d7b`: the gate on the
+     stage-time line lands in `run_fisheye_frames` by itself. On that
+     head: it builds (the macOS-gated arms inside the shared loops were
+     never compiled on Windows; this is their compile), tests braw 6,
+     core 63, fisheye 69, gui 40, pipeline 235, and the Mac's stored sets
+     are the same as `main`'s: 65 exports (every encoder arm of both
+     loops, raw takes, lens frames, DNG frames) and 169 preview lines
+     (the workers, the zoom stills). With the macOS branches switched off
+     the workspace type-checks as `main` does, and the text of the
+     Windows-gated items is `main`'s but for the `stab_cap_and_window`
+     substitution in `run_fisheye_zerocopy`. With the A/B above the branch
+     gives `main`'s pictures on both machines; what is left before it
+     lands is the decision.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
