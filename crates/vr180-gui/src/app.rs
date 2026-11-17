@@ -1414,7 +1414,7 @@ mod export_size_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Default::default(),
-            status: BatchStatus::Idle, selected: false, x6,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false,
         };
         let x6 = |single_eye| Some(X6ClipInfo { window: None, ilog: Some(true), paraxial_native: 2086.97, single_lens: single_eye, single_eye });
         let two = item(SourceKind::Insta360Insv, x6(false));
@@ -1460,7 +1460,7 @@ mod ettr_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Settings { ettr_stops, ..Default::default() },
-            status: BatchStatus::Idle, selected: false, x6,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false,
         }
     }
 
@@ -1996,12 +1996,14 @@ struct BatchItem {
     /// Insta360 X6 video: the trailer's recording-mode signature (the
     /// native-sharpness export size of a Crop clip follows from it).
     x6: Option<X6ClipInfo>,
+    /// A raw take of one lens ([`raw_take_of_one_lens`]).
+    raw_one_lens: bool,
 }
 
 impl BatchItem {
     /// The source holds ONE eye (see `ClipInfo::single_eye`).
     fn single_eye(&self) -> bool {
-        self.x6.is_some_and(|x| x.single_eye)
+        self.x6.is_some_and(|x| x.single_eye) || self.raw_one_lens
     }
 
     /// The clip is taken as Insta360 I-Log (see [`takes_ilog`]).
@@ -2786,6 +2788,8 @@ struct ClipInfo {
     /// Insta360 X6 video: the trailer's recording-mode signature and
     /// picture profile.
     x6: Option<X6ClipInfo>,
+    /// A raw take of one lens ([`raw_take_of_one_lens`]).
+    raw_one_lens: bool,
     /// Bit rate of each video stream of the recording, bits per second, as
     /// the container reports it (two entries = the two eyes of a
     /// dual-stream file; the first chapter's for a chain). Empty when the
@@ -2800,7 +2804,7 @@ impl ClipInfo {
     /// The source holds ONE eye: the preview shows it alone and an export
     /// writes it as the whole frame.
     fn single_eye(&self) -> bool {
-        self.x6.is_some_and(|x| x.single_eye)
+        self.x6.is_some_and(|x| x.single_eye) || self.raw_one_lens
     }
 
     /// The clip is taken as Insta360 I-Log (see [`takes_ilog`]).
@@ -2818,6 +2822,12 @@ impl ClipInfo {
     fn sharp_eye(&self, view: vr180_fisheye::X6ViewChoice) -> Option<u32> {
         self.x6.and_then(|x| x.sharp_eye(self.fisheye_eye_w, self.fisheye_eye_h, view))
     }
+}
+
+/// A raw video take that holds one lens's frames: a single-eye source (the
+/// take's own description says so; read once per take).
+fn raw_take_of_one_lens(kind: vr180_pipeline::SourceKind, path: &std::path::Path) -> bool {
+    vr180_pipeline::source_kind::is_single_eye(kind, path) && kind.is_raw_video()
 }
 
 /// A raw take without sound leaves its folder as the "audio path": there
@@ -2923,6 +2933,8 @@ struct LoadedMeta {
     braw_color: Option<vr180_braw::BrawColorInfo>,
     /// Insta360 X6 video: recording-mode signature + picture profile.
     x6: Option<X6ClipInfo>,
+    /// A raw take of one lens ([`raw_take_of_one_lens`]).
+    raw_one_lens: bool,
     /// See `ClipInfo::video_bitrates_bps` / `file_bitrate_bps`.
     video_bitrates_bps: Vec<u64>,
     file_bitrate_bps: Option<u64>,
@@ -3421,7 +3433,8 @@ impl App {
     /// changed and every few seconds while the Format window is open, so
     /// frames enhanced meanwhile show up.
     fn enhanced_frames(&mut self, ctx: &egui::Context) -> Option<EnhancedFrames> {
-        if !self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) {
+        // A take of one lens has none: its frames come from the capture.
+        if !self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video() && !c.raw_one_lens) {
             return None;
         }
         let path = self.loaded_path.clone()?;
@@ -4206,6 +4219,7 @@ impl App {
             // camera's two eyes (their alignment above all) is not its.
             K::Insta360Insv if single_eye => "insv_single_eye",
             K::Insta360Insv   => "insv",
+            K::X6Raw if single_eye => "x6raw_single_eye",
             K::X6Raw          => "x6raw",
             K::GoProEac       => "eac",
             K::SbsFisheye     => "sbs",
@@ -4370,12 +4384,13 @@ impl App {
             // Insta360 X6: the recording-mode signature (a few KB from the
             // file's end) — a Crop clip's native-sharpness size follows from it.
             let x6 = (source_kind == vr180_pipeline::SourceKind::Insta360Insv).then(|| X6ClipInfo::read(&path).0);
+            let raw_one_lens = raw_take_of_one_lens(source_kind, &path);
             // A NEW clip inherits ITS kind's template (OSV / .360 / … kept
             // independent); the already-loaded clip keeps its live edits.
             let mut settings = if is_loaded_clip {
                 self.settings.clone()
             } else {
-                self.kind_template(source_kind, x6.is_some_and(|x| x.single_eye))
+                self.kind_template(source_kind, x6.is_some_and(|x| x.single_eye) || raw_one_lens)
             };
             if !is_loaded_clip {
                 // RS mode + readout are per-clip — auto-detect firmware vs
@@ -4419,6 +4434,7 @@ impl App {
                 status: BatchStatus::Idle,
                 selected: false,
                 x6,
+                raw_one_lens,
             });
             if is_loaded_clip {
                 // The loaded clip just joined the list — link it up.
@@ -5394,8 +5410,9 @@ impl App {
         if source_kind == vr180_pipeline::SourceKind::BlackmagicRaw && braw_color.is_none() {
             tracing::warn!("load: BRAW probe has no colour block — the Blackmagic RAW colour section needs a rebuilt helper");
         }
+        let raw_one_lens = raw_take_of_one_lens(source_kind, &path);
         Ok(LoadedMeta {
-            token, path, preserve_clip_settings, source_kind,
+            token, path, preserve_clip_settings, source_kind, raw_one_lens,
             width: probe.width, height: probe.height, fps: probe.fps,
             duration_sec, frame_count, segments,
             cori_count, grav_count, srot_ms,
@@ -5554,6 +5571,7 @@ impl App {
             braw_color: meta.braw_color.map(std::sync::Arc::new),
             braw_lut: meta.braw_lut.clone(),
             x6: meta.x6,
+            raw_one_lens: meta.raw_one_lens,
             video_bitrates_bps: meta.video_bitrates_bps,
             file_bitrate_bps: meta.file_bitrate_bps,
         });
@@ -8396,7 +8414,11 @@ impl App {
                     Color32::GRAY
                 };
                 // A single-eye clip is no pair of streams: say what it is.
-                let kind_name = if c.single_eye() { "Insta360 (single fisheye)" } else { c.source_kind.display() };
+                let kind_name = match (c.single_eye(), c.raw_one_lens) {
+                    (true, true) => "Insta360 X6 raw video (single fisheye)",
+                    (true, false) => "Insta360 (single fisheye)",
+                    _ => c.source_kind.display(),
+                };
                 ui.label(RichText::new(kind_name).color(kind_color).small());
 
                 ui.horizontal(|ui| {

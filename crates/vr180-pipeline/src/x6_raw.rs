@@ -22,6 +22,10 @@
 //! the lens the stock video writes as stream 0 (calibration entry 2, the
 //! RIGHT eye on a VR180-modded body), channel 1 the other.
 //!
+//! A take of one lens ([`x6b::Layout::Single`]) is a single-eye source
+//! ([`crate::source_kind::is_single_eye`]): its frames are one 7680×7680
+//! eye, a pair's left with no right, under that lens's calibration entry.
+//!
 //! The frames are the sensor's linear values (black level subtracted, white
 //! level at 1.0, no white balance): they need the raw development stage of
 //! the colour stack before anything display-referred.
@@ -33,7 +37,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use vr180_core::gyro::cori_iori::Quat;
 use vr180_fisheye::insta360::{Insta360Meta, InsvImuSample, X6ViewChoice, X6_DEFAULT_WINDOW};
-use vr180_fisheye::x6b::{self, Channels, PairEntry, Take, EYE_SAMPLES, EYE_SIDE};
+use vr180_fisheye::x6b::{self, Channels, Layout, PairEntry, Take, EYE_SAMPLES, EYE_SIDE};
 use vr180_fisheye::DjiOsvImu;
 
 use crate::decode::VideoProbe;
@@ -50,28 +54,35 @@ fn take_err(e: impl std::fmt::Display) -> Error {
 /// `FisheyePair::bit_depth` of a pair whose two buffers are MOSAICS (one
 /// little-endian `u16` per site, `eye_w × eye_h` sites) and not pictures:
 /// what [`X6RawIter::mosaic_pairs`] hands a consumer that demosaics on its
-/// own device ([`demosaic_pair`]).
+/// own device ([`demosaic_pair`]). A take of one lens has one mosaic, the
+/// left, and no right.
 pub const MOSAIC_BIT_DEPTH: u8 = 14;
 
-/// Demosaic a mosaic pair (see [`MOSAIC_BIT_DEPTH`]) on `dev` at full size:
-/// the two camera-linear eyes, left and right.
-pub fn demosaic_pair(dev: &Device, pair: &FisheyePair) -> Result<(wgpu::Texture, wgpu::Texture)> {
+/// Demosaic a mosaic pair (see [`MOSAIC_BIT_DEPTH`]) of a take whose
+/// mosaic is `bayer` ([`bayer_at`]) on `dev` at full size: the two
+/// camera-linear eyes, left and right (one eye twice, for a pair of one).
+pub fn demosaic_pair(dev: &Device, pair: &FisheyePair, bayer: &BayerLayout) -> Result<(wgpu::Texture, wgpu::Texture)> {
     let (w, h) = (pair.eye_w, pair.eye_h);
     let want = w as usize * h as usize * 2;
-    if pair.bit_depth != MOSAIC_BIT_DEPTH || pair.left.len() != want || pair.right.len() != want {
+    let one_eye = pair.right.is_empty();
+    if pair.bit_depth != MOSAIC_BIT_DEPTH || pair.left.len() != want || (!one_eye && pair.right.len() != want) {
         return Err(take_err("not a mosaic pair"));
     }
     let eye = |bytes: &[u8]| -> Result<wgpu::Texture> {
         let mosaic = dev.new_bayer_texture(w, h);
         dev.write_bayer_bytes(&mosaic, bytes);
         let out = dev.new_linear_eye_texture(w, h);
-        dev.demosaic_bayer(&mosaic, &BAYER, &out)?;
+        dev.demosaic_bayer(&mosaic, bayer, &out)?;
         Ok(out)
     };
-    Ok((eye(&pair.left)?, eye(&pair.right)?))
+    let left = eye(&pair.left)?;
+    if one_eye {
+        return Ok((left.clone(), left));
+    }
+    Ok((left, eye(&pair.right)?))
 }
 
-/// The mosaic of a take's frames.
+/// The mosaic of a paired take's frames.
 pub const BAYER: BayerLayout = BayerLayout {
     cfa: x6b::CFA,
     black: x6b::BLACK_LEVEL as f32,
@@ -79,6 +90,36 @@ pub const BAYER: BayerLayout = BayerLayout {
     // `RawCamera::X6`'s as-shot neutral (a test in `bayer` holds them equal).
     neutral: [0.565_429_7, 1.0, 0.401_367_2],
 };
+
+/// The mosaic of `take`'s frames: its pattern and levels (a take of one
+/// lens states its own), the sensor's neutral.
+pub fn bayer_of(take: &Take) -> BayerLayout {
+    BayerLayout { cfa: take.cfa, black: take.black_level as f32, white: take.white_level as f32, neutral: BAYER.neutral }
+}
+
+/// [`bayer_of`] the take `path` names; a paired take's for a path that
+/// names none.
+pub fn bayer_at(path: &Path) -> BayerLayout {
+    describe(path).map_or(BAYER, |take| bayer_of(&take))
+}
+
+/// The take `path` names holds one lens's frames: a single-eye source. A
+/// take is looked at once (its `clip.json`); later calls touch no file. A
+/// path that names no take (yet: a folder still being copied) is asked
+/// again the next time.
+pub fn single_eye(path: &Path) -> bool {
+    static KNOWN: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some(one) = known.lock().ok().and_then(|k| k.get(path).copied()) {
+        return one;
+    }
+    let Some(layout) = x6b::take_layout(path) else { return false };
+    let one = matches!(layout, Layout::Single { .. });
+    if let Ok(mut k) = known.lock() {
+        k.insert(path.to_path_buf(), one);
+    }
+    one
+}
 
 /// A take, opened: its description and its pairs in request order.
 #[derive(Debug)]
@@ -258,8 +299,9 @@ fn load_index(file: &Path, take: &Take) -> Option<Vec<PairEntry>> {
     }
     // The same checks the walk makes on what the rows claim.
     let (lo, hi) = take.seal.request_window;
+    let in_window = |p: &PairEntry| !take.window_numbers_records() || (p.request >= lo && p.request <= hi);
     let ok = out.windows(2).all(|w| w[0].request < w[1].request)
-        && out.iter().all(|p| p.request >= lo && p.request <= hi && p.profile.fps() == take.fps_setting && p.offset + p.len <= take.capture_bytes);
+        && out.iter().all(|p| in_window(p) && p.profile.fps() == take.fps_setting && p.profile.layout_is(take.layout) && p.offset + p.len <= take.capture_bytes);
     ok.then_some(out)
 }
 
@@ -307,9 +349,10 @@ pub fn open(path: &Path) -> Result<Arc<TakeIndex>> {
             Ok(Some(pairs)) => {
                 let index = TakeIndex::new(take.clone(), pairs);
                 tracing::info!(
-                    "raw take {}: {} pairs at {} fps listed in {:.1?} ({} missing, {:.0} MB/s both eyes)",
-                    take.dir.display(), index.frames(), take.fps_setting, t0.elapsed(), index.missing.len(),
-                    index.bytes_per_second() / 1e6);
+                    "raw take {}: {} {} at {} fps listed in {:.1?} ({} missing, {:.0} MB/s {})",
+                    take.dir.display(), index.frames(), if take.layout.channels() == 1 { "frames of one lens" } else { "pairs" },
+                    take.fps_setting, t0.elapsed(), index.missing.len(), index.bytes_per_second() / 1e6,
+                    if take.layout.channels() == 1 { "its one eye" } else { "both eyes" });
                 if let Some(f) = on_disk {
                     store_index(&f, &take, &index.pairs);
                 }
@@ -336,7 +379,7 @@ pub fn probe(path: &Path) -> Result<VideoProbe> {
         Some(index) => index.duration_s(),
         None => (hi - lo + 1) as f64 / take.nominal_fps(),
     };
-    let rate = (take.capture_bytes as f64 * 8.0 / duration_sec.max(1e-6) / 2.0) as u64;
+    let rate = (take.capture_bytes as f64 * 8.0 / duration_sec.max(1e-6) / take.layout.channels() as f64) as u64;
     Ok(VideoProbe {
         width: take.width,
         height: take.height,
@@ -382,11 +425,23 @@ pub fn audio_source(path: &Path) -> Option<(PathBuf, f64)> {
 /// the take states it: the factory lens string, the frame placed like the
 /// camera's own 8K video frame (the 7680² window of each sensor half,
 /// binned 2×2), channel 0 = calibration entry 2. No motion data.
+///
+/// A take of one lens: that lens's entry alone, as the camera's own
+/// single-lens video states it, and the same window at the sensor's own
+/// resolution.
 pub fn lens_meta(take: &Take) -> Insta360Meta {
     let calib_string = x6b::read_calibration_string(&take.dir).unwrap_or_default();
-    let lenses = vr180_fisheye::insta360::parse_calib_string(&calib_string).unwrap_or_default();
+    let mut lenses = vr180_fisheye::insta360::parse_calib_string(&calib_string).unwrap_or_default();
     if lenses.len() < 2 {
         tracing::warn!("raw take {}: no factory lens string, the generic X6 profile is used", take.dir.display());
+    }
+    let single = take.layout.single_channel();
+    if let Some(channel) = single {
+        // Channel 0 is the string's second entry, as in a paired take.
+        lenses = match lenses.len() {
+            n if n >= 2 => vec![lenses.swap_remove(1 - channel.min(1))],
+            _ => Vec::new(),
+        };
     }
     Insta360Meta {
         model: "Insta360 X6".into(),
@@ -396,6 +451,7 @@ pub fn lens_meta(take: &Take) -> Insta360Meta {
         dimension: Some((take.width, take.height)),
         frame_rate: Some(take.fps_setting),
         track_order_reversed: Some(true),
+        single_lens: single.is_some(),
         ..Default::default()
     }
 }
@@ -586,22 +642,26 @@ pub fn build_imu(index: &TakeIndex, stream_w: u32, stream_h: u32) -> DjiOsvImu {
 
 // ── Frames ─────────────────────────────────────────────────────────────
 
-/// Demosaiced eyes handed back by frames that are done with them.
+/// Demosaiced eyes handed back by frames that are done with them: a
+/// frame's eye textures, one per channel.
 #[derive(Default)]
 struct EyePool {
-    free: Mutex<Vec<(wgpu::Texture, wgpu::Texture)>>,
+    free: Mutex<Vec<Vec<wgpu::Texture>>>,
 }
 
-/// Returns a frame's two eye textures to the pool with its last holder.
+/// Returns a frame's eye textures to the pool with its last holder.
 struct EyeLoan {
     pool: Arc<EyePool>,
-    eyes: Option<(wgpu::Texture, wgpu::Texture)>,
+    eyes: Option<Vec<wgpu::Texture>>,
 }
 
 impl Drop for EyeLoan {
     fn drop(&mut self) {
         if let (Some(eyes), Ok(mut free)) = (self.eyes.take(), self.pool.free.lock()) {
-            if free.len() < 12 {
+            // A frame of 3840² eyes is 236 MB, one 7680² eye twice that:
+            // fewer of the large ones are kept.
+            let keep = if eyes.first().is_some_and(|e| e.width() as usize > EYE_SIDE) { 4 } else { 12 };
+            if free.len() < keep {
                 free.push(eyes);
             }
         }
@@ -727,6 +787,10 @@ pub fn enhanced_side(path: &Path, source: &EnhancedSource) -> Option<u32> {
         return None;
     }
     let index = open(path).ok()?;
+    // Only a paired take's frames have enhanced pictures to stand in for them.
+    if index.take.layout != Layout::Paired {
+        return None;
+    }
     find_enhanced(&index, source).side()
 }
 
@@ -796,8 +860,12 @@ pub struct X6RawIter {
     half: bool,
     gpu: Option<Arc<Device>>,
     record: Vec<u8>,
+    /// The frame decoded last: the take's channels one after the other.
     samples: Vec<u16>,
-    mosaics: Option<(wgpu::Texture, wgpu::Texture)>,
+    /// The take's mosaic ([`bayer_of`]).
+    bayer: BayerLayout,
+    /// One mosaic texture per channel.
+    mosaics: Vec<wgpu::Texture>,
     pool: Arc<EyePool>,
     /// Stop after this many frames from the start of the take (0 = all).
     frame_limit: usize,
@@ -814,14 +882,15 @@ pub struct X6RawIter {
 /// own, ahead of the consumer: reading a pair (22 MB at 60 fps, more at 30)
 /// and unpacking its two mosaics take 13 ms from a fast disk and 35 from a
 /// network share, which an export otherwise waits for between two frames'
-/// GPU work. The thread has its own handle on the capture and touches no
-/// GPU; the frames come out in order, each exactly as [`X6RawIter::decode_frame`]
+/// GPU work (a take of one lens: its one mosaic, twice a pair's samples).
+/// The thread has its own handle on the capture and touches no GPU; the
+/// frames come out in order, each exactly as [`X6RawIter::decode_frame`]
 /// decodes it.
 struct ReadAhead {
     /// The unpacked pairs, in order: the frame's index and its two mosaics.
     frames: std::sync::mpsc::Receiver<Result<(usize, Vec<u16>)>>,
-    /// Buffers handed back for the next frames (59 MB each: not allocated
-    /// per frame).
+    /// Buffers handed back for the next frames (59 MB each for a pair, 118
+    /// for one lens's frame: not allocated per frame).
     spare: std::sync::mpsc::Sender<Vec<u16>>,
     /// The frame the next message holds.
     next: usize,
@@ -843,9 +912,10 @@ impl ReadAhead {
             let mut i = first;
             while i < end {
                 let Some(entry) = index.pairs.get(i).copied() else { break };
-                let mut samples = spares.try_recv().ok().filter(|b| b.len() == 2 * EYE_SAMPLES)
-                    .unwrap_or_else(|| vec![0u16; 2 * EYE_SAMPLES]);
-                let read = x6b::decode_pair(&mut file, &entry, index.take.fps_setting, Channels::Both, &mut record, &mut samples, 0)
+                let count = index.take.layout.samples();
+                let mut samples = spares.try_recv().ok().filter(|b| b.len() == count)
+                    .unwrap_or_else(|| vec![0u16; count]);
+                let read = x6b::decode_pair(&mut file, &entry, index.take.format(), Channels::Both, &mut record, &mut samples, 0)
                     .map_err(take_err);
                 let failed = read.is_err();
                 // The consumer went away (the export's end, a seek): stop.
@@ -885,9 +955,10 @@ impl X6RawIter {
     pub fn new(path: &Path, swap_eyes: bool, half: bool, step: u32, gpu: Option<Arc<Device>>) -> Result<Self> {
         let index = open(path)?;
         let file = File::open(index.take.capture_path())?;
+        let (count, bayer) = (index.take.layout.samples(), bayer_of(&index.take));
         Ok(Self {
             index, file, next: 0, step: step.max(1) as usize, swap_eyes, half, gpu,
-            record: Vec::new(), samples: vec![0u16; 2 * EYE_SAMPLES], mosaics: None,
+            record: Vec::new(), samples: vec![0u16; count], bayer, mosaics: Vec::new(),
             pool: Arc::default(), frame_limit: 0, mosaics_out: false, enhanced: None,
             read_ahead: false, ahead: None,
         })
@@ -932,6 +1003,10 @@ impl X6RawIter {
     pub fn with_enhanced_frames(mut self, source: Option<&EnhancedSource>) -> Self {
         let Some(source) = source else { return self };
         let dir = &source.dir;
+        if self.index.take.layout != Layout::Paired {
+            tracing::info!("raw take: enhanced frames are read for a paired take only: the capture's frames are used");
+            return self;
+        }
         if !crate::enhanced_dng::decodable() {
             tracing::info!("raw take: enhanced frames are not read on this system (no JPEG XL decoder in this build): the capture's frames are used");
             return self;
@@ -981,11 +1056,17 @@ impl X6RawIter {
     }
 
     fn eye_side(&self) -> u32 {
+        let side = self.index.take.layout.side() as u32;
         match &self.enhanced {
             Some(e) => e.side as u32,
-            None if self.half => EYE_SIDE as u32 / 2,
-            None => EYE_SIDE as u32,
+            None if self.half => side / 2,
+            None => side,
         }
+    }
+
+    /// The take holds one lens's frames: a pair is its left eye alone.
+    fn one_eye(&self) -> bool {
+        self.index.take.layout.channels() == 1
     }
 
     /// Frame `i`'s two channels from the enhanced frames' folder, as 16-bit
@@ -1044,37 +1125,51 @@ impl X6RawIter {
         Ok(eyes)
     }
 
-    /// The mosaic of the frame decoded last: channel 0 then channel 1.
+    /// The mosaic of the frame decoded last: channel 0 then channel 1 (a
+    /// take of one lens: its one channel).
     pub fn last_mosaic(&self) -> &[u16] {
         &self.samples
     }
 
-    /// Decode frame `i`'s two mosaics into the iterator's buffer.
+    /// Decode frame `i`'s mosaics into the iterator's buffer.
     pub fn decode_frame(&mut self, i: usize) -> Result<&[u16]> {
         let entry = *self.index.pairs.get(i).ok_or_else(|| take_err(format!("frame {i} is past the take's end")))?;
-        x6b::decode_pair(&mut self.file, &entry, self.index.take.fps_setting, Channels::Both, &mut self.record, &mut self.samples, 0)
+        x6b::decode_pair(&mut self.file, &entry, self.index.take.format(), Channels::Both, &mut self.record, &mut self.samples, 0)
             .map_err(take_err)?;
         Ok(&self.samples)
     }
 
     fn gpu_pair(&mut self, dev: &Arc<Device>) -> Result<GpuPair> {
-        let side = EYE_SIDE as u32;
+        let layout = self.index.take.layout;
+        let (side, channels, per) = (layout.side() as u32, layout.channels(), layout.eye_samples());
         let out_side = self.eye_side();
-        let (m0, m1) = self.mosaics.get_or_insert_with(|| (dev.new_bayer_texture(side, side), dev.new_bayer_texture(side, side)));
-        dev.write_bayer_texture(m0, &self.samples[..EYE_SAMPLES]);
-        dev.write_bayer_texture(m1, &self.samples[EYE_SAMPLES..]);
-        let pooled = self.pool.free.lock().ok().and_then(|mut f| f.pop()).filter(|(a, _)| a.width() == out_side);
-        let (e0, e1) = pooled.unwrap_or_else(|| (dev.new_linear_eye_texture(out_side, out_side), dev.new_linear_eye_texture(out_side, out_side)));
-        dev.demosaic_bayer(m0, &BAYER, &e0)?;
-        dev.demosaic_bayer(m1, &BAYER, &e1)?;
-        let (left, right) = if self.swap_eyes { (e1.clone(), e0.clone()) } else { (e0.clone(), e1.clone()) };
-        Ok(GpuPair { left, right, keep: Box::new(EyeLoan { pool: self.pool.clone(), eyes: Some((e0, e1)) }) })
+        if self.mosaics.len() != channels {
+            self.mosaics = (0..channels).map(|_| dev.new_bayer_texture(side, side)).collect();
+        }
+        for (mosaic, samples) in self.mosaics.iter().zip(self.samples.chunks(per)) {
+            dev.write_bayer_texture(mosaic, samples);
+        }
+        let pooled = self.pool.free.lock().ok().and_then(|mut f| f.pop())
+            .filter(|eyes| eyes.len() == channels && eyes.iter().all(|e| e.width() == out_side));
+        let eyes = pooled.unwrap_or_else(|| (0..channels).map(|_| dev.new_linear_eye_texture(out_side, out_side)).collect());
+        for (mosaic, eye) in self.mosaics.iter().zip(&eyes) {
+            dev.demosaic_bayer(mosaic, &self.bayer, eye)?;
+        }
+        let (left, right) = match eyes.as_slice() {
+            [e0, e1] if self.swap_eyes => (e1.clone(), e0.clone()),
+            [e0, e1] => (e0.clone(), e1.clone()),
+            // One eye: it stands in both places.
+            eyes => (eyes[0].clone(), eyes[0].clone()),
+        };
+        Ok(GpuPair { left, right, one_eye: channels == 1, keep: Box::new(EyeLoan { pool: self.pool.clone(), eyes: Some(eyes) }) })
     }
 
     fn cpu_pair(&self) -> (Vec<u8>, Vec<u8>) {
+        let layout = self.index.take.layout;
+        let (side, per) = (layout.side(), layout.eye_samples());
         // The GPU demosaic's twin, one channel at a time.
         let eye = |channel: usize| -> Vec<u8> {
-            let rgb = crate::bayer::demosaic(&self.samples[channel * EYE_SAMPLES..(channel + 1) * EYE_SAMPLES], EYE_SIDE, EYE_SIDE, &BAYER, self.half);
+            let rgb = crate::bayer::demosaic(&self.samples[channel * per..(channel + 1) * per], side, side, &self.bayer, self.half);
             let mut bytes = Vec::with_capacity(rgb.len() * 8);
             for px in &rgb {
                 for v in [px[0], px[1], px[2], 1.0] {
@@ -1083,6 +1178,9 @@ impl X6RawIter {
             }
             bytes
         };
+        if self.one_eye() {
+            return (eye(0), Vec::new());
+        }
         let (c0, c1) = (eye(0), eye(1));
         if self.swap_eyes { (c1, c0) } else { (c0, c1) }
     }
@@ -1131,7 +1229,7 @@ impl FisheyePairIter for X6RawIter {
                     dev.write_camera_eye_texture(&tex, px);
                     tex
                 };
-                let pair = GpuPair { left: upload(&left), right: upload(&right), keep: Box::new(()) };
+                let pair = GpuPair { left: upload(&left), right: upload(&right), one_eye: false, keep: Box::new(()) };
                 return Ok(Some(FisheyePair {
                     left: Vec::new(), right: Vec::new(), eye_w: side, eye_h: side, bit_depth: 16, pts_s,
                     gpu: Some(Arc::new(pair)),
@@ -1150,8 +1248,13 @@ impl FisheyePairIter for X6RawIter {
             }));
         }
         if self.mosaics_out {
-            let bytes = |ch: usize| bytemuck::cast_slice::<u16, u8>(&self.samples[ch * EYE_SAMPLES..(ch + 1) * EYE_SAMPLES]).to_vec();
-            let (left, right) = if self.swap_eyes { (bytes(1), bytes(0)) } else { (bytes(0), bytes(1)) };
+            let per = self.index.take.layout.eye_samples();
+            let bytes = |ch: usize| bytemuck::cast_slice::<u16, u8>(&self.samples[ch * per..(ch + 1) * per]).to_vec();
+            let (left, right) = match (self.one_eye(), self.swap_eyes) {
+                (true, _) => (bytes(0), Vec::new()),
+                (false, true) => (bytes(1), bytes(0)),
+                (false, false) => (bytes(0), bytes(1)),
+            };
             return Ok(Some(FisheyePair { left, right, eye_w: side, eye_h: side, bit_depth: MOSAIC_BIT_DEPTH, pts_s, gpu: None }));
         }
         let (left, right) = self.cpu_pair();
@@ -1184,6 +1287,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let take = Take {
+            layout: Layout::Paired, cfa: x6b::CFA, black_level: x6b::BLACK_LEVEL, white_level: x6b::WHITE_LEVEL,
             dir: dir.clone(), fps_setting: 60, width: 3840, height: 3840, clock_start: None,
             audio_file: None, audio_timing: None, sensor_metadata: None, exposure_file: None,
             seal: x6b::Seal { fps_setting: 60, request_window: (10, 13), received_pairs: 3, pairs: 3, bytes: 3 * 8192 },
@@ -1263,6 +1367,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vr180-take-timing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut take = Take {
+            layout: Layout::Paired, cfa: x6b::CFA, black_level: x6b::BLACK_LEVEL, white_level: x6b::WHITE_LEVEL,
             dir: dir.clone(), fps_setting: 30, width: 3840, height: 3840, clock_start: None,
             audio_file: None, audio_timing: None, sensor_metadata: None, exposure_file: None,
             seal: x6b::Seal { fps_setting: 30, request_window: (1, 1), received_pairs: 1, pairs: 1, bytes: 8192 },
@@ -1293,6 +1398,7 @@ mod tests {
         let eye = r#"{"bayer_output_wh":[3840,3840],"line_period_ns":4000.0,"rolling_shutter_first_to_last_row_ns":15356000}"#;
         std::fs::write(dir.join("sensor-metadata.json"), format!(r#"{{"eyes":{{"CAM0":{eye},"CAM1":{eye}}}}}"#)).unwrap();
         let take = Take {
+            layout: Layout::Paired, cfa: x6b::CFA, black_level: x6b::BLACK_LEVEL, white_level: x6b::WHITE_LEVEL,
             dir: dir.clone(), fps_setting: 50, width: 3840, height: 3840,
             clock_start: Some(x6b::ClockAnchor { counter_ticks: 0, counter_hz: hz, ..Default::default() }),
             audio_file: None, audio_timing: None, sensor_metadata: Some("sensor-metadata.json".into()), exposure_file: None,
@@ -1534,6 +1640,85 @@ mod tests {
 
     /// The sample takes (skipped when the volume is not mounted): they open,
     /// their timelines are the stated rates, and their lens and gyro build.
+    /// A take of one lens: that lens's entry of the factory string alone
+    /// (channel 0 the second, as in a paired take), the frame at the
+    /// sensor's own resolution, its own levels, its one sensor's timing.
+    #[test]
+    fn a_take_of_one_lens_is_described_by_its_lens() {
+        let dir = std::env::temp_dir().join(format!("vr180-take-one-lens-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lens = "2_2.455430_7216.620_7216.620_3855.460_3884.530_0.276_-0.042_89.578_0.000000_0.000000_0.000000_1.32059765_-1.38414502_4.43894196_5.25202703_0.00000000_-0.00032840_0.00113587_0.00412989_0.00653467_-0.00106616_-0.00235222_0.02084749_-0.01150168_15488_7744_193_2.455430_7227.070_7227.070_11569.100_3877.970_-0.132_0.081_89.544_-0.000064_-0.000049_-0.032576_1.31835759_-1.57224715_5.29361629_3.47188210_0.00000000_0.00016541_-0.00072159_-0.00095306_0.01344961_-0.00061933_-0.00056505_0.01970853_-0.02243911_15488_7744_193_394240";
+        std::fs::write(dir.join(x6b::CALIBRATION_FILE), format!(r#"{{"eis_calib":{{"offset_v6":"{lens}"}}}}"#)).unwrap();
+        let take = |channel: usize| Take {
+            layout: Layout::Single { channel }, cfa: x6b::CFA, black_level: 64, white_level: 1023,
+            dir: dir.clone(), fps_setting: 30, width: 7680, height: 7680, clock_start: None,
+            audio_file: None, audio_timing: None, sensor_metadata: Some("sensor-metadata.json".into()), exposure_file: None,
+            seal: x6b::Seal { fps_setting: 30, request_window: (900, 900), received_pairs: 1, pairs: 1, bytes: 8192 },
+            capture_bytes: 8192,
+        };
+        for (channel, fx, second) in [(0usize, 7227.07f32, true), (1, 7216.62, false)] {
+            let take = take(channel);
+            let meta = lens_meta(&take);
+            assert!(meta.single_lens && !meta.back_to_back && meta.lenses.len() == 1, "channel {channel}");
+            assert_eq!((meta.lenses[0].is_second_lens(), meta.dimension), (second, Some((7680, 7680))), "channel {channel}");
+            // Both eyes of the calibration are that lens, at the sensor's scale.
+            let imu = crate::insv_imu::insv_calib_only(&meta, 7680, 7680, X6ViewChoice::Auto);
+            let (a, b) = (imu.lens_a.omni.expect("factory lens"), imu.lens_b.omni.expect("factory lens"));
+            assert!((a.fx - fx).abs() < 1e-2 && a == b, "channel {channel}: {a:?}");
+            assert_eq!(bayer_of(&take), BayerLayout { cfa: x6b::CFA, black: 64.0, white: 1023.0, neutral: BAYER.neutral });
+        }
+        // A paired take keeps both entries and its own levels.
+        let paired = Take { layout: Layout::Paired, width: 3840, height: 3840, black_level: x6b::BLACK_LEVEL, white_level: x6b::WHITE_LEVEL, ..take(0) };
+        assert!(lens_meta(&paired).lenses.len() == 2 && !lens_meta(&paired).single_lens);
+        assert_eq!(bayer_of(&paired), BAYER);
+        // The readout: the one sensor's record.
+        std::fs::write(dir.join("sensor-metadata.json"),
+            r#"{"eyes":{"CAM1":{"bayer_output_wh":[7680,7680],"line_period_ns":4000.000009472,"rolling_shutter_first_to_last_row_ns":30716000}}}"#).unwrap();
+        assert_eq!(capture_timing(&take(0)).readout_ms, None, "another sensor's record says nothing of this one");
+        let t = capture_timing(&take(1));
+        assert!((t.readout_ms.unwrap() - 30.716).abs() < 1e-4 && (t.stamp_to_content_ms - 15.358).abs() < 1e-4, "{t:?}");
+        // A kept list of one lens's records is not held to the seal's window
+        // (sensor frame numbers), and is another layout's for a paired take.
+        let entry = PairEntry { request: 41, offset: 0, len: 8192, profile: x6b::Profile::Single10, exposure_ns: [7_000_000_000; 2] };
+        let file = dir.join("t.pairs");
+        store_index(&file, &take(1), &[entry]);
+        assert_eq!(load_index(&file, &take(1)).as_deref(), Some(&[entry][..]));
+        let as_paired = Take { layout: Layout::Paired, seal: x6b::Seal { request_window: (41, 41), ..take(1).seal }, ..take(1) };
+        assert!(load_index(&file, &as_paired).is_none());
+        let index = TakeIndex::new(take(1), vec![entry, PairEntry { request: 43, exposure_ns: [7_066_733_333; 2], ..entry }]);
+        assert_eq!((index.frames(), index.missing.clone()), (2, vec![42]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A take of one lens on disk (`VR180_ONE_LENS_TAKE=<folder>`; skipped
+    /// without it): a single-eye source whose frames are one mosaic.
+    #[test]
+    fn a_take_of_one_lens_opens_as_one_eye() {
+        let Some(dir) = std::env::var_os("VR180_ONE_LENS_TAKE").map(PathBuf::from) else { return };
+        assert!(is_take(&dir) && single_eye(&dir) && single_eye(&dir.join("capture.x6b")));
+        assert!(crate::source_kind::is_single_eye(crate::SourceKind::X6Raw, &dir));
+        let quick = probe(&dir).unwrap();
+        assert_eq!((quick.width, quick.height), (7680, 7680));
+        assert!((quick.fps - 29.97).abs() < 1e-2);
+        let index = open(&dir).unwrap();
+        assert!(index.take.layout.single_channel().is_some() && index.frames() > 0);
+        // Every frame has its integration time, and the timeline is even.
+        assert!((0..index.frames()).all(|i| index.shutter_s(i, 0).is_some() && index.shutter_s(i, 1).is_some()));
+        let imu = build_imu(&index, 7680, 7680);
+        assert_eq!(imu.frame_quats.len(), index.frames());
+        assert!(imu.lens_a.omni.is_some() && imu.lens_a.omni.map(|l| l.fx) == imu.lens_b.omni.map(|l| l.fx));
+        // A frame is one mosaic: the left, with no right.
+        let mut frames = X6RawIter::new(&dir, true, false, 1, None).unwrap().mosaic_pairs();
+        assert_eq!(frames.eye_dims(), (7680, 7680));
+        let pair = frames.next_pair().unwrap().expect("a frame");
+        assert!(pair.single_eye() && pair.right.is_empty() && pair.bit_depth == MOSAIC_BIT_DEPTH);
+        assert_eq!(pair.left.len(), 7680 * 7680 * 2);
+        let top = bytemuck::cast_slice::<u8, u16>(&pair.left).iter().copied().max().unwrap_or(0);
+        assert!(top <= index.take.white_level.max(1023), "a sample of {top}");
+        // The enhanced frames of a paired take are not looked for.
+        assert_eq!(enhanced_side(&dir, &EnhancedSource { dir: dir.clone(), t_in: None, t_out: None }), None);
+    }
+
     #[test]
     fn sample_takes_open() {
         for (name, fps, frames) in [("RAWVIDEO-20261116-011723", 50.0, 1167usize), ("RAWVIDEO-20261116-021546", 60000.0 / 1001.0, 3021)] {

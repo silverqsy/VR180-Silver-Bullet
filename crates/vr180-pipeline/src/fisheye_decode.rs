@@ -406,9 +406,13 @@ pub struct FisheyePair {
 }
 
 impl FisheyePair {
-    /// One eye only: `left` is the picture and there is no `right`.
+    /// One eye only: `left` is the picture and there is no `right` (on the
+    /// GPU: [`GpuPair::one_eye`]).
     pub fn single_eye(&self) -> bool {
-        self.gpu.is_none() && self.right.is_empty() && !self.left.is_empty()
+        match &self.gpu {
+            Some(gpu) => gpu.one_eye,
+            None => self.right.is_empty() && !self.left.is_empty(),
+        }
     }
 }
 
@@ -420,6 +424,8 @@ impl FisheyePair {
 pub struct GpuPair {
     pub left: wgpu::Texture,
     pub right: wgpu::Texture,
+    /// The source holds one eye: `right` is `left` again.
+    pub one_eye: bool,
     pub keep: Box<dyn std::any::Any + Send + Sync>,
 }
 
@@ -4380,6 +4386,7 @@ impl FisheyePairIter for BrawZcIter {
             pts_s: f.index as f64 * self.dt_s,
             gpu: Some(std::sync::Arc::new(GpuPair {
                 left: l.texture.clone(), right: r.texture.clone(),
+                one_eye: false,
                 keep: Box::new(guard),
             })),
         }))
@@ -4502,7 +4509,9 @@ impl CameraEyeUploader {
     /// not 16-bit, is handed back as it came).
     fn upload(&self, pair: FisheyePair) -> FisheyePair {
         let need = pair.eye_w as usize * pair.eye_h as usize * 8;
-        if pair.gpu.is_some() || pair.bit_depth < 16 || pair.left.len() < need || pair.right.len() < need {
+        // A pair of one eye has no right: its left goes up alone.
+        let one_eye = pair.gpu.is_none() && pair.single_eye();
+        if pair.gpu.is_some() || pair.bit_depth < 16 || pair.left.len() < need || (!one_eye && pair.right.len() < need) {
             return pair;
         }
         let eye = |bytes: &[u8]| -> wgpu::Texture {
@@ -4518,7 +4527,9 @@ impl CameraEyeUploader {
             }
             tex
         };
-        let gpu = GpuPair { left: eye(&pair.left), right: eye(&pair.right), keep: Box::new(()) };
+        let left = eye(&pair.left);
+        let right = if one_eye { left.clone() } else { eye(&pair.right) };
+        let gpu = GpuPair { left, right, one_eye, keep: Box::new(()) };
         FisheyePair {
             left: Vec::new(), right: Vec::new(),
             eye_w: pair.eye_w, eye_h: pair.eye_h, bit_depth: pair.bit_depth, pts_s: pair.pts_s,
@@ -4656,24 +4667,32 @@ impl DenoisingFisheyeIter {
         self
     }
 
-    fn ensure_denoisers(&mut self, bit_depth: u8) -> Result<()> {
+    /// The two eyes' filters, or the left one alone for a source of one eye
+    /// (`one_eye`: its pairs have no right).
+    fn ensure_denoisers(&mut self, bit_depth: u8, one_eye: bool) -> Result<()> {
         if self.left.is_none() {
             self.bit_depth = bit_depth;
             self.left = Some(crate::vt_denoise::VtDenoiser::new(
                 self.eye_w, self.eye_h, bit_depth, self.strength,
             )?);
-            self.right = Some(crate::vt_denoise::VtDenoiser::new(
-                self.eye_w, self.eye_h, bit_depth, self.strength,
-            )?);
+            self.right = if one_eye { None } else {
+                Some(crate::vt_denoise::VtDenoiser::new(self.eye_w, self.eye_h, bit_depth, self.strength)?)
+            };
         }
         Ok(())
     }
 
+    /// Hand out filtered frames: each left with its right, or with none
+    /// where the source has one eye (`rights` is then empty).
     fn emit(&mut self, lefts: Vec<Vec<u8>>, rights: Vec<Vec<u8>>) {
-        for (mut l, mut r) in lefts.into_iter().zip(rights.into_iter()) {
+        let mut rights = rights.into_iter();
+        for mut l in lefts {
+            let mut r = rights.next().unwrap_or_default();
             if let Some(code) = &self.linear {
                 code.apply(&mut l, self.eye_w as usize, false);
-                code.apply(&mut r, self.eye_w as usize, false);
+                if !r.is_empty() {
+                    code.apply(&mut r, self.eye_w as usize, false);
+                }
             }
             let pts = self.pending_pts.pop_front().unwrap_or(0.0);
             self.emitted += 1;
@@ -4702,7 +4721,7 @@ impl FisheyePairIter for DenoisingFisheyeIter {
             }
             match self.inner.next_pair()? {
                 Some(mut pair) => {
-                    self.ensure_denoisers(pair.bit_depth)?;
+                    self.ensure_denoisers(pair.bit_depth, pair.single_eye())?;
                     if self.pushed == 0 {
                         self.first_pair = Some(pair.clone());
                     }
@@ -4710,17 +4729,25 @@ impl FisheyePairIter for DenoisingFisheyeIter {
                     self.pending_pts.push_back(pair.pts_s);
                     if let Some(code) = self.linear.as_ref().filter(|_| pair.bit_depth >= 16) {
                         code.apply(&mut pair.left, self.eye_w as usize, true);
-                        code.apply(&mut pair.right, self.eye_w as usize, true);
+                        if self.right.is_some() {
+                            code.apply(&mut pair.right, self.eye_w as usize, true);
+                        }
                     }
                     let lefts = self.left.as_mut().unwrap().push(&pair.left)?;
-                    let rights = self.right.as_mut().unwrap().push(&pair.right)?;
+                    let rights = match self.right.as_mut() {
+                        Some(right) => right.push(&pair.right)?,
+                        None => Vec::new(),
+                    };
                     self.emit(lefts, rights);
                 }
                 None => {
                     self.inner_done = true;
-                    if let (Some(l), Some(r)) = (self.left.as_mut(), self.right.as_mut()) {
+                    if let Some(l) = self.left.as_mut() {
                         let lefts = l.finish()?;
-                        let rights = r.finish()?;
+                        let rights = match self.right.as_mut() {
+                            Some(right) => right.finish()?,
+                            None => Vec::new(),
+                        };
                         self.emit(lefts, rights);
                     }
                     // Single-frame clip: nothing could be denoised — pass the

@@ -5895,6 +5895,9 @@ pub(crate) struct DetailCache {
     cached_pair: Option<vr180_pipeline::fisheye_decode::FisheyePair>,
     cached_stab_key: u64,
     cached_stab: Option<Vec<EquirectRotation>>,
+    /// A raw take's mosaic (its pattern and levels), read from the take
+    /// when its first still is rendered.
+    raw_mosaic: Option<vr180_pipeline::raw_gpu::BayerLayout>,
 }
 
 impl DetailCache {
@@ -5924,6 +5927,7 @@ impl DetailCache {
             cached_pair: None,
             cached_stab_key: u64::MAX,
             cached_stab: None,
+            raw_mosaic: None,
         }
     }
 
@@ -5980,11 +5984,15 @@ impl DetailCache {
             self.cached_stab_key = sk;
         }
 
+        // A raw take's frame arrives as mosaics, which its own levels read.
+        let mosaic = (pair.bit_depth == vr180_pipeline::x6_raw::MOSAIC_BIT_DEPTH)
+            .then(|| *self.raw_mosaic.get_or_insert_with(|| vr180_pipeline::x6_raw::bayer_at(&self.path)));
+
         // Project + color + compose on THIS (main) thread (≈10 ms).
         render_still_from_pair(
             pipeline, self.kind, s, self.fps, pair,
             imu.as_deref(), self.cached_stab.as_deref(), out_cap, out_eye,
-            timeline.as_deref(),
+            timeline.as_deref(), mosaic.as_ref(),
         ).ok().flatten()
     }
 }
@@ -6173,6 +6181,7 @@ fn render_still_from_pair(
     out_cap: u32,
     out_eye: Option<(u32, u32)>,
     timeline: Option<&vr180_pipeline::frame_timeline::FrameTimeline>,
+    mosaic: Option<&vr180_pipeline::raw_gpu::BayerLayout>,
 ) -> anyhow::Result<Option<(wgpu::Texture, u32, u32)>> {
     let (src_w, src_h) = (pair.eye_w, pair.eye_h);
 
@@ -6212,10 +6221,11 @@ fn render_still_from_pair(
         }),
     );
 
-    // A raw source's still arrives as its two mosaics: demosaiced here, at
-    // full size, into camera-linear eyes for the 16-bit build.
+    // A raw source's still arrives as its mosaics (`mosaic`: what their
+    // codes mean; a paired take's when the caller names none): demosaiced
+    // here, at full size, into camera-linear eyes for the 16-bit build.
     let raw_eyes = if pair.bit_depth == vr180_pipeline::x6_raw::MOSAIC_BIT_DEPTH {
-        Some(vr180_pipeline::x6_raw::demosaic_pair(pipeline, pair)?)
+        Some(vr180_pipeline::x6_raw::demosaic_pair(pipeline, pair, mosaic.unwrap_or(&vr180_pipeline::x6_raw::BAYER))?)
     } else { None };
     let (eye_l, eye_r) = (raw_eyes.as_ref().map(|e| &e.0), raw_eyes.as_ref().map(|e| &e.1));
     // Per-row correction needs both eyes' rows, as before.
@@ -6791,7 +6801,7 @@ mod preview_dims_tests {
         s.fisheye_output_mode = FisheyeOutputMode::HalfEquirect;
         s.preview_mode = PreviewMode::Sbs;
         let out = render_still_from_pair(
-            &pipeline, vr180_pipeline::SourceKind::SbsFisheye, &s, 30.0, &pair, None, None, 0, None, None);
+            &pipeline, vr180_pipeline::SourceKind::SbsFisheye, &s, 30.0, &pair, None, None, 0, None, None, None);
         let _ = pipeline.device.poll(wgpu::PollType::wait_indefinitely());
         assert_eq!(vr180_pipeline::gpu::last_gpu_error(), None, "GPU error while rendering the still");
         let (_tex, ow, oh) = out.expect("render").expect("a still");
@@ -6815,7 +6825,7 @@ mod preview_dims_tests {
         s.fisheye_output_mode = FisheyeOutputMode::HalfEquirect;
         s.preview_mode = PreviewMode::Sbs;
         let (_tex, ow, oh) = render_still_from_pair(
-            &pipeline, vr180_pipeline::SourceKind::Insta360Insv, &s, 30.0, &pair, None, None, 0, None, None,
+            &pipeline, vr180_pipeline::SourceKind::Insta360Insv, &s, 30.0, &pair, None, None, 0, None, None, None,
         ).expect("render").expect("a still");
         assert_eq!((ow, oh), (2 * w, w), "side by side: 2:1, each eye square");
     }
@@ -6943,7 +6953,7 @@ mod preview_dims_tests {
         };
         let s = lens_space_settings();
         let kind = vr180_pipeline::SourceKind::SbsFisheye;
-        let (tex, ow, oh) = render_still_from_pair(&pipeline, kind, &s, 30.0, &pair, None, None, 0, None, None)
+        let (tex, ow, oh) = render_still_from_pair(&pipeline, kind, &s, 30.0, &pair, None, None, 0, None, None, None)
             .expect("render").expect("a still");
         let _ = pipeline.device.poll(wgpu::PollType::wait_indefinitely());
         assert_eq!(vr180_pipeline::gpu::last_gpu_error(), None, "GPU error while rendering the still");
@@ -6958,12 +6968,12 @@ mod preview_dims_tests {
         // A snapshot renders the frame the export writes.
         let stab = Settings { stabilize: true, ..s.clone() };
         let out = vr180_pipeline::lens_frame::stabilized_dims(w, h);
-        let (_tex, ow, oh) = render_still_from_pair(&pipeline, kind, &stab, 30.0, &pair, None, None, 0, Some(out), None)
+        let (_tex, ow, oh) = render_still_from_pair(&pipeline, kind, &stab, 30.0, &pair, None, None, 0, Some(out), None, None)
             .expect("render").expect("a still");
         assert_eq!((ow, oh), (2 * out.0, out.1));
         // The equidistant lens: the disc, in a square.
         let disc = Settings { lens_space: LensSpaceLens::Equidistant, ..s.clone() };
-        let (_tex, ow, oh) = render_still_from_pair(&pipeline, kind, &disc, 30.0, &pair, None, None, 0, None, None)
+        let (_tex, ow, oh) = render_still_from_pair(&pipeline, kind, &disc, 30.0, &pair, None, None, 0, None, None, None)
             .expect("render").expect("a still");
         assert_eq!((ow, oh), (2 * h, h));
     }

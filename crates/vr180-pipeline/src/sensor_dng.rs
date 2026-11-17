@@ -29,6 +29,9 @@
 //! The colour description is the take's reference one (a raw take records
 //! no white balance of its own), the same this app develops with, so a raw
 //! converter opening a file starts from the colours the app shows.
+//!
+//! A take of one lens writes its one channel's folder, and its files are
+//! that take's frames: 7680×7680, 10-bit samples, tiles of 7680×320.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -37,14 +40,50 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use vr180_fisheye::x6b::{self, Channels, PairEntry, EYE_SAMPLES, EYE_SIDE, TILES_PER_EYE, TILE_ROWS, TILE_SAMPLES};
+use vr180_fisheye::x6b::{self, Channels, PairEntry, EYE_SIDE, TILES_PER_EYE, TILE_ROWS};
 
 use crate::fisheye_export::ExportProgress;
 use crate::raw_color::RawCamera;
 use crate::{Error, Result};
 
-/// Bits of a sample.
+/// Bits of a paired take's sample.
 pub const BITS: u8 = 14;
+
+/// The mosaic a file holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mosaic {
+    /// Side of the frame.
+    pub side: usize,
+    /// Rows of one of its tiles (the capture's own).
+    pub tile_rows: usize,
+    /// Bits of a sample.
+    pub bits: u8,
+    pub cfa: [u8; 4],
+    pub black_level: u16,
+    pub white_level: u16,
+}
+
+impl Mosaic {
+    /// One channel of a paired take.
+    pub const PAIRED: Mosaic = Mosaic {
+        side: EYE_SIDE, tile_rows: TILE_ROWS, bits: BITS,
+        cfa: x6b::CFA, black_level: x6b::BLACK_LEVEL, white_level: x6b::WHITE_LEVEL,
+    };
+
+    /// One channel of `take`: the bits its largest sample needs.
+    pub fn of(take: &x6b::Take) -> Self {
+        let top = take.sample_max();
+        Mosaic {
+            side: take.layout.side(), tile_rows: take.layout.tile_rows(),
+            bits: (16 - top.leading_zeros()) as u8,
+            cfa: take.cfa, black_level: take.black_level, white_level: take.white_level,
+        }
+    }
+
+    fn samples(&self) -> usize {
+        self.side * self.side
+    }
+}
 /// `UniqueCameraModel` of the files: a name of its own, so a raw converter
 /// takes the colour description from the file.
 pub const UNIQUE_CAMERA_MODEL: &str = "Insta360 X6 Raw Video";
@@ -189,16 +228,16 @@ pub struct EyeScratch {
     body: Vec<u8>,
 }
 
-/// One channel's frame (`EYE_SIDE × EYE_SIDE` samples) as a DNG file: the
-/// head and the tile data, to be written one after the other.
-pub fn eye_dng<'a>(samples: &[u16], tag: FrameTag, camera: &RawCamera, scratch: &'a mut EyeScratch) -> (Vec<u8>, &'a [u8]) {
-    assert_eq!(samples.len(), EYE_SAMPLES, "one eye's samples");
+/// One channel's frame (`mosaic`'s samples) as a DNG file: the head and
+/// the tile data, to be written one after the other.
+pub fn eye_dng<'a>(samples: &[u16], mosaic: &Mosaic, tag: FrameTag, camera: &RawCamera, scratch: &'a mut EyeScratch) -> (Vec<u8>, &'a [u8]) {
+    assert_eq!(samples.len(), mosaic.samples(), "one eye's samples");
     let fields = |offsets: &[u32], counts: &[u32]| {
         let mut f = Fields::default();
         f.longs(254, &[0]);
-        f.longs(256, &[EYE_SIDE as u32]);
-        f.longs(257, &[EYE_SIDE as u32]);
-        f.shorts(258, &[BITS as u16]);
+        f.longs(256, &[mosaic.side as u32]);
+        f.longs(257, &[mosaic.side as u32]);
+        f.shorts(258, &[mosaic.bits as u16]);
         f.shorts(259, &[7]);
         f.shorts(262, &[32803]);
         f.text(270, &tag.description());
@@ -208,17 +247,17 @@ pub fn eye_dng<'a>(samples: &[u16], tag: FrameTag, camera: &RawCamera, scratch: 
         f.shorts(277, &[1]);
         f.shorts(284, &[1]);
         f.text(305, concat!("VR180 Silver Bullet ", env!("CARGO_PKG_VERSION")));
-        f.longs(322, &[EYE_SIDE as u32]);
-        f.longs(323, &[TILE_ROWS as u32]);
+        f.longs(322, &[mosaic.side as u32]);
+        f.longs(323, &[mosaic.tile_rows as u32]);
         f.longs(324, offsets);
         f.longs(325, counts);
         f.shorts(33421, &[2, 2]);
-        f.bytes(33422, &x6b::CFA);
+        f.bytes(33422, &mosaic.cfa);
         f.bytes(50706, &[1, 4, 0, 0]);
         f.bytes(50707, &[1, 1, 0, 0]);
         f.text(50708, UNIQUE_CAMERA_MODEL);
-        f.shorts(50714, &[x6b::BLACK_LEVEL]);
-        f.longs(50717, &[x6b::WHITE_LEVEL as u32]);
+        f.shorts(50714, &[mosaic.black_level]);
+        f.longs(50717, &[mosaic.white_level as u32]);
         let m = camera.color_matrix;
         f.fractions(50721, true, &[m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]]);
         f.fractions(50728, false, &camera.as_shot_neutral);
@@ -230,8 +269,8 @@ pub fn eye_dng<'a>(samples: &[u16], tag: FrameTag, camera: &RawCamera, scratch: 
     scratch.body.clear();
     let mut offsets = [0u32; TILES_PER_EYE];
     let mut counts = [0u32; TILES_PER_EYE];
-    for (i, tile) in samples.chunks_exact(TILE_SAMPLES).enumerate() {
-        crate::ljpeg::encode_tile_cfa_into(tile, EYE_SIDE, TILE_ROWS, BITS, &mut scratch.tile);
+    for (i, tile) in samples.chunks_exact(mosaic.side * mosaic.tile_rows).enumerate() {
+        crate::ljpeg::encode_tile_cfa_into(tile, mosaic.side, mosaic.tile_rows, mosaic.bits, &mut scratch.tile);
         offsets[i] = (head_len + scratch.body.len()) as u32;
         counts[i] = scratch.tile.len() as u32;
         scratch.body.extend_from_slice(&scratch.tile);
@@ -249,8 +288,9 @@ pub struct WrittenPair {
     pub exposure_ns: [u64; 2],
     /// The record's signature in the capture.
     pub signature: String,
-    /// Length of each channel's file.
-    pub bytes: [u64; 2],
+    /// Each file written: its channel and its length (a paired take's two
+    /// channels; the one channel of a take of one lens).
+    pub files: Vec<(usize, u64)>,
 }
 
 impl WrittenPair {
@@ -260,9 +300,13 @@ impl WrittenPair {
             "request": self.request,
             "exposures_ns": self.exposure_ns,
             "signature": self.signature,
-            "files": [frame_file(0, self.request), frame_file(1, self.request)],
-            "bytes": self.bytes,
+            "files": self.files.iter().map(|f| frame_file(f.0, self.request)).collect::<Vec<_>>(),
+            "bytes": self.files.iter().map(|f| f.1).collect::<Vec<_>>(),
         }).to_string()
+    }
+
+    fn bytes(&self) -> u64 {
+        self.files.iter().map(|f| f.1).sum()
     }
 }
 
@@ -329,11 +373,17 @@ pub fn export_sensor_dng_sequence(
     let index = crate::x6_raw::open(source)?;
     let frames = frames_in(&index, t_in, t_out);
     let total = frames.len();
-    for channel in 0..2 {
+    // The sensor channel of each of a record's channels: a paired take's
+    // two, the one a take of one lens holds.
+    let channels: Vec<usize> = match index.take.layout.single_channel() {
+        Some(channel) => vec![channel],
+        None => vec![0, 1],
+    };
+    for &channel in &channels {
         std::fs::create_dir_all(out.join(channel_dir(channel)))?;
     }
     let camera = RawCamera::X6;
-    let fps = index.take.fps_setting;
+    let (format, mosaic) = (index.take.format(), Mosaic::of(&index.take));
     let capture = index.take.capture_path();
     // Two cores stay free for the app's own threads.
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -379,23 +429,23 @@ pub fn export_sensor_dng_sequence(
         }
         for _ in 0..workers {
             let (tx, free_tx) = (tx.clone(), free_tx.clone());
-            let (index, work_rx, stop, cancel) = (&index, &work_rx, &stop, &cancel);
+            let (index, work_rx, stop, cancel, channels, mosaic) = (&index, &work_rx, &stop, &cancel, &channels, &mosaic);
             scope.spawn(move || {
                 let one = |record: &[u8], samples: &mut [u16], scratch: &mut EyeScratch, entry: &PairEntry| -> Result<WrittenPair> {
-                    let got = x6b::decode_record(record, fps, Channels::Both, samples, 1).map_err(|e| Error::Ffmpeg(e.to_string()))?;
+                    let got = x6b::decode_record(record, format, Channels::Both, samples, 1).map_err(|e| Error::Ffmpeg(e.to_string()))?;
                     if got.request != entry.request {
                         return Err(Error::Ffmpeg(format!("byte {} of the capture holds request {}, {} expected", entry.offset, got.request, entry.request)));
                     }
-                    let mut bytes = [0u64; 2];
-                    for channel in 0..2 {
+                    let mut files = Vec::with_capacity(channels.len());
+                    for (&channel, eye) in channels.iter().zip(samples.chunks(mosaic.samples())) {
                         let tag = FrameTag { channel, request: entry.request, exposure_ns: entry.exposure_ns[channel] };
-                        let (head, body) = eye_dng(&samples[channel * EYE_SAMPLES..(channel + 1) * EYE_SAMPLES], tag, &camera, scratch);
-                        bytes[channel] = write_whole(&out.join(frame_file(channel, entry.request)), &[&head, body])?;
+                        let (head, body) = eye_dng(eye, mosaic, tag, &camera, scratch);
+                        files.push((channel, write_whole(&out.join(frame_file(channel, entry.request)), &[&head, body])?));
                     }
-                    let signature = String::from_utf8_lossy(entry.profile.signature()).into_owned();
-                    Ok(WrittenPair { request: entry.request, exposure_ns: entry.exposure_ns, signature, bytes })
+                    let signature = String::from_utf8_lossy(entry.profile.signature()).trim_end_matches('\0').to_owned();
+                    Ok(WrittenPair { request: entry.request, exposure_ns: entry.exposure_ns, signature, files })
                 };
-                let mut samples = vec![0u16; 2 * EYE_SAMPLES];
+                let mut samples = vec![0u16; format.layout.samples()];
                 let mut scratch = EyeScratch::default();
                 loop {
                     let job = work_rx.lock().ok().and_then(|rx| rx.recv().ok());
@@ -446,7 +496,7 @@ pub fn export_sensor_dng_sequence(
         return Err(e);
     }
     let copied = copy_take_files(&index.take.dir, out)?;
-    let bytes: u64 = written.iter().map(|p| p.bytes[0] + p.bytes[1]).sum();
+    let bytes: u64 = written.iter().map(|p| p.bytes()).sum();
     if cancel.load(Ordering::SeqCst) && written.len() < total {
         tracing::info!("sensor frames: cancelled after {} of {total} pairs", written.len());
     }
@@ -547,7 +597,7 @@ mod tests {
     fn mosaic(seed: u64) -> Vec<u16> {
         let mut s = seed.max(1);
         let mut next = move || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
-        (0..EYE_SAMPLES).map(|i| {
+        (0..x6b::EYE_SAMPLES).map(|i| {
             let (x, y) = (i % EYE_SIDE, i / EYE_SIDE);
             let site = [1.0f64, 0.6, 1.7, 1.0][(y % 2) * 2 + x % 2];
             let scene = 64.0 + 2600.0 * site * (1.0 + ((x as f64) * 0.004).sin() * ((y as f64) * 0.003).cos());
@@ -574,7 +624,7 @@ mod tests {
         let samples = mosaic(7);
         let tag = FrameTag { channel: 1, request: 94, exposure_ns: 416_279_938_533 };
         let mut scratch = EyeScratch::default();
-        let (head, body) = eye_dng(&samples, tag, &RawCamera::X6, &mut scratch);
+        let (head, body) = eye_dng(&samples, &Mosaic::PAIRED, tag, &RawCamera::X6, &mut scratch);
         let file = [head.as_slice(), body].concat();
         let back = read_back(&file);
         // Every sample, the ones above the white level too.
@@ -598,10 +648,10 @@ mod tests {
         assert_eq!(back.fractions(50721), [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]]);
         assert_eq!(back.fractions(50728), RawCamera::X6.as_shot_neutral);
         // Packed, it is well under the loose 2 bytes a sample.
-        assert!(file.len() < EYE_SAMPLES * 2 * 3 / 4, "{} bytes", file.len());
+        assert!(file.len() < x6b::EYE_SAMPLES * 2 * 3 / 4, "{} bytes", file.len());
         // The scratch space serves the next frame.
         let other = mosaic(8);
-        let (head, body) = eye_dng(&other, FrameTag { channel: 0, ..tag }, &RawCamera::X6, &mut scratch);
+        let (head, body) = eye_dng(&other, &Mosaic::PAIRED, FrameTag { channel: 0, ..tag }, &RawCamera::X6, &mut scratch);
         let back = read_back(&[head.as_slice(), body].concat());
         assert!(back.samples == other);
         assert_eq!(back.text(270), "CAM0 request=94 exposure_start_ns=416279938533");
@@ -611,7 +661,7 @@ mod tests {
     fn names_and_index_lines() {
         assert_eq!(frame_file(0, 94), "CAM0/000000094.dng");
         assert_eq!(frame_file(1, 123_456_789), "CAM1/123456789.dng");
-        let pair = WrittenPair { request: 94, exposure_ns: [416_279_938_533, 416_279_938_901], signature: "L1024___".into(), bytes: [11, 12] };
+        let pair = WrittenPair { request: 94, exposure_ns: [416_279_938_533, 416_279_938_901], signature: "L1024___".into(), files: vec![(0, 11), (1, 12)] };
         let v: serde_json::Value = serde_json::from_str(&pair.line()).unwrap();
         assert_eq!(v["request"], 94);
         assert_eq!(v["exposures_ns"][1], 416_279_938_901u64);
@@ -619,6 +669,10 @@ mod tests {
         assert_eq!(v["files"][1], "CAM1/000000094.dng");
         assert_eq!((v["signature"].as_str(), v["bytes"][1].as_u64()), (Some("L1024___"), Some(12)));
         assert!(!pair.line().contains('\n'));
+        // One lens's frame: its one file.
+        let one = WrittenPair { request: 7, exposure_ns: [5, 5], signature: "X6S8B01".into(), files: vec![(1, 9)] };
+        let v: serde_json::Value = serde_json::from_str(&one.line()).unwrap();
+        assert_eq!((v["files"].as_array().map(|a| a.len()), v["files"][0].as_str(), v["bytes"][0].as_u64()), (Some(1), Some("CAM1/000000007.dng"), Some(9)));
         assert_eq!(FrameTag::parse("CAM0 request=7 exposure_start_ns=12"), Some(FrameTag { channel: 0, request: 7, exposure_ns: 12 }));
         assert_eq!(FrameTag::parse("frame 12 at 0.4 s"), None);
     }
@@ -652,7 +706,7 @@ mod tests {
                 let file = std::fs::read(&path).unwrap();
                 assert_eq!(file.len() as u64, line["bytes"][channel].as_u64().unwrap());
                 let back = read_back(&file);
-                assert!(back.samples == samples[channel * EYE_SAMPLES..(channel + 1) * EYE_SAMPLES], "request {} channel {channel}", entry.request);
+                assert!(back.samples == samples[channel * x6b::EYE_SAMPLES..(channel + 1) * x6b::EYE_SAMPLES], "request {} channel {channel}", entry.request);
                 assert_eq!(FrameTag::parse(&back.text(270)), Some(FrameTag { channel, request: entry.request, exposure_ns: entry.exposure_ns[channel] }));
             }
         }

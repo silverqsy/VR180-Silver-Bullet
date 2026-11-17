@@ -203,7 +203,12 @@ impl SourceKind {
 /// that eye and an export writes it as the whole frame instead of side by
 /// side.
 pub fn is_single_eye(kind: SourceKind, path: &Path) -> bool {
-    kind == SourceKind::Insta360Insv && crate::x6_pair::single_eye(path)
+    match kind {
+        SourceKind::Insta360Insv => crate::x6_pair::single_eye(path),
+        // A raw take of one lens.
+        SourceKind::X6Raw => crate::x6_raw::single_eye(path),
+        _ => false,
+    }
 }
 
 /// How one video stream packs its two fisheye eyes.

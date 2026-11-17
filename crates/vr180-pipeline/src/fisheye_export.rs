@@ -1945,7 +1945,9 @@ fn export_fisheye_inner(
     // decode and the eyes are larger, which the export bar says.
     if cfg.source_kind.is_raw_video() && cfg.raw_enhanced_dir.is_some() {
         let (w, h) = decoder.eye_dims();
-        if w as usize > vr180_fisheye::x6b::EYE_SIDE {
+        // Larger than the take's own frame (3840² for a path that names none).
+        let own = crate::x6_raw::describe(&cfg.source_path).map_or(vr180_fisheye::x6b::EYE_SIDE as u32, |take| take.width);
+        if w > own {
             append_export_path_note(&format!("frames from the enhanced DNGs, {w} × {h} per eye"));
         }
     }
@@ -5000,7 +5002,11 @@ pub(crate) fn build_eye_eq_16(
             pipeline.project_eye(&EyeProjection::new(EyePicture::Rgba(&view), eye_w, eye_h, rot, calib)
                 .wide().fisheye_out(projection == FisheyeExportProjection::Fisheye).rs_rows(rows).slot(slot))
         };
-        return Ok((eye(&g.left, rot_left, calib_left, rs_l, 30)?, eye(&g.right, rot_right, calib_right, rs_r, 31)?));
+        let left = eye(&g.left, rot_left, calib_left, rs_l, 30)?;
+        if g.one_eye {
+            return Ok((left.clone(), left));
+        }
+        return Ok((left, eye(&g.right, rot_right, calib_right, rs_r, 31)?));
     }
     let left = eye(&pair.left, rot_left, calib_left, rs_l, 30)?;
     if pair.single_eye() {
