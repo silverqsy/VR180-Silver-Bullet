@@ -7893,7 +7893,15 @@ impl App {
     /// and a half, and at once when the window closes.
     fn persist_session(&mut self, ctx: &egui::Context) {
         let closing = ctx.input(|i| i.viewport().close_requested());
-        if !closing && self.session_checked_at.elapsed() < std::time::Duration::from_millis(1500) {
+        let every = std::time::Duration::from_millis(1500);
+        let since = self.session_checked_at.elapsed();
+        if !closing && since < every {
+            // Whatever drew this frame may have changed the list, and a
+            // window that then sits still draws no further one: come back
+            // when the look is due, so that what was done last is not left
+            // unwritten. (That frame is the look itself and asks for
+            // nothing more: a still window stays still.)
+            ctx.request_repaint_after(every - since + std::time::Duration::from_millis(50));
             return;
         }
         self.write_session();
