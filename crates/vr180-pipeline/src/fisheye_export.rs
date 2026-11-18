@@ -643,28 +643,6 @@ fn single_eye_source(cfg: &FisheyeExportConfig) -> bool {
     crate::source_kind::is_single_eye(cfg.source_kind, &cfg.source_path)
 }
 
-/// Both eyes after the 16-bit colour stack. A single-eye frame grades its
-/// one eye once and returns it for both.
-#[allow(clippy::too_many_arguments)]
-fn grade_eyes_16(
-    pipeline: &Device,
-    left: &wgpu::Texture,
-    right: &wgpu::Texture,
-    eye_w: u32,
-    eye_h: u32,
-    plan: &ColorStackPlan,
-    eye_match: Option<(&crate::gpu::EyeMatchState, EyeMatchFrame)>,
-    single_eye: bool,
-) -> Result<(wgpu::Texture, wgpu::Texture)> {
-    if single_eye {
-        let eye = pipeline.apply_color_stack_per_eye_16(left, eye_w, eye_h, plan)?
-            .unwrap_or_else(|| left.clone());
-        return Ok((eye.clone(), eye));
-    }
-    let (l, r) = pipeline.apply_color_stack_pair_16(left, right, eye_w, eye_h, plan, eye_match)?;
-    Ok((l.unwrap_or_else(|| left.clone()), r.unwrap_or_else(|| right.clone())))
-}
-
 /// A frame's two eyes into the hardware encoder as a 10-bit surface (macOS):
 /// composed into a new one of the encoder's layout (P210, true 4:2:2, for
 /// ProRes; P010 for HEVC Main10) and handed over `copies` times. `mono`:
@@ -2625,7 +2603,7 @@ fn run_fisheye_frames<F: FrameFeed>(
                         }
                         None => {
                             let (left, right) = frame.project_16(pipeline, &job)?;
-                            let (left, right) = grade_eyes_16(
+                            let (left, right) = crate::render::grade_eyes(
                                 pipeline, &left, &right, cfg.eye_w, cfg.eye_h, color_plan, eye_match(), mono,
                             )?;
                             encode_bgra_surface(
@@ -2645,7 +2623,7 @@ fn run_fisheye_frames<F: FrameFeed>(
                 {
                     let (left, right) = frame.project_16(pipeline, &job)?;
                     let frame_plan = frame.develop_plan(pipeline, color_plan, &job)?;
-                    let (left, right) = grade_eyes_16(
+                    let (left, right) = crate::render::grade_eyes(
                         pipeline, &left, &right, cfg.eye_w, cfg.eye_h, &frame_plan, eye_match(), mono,
                     )?;
                     encode_wide_surface(
@@ -2664,7 +2642,7 @@ fn run_fisheye_frames<F: FrameFeed>(
                 let g0 = std::time::Instant::now();
                 let (left, right) = frame.project_16(pipeline, &job)?;
                 let frame_plan = frame.develop_plan(pipeline, color_plan, &job)?;
-                let (left, right) = grade_eyes_16(
+                let (left, right) = crate::render::grade_eyes(
                     pipeline, &left, &right, cfg.eye_w, cfg.eye_h, &frame_plan, eye_match(), mono,
                 )?;
                 match plane_feed {
@@ -4879,26 +4857,26 @@ const RAW_REFERENCE_SLOT: u32 = 40;
 /// half-equirect would be. Any other clip, and the half-equirect itself
 /// (its own eyes are the reference), keep `plan` as it is.
 ///
-/// `job`: the frame's projection, whose view calibration, size, rotations
-/// and per-row matrices the reference is drawn with; `job.mono`: the frame
-/// written is one eye (the left), and so is its reference.
+/// `job`: the frame's projection, which draws the reference
+/// ([`EyeJob::raw_reference`]).
 pub(crate) fn plan_with_raw_reference<'a>(
     pipeline: &Device,
     plan: &'a ColorStackPlan,
     pair: &FisheyePair,
     job: &EyeJob,
 ) -> Result<std::borrow::Cow<'a, ColorStackPlan>> {
-    let eyes = match pair.gpu.as_deref() {
-        Some(g) if plan.raw_develop.is_some() && job.projection != FisheyeExportProjection::HalfEquirect => g,
-        _ => return Ok(std::borrow::Cow::Borrowed(plan)),
-    };
-    let reference = crate::render::raw_view_reference(
-        pipeline, (&eyes.left, &eyes.right), job.mono, &job.calib_left, (job.eye_w, job.eye_h),
-        job.fisheye_out(), job.source_calib, (job.pose.rot_left, job.pose.rot_right),
-        (job.pose.rows_left.as_deref(), job.pose.rows_right.as_deref()), RAW_REFERENCE_SLOT)?;
-    let mut plan = plan.clone();
-    plan.raw_reference = Some(reference);
-    Ok(std::borrow::Cow::Owned(plan))
+    if plan.raw_develop.is_none() {
+        return Ok(std::borrow::Cow::Borrowed(plan));
+    }
+    let eyes = pair.gpu.as_deref().map(|g| (&g.left, &g.right));
+    Ok(match job.raw_reference(pipeline, eyes, RAW_REFERENCE_SLOT)? {
+        Some(reference) => {
+            let mut plan = plan.clone();
+            plan.raw_reference = Some(reference);
+            std::borrow::Cow::Owned(plan)
+        }
+        None => std::borrow::Cow::Borrowed(plan),
+    })
 }
 
 /// Both eyes of a pair at 16 bits a channel (`Rgba16Unorm`), for the 10-bit

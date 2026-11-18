@@ -187,6 +187,55 @@ impl<'a> EyeJob<'a> {
     }
 }
 
+impl EyeJob<'_> {
+    /// The frame a raw clip's view is developed from
+    /// ([`crate::raw_gpu::RawReference`]), where this job's view needs one:
+    /// `eyes` are the frame's camera-linear source eyes, and the view is not
+    /// the half-equirect (whose own eyes are that frame). `None` for the
+    /// half-equirect, and for a frame whose eyes are not held that way. For
+    /// a clip that is developed as raw: the caller knows.
+    pub fn raw_reference(
+        &self,
+        pipeline: &Device,
+        eyes: Option<(&wgpu::Texture, &wgpu::Texture)>,
+        slot: u32,
+    ) -> crate::Result<Option<crate::raw_gpu::RawReference>> {
+        let Some((left, right)) = eyes else { return Ok(None) };
+        if self.projection == FisheyeExportProjection::HalfEquirect || left.format() != wgpu::TextureFormat::Rgba16Unorm {
+            return Ok(None);
+        }
+        raw_view_reference(
+            pipeline, (left, right), self.mono, &self.calib_left, (self.eye_w, self.eye_h), self.fisheye_out(),
+            self.source_calib, (self.pose.rot_left, self.pose.rot_right),
+            (self.pose.rows_left.as_deref(), self.pose.rows_right.as_deref()), slot,
+        ).map(Some)
+    }
+}
+
+/// A frame's eyes after the 16-bit colour stack, each one itself where the
+/// plan leaves it as it is. `eye_match`: the state of the automatic
+/// eye-exposure match, for a source that has one. `mono`: the frame is one
+/// eye, graded once and returned for both.
+#[allow(clippy::too_many_arguments)]
+pub fn grade_eyes(
+    pipeline: &Device,
+    left: &wgpu::Texture,
+    right: &wgpu::Texture,
+    eye_w: u32,
+    eye_h: u32,
+    plan: &crate::gpu::ColorStackPlan,
+    eye_match: Option<(&crate::gpu::EyeMatchState, crate::gpu::EyeMatchFrame)>,
+    mono: bool,
+) -> crate::Result<(wgpu::Texture, wgpu::Texture)> {
+    if mono {
+        let eye = pipeline.apply_color_stack_per_eye_16(left, eye_w, eye_h, plan)?
+            .unwrap_or_else(|| left.clone());
+        return Ok((eye.clone(), eye));
+    }
+    let (l, r) = pipeline.apply_color_stack_pair_16(left, right, eye_w, eye_h, plan, eye_match)?;
+    Ok((l.unwrap_or_else(|| left.clone()), r.unwrap_or_else(|| right.clone())))
+}
+
 /// The frame a raw clip's view is developed from when that view is not the
 /// half-equirect ([`crate::raw_gpu::RawReference`]): the same moment as a
 /// half-equirect, turned as the view is, so that a reframed view or a lens
@@ -199,7 +248,7 @@ impl<'a> EyeJob<'a> {
 /// before the view; `rot`, `rows`: the frame's rotations and per-row
 /// matrices, as its projection takes them ([`FramePose`]).
 #[allow(clippy::too_many_arguments)]
-pub fn raw_view_reference(
+fn raw_view_reference(
     pipeline: &crate::gpu::Device,
     eyes: (&wgpu::Texture, &wgpu::Texture),
     one_eye: bool,

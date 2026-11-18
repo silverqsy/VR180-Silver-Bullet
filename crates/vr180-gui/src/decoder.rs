@@ -2860,9 +2860,9 @@ fn run_fisheye_frames<F: PreviewFeed>(
         // stabilization (it goes with `stabilize`, not `rs_correct`), as on
         // the paused-still path. The readout is the source's own, or the
         // one its frame rate implies.
-        let (swapped_eyes, stabilize, view_adjust, mode, aspect, single_eye, auto_eye, projection) = {
+        let (swapped_eyes, stabilize, view_adjust, mode, aspect, single_eye, auto_eye, projection, raw_source) = {
             let s = control.settings.read();
-            (s.effective_swap_eyes(), s.stabilize, s.output_view_adjust(), s.fisheye_output_mode, s.reframe_aspect, s.single_eye, s.auto_eye_match, s.export_projection())
+            (s.effective_swap_eyes(), s.stabilize, s.output_view_adjust(), s.fisheye_output_mode, s.reframe_aspect, s.single_eye, s.auto_eye_match, s.export_projection(), s.raw_source)
         };
         let readout_s = vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0;
         let pose = vr180_pipeline::render::FramePose::new(
@@ -2880,25 +2880,26 @@ fn run_fisheye_frames<F: PreviewFeed>(
         let phase_t1 = std::time::Instant::now();
         let one_eye = single_eye || feed.one_eye();
         let (out_w, out_h) = view_out_dims(mode, aspect, eye_w, eye_h, lens_dims);
-        let (left_tex, right_tex) = feed.project(&pipeline, &EyeJob {
+        let job = EyeJob {
             src_w, src_h, eye_w: out_w, eye_h: out_h, pose: &pose,
             calib_left, calib_right, source_calib, projection, mono: one_eye,
-        })?;
+        };
+        let (left_tex, right_tex) = feed.project(&pipeline, &job)?;
         let (preview_eye_w, preview_eye_h) = (left_tex.width(), left_tex.height());
         let phase_project = phase_t1.elapsed();
 
         // ── Colour and compose. A raw clip in a view that is not the
         //    half-equirect is developed from the half-equirect of the frame.
         let phase_t2 = std::time::Instant::now();
-        let raw_reference = raw_view_reference(
-            &pipeline, &control.settings.read(), feed.raw_eyes(), one_eye,
-            &calib_left, (preview_eye_w, preview_eye_h), source_calib,
-            (pose.rot_left, pose.rot_right), (pose.rows_left.as_deref(), pose.rows_right.as_deref()), RAW_REFERENCE_SLOT_LIVE)?;
+        let raw_reference = if raw_source { job.raw_reference(&pipeline, feed.raw_eyes(), RAW_REFERENCE_SLOT_LIVE)? } else { None };
+        // This is the live preview: it takes the last measurement of the
+        // frame's levels that came back, and never waits on the GPU (the
+        // window's own renderer shares the device).
         let (sbs_tex, out_w, out_h) = compose_view_with_color_and_mode(
             &pipeline, &control.settings.read(), &left_tex, &right_tex,
             preview_eye_w, preview_eye_h,
             eye_match_arg(&eye_match_state, kind, stab_idx, auto_eye),
-            raw_reference,
+            raw_reference, vr180_pipeline::raw_tone::Measure::Latest,
         )?;
         if matches!(kind, vr180_pipeline::SourceKind::Insta360Insv) && auto_eye {
             if let Some(r) = pipeline.eye_match_readback_poll(&eye_match_state, &mut eye_match_rb) {
@@ -4148,44 +4149,6 @@ pub(crate) fn resolve_fisheye_view(
 const RAW_REFERENCE_SLOT_LIVE: u32 = 42;
 const RAW_REFERENCE_SLOT_STILL: u32 = 44;
 
-/// The frame a raw clip's view is developed from when that view is not the
-/// half-equirect (`vr180_pipeline::raw_gpu::RawReference`): the same moment
-/// as a half-equirect, turned as the view is, so a reframed view or a lens
-/// frame comes out in the colours of the half-equirect. `None` for the
-/// half-equirect itself (its own eyes are that frame) and for every source
-/// that is not raw.
-///
-/// `eyes`: the camera-linear source eyes; `view_calib`: one eye's
-/// calibration with the view, drawing a frame of `out`; `source_calib`:
-/// both eyes' before the view ([`FisheyeView::source`]); `rot`, `rs`: the
-/// frame's rotations and per-row matrices, as its projection takes them.
-#[allow(clippy::too_many_arguments)]
-fn raw_view_reference(
-    pipeline: &Device,
-    s: &Settings,
-    eyes: Option<(&wgpu::Texture, &wgpu::Texture)>,
-    one_eye: bool,
-    view_calib: &vr180_pipeline::gpu::FisheyeCalib,
-    out: (u32, u32),
-    source_calib: (vr180_pipeline::gpu::FisheyeCalib, vr180_pipeline::gpu::FisheyeCalib),
-    rot: (EquirectRotation, EquirectRotation),
-    rs: (Option<&[f32]>, Option<&[f32]>),
-    slot: u32,
-) -> vr180_pipeline::Result<Option<vr180_pipeline::raw_gpu::RawReference>> {
-    let Some((left, right)) = eyes else { return Ok(None) };
-    if !s.raw_source
-        || s.fisheye_output_mode == FisheyeOutputMode::HalfEquirect
-        || left.format() != wgpu::TextureFormat::Rgba16Unorm
-    {
-        return Ok(None);
-    }
-    // The frame itself is drawn where the export draws its own.
-    vr180_pipeline::render::raw_view_reference(
-        pipeline, (left, right), one_eye, view_calib, out,
-        s.fisheye_output_mode == FisheyeOutputMode::Fisheye, source_calib, rot, rs, slot,
-    ).map(Some)
-}
-
 /// Per-eye size of a view: the lens frame's own where the view is one
 /// (`lens_dims`, from [`resolve_fisheye_view`]), [`preview_out_dims`]
 /// everywhere else.
@@ -5228,12 +5191,24 @@ fn compose_with_color_and_mode(
     eye_h: u32,
     eye_match: Option<(&vr180_pipeline::gpu::EyeMatchState, vr180_pipeline::gpu::EyeMatchFrame)>,
 ) -> anyhow::Result<(wgpu::Texture, u32, u32)> {
-    compose_view_with_color_and_mode(pipeline, s, left_tex, right_tex, eye_w, eye_h, eye_match, None)
+    // The workers that are not on the one frame loop yet say who measures
+    // by their thread: a preview worker takes the last measurement, anything
+    // drawn on demand measures its own frame.
+    let measure = if LIVE_PREVIEW.with(|live| live.get()) {
+        vr180_pipeline::raw_tone::Measure::Latest
+    } else {
+        vr180_pipeline::raw_tone::Measure::Wait
+    };
+    compose_view_with_color_and_mode(pipeline, s, left_tex, right_tex, eye_w, eye_h, eye_match, None, measure)
 }
 
 /// [`compose_with_color_and_mode`] for a view that may be a raw clip's:
 /// `raw_reference` is the frame its development is read from when the eyes
-/// are not the half-equirect ([`raw_view_reference`]).
+/// are not the half-equirect (`EyeJob::raw_reference`). `measure`: who
+/// measures the levels a frame's tone is derived from (a raw clip's
+/// development, the tone controls of any other clip): the live preview takes
+/// the last measurement that came back, a still drawn on demand measures its
+/// own frame and waits for it.
 #[allow(clippy::too_many_arguments)]
 fn compose_view_with_color_and_mode(
     pipeline: &Device,
@@ -5244,6 +5219,7 @@ fn compose_view_with_color_and_mode(
     eye_h: u32,
     eye_match: Option<(&vr180_pipeline::gpu::EyeMatchState, vr180_pipeline::gpu::EyeMatchFrame)>,
     raw_reference: Option<vr180_pipeline::raw_gpu::RawReference>,
+    measure: vr180_pipeline::raw_tone::Measure,
 ) -> anyhow::Result<(wgpu::Texture, u32, u32)> {
     let mut color_plan = s.build_color_stack();
     color_plan.raw_reference = raw_reference;
@@ -5252,13 +5228,7 @@ fn compose_view_with_color_and_mode(
     if s.export_eye_w > 0 && eye_w > 0 {
         color_plan.raw_pixel_scale = eye_w as f32 / s.export_eye_w as f32;
     }
-    // A raw clip's tone keys: the live preview takes the last measurement
-    // that came back; a still drawn on demand measures its own frame.
-    let measure = if LIVE_PREVIEW.with(|live| live.get()) {
-        vr180_pipeline::raw_tone::Measure::Latest
-    } else {
-        vr180_pipeline::raw_tone::Measure::Wait
-    };
+    // A raw clip's tone keys.
     if let Some(stage) = color_plan.raw_develop.as_mut() {
         stage.measure = measure;
     }
@@ -5274,11 +5244,10 @@ fn compose_view_with_color_and_mode(
     }
     // A single-eye source: its one eye (the left input), graded once.
     if s.single_eye {
-        let plan = color_plan.single_eye();
-        let graded = pipeline.apply_color_stack_per_eye_16(left_tex, eye_w, eye_h, &plan)?;
-        let eye = graded.as_ref().unwrap_or(left_tex);
+        let (eye, _) = vr180_pipeline::render::grade_eyes(
+            pipeline, left_tex, right_tex, eye_w, eye_h, &color_plan.single_eye(), None, true)?;
         let mode = vr180_pipeline::gpu::PreviewMode::SingleEye;
-        let out = pipeline.compose_preview(eye, eye, eye_w, eye_h, mode)?;
+        let out = pipeline.compose_preview(&eye, &eye, eye_w, eye_h, mode)?;
         let (out_w, out_h) = mode.output_dims(eye_w, eye_h);
         return Ok((out, out_w, out_h));
     }
@@ -5332,12 +5301,9 @@ fn compose_view_with_color_and_mode(
     // Rgba16Unorm graded eyes feed it directly and it writes the Rgba8Unorm
     // SBS that egui displays. (The source is still the preview's working-res
     // 8-bit decode, but the grade math now matches the export exactly.)
-    let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
-        left_tex, right_tex, eye_w, eye_h, &color_plan, eye_match,
-    )?;
-    let left_post  = left_g .as_ref().unwrap_or(left_tex);
-    let right_post = right_g.as_ref().unwrap_or(right_tex);
-    let (left_post, right_post) = for_compose(left_post, right_post);
+    let (left_post, right_post) = vr180_pipeline::render::grade_eyes(
+        pipeline, left_tex, right_tex, eye_w, eye_h, &color_plan, eye_match, false)?;
+    let (left_post, right_post) = for_compose(&left_post, &right_post);
     let sbs_tex = pipeline.compose_preview(
         &left_post, &right_post, eye_w, eye_h, preview_mode,
     )?;
@@ -5848,33 +5814,30 @@ fn render_still_from_pair(
     let raw_eyes = if pair.bit_depth == vr180_pipeline::x6_raw::MOSAIC_BIT_DEPTH {
         Some(vr180_pipeline::x6_raw::demosaic_pair(pipeline, pair, mosaic.unwrap_or(&vr180_pipeline::x6_raw::BAYER))?)
     } else { None };
-    let (left_tex, right_tex) = {
-        let fisheye_out = s.fisheye_output_mode == FisheyeOutputMode::Fisheye;
-        let (out_w, out_h) = if fisheye_out {
-            // The disc, or a lens frame at its own size.
-            view.lens_dims.unwrap_or_else(|| {
-                let side = out_eye.map(|(w, h)| w.min(h)).unwrap_or(oside);
-                (side, side)
-            })
-        } else {
-            // A reframed view keeps the working width and takes its aspect.
-            // A snapshot renders at the export's exact eye size instead.
-            out_eye.unwrap_or_else(||
-                preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, oeq_w, oeq_h))
-        };
-        let job = EyeJob {
-            src_w, src_h, eye_w: out_w, eye_h: out_h, pose: &pose,
-            calib_left, calib_right, source_calib: view.source,
-            projection: s.export_projection(), mono: one_eye,
-        };
-        match raw_eyes.as_ref() {
-            // Eyes already on the GPU, through the build of their depth
-            // (output slots 20 / 21).
-            Some((l, r)) => job.project_textures(pipeline, l, r, EyeDepth::AsHeld, (20, 21))?,
-            // The decoded bytes (upload slots 20 / 21: the still's own,
-            // apart from the preview's).
-            None => job.project_bytes_8(pipeline, &pair.left, &pair.right, (20, 21))?,
-        }
+    let (out_w, out_h) = if s.fisheye_output_mode == FisheyeOutputMode::Fisheye {
+        // The disc, or a lens frame at its own size.
+        view.lens_dims.unwrap_or_else(|| {
+            let side = out_eye.map(|(w, h)| w.min(h)).unwrap_or(oside);
+            (side, side)
+        })
+    } else {
+        // A reframed view keeps the working width and takes its aspect.
+        // A snapshot renders at the export's exact eye size instead.
+        out_eye.unwrap_or_else(||
+            preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, oeq_w, oeq_h))
+    };
+    let job = EyeJob {
+        src_w, src_h, eye_w: out_w, eye_h: out_h, pose: &pose,
+        calib_left, calib_right, source_calib: view.source,
+        projection: s.export_projection(), mono: one_eye,
+    };
+    let (left_tex, right_tex) = match raw_eyes.as_ref() {
+        // Eyes already on the GPU, through the build of their depth (output
+        // slots 20 / 21).
+        Some((l, r)) => job.project_textures(pipeline, l, r, EyeDepth::AsHeld, (20, 21))?,
+        // The decoded bytes (upload slots 20 / 21: the still's own, apart
+        // from the preview's).
+        None => job.project_bytes_8(pipeline, &pair.left, &pair.right, (20, 21))?,
     };
     let (ew, eh) = (left_tex.width(), left_tex.height());
     // A still is one frame: a fresh state measures it without history (the
@@ -5884,13 +5847,14 @@ fn render_still_from_pair(
         .then(|| pipeline.create_eye_match_state());
     // A raw clip in a view that is not the half-equirect is developed from
     // the half-equirect of the same frame.
-    let raw_reference = raw_view_reference(
-        pipeline, s, raw_eyes.as_ref().map(|e| (&e.0, &e.1)), one_eye, &calib_left, (ew, eh), view.source,
-        (pose.rot_left, pose.rot_right), (pose.rows_left.as_deref(), pose.rows_right.as_deref()), RAW_REFERENCE_SLOT_STILL)?;
+    let raw_reference = if s.raw_source {
+        job.raw_reference(pipeline, raw_eyes.as_ref().map(|e| (&e.0, &e.1)), RAW_REFERENCE_SLOT_STILL)?
+    } else { None };
+    // A still drawn on demand measures its own frame.
     let (sbs, ow, oh) = compose_view_with_color_and_mode(
         pipeline, s, &left_tex, &right_tex, ew, eh,
         eye_match_state.as_ref().and_then(|st| eye_match_arg(st, kind, stab_idx, true)),
-        raw_reference,
+        raw_reference, vr180_pipeline::raw_tone::Measure::Wait,
     )?;
     Ok(Some((sbs, ow, oh)))
 }
