@@ -4976,14 +4976,9 @@ pub(crate) fn plan_with_raw_reference<'a>(
         Some(g) if plan.raw_develop.is_some() && projection != FisheyeExportProjection::HalfEquirect => g,
         _ => return Ok(std::borrow::Cow::Borrowed(plan)),
     };
-    // Per-row correction needs both eyes' rows, as in the projection itself.
-    let (rs_l, rs_r) = match rs { (Some(l), Some(r)) => (Some(l), Some(r)), _ => (None, None) };
-    let density = view_calib.center_px_per_rad(eye_w, eye_h, projection == FisheyeExportProjection::Fisheye);
-    let drawn = [
-        crate::raw_gpu::RawReferenceEye { src: &eyes.left, rotation: rot.0, calib: source_calib.0, rows: rs_l },
-        crate::raw_gpu::RawReferenceEye { src: &eyes.right, rotation: rot.1, calib: source_calib.1, rows: rs_r },
-    ];
-    let reference = pipeline.raw_reference(if single_eye { &drawn[..1] } else { &drawn[..] }, density, RAW_REFERENCE_SLOT)?;
+    let reference = crate::render::raw_view_reference(
+        pipeline, (&eyes.left, &eyes.right), single_eye, view_calib, (eye_w, eye_h),
+        projection == FisheyeExportProjection::Fisheye, source_calib, rot, rs, RAW_REFERENCE_SLOT)?;
     let mut plan = plan.clone();
     plan.raw_reference = Some(reference);
     Ok(std::borrow::Cow::Owned(plan))

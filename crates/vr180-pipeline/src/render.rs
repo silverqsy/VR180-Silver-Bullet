@@ -66,6 +66,41 @@ impl FramePose {
     }
 }
 
+/// The frame a raw clip's view is developed from when that view is not the
+/// half-equirect ([`crate::raw_gpu::RawReference`]): the same moment as a
+/// half-equirect, turned as the view is, so that a reframed view or a lens
+/// frame comes out in the colours of the half-equirect. The export, the
+/// live preview and the stills all draw it here.
+///
+/// `eyes`: the camera-linear source eyes (the left alone for `one_eye`);
+/// `view_calib`: one eye's calibration with the view, drawing a frame of
+/// `out`, a fisheye output for `fisheye_out`; `source_calib`: both eyes'
+/// before the view; `rot`, `rows`: the frame's rotations and per-row
+/// matrices, as its projection takes them ([`FramePose`]).
+#[allow(clippy::too_many_arguments)]
+pub fn raw_view_reference(
+    pipeline: &crate::gpu::Device,
+    eyes: (&wgpu::Texture, &wgpu::Texture),
+    one_eye: bool,
+    view_calib: &crate::gpu::FisheyeCalib,
+    out: (u32, u32),
+    fisheye_out: bool,
+    source_calib: (crate::gpu::FisheyeCalib, crate::gpu::FisheyeCalib),
+    rot: (EquirectRotation, EquirectRotation),
+    rows: (Option<&[f32]>, Option<&[f32]>),
+    slot: u32,
+) -> crate::Result<crate::raw_gpu::RawReference> {
+    use crate::raw_gpu::RawReferenceEye;
+    // Per-row correction needs both eyes' rows, as in the projection itself.
+    let (rows_l, rows_r) = crate::gpu::rows_for_both(rows.0, rows.1);
+    let density = view_calib.center_px_per_rad(out.0, out.1, fisheye_out);
+    let drawn = [
+        RawReferenceEye { src: eyes.0, rotation: rot.0, calib: source_calib.0, rows: rows_l },
+        RawReferenceEye { src: eyes.1, rotation: rot.1, calib: source_calib.1, rows: rows_r },
+    ];
+    pipeline.raw_reference(if one_eye { &drawn[..1] } else { &drawn[..] }, density, slot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4188,7 +4188,6 @@ fn raw_view_reference(
     rs: (Option<&[f32]>, Option<&[f32]>),
     slot: u32,
 ) -> vr180_pipeline::Result<Option<vr180_pipeline::raw_gpu::RawReference>> {
-    use vr180_pipeline::raw_gpu::RawReferenceEye;
     let Some((left, right)) = eyes else { return Ok(None) };
     if !s.raw_source
         || s.fisheye_output_mode == FisheyeOutputMode::HalfEquirect
@@ -4196,14 +4195,11 @@ fn raw_view_reference(
     {
         return Ok(None);
     }
-    // Per-row correction needs both eyes' rows, as in the projection itself.
-    let (rs_l, rs_r) = match rs { (Some(l), Some(r)) => (Some(l), Some(r)), _ => (None, None) };
-    let density = view_calib.center_px_per_rad(out.0, out.1, s.fisheye_output_mode == FisheyeOutputMode::Fisheye);
-    let mut drawn = vec![RawReferenceEye { src: left, rotation: rot.0, calib: source_calib.0, rows: rs_l }];
-    if !one_eye {
-        drawn.push(RawReferenceEye { src: right, rotation: rot.1, calib: source_calib.1, rows: rs_r });
-    }
-    pipeline.raw_reference(&drawn, density, slot).map(Some)
+    // The frame itself is drawn where the export draws its own.
+    vr180_pipeline::render::raw_view_reference(
+        pipeline, (left, right), one_eye, view_calib, out,
+        s.fisheye_output_mode == FisheyeOutputMode::Fisheye, source_calib, rot, rs, slot,
+    ).map(Some)
 }
 
 /// Per-eye size of a view: the lens frame's own where the view is one
