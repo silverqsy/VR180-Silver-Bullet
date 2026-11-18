@@ -499,8 +499,12 @@ fn accel_at_gyro(gyro: &[x6b::GyroSample], accel: &[x6b::GyroSample]) -> Vec<[f3
     if accel.len() < 16 || gyro.is_empty() {
         return Vec::new();
     }
-    // It has to cover the gyro's span, give or take a few samples.
-    let slack = 20_000_000;
+    // It has to cover the gyro's span but for a short stretch at either end:
+    // the camera opens the two streams one after the other (26 ms apart on a
+    // take of 2026-11-17, which a tighter rule read as no accelerometer), and
+    // the samples outside take the nearest reading. Gravity is used slowly
+    // (the bias estimate, the trim), so half a second of that changes nothing.
+    let slack = 500_000_000;
     if accel[0].t_ns > gyro[0].t_ns + slack || accel[accel.len() - 1].t_ns + slack < gyro[gyro.len() - 1].t_ns {
         return Vec::new();
     }
@@ -1355,8 +1359,13 @@ mod tests {
         // Too few samples, or a stream that stops well short of the gyro's: none.
         assert!(accel_at_gyro(&gyro, &same[..10]).is_empty());
         let short: Vec<_> = (0..16).map(|i| at(100 + i, 1.0)).collect();
-        let long_gyro: Vec<_> = (0..200).map(|i| at(100 + i, 0.0)).collect();
+        let long_gyro: Vec<_> = (0..2000).map(|i| at(100 + i, 0.0)).collect();
         assert!(accel_at_gyro(&long_gyro, &short).is_empty());
+        // One that starts a little after the gyro and ends a little before
+        // it serves: the samples outside take its nearest reading.
+        let inner: Vec<_> = (26..1980).map(|i| at(100 + i, i as f32)).collect();
+        let a = accel_at_gyro(&long_gyro, &inner);
+        assert_eq!((a.len(), a[0][0], a[26][0], a[1000][0], a[1999][0]), (2000, 26.0, 26.0, 1000.0, 1979.0));
         assert!(accel_at_gyro(&[], &same).is_empty());
     }
 
