@@ -35,6 +35,7 @@ pub mod gpu;
 pub mod helpers;
 pub mod imu;
 pub mod insv_imu;
+pub mod join;
 pub mod kandao_imu;
 pub mod lens_model;
 pub mod lens_frame;

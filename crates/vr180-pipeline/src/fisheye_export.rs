@@ -1459,6 +1459,37 @@ pub fn export_fisheye(
     state_lens_frame(&out, lens_frame)
 }
 
+/// State in `out` the projection metadata an export of `cfg` states in its
+/// own file: the VR180 flags (stereo or one eye), a lens frame's or a
+/// disc's lens, or nothing for a reframed view. For a file put together
+/// from several exports of one shape ([`crate::join`]), whose packet copy
+/// does not carry what each part's own file said.
+pub fn state_export_metadata(mut cfg: FisheyeExportConfig, out: &std::path::Path) -> Result<()> {
+    if cfg.projection.is_reframe() {
+        cfg.inject_apmp = false;
+        cfg.inject_youtube_vr180 = false;
+    }
+    let (single_eye, lens_frame) = if cfg.source_kind.is_eac() {
+        // The decisions of [`export_eac`].
+        let lens = match resolve_eac_lens_frame(&mut cfg)? {
+            Some(lens) => Some(lens),
+            None => resolve_disc_lens(&mut cfg, EAC_LENS_FRAME_HALF_FOV_DEG, true),
+        };
+        (false, lens)
+    } else {
+        // Those of [`export_fisheye`], in its order.
+        let _ = cfg.settle_raw_enhanced(cfg.trim_in_s, cfg.trim_out_s);
+        let single_eye = single_eye_source(&cfg);
+        let lens = match resolve_lens_frame(&mut cfg)? {
+            Some(lens) => Some(lens),
+            None => resolve_disc_lens(&mut cfg, FISHEYE_OUT_FULL_FOV_DEG as f64 * 0.5, !single_eye),
+        };
+        (single_eye, lens)
+    };
+    finalize_metadata_for(out, cfg.inject_youtube_vr180, cfg.inject_apmp, single_eye)?;
+    state_lens_frame(out, lens_frame)
+}
+
 /// The metadata of a fisheye-disc export ([`FisheyeExportProjection::Fisheye`]
 /// without a lens frame). A disc is no half-equirect, so the VR180 flags
 /// never tag it as one. Where the Apple one was asked for, the file states
