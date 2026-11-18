@@ -56,12 +56,26 @@
 //! frame number, stamp and integration time, and `exposure.csv` has the
 //! integration time in the recorded sensor's column only.
 //!
-//! Its records: a 4096-byte header (signature `X6S8B01\0`, request number,
-//! width, rows, tile count as `u32`; the sensor's frame number, the
-//! exposure-start stamp and the integration time as `u64` nanoseconds; then
-//! 24 payload lengths and 24 checksums), then 24 tiles of 7680×320 samples,
-//! each padded to 4096 bytes. A tile is the predictor stream of the paired
-//! format with no tail stream: a symbol is the 10-bit sample.
+//! Its records: a 4096-byte header (signature, request number, width, rows,
+//! tile count as `u32`; the sensor's frame number, the exposure-start stamp
+//! and the integration time as `u64` nanoseconds; then 24 payload lengths,
+//! 24 checksums and a flag that says whether the checksums were computed),
+//! then 24 tiles of 7680×320 samples, each padded to 4096 bytes. A tile is
+//! a predictor stream with no tail stream: a symbol is the 10-bit sample. A
+//! checksum is the CRC-32 of its tile's samples packed four to five bytes
+//! (the high eight bits of each, then a byte of their low two bits).
+//!
+//! The signature names the predictor stream's block layout, record by
+//! record (one capture may hold both):
+//!
+//! - `X6S8B01\0`: the paired format's, a bit width for every 32 samples.
+//! - `X6S8B02\0`: per 32 samples one header byte holds two bit widths, the
+//!   low four bits for the first 16 samples and the high four for the last
+//!   16. Where they agree the 32 samples are one block as above; where they
+//!   differ each half is a block of its own, eight lanes of two values. A
+//!   block of `n` values of `b` bits is `n × b / 8` bytes: every lane's
+//!   whole bytes interleaved, then the bits left over of each lane, lane
+//!   after lane, low bits first.
 
 use crate::{Error, Result};
 use std::fs::File;
@@ -223,10 +237,13 @@ pub enum Profile {
     Raised60,
     /// One lens at 30 fps: every 10-bit sensor value kept.
     Single10,
+    /// The same samples in the later block layout: a bit width for every 16.
+    Single10Split,
 }
 
 impl Profile {
-    pub const ALL: [Profile; 6] = [Self::Exact30, Self::Mid50, Self::Raised50, Self::Coarse60, Self::Raised60, Self::Single10];
+    /// A kept pair list names a profile by its place here: new ones go last.
+    pub const ALL: [Profile; 7] = [Self::Exact30, Self::Mid50, Self::Raised50, Self::Coarse60, Self::Raised60, Self::Single10, Self::Single10Split];
 
     /// The record signature.
     pub fn signature(self) -> &'static [u8; 8] {
@@ -237,13 +254,14 @@ impl Profile {
             Self::Coarse60 => b"X6QBLK05",
             Self::Raised60 => b"X6QBLK0B",
             Self::Single10 => b"X6S8B01\0",
+            Self::Single10Split => b"X6S8B02\0",
         }
     }
 
     /// The frame rate setting this signature belongs to.
     pub fn fps(self) -> u32 {
         match self {
-            Self::Exact30 | Self::Single10 => 30,
+            Self::Exact30 | Self::Single10 | Self::Single10Split => 30,
             Self::Mid50 | Self::Raised50 => 50,
             Self::Coarse60 | Self::Raised60 => 60,
         }
@@ -255,9 +273,14 @@ impl Profile {
         Self::ALL.into_iter().find(|p| p.signature()[..] == *signature && p.fps() == fps)
     }
 
+    /// The records of a take of one lens carry this signature.
+    fn is_single(self) -> bool {
+        matches!(self, Self::Single10 | Self::Single10Split)
+    }
+
     /// The layout whose records carry this signature.
     pub fn layout_is(self, layout: Layout) -> bool {
-        (self == Self::Single10) == matches!(layout, Layout::Single { .. })
+        self.is_single() == matches!(layout, Layout::Single { .. })
     }
 
     /// Widest bit width a block may use.
@@ -273,13 +296,13 @@ impl Profile {
             Self::Raised50 => &[(0, 4, 64), (256, 16, 48), (1024, 32, 32), (2048, 64, 32), (4096, 128, 73), (13440, 32, 1), (13472, 16, 182)],
             Self::Coarse60 => &[(0, 8, 32), (256, 32, 24), (1024, 128, 24), (4096, 256, 16), (8192, 512, 10), (13312, 160, 1), (13472, 16, 182)],
             Self::Raised60 => &[(0, 8, 32), (256, 32, 24), (1024, 64, 16), (2048, 128, 16), (4096, 256, 16), (8192, 512, 10), (13312, 160, 1), (13472, 16, 182)],
-            Self::Single10 => &[(0, 1, 1024)],
+            Self::Single10 | Self::Single10Split => &[(0, 1, 1024)],
         }
     }
 
     /// Symbol → sensor level, in symbol order.
     pub fn levels(self) -> &'static [u16] {
-        static TABLES: OnceLock<[Vec<u16>; 6]> = OnceLock::new();
+        static TABLES: OnceLock<[Vec<u16>; 7]> = OnceLock::new();
         let tables = TABLES.get_or_init(|| {
             Profile::ALL.map(|p| {
                 p.runs().iter()
@@ -292,7 +315,7 @@ impl Profile {
 
     /// The values of this profile are every sensor value (no coarser steps).
     pub fn is_exact(self) -> bool {
-        matches!(self, Self::Exact30 | Self::Single10)
+        matches!(self, Self::Exact30 | Self::Single10 | Self::Single10Split)
     }
 }
 
@@ -801,10 +824,14 @@ fn decode_tile(bytes: &[u8], profile: Profile, layout: Layout, dst: &mut [u16]) 
         return Err(err("invalid predictor length"));
     }
     let levels = profile.levels();
-    unpack_symbols(&bytes[4..4 + main], dst, layout.side(), profile.max_width(), levels.len() as i32)?;
-    let tail = &bytes[4 + main..];
+    let (stream, tail) = bytes[4..].split_at(main);
+    if profile == Profile::Single10Split {
+        unpack_split(stream, dst, layout.side(), profile.max_width(), levels.len() as i32)?;
+    } else {
+        unpack_symbols(stream, dst, layout.side(), profile.max_width(), levels.len() as i32)?;
+    }
     // One lens's symbols are its samples: nothing follows the predictor stream.
-    if profile == Profile::Single10 {
+    if profile.is_single() {
         return if tail.is_empty() { Ok(()) } else { Err(err("tile has bytes left over")) };
     }
     apply_levels(tail, levels, dst)
@@ -858,6 +885,110 @@ fn unpack_symbols(stream: &[u8], dst: &mut [u16], width: usize, max_width: usize
                     row[col] = symbol as u16;
                 }
             }
+        }
+    }
+    if p != stream.len() {
+        return Err(err("predictor stream has bytes left over"));
+    }
+    Ok(())
+}
+
+// ── The later block layout of a take of one lens ───────────────────────
+
+/// The eight lanes of a block of 32 values of `b` bits (`4 × b` bytes), as
+/// [`unpack_symbols`] reads them: every lane's whole bytes interleaved
+/// (byte `k` of lane `l` at `k × 8 + l`), then, for an odd width, each
+/// lane's last four bits, two lanes to a byte.
+#[inline(always)]
+fn lanes_of_32(block: &[u8], b: usize) -> [u64; 8] {
+    let mut lanes = [0u64; 8];
+    let whole = b / 2;
+    for (lane, word) in lanes.iter_mut().enumerate() {
+        let mut bits = 0u64;
+        for k in 0..whole {
+            bits |= (block[k * 8 + lane] as u64) << (8 * k);
+        }
+        if b & 1 == 1 {
+            bits |= (((block[whole * 8 + lane / 2] >> (4 * (lane & 1))) & 15) as u64) << (8 * whole);
+        }
+        *word = bits;
+    }
+    lanes
+}
+
+/// The eight lanes of a block of 16 values of `b` bits (`2 × b` bytes):
+/// every lane's whole bytes interleaved as in a block of 32, then the bits
+/// left over of each lane (`2 × b` mod 8 of them), lane after lane, low
+/// bits first.
+#[inline(always)]
+fn lanes_of_16(block: &[u8], b: usize) -> [u64; 8] {
+    let (whole, rest) = (b / 4, 2 * b % 8);
+    let mut last = 0u64;
+    for (k, &byte) in block[whole * 8..].iter().enumerate() {
+        last |= (byte as u64) << (8 * k);
+    }
+    let rest_mask = (1u64 << rest) - 1;
+    let mut lanes = [0u64; 8];
+    for (lane, word) in lanes.iter_mut().enumerate() {
+        let mut bits = 0u64;
+        for k in 0..whole {
+            bits |= (block[k * 8 + lane] as u64) << (8 * k);
+        }
+        *word = bits | (((last >> (lane * rest)) & rest_mask) << (8 * whole));
+    }
+    lanes
+}
+
+/// One block, its lanes read: `N` values of `b` bits (value `j` in lane
+/// `j % 8`, `b × (j / 8)` bits up) → the symbols of `row` from column `x0`.
+/// A value is a zigzag difference from `(left₂ + up₂ + 1) >> 1`, the
+/// neighbours of the same Bayer site (zero outside the tile), as in
+/// [`unpack_symbols`]; `up` is the row two above.
+#[inline(always)]
+fn restore_block<const N: usize>(lanes: [u64; 8], b: usize, x0: usize, row: &mut [u16], up: Option<&[u16]>, count: i32) -> Result<()> {
+    let mask = (1u64 << b) - 1;
+    for j in 0..N {
+        let v = ((lanes[j % 8] >> (b * (j / 8))) & mask) as i32;
+        let col = x0 + j;
+        let left = if col >= 2 { row[col - 2] as i32 } else { 0 };
+        let above = up.map_or(0, |u| u[col] as i32);
+        let delta = if v & 1 == 1 { -((v + 1) >> 1) } else { v >> 1 };
+        let symbol = ((left + above + 1) >> 1) + delta;
+        if symbol < 0 || symbol >= count {
+            return Err(err("invalid symbol"));
+        }
+        row[col] = symbol as u16;
+    }
+    Ok(())
+}
+
+/// The predictor stream of one tile in the later layout of a take of one
+/// lens (rows of `width` samples) → symbols in `dst`: per 32 samples one
+/// header byte, its low four bits the width of the first 16 samples and its
+/// high four that of the last 16; one block of 32 where the two agree, a
+/// block of 16 for each half where they differ.
+fn unpack_split(stream: &[u8], dst: &mut [u16], width: usize, max_width: usize, count: i32) -> Result<()> {
+    let w = width;
+    let rows = dst.len() / w;
+    let mut p = 0usize;
+    for y in 0..rows {
+        let (done, rest) = dst.split_at_mut(y * w);
+        let row = &mut rest[..w];
+        let up: Option<&[u16]> = (y >= 2).then(|| &done[(y - 2) * w..(y - 1) * w]);
+        for x in (0..w).step_by(32) {
+            let Some(&widths) = stream.get(p) else { return Err(err("predictor stream ends early")) };
+            p += 1;
+            let (first, last) = ((widths & 15) as usize, (widths >> 4) as usize);
+            if first > max_width || last > max_width || stream.len() - p < 2 * (first + last) {
+                return Err(err("invalid block length"));
+            }
+            if first == last {
+                restore_block::<32>(lanes_of_32(&stream[p..p + 4 * first], first), first, x, row, up, count)?;
+            } else {
+                restore_block::<16>(lanes_of_16(&stream[p..p + 2 * first], first), first, x, row, up, count)?;
+                restore_block::<16>(lanes_of_16(&stream[p + 2 * first..p + 2 * (first + last)], last), last, x + 16, row, up, count)?;
+            }
+            p += 2 * (first + last);
         }
     }
     if p != stream.len() {
@@ -1173,17 +1304,97 @@ pub(crate) mod test_support {
         out
     }
 
+    /// A block of a predictor stream: `vals` (eight lanes, value `j` in lane
+    /// `j % 8`) at `b` bits each.
+    fn pack_block(vals: &[u32], b: usize) -> Vec<u8> {
+        let per = vals.len() / 8;
+        let (whole, rest) = (per * b / 8, per * b % 8);
+        let mut block = vec![0u8; per * b];
+        let mut last = 0u64;
+        for lane in 0..8 {
+            let mut w = 0u64;
+            for q in 0..per {
+                w |= (vals[lane + 8 * q] as u64) << (b * q);
+            }
+            for k in 0..whole {
+                block[k * 8 + lane] = (w >> (8 * k)) as u8;
+            }
+            last |= ((w >> (8 * whole)) & ((1u64 << rest) - 1)) << (lane * rest);
+        }
+        for k in 0..rest {
+            block[whole * 8 + k] = (last >> (8 * k)) as u8;
+        }
+        block
+    }
+
+    /// One tile of a take of one lens in the later block layout: rows of
+    /// `w` samples.
+    fn encode_tile_split(samples: &[u16], w: usize) -> Vec<u8> {
+        let mut main = Vec::new();
+        for y in 0..samples.len() / w {
+            for x in (0..w).step_by(32) {
+                let mut vals = [0u32; 32];
+                for (j, v) in vals.iter_mut().enumerate() {
+                    let col = x + j;
+                    let i = y * w + col;
+                    let left = if col >= 2 { samples[i - 2] as i32 } else { 0 };
+                    let up = if y >= 2 { samples[i - 2 * w] as i32 } else { 0 };
+                    let d = samples[i] as i32 - ((left + up + 1) >> 1);
+                    *v = if d < 0 { (-d * 2 - 1) as u32 } else { (d * 2) as u32 };
+                }
+                let width = |v: &[u32]| (32 - v.iter().fold(0, |a, v| a | v).leading_zeros()) as usize;
+                let (first, last) = (width(&vals[..16]), width(&vals[16..]));
+                assert!(first <= 11 && last <= 11);
+                main.push((first | last << 4) as u8);
+                if first == last {
+                    main.extend(pack_block(&vals, first));
+                } else {
+                    main.extend(pack_block(&vals[..16], first));
+                    main.extend(pack_block(&vals[16..], last));
+                }
+            }
+        }
+        let mut out = (main.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(&main);
+        out
+    }
+
+    /// The checksum a record of one lens carries for a tile: the CRC-32 of
+    /// its samples packed four to five bytes (the high eight bits of each,
+    /// then a byte of their low two bits).
+    pub fn packed_crc(tile: &[u16]) -> u32 {
+        let mut c = !0u32;
+        let mut feed = |byte: u8| {
+            c ^= byte as u32;
+            for _ in 0..8 {
+                c = (c >> 1) ^ if c & 1 == 1 { 0xedb8_8320 } else { 0 };
+            }
+        };
+        for four in tile.chunks(4) {
+            let mut low = 0u8;
+            for (j, v) in four.iter().enumerate() {
+                feed((v >> 2) as u8);
+                low |= ((v & 3) as u8) << (2 * j);
+            }
+            feed(low);
+        }
+        !c
+    }
+
     /// One record of a take of one lens holding `samples` (7680×7680, below
-    /// 1024), as the camera lays it out: the sensor's frame number, the
-    /// stamp and the integration time after the four `u32` fields, the
-    /// payload lengths, then the checksums (left at zero: the first record
-    /// alone carries any).
-    pub fn encode_single_record(request: u32, hardware: u64, exposure_ns: u64, duration_ns: u64, samples: &[u16]) -> Vec<u8> {
+    /// 1024) in `profile`'s block layout, as the camera lays it out: the
+    /// sensor's frame number, the stamp and the integration time after the
+    /// four `u32` fields, the payload lengths, then the checksums (left at
+    /// zero: the first record alone carries any).
+    pub fn encode_single_record(profile: Profile, request: u32, hardware: u64, exposure_ns: u64, duration_ns: u64, samples: &[u16]) -> Vec<u8> {
         let layout = Layout::Single { channel: 0 };
-        assert_eq!(samples.len(), layout.samples());
-        let tiles: Vec<Vec<u8>> = samples.chunks(layout.tile_samples()).map(|t| encode_tile(Profile::Single10, t, SINGLE_SIDE)).collect();
+        assert!(samples.len() == layout.samples() && profile.layout_is(layout));
+        let tiles: Vec<Vec<u8>> = samples.chunks(layout.tile_samples()).map(|t| match profile {
+            Profile::Single10Split => encode_tile_split(t, SINGLE_SIDE),
+            _ => encode_tile(profile, t, SINGLE_SIDE),
+        }).collect();
         let mut out = vec![0u8; BLOCK as usize];
-        out[..8].copy_from_slice(Profile::Single10.signature());
+        out[..8].copy_from_slice(profile.signature());
         for (o, v) in [(8, request), (12, SINGLE_SIDE as u32), (16, SINGLE_SIDE as u32), (20, TILES_PER_EYE as u32)] {
             out[o..o + 4].copy_from_slice(&v.to_le_bytes());
         }
@@ -1208,6 +1419,24 @@ pub(crate) mod test_support {
             let (x, y) = (i % SINGLE_SIDE, i / SINGLE_SIDE);
             let ramp = ((x + y * 3) % 1000) as u32;
             (ramp + next() % 24).min(1023) as u16
+        }).collect()
+    }
+
+    /// A 10-bit test picture of one lens in bands: flat (differences of
+    /// zero), a ramp with noise, steps between 0 and 1023 (the widest
+    /// differences), and noise on every other 16 samples (halves of unlike
+    /// widths).
+    pub fn banded_test_samples() -> Vec<u16> {
+        let mut s = 0x9e37_79b9u32;
+        let mut next = move || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; s };
+        (0..SINGLE_SIDE * SINGLE_SIDE).map(|i| {
+            let (x, y) = (i % SINGLE_SIDE, i / SINGLE_SIDE);
+            match (y / 40) % 4 {
+                0 => 64,
+                1 => (((x + y * 3) % 1000) as u32 + next() % 24).min(1023) as u16,
+                2 => if (x / 2 + y / 2) % 2 == 0 { 0 } else { 1023 },
+                _ => if (x / 16) % 2 == 0 { 512 } else { (480 + next() % 64) as u16 },
+            }
         }).collect()
     }
 
@@ -1285,9 +1514,10 @@ mod tests {
             assert_eq!(*t.last().unwrap(), 16368, "{p:?}");
             assert_eq!(t[0], 0);
         }
-        // One lens: a symbol is the 10-bit sample.
+        // One lens: a symbol is the 10-bit sample, in either block layout.
         let t = Profile::Single10.levels();
         assert!(t.len() == 1024 && t.iter().enumerate().all(|(i, v)| *v as usize == i));
+        assert_eq!(Profile::Single10Split.levels(), t);
     }
 
     #[test]
@@ -1301,6 +1531,13 @@ mod tests {
         assert_eq!(Profile::from_signature(b"X6S8B01\0", 30), Some(Profile::Single10));
         assert_eq!(Profile::from_signature(b"X6S8B01\0", 60), None);
         assert!(Profile::Single10.layout_is(Layout::Single { channel: 1 }) && !Profile::Single10.layout_is(Layout::Paired));
+        // One lens has a second signature, for its later block layout.
+        assert_eq!(Profile::from_signature(b"X6S8B02\0", 30), Some(Profile::Single10Split));
+        assert_eq!(Profile::from_signature(b"X6S8B02\0", 50), None);
+        assert_eq!(Profile::from_signature(b"X6S8B03\0", 30), None);
+        assert!(Profile::Single10Split.layout_is(Layout::Single { channel: 0 }) && !Profile::Single10Split.layout_is(Layout::Paired));
+        // A kept pair list names a profile by its place: the earlier ones stay where they were.
+        assert_eq!(Profile::ALL[..6], [Profile::Exact30, Profile::Mid50, Profile::Raised50, Profile::Coarse60, Profile::Raised60, Profile::Single10]);
         assert!(Profile::Exact30.layout_is(Layout::Paired) && !Profile::Exact30.layout_is(Layout::Single { channel: 0 }));
     }
 
@@ -1476,8 +1713,8 @@ mod tests {
         let samples = single_test_samples(11);
         let single = Format { layout: Layout::Single { channel: 1 }, fps: 30 };
         // Requests 41 and 43 (42 was never written), sensor frames 900 and 902.
-        let a = encode_single_record(41, 900, 7_000_000_000, 8_000_000, &samples);
-        let b = encode_single_record(43, 902, 7_066_733_333, 4_000_000, &samples);
+        let a = encode_single_record(Profile::Single10, 41, 900, 7_000_000_000, 8_000_000, &samples);
+        let b = encode_single_record(Profile::Single10, 43, 902, 7_066_733_333, 4_000_000, &samples);
         write_single_take(&dir, 1, (900, 902), &[a.clone(), b.clone()]);
         assert_eq!(take_dir(&dir).as_deref(), Some(dir.as_path()));
         assert_eq!(take_layout(&dir.join(CAPTURE_FILE)), Some(Layout::Single { channel: 1 }));
@@ -1547,6 +1784,107 @@ mod tests {
         std::fs::write(dir.join(CLIP_FILE), clip.replace("CAM1", "CAM7")).unwrap();
         assert_eq!(take_dir(&dir), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_later_block_layout_reads_as_it_is_written() {
+        // Four rows of 32 samples with the widths 5 | 11, 0 | 3, 7 = 7 and
+        // 2 | 6: written from the layout's description by another program,
+        // which read them back with a transcription of the camera side's
+        // reference reader.
+        let stream: [u8; 86] = [
+            181, 4, 16, 156, 222, 216, 141, 38, 33, 115, 8, 192, 118, 140, 186, 128, 162, 88, 153, 246, 144, 75, 211, 19,
+            36, 16, 209, 165, 138, 153, 159, 181, 52, 48, 48, 72, 216, 178, 6, 15, 119, 252, 106, 88, 128, 84, 135, 58,
+            46, 11, 132, 73, 138, 2, 65, 226, 110, 118, 146, 68, 234, 42, 176, 202, 241, 233, 250, 63, 144, 98, 34, 40,
+            9, 24, 38, 20, 32, 144, 1, 68, 186, 4, 188, 99, 54, 144,
+        ];
+        let want: [u16; 128] = [
+            2, 8, 15, 19, 20, 3, 13, 1, 19, 1, 24, 8, 15, 14, 7, 6,
+            868, 62, 888, 508, 892, 847, 490, 219, 852, 791, 37, 1017, 516, 863, 435, 653,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 2, 3, 2, 3, 1, 0, 4, 2, 2, 4, 4, 0, 5, 0,
+            63, 57, 83, 38, 94, 17, 83, 32, 39, 21, 41, 4, 30, 7, 53, 53,
+            505, 95, 688, 323, 810, 552, 628, 351, 702, 629, 411, 759, 403, 796, 422, 685,
+            1, 1, 1, 2, 0, 1, 0, 0, 0, 0, 1, 0, 2, 0, 2, 0,
+            20, 10, 27, 15, 14, 11, 37, 8, 45, 27, 30, 29, 29, 8, 18, 22,
+        ];
+        let mut got = [0u16; 128];
+        unpack_split(&stream, &mut got, 32, 11, 1024).unwrap();
+        assert_eq!(got, want);
+        // Cut short, a byte too many, a width beyond the widest, a symbol beyond the table: refused.
+        assert!(unpack_split(&stream[..85], &mut got, 32, 11, 1024).is_err());
+        assert!(unpack_split(&[&stream[..], &[0]].concat(), &mut got, 32, 11, 1024).is_err());
+        let mut wide = stream;
+        wide[0] = 0xc5;
+        assert!(unpack_split(&wide, &mut got, 32, 11, 1024).is_err());
+        assert!(unpack_split(&stream, &mut got, 32, 11, 512).is_err());
+        // The earlier layout reads another stream in these bytes.
+        assert!(unpack_symbols(&stream, &mut [0u16; 256], 64, 11, 1024).is_err());
+    }
+
+    #[test]
+    fn one_lens_records_decode_in_either_block_layout() {
+        let dir = temp_dir("split");
+        let single = Format { layout: Layout::Single { channel: 0 }, fps: 30 };
+        let (plain, banded) = (single_test_samples(5), banded_test_samples());
+        // One capture may hold both: a record in the earlier layout, then two in the later one.
+        let a = encode_single_record(Profile::Single10, 7, 100, 1_000_000_000, 6_000_000, &plain);
+        let b = encode_single_record(Profile::Single10Split, 8, 101, 1_033_366_667, 6_000_000, &banded);
+        let c = encode_single_record(Profile::Single10Split, 9, 102, 1_066_733_333, 6_000_000, &plain);
+        write_single_take(&dir, 0, (100, 102), &[a.clone(), b.clone(), c.clone()]);
+        let take = read_take(&dir).unwrap().unwrap();
+        let pairs = scan_pairs(&take, |_, _| true).unwrap().unwrap();
+        assert_eq!(pairs.iter().map(|p| (p.request, p.profile)).collect::<Vec<_>>(),
+            vec![(7, Profile::Single10), (8, Profile::Single10Split), (9, Profile::Single10Split)]);
+        let mut file = File::open(take.capture_path()).unwrap();
+        let (mut record, mut out) = (Vec::new(), vec![0u16; SINGLE_SIDE * SINGLE_SIDE]);
+        for (entry, want) in pairs.iter().zip([&plain, &banded, &plain]) {
+            decode_pair(&mut file, entry, take.format(), Channels::Both, &mut record, &mut out, 0).unwrap();
+            assert_eq!(fnv(&out), fnv(want), "request {}", entry.request);
+        }
+        // On one thread as on many.
+        let mut one = vec![0u16; SINGLE_SIDE * SINGLE_SIDE];
+        let got = decode_record(&b, single, Channels::Both, &mut one, 1).unwrap();
+        assert_eq!((fnv(&one), got.request, got.profile, got.len as usize), (fnv(&banded), 8, Profile::Single10Split, b.len()));
+        // A record under the other layout's signature is refused, either way round.
+        for (bytes, other) in [(&a, Profile::Single10Split), (&c, Profile::Single10)] {
+            let mut renamed = bytes.clone();
+            renamed[..8].copy_from_slice(other.signature());
+            assert!(decode_record(&renamed, single, Channels::Both, &mut out, 0).is_err(), "{other:?}");
+        }
+        // So are a width beyond the widest and bytes after a tile's stream.
+        let mut wide = b.clone();
+        wide[BLOCK as usize + 4] = 0xcc;
+        assert!(decode_record(&wide, single, Channels::Both, &mut out, 0).is_err());
+        let mut longer = b.clone();
+        let first = u32::from_le_bytes(b[48..52].try_into().unwrap());
+        longer[48..52].copy_from_slice(&(first + 1).to_le_bytes());
+        assert!(decode_record(&longer, single, Channels::Both, &mut out, 0).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record of a real take of one lens against the checksums it carries
+    /// (a take's first record has them, so a capture file itself will do):
+    /// skipped unless `VR180_ONE_LENS_RECORD` names a file that starts at a
+    /// record's header.
+    #[test]
+    fn a_real_record_of_one_lens_matches_its_checksums() {
+        let Some(path) = std::env::var_os("VR180_ONE_LENS_RECORD") else { return };
+        let single = Format { layout: Layout::Single { channel: 0 }, fps: 30 };
+        let mut file = File::open(&path).unwrap();
+        let mut record = vec![0u8; BLOCK as usize];
+        file.read_exact(&mut record).unwrap();
+        let len = Header::parse(&record, single, 0).unwrap().record_len() as usize;
+        record.resize(len, 0);
+        file.read_exact(&mut record[BLOCK as usize..]).unwrap();
+        let mut out = vec![0u16; SINGLE_SIDE * SINGLE_SIDE];
+        let got = decode_record(&record, single, Channels::Both, &mut out, 0).unwrap();
+        let u32_at = |o: usize| u32::from_le_bytes(record[o..o + 4].try_into().unwrap());
+        assert_eq!(u32_at(240), 1, "request {} carries no checksums", got.request);
+        for (i, tile) in out.chunks(single.layout.tile_samples()).enumerate() {
+            assert_eq!(packed_crc(tile), u32_at(144 + 4 * i), "tile {i} of request {} ({:?})", got.request, got.profile);
+        }
+        println!("request {} ({:?}): 24 tiles match their checksums", got.request, got.profile);
     }
 
     /// The camera side's reference digests on the sample takes (skipped when
