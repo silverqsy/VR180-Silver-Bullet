@@ -456,6 +456,14 @@ pub fn lens_meta(take: &Take) -> Insta360Meta {
     }
 }
 
+/// How much later than a frame's content time its gyro samples are
+/// stamped, ms. A take states none: this is what the camera states in every
+/// one of its own video files (`gyro_timestamp`: the same on every body,
+/// firmware and recording mode looked at), taken to hold for a take's gyro
+/// as well. [`build_imu`] adds it as a camera file's poses have it added
+/// (less [`crate::insv_imu::INSV_STUDIO_SAMPLE_LAG_MS`]).
+pub const GYRO_OFFSET_MS: f64 = 1.1;
+
 /// Timing of a take's frames, as far as the take states it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaptureTiming {
@@ -486,7 +494,7 @@ pub struct CaptureTiming {
 /// (`exposure.csv`, [`x6b::read_exposures`]). [`build_imu`] adds half of it,
 /// frame by frame, to the time above: the centre row's mid-exposure, which
 /// is the content time. What then remains is the gyro's own lag, which no
-/// file states.
+/// take states: [`GYRO_OFFSET_MS`] stands in for it.
 pub fn capture_timing(take: &Take) -> CaptureTiming {
     let readout_ms = x6b::read_sensor_readout(take).map(|eyes| (eyes[0].first_to_last_row_ns * 1e-6) as f32);
     CaptureTiming { readout_ms, stamp_to_content_ms: readout_ms.map_or(0.0, |r| r as f64 * 0.5) }
@@ -658,7 +666,9 @@ pub fn build_imu(index: &TakeIndex, stream_w: u32, stream_h: u32) -> DjiOsvImu {
     let quats = crate::insv_imu::integrate_orientation_samples(&samples, bias, trim_tau_s);
     let line = crate::insv_imu::QuatTimeline { t_s: gyro.iter().map(|g| g.t_ns as f64 * 1e-9).collect(), quats: &quats };
     let frame_dur = index.dt_s();
-    let lead = timing.stamp_to_content_ms * 1e-3;
+    // To the centre row's start, and on by the gyro's offset as for a camera file.
+    let gyro_offset_ms = GYRO_OFFSET_MS - crate::insv_imu::INSV_STUDIO_SAMPLE_LAG_MS;
+    let lead = (timing.stamp_to_content_ms + gyro_offset_ms) * 1e-3;
     // Each frame's integration time, where the take lists it: half of it
     // takes the sample from the centre row's start to its mid-exposure. A
     // frame the list has no value for keeps the row's start.
@@ -692,8 +702,8 @@ pub fn build_imu(index: &TakeIndex, stream_w: u32, stream_h: u32) -> DjiOsvImu {
         },
         f0 - first, last - f1, out.frame_quats.len(),
         match timing.readout_ms {
-            Some(r) => format!("readout {r:.3} ms, centre row {:.3} ms after the stamp", timing.stamp_to_content_ms),
-            None => "no readout record".to_string(),
+            Some(r) => format!("readout {r:.3} ms, centre row {:.3} ms after the stamp, the gyro read {gyro_offset_ms:.2} ms on", timing.stamp_to_content_ms),
+            None => format!("no readout record, the gyro read {gyro_offset_ms:.2} ms on"),
         });
     // The shutter times in use, or that the take has none.
     let known: Vec<f64> = (0..index.pairs.len()).filter_map(|i| half_shutter_s(i, 0)).map(|h| h * 2e3).collect();
@@ -1501,8 +1511,9 @@ mod tests {
         // How far the camera has turned at each frame's sample, radians.
         let turned = |imu: &DjiOsvImu| -> Vec<f64> { imu.frame_quats.iter().map(|q| 2.0 * (q.w as f64).abs().min(1.0).acos()).collect() };
         let plain = turned(&build_imu(&index, 3840, 3840));
-        // Half the readout after each stamp: 0.5 s + 7.678 ms, then 20 ms a frame.
-        assert!((plain[0] - 0.507_678).abs() < 2e-4 && (plain[3] - plain[0] - 0.060).abs() < 2e-4, "{plain:?}");
+        // Half the readout after each stamp and the gyro's offset on: 0.5 s + 7.678 ms + 0.47 ms, then 20 ms a frame.
+        assert!((GYRO_OFFSET_MS - crate::insv_imu::INSV_STUDIO_SAMPLE_LAG_MS - 0.47).abs() < 1e-9);
+        assert!((plain[0] - 0.508_148).abs() < 1e-4 && (plain[3] - plain[0] - 0.060).abs() < 2e-4, "{plain:?}");
         // Ten milliseconds for request 10, twelve for 11 (one eye only), none for 12, nothing listed for 13.
         std::fs::write(dir.join(x6b::EXPOSURE_FILE), "request,cam0_exposure_ns,cam1_exposure_ns\n10,10000000,10000000\n11,,12000000\n12,0,\n").unwrap();
         let index = TakeIndex::new(take.clone(), (10..14).map(pair).collect());
