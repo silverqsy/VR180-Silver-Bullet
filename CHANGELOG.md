@@ -409,8 +409,31 @@ closed. It is now also a simple timeline, and it is kept.
   - One file or none: when a clip fails or the run is stopped no joined
     file is written, and the clips exported by then stay in a folder beside
     where it would have been.
-  - Not joined: stills, DNG sequences, spatial videos, and the Lens Space
-    view through the camera's own lens (its file states one clip's lens).
+  - **Lens Space clips become an Apple Immersive Video file** (macOS 26 or
+    later). A Lens Space file states its clip's lens, and a file described
+    that way has one lens, so clips of different recording modes or cameras
+    could not share one. An Apple Immersive Video Universal file (`.aivu`)
+    holds a camera for every clip, a mesh made from that clip's lens that
+    ends where its picture does, and says frame by frame which one a frame
+    is shown through.
+    The clips' side-by-side pictures and their sound go in packet for
+    packet: nothing is encoded again, and the file is written in about the
+    time it takes to copy it. A sound field is written as Apple Positional
+    Audio. The file is named `<name>_Joined_Lens.aivu`.
+    - Checked with what the system offers: Apple's own validator passes the
+      files, and the system's preview renderer draws every clip through its
+      own lens, both eyes (against the same view drawn from each lens:
+      0.00 px with the clip's own, 10 to 127 px with another clip's), for a
+      full-view clip, a Crop clip and a clip of another mode in one file.
+      Looking to the sides, straight up and down and behind, it draws the
+      picture to its edge and nothing beyond it.
+    - For Apple Vision Pro. The clips still have to come out at one frame
+      size and frame rate (the 8K size in Format does that for every mode).
+    - Not seen on the headset yet. Not available on Windows: the camera
+      description is written by a framework of macOS.
+  - Not joined: stills, DNG sequences, spatial videos; and, where no Apple
+    Immersive Video file can be written, the Lens Space view through the
+    camera's own lens.
 - **The list comes back.** The clips, their order, every clip's trim and
   settings, the ticks, the output folder and the Format choices are kept as
   you work and are there again the next time the app starts, with the clip

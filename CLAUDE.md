@@ -3823,6 +3823,143 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       10 bit. (3) The live preview's redraw when a measurement lands (the
       notifier), with the zoom view open.
 
+38. **Lens Space clips joined as an Apple Immersive Video file (2026-11-18,
+    Mac; UNRELEASED).** The user-facing text is in the CHANGELOG (the clip
+    list's section). Item 36's join refused lens frames: each states its
+    clip's own lens (item 33), and a file described that way has one lens.
+    An Apple Immersive Video Universal file (`.aivu`) holds a VENUE, a list
+    of cameras each with the mesh its picture is drawn on, and a metadata
+    track that says for every frame which camera it is shown through.
+    - **What an `.aivu` is, as written here.** A QuickTime movie: the video
+      with the projection kind `AppleImmersiveVideo` in its sample entry;
+      the venue as asset metadata (`quickTimeMetadataAIMEData`: an opaque
+      blob `ImmersiveMediaSupport.VenueDescriptor` makes); one sample per
+      frame on a metadata track (`quickTimeMetadataPresentationImmersiveMedia`):
+      a JSON array of the commands in force, here one `setCamera`; the
+      sound. **The video need not be MV-HEVC**: Apple's guide describes the
+      format with MV-HEVC, but a side-by-side picture (view packing
+      `SideBySide`, both eye flags) passes Apple's validator and renderer,
+      HEVC and ProRes alike, and the user had verified such files play.
+      So the parts go in packet for packet.
+    - **The camera of a clip is a MESH the helper builds.** A venue's
+      camera is drawn as a mesh for each eye: a piece of the unit sphere
+      (x right, y up, forward −z), every vertex with the place in the eye's
+      frame it shows (texture coordinates from the frame's bottom left).
+      The helper builds it from the lens the part's file states
+      (`pictureMesh`): 128 rings by 256 spokes (64 to each side of the
+      frame, so the corners are spokes), ending along every spoke at the
+      frame's rim (8 px) or the lens's limit (less 1.5 px), whichever comes
+      first; triangles counter-clockwise seen from the centre, as the
+      framework's own are. It goes in as a USDZ (`.usdzMesh`): Model I/O
+      writes the `.usdc`, the helper zips it itself (stored, the data on a
+      64-byte boundary). **The two meshes have to be named `_0_Left` and
+      `_0_Right`**: with other names the framework answers `invalidData`.
+      The mask is an all-white image (`no_mask`, 8640 × 4320, the eyes side
+      by side), one for every camera. The mesh is flat between its
+      vertices: against the lens, at 4096 px an eye, a full fisheye's
+      picture is off by up to 0.26 px at its rim, 0.08 px rms.
+      - **Why not a lens profile** (the first version, never committed).
+        An Apple Immersive lens profile (the JSON of an `.ilpd` file; its
+        model `radial2ProjectionOffsetTangential2` is item 33's Mei-Rives
+        model, `distortions` = k1, k2, xi, p1, p2 with xi POSITIVE,
+        `centerX` / `centerY` counting pixel centres from 0) makes the
+        framework build the mesh, to 0.000 px of the app's lens, but out
+        to 121.7° from the axis whatever limit is stated: past this
+        model's fold and past the frame's edge, where a side-by-side
+        picture holds the OTHER EYE. A mask then has to end the picture,
+        and a mask of control points (a) is kept by its NAME, so cameras
+        whose masks share a name all get one of them; (b) is drawn wrong
+        where its outline goes over the zenith, as a full fisheye's does
+        (a 112° circle came out as a band between ±68° of height); (c)
+        crashes the framework, a bus error and no message, with more than
+        64 control points or without every key of `maskData`
+        (`isForVisionOS`, `leftMapToRight`, `maskColor`, `FOVWidth`,
+        `FOVHeight`, `defaultCalibration`, `controlPointsOffsets`). With
+        its own mesh the helper needs none of it.
+      - **What such files hold** (three read with the framework: one from
+        Apple's calibration service, one multi-camera production, one made
+        with a mesh of its author's own): every camera is stored as a USDZ
+        mesh, a profile's too (the venue keeps the mesh it built, named
+        `_0_Left` / `_0_Right`); the mask is an all-white 8640 × 4320 image
+        (`no_mask`) or 64 control points that stay under the zenith; the
+        video's sample entry has `hero` = left beside the eye flags
+        (written here too). All three are MV-HEVC.
+    - **`helpers/swift/aivu_wrap.swift`** (macOS 26; `helpers/build_swift.sh`
+      builds it LAST and as an OPTIONAL helper: where the SDK has no
+      ImmersiveMediaSupport it is skipped with a note and the others still
+      build; `--install`, which a release runs, requires it). `--joined
+      <file> --output <file.aivu> --part <file> --frames <n> …`: reads each
+      part's lens from the part's own format description (a lens with two
+      focal lengths or tangential terms is refused: the mesh draws one that
+      is the same all the way round, which is what the app writes), makes a
+      camera `clip-N` for it (the mesh above; the venue's own reading of it
+      is asked for before anything is written), copies the joined file's
+      video and sound packets (the video's sample entry rebuilt: the
+      Verbatim* entries and the lens collection out, the projection kind
+      and the hero eye in), and writes a metadata sample per frame. A
+      packet's part is known
+      by COUNTING (a part's packets are together in decoding order): no
+      time is matched against a cut. Metadata samples are released in
+      display order once no earlier frame can still come. Apple's
+      `AIVUValidator` reads the result; a refused file is removed.
+      - **The writer's rule** (three deadlocks in the prototype): it takes
+        no more of one track while it waits for another. Only the video is
+        waited for; the sound is read two seconds ahead of it, and sound
+        and metadata are handed over whenever their inputs take some; a
+        track whose data has all gone in is closed at once.
+    - **Rust.** `helpers::aivu_wrap_available()` (the helper is there and
+      answers `--version`: it does not start before macOS 26, which is the
+      test; asked once), `helpers::spawn_aivu_wrap` (macOS; progress lines,
+      cancel kills it and removes the file). `join::Described::LensFrame`,
+      `PlannedPart::immersive()`, `immersive_available()`;
+      `planned_part_where(cfg, one_eye, immersive)` is `planned_part` with
+      the system's answer handed in (what the tests use).
+      `join::join_immersive(parts, output, sound, …)`: `join_parts` (the
+      old `join_exports` body, which now also returns each part's packet
+      count from `concat_video`) into `<output>.joined.<ext>`, then the
+      helper, then that file goes; `JoinSound::Ambisonic` is taken as
+      `Apac`. It exists on every platform and is an error off macOS, so
+      the GUI has no platform gate.
+    - **GUI.** `JoinRun.immersive` (from the first planned part);
+      `joined_output_for(.., immersive)` → `<stem>_Joined_Lens.aivu`;
+      `start_join` calls `join_immersive` and skips
+      `state_export_metadata`; a part is now named as the clip's own export
+      (`…_Lens.mp4`). `Unjoinable::LensFrame` is left for where no such
+      file can be written.
+    - **Checked on the Mac (macOS 27.2).** Tests: braw 6, core 63, fisheye
+      70, gui 57, pipeline 260. Three clips of one X6 in three recording
+      modes (8K full view, 10K Crop, 10K full view; 5 s each, exported as
+      Lens Space at 8192 × 4096, 29.97 fps) through `join_immersive`:
+      0.8 s; the validator passes; the system lists Apple Immersive Video
+      with three cameras; every one of the 451 frames decodes to its
+      part's frame (checksums) and the sound to the joined file's samples;
+      the system's preview renderer (`ImmersivePreviewRenderer`, fed the
+      packed frame) draws each clip through ITS lens, BOTH eyes: 0.00 px
+      against the same view drawn from that lens, 10 to 127 px with another
+      clip's. Views away from the axis (to the sides at 55° and 90°,
+      straight up and down, behind, and diagonal ones, both eyes): the
+      picture is the lens's inside its edge and NOT ONE pixel is lit
+      outside it, over the zenith included (the first version, with the
+      framework's mesh and a mask, showed the other eye beyond a Crop
+      frame's edge). The same with ProRes parts, and with four-channel
+      parts as Apple Positional Audio (`apac`, read back). Parts without a
+      lens: the helper's reason comes back as the error and nothing is left
+      behind. **Not checked: the run through the app's own buttons (the
+      planning and the naming are tested, the function is run from a
+      harness), and the headset.** For whoever checks again, the
+      renderer's `rotation` as `Rotation3D(eulerAngles:)` with x = pitch,
+      y = yaw, order `.xyz`: a positive yaw turns the view to the RIGHT,
+      and the yaw applies before the pitch.
+    - **Not built.** A dip to black at a cut (the format has a `fade`
+      command; a prototype's file with them passes the validator). A plain
+      Lens Space join for clips that state the SAME lens (two clips of one
+      recording mode do: such a file needs no venue).
+    - **Windows, to look at.** Nothing is gated in the GUI:
+      `immersive_available()` is false there, so a Lens Space clip in a
+      joined run is still refused, with the new wording. (1) It builds
+      (`join_immersive`'s other branch, `aivu_wrap_available`). (2) That
+      refusal appears.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

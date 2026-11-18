@@ -27,13 +27,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$SCRIPT_DIR/swift"
 OUT_DIR="$SCRIPT_DIR/bin"
-HELPERS=(mvhevc_encode vt_denoise apac_encode)
+HELPERS=(mvhevc_encode vt_denoise apac_encode aivu_wrap)
+# Helpers a build may go without: they need an SDK newer than the others do
+# (`aivu_wrap`: macOS 26's ImmersiveMediaSupport). Where one does not build,
+# the app does not offer what it does; a release checks every helper.
+OPTIONAL_HELPERS=(aivu_wrap)
+
+is_optional() {
+    local name
+    for name in "${OPTIONAL_HELPERS[@]}"; do [[ "$name" == "$1" ]] && return 0; done
+    return 1
+}
 
 frameworks_for() {
     case "$1" in
         mvhevc_encode) echo AVFoundation VideoToolbox CoreMedia CoreVideo ;;
         vt_denoise)    echo AVFoundation VideoToolbox CoreMedia CoreVideo ;;
         apac_encode)   echo AVFoundation CoreMedia AudioToolbox ;;
+        aivu_wrap)     echo AVFoundation CoreMedia ImageIO ImmersiveMediaSupport ModelIO ;;
         *) echo "unknown helper: $1" >&2; return 1 ;;
     esac
 }
@@ -44,6 +55,7 @@ frameworks_for() {
 min_macos_for() {
     case "$1" in
         mvhevc_encode|apac_encode) echo 14.0 ;;
+        aivu_wrap) echo 26.0 ;;
         *) echo "" ;;
     esac
 }
@@ -113,9 +125,19 @@ fi
 command -v swiftc >/dev/null || { echo "✗ swiftc not found (install the Xcode command line tools)" >&2; exit 1; }
 
 mkdir -p "$OUT_DIR"
-for name in "${HELPERS[@]}"; do build_helper "$name"; done
+for name in "${HELPERS[@]}"; do
+    if is_optional "$name" && [[ "$mode" != "--install" ]]; then
+        # (in an `if`: a failure here is not the script's)
+        if ! build_helper "$name"; then
+            rm -f "$OUT_DIR/$name"
+            echo "  ! $name not built (it needs a newer SDK): the app goes without it" >&2
+        fi
+    else
+        build_helper "$name"
+    fi
+done
 echo
-echo "✓ All helpers built into $OUT_DIR"
+echo "✓ Helpers built into $OUT_DIR"
 
 if [[ "$mode" == "--install" ]]; then
     dest="${2:-}"

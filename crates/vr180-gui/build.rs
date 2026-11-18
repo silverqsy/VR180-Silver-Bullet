@@ -19,7 +19,7 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let script = root.join("helpers/build_swift.sh");
-        for f in ["apac_encode", "mvhevc_encode", "vt_denoise"] {
+        for f in ["apac_encode", "mvhevc_encode", "vt_denoise", "aivu_wrap"] {
             println!("cargo:rerun-if-changed={}", root.join("helpers/swift").join(format!("{f}.swift")).display());
         }
         println!("cargo:rerun-if-changed={}", script.display());

@@ -21,6 +21,14 @@
 //! The projection metadata of the parts' own files is not carried by a
 //! packet copy: the caller states it in the joined file
 //! ([`crate::fisheye_export::state_export_metadata`]).
+//!
+//! Lens frames are the exception: each states its clip's own lens, and a
+//! file described that way has one lens. Such parts become an Apple
+//! Immersive Video file instead ([`join_immersive`]), which holds a camera
+//! for every part and says, frame by frame, which one a frame is shown
+//! through. The picture and the sound are put together here as for any
+//! other join, and a helper writes them again, packet for packet, with that
+//! description. macOS 26 or later.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -198,6 +206,9 @@ enum Described {
     HalfEquirect { youtube: bool, apple: bool, one_eye: bool },
     /// A fisheye disc with its lens stated: the angle at its edge, degrees.
     Disc { half_fov_deg: f64, stereo: bool },
+    /// A lens frame, two eyes: every part states its own lens, and the
+    /// joined file a lens for every part ([`join_immersive`]).
+    LensFrame,
 }
 
 /// An export that cannot be a part of a joined file.
@@ -205,8 +216,24 @@ enum Described {
 pub enum Unjoinable {
     /// A spatial video: one stream of two views.
     Spatial,
-    /// A lens frame: the lens it states is the clip's own.
+    /// A lens frame, where no file can be written that holds a lens for
+    /// every part ([`immersive_available`]), or one that holds a single
+    /// view.
     LensFrame,
+}
+
+/// Whether lens frames can be joined on this system: as an Apple Immersive
+/// Video file, which macOS 26 or later writes ([`join_immersive`]).
+pub fn immersive_available() -> bool {
+    crate::helpers::aivu_wrap_available()
+}
+
+impl PlannedPart {
+    /// The joined file of such parts is an Apple Immersive Video file
+    /// ([`join_immersive`] writes it, not [`join_exports`]).
+    pub fn immersive(&self) -> bool {
+        self.described == Described::LensFrame
+    }
 }
 
 /// What keeps two planned parts out of one file.
@@ -223,6 +250,12 @@ pub enum Mismatch {
 /// The part an export of `cfg` would be (`one_eye`: its source holds one
 /// eye, which the caller knows from its own probe).
 pub fn planned_part(cfg: &crate::fisheye_export::FisheyeExportConfig, one_eye: bool) -> std::result::Result<PlannedPart, Unjoinable> {
+    planned_part_where(cfg, one_eye, immersive_available())
+}
+
+/// [`planned_part`] on a system that can (`immersive`) or cannot join lens
+/// frames.
+pub fn planned_part_where(cfg: &crate::fisheye_export::FisheyeExportConfig, one_eye: bool, immersive: bool) -> std::result::Result<PlannedPart, Unjoinable> {
     use crate::fisheye_export::{FisheyeExportProjection as P, LensFrameOut, EAC_LENS_FRAME_HALF_FOV_DEG, FISHEYE_OUT_FULL_FOV_DEG};
     if cfg.spatial.is_some() {
         return Err(Unjoinable::Spatial);
@@ -232,6 +265,8 @@ pub fn planned_part(cfg: &crate::fisheye_export::FisheyeExportConfig, one_eye: b
     // As the export decides ([`crate::fisheye_export::state_export_metadata`]).
     let described = match cfg.projection {
         P::Reframe { .. } => Described::Plain,
+        // An Apple Immersive Video camera is a pair of eyes.
+        P::Fisheye if cfg.lens_frame != LensFrameOut::Off && immersive && !one_eye => Described::LensFrame,
         P::Fisheye if cfg.lens_frame != LensFrameOut::Off => return Err(Unjoinable::LensFrame),
         P::Fisheye if cfg.inject_apmp => Described::Disc {
             half_fov_deg: if eac { EAC_LENS_FRAME_HALF_FOV_DEG } else { FISHEYE_OUT_FULL_FOV_DEG as f64 * 0.5 },
@@ -272,14 +307,15 @@ pub fn mismatch(a: &PlannedPart, b: &PlannedPart) -> Option<Mismatch> {
 pub const FPS_TOLERANCE: f64 = 0.01;
 
 /// The video streams of `parts` one after the other in `out`, packets
-/// copied. Returns each part's length as written, seconds.
+/// copied. Returns each part's length as written, seconds, and the number
+/// of its packets.
 fn concat_video(
     parts: &[PathBuf],
     infos: &[PartInfo],
     out: &Path,
     progress: &mut impl FnMut(ExportProgress),
     cancel: &AtomicBool,
-) -> Result<Vec<f64>> {
+) -> Result<Vec<(f64, u64)>> {
     let total_frames: u64 = infos.iter().map(|i| i.frames).sum();
     let started = std::time::Instant::now();
     let mut octx = ffmpeg::format::output(&out).map_err(|e| err(format!("open {}: {e}", name(out))))?;
@@ -303,8 +339,9 @@ fn concat_video(
             out_tb = octx.stream(0).ok_or_else(|| err("no output stream"))?.time_base();
         }
         // The part's length on the joined file's clock: where its last
-        // frame ends.
+        // frame ends. And the packets it gives.
         let mut end: i64 = 0;
+        let before = written;
         for (stream, mut packet) in ictx.packets() {
             if stream.index() != info.video_index {
                 continue;
@@ -338,7 +375,7 @@ fn concat_video(
             return Err(err(format!("{} holds no frames", name(part))));
         }
         offset += end;
-        lengths.push(end as f64 * out_tb.numerator() as f64 / out_tb.denominator().max(1) as f64);
+        lengths.push((end as f64 * out_tb.numerator() as f64 / out_tb.denominator().max(1) as f64, written - before));
     }
     octx.write_trailer().map_err(|e| err(format!("write trailer: {e}")))?;
     progress(ExportProgress {
@@ -529,9 +566,76 @@ pub fn join_exports(
     parts: &[PathBuf],
     output: &Path,
     sound: JoinSound,
+    progress: impl FnMut(ExportProgress),
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    join_parts(parts, output, sound, progress, cancel).map(|_| ())
+}
+
+/// Join `parts`, Lens Space files that each state their own lens, into the
+/// Apple Immersive Video file `output` (`.aivu`): the parts' pictures one
+/// after the other and their sound, as [`join_exports`] puts them together,
+/// written again packet for packet by the `aivu_wrap` helper with a camera
+/// for every part (a mesh of its picture, built from the lens the part's
+/// own file states) and, for every frame, the camera it is shown through.
+/// Nothing is encoded again, and the picture stays side by side. Apple's
+/// validator reads the result; a file it refuses is an error and is not
+/// left behind.
+///
+/// A sound field is written as Apple Positional Audio, the form the players
+/// of such a file read ([`JoinSound::Ambisonic`] is taken as
+/// [`JoinSound::Apac`]).
+///
+/// macOS 26 or later ([`immersive_available`]); an error elsewhere.
+pub fn join_immersive(
+    parts: &[PathBuf],
+    output: &Path,
+    sound: JoinSound,
     mut progress: impl FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let started = std::time::Instant::now();
+        let sound = if sound == JoinSound::Ambisonic { JoinSound::Apac } else { sound };
+        // The plain joined file first, beside the output, in the parts' own
+        // container; it goes once it has been written again.
+        let ext = parts.first().and_then(|p| p.extension()).and_then(|e| e.to_str()).unwrap_or("mp4").to_string();
+        let joined = output.with_extension(format!("joined.{ext}"));
+        // Two passes over the frames: the bar runs once over both.
+        let frames = join_parts(parts, &joined, sound, |p| progress(ExportProgress { total_frames: p.total_frames * 2, ..p }), cancel.clone())?;
+        let total: u64 = frames.iter().sum();
+        let listed: Vec<(PathBuf, u64)> = parts.iter().cloned().zip(frames).collect();
+        let wrapped = crate::helpers::spawn_aivu_wrap(&joined, output, &listed, |done, _| progress(ExportProgress {
+            frame_idx: total + done, total_frames: total * 2,
+            fps_avg: (total + done) as f32 / started.elapsed().as_secs_f32().max(1e-3),
+        }), &cancel);
+        let _ = std::fs::remove_file(&joined);
+        if let Err(e) = wrapped {
+            let _ = std::fs::remove_file(output);
+            return Err(match e {
+                Error::Helper { stderr, .. } => err(stderr.trim().to_string()),
+                other => other,
+            });
+        }
+        tracing::info!("join: {} clips as Apple Immersive Video, a lens for each → {} in {:.1?}", parts.len(), output.display(), started.elapsed());
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (parts, output, sound, &mut progress, cancel);
+        Err(err("an Apple Immersive Video file is written on macOS only"))
+    }
+}
+
+/// [`join_exports`]; returns the number of video frames each part gave.
+fn join_parts(
+    parts: &[PathBuf],
+    output: &Path,
+    sound: JoinSound,
+    mut progress: impl FnMut(ExportProgress),
+    cancel: Arc<AtomicBool>,
+) -> Result<Vec<u64>> {
     crate::decode::init();
     let infos: Vec<PartInfo> = parts.iter().map(|p| describe(p)).collect::<Result<_>>()?;
     if let Some(why) = obstacle(parts, &infos, sound) {
@@ -542,7 +646,8 @@ pub fn join_exports(
     let with_sound = infos.iter().any(|i| i.has_sound);
     // The picture alone first (the whole file when there is no sound).
     let video = if with_sound { output.with_extension(format!("joining.{ext}")) } else { output.to_path_buf() };
-    let lengths = concat_video(parts, &infos, &video, &mut progress, &cancel)?;
+    let copied = concat_video(parts, &infos, &video, &mut progress, &cancel)?;
+    let (lengths, frames): (Vec<f64>, Vec<u64>) = copied.into_iter().unzip();
     let seconds: f64 = lengths.iter().sum();
     let mut written = "no sound";
     if with_sound {
@@ -590,7 +695,7 @@ pub fn join_exports(
     tracing::info!(
         "join: {} clips, {:.2} s, {written} → {} in {:.1?}",
         parts.len(), seconds, output.display(), started.elapsed());
-    Ok(())
+    Ok(frames)
 }
 
 #[cfg(test)]

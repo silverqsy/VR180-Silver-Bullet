@@ -1514,7 +1514,7 @@ mod join_and_project_tests {
         ProResProfile, JOIN_HOVER, PROJECT_HOVER};
     use crate::decoder::{FisheyeOutputMode, Settings};
     use std::path::{Path, PathBuf};
-    use vr180_pipeline::join::{mismatch, planned_part, Mismatch, PlannedPart, Unjoinable};
+    use vr180_pipeline::join::{mismatch, planned_part, planned_part_where, Mismatch, PlannedPart, Unjoinable};
     use vr180_pipeline::SourceKind;
 
     /// The part a clip would be in a joined run: `kind`, `eye` pixels a
@@ -1580,9 +1580,31 @@ mod join_and_project_tests {
                 assert_eq!(mismatch(&b, &eac), Some(Mismatch::View));
             }
         }
-        // Through the camera's own lens the file states that clip's lens.
+        // Through the camera's own lens the file states that clip's lens:
+        // such clips share an Apple Immersive Video file where one can be
+        // written, and no file elsewhere.
         let lens = Settings { fisheye_output_mode: FisheyeOutputMode::Fisheye, lens_space: crate::decoder::LensSpaceLens::Camera, ..Default::default() };
-        assert_eq!(part_of(SourceKind::DjiOsv, 3840, 29.97, &lens, &opts, false).unwrap_err(), Unjoinable::LensFrame);
+        let framed_cfg = |kind: SourceKind, s: &Settings| App::build_export_cfg(
+            Path::new("/nonexistent/in"), Path::new(""), 29.97, kind, 3840, 3840, 3840, 3840, None, s, &opts, Vec::new());
+        let osv = framed_cfg(SourceKind::DjiOsv, &lens);
+        // Where such a file can be written: a part of its own kind.
+        let framed = planned_part_where(&osv, false, true).unwrap();
+        assert!(framed.immersive() && !a.immersive() && !b.immersive());
+        assert_eq!(mismatch(&framed, &framed.clone()), None);
+        // Beside a disc or a half-equirect it is another view (or another frame).
+        for other in [&a, &b] {
+            assert!(mismatch(&framed, other).is_some());
+        }
+        // A clip of another camera in the same view: one file, whatever its lens.
+        let x6 = planned_part_where(&framed_cfg(SourceKind::Insta360Insv, &lens), false, true).unwrap();
+        if x6.frame == framed.frame {
+            assert_eq!(mismatch(&framed, &x6), None);
+        }
+        // Nowhere else, and never with one eye.
+        assert_eq!(planned_part_where(&osv, false, false).unwrap_err(), Unjoinable::LensFrame);
+        assert_eq!(planned_part_where(&framed_cfg(SourceKind::Insta360Insv, &lens.for_single_eye()), true, true).unwrap_err(), Unjoinable::LensFrame);
+        // And this system says the one or the other.
+        assert_eq!(part_of(SourceKind::DjiOsv, 3840, 29.97, &lens, &opts, false).is_ok(), vr180_pipeline::join::immersive_available());
     }
 
     #[test]
@@ -1599,7 +1621,7 @@ mod join_and_project_tests {
             "stopped", "Drag to change the order", "is a still photo: a joined file is made of video clips.",
             "A DNG sequence is a folder of frames for each clip: it cannot be joined. Pick a video format in Format.",
             "A spatial video cannot be joined: export the clips one by one, or pick H.265 or ProRes in Format.",
-            "is in the Lens Space view through the camera's lens, which states that clip's own lens in its file: such clips cannot be joined. Pick the Equidistant lens, or another view.",
+            "is in the Lens Space view through the camera's lens. Clips in that view are joined as an Apple Immersive Video file, which needs macOS 26 or later and two eyes in every clip: here they cannot be joined. Pick the Equidistant lens, or another view.",
             "has no four-channel sound: a joined file with Ambisonic or APAC sound needs it in every clip. Set the first clip's Audio to Stereo, or leave this clip out.",
             "Project", "New project", "Open project…", "Save project", "Save project as…", "Save project…", "Don't save",
             "Replace the clip list?", "The clip list has changes that are not saved in a project file.", "looking…", "missing",
@@ -1631,11 +1653,14 @@ mod join_and_project_tests {
     #[test]
     fn the_joined_file_is_named_after_the_first_clip() {
         let src = Path::new("/clips/VID_0042.insv");
-        assert_eq!(joined_output_for(src, ExportCodec::H265, false), PathBuf::from("/clips/VID_0042_Joined_SBS.mp4"));
-        assert_eq!(joined_output_for(src, ExportCodec::ProRes, false), PathBuf::from("/clips/VID_0042_Joined_SBS.mov"));
-        assert_eq!(joined_output_for(src, ExportCodec::H265, true), PathBuf::from("/clips/VID_0042_Joined_Mono.mp4"));
+        assert_eq!(joined_output_for(src, ExportCodec::H265, false, false), PathBuf::from("/clips/VID_0042_Joined_SBS.mp4"));
+        assert_eq!(joined_output_for(src, ExportCodec::ProRes, false, false), PathBuf::from("/clips/VID_0042_Joined_SBS.mov"));
+        assert_eq!(joined_output_for(src, ExportCodec::H265, true, false), PathBuf::from("/clips/VID_0042_Joined_Mono.mp4"));
         // A raw take is a folder: the file goes beside it.
-        assert_eq!(joined_output_for(Path::new("/takes/RAWVIDEO-1"), ExportCodec::H265, false), PathBuf::from("/takes/RAWVIDEO-1_Joined_SBS.mp4"));
+        assert_eq!(joined_output_for(Path::new("/takes/RAWVIDEO-1"), ExportCodec::H265, false, false), PathBuf::from("/takes/RAWVIDEO-1_Joined_SBS.mp4"));
+        // Lens frames: an Apple Immersive Video file, whatever the parts' codec.
+        assert_eq!(joined_output_for(src, ExportCodec::H265, false, true), PathBuf::from("/clips/VID_0042_Joined_Lens.aivu"));
+        assert_eq!(joined_output_for(src, ExportCodec::ProRes, false, true), PathBuf::from("/clips/VID_0042_Joined_Lens.aivu"));
     }
 
     #[test]
@@ -2551,6 +2576,10 @@ struct JoinRun {
     /// The file's sound ([`joined_sound`]): every part is exported with the
     /// track it is made of.
     sound: vr180_pipeline::join::JoinSound,
+    /// The parts are lens frames, each with its own lens: the joined file
+    /// is an Apple Immersive Video file, which holds a lens for every part
+    /// (`vr180_pipeline::join::join_immersive`).
+    immersive: bool,
     /// The parts are written; they are being put together.
     joining: bool,
 }
@@ -2590,9 +2619,12 @@ fn join_mismatch_text(a: &str, b: &str, why: vr180_pipeline::join::Mismatch, zh:
 
 /// The name of a joined file, from the one its first clip would export
 /// under by itself: `<stem>_Joined_<tag>.<ext>` for `<stem>_<tag>.<ext>`.
-fn joined_output_for(first_source: &std::path::Path, codec: ExportCodec, single_eye: bool) -> PathBuf {
+/// `immersive`: lens frames, joined as an Apple Immersive Video file
+/// (`<stem>_Joined_Lens.aivu`, whatever the codec).
+fn joined_output_for(first_source: &std::path::Path, codec: ExportCodec, single_eye: bool, immersive: bool) -> PathBuf {
     let stem = first_source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
-    App::default_output_for(&first_source.with_file_name(format!("{stem}_Joined.x")), codec, single_eye, false)
+    let out = App::default_output_for(&first_source.with_file_name(format!("{stem}_Joined.x")), codec, single_eye, immersive);
+    if immersive { out.with_extension("aivu") } else { out }
 }
 
 /// `out`, or the first of `<stem> (2)`, `<stem> (3)`… that is not there
@@ -2636,7 +2668,7 @@ const MATCH_PLAYBACK_LABEL: &str = "Match QuickTime";
 const MATCH_PLAYBACK_HOVER: &str = "Show the preview the way Apple's players (QuickTime, Safari, Apple Vision Pro) show the exported file: read with Apple's Rec.709 video curve, so the mid-tones come out a little brighter. Off, the picture is shown as sRGB, which is closer to most players on Windows. Only the preview changes: the exported file is the same either way.";
 
 /// What the export bar's "Join into one file" says about itself.
-const JOIN_HOVER: &str = "Export the clips in the order of the list and write them as ONE file, one after the other, with hard cuts. Every clip keeps its own trim and settings. They have to come out at the same frame size and frame rate (pick one size for all of them in Format). The file's sound is the first clip's Audio choice: stereo, or Ambisonic / APAC when every clip has four-channel sound. Drag a clip by its handle (☰) to change the order.";
+const JOIN_HOVER: &str = "Export the clips in the order of the list and write them as ONE file, one after the other, with hard cuts. Every clip keeps its own trim and settings. They have to come out at the same frame size and frame rate (pick one size for all of them in Format). The file's sound is the first clip's Audio choice: stereo, or Ambisonic / APAC when every clip has four-channel sound. Clips in the Lens Space view through the camera's lens are joined as an Apple Immersive Video file (.aivu, macOS 26 or later, for Apple Vision Pro): it holds a lens for every clip, so clips of different recording modes and cameras can share it. Drag a clip by its handle (☰) to change the order.";
 /// And the toolbar's Project menu.
 const PROJECT_HOVER: &str = "The clip list, with every clip's trim and settings and the export choices, as a file to save and open. The list also comes back by itself the next time the app starts.";
 
@@ -3115,7 +3147,7 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Remove both in/out points" => "清除入点与出点",
         // Several clips as one file
         "Join into one file" => "合成一个文件",
-        JOIN_HOVER => "按列表顺序导出各片段，并首尾相接写成一个文件（硬切）。每个片段保留自己的裁切和设置。各片段的输出尺寸和帧率必须相同（在“格式”里为它们选同一尺寸）。合成文件的声音跟随第一个片段的音频选项：立体声；当每个片段都有 4 声道声音时，也可以是 Ambisonic 或 APAC。拖动片段左侧的手柄（☰）可以调整顺序。",
+        JOIN_HOVER => "按列表顺序导出各片段，并首尾相接写成一个文件（硬切）。每个片段保留自己的裁切和设置。各片段的输出尺寸和帧率必须相同（在“格式”里为它们选同一尺寸）。合成文件的声音跟随第一个片段的音频选项：立体声；当每个片段都有 4 声道声音时，也可以是 Ambisonic 或 APAC。使用相机镜头的“镜头空间”视图的片段会合成为 Apple Immersive Video 文件（.aivu，需要 macOS 26 或更高版本，供 Apple Vision Pro 播放）：文件里为每个片段各存一个镜头，所以不同拍摄模式、不同相机的片段可以放在一起。拖动片段左侧的手柄（☰）可以调整顺序。",
         "has no four-channel sound: a joined file with Ambisonic or APAC sound needs it in every clip. Set the first clip's Audio to Stereo, or leave this clip out." => "没有 4 声道声音：要让合成文件带 Ambisonic 或 APAC 音轨，每个片段都必须有 4 声道声音。请把第一个片段的音频改为立体声，或者不要包含这个片段。",
         "Join all" => "合成全部",
         "Join selected" => "合成所选",
@@ -3130,7 +3162,7 @@ fn tr_zh(en: &'static str) -> &'static str {
         "is a still photo: a joined file is made of video clips." => "是照片：合成文件只能由视频片段组成。",
         "A DNG sequence is a folder of frames for each clip: it cannot be joined. Pick a video format in Format." => "DNG 序列是每个片段一个帧文件夹，无法合成。请在“格式”里选择视频格式。",
         "A spatial video cannot be joined: export the clips one by one, or pick H.265 or ProRes in Format." => "空间视频无法合成：请逐个导出，或在“格式”里改用 H.265 或 ProRes。",
-        "is in the Lens Space view through the camera's lens, which states that clip's own lens in its file: such clips cannot be joined. Pick the Equidistant lens, or another view." => "用的是相机镜头的镜头空间视图，文件里记录的是该片段自己的镜头，这样的片段无法合成。请改用等距镜头，或换一种视图。",
+        "is in the Lens Space view through the camera's lens. Clips in that view are joined as an Apple Immersive Video file, which needs macOS 26 or later and two eyes in every clip: here they cannot be joined. Pick the Equidistant lens, or another view." => "用的是相机镜头的镜头空间视图。这种视图的片段要合成为 Apple Immersive Video 文件，需要 macOS 26 或更高版本，而且每个片段都得是双眼画面：这里无法合成。请改用等距镜头，或换一种视图。",
         // The list as a project
         "Project" => "项目",
         PROJECT_HOVER => "把片段列表连同每个片段的裁切、设置和导出选项存成一个文件，可以保存和打开。下次启动时，列表也会自动恢复。",
@@ -5164,7 +5196,7 @@ impl App {
             let (cfg, _) = self.export_cfg_for(i, std::path::Path::new(""), opts, Vec::new());
             let part = planned_part(&cfg, item.single_eye()).map_err(|why| match why {
                 Unjoinable::Spatial => tr("A spatial video cannot be joined: export the clips one by one, or pick H.265 or ProRes in Format.").to_string(),
-                Unjoinable::LensFrame => format!("{name} {}", tr("is in the Lens Space view through the camera's lens, which states that clip's own lens in its file: such clips cannot be joined. Pick the Equidistant lens, or another view.")),
+                Unjoinable::LensFrame => format!("{name} {}", tr("is in the Lens Space view through the camera's lens. Clips in that view are joined as an Apple Immersive Video file, which needs macOS 26 or later and two eyes in every clip: here they cannot be joined. Pick the Equidistant lens, or another view.")),
             })?;
             match &first {
                 None => first = Some((name, part)),
@@ -5177,7 +5209,8 @@ impl App {
             // A part is named as the clip's own export would be, with its
             // place in front: what is left behind when no file is joined
             // can be used as it is.
-            let own = Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye(), false);
+            let own = Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye(),
+                item.settings.lens_frame_view(item.source_kind));
             parts.push((item.path.clone(), format!("{:02}_{}", k + 1, clip_label(&own))));
         }
         let head = &self.batch[run[0]];
@@ -5186,7 +5219,9 @@ impl App {
             let name = clip_label(&self.batch[run[odd]].path);
             format!("{name} {}", tr("has no four-channel sound: a joined file with Ambisonic or APAC sound needs it in every clip. Set the first clip's Audio to Stereo, or leave this clip out."))
         })?;
-        let mut output = joined_output_for(&head.path, opts.codec_for(&head.export_settings(), false), head.single_eye());
+        // (The parts agree on it: a lens frame beside anything else is another view.)
+        let immersive = first.as_ref().is_some_and(|(_, part)| part.immersive());
+        let mut output = joined_output_for(&head.path, opts.codec_for(&head.export_settings(), false), head.single_eye(), immersive);
         if let Some(dir) = &self.batch_out_dir {
             if let Some(name) = output.file_name() {
                 output = dir.join(name);
@@ -5200,6 +5235,7 @@ impl App {
             parts_dir,
             first_cfg: None,
             sound,
+            immersive,
             joining: false,
         })
     }
@@ -5212,7 +5248,8 @@ impl App {
         if self.join_clips && run.len() >= 2 {
             match self.plan_join(&run, &self.export_opts) {
                 Ok(plan) => {
-                    tracing::info!("join: {} clips → {} ({:?} sound)", run.len(), plan.output.display(), plan.sound);
+                    tracing::info!("join: {} clips → {} ({:?} sound{})", run.len(), plan.output.display(), plan.sound,
+                        if plan.immersive { ", Apple Immersive Video: a lens for each clip" } else { "" });
                     self.join_run = Some(plan);
                 }
                 Err(why) => {
@@ -5252,13 +5289,17 @@ impl App {
         join.joining = true;
         let parts: Vec<PathBuf> = join.parts.iter().map(|(_, part)| part.clone()).collect();
         let output = join.output.clone();
-        let sound = join.sound;
+        let (sound, immersive) = (join.sound, join.immersive);
         tracing::info!("join: {} parts → {}", parts.len(), output.display());
         let (progress_tx, progress_rx) = crossbeam_channel::bounded(256);
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_for_thread = cancel.clone();
         let out = output.clone();
         let handle = std::thread::spawn(move || {
+            if immersive {
+                // Each part states its own lens: the joined file gets them all.
+                return vr180_pipeline::join::join_immersive(&parts, &out, sound, move |p| { let _ = progress_tx.try_send(p); }, cancel_for_thread);
+            }
             vr180_pipeline::join::join_exports(&parts, &out, sound, move |p| { let _ = progress_tx.try_send(p); }, cancel_for_thread)?;
             let mut cfg = *cfg;
             cfg.output_path = out.clone();

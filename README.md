@@ -82,9 +82,11 @@ Studio).
 - **Batch**: load many clips, tune each (or apply one setup to all), and
   export from one queue with progress, ETA and a completion notification.
 - **Join and projects**: write several clips as one file, in the order of
-  the list (drag to reorder), with hard cuts and no second encode. The list
-  comes back the next time the app starts, and can be saved as a project
-  file.
+  the list (drag to reorder), with hard cuts and no second encode. Lens
+  Space clips are joined as an Apple Immersive Video file (`.aivu`, macOS
+  26 or later), which holds a lens for every clip, so clips of different
+  recording modes and cameras can share it. The list comes back the next
+  time the app starts, and can be saved as a project file.
 - **English / 简体中文**, live toggle.
 
 ## Quick start
