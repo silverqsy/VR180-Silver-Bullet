@@ -329,6 +329,44 @@ show the export.
   which is closer to how most players on Windows show the file.
 - macOS only.
 
+### Clip list: several clips as one file, projects, the list kept between launches
+
+The clip list was a queue of separate exports, and it was gone when the app
+closed. It is now also a simple timeline, and it is kept.
+
+- **Join into one file.** With that box ticked in the export bar, "Join
+  all" (or "Join selected") exports the clips in the order of the list and
+  writes them as one file, one after the other, with hard cuts. Every clip
+  keeps its own trim, stabilization, grade and lens settings. A clip is
+  dragged to another place in the list by the handle at its left.
+  - Each clip is exported once, the usual way, and the results are put
+    together without encoding the picture again: a cut costs no quality
+    and falls on a keyframe. The sound is cut to each clip's own picture to
+    the sample, faded over 5 ms at a cut and encoded once for the whole
+    file, as stereo, so it stays on the picture however many clips there
+    are.
+  - The clips have to come out alike: the same frame size and frame rate,
+    the same codec and bit depth, the same view. One size for all of them
+    is picked in Format (8192 × 4096 takes clips of any camera). What does
+    not fit is said, with the clips' names, before anything is exported.
+  - The file is named after the first clip (`<name>_Joined_SBS.mp4`) and
+    carries the projection metadata a single export carries.
+  - One file or none: when a clip fails or the run is stopped no joined
+    file is written, and the clips exported by then stay in a folder beside
+    where it would have been.
+  - Not joined: stills, DNG sequences, spatial videos, and the Lens Space
+    view through the camera's own lens (its file states one clip's lens).
+- **The list comes back.** The clips, their order, every clip's trim and
+  settings, the ticks, the output folder and the Format choices are kept as
+  you work and are there again the next time the app starts, with the clip
+  that was on screen. A clip whose file is not found (a drive that is not
+  connected) stays in the list, marked, with its settings: click it once
+  the file is back.
+- **Projects.** The toolbar's Project menu saves the same things as a file
+  (`.vr180proj`) and opens one: New, Open, Save, Save as; Cmd/Ctrl+S saves.
+  A project holds no media, only where the clips are, and that also from
+  its own folder: a project moved together with its clips still finds them.
+
 ### Windows: faster exports of sources without a fast path
 
 Sources that have no zero-copy path on Windows (Insta360 X6 raw video,

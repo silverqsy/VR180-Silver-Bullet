@@ -18,6 +18,8 @@ mod audio_player;
 mod decoder;
 mod display_colour;
 mod displays;
+mod project;
+mod reorder;
 mod updater;
 
 use tracing_subscriber::EnvFilter;

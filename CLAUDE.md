@@ -3557,6 +3557,92 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
        checkout that still has the branch can drop it after
        `git fetch --prune`.
 
+36. **Several clips as one file, projects, and the list kept between
+    launches (2026-11-17, Mac; UNRELEASED).** The user-facing text is in the
+    CHANGELOG. None of the code is gated by platform, and none of it has run
+    on Windows.
+    - **`vr180_pipeline::join`.** `join_exports(parts, out, progress,
+      cancel)` puts exported files of one shape together: the video packets
+      are copied into one stream (each part's time stamps moved on by the
+      length of what came before, on the output's clock; the first part's
+      stream parameters, so the `hvc1` tag stays), nothing is encoded again
+      and every cut is a part's first keyframe. The sound of each part is
+      decoded to stereo at 48 kHz, cut or filled to that part's OWN picture
+      to the sample (`PartSound`: 5 ms fades at both ends, silence for a
+      part without a track), written as one float WAV beside the output,
+      encoded once (`stereo_to_aac`) and muxed. A part's track runs up to a
+      codec frame past its picture: appended whole it puts every later part
+      late (128 samples at the first cut of the test files), so each cut is
+      placed from the running total of the pictures' lengths. A part of
+      another codec, frame size, frame rate (0.01 fps apart is one rate) or
+      with other parameter sets is named in the error (`join_obstacle`).
+      `planned_part` and `mismatch` tell the same BEFORE a run, from the
+      export configurations: frame, frame rate, encoder with
+      its depth or profile, how the file is described to a player.
+      `Unjoinable`: a spatial video, a lens frame.
+    - **`fisheye_export::state_export_metadata(cfg, out)`** states in a
+      joined file what an export of `cfg` states in its own (the packet
+      copy carries none of those boxes): the decisions of `export_fisheye`
+      or `export_eac`, in their order.
+    - **The run** (`app.rs`). `start_run` → `plan_join` (the checks, the
+      file's name `<first clip>_Joined_<tag>.<ext>`, the parts as
+      `<that name>.parts/NN_<the clip's own output name>`) → the queue as
+      ever, each clip written to its part with `AudioTrack::Stereo` →
+      `start_join` when the queue drains → `end_join` → `finish_run`. The
+      join runs as the run's last `ExportJob`, so `logic()` hands over to it
+      with the window covered like to any clip. One file or none: a clip
+      that fails takes the waiting ones out of the queue, Stop and the
+      toolbar's Cancel stop the run, Skip is not offered; the parts go once
+      the joined file is whole and stay where they are, and that is said,
+      when there is none. "Export all" with the box ticked is the whole
+      list, whatever was exported before.
+    - **The list.** `reorder.rs`: a row's handle is a drag source and the
+      row the place to let go (`Move::place_of` renumbers `active_clip`,
+      `batch_current` and `batch_run_indices`). Its glyph is one the
+      built-in fonts hold; a test checks that, because the first choice was
+      not.
+    - **Projects** (`project.rs`). `Project<E>`: format `version` 1 (a later
+      one is refused, in words), `FileRef` = where the file was and the same
+      from the project file's folder with `/` between the parts. A file is
+      written beside its place, read back, and only then moved into it: one
+      this build could not open again (a number JSON has no form for) never
+      replaces one it can. `ExportOptions` and its enums are serde, with
+      defaults for what a file does not hold. The session is the same thing
+      in `<app folder>/session.json`, compared with the list every 1.5 s and
+      at close. Opening one puts an entry per clip in the list at once
+      (`BatchItem::offline`: `source_kind` Unknown, never exported, kept in
+      the project as read) and looks for the files on a thread
+      (`ClipFacts::read`, split out of `add_batch_files`; `poll_restore`), so
+      a network drive that has to wake does not hold the window.
+      `GuardStage` (`session.loading`): a launch that died putting the list
+      back starts empty with the session put aside, one that died loading a
+      clip gets its list without a clip on screen.
+    - **Checked on the Mac.** Tests: braw 6, core 63, fisheye 70, gui 55,
+      pipeline 241 (19 of them new). The stored sets are as they were: 65
+      exports, 169 preview lines. A joined file of five parts from three X6
+      clips, written through the zero-copy loop, the portable loop and the
+      noise-filter loop: the parts' parameter sets are byte for byte the
+      same, its 165 frames are the parts' frames by checksum, every part's
+      sound sits at a shift of 0 samples against the part's own (cross
+      correlation), and its projection boxes are those of a single export.
+      The same for `.360` clips as VR180 and as a disc with its lens (`cams`
+      / `lnsc`) and for ProRes in `.mov`. In the app itself, started with a scratch home folder: a
+      session of two X6 clips set to join came back at launch (trims,
+      ticks, output folder, Format choices; a clip named in it that does
+      not exist stayed in the list as missing), and a run wrote the two
+      parts, joined them into `…_Joined_SBS.mp4` (8192 × 4096, 105 frames,
+      stereo, the VR180 boxes) and took the parts' folder away. That run
+      was started by a line of test code, since removed: the buttons, the
+      dragging of a row and the Project menu have not been worked by hand
+      yet.
+    - **Windows, to look at.** (1) A joined run through NVENC and one
+      through libx265: the parts' parameter sets have to be byte for byte
+      the same across clips (here the zero-copy loop, the portable loop and
+      the noise-filter loop write the same ones for VideoToolbox). (2)
+      `prores_ks` parts in `.mov`. (3) A project saved, its folder moved
+      with the clips, opened again. (4) The list across a restart, and a
+      restart with the clips' drive away.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

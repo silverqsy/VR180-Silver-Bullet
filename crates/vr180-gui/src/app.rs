@@ -11,6 +11,7 @@
 
 use crossbeam_channel::{Receiver, Sender};
 use egui::{Color32, RichText};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -32,8 +33,15 @@ enum DialogResult {
     Lut(std::path::PathBuf),
     /// A Gyroflow lens profile, applied to both eyes.
     GyroflowProfile(std::path::PathBuf),
+    /// A project file to open.
+    ProjectOpen(std::path::PathBuf),
+    /// Where the project is saved.
+    ProjectSave(std::path::PathBuf),
     Cancelled,
 }
+
+/// The app's project file: the list with the export bar's choices.
+type Project = crate::project::Project<ExportOptions>;
 
 pub struct App {
     /// The UI context, handed to decoder workers so they can repaint the
@@ -287,6 +295,60 @@ pub struct App {
     /// modal). `None` when no decision is pending.
     pending_import: Option<PendingImport>,
 
+    // ─── The list as a project, and one file from several clips ────
+    /// The clips of an export run are written as ONE file, in the list's
+    /// order (see [`JoinRun`]). The user's choice, kept with the project.
+    join_clips: bool,
+    /// A run that writes one file, while it is in flight.
+    join_run: Option<JoinRun>,
+    /// The file the last run joined its clips into (for the summary).
+    joined_output: Option<PathBuf>,
+    /// Why a joined export did not start, or did not end in a joined file
+    /// (shown in the export bar until dismissed).
+    join_notice: Option<String>,
+    /// The project file the list was opened from or last saved to.
+    project_path: Option<PathBuf>,
+    /// The list as that file holds it (to tell what is not saved yet).
+    project_saved: Option<Project>,
+    /// The session as last written, and when the list was last compared
+    /// with it.
+    session_saved: Option<Project>,
+    session_checked_at: std::time::Instant,
+    /// Why the session could not be written the last time it was tried
+    /// (it is tried again at the next look; said in the log once).
+    session_error: Option<String>,
+    /// The last session's list, put back on the first frame.
+    pending_session: Option<Project>,
+    /// The last launch ended while a clip was loading: the list comes back
+    /// without one on screen.
+    session_no_autoload: bool,
+    /// The mark this launch has on disk (`project::GuardStage`): the list
+    /// is being put back, or a clip is loading that has shown no frame yet.
+    session_guard: Option<crate::project::GuardStage>,
+    /// Frames drawn since the session's list was put back: the mark of
+    /// that stage goes once a few have come out whole.
+    session_restore_frames: Option<u8>,
+    /// Clips of a project being looked for on threads: where the answers
+    /// arrive and how many are owed.
+    restore_tx: crossbeam_channel::Sender<RestoredClip>,
+    restore_rx: crossbeam_channel::Receiver<RestoredClip>,
+    restore_owed: usize,
+    restore_seq: u64,
+    /// The entry that goes on screen when its file is found: the project's
+    /// own (if nothing else is on screen by then), or one the user clicked.
+    restore_activate: Option<u64>,
+    restore_clicked: Option<u64>,
+    /// With nothing on screen when the last answer is in, the first clip
+    /// that was found goes there.
+    restore_autoload: bool,
+    /// The list being put back was read from the project file itself (not
+    /// from the session, which may hold later changes): once its clips are
+    /// found, the list is what that file holds.
+    restore_from_file: bool,
+    /// New / Open waiting for the user's word: the list has changes that
+    /// no project file holds.
+    pending_project: Option<PendingProject>,
+
     /// Preview magnifier for alignment inspection. `preview_zoom` is the
     /// magnification (1.0 = fit-to-window); `preview_center` is the point
     /// of the image kept centered, in UV [0,1]. Scroll zooms toward the
@@ -356,7 +418,7 @@ pub struct App {
 /// metadata. It exists only where [`spatial_video_available`] says so; any
 /// other export it is selected for runs as `H265`
 /// ([`ExportOptions::codec_for`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ExportCodec { H265, ProRes, Spatial }
 
 /// The note under the Resolution list for a video larger than 8192 × 4096:
@@ -455,7 +517,7 @@ fn spatial_view_scaled_note(template: &str, hfov_deg: f32, aspect_w_over_h: f32)
 
 /// Output container for a STILL source (Insta360 X6 `.dng`). Videos
 /// use `ExportCodec`; stills use this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum StillFormatChoice { Png16, Jpeg, LinearDng }
 
 impl StillFormatChoice {
@@ -561,7 +623,7 @@ const LENS_FRAME_HELD_NOTE: &str = "This size is the stabilized frame scaled to 
 /// enhanced (7680² an eye): such frames hold more than 8192 × 4096 shows,
 /// and these two canvases (6560² and 8192² per eye) keep it. Offered only
 /// where the take's enhanced frames are found, with a choice of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ExportResolution { Native, R8k, Sharp, R13k, R16k }
 
 impl ExportResolution {
@@ -665,7 +727,7 @@ struct EnhancedProbe {
 /// for the 1:1 view, 4320 (4320² per eye) — a photo renders from the native
 /// lens half, so the only cost is the file. The width follows the view's
 /// aspect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ReframeSize { P1080, P1440, P2160, P3240, P3840, P4320 }
 
 impl ReframeSize {
@@ -747,7 +809,7 @@ impl ExportCodec {
 }
 
 /// ProRes profiles. Numbers match ffmpeg's `-profile:v N`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ProResProfile {
     Proxy = 0,
     Lt = 1,
@@ -770,7 +832,10 @@ impl ProResProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// (Saved with a project and with the session: a field a file does not hold
+/// takes its default.)
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 struct ExportOptions {
     codec: ExportCodec,
     /// A raw video clip exports as a folder of DNG frames instead of a
@@ -1414,7 +1479,7 @@ mod export_size_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Default::default(),
-            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, offline: None,
         };
         let x6 = |single_eye| Some(X6ClipInfo { window: None, ilog: Some(true), paraxial_native: 2086.97, single_lens: single_eye, single_eye });
         let two = item(SourceKind::Insta360Insv, x6(false));
@@ -1444,6 +1509,147 @@ mod export_size_tests {
 }
 
 #[cfg(test)]
+mod join_and_project_tests {
+    use super::{join_mismatch_text, joined_output_for, tr_zh, unused_path, App, ExportCodec, ExportOptions, ExportResolution,
+        ProResProfile, JOIN_HOVER, PROJECT_HOVER};
+    use crate::decoder::{FisheyeOutputMode, Settings};
+    use std::path::{Path, PathBuf};
+    use vr180_pipeline::join::{mismatch, planned_part, Mismatch, PlannedPart, Unjoinable};
+    use vr180_pipeline::SourceKind;
+
+    /// The part a clip would be in a joined run: `kind`, `eye` pixels a
+    /// side, at `fps`.
+    fn part_of(kind: SourceKind, eye: u32, fps: f32, settings: &Settings, opts: &ExportOptions, one_eye: bool) -> Result<PlannedPart, Unjoinable> {
+        let cfg = App::build_export_cfg(
+            Path::new("/nonexistent/in.insv"), Path::new(""), fps, kind,
+            eye, eye, eye, eye, None, settings, opts, Vec::new(),
+        );
+        planned_part(&cfg, one_eye)
+    }
+
+    #[test]
+    fn clips_of_one_shape_join_and_others_say_why() {
+        let (s, opts) = (Settings::default(), ExportOptions::default());
+        let osv = part_of(SourceKind::DjiOsv, 3840, 29.97, &s, &opts, false).unwrap();
+        // Two cameras at the 8K size, and a frame rate stated a hair apart.
+        let x6 = part_of(SourceKind::Insta360Insv, 3712, 29.97, &s, &opts, false).unwrap();
+        assert_eq!(osv.frame, (8192, 4096));
+        assert_eq!(mismatch(&osv, &x6), None);
+        let raw = part_of(SourceKind::X6Raw, 3840, 29.969, &s, &opts, false).unwrap();
+        assert_eq!(mismatch(&osv, &raw), None);
+        // Each at its own size: two sizes.
+        let native = ExportOptions { resolution: ExportResolution::Native, ..opts };
+        let (a, b) = (part_of(SourceKind::DjiOsv, 3840, 29.97, &s, &native, false).unwrap(),
+                      part_of(SourceKind::Insta360Insv, 3712, 29.97, &s, &native, false).unwrap());
+        assert_eq!(mismatch(&a, &b), Some(Mismatch::Frame((7680, 3840), (7424, 3712))));
+        // Another frame rate.
+        let fast = part_of(SourceKind::DjiOsv, 3840, 59.94, &s, &opts, false).unwrap();
+        assert!(matches!(mismatch(&osv, &fast), Some(Mismatch::FrameRate(..))));
+        // 8-bit H.265 beside a raw clip, which is always written at 10 bits.
+        let eight = ExportOptions { h265_bit_depth: 8, ..opts };
+        let (a, b) = (part_of(SourceKind::DjiOsv, 3840, 29.97, &s, &eight, false).unwrap(),
+                      part_of(SourceKind::X6Raw, 3840, 29.97, &s, &eight, false).unwrap());
+        assert_eq!(mismatch(&a, &b), Some(Mismatch::Encoding));
+        // One eye beside two: another frame.
+        let mono = part_of(SourceKind::Insta360Insv, 3840, 29.97, &s.for_single_eye(), &opts, true).unwrap();
+        assert_eq!(mono.frame, (4096, 4096));
+        assert!(matches!(mismatch(&osv, &mono), Some(Mismatch::Frame(..))));
+        // ProRes: the profile is the encoding.
+        let prores = ExportOptions { codec: ExportCodec::ProRes, ..opts };
+        let hq = ExportOptions { prores_profile: ProResProfile::Hq, ..prores };
+        let (a, b) = (part_of(SourceKind::DjiOsv, 3840, 29.97, &s, &prores, false).unwrap(),
+                      part_of(SourceKind::DjiOsv, 3840, 29.97, &s, &hq, false).unwrap());
+        assert_eq!(mismatch(&a, &a.clone()), None);
+        assert_eq!(mismatch(&a, &b), Some(Mismatch::Encoding));
+    }
+
+    #[test]
+    fn views_that_do_not_share_a_file() {
+        let opts = ExportOptions::default();
+        let vr180 = Settings::default();
+        let disc = Settings { fisheye_output_mode: FisheyeOutputMode::Fisheye, lens_space: crate::decoder::LensSpaceLens::Equidistant, ..Default::default() };
+        let a = part_of(SourceKind::DjiOsv, 3840, 29.97, &vr180, &opts, false).unwrap();
+        let b = part_of(SourceKind::DjiOsv, 3840, 29.97, &disc, &opts, false).unwrap();
+        assert_eq!(a.frame, b.frame);
+        assert_eq!(mismatch(&a, &b), Some(Mismatch::View));
+        // A disc of a fisheye camera and one of a `.360` state different
+        // lenses (97.5° and 92.5° at the edge).
+        let eac = part_of(SourceKind::GoProEac, 0, 29.97, &disc, &opts, false);
+        if let Ok(eac) = eac {
+            if eac.frame == b.frame {
+                assert_eq!(mismatch(&b, &eac), Some(Mismatch::View));
+            }
+        }
+        // Through the camera's own lens the file states that clip's lens.
+        let lens = Settings { fisheye_output_mode: FisheyeOutputMode::Fisheye, lens_space: crate::decoder::LensSpaceLens::Camera, ..Default::default() };
+        assert_eq!(part_of(SourceKind::DjiOsv, 3840, 29.97, &lens, &opts, false).unwrap_err(), Unjoinable::LensFrame);
+    }
+
+    #[test]
+    fn every_reason_is_said_in_both_languages() {
+        for why in [Mismatch::Frame((8192, 4096), (7680, 3840)), Mismatch::FrameRate(29.97, 59.94), Mismatch::Encoding, Mismatch::View] {
+            let en = join_mismatch_text("a.osv", "b.insv", why, false);
+            let zh = join_mismatch_text("a.osv", "b.insv", why, true);
+            assert!(en.contains("a.osv") && en.contains("b.insv") && zh.contains("a.osv") && zh.contains("b.insv"));
+            assert_ne!(en, zh, "{why:?}");
+        }
+        for text in [
+            JOIN_HOVER, PROJECT_HOVER, "Join into one file", "Join all", "Join selected", "Export the ticked clips as one file",
+            "joining the clips…", "Not joined", "the clips exported so far are in", "was not exported", "no clip was exported",
+            "stopped", "Drag to change the order", "is a still photo: a joined file is made of video clips.",
+            "A DNG sequence is a folder of frames for each clip: it cannot be joined. Pick a video format in Format.",
+            "A spatial video cannot be joined: export the clips one by one, or pick H.265 or ProRes in Format.",
+            "is in the Lens Space view through the camera's lens, which states that clip's own lens in its file: such clips cannot be joined. Pick the Equidistant lens, or another view.",
+            "Project", "New project", "Open project…", "Save project", "Save project as…", "Save project…", "Don't save",
+            "Replace the clip list?", "The clip list has changes that are not saved in a project file.", "looking…", "missing",
+            "The file was not found where the project says it is. Click to look again.",
+        ] {
+            assert_ne!(tr_zh(text), text, "no Chinese text for: {text}");
+        }
+    }
+
+    #[test]
+    fn the_joined_file_is_named_after_the_first_clip() {
+        let src = Path::new("/clips/VID_0042.insv");
+        assert_eq!(joined_output_for(src, ExportCodec::H265, false), PathBuf::from("/clips/VID_0042_Joined_SBS.mp4"));
+        assert_eq!(joined_output_for(src, ExportCodec::ProRes, false), PathBuf::from("/clips/VID_0042_Joined_SBS.mov"));
+        assert_eq!(joined_output_for(src, ExportCodec::H265, true), PathBuf::from("/clips/VID_0042_Joined_Mono.mp4"));
+        // A raw take is a folder: the file goes beside it.
+        assert_eq!(joined_output_for(Path::new("/takes/RAWVIDEO-1"), ExportCodec::H265, false), PathBuf::from("/takes/RAWVIDEO-1_Joined_SBS.mp4"));
+    }
+
+    #[test]
+    fn a_name_in_use_is_never_written_over() {
+        let dir = std::env::temp_dir().join(format!("vr180_unused_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("a_SBS.mp4");
+        assert_eq!(unused_path(out.clone()), out);
+        std::fs::write(&out, b"x").unwrap();
+        assert_eq!(unused_path(out.clone()), dir.join("a_SBS (2).mp4"));
+        std::fs::write(dir.join("a_SBS (2).mp4"), b"x").unwrap();
+        assert_eq!(unused_path(out.clone()), dir.join("a_SBS (3).mp4"));
+        // A folder of parts keeps its extension too.
+        let parts = dir.join("a_Joined_SBS.parts");
+        std::fs::create_dir_all(&parts).unwrap();
+        assert_eq!(unused_path(parts), dir.join("a_Joined_SBS (2).parts"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_export_choices_are_kept_with_a_project() {
+        let opts = ExportOptions {
+            codec: ExportCodec::ProRes, prores_profile: ProResProfile::Hq, resolution: ExportResolution::Native,
+            h265_bitrate_mbps: 320, inject_apmp: false, inject_youtube: true, beyondvr_scale_pct: 72.5, ..Default::default()
+        };
+        let json = serde_json::to_string(&opts).unwrap();
+        assert_eq!(serde_json::from_str::<ExportOptions>(&json).unwrap(), opts);
+        // A file from before a choice existed: that choice is the default's.
+        let old: ExportOptions = serde_json::from_str(r#"{ "codec": "ProRes", "h265_bitrate_mbps": 80 }"#).unwrap();
+        assert_eq!(old, ExportOptions { codec: ExportCodec::ProRes, h265_bitrate_mbps: 80, ..Default::default() });
+    }
+}
+
+#[cfg(test)]
 mod ettr_tests {
     use super::{takes_ilog, App, BatchItem, BatchStatus, ExportOptions, X6ClipInfo};
     use crate::decoder::Settings;
@@ -1460,7 +1666,7 @@ mod ettr_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Settings { ettr_stops, ..Default::default() },
-            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, offline: None,
         }
     }
 
@@ -1998,9 +2204,142 @@ struct BatchItem {
     x6: Option<X6ClipInfo>,
     /// A raw take of one lens ([`raw_take_of_one_lens`]).
     raw_one_lens: bool,
+    /// The entry's file is not at hand (see [`OfflineClip`]); what the
+    /// fields above say of the file is then empty.
+    offline: Option<OfflineClip>,
+}
+
+/// A clip of an opened project, or of the last session, whose file is not
+/// at hand: being looked for, or not found. The entry keeps its place in
+/// the list and its settings, exports nothing, and goes back into the
+/// project as it was read.
+struct OfflineClip {
+    /// The request that looks for it ([`App::poll_restore`]).
+    token: u64,
+    /// Still being looked for (`false`: not found).
+    looking: bool,
+    file: crate::project::FileRef,
+    segments: Option<Vec<crate::project::FileRef>>,
+    /// The folder of the project file it was read from.
+    base: Option<PathBuf>,
+}
+
+/// What the list keeps of a clip's file, read from its header when the
+/// clip joins the list.
+struct ClipFacts {
+    source_kind: vr180_pipeline::SourceKind,
+    fps: f32,
+    duration_sec: f64,
+    width: u32,
+    height: u32,
+    fisheye_eye_w: u32,
+    fisheye_eye_h: u32,
+    x6: Option<X6ClipInfo>,
+    raw_one_lens: bool,
+}
+
+impl ClipFacts {
+    /// Read them. `None`: not a source the app exports, or not readable
+    /// (said in the log). Touches the file: a clip of a project is read on
+    /// a thread.
+    fn read(path: &std::path::Path) -> Option<Self> {
+        let source_kind = vr180_pipeline::source_kind::detect(path)
+            .unwrap_or(vr180_pipeline::SourceKind::Unknown);
+        if !source_kind.is_exportable() {
+            tracing::warn!("batch: skipping non-exportable source {}", path.display());
+            return None;
+        }
+        let probe = if source_kind.is_still() {
+            // One Bayer frame, both eyes side by side: no video probe.
+            match vr180_fisheye::dng::probe(path) {
+                Ok((w, h)) => vr180_pipeline::decode::VideoProbe { width: w, height: h, fps: 1.0, duration_sec: 0.0, hlg: false, video_bitrates_bps: [0; 2] },
+                Err(e) => { tracing::warn!("batch: DNG probe failed for {}: {e}", path.display()); return None; }
+            }
+        } else { match vr180_pipeline::decode::probe_video(path) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("batch: probe failed for {}: {e}", path.display());
+                return None;
+            }
+        } };
+        let (fisheye_eye_w, fisheye_eye_h) = match source_kind {
+            vr180_pipeline::SourceKind::SbsFisheye
+            | vr180_pipeline::SourceKind::Insta360Dng
+            | vr180_pipeline::SourceKind::KandaoDng => (probe.width / 2, probe.height),
+            vr180_pipeline::SourceKind::KandaoQoocam => (probe.width, probe.height / 2),
+            vr180_pipeline::SourceKind::DjiOsv
+            | vr180_pipeline::SourceKind::X6Raw
+            | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
+            // The probe is the helper's own (`probe_video` routes `.braw`
+            // to it): the frame holds both eyes side by side, unless the
+            // first frame shows one centred circle (`braw_layout`).
+            vr180_pipeline::SourceKind::BlackmagicRaw => braw_eye_dims(path, probe.width, probe.height),
+            _ => (0, 0),
+        };
+        Some(Self {
+            source_kind,
+            fps: probe.fps,
+            duration_sec: probe.duration_sec,
+            width: probe.width,
+            height: probe.height,
+            fisheye_eye_w, fisheye_eye_h,
+            // Insta360 X6: the recording-mode signature (a few KB from the
+            // file's end) — a Crop clip's native-sharpness size follows from it.
+            x6: (source_kind == vr180_pipeline::SourceKind::Insta360Insv).then(|| X6ClipInfo::read(path).0),
+            raw_one_lens: raw_take_of_one_lens(source_kind, path),
+        })
+    }
+}
+
+/// A clip of a project, looked for and read on a thread: the entry it is
+/// for, and where its file and the files of its recording are with what
+/// their headers say (`None`: not found, or not a readable source).
+struct RestoredClip {
+    token: u64,
+    found: Option<(PathBuf, Option<Vec<PathBuf>>, ClipFacts)>,
+}
+
+/// Where a project's clip is now, and what its file says. Touches the disk.
+fn locate_clip(
+    file: &crate::project::FileRef,
+    segments: Option<&[crate::project::FileRef]>,
+    base: Option<&std::path::Path>,
+) -> Option<(PathBuf, Option<Vec<PathBuf>>, ClipFacts)> {
+    let path = file.resolve(base)?;
+    // A recording of several files is there when all of them are.
+    let segments = match segments {
+        None => None,
+        Some(files) => Some(files.iter().map(|f| f.resolve(base)).collect::<Option<Vec<_>>>()?),
+    };
+    let facts = ClipFacts::read(&path)?;
+    Some((path, segments, facts))
 }
 
 impl BatchItem {
+    /// An entry for a clip of a project, before its file has been looked
+    /// for.
+    fn offline(clip: &crate::project::ProjectClip, token: u64, base: Option<PathBuf>) -> Self {
+        Self {
+            path: clip.file.path.clone(),
+            fps: 0.0,
+            duration_sec: 0.0,
+            source_kind: vr180_pipeline::SourceKind::Unknown,
+            fisheye_eye_w: 0, fisheye_eye_h: 0,
+            width: 0, height: 0,
+            settings: clip.settings.clone(),
+            status: BatchStatus::Idle,
+            selected: clip.selected,
+            x6: None,
+            raw_one_lens: false,
+            offline: Some(OfflineClip { token, looking: true, file: clip.file.clone(), segments: clip.segments.clone(), base }),
+        }
+    }
+
+    /// The file is at hand and its header has been read.
+    fn ready(&self) -> bool {
+        self.offline.is_none()
+    }
+
     /// The source holds ONE eye (see `ClipInfo::single_eye`).
     fn single_eye(&self) -> bool {
         self.x6.is_some_and(|x| x.single_eye) || self.raw_one_lens
@@ -2066,6 +2405,84 @@ struct BatchSummary {
     done: usize,
     failed: usize,
     elapsed: std::time::Duration,
+    /// The one file the run's clips were joined into.
+    joined: Option<PathBuf>,
+}
+
+/// A run of the export queue whose clips are written as ONE file. Each
+/// clip is exported the usual way, to a part of its own, and the parts are
+/// put together when the last one is written (`vr180_pipeline::join`):
+/// nothing is encoded twice, a cut falls on a keyframe, and the sound is
+/// encoded once for the whole length. One file or none: a clip that does
+/// not come out whole ends the run, and what was exported by then stays in
+/// the parts' folder.
+struct JoinRun {
+    /// The joined file.
+    output: PathBuf,
+    /// The folder the parts are written in: made beside the joined file,
+    /// and taken away with the parts once that file is whole.
+    parts_dir: PathBuf,
+    /// The clips in the order they are joined, each with its part's file.
+    parts: Vec<(PathBuf, PathBuf)>,
+    /// The first clip's export, as it ran: the joined file is described to
+    /// a player as that export described its own.
+    first_cfg: Option<Box<vr180_pipeline::fisheye_export::FisheyeExportConfig>>,
+    /// The parts are written; they are being put together.
+    joining: bool,
+}
+
+/// A clip's name in a message: its file's (a raw take's folder's).
+fn clip_label(path: &std::path::Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+}
+
+/// Why two clips cannot go into one joined file, for the user (`a` is the
+/// run's first clip), in Chinese (`zh`) or English.
+fn join_mismatch_text(a: &str, b: &str, why: vr180_pipeline::join::Mismatch, zh: bool) -> String {
+    use vr180_pipeline::join::Mismatch as M;
+    match why {
+        M::Frame((w, h), (w2, h2)) => if zh {
+            format!("{a} 的输出尺寸是 {w} × {h}，{b} 是 {w2} × {h2}。合成需要同一尺寸：请在“格式”里选一个所有片段都适用的尺寸。")
+        } else {
+            format!("{a} exports at {w} × {h} and {b} at {w2} × {h2}. A joined file has one frame size: pick a size in Format that every clip can use.")
+        },
+        M::FrameRate(x, y) => if zh {
+            format!("{a} 是 {x:.2} fps，{b} 是 {y:.2} fps：帧率不同的片段无法合成。")
+        } else {
+            format!("{a} is {x:.2} fps and {b} is {y:.2} fps: clips of different frame rates cannot be joined.")
+        },
+        M::Encoding => if zh {
+            format!("{a} 和 {b} 的编码不同（编码器或位深）。raw 视频片段始终按 10 位写出：请在“格式”里把 H.265 设为 10-bit。")
+        } else {
+            format!("{a} and {b} come out in different encodings (codec or bit depth). A raw video clip is always written at 10 bits: set H.265 to 10-bit in Format.")
+        },
+        M::View => if zh {
+            format!("{a} 和 {b} 的输出视图不同：合成文件里的片段必须是同一种视图（VR180、镜头空间或重新取景），单眼和双眼片段也不能混合。")
+        } else {
+            format!("{a} and {b} are exported in different views: the clips of a joined file share one (VR180, Lens Space or Reframed), and all hold one eye or all two.")
+        },
+    }
+}
+
+/// The name of a joined file, from the one its first clip would export
+/// under by itself: `<stem>_Joined_<tag>.<ext>` for `<stem>_<tag>.<ext>`.
+fn joined_output_for(first_source: &std::path::Path, codec: ExportCodec, single_eye: bool) -> PathBuf {
+    let stem = first_source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    App::default_output_for(&first_source.with_file_name(format!("{stem}_Joined.x")), codec, single_eye, false)
+}
+
+/// `out`, or the first of `<stem> (2)`, `<stem> (3)`… that is not there
+/// yet: nothing is written over, nothing silently skipped.
+fn unused_path(out: PathBuf) -> PathBuf {
+    if !out.exists() {
+        return out;
+    }
+    let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("output").to_string();
+    // A folder of frames has no extension to keep.
+    let ext = out.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    let ext = if ext.is_empty() && !out.is_dir() { ".mp4".to_string() } else { ext };
+    let dir = out.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    (2..).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|cand| !cand.exists()).unwrap_or(out)
 }
 
 /// UI language. English is the source of truth; `tr` maps the core chrome
@@ -2093,6 +2510,11 @@ fn set_cur_lang(l: Lang) {
 /// the export (`display_colour`), and what it says about itself.
 const MATCH_PLAYBACK_LABEL: &str = "Match QuickTime";
 const MATCH_PLAYBACK_HOVER: &str = "Show the preview the way Apple's players (QuickTime, Safari, Apple Vision Pro) show the exported file: read with Apple's Rec.709 video curve, so the mid-tones come out a little brighter. Off, the picture is shown as sRGB, which is closer to most players on Windows. Only the preview changes: the exported file is the same either way.";
+
+/// What the export bar's "Join into one file" says about itself.
+const JOIN_HOVER: &str = "Export the clips in the order of the list and write them as ONE file, one after the other, with hard cuts. Every clip keeps its own trim and settings. They have to come out at the same frame size and frame rate (pick one size for all of them in Format); the joined file's sound is stereo. Drag a clip by its handle (☰) to change the order.";
+/// And the toolbar's Project menu.
+const PROJECT_HOVER: &str = "The clip list, with every clip's trim and settings and the export choices, as a file to save and open. The list also comes back by itself the next time the app starts.";
 
 /// Translate a (static English) UI string for the current language.
 fn tr(en: &'static str) -> &'static str {
@@ -2549,6 +2971,37 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Set trim-in to current playhead (I)" => "将入点设为当前播放头（I）",
         "Set trim-out to current playhead (O)" => "将出点设为当前播放头（O）",
         "Remove both in/out points" => "清除入点与出点",
+        // Several clips as one file
+        "Join into one file" => "合成一个文件",
+        JOIN_HOVER => "按列表顺序导出各片段，并首尾相接写成一个文件（硬切）。每个片段保留自己的裁切和设置。各片段的输出尺寸和帧率必须相同（在“格式”里为它们选同一尺寸）；合成文件的声音为立体声。拖动片段左侧的手柄（☰）可以调整顺序。",
+        "Join all" => "合成全部",
+        "Join selected" => "合成所选",
+        "Export the ticked clips as one file" => "把勾选的片段导出为一个文件",
+        "joining the clips…" => "正在合成片段…",
+        "Not joined" => "未合成",
+        "the clips exported so far are in" => "已导出的片段保留在",
+        "was not exported" => "没有导出成功",
+        "no clip was exported" => "没有片段导出成功",
+        "stopped" => "已停止",
+        "Drag to change the order" => "拖动以调整顺序",
+        "is a still photo: a joined file is made of video clips." => "是照片：合成文件只能由视频片段组成。",
+        "A DNG sequence is a folder of frames for each clip: it cannot be joined. Pick a video format in Format." => "DNG 序列是每个片段一个帧文件夹，无法合成。请在“格式”里选择视频格式。",
+        "A spatial video cannot be joined: export the clips one by one, or pick H.265 or ProRes in Format." => "空间视频无法合成：请逐个导出，或在“格式”里改用 H.265 或 ProRes。",
+        "is in the Lens Space view through the camera's lens, which states that clip's own lens in its file: such clips cannot be joined. Pick the Equidistant lens, or another view." => "用的是相机镜头的镜头空间视图，文件里记录的是该片段自己的镜头，这样的片段无法合成。请改用等距镜头，或换一种视图。",
+        // The list as a project
+        "Project" => "项目",
+        PROJECT_HOVER => "把片段列表连同每个片段的裁切、设置和导出选项存成一个文件，可以保存和打开。下次启动时，列表也会自动恢复。",
+        "New project" => "新建项目",
+        "Open project…" => "打开项目…",
+        "Save project" => "保存项目",
+        "Save project as…" => "项目另存为…",
+        "Save project…" => "保存项目…",
+        "Don't save" => "不保存",
+        "Replace the clip list?" => "替换当前片段列表？",
+        "The clip list has changes that are not saved in a project file." => "当前片段列表有尚未保存到项目文件的更改。",
+        "looking…" => "查找中…",
+        "missing" => "文件缺失",
+        "The file was not found where the project says it is. Click to look again." => "在项目记录的位置没有找到这个文件。点击可重新查找。",
         _ => en,
     }
 }
@@ -3017,6 +3470,8 @@ impl App {
         crate::updater::spawn_check(updater_tx.clone());
         // Worker-thread file pickers (see the `dialog_tx` field comment).
         let (dialog_tx, dialog_rx) = crossbeam_channel::unbounded();
+        let (restore_tx, restore_rx) = crossbeam_channel::unbounded();
+        let (pending_session, session_no_autoload) = Self::read_session();
 
         Self {
             egui_ctx: cc.egui_ctx.clone(),
@@ -3087,6 +3542,28 @@ impl App {
             lang: Self::load_lang(),
             merge_groups: std::collections::HashMap::new(),
             pending_import: None,
+            join_clips: false,
+            join_run: None,
+            joined_output: None,
+            join_notice: None,
+            project_path: None,
+            project_saved: None,
+            session_saved: None,
+            session_checked_at: std::time::Instant::now(),
+            session_error: None,
+            pending_session,
+            session_no_autoload,
+            session_guard: None,
+            session_restore_frames: None,
+            restore_tx,
+            restore_rx,
+            restore_owed: 0,
+            restore_seq: 0,
+            restore_activate: None,
+            restore_clicked: None,
+            restore_autoload: false,
+            restore_from_file: false,
+            pending_project: None,
             preview_zoom: 1.0,
             preview_center: egui::vec2(0.5, 0.5),
             full_res_display: None,
@@ -3232,10 +3709,7 @@ impl App {
             tracing::warn!("export: nothing selected to export");
             return;
         }
-        for &i in &run {
-            self.batch[i].status = BatchStatus::Queued;
-        }
-        self.begin_run(run);
+        self.start_run(run);
     }
 
     /// Common run setup: freeze the output options, record the run-set +
@@ -3917,6 +4391,8 @@ impl App {
             self.dialog_open = false;
             match r {
                 DialogResult::Videos(paths) => self.open_paths(paths),
+                DialogResult::ProjectOpen(path) => self.request_project(ProjectAction::Open(path)),
+                DialogResult::ProjectSave(path) => self.save_project_to(path),
                 DialogResult::BatchOutDir(dir) => self.batch_out_dir = Some(dir),
                 DialogResult::Lut(p) => {
                     self.settings.lut_path = p.to_string_lossy().to_string();
@@ -3948,7 +4424,13 @@ impl App {
                         Err(e) => tracing::error!("load Gyroflow JSON {}: {e}", path.display()),
                     }
                 }
-                DialogResult::Cancelled => {}
+                DialogResult::Cancelled => {
+                    // A save that was asked for before New / Open: not made,
+                    // so the list stays.
+                    if self.pending_project.as_ref().is_some_and(|p| p.after_save) {
+                        self.pending_project = None;
+                    }
+                }
             }
         }
     }
@@ -4197,9 +4679,30 @@ impl App {
                     };
                 }
                 self.batch_skip_flag = false;
+                // One file or none: a joined run whose clip did not come
+                // out whole ends here, and the clips still waiting are not
+                // exported for a file that will not be made.
+                if self.join_run.is_some() && !self.batch.get(idx).is_some_and(|b| b.status == BatchStatus::Done) {
+                    for b in &mut self.batch {
+                        if b.status == BatchStatus::Queued {
+                            b.status = BatchStatus::Idle;
+                        }
+                    }
+                }
                 if self.batch_running {
                     self.start_next_batch_item();
+                } else {
+                    // Stopped by the user.
+                    self.end_join(Err(tr("stopped").to_string()));
                 }
+            } else if self.join_run.as_ref().is_some_and(|j| j.joining) {
+                // The run's last job: its parts put together.
+                self.end_join(match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("worker panicked".into()),
+                });
+                self.finish_run();
             }
         }
     }
@@ -4307,6 +4810,11 @@ impl App {
     /// at ITS settings. The outgoing clip's edits are saved first.
     fn select_clip(&mut self, idx: usize) {
         if self.active_clip == Some(idx) { return; }
+        // A clip whose file is not at hand is looked for again instead.
+        if self.batch.get(idx).is_some_and(|b| !b.ready()) {
+            self.look_again(idx);
+            return;
+        }
         let Some(path) = self.batch.get(idx).map(|b| b.path.clone()) else { return; };
         self.sync_active_clip_settings();
         self.settings = self.batch[idx].settings.clone();
@@ -4347,44 +4855,9 @@ impl App {
             {
                 continue;
             }
-            let source_kind = vr180_pipeline::source_kind::detect(&path)
-                .unwrap_or(vr180_pipeline::SourceKind::Unknown);
-            if !source_kind.is_exportable() {
-                tracing::warn!("batch: skipping non-exportable source {}", path.display());
-                continue;
-            }
-            let probe = if source_kind.is_still() {
-                // One Bayer frame, both eyes side by side: no video probe.
-                match vr180_fisheye::dng::probe(&path) {
-                    Ok((w, h)) => vr180_pipeline::decode::VideoProbe { width: w, height: h, fps: 1.0, duration_sec: 0.0, hlg: false, video_bitrates_bps: [0; 2] },
-                    Err(e) => { tracing::warn!("batch: DNG probe failed for {}: {e}", path.display()); continue; }
-                }
-            } else { match vr180_pipeline::decode::probe_video(&path) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("batch: probe failed for {}: {e}", path.display());
-                    continue;
-                }
-            } };
-            let (fisheye_eye_w, fisheye_eye_h) = match source_kind {
-                vr180_pipeline::SourceKind::SbsFisheye
-                | vr180_pipeline::SourceKind::Insta360Dng
-                | vr180_pipeline::SourceKind::KandaoDng => (probe.width / 2, probe.height),
-                vr180_pipeline::SourceKind::KandaoQoocam => (probe.width, probe.height / 2),
-                vr180_pipeline::SourceKind::DjiOsv
-                | vr180_pipeline::SourceKind::X6Raw
-                | vr180_pipeline::SourceKind::Insta360Insv => (probe.width, probe.height),
-                // The probe is the helper's own (`probe_video` routes `.braw`
-                // to it): the frame holds both eyes side by side, unless the
-                // first frame shows one centred circle (`braw_layout`).
-                vr180_pipeline::SourceKind::BlackmagicRaw => braw_eye_dims(&path, probe.width, probe.height),
-                _ => (0, 0),
-            };
+            let Some(facts) = ClipFacts::read(&path) else { continue };
+            let ClipFacts { source_kind, fisheye_eye_w, fisheye_eye_h, x6, raw_one_lens, .. } = facts;
             let is_loaded_clip = self.loaded_path.as_deref() == Some(path.as_path());
-            // Insta360 X6: the recording-mode signature (a few KB from the
-            // file's end) — a Crop clip's native-sharpness size follows from it.
-            let x6 = (source_kind == vr180_pipeline::SourceKind::Insta360Insv).then(|| X6ClipInfo::read(&path).0);
-            let raw_one_lens = raw_take_of_one_lens(source_kind, &path);
             // A NEW clip inherits ITS kind's template (OSV / .360 / … kept
             // independent); the already-loaded clip keeps its live edits.
             let mut settings = if is_loaded_clip {
@@ -4425,16 +4898,17 @@ impl App {
             }
             self.batch.push(BatchItem {
                 path,
-                fps: probe.fps,
-                duration_sec: probe.duration_sec,
+                fps: facts.fps,
+                duration_sec: facts.duration_sec,
                 source_kind,
                 fisheye_eye_w, fisheye_eye_h,
-                width: probe.width, height: probe.height,
+                width: facts.width, height: facts.height,
                 settings,
                 status: BatchStatus::Idle,
                 selected: false,
                 x6,
                 raw_one_lens,
+                offline: None,
             });
             if is_loaded_clip {
                 // The loaded clip just joined the list — link it up.
@@ -4495,86 +4969,271 @@ impl App {
                 out = dir.join(name);
             }
         }
-        if out.exists() {
-            let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("output").to_string();
-            // A folder of frames has no extension to keep.
-            let ext = out.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
-            let ext = if ext.is_empty() && !out.is_dir() { ".mp4".to_string() } else { ext };
-            let dir = out.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-            for n in 2.. {
-                let cand = dir.join(format!("{stem} ({n}){ext}"));
-                if !cand.exists() { out = cand; break; }
-            }
-        }
-        out
+        unused_path(out)
     }
 
-    /// Export every not-yet-done clip in the list (Idle / Failed / Skipped).
-    /// Done clips stay done — re-arm one with its Re-run button.
-    fn start_batch(&mut self) {
-        if self.batch_running || self.export_job.is_some() { return; }
-        self.sync_active_clip_settings();
-        let mut run = Vec::new();
-        for (i, item) in self.batch.iter_mut().enumerate() {
-            if matches!(item.status,
-                BatchStatus::Idle | BatchStatus::Failed(_) | BatchStatus::Skipped)
-            {
-                item.status = BatchStatus::Queued;
-                run.push(i);
+    /// The export of list entry `idx` to `output` under `opts`, and what a
+    /// `.360` export needs for its stabilization.
+    fn export_cfg_for(
+        &self,
+        idx: usize,
+        output: &std::path::Path,
+        opts: &ExportOptions,
+        segments: Vec<PathBuf>,
+    ) -> (vr180_pipeline::fisheye_export::FisheyeExportConfig, Option<(crate::decoder::Settings, usize)>) {
+        let item = &self.batch[idx];
+        let eac_stab = item.source_kind.is_eac().then(|| {
+            // Total across the merged recording (== single-file count when
+            // `segments` is one file) so EAC stab spans the whole timeline.
+            (item.settings.clone(), crate::decoder::segments_total_frames(&segments).max(1))
+        });
+        (
+            Self::build_export_cfg(
+                &item.path, output,
+                item.fps, item.source_kind,
+                item.fisheye_eye_w, item.fisheye_eye_h, item.width, item.height,
+                item.sharp_eye(),
+                &item.export_settings(), opts,
+                segments,
+            ),
+            eac_stab,
+        )
+    }
+
+    /// The clips `run` (list entries, in order) as one joined file under
+    /// `opts`: where it and its parts go. `Err`: why these clips cannot be
+    /// one file, for the user. Nothing is written yet.
+    fn plan_join(&self, run: &[usize], opts: &ExportOptions) -> Result<JoinRun, String> {
+        use vr180_pipeline::join::{mismatch, planned_part, Unjoinable};
+        let mut first: Option<(String, vr180_pipeline::join::PlannedPart)> = None;
+        let mut parts = Vec::with_capacity(run.len());
+        for (k, &i) in run.iter().enumerate() {
+            let item = &self.batch[i];
+            let name = clip_label(&item.path);
+            if item.source_kind.is_still() {
+                return Err(format!("{name} {}", tr("is a still photo: a joined file is made of video clips.")));
             }
+            if item.source_kind.is_raw_video() && opts.raw_dng_sequence {
+                return Err(tr("A DNG sequence is a folder of frames for each clip: it cannot be joined. Pick a video format in Format.").to_string());
+            }
+            // (No segments: what the export writes does not depend on them.)
+            let (cfg, _) = self.export_cfg_for(i, std::path::Path::new(""), opts, Vec::new());
+            let part = planned_part(&cfg, item.single_eye()).map_err(|why| match why {
+                Unjoinable::Spatial => tr("A spatial video cannot be joined: export the clips one by one, or pick H.265 or ProRes in Format.").to_string(),
+                Unjoinable::LensFrame => format!("{name} {}", tr("is in the Lens Space view through the camera's lens, which states that clip's own lens in its file: such clips cannot be joined. Pick the Equidistant lens, or another view.")),
+            })?;
+            match &first {
+                None => first = Some((name, part)),
+                Some((first_name, a)) => {
+                    if let Some(why) = mismatch(a, &part) {
+                        return Err(join_mismatch_text(first_name, &name, why, cur_lang() == Lang::Zh));
+                    }
+                }
+            }
+            // A part is named as the clip's own export would be, with its
+            // place in front: what is left behind when no file is joined
+            // can be used as it is.
+            let own = Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye(), false);
+            parts.push((item.path.clone(), format!("{:02}_{}", k + 1, clip_label(&own))));
+        }
+        let head = &self.batch[run[0]];
+        let mut output = joined_output_for(&head.path, opts.codec_for(&head.export_settings(), false), head.single_eye());
+        if let Some(dir) = &self.batch_out_dir {
+            if let Some(name) = output.file_name() {
+                output = dir.join(name);
+            }
+        }
+        let output = unused_path(output);
+        let parts_dir = unused_path(output.with_extension("parts"));
+        Ok(JoinRun {
+            parts: parts.into_iter().map(|(clip, name)| (clip, parts_dir.join(name))).collect(),
+            output,
+            parts_dir,
+            first_cfg: None,
+            joining: false,
+        })
+    }
+
+    /// Start a run of `run` (list entries, in order): as ONE file when that
+    /// is chosen and there are several clips, else each to its own.
+    fn start_run(&mut self, run: Vec<usize>) {
+        self.join_notice = None;
+        self.joined_output = None;
+        if self.join_clips && run.len() >= 2 {
+            match self.plan_join(&run, &self.export_opts) {
+                Ok(plan) => {
+                    tracing::info!("join: {} clips → {}", run.len(), plan.output.display());
+                    self.join_run = Some(plan);
+                }
+                Err(why) => {
+                    tracing::warn!("join: not started: {why}");
+                    self.join_notice = Some(why);
+                    return;
+                }
+            }
+        }
+        for &i in &run {
+            self.batch[i].status = BatchStatus::Queued;
         }
         self.begin_run(run);
     }
 
+    /// The clips of a joined run are all written: put them together, as
+    /// the run's last job (so its progress, Stop, and the hand-over while
+    /// the window is covered are those of any export). `false`: this is no
+    /// joined run, or one that ends here without a file.
+    fn start_join(&mut self) -> bool {
+        let Some(join) = self.join_run.as_mut() else { return false };
+        if join.joining {
+            return false;
+        }
+        // One file or none: every clip of the run has to be there.
+        let missing = join.parts.iter()
+            .find(|(clip, _)| !self.batch.iter().any(|b| b.path == *clip && b.status == BatchStatus::Done))
+            .map(|(clip, _)| clip_label(clip));
+        if let Some(name) = missing {
+            self.end_join(Err(format!("{name} {}", tr("was not exported"))));
+            return false;
+        }
+        let Some(cfg) = join.first_cfg.clone() else {
+            self.end_join(Err(tr("no clip was exported").to_string()));
+            return false;
+        };
+        join.joining = true;
+        let parts: Vec<PathBuf> = join.parts.iter().map(|(_, part)| part.clone()).collect();
+        let output = join.output.clone();
+        tracing::info!("join: {} parts → {}", parts.len(), output.display());
+        let (progress_tx, progress_rx) = crossbeam_channel::bounded(256);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_for_thread = cancel.clone();
+        let out = output.clone();
+        let handle = std::thread::spawn(move || {
+            vr180_pipeline::join::join_exports(&parts, &out, move |p| { let _ = progress_tx.try_send(p); }, cancel_for_thread)?;
+            let mut cfg = *cfg;
+            cfg.output_path = out.clone();
+            vr180_pipeline::fisheye_export::state_export_metadata(cfg, &out)
+        });
+        self.export_job = Some(ExportJob {
+            output_path: output,
+            handle,
+            progress_rx,
+            cancel,
+            last_progress: None,
+            started_at: std::time::Instant::now(),
+        });
+        true
+    }
+
+    /// A joined run ends: with its file (the parts go), or without one
+    /// (`Err`: why; what was exported stays where it was written).
+    fn end_join(&mut self, outcome: Result<(), String>) {
+        let Some(join) = self.join_run.take() else { return };
+        match outcome {
+            Ok(()) => {
+                // The parts are this run's own files, in a folder it made:
+                // they go, and the folder with them unless something else
+                // is in it.
+                for (_, part) in &join.parts {
+                    let _ = std::fs::remove_file(part);
+                }
+                let _ = std::fs::remove_dir(&join.parts_dir);
+                tracing::info!("join: done → {}", join.output.display());
+                self.joined_output = Some(join.output);
+            }
+            Err(why) => {
+                let why = why.trim_start_matches("ffmpeg: ").trim_start_matches("join: ").to_string();
+                tracing::warn!("join: no joined file: {why}");
+                let kept = join.parts.iter().filter(|(_, part)| part.exists()).count();
+                let mut text = format!("{}: {why}", tr("Not joined"));
+                if kept > 0 {
+                    text.push_str(&format!(" · {} {}", tr("the clips exported so far are in"), join.parts_dir.display()));
+                } else {
+                    let _ = std::fs::remove_dir(&join.parts_dir);
+                }
+                self.join_notice = Some(text);
+            }
+        }
+    }
+
+    /// The run is over: its summary (banner + notification), and the run's
+    /// state back to idle.
+    fn finish_run(&mut self) {
+        let done = self.batch_run_indices.iter()
+            .filter(|&&i| self.batch.get(i).map_or(false, |b| b.status == BatchStatus::Done))
+            .count();
+        let failed = self.batch_run_indices.iter()
+            .filter(|&&i| self.batch.get(i).map_or(false,
+                |b| matches!(b.status, BatchStatus::Failed(_))))
+            .count();
+        let elapsed = self.batch_started_at.map(|t| t.elapsed())
+            .unwrap_or_default();
+        tracing::info!("export run: complete — {done} done, {failed} failed in {:.1?}", elapsed);
+        let n_run = self.batch_run_indices.len();
+        self.batch_running = false;
+        self.batch_opts = None;
+        self.batch_started_at = None;
+        self.batch_run_indices.clear();
+        if done + failed > 0 {
+            self.notify_run_complete(done, failed, elapsed, n_run);
+            self.last_batch_summary = Some(BatchSummary { done, failed, elapsed, joined: self.joined_output.take() });
+        }
+    }
+
+    /// Export every not-yet-done clip in the list (Idle / Failed / Skipped).
+    /// Done clips stay done — re-arm one with its Re-run button. As ONE
+    /// file (`join_clips`) the run is the whole list, whatever was exported
+    /// before: the file is the list.
+    fn start_batch(&mut self) {
+        if self.batch_running || self.export_job.is_some() { return; }
+        self.sync_active_clip_settings();
+        let run: Vec<usize> = self.batch.iter().enumerate()
+            .filter(|(_, item)| item.ready() && (self.joins_all() || matches!(item.status,
+                BatchStatus::Idle | BatchStatus::Failed(_) | BatchStatus::Skipped)))
+            .map(|(i, _)| i)
+            .collect();
+        self.start_run(run);
+    }
+
+    /// "Export all" writes the whole list as one file: that is chosen, and
+    /// the list holds several clips to join.
+    fn joins_all(&self) -> bool {
+        self.join_clips && self.batch.iter().filter(|b| b.ready()).count() >= 2
+    }
+
     fn start_next_batch_item(&mut self) {
         let Some(idx) = self.batch.iter().position(|b| b.status == BatchStatus::Queued) else {
-            // Queue drained — run complete. Record the summary (banner +
-            // notification) and reset run state.
-            let done = self.batch_run_indices.iter()
-                .filter(|&&i| self.batch.get(i).map_or(false, |b| b.status == BatchStatus::Done))
-                .count();
-            let failed = self.batch_run_indices.iter()
-                .filter(|&&i| self.batch.get(i).map_or(false,
-                    |b| matches!(b.status, BatchStatus::Failed(_))))
-                .count();
-            let elapsed = self.batch_started_at.map(|t| t.elapsed())
-                .unwrap_or_default();
-            tracing::info!("export run: complete — {done} done, {failed} failed in {:.1?}", elapsed);
-            let n_run = self.batch_run_indices.len();
-            self.batch_running = false;
-            self.batch_opts = None;
-            self.batch_started_at = None;
-            self.batch_run_indices.clear();
-            if done + failed > 0 {
-                self.notify_run_complete(done, failed, elapsed, n_run);
-                self.last_batch_summary = Some(BatchSummary { done, failed, elapsed });
+            // Queue drained. A run that writes one file puts its parts
+            // together now; any other is complete.
+            if !self.start_join() {
+                self.finish_run();
             }
             return;
         };
         let opts = self.batch_opts.unwrap_or(self.export_opts);
-        let output = self.batch_output_for(&self.batch[idx], &opts);
+        // A clip of a joined run is written to its part.
+        let part = self.join_run.as_ref().and_then(|j| {
+            let k = j.parts.iter().position(|(clip, _)| *clip == self.batch[idx].path)?;
+            Some((k, j.parts[k].1.clone(), j.parts_dir.clone()))
+        });
+        let output = match &part {
+            Some((_, file, _)) => file.clone(),
+            None => self.batch_output_for(&self.batch[idx], &opts),
+        };
         let item_path = self.batch[idx].path.clone();
         let segments = self.clip_segments(&item_path);
-        let (cfg, eac_stab) = {
-            let item = &self.batch[idx];
-            // Total across the merged recording (== single-file count when
-            // `segments` is one file) so EAC stab spans the whole timeline.
-            let n_frames = crate::decoder::segments_total_frames(&segments).max(1);
-            let eac_stab = if item.source_kind.is_eac() {
-                Some((item.settings.clone(), n_frames))
-            } else { None };
-            (
-                Self::build_export_cfg(
-                    &item.path, &output,
-                    item.fps, item.source_kind,
-                    item.fisheye_eye_w, item.fisheye_eye_h, item.width, item.height,
-                    item.sharp_eye(),
-                    &item.export_settings(), &opts,
-                    segments,
-                ),
-                eac_stab,
-            )
-        };
+        let (mut cfg, eac_stab) = self.export_cfg_for(idx, &output, &opts, segments);
+        if let Some((k, _, dir)) = &part {
+            // The joined file's sound is one stereo track.
+            cfg.audio_track = vr180_pipeline::fisheye_export::AudioTrack::Stereo;
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!("join: {}: {e}", dir.display());
+            }
+            if *k == 0 {
+                if let Some(join) = self.join_run.as_mut() {
+                    join.first_cfg = Some(Box::new(cfg.clone()));
+                }
+            }
+        }
         self.batch[idx].status = BatchStatus::Running;
         self.batch_current = Some(idx);
         tracing::info!("batch: item {}/{} → {}", idx + 1, self.batch.len(), output.display());
@@ -4594,9 +5253,14 @@ impl App {
     fn stop_batch(&mut self) {
         self.batch_running = false;
         self.batch_opts = None;
-        if let (Some(_), Some(job)) = (self.batch_current, self.export_job.as_ref()) {
-            self.batch_skip_flag = true; // mark the cut-short item Skipped
-            job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        let joining = self.join_run.as_ref().is_some_and(|j| j.joining);
+        if let Some(job) = self.export_job.as_ref() {
+            if self.batch_current.is_some() {
+                self.batch_skip_flag = true; // mark the cut-short item Skipped
+                job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            } else if joining {
+                job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     }
 
@@ -4958,6 +5622,12 @@ impl App {
     /// (GoPro `.360` EAC) bypass the list and load directly, exactly as
     /// before — they aren't batchable.
     fn open_paths(&mut self, paths: Vec<PathBuf>) {
+        // A project file is opened as one (the first, if several came).
+        let is_project = |p: &PathBuf| p.extension().is_some_and(|e| e.eq_ignore_ascii_case(crate::project::EXTENSION));
+        if let Some(project) = paths.iter().find(|p| is_project(p)) {
+            self.request_project(ProjectAction::Open(project.clone()));
+            return;
+        }
         let (paths, notice) = resolve_raw_takes(paths);
         self.import_notice = notice;
         if paths.is_empty() { return; }
@@ -5194,6 +5864,7 @@ impl App {
         // instant once cached, which is exactly the "first time hangs,
         // second time instant" report).
         self.unload_clip(preserve_clip_settings);
+        self.arm_session_guard();
 
         // Resolve the segment list on the UI thread when it's a cheap
         // import-time choice (a HashMap lookup); otherwise leave it to the
@@ -6116,10 +6787,19 @@ impl App {
         let cur_nr = self.batch_current
             .and_then(|i| self.batch.get(i))
             .map_or(false, |b| export_runs_noise_filter(b.source_kind, b.settings.denoise_strength, &run_opts));
-        let n_all = self.batch.iter().filter(|b| matches!(b.status,
+        let n_all = self.batch.iter().filter(|b| b.ready() && matches!(b.status,
             BatchStatus::Idle | BatchStatus::Queued
             | BatchStatus::Failed(_) | BatchStatus::Skipped)).count();
-        let n_sel = self.batch.iter().filter(|b| b.selected).count();
+        let n_sel = self.batch.iter().filter(|b| b.selected && b.source_kind.is_exportable()).count();
+        // As one file: "all" is the whole list, and a selection joins when
+        // it holds several clips.
+        let n_ready = self.batch.iter().filter(|b| b.ready()).count();
+        let join_all = self.joins_all();
+        let join_sel = self.join_clips && n_sel >= 2;
+        let join_run = self.join_run.is_some();
+        // The run's last job: its parts being put together.
+        let join_progress = self.join_run.as_ref().filter(|j| j.joining)
+            .map(|_| self.export_job.as_ref().and_then(|j| j.last_progress));
         let can_export = self.export_job.is_none() && !running;
         let has_active = self.active_clip.is_some();
         let out_label = match &self.batch_out_dir {
@@ -6205,12 +6885,20 @@ impl App {
         let summary = self.last_batch_summary.as_ref().map(|s| {
             let col = if s.failed > 0 { Color32::from_rgb(230, 160, 90) }
                       else { Color32::from_rgb(120, 200, 120) };
+            let took = format_eta(s.elapsed.as_secs_f64());
             let txt = if s.failed > 0 {
-                format!("✓ {} done · {} failed · {}", s.done, s.failed, format_eta(s.elapsed.as_secs_f64()))
+                format!("✓ {} done · {} failed · {took}", s.done, s.failed)
+            } else if s.joined.is_some() {
+                if cur_lang() == Lang::Zh { format!("✓ 已合成 {} 个片段 · {took}", s.done) } else { format!("✓ {} clips joined · {took}", s.done) }
             } else {
-                format!("✓ {} exported · {}", s.done, format_eta(s.elapsed.as_secs_f64()))
+                format!("✓ {} exported · {took}", s.done)
             };
-            (txt, col)
+            // The joined file's name goes with the hint.
+            let hover = match s.joined.as_deref().map(clip_label) {
+                Some(name) => format!("{name}\n{}", tr("Click to dismiss")),
+                None => tr("Click to dismiss").to_string(),
+            };
+            (txt, col, hover)
         });
 
         let mut do_export_selected = false;
@@ -6226,7 +6914,15 @@ impl App {
         egui::TopBottomPanel::bottom("export_bar").exact_height(40.0).show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
                 if running {
-                    if let Some((done, total, eta, pos, n)) = run_progress {
+                    if let Some(progress) = join_progress {
+                        // The clips are written; the parts are copied into
+                        // the one file.
+                        let frac = progress.filter(|p| p.total_frames > 0)
+                            .map_or(0.0, |p| (p.frame_idx as f32 / p.total_frames as f32).clamp(0.0, 1.0));
+                        ui.add(egui::ProgressBar::new(frac).desired_width(240.0)
+                            .text(format!("{:.0}%", frac * 100.0)));
+                        ui.label(RichText::new(tr("joining the clips…")).color(Color32::from_rgb(120, 180, 255)));
+                    } else if let Some((done, total, eta, pos, n)) = run_progress {
                         let frac = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
                         ui.add(egui::ProgressBar::new(frac).desired_width(240.0)
                             .text(format!("{:.0}%", frac * 100.0)));
@@ -6256,7 +6952,8 @@ impl App {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button(tr("Stop")).clicked() { do_stop = true; }
-                        if ui.button(tr("Skip current")).clicked() { do_skip = true; }
+                        // (One file or none: a joined run has no clip to skip.)
+                        if !join_run && ui.button(tr("Skip current")).clicked() { do_skip = true; }
                     });
                 } else {
                     ui.menu_button(format!("📁  {out_label}"), |ui| {
@@ -6274,27 +6971,43 @@ impl App {
                         toggle_settings = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_enabled_ui(can_export && n_all > 0, |ui| {
-                            if ui.button(RichText::new(format!("{} ({n_all})", tr("Export all"))).strong()).clicked() {
+                        let all_label = if join_all {
+                            format!("{} ({n_ready})", tr("Join all"))
+                        } else {
+                            format!("{} ({n_all})", tr("Export all"))
+                        };
+                        ui.add_enabled_ui(can_export && (join_all || n_all > 0), |ui| {
+                            if ui.button(RichText::new(all_label).strong()).clicked() {
                                 do_export_all = true;
                             }
                         });
-                        let sel_label = if n_sel > 0 {
+                        let sel_label = if join_sel {
+                            format!("{} ({n_sel})", tr("Join selected"))
+                        } else if n_sel > 0 {
                             format!("{} ({n_sel})", tr("Export selected"))
                         } else {
                             tr("Export selected").to_string()
                         };
                         ui.add_enabled_ui(can_export && (n_sel > 0 || has_active), |ui| {
-                            if ui.button(sel_label).on_hover_text(tr(if n_sel > 0 {
+                            if ui.button(sel_label).on_hover_text(tr(if join_sel {
+                                "Export the ticked clips as one file"
+                            } else if n_sel > 0 {
                                 "Export the ticked clips"
                             } else {
                                 "Export the active clip"
                             })).clicked() { do_export_selected = true; }
                         });
-                        if let Some((txt, col)) = &summary {
+                        // Several clips can be written as one file.
+                        if n_ready >= 2 {
+                            ui.add_enabled_ui(can_export, |ui| {
+                                ui.checkbox(&mut self.join_clips, tr("Join into one file"))
+                                    .on_hover_text(tr(JOIN_HOVER));
+                            });
+                        }
+                        if let Some((txt, col, hover)) = &summary {
                             if ui.add(egui::Label::new(RichText::new(txt).color(*col))
                                 .sense(egui::Sense::click()))
-                                .on_hover_text(tr("Click to dismiss")).clicked() {
+                                .on_hover_text(hover).clicked() {
                                 dismiss_summary = true;
                             }
                         }
@@ -6331,6 +7044,7 @@ impl App {
         if do_export_all { self.start_batch(); }
         if do_skip { self.skip_current_batch_item(); }
         if do_stop { self.stop_batch(); }
+        self.draw_join_notice(ctx);
 
         // Format settings popover — a real (non-modal) window so ComboBoxes
         // and sliders stay open while you edit them.
@@ -6789,6 +7503,469 @@ impl App {
 
 }
 
+/// What replaces the list.
+#[derive(Clone)]
+enum ProjectAction {
+    /// An empty list.
+    New,
+    /// The list of this project file.
+    Open(PathBuf),
+}
+
+/// New / Open, held until the user has said what becomes of the list's
+/// unsaved changes.
+struct PendingProject {
+    action: ProjectAction,
+    /// "Save project…" was chosen: the action runs once the file is written.
+    after_save: bool,
+}
+
+// ─── The list as a project file, and the last session ───────────────
+impl App {
+    /// The last session's list, and whether its clip stays off the screen
+    /// (`project::take_session`).
+    fn read_session() -> (Option<Project>, bool) {
+        match crate::project::config_dir() {
+            Some(dir) => crate::project::take_session(&dir),
+            None => (None, false),
+        }
+    }
+
+    /// The list and the output choices as a project whose file is in the
+    /// folder `base` (`None`: no folder to name the clips from).
+    fn project_snapshot(&self, base: Option<&std::path::Path>) -> Project {
+        use crate::project::{FileRef, ProjectClip};
+        let clips = self.batch.iter().enumerate().map(|(i, item)| match &item.offline {
+            // As it was read: its file may only be away for now.
+            Some(off) => ProjectClip {
+                file: if base.is_some() { FileRef::new(&off.file.path, base) } else { off.file.clone() },
+                segments: off.segments.clone(),
+                selected: item.selected,
+                settings: item.settings.clone(),
+            },
+            None => {
+                // The sidebar edits the clip on screen in `self.settings`.
+                let live = self.active_clip == Some(i) && self.loaded_path.as_ref() == Some(&item.path);
+                ProjectClip {
+                    file: FileRef::new(&item.path, base),
+                    segments: self.merge_groups.get(&item.path)
+                        .map(|files| files.iter().map(|f| FileRef::new(f, base)).collect()),
+                    selected: item.selected,
+                    settings: if live { self.settings.clone() } else { item.settings.clone() },
+                }
+            }
+        }).collect();
+        Project {
+            version: crate::project::VERSION,
+            written_by: format!("VR180 Silver Bullet {}", env!("CARGO_PKG_VERSION")),
+            clips,
+            active: self.active_clip,
+            join_clips: self.join_clips,
+            output_folder: self.batch_out_dir.clone(),
+            export: self.export_opts,
+            project_file: None,
+        }
+    }
+
+    /// The folder the open project's clips are named from.
+    fn project_base(&self) -> Option<PathBuf> {
+        self.project_path.as_ref().and_then(|p| p.parent()).map(|d| d.to_path_buf())
+    }
+
+    /// The list has changes that no project file holds. (Which clip is on
+    /// screen is not one.)
+    fn project_dirty(&self) -> bool {
+        // While a project's clips are still being looked for, the list is
+        // the file's.
+        if self.batch.is_empty() || self.restore_owed > 0 {
+            return false;
+        }
+        let Some(saved) = &self.project_saved else { return true };
+        let mut now = self.project_snapshot(self.project_base().as_deref());
+        now.active = saved.active;
+        now != *saved
+    }
+
+    /// Replace the list with `project`'s (`file`: the project file it was
+    /// belongs to, if any). The clips show at once, in their places; their
+    /// files are looked for and read on a thread ([`Self::poll_restore`]),
+    /// so that a network drive that has to wake does not hold the window.
+    /// `autoload`: the project's clip goes on screen when it is found.
+    /// `from_file`: `project` was read from `file` just now (the session's
+    /// copy of a project may hold changes the file does not).
+    fn apply_project(&mut self, project: Project, file: Option<PathBuf>, autoload: bool, from_file: bool) {
+        self.unload_clip(false);
+        self.batch.clear();
+        self.merge_groups.clear();
+        self.active_clip = None;
+        self.pending_import = None;
+        self.import_notice = None;
+        self.last_batch_summary = None;
+        self.join_notice = None;
+        self.restore_activate = None;
+        self.restore_clicked = None;
+        self.export_opts = project.export;
+        self.join_clips = project.join_clips;
+        self.batch_out_dir = project.output_folder.clone();
+        self.project_path = file;
+        self.project_saved = None;
+        let base = self.project_base();
+        let mut requests = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (i, clip) in project.clips.iter().enumerate() {
+            // One entry per file, as everywhere in the list.
+            if !seen.insert(clip.file.path.clone()) {
+                continue;
+            }
+            self.restore_seq += 1;
+            let token = self.restore_seq;
+            self.batch.push(BatchItem::offline(clip, token, base.clone()));
+            let request = (token, clip.file.clone(), clip.segments.clone(), base.clone());
+            if autoload && project.active == Some(i) {
+                // The clip that goes on screen is looked for first.
+                self.restore_activate = Some(token);
+                requests.insert(0, request);
+            } else {
+                requests.push(request);
+            }
+        }
+        self.restore_autoload = autoload;
+        self.restore_from_file = from_file;
+        tracing::info!("project: {} clips{}", self.batch.len(),
+            self.project_path.as_ref().map(|p| format!(" from {}", p.display())).unwrap_or_default());
+        if requests.is_empty() {
+            self.restore_done();
+        } else {
+            self.look_for(requests);
+        }
+    }
+
+    /// Look for clips of a project on a thread; the answers arrive in
+    /// [`Self::poll_restore`].
+    #[allow(clippy::type_complexity)]
+    fn look_for(&mut self, requests: Vec<(u64, crate::project::FileRef, Option<Vec<crate::project::FileRef>>, Option<PathBuf>)>) {
+        self.restore_owed += requests.len();
+        let tx = self.restore_tx.clone();
+        let ctx = self.egui_ctx.clone();
+        std::thread::spawn(move || {
+            for (token, file, segments, base) in requests {
+                // A reader that gives up on a file must not leave its entry
+                // "looking" for good: it counts as not found.
+                let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    locate_clip(&file, segments.as_deref(), base.as_deref())
+                })).unwrap_or(None);
+                if tx.send(RestoredClip { token, found }).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Look again for a clip that was not found: the user clicked it.
+    fn look_again(&mut self, idx: usize) {
+        let token = self.restore_seq + 1;
+        let Some(off) = self.batch.get_mut(idx).and_then(|b| b.offline.as_mut()).filter(|o| !o.looking) else { return };
+        off.looking = true;
+        off.token = token;
+        let request = (token, off.file.clone(), off.segments.clone(), off.base.clone());
+        self.restore_seq = token;
+        self.restore_clicked = Some(token);
+        self.look_for(vec![request]);
+    }
+
+    /// Take in the clips that have been looked for.
+    fn poll_restore(&mut self, ctx: &egui::Context) {
+        while let Ok(restored) = self.restore_rx.try_recv() {
+            self.restore_owed = self.restore_owed.saturating_sub(1);
+            self.take_restored(restored);
+            if self.restore_owed == 0 {
+                self.restore_done();
+            }
+        }
+        if self.restore_owed > 0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+
+    fn take_restored(&mut self, restored: RestoredClip) {
+        let token = restored.token;
+        // The entry may be gone: removed while it was looked for, or the
+        // list replaced.
+        let Some(idx) = self.batch.iter().position(|b| b.offline.as_ref().is_some_and(|o| o.token == token)) else { return };
+        let Some((path, segments, facts)) = restored.found else {
+            if let Some(off) = self.batch[idx].offline.as_mut() {
+                off.looking = false;
+            }
+            tracing::warn!("project: {} was not found", self.batch[idx].path.display());
+            return;
+        };
+        // The same file came into the list while this entry was looked for.
+        if self.batch.iter().any(|b| b.ready() && b.path == path) {
+            self.remove_clip(idx);
+            return;
+        }
+        let item = &mut self.batch[idx];
+        item.path = path.clone();
+        item.source_kind = facts.source_kind;
+        item.fps = facts.fps;
+        item.duration_sec = facts.duration_sec;
+        item.width = facts.width;
+        item.height = facts.height;
+        item.fisheye_eye_w = facts.fisheye_eye_w;
+        item.fisheye_eye_h = facts.fisheye_eye_h;
+        item.x6 = facts.x6;
+        item.raw_one_lens = facts.raw_one_lens;
+        item.offline = None;
+        if let Some(files) = segments {
+            self.merge_groups.insert(path, files);
+        }
+        if self.restore_clicked == Some(token) {
+            self.restore_clicked = None;
+            self.select_clip(idx);
+        } else if self.restore_activate == Some(token) {
+            self.restore_activate = None;
+            self.show_restored(idx);
+        }
+    }
+
+    /// Put a project's clip on screen, unless the user has put one there
+    /// meanwhile.
+    fn show_restored(&mut self, idx: usize) {
+        if self.active_clip.is_none() && self.loaded_path.is_none() && self.load_pending.is_none() {
+            self.select_clip(idx);
+        }
+    }
+
+    /// Every clip of the project has been looked for.
+    fn restore_done(&mut self) {
+        self.restore_activate = None;
+        if std::mem::take(&mut self.restore_autoload) {
+            if let Some(idx) = self.batch.iter().position(BatchItem::ready) {
+                self.show_restored(idx);
+            }
+        }
+        let missing = self.batch.iter().filter(|b| !b.ready()).count();
+        if missing > 0 {
+            tracing::warn!("project: {missing} of {} clips were not found", self.batch.len());
+        }
+        // What the project file holds is the list as it now stands.
+        if self.project_path.is_some() && std::mem::take(&mut self.restore_from_file) {
+            self.project_saved = Some(self.project_snapshot(self.project_base().as_deref()));
+        }
+    }
+
+    /// New / Open: at once when the list holds nothing unsaved, else after
+    /// the user's word ([`Self::draw_project_prompt`]). Not while exporting.
+    fn request_project(&mut self, action: ProjectAction) {
+        if self.batch_running || self.export_job.is_some() {
+            return;
+        }
+        if self.project_dirty() {
+            self.pending_project = Some(PendingProject { action, after_save: false });
+        } else {
+            self.run_project_action(action);
+        }
+    }
+
+    fn run_project_action(&mut self, action: ProjectAction) {
+        match action {
+            ProjectAction::New => {
+                // A new list; how things are exported stays as it is set.
+                let blank = Project { export: self.export_opts, output_folder: self.batch_out_dir.clone(), ..Default::default() };
+                self.apply_project(blank, None, false, false);
+            }
+            ProjectAction::Open(path) => match crate::project::load::<ExportOptions>(&path) {
+                Ok(project) => self.apply_project(project, Some(path), true, true),
+                Err(e) => {
+                    tracing::warn!("project: {e}");
+                    self.snapshot_status = Some((e, std::time::Instant::now()));
+                }
+            },
+        }
+    }
+
+    /// Write the list to the project file `path` (its extension added
+    /// where none was typed), which becomes the open project.
+    fn save_project_to(&mut self, path: PathBuf) {
+        let path = if path.extension().is_none() { path.with_extension(crate::project::EXTENSION) } else { path };
+        self.sync_active_clip_settings();
+        let snapshot = self.project_snapshot(path.parent());
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match crate::project::save(&snapshot, &path) {
+            Ok(()) => {
+                tracing::info!("project: saved {}", path.display());
+                self.project_path = Some(path);
+                self.project_saved = Some(snapshot);
+                self.snapshot_status = Some((format!("{} {name}", tr("Saved")), std::time::Instant::now()));
+                if let Some(pending) = self.pending_project.take() {
+                    if pending.after_save {
+                        self.run_project_action(pending.action);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("project: {e}");
+                self.snapshot_status = Some((e, std::time::Instant::now()));
+                self.pending_project = None;
+            }
+        }
+    }
+
+    /// Save: to the open project's file, or ask where.
+    fn save_project(&mut self, ctx: &egui::Context) {
+        match self.project_path.clone() {
+            Some(path) => self.save_project_to(path),
+            None => self.pick_project_save(ctx),
+        }
+    }
+
+    fn pick_project_open(&mut self, ctx: &egui::Context) {
+        let dir = self.project_base();
+        self.spawn_dialog(ctx, move || {
+            let mut dialog = rfd::FileDialog::new().add_filter("VR180 Silver Bullet project", &[crate::project::EXTENSION]);
+            if let Some(dir) = dir {
+                dialog = dialog.set_directory(dir);
+            }
+            dialog.pick_file().map(DialogResult::ProjectOpen)
+        });
+    }
+
+    fn pick_project_save(&mut self, ctx: &egui::Context) {
+        // Offered: the open project's own name and folder, else the first
+        // clip's.
+        let first = self.batch.first().map(|b| b.path.clone());
+        let dir = self.project_base().or_else(|| first.as_ref().and_then(|p| p.parent()).map(|d| d.to_path_buf()));
+        let name = self.project_path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                let stem = first.as_ref().and_then(|p| p.file_stem()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
+                format!("{stem}.{}", crate::project::EXTENSION)
+            });
+        self.spawn_dialog(ctx, move || {
+            let mut dialog = rfd::FileDialog::new()
+                .add_filter("VR180 Silver Bullet project", &[crate::project::EXTENSION])
+                .set_file_name(name);
+            if let Some(dir) = dir {
+                dialog = dialog.set_directory(dir);
+            }
+            dialog.save_file().map(DialogResult::ProjectSave)
+        });
+    }
+
+    /// The question asked before New / Open replaces a list with unsaved
+    /// changes.
+    fn draw_project_prompt(&mut self, ctx: &egui::Context) {
+        if !self.pending_project.as_ref().is_some_and(|p| !p.after_save) {
+            return;
+        }
+        let (mut save, mut discard, mut cancel) = (false, false, false);
+        egui::Window::new(tr("Replace the clip list?"))
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label(tr("The clip list has changes that are not saved in a project file."));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new(tr("Save project…")).strong()).clicked() { save = true; }
+                    ui.add_space(6.0);
+                    if ui.button(tr("Don't save")).clicked() { discard = true; }
+                    ui.add_space(6.0);
+                    if ui.button(tr("Cancel")).clicked() { cancel = true; }
+                });
+            });
+        if save {
+            if let Some(pending) = self.pending_project.as_mut() {
+                pending.after_save = true;
+            }
+            self.save_project(ctx);
+        } else if discard {
+            if let Some(pending) = self.pending_project.take() {
+                self.run_project_action(pending.action);
+            }
+        } else if cancel {
+            self.pending_project = None;
+        }
+    }
+
+    /// Keep the session file in step with the list: looked at every second
+    /// and a half, and at once when the window closes.
+    fn persist_session(&mut self, ctx: &egui::Context) {
+        let closing = ctx.input(|i| i.viewport().close_requested());
+        if !closing && self.session_checked_at.elapsed() < std::time::Duration::from_millis(1500) {
+            return;
+        }
+        self.write_session();
+    }
+
+    /// Write the session file if the list is not what it holds.
+    fn write_session(&mut self) {
+        self.session_checked_at = std::time::Instant::now();
+        // Not before the last session has been put back: it would be
+        // written over with an empty list.
+        if self.pending_session.is_some() {
+            return;
+        }
+        let mut session = self.project_snapshot(self.project_base().as_deref());
+        session.project_file = self.project_path.clone();
+        if self.session_saved.as_ref() == Some(&session) {
+            return;
+        }
+        let Some(path) = crate::project::session_path() else { return };
+        match crate::project::save(&session, &path) {
+            Ok(()) => {
+                self.session_saved = Some(session);
+                self.session_error = None;
+            }
+            // Not marked as written: the next look tries again (a file that
+            // was held by another program for a moment must not cost the
+            // last changes).
+            Err(e) => {
+                if self.session_error.as_ref() != Some(&e) {
+                    tracing::warn!("session: {e}");
+                }
+                self.session_error = Some(e);
+            }
+        }
+    }
+
+    /// A clip load starts: leave the mark that a launch which finds it
+    /// reads as "died loading" (`project::GuardStage`).
+    fn arm_session_guard(&mut self) {
+        use crate::project::GuardStage;
+        if self.session_guard != Some(GuardStage::Loading) {
+            GuardStage::Loading.leave();
+            self.session_guard = Some(GuardStage::Loading);
+        }
+    }
+
+    /// The clip shows, or the app closes in order: the mark goes.
+    fn clear_session_guard(&mut self) {
+        if self.session_guard.take().is_some() {
+            crate::project::GuardStage::clear();
+        }
+    }
+
+    /// The marks' upkeep, once a frame: a clip that shows has loaded, and
+    /// a list that has been drawn a few times is back.
+    fn tend_session_guard(&mut self) {
+        use crate::project::GuardStage;
+        if self.session_guard == Some(GuardStage::Loading) && self.current_display.is_some() {
+            self.clear_session_guard();
+        }
+        if let Some(frames) = self.session_restore_frames.as_mut() {
+            *frames += 1;
+            if *frames >= 3 {
+                self.session_restore_frames = None;
+                if self.session_guard == Some(GuardStage::Restoring) {
+                    self.clear_session_guard();
+                }
+            }
+        }
+    }
+}
+
 impl eframe::App for App {
     // eframe 0.34 made `ui` the required method and deprecated `update`.
     // Our UI builds multiple panels (top/side/central) directly from
@@ -6801,6 +7978,11 @@ impl eframe::App for App {
     /// the verified silent installer now; it replaces our files and
     /// relaunches the app (windows.iss `[Run] Check: WizardSilent`).
     fn on_exit(&mut self) {
+        // Closed in order: the list as it stands, and no mark of a load
+        // that never showed.
+        self.sync_active_clip_settings();
+        self.write_session();
+        self.clear_session_guard();
         #[cfg(target_os = "windows")]
         if let Some(staged) = self.pending_update_install.take() {
             match crate::updater::spawn_installer(&staged) {
@@ -6829,6 +8011,20 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Mirror the chosen language into the process global that `tr` reads.
         set_cur_lang(self.lang);
+        // The last session's list, once: its clip goes on screen unless the
+        // last launch died loading one, or files were named to open now.
+        self.tend_session_guard();
+        if let Some(session) = self.pending_session.take() {
+            // Marked while the list goes back and is first drawn: a session
+            // that kills the app doing so is not walked into again.
+            crate::project::GuardStage::Restoring.leave();
+            self.session_guard = Some(crate::project::GuardStage::Restoring);
+            self.session_restore_frames = Some(0);
+            let file = session.project_file.clone();
+            let autoload = !self.session_no_autoload && self.pending_open.is_empty();
+            self.apply_project(session, file, autoload, false);
+        }
+        self.poll_restore(ctx);
         if !self.pending_open.is_empty() {
             let paths = std::mem::take(&mut self.pending_open);
             self.open_paths(paths);
@@ -6904,6 +8100,7 @@ impl eframe::App for App {
         // Import merge/individual prompt (shown when a multi-file recording
         // is picked). Modal-ish: it sits on top until resolved.
         self.draw_import_prompt(ctx);
+        self.draw_project_prompt(ctx);
         // Keep repainting while a run is mid-flight so completion chaining +
         // the export-bar progress update without waiting for mouse input.
         if self.batch_running {
@@ -6932,8 +8129,12 @@ impl eframe::App for App {
         let mut pending_trim_in:  Option<Option<f64>> = None;
         let mut pending_trim_out: Option<Option<f64>> = None;
         let mut pending_snapshot = false;
+        let mut pending_project_save = false;
         if !ctx.wants_keyboard_input() {
             ctx.input(|i| {
+                if i.key_pressed(egui::Key::S) && (i.modifiers.command || i.modifiers.ctrl) {
+                    pending_project_save = true;
+                }
                 // S — snapshot the frame on screen. (Stop has no hotkey: the
                 // old plain-S stop tore the decoder down mid-session by
                 // accident too easily; the ■ Stop button remains.)
@@ -6962,6 +8163,9 @@ impl eframe::App for App {
         if let Some(t) = pending_trim_in  { self.set_trim_in(t); }
         if let Some(t) = pending_trim_out { self.set_trim_out(t); }
         if pending_snapshot { self.request_snapshot(); }
+        if pending_project_save && !self.batch.is_empty() && !self.batch_running && self.export_job.is_none() {
+            self.save_project(ctx);
+        }
 
         // ─── Top toolbar (file + preview-size only; transport is bottom) ─
         egui::TopBottomPanel::top("toolbar")
@@ -7010,6 +8214,30 @@ impl eframe::App for App {
                     if ui.button(tr("Load video…")).clicked() {
                         self.pick_and_load_file(ctx);
                     }
+                    // The list as a project file (not while exporting: the
+                    // run reads the list).
+                    let project_label = match self.project_path.as_ref().and_then(|p| p.file_stem()) {
+                        Some(name) => format!("{}: {}", tr("Project"), name.to_string_lossy()),
+                        None => tr("Project").to_string(),
+                    };
+                    let idle = !self.batch_running && self.export_job.is_none();
+                    let has_clips = !self.batch.is_empty();
+                    let (mut new, mut open, mut save, mut save_as) = (false, false, false, false);
+                    ui.add_enabled_ui(idle, |ui| {
+                        ui.menu_button(project_label, |ui| {
+                            if ui.button(tr("New project")).clicked() { new = true; ui.close_menu(); }
+                            if ui.button(tr("Open project…")).clicked() { open = true; ui.close_menu(); }
+                            ui.separator();
+                            ui.add_enabled_ui(has_clips, |ui| {
+                                if ui.button(tr("Save project")).clicked() { save = true; ui.close_menu(); }
+                                if ui.button(tr("Save project as…")).clicked() { save_as = true; ui.close_menu(); }
+                            });
+                        }).response.on_hover_text(tr(PROJECT_HOVER));
+                    });
+                    if new { self.request_project(ProjectAction::New); }
+                    if open { self.pick_project_open(ctx); }
+                    if save { self.save_project(ctx); }
+                    if save_as { self.pick_project_save(ctx); }
                     // Language toggle (EN / 中文), persisted.
                     ui.separator();
                     if ui.selectable_label(cur_lang() == Lang::En, "EN").clicked() {
@@ -7109,10 +8337,17 @@ impl eframe::App for App {
 
                         // Export progress badge in the right corner —
                         // only when a job is in flight.
+                        let mut stop_run = false;
                         if let Some(job) = &self.export_job {
                             ui.separator();
                             if ui.small_button(tr("Cancel")).clicked() {
-                                job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                                // A run that writes one file has no file
+                                // without this clip: the run stops.
+                                if self.join_run.is_some() {
+                                    stop_run = true;
+                                } else {
+                                    job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                                }
                             }
                             if let Some(p) = job.last_progress {
                                 let pct = if p.total_frames > 0 {
@@ -7133,6 +8368,9 @@ impl eframe::App for App {
                                 ui.label(RichText::new(tr("starting…"))
                                     .small().color(Color32::from_rgb(255, 176, 100)));
                             }
+                        }
+                        if stop_run {
+                            self.stop_batch();
                         }
                     });
                 });
@@ -7664,6 +8902,7 @@ impl eframe::App for App {
         self.maybe_push_settings();
         // Remember settings across launches (debounced; flushes on close).
         self.persist_settings(ctx);
+        self.persist_session(ctx);
 
         // Keep the UI awake whenever a decoder is running so the next
         // frame draws without waiting for a user input event. The worker
@@ -8177,9 +9416,17 @@ impl App {
         let mut toggle_select: Option<usize> = None;
         let mut do_apply_all = false;
 
+        // The order of the list is the order of a joined export: a clip is
+        // dragged to another place by its handle.
+        let list_id = egui::Id::new("source_clip_list");
+        let reorder = self.batch.len() > 1;
+        let mut moved: Option<crate::reorder::Move> = None;
         if !self.batch.is_empty() {
             for (i, item) in self.batch.iter().enumerate() {
-                ui.horizontal(|ui| {
+                let row = ui.horizontal(|ui| {
+                    if reorder {
+                        crate::reorder::handle(ui, list_id, i).on_hover_text(tr("Drag to change the order"));
+                    }
                     // Multi-select checkbox → drives "Export selected".
                     let mut sel = item.selected;
                     if ui.checkbox(&mut sel, "")
@@ -8195,14 +9442,30 @@ impl App {
                     let label = if active {
                         RichText::new(format!("▶ {name}")).strong()
                             .color(Color32::from_rgb(255, 200, 120))
-                    } else {
+                    } else if item.ready() {
                         RichText::new(format!("   {name}"))
+                    } else {
+                        RichText::new(format!("   {name}")).color(Color32::GRAY)
+                    };
+                    let hover = match &item.offline {
+                        None => tr("Click to make this the active clip").to_string(),
+                        Some(off) if off.looking => item.path.display().to_string(),
+                        Some(_) => format!("{}\n{}", item.path.display(), tr("The file was not found where the project says it is. Click to look again.")),
                     };
                     if ui.add(egui::Label::new(label).sense(egui::Sense::click()))
-                        .on_hover_text(tr("Click to make this the active clip"))
+                        .on_hover_text(hover)
                         .clicked() && !active
                     {
                         select_idx = Some(i);
+                    }
+                    // A clip of a project whose file is not at hand.
+                    if let Some(off) = &item.offline {
+                        let (text, col) = if off.looking {
+                            (tr("looking…"), Color32::GRAY)
+                        } else {
+                            (tr("missing"), Color32::from_rgb(230, 160, 90))
+                        };
+                        ui.label(RichText::new(text).small().color(col));
                     }
                     // Status chip (only interesting once exports ran).
                     if item.status != BatchStatus::Idle {
@@ -8229,7 +9492,12 @@ impl App {
                             requeue_idx = Some(i);
                         }
                     });
-                });
+                }).response.rect;
+                if reorder {
+                    if let Some(m) = crate::reorder::drop_target(ui, list_id, i, row) {
+                        moved = Some(m);
+                    }
+                }
             }
             ui.add_space(2.0);
         }
@@ -8264,6 +9532,7 @@ impl App {
             });
         }
 
+        if let Some(m) = moved { self.move_clip(m); }
         if let Some(i) = select_idx { self.select_clip(i); }
         if let Some(i) = remove_idx { self.remove_clip(i); }
         if let Some(i) = toggle_select {
@@ -8272,8 +9541,9 @@ impl App {
         if let Some(i) = requeue_idx {
             if let Some(item) = self.batch.get_mut(i) {
                 // Mid-run a re-armed clip joins the current run; otherwise it
-                // waits for the next Export.
-                item.status = if self.batch_running {
+                // waits for the next Export. (A run that writes one file is
+                // the clips it started with.)
+                item.status = if self.batch_running && self.join_run.is_none() {
                     BatchStatus::Queued
                 } else {
                     BatchStatus::Idle
@@ -8288,7 +9558,8 @@ impl App {
             self.sync_active_clip_settings();
             if let Some(class) = self.active_clip.and_then(|a| self.batch.get(a)).map(BatchItem::settings_class) {
                 for i in 0..self.batch.len() {
-                    if self.batch[i].settings_class() == class {
+                    // (A clip whose file is away has no type to go by.)
+                    if self.batch[i].ready() && self.batch[i].settings_class() == class {
                         self.apply_current_settings_to_item(i);
                     }
                 }
@@ -8339,6 +9610,42 @@ impl App {
                     .small().color(Color32::GRAY));
             }
             _ => {}
+        }
+    }
+
+    /// Put a clip of the list in another place; what points into the list
+    /// by place follows.
+    fn move_clip(&mut self, m: crate::reorder::Move) {
+        if m.from >= self.batch.len() || m.to >= self.batch.len() || m.from == m.to {
+            return;
+        }
+        m.apply(&mut self.batch);
+        self.active_clip = self.active_clip.map(|i| m.place_of(i));
+        self.batch_current = self.batch_current.map(|i| m.place_of(i));
+        for i in &mut self.batch_run_indices {
+            *i = m.place_of(*i);
+        }
+    }
+
+    /// Why a joined export did not start, or ended without its file: said
+    /// in a window of its own, until the user has read it.
+    fn draw_join_notice(&mut self, ctx: &egui::Context) {
+        let Some(note) = self.join_notice.clone() else { return };
+        let mut close = false;
+        egui::Window::new(tr("Join into one file"))
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label(note);
+                ui.add_space(10.0);
+                if ui.button("OK").clicked() {
+                    close = true;
+                }
+            });
+        if close {
+            self.join_notice = None;
         }
     }
 

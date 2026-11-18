@@ -78,6 +78,10 @@ Studio).
   life size (90° wide, 80° tall).
 - **Batch**: load many clips, tune each (or apply one setup to all), and
   export from one queue with progress, ETA and a completion notification.
+- **Join and projects**: write several clips as one file, in the order of
+  the list (drag to reorder), with hard cuts and no second encode. The list
+  comes back the next time the app starts, and can be saved as a project
+  file.
 - **English / 简体中文**, live toggle.
 
 ## Quick start
@@ -89,7 +93,8 @@ Studio).
    (`I` / `O`). With a numeric field selected, **↑ / ↓** steps it precisely.
 3. **Export** — pick the output folder and **Format** (VR180 SBS or
    Reframed, resolution, codec, metadata, audio) in the bottom bar, then
-   **Export selected** or **Export all**.
+   **Export selected** or **Export all**. Tick **Join into one file** to
+   get the clips as one video instead of one each.
 
 ## Build from source
 
