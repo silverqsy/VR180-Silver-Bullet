@@ -4225,26 +4225,17 @@ impl App {
         } else {
             vr180_pipeline::fisheye_export::LensFrameOut::Off
         };
-        let projection = match settings.fisheye_output_mode {
-            crate::decoder::FisheyeOutputMode::HalfEquirect =>
-                vr180_pipeline::fisheye_export::FisheyeExportProjection::HalfEquirect,
-            crate::decoder::FisheyeOutputMode::Fisheye =>
-                vr180_pipeline::fisheye_export::FisheyeExportProjection::Fisheye,
-            crate::decoder::FisheyeOutputMode::Reframe => {
-                // The exact viewport at the chosen per-eye size and aspect
-                // (overrides the VR180 resolution targets above); the
-                // still-only sizes never reach a video export.
-                let (w, h) = opts.reframe_size
-                    .clamped(source_kind.is_still(), settings.reframe_aspect)
-                    .eye_dims(settings.reframe_aspect);
-                eye_w = w;
-                eye_h = h;
-                vr180_pipeline::fisheye_export::FisheyeExportProjection::Reframe {
-                    hfov_deg: settings.reframe_hfov_deg,
-                    defish: settings.reframe_defish,
-                }
-            }
-        };
+        let projection = settings.export_projection();
+        if settings.fisheye_output_mode == crate::decoder::FisheyeOutputMode::Reframe {
+            // The exact viewport at the chosen per-eye size and aspect
+            // (overrides the VR180 resolution targets above); the
+            // still-only sizes never reach a video export.
+            let (w, h) = opts.reframe_size
+                .clamped(source_kind.is_still(), settings.reframe_aspect)
+                .eye_dims(settings.reframe_aspect);
+            eye_w = w;
+            eye_h = h;
+        }
         // Fisheye output is a CIRCLE in a SQUARE frame — force eye_h = eye_w
         // so SBS becomes (2*side × side). For OSV (3840×3840) this is a
         // no-op; for non-square sources it picks the smaller side so

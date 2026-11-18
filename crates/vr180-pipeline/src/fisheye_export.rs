@@ -15,7 +15,8 @@ use crate::fisheye_decode::{
     BrawFisheyeIter, DualStreamFisheyeIter, FisheyePair, FisheyePairIter,
     SbsFisheyeIter, SegmentedFisheyeIter,
 };
-use crate::gpu::{ColorStackPlan, Device, EquirectRotation, EyePicture, EyeProjection, FisheyeCalib, EyeMatchFrame};
+use crate::gpu::{ColorStackPlan, Device, EquirectRotation, FisheyeCalib, EyeMatchFrame};
+use crate::render::EyeJob;
 use crate::source_kind::SourceKind;
 use crate::{Error, Result};
 
@@ -2065,41 +2066,6 @@ enum FrameSink {
     Readback,
 }
 
-/// What projecting one frame's eyes takes besides the frame itself.
-struct EyeJob<'a> {
-    /// One eye's size in the source.
-    src_w: u32,
-    src_h: u32,
-    /// One eye's size in the output.
-    eye_w: u32,
-    eye_h: u32,
-    pose: &'a crate::render::FramePose,
-    calib_left: FisheyeCalib,
-    calib_right: FisheyeCalib,
-    /// The eyes' calibrations before the view was put on them
-    /// ([`resolve_source_calib_pair`]): what a raw frame's reference is
-    /// drawn through.
-    source_calib: (FisheyeCalib, FisheyeCalib),
-    projection: FisheyeExportProjection,
-    /// The source holds one eye: it is projected once and stands for both.
-    /// (A frame held as pictures knows it by its own missing right eye;
-    /// only the surface-backed frames, which are macOS's, read this.)
-    #[allow(dead_code)]
-    mono: bool,
-}
-
-impl EyeJob<'_> {
-    fn fisheye_out(&self) -> bool {
-        self.projection == FisheyeExportProjection::Fisheye
-    }
-
-    /// The per-row matrices of both eyes (rolling-shutter correction needs
-    /// both or none).
-    fn rows(&self) -> (Option<&[f32]>, Option<&[f32]>) {
-        crate::gpu::rows_for_both(self.pose.rows_left.as_deref(), self.pose.rows_right.as_deref())
-    }
-}
-
 /// One decoded frame of a fisheye source, however its eyes are held.
 trait EyeFrame {
     fn pts_s(&self) -> f64;
@@ -2145,41 +2111,20 @@ impl FrameFeed for Box<dyn FisheyePairIter> {
 impl EyeFrame for FisheyePair {
     fn pts_s(&self) -> f64 { self.pts_s }
 
+    /// Upload slots 10 / 11: an export's own, apart from the preview's 0 / 1
+    /// and a still's 20 / 21. A pair of one eye says so itself.
     fn project_8(&self, pipeline: &Device, job: &EyeJob) -> Option<Result<(wgpu::Texture, wgpu::Texture)>> {
-        // One eye of the pair (`slot`: the upload slot).
-        let eye = |bytes: &[u8], rot: EquirectRotation, calib: FisheyeCalib, rows: Option<&[f32]>, slot: u32| -> Result<wgpu::Texture> {
-            pipeline.project_eye(&EyeProjection::new(
-                EyePicture::Bytes8 { rgba: bytes, w: job.src_w, h: job.src_h, slot },
-                job.eye_w, job.eye_h, rot, calib,
-            ).fisheye_out(job.fisheye_out()).rs_rows(rows))
-        };
-        let both = || -> Result<(wgpu::Texture, wgpu::Texture)> {
-            let (rs_l, rs_r) = job.rows();
-            let left = eye(&self.left, job.pose.rot_left, job.calib_left, rs_l, 10)?;
-            if self.single_eye() {
-                return Ok((left.clone(), left));
-            }
-            let right = eye(&self.right, job.pose.rot_right, job.calib_right, rs_r, 11)?;
-            Ok((left, right))
-        };
-        Some(both())
+        Some(EyeJob { mono: self.single_eye(), ..*job }.project_bytes_8(pipeline, &self.left, &self.right, (10, 11)))
     }
 
     fn project_16(&self, pipeline: &Device, job: &EyeJob) -> Result<(wgpu::Texture, wgpu::Texture)> {
-        build_eye_eq_16(
-            pipeline, self, job.src_w, job.src_h, job.eye_w, job.eye_h,
-            job.pose.rot_left, job.pose.rot_right, job.calib_left, job.calib_right,
-            job.projection, (job.pose.rows_left.as_deref(), job.pose.rows_right.as_deref()),
-        )
+        project_pair_16(pipeline, self, job)
     }
 
     fn develop_plan<'a>(
         &self, pipeline: &Device, plan: &'a ColorStackPlan, job: &EyeJob,
     ) -> Result<std::borrow::Cow<'a, ColorStackPlan>> {
-        plan_with_raw_reference(
-            pipeline, plan, self, job.projection, &job.calib_left, job.eye_w, job.eye_h,
-            job.source_calib, (job.pose.rot_left, job.pose.rot_right),
-            (job.pose.rows_left.as_deref(), job.pose.rows_right.as_deref()), job.mono)
+        plan_with_raw_reference(pipeline, plan, self, job)
     }
 }
 
@@ -2201,30 +2146,20 @@ impl EyeFrame for crate::fisheye_decode::ZcMacFrame {
         None
     }
 
-    /// Each eye straight from the planes of its decoded surface (the
-    /// Y'CbCr → RGB conversion is in the projection kernel): no resolve,
-    /// no upload. Per-row rolling-shutter correction works on the source
-    /// ray, so it is the same for both output projections.
+    /// Each eye straight from the planes of its decoded surface
+    /// ([`EyeJob::project_planes`]). Per-row rolling-shutter correction
+    /// works on the source ray, so it is the same for both output
+    /// projections.
     fn project_16(&self, pipeline: &Device, job: &EyeJob) -> Result<(wgpu::Texture, wgpu::Texture)> {
         use crate::fisheye_decode::ZcMacFrame;
-        let eye_from_planes = |y: &wgpu::Texture, uv: &wgpu::Texture, rot: EquirectRotation,
-                               calib: FisheyeCalib, rows: Option<&[f32]>| -> Result<wgpu::Texture> {
-            let (y, uv) = (y.create_view(&Default::default()), uv.create_view(&Default::default()));
-            pipeline.project_eye(&EyeProjection::new(
-                EyePicture::Planes { y: &y, uv: &uv }, job.eye_w, job.eye_h, rot, calib,
-            ).wide().fisheye_out(job.fisheye_out()).rs_rows(rows))
-        };
-        let (rs_l, rs_r) = job.rows();
         match self {
-            // Dual-stream: each eye has its own surface.
-            ZcMacFrame::Pair(pair) => {
-                let l = eye_from_planes(&pair.left_y.texture, &pair.left_uv.texture, job.pose.rot_left, job.calib_left, rs_l)?;
-                // A single-eye source: the one eye is the frame.
-                let r = if job.mono { l.clone() } else {
-                    eye_from_planes(&pair.right_y.texture, &pair.right_uv.texture, job.pose.rot_right, job.calib_right, rs_r)?
-                };
-                Ok((l, r))
-            }
+            // Dual-stream: each eye has its own surface. (A single-eye
+            // source: the one eye is the frame, as the job says.)
+            ZcMacFrame::Pair(pair) => job.project_planes(
+                pipeline,
+                (&pair.left_y.texture, &pair.left_uv.texture),
+                (&pair.right_y.texture, &pair.right_uv.texture),
+            ),
             // Generic SBS: the kernels sample each eye IN PLACE from the
             // whole-frame planes, one eye per dispatch. `src_x0` / `src_y0`
             // select the eye's sub-rectangle and every tap is clamped to it
@@ -2246,11 +2181,9 @@ impl EyeFrame for crate::fisheye_decode::ZcMacFrame {
                     r.yuv_mat = f.yuv_mat;
                     (l, r)
                 };
-                let (y, uv) = (&f.frame_y.texture, &f.frame_uv.texture);
-                Ok((
-                    eye_from_planes(y, uv, job.pose.rot_left, cal_l, rs_l)?,
-                    eye_from_planes(y, uv, job.pose.rot_right, cal_r, rs_r)?,
-                ))
+                let planes = (&f.frame_y.texture, &f.frame_uv.texture);
+                // Both halves of the frame, always: such a source has two eyes.
+                EyeJob { calib_left: cal_l, calib_right: cal_r, mono: false, ..*job }.project_planes(pipeline, planes, planes)
             }
         }
     }
@@ -2459,16 +2392,7 @@ fn project_texture_eyes_16(
     right: &wgpu::Texture,
     job: &EyeJob,
 ) -> Result<(wgpu::Texture, wgpu::Texture)> {
-    let (rows_l, rows_r) = job.rows();
-    let (view_l, view_r) = (left.create_view(&Default::default()), right.create_view(&Default::default()));
-    let eye = |view, rot, calib, rows, slot| {
-        EyeProjection::new(EyePicture::Rgba(view), job.eye_w, job.eye_h, rot, calib)
-            .wide().fisheye_out(job.fisheye_out()).rs_rows(rows).slot(slot)
-    };
-    pipeline.project_eyes(
-        &eye(&view_l, job.pose.rot_left, job.calib_left, rows_l, 30),
-        Some(&eye(&view_r, job.pose.rot_right, job.calib_right, rows_r, 31)),
-    )
+    job.project_textures(pipeline, left, right, crate::render::EyeDepth::Wide, (30, 31))
 }
 
 /// The frame loop of a fisheye export, from the opened decoder to the
@@ -4955,92 +4879,42 @@ const RAW_REFERENCE_SLOT: u32 = 40;
 /// half-equirect would be. Any other clip, and the half-equirect itself
 /// (its own eyes are the reference), keep `plan` as it is.
 ///
-/// `source_calib`: the eyes' calibrations before the view
-/// ([`resolve_source_calib_pair`]); `view_calib`: one eye's with the view,
-/// for a frame `eye_w × eye_h`; `rot`, `rs`: the frame's rotations and
-/// per-row matrices, as [`build_eye_eq_16`] takes them; `single_eye`: the
-/// frame written is one eye (the left), and so is its reference.
-#[allow(clippy::too_many_arguments)]
+/// `job`: the frame's projection, whose view calibration, size, rotations
+/// and per-row matrices the reference is drawn with; `job.mono`: the frame
+/// written is one eye (the left), and so is its reference.
 pub(crate) fn plan_with_raw_reference<'a>(
     pipeline: &Device,
     plan: &'a ColorStackPlan,
     pair: &FisheyePair,
-    projection: FisheyeExportProjection,
-    view_calib: &FisheyeCalib,
-    eye_w: u32, eye_h: u32,
-    source_calib: (FisheyeCalib, FisheyeCalib),
-    rot: (EquirectRotation, EquirectRotation),
-    rs: (Option<&[f32]>, Option<&[f32]>),
-    single_eye: bool,
+    job: &EyeJob,
 ) -> Result<std::borrow::Cow<'a, ColorStackPlan>> {
     let eyes = match pair.gpu.as_deref() {
-        Some(g) if plan.raw_develop.is_some() && projection != FisheyeExportProjection::HalfEquirect => g,
+        Some(g) if plan.raw_develop.is_some() && job.projection != FisheyeExportProjection::HalfEquirect => g,
         _ => return Ok(std::borrow::Cow::Borrowed(plan)),
     };
     let reference = crate::render::raw_view_reference(
-        pipeline, (&eyes.left, &eyes.right), single_eye, view_calib, (eye_w, eye_h),
-        projection == FisheyeExportProjection::Fisheye, source_calib, rot, rs, RAW_REFERENCE_SLOT)?;
+        pipeline, (&eyes.left, &eyes.right), job.mono, &job.calib_left, (job.eye_w, job.eye_h),
+        job.fisheye_out(), job.source_calib, (job.pose.rot_left, job.pose.rot_right),
+        (job.pose.rows_left.as_deref(), job.pose.rows_right.as_deref()), RAW_REFERENCE_SLOT)?;
     let mut plan = plan.clone();
     plan.raw_reference = Some(reference);
     Ok(std::borrow::Cow::Owned(plan))
 }
 
-/// Build a per-eye `Rgba16Unorm` half-equirect (or normalized fisheye)
-/// for the 10-bit export paths. Honors `projection`:
-///   - HalfEquirect → run KB → equirect projection on the GPU.
-///   - Fisheye → KB → normalized equidistant fisheye on the GPU (8-bit
-///     source widened to 16-bit (each byte twice: 255 is 65535); no precision is gained,
-///     but the texture format matches the P010 compose path).
-///
-/// `rs` = optional per-row rolling-shutter matrices for THIS frame
-/// (`pack_per_row_camera_matrices` layout). When set, each eye is
-/// uploaded once as Rgba16Unorm and projected through the RS-capable
-/// rgba16 kernels (the same ones the Windows readback path dispatches;
-/// slots 30/31 = export, distinct from preview 0/1). `None` keeps the
-/// legacy byte-path projections — byte-identical to before.
-pub(crate) fn build_eye_eq_16(
-    pipeline: &Device,
-    pair: &FisheyePair,
-    src_w: u32, src_h: u32,
-    eye_w: u32, eye_h: u32,
-    rot_left: EquirectRotation,
-    rot_right: EquirectRotation,
-    calib_left: FisheyeCalib,
-    calib_right: FisheyeCalib,
-    projection: FisheyeExportProjection,
-    rs: (Option<&[f32]>, Option<&[f32]>),
-) -> Result<(wgpu::Texture, wgpu::Texture)> {
-    // One eye of the pair. A single-eye pair projects its one eye and
-    // returns it twice. With rows, the output is the one kept for `slot`.
-    let eye = |bytes: &[u8], rot: EquirectRotation, calib: FisheyeCalib, rows: Option<&[f32]>, slot: u32| -> Result<wgpu::Texture> {
-        let request = EyeProjection::new(
-            EyePicture::Bytes16 { bytes, bit_depth: pair.bit_depth, w: src_w, h: src_h },
-            eye_w, eye_h, rot, calib,
-        ).wide().fisheye_out(projection == FisheyeExportProjection::Fisheye).rs_rows(rows);
-        pipeline.project_eye(&if rows.is_some() { request.slot(slot) } else { request })
-    };
-    // Per-row RS needs both eyes' rows, as before.
-    let (rs_l, rs_r) = crate::gpu::rows_for_both(rs.0, rs.1);
-    // Eyes already on the GPU (a raw source demosaiced there): the same
-    // kernels, without the upload, into the outputs kept for the slots.
-    if let Some(g) = pair.gpu.as_deref() {
-        let eye = |tex: &wgpu::Texture, rot: EquirectRotation, calib: FisheyeCalib, rows: Option<&[f32]>, slot: u32| -> Result<wgpu::Texture> {
-            let view = tex.create_view(&Default::default());
-            pipeline.project_eye(&EyeProjection::new(EyePicture::Rgba(&view), eye_w, eye_h, rot, calib)
-                .wide().fisheye_out(projection == FisheyeExportProjection::Fisheye).rs_rows(rows).slot(slot))
-        };
-        let left = eye(&g.left, rot_left, calib_left, rs_l, 30)?;
-        if g.one_eye {
-            return Ok((left.clone(), left));
-        }
-        return Ok((left, eye(&g.right, rot_right, calib_right, rs_r, 31)?));
+/// Both eyes of a pair at 16 bits a channel (`Rgba16Unorm`), for the 10-bit
+/// export paths and the raw frame export. Eyes already on the GPU (a raw
+/// source demosaiced there) go straight through the kernels into the
+/// outputs kept for slots 30 / 31: an export's own, apart from a preview's
+/// 0 / 1. Decoded bytes are uploaded as 16-bit textures first (an 8-bit
+/// source widened: no precision is gained, but the format matches the
+/// 16-bit route), and written into those slots when the frame has per-row
+/// matrices. A pair of one eye projects it once and returns it twice.
+pub(crate) fn project_pair_16(pipeline: &Device, pair: &FisheyePair, job: &EyeJob) -> Result<(wgpu::Texture, wgpu::Texture)> {
+    let job = EyeJob { mono: pair.single_eye(), ..*job };
+    match pair.gpu.as_deref() {
+        Some(g) => job.project_textures(pipeline, &g.left, &g.right, crate::render::EyeDepth::Wide, (30, 31)),
+        None => job.project_bytes_16(pipeline, &pair.left, &pair.right, pair.bit_depth, (30, 31)),
     }
-    let left = eye(&pair.left, rot_left, calib_left, rs_l, 30)?;
-    if pair.single_eye() {
-        return Ok((left.clone(), left));
-    }
-    let right = eye(&pair.right, rot_right, calib_right, rs_r, 31)?;
-    Ok((left, right))
 }
 
 /// Apply the color stack from the CDL on to an Rgba8 SBS readback buffer.

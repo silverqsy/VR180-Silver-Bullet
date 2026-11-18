@@ -5,7 +5,8 @@
 //! comes from and where it goes. This module is the common part, growing
 //! one step at a time out of the arms that each carried a copy of it.
 
-use crate::gpu::EquirectRotation;
+use crate::fisheye_export::FisheyeExportProjection;
+use crate::gpu::{Device, EquirectRotation, EyePicture, EyeProjection, FisheyeCalib};
 use crate::panomap::ViewAdjust;
 use vr180_fisheye::DjiOsvImu;
 
@@ -66,6 +67,126 @@ impl FramePose {
     }
 }
 
+/// What projecting one frame's eyes takes besides the pictures themselves:
+/// the same request from an export, the live preview and a still. The
+/// `project_*` functions are the ways a frame holds its eyes; each makes
+/// the two eyes' requests ([`EyeProjection`]) and runs them.
+#[derive(Debug, Clone, Copy)]
+pub struct EyeJob<'a> {
+    /// One eye's size in the source: the size its picture is projected from.
+    pub src_w: u32,
+    pub src_h: u32,
+    /// One eye's size in the output.
+    pub eye_w: u32,
+    pub eye_h: u32,
+    pub pose: &'a FramePose,
+    pub calib_left: FisheyeCalib,
+    pub calib_right: FisheyeCalib,
+    /// The eyes' calibrations before the view was put on them: what a raw
+    /// frame's reference is drawn through.
+    pub source_calib: (FisheyeCalib, FisheyeCalib),
+    pub projection: FisheyeExportProjection,
+    /// The frame holds one eye, or is shown as one: the left is projected
+    /// and stands for both.
+    pub mono: bool,
+}
+
+/// The build an eye that is a texture goes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EyeDepth {
+    /// 16 bits a channel, whatever the texture holds: an export's 16-bit
+    /// route, and eyes that were resolved to 16 bits.
+    Wide,
+    /// The texture's own: a 16-bit eye (a raw take's, demosaiced) through
+    /// the 16-bit build, so that its linear values reach the colour stack
+    /// whole; an 8-bit one (a zero-copy Blackmagic RAW slot) through the
+    /// 8-bit build.
+    AsHeld,
+}
+
+impl<'a> EyeJob<'a> {
+    pub fn fisheye_out(&self) -> bool {
+        self.projection == FisheyeExportProjection::Fisheye
+    }
+
+    /// The per-row matrices of the two eyes: rolling-shutter correction is
+    /// applied to both eyes or to neither.
+    pub fn rows(&self) -> (Option<&'a [f32]>, Option<&'a [f32]>) {
+        let pose: &'a FramePose = self.pose;
+        crate::gpu::rows_for_both(pose.rows_left.as_deref(), pose.rows_right.as_deref())
+    }
+
+    /// The two eyes' requests for their pictures: 8 bits a channel into
+    /// textures of their own, which each `project_*` then widens or keeps.
+    fn requests<'p>(&self, left: EyePicture<'p>, right: EyePicture<'p>) -> (EyeProjection<'p>, EyeProjection<'p>)
+    where 'a: 'p {
+        let (rows_l, rows_r) = self.rows();
+        let eye = |picture, rotation, calib, rows| {
+            EyeProjection::new(picture, self.eye_w, self.eye_h, rotation, calib)
+                .fisheye_out(self.fisheye_out()).rs_rows(rows)
+        };
+        (
+            eye(left, self.pose.rot_left, self.calib_left, rows_l),
+            eye(right, self.pose.rot_right, self.calib_right, rows_r),
+        )
+    }
+
+    /// Both eyes projected, or the left alone standing for both.
+    fn run(&self, pipeline: &Device, left: &EyeProjection<'_>, right: &EyeProjection<'_>) -> crate::Result<(wgpu::Texture, wgpu::Texture)> {
+        pipeline.project_eyes(left, (!self.mono).then_some(right))
+    }
+
+    /// Eyes held as RGBA8 pixels in memory, through the 8-bit builds.
+    /// `upload`: the two eyes' upload slots (`EyePicture::Bytes8`): an
+    /// export, the live preview and a still each have a pair of their own,
+    /// since they run side by side.
+    pub fn project_bytes_8(&self, pipeline: &Device, left: &[u8], right: &[u8], upload: (u32, u32)) -> crate::Result<(wgpu::Texture, wgpu::Texture)> {
+        let (l, r) = self.requests(
+            EyePicture::Bytes8 { rgba: left, w: self.src_w, h: self.src_h, slot: upload.0 },
+            EyePicture::Bytes8 { rgba: right, w: self.src_w, h: self.src_h, slot: upload.1 },
+        );
+        self.run(pipeline, &l, &r)
+    }
+
+    /// Eyes held as pixels in memory (`bit_depth` 8 or 16), through the
+    /// 16-bit builds. A frame with per-row matrices writes the outputs kept
+    /// for the slots `out`; one without gets textures of its own.
+    pub fn project_bytes_16(&self, pipeline: &Device, left: &[u8], right: &[u8], bit_depth: u8, out: (u32, u32)) -> crate::Result<(wgpu::Texture, wgpu::Texture)> {
+        let (l, r) = self.requests(
+            EyePicture::Bytes16 { bytes: left, bit_depth, w: self.src_w, h: self.src_h },
+            EyePicture::Bytes16 { bytes: right, bit_depth, w: self.src_w, h: self.src_h },
+        );
+        fn kept<'p>(p: EyeProjection<'p>, slot: u32) -> EyeProjection<'p> {
+            if p.rs_rows.is_some() { p.wide().slot(slot) } else { p.wide() }
+        }
+        self.run(pipeline, &kept(l, out.0), &kept(r, out.1))
+    }
+
+    /// Eyes that are textures on the GPU. A 16-bit build writes the output
+    /// kept for its slot of `out`.
+    pub fn project_textures(&self, pipeline: &Device, left: &wgpu::Texture, right: &wgpu::Texture, depth: EyeDepth, out: (u32, u32)) -> crate::Result<(wgpu::Texture, wgpu::Texture)> {
+        // A frame of one eye has no right picture worth looking at.
+        let right = if self.mono { left } else { right };
+        let (view_l, view_r) = (left.create_view(&Default::default()), right.create_view(&Default::default()));
+        let (l, r) = self.requests(EyePicture::Rgba(&view_l), EyePicture::Rgba(&view_r));
+        fn build<'p>(p: EyeProjection<'p>, depth: EyeDepth, eye: &wgpu::Texture, slot: u32) -> EyeProjection<'p> {
+            if depth == EyeDepth::Wide || eye.format() == wgpu::TextureFormat::Rgba16Unorm { p.wide().slot(slot) } else { p }
+        }
+        self.run(pipeline, &build(l, depth, left, out.0), &build(r, depth, right, out.1))
+    }
+
+    /// Eyes that are decoded surfaces, each its luma plane and its chroma
+    /// plane, sampled in place (the Y'CbCr → RGB conversion is in the
+    /// kernel): no resolve, no upload. 16 bits a channel.
+    pub fn project_planes(&self, pipeline: &Device, left: (&wgpu::Texture, &wgpu::Texture), right: (&wgpu::Texture, &wgpu::Texture)) -> crate::Result<(wgpu::Texture, wgpu::Texture)> {
+        let right = if self.mono { left } else { right };
+        let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let (ly, luv, ry, ruv) = (view(left.0), view(left.1), view(right.0), view(right.1));
+        let (l, r) = self.requests(EyePicture::Planes { y: &ly, uv: &luv }, EyePicture::Planes { y: &ry, uv: &ruv });
+        self.run(pipeline, &l.wide(), &r.wide())
+    }
+}
+
 /// The frame a raw clip's view is developed from when that view is not the
 /// half-equirect ([`crate::raw_gpu::RawReference`]): the same moment as a
 /// half-equirect, turned as the view is, so that a reframed view or a lens
@@ -113,6 +234,55 @@ mod tests {
         assert_eq!(pose.rot_left.0, rot.0);
         assert_eq!(pose.rot_right.0, rot.0);
         assert!(pose.rows_left.is_none() && pose.rows_right.is_none());
+    }
+
+    fn job(pose: &FramePose, projection: FisheyeExportProjection) -> EyeJob<'_> {
+        let calib = FisheyeCalib::new(4.0, 4.0, 4.0, 3.0, [0.0; 4], 8.0, 6.0, 90.0);
+        EyeJob {
+            src_w: 8, src_h: 6, eye_w: 32, eye_h: 16, pose,
+            calib_left: calib, calib_right: calib, source_calib: (calib, calib),
+            projection, mono: false,
+        }
+    }
+
+    #[test]
+    fn the_two_eyes_are_asked_for_at_the_jobs_size_with_their_own_rotation() {
+        let (a, b) = (EquirectRotation([0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]), EquirectRotation::IDENTITY);
+        let pose = FramePose { rot_left: a, rot_right: b, rows_left: None, rows_right: None };
+        let (left, right) = (vec![0u8; 8 * 6 * 4], vec![0u8; 8 * 6 * 4]);
+        for (projection, fisheye) in [
+            (FisheyeExportProjection::HalfEquirect, false),
+            (FisheyeExportProjection::Fisheye, true),
+            (FisheyeExportProjection::Reframe { hfov_deg: 90.0, defish: 0.0 }, false),
+        ] {
+            let (l, r) = job(&pose, projection).requests(
+                EyePicture::Bytes8 { rgba: &left, w: 8, h: 6, slot: 0 },
+                EyePicture::Bytes8 { rgba: &right, w: 8, h: 6, slot: 1 });
+            for (eye, rot) in [(&l, a), (&r, b)] {
+                assert_eq!((eye.out_w, eye.out_h, eye.fisheye_out, eye.wide), (32, 16, fisheye, false));
+                assert_eq!(eye.rotation.0, rot.0);
+                assert_eq!(eye.output, crate::gpu::EyeOutput::New);
+                assert!(eye.rs_rows.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn rows_go_to_both_eyes_or_to_neither() {
+        let rows = vec![0.0f32; 12 * 6];
+        let with = |l: bool, r: bool| FramePose {
+            rot_left: EquirectRotation::IDENTITY, rot_right: EquirectRotation::IDENTITY,
+            rows_left: l.then(|| rows.clone()), rows_right: r.then(|| rows.clone()),
+        };
+        let bytes = vec![0u8; 8 * 6 * 4];
+        let picture = EyePicture::Bytes8 { rgba: &bytes, w: 8, h: 6, slot: 0 };
+        for (l, r, both) in [(true, true, true), (true, false, false), (false, true, false), (false, false, false)] {
+            let pose = with(l, r);
+            let job = job(&pose, FisheyeExportProjection::HalfEquirect);
+            let (a, b) = job.requests(picture, picture);
+            assert_eq!((a.rs_rows.is_some(), b.rs_rows.is_some()), (both, both), "left {l}, right {r}");
+            assert_eq!(job.rows().0.is_some(), both);
+        }
     }
 
     #[test]

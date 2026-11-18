@@ -354,41 +354,40 @@ impl FrameSource {
         crate::frame_timeline::stab_row(self.timeline.as_ref(), pair.pts_s, 1.0 / self.cfg.fps as f64, fallback)
     }
 
-    /// The frame's rotations and per-row matrices, eye by eye.
-    #[allow(clippy::type_complexity)]
-    fn motion(&self, row: usize) -> ((EquirectRotation, EquirectRotation), (Option<Vec<f32>>, Option<Vec<f32>>)) {
+    /// The frame's pose: each eye's rotation and per-row matrices.
+    fn pose(&self, row: usize) -> crate::render::FramePose {
         let cfg = &self.cfg;
         let rot = self.stab.as_ref().and_then(|v| v.get(row).copied()).unwrap_or(EquirectRotation::IDENTITY);
-        let (rl, rr) = crate::dji_imu::per_eye_rotations(rot, self.imu.as_ref(), row, cfg.fisheye_swap_eyes);
-        let (rl, rr) = if cfg.view_adjust.is_identity() { (rl, rr) } else {
-            let (vl, vr) = cfg.view_adjust.per_eye_matrices();
-            (EquirectRotation(crate::panomap::mat3_mul_row_major(&rl.0, &vl)), EquirectRotation(crate::panomap::mat3_mul_row_major(&rr.0, &vr)))
-        };
-        let rows = if cfg.stabilize && self.imu.is_some() && self.readout_s > 0.0 {
-            self.imu.as_ref().map(|osv| crate::dji_imu::per_eye_rs_rows(osv, row, self.readout_s, self.src.1, cfg.fps, cfg.fisheye_swap_eyes))
-                .unwrap_or((None, None))
-        } else { (None, None) };
-        ((rl, rr), rows)
+        crate::render::FramePose::new(
+            rot, self.imu.as_ref(), row, cfg.fisheye_swap_eyes, &cfg.view_adjust,
+            (cfg.stabilize && self.readout_s > 0.0).then(|| crate::render::RowReadout {
+                readout_s: self.readout_s, src_h: self.src.1, fps: cfg.fps,
+            }),
+        )
+    }
+
+    /// The frame's projection, as the export of the clip asks for it.
+    fn job<'a>(&self, pose: &'a crate::render::FramePose) -> crate::render::EyeJob<'a> {
+        let cfg = &self.cfg;
+        crate::render::EyeJob {
+            src_w: self.src.0, src_h: self.src.1, eye_w: cfg.eye_w, eye_h: cfg.eye_h, pose,
+            calib_left: self.calib.0, calib_right: self.calib.1, source_calib: self.source_calib,
+            projection: cfg.projection,
+            mono: crate::source_kind::is_single_eye(cfg.source_kind, &cfg.source_path),
+        }
     }
 
     /// The pair's two eyes as the export projects them, camera-linear.
     fn eyes(&self, pair: &FisheyePair, row: usize) -> Result<(wgpu::Texture, wgpu::Texture)> {
-        let cfg = &self.cfg;
-        let ((rl, rr), (rows_l, rows_r)) = self.motion(row);
-        crate::fisheye_export::build_eye_eq_16(
-            &self.pipeline, pair, self.src.0, self.src.1, cfg.eye_w, cfg.eye_h,
-            rl, rr, self.calib.0, self.calib.1, cfg.projection, (rows_l.as_deref(), rows_r.as_deref()))
+        let pose = self.pose(row);
+        crate::fisheye_export::project_pair_16(&self.pipeline, pair, &self.job(&pose))
     }
 
     /// The clip's colour plan for this frame: with the frame's reference
     /// where the view is not the half-equirect.
     fn plan(&self, pair: &FisheyePair, row: usize) -> Result<std::borrow::Cow<'_, crate::gpu::ColorStackPlan>> {
-        let cfg = &self.cfg;
-        let (rot, (rows_l, rows_r)) = self.motion(row);
-        let mono = crate::source_kind::is_single_eye(cfg.source_kind, &cfg.source_path);
-        crate::fisheye_export::plan_with_raw_reference(
-            &self.pipeline, &cfg.color_stack, pair, cfg.projection, &self.calib.0, cfg.eye_w, cfg.eye_h,
-            self.source_calib, rot, (rows_l.as_deref(), rows_r.as_deref()), mono)
+        let pose = self.pose(row);
+        crate::fisheye_export::plan_with_raw_reference(&self.pipeline, &self.cfg.color_stack, pair, &self.job(&pose))
     }
 
     /// Write the pair as a linear DNG.

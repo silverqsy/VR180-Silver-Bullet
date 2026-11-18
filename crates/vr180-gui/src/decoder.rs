@@ -31,6 +31,7 @@ use vr180_pipeline::gpu::{
 #[allow(unused_imports)]
 use vr180_pipeline::gpu::ColorStackPlan;
 use vr180_pipeline::gpu::{EyePicture, EyeProjection};
+use vr180_pipeline::render::{EyeDepth, EyeJob};
 
 pub(crate) mod preview_probe;
 
@@ -762,6 +763,21 @@ impl Settings {
     /// a swap on top of whatever the user chose).
     pub fn effective_swap_eyes(&self) -> bool {
         self.fisheye_swap_eyes ^ self.camera_upside_down
+    }
+
+    /// The view the eyes are projected into, as the pipeline names it: the
+    /// half-equirect, the fisheye (the disc or a lens frame), or the
+    /// reframed view with its field and its defish.
+    pub fn export_projection(&self) -> vr180_pipeline::fisheye_export::FisheyeExportProjection {
+        use vr180_pipeline::fisheye_export::FisheyeExportProjection;
+        match self.fisheye_output_mode {
+            FisheyeOutputMode::HalfEquirect => FisheyeExportProjection::HalfEquirect,
+            FisheyeOutputMode::Fisheye => FisheyeExportProjection::Fisheye,
+            FisheyeOutputMode::Reframe => FisheyeExportProjection::Reframe {
+                hfov_deg: self.reframe_hfov_deg,
+                defish: self.reframe_defish,
+            },
+        }
     }
 
     /// The view adjustment the projection composes after stabilization.
@@ -2341,24 +2357,6 @@ fn run_fisheye(
 /// What the decode thread of [`CpuFeed`] is told.
 enum SourceCmd { Seek(f64), BrawColor(vr180_braw::BrawColorParams) }
 
-/// One frame's projection, as the preview loop asks a feed for it.
-struct EyeView<'a> {
-    /// The size the eyes are projected from ([`PreviewFeed::source_dims`]).
-    src_w: u32,
-    src_h: u32,
-    out_w: u32,
-    out_h: u32,
-    fisheye_out: bool,
-    /// The frame shows one eye: the left projection stands for both.
-    one_eye: bool,
-    rot_left: EquirectRotation,
-    rot_right: EquirectRotation,
-    calib_left: vr180_pipeline::gpu::FisheyeCalib,
-    calib_right: vr180_pipeline::gpu::FisheyeCalib,
-    rows_left: Option<&'a [f32]>,
-    rows_right: Option<&'a [f32]>,
-}
-
 /// Where the fisheye preview's frames come from. The loop
 /// ([`run_fisheye_frames`]) is the same for every source: pacing, pause,
 /// seek, trim, the live stabilization and calibration, the pose, the colour
@@ -2388,8 +2386,9 @@ trait PreviewFeed {
     /// resolved for it and the per-row matrices have its rows. `reframe`: the
     /// view shows a part of the lens.
     fn source_dims(&self, reframe: bool) -> (u32, u32);
-    /// Project the frame in hand: both eyes, or the left one twice.
-    fn project(&mut self, pipeline: &Device, view: &EyeView<'_>) -> anyhow::Result<(wgpu::Texture, wgpu::Texture)>;
+    /// Project the frame in hand as `job` asks: both eyes, or the left one
+    /// twice.
+    fn project(&mut self, pipeline: &Device, job: &EyeJob<'_>) -> anyhow::Result<(wgpu::Texture, wgpu::Texture)>;
     /// The frame's eyes as camera-linear textures, where it has them (a raw
     /// take): what a view other than the half-equirect is developed from.
     fn raw_eyes(&self) -> Option<(&wgpu::Texture, &wgpu::Texture)> { None }
@@ -2482,39 +2481,21 @@ impl PreviewFeed for CpuFeed {
     fn one_eye(&self) -> bool { self.pair.as_ref().is_some_and(|p| p.single_eye()) }
     fn source_dims(&self, _reframe: bool) -> (u32, u32) { self.dims }
 
-    fn project(&mut self, pipeline: &Device, view: &EyeView<'_>) -> anyhow::Result<(wgpu::Texture, wgpu::Texture)> {
+    fn project(&mut self, pipeline: &Device, job: &EyeJob<'_>) -> anyhow::Result<(wgpu::Texture, wgpu::Texture)> {
         let pair = self.pair.as_ref().ok_or_else(|| anyhow::anyhow!("no frame in hand"))?;
-        let _ = _check_pair_dims(pair, view.src_w, view.src_h);
+        let _ = _check_pair_dims(pair, job.src_w, job.src_h);
         // Both projections take the per-row rolling-shutter correction: the
         // warp works on the source-frame direction, whatever the output.
-        // Eyes that are textures already correct each eye that has rows;
-        // decoded bytes correct both eyes or neither.
-        let gpu = pair.gpu.as_deref();
-        let (rows_l, rows_r) = if gpu.is_some() {
-            (view.rows_left.filter(|r| !r.is_empty()), view.rows_right.filter(|r| !r.is_empty()))
-        } else {
-            vr180_pipeline::gpu::rows_for_both(view.rows_left, view.rows_right)
-        };
-        let views = gpu.map(|g| (g.left.create_view(&Default::default()), g.right.create_view(&Default::default())));
-        let (pic_l, pic_r) = match &views {
-            Some((l, r)) => (EyePicture::Rgba(l), EyePicture::Rgba(r)),
-            None => (
-                EyePicture::Bytes8 { rgba: &pair.left, w: view.src_w, h: view.src_h, slot: 0 },
-                EyePicture::Bytes8 { rgba: &pair.right, w: view.src_w, h: view.src_h, slot: 1 },
-            ),
-        };
-        let left = EyeProjection::new(pic_l, view.out_w, view.out_h, view.rot_left, view.calib_left)
-            .fisheye_out(view.fisheye_out).rs_rows(rows_l);
-        let right = EyeProjection::new(pic_r, view.out_w, view.out_h, view.rot_right, view.calib_right)
-            .fisheye_out(view.fisheye_out).rs_rows(rows_r);
-        // A 16-bit eye on the GPU (a raw take's demosaiced eye) goes through
-        // the 16-bit build, so its linear values reach the colour stack at
-        // full precision, into the outputs kept for slots 0 / 1. An 8-bit
-        // one (a zero-copy Blackmagic RAW slot) keeps the 8-bit build.
-        let wide = |eye: &wgpu::Texture| eye.format() == wgpu::TextureFormat::Rgba16Unorm;
-        let left = if gpu.is_some_and(|g| wide(&g.left)) { left.wide().slot(0) } else { left };
-        let right = if gpu.is_some_and(|g| wide(&g.right)) { right.wide().slot(1) } else { right };
-        Ok(pipeline.project_eyes(&left, (!view.one_eye).then_some(&right))?)
+        Ok(match pair.gpu.as_deref() {
+            // Eyes on the GPU, each through the build of its own depth: a
+            // 16-bit one (a raw take's demosaiced eye), so that its linear
+            // values reach the colour stack at full precision, into the
+            // outputs kept for slots 0 / 1; an 8-bit one (a zero-copy
+            // Blackmagic RAW slot) through the 8-bit build.
+            Some(g) => job.project_textures(pipeline, &g.left, &g.right, EyeDepth::AsHeld, (0, 1))?,
+            // Decoded bytes, uploaded into slots 0 / 1: the preview's.
+            None => job.project_bytes_8(pipeline, &pair.left, &pair.right, (0, 1))?,
+        })
     }
 
     fn raw_eyes(&self) -> Option<(&wgpu::Texture, &wgpu::Texture)> {
@@ -2879,9 +2860,9 @@ fn run_fisheye_frames<F: PreviewFeed>(
         // stabilization (it goes with `stabilize`, not `rs_correct`), as on
         // the paused-still path. The readout is the source's own, or the
         // one its frame rate implies.
-        let (swapped_eyes, stabilize, view_adjust, mode, aspect, single_eye, auto_eye) = {
+        let (swapped_eyes, stabilize, view_adjust, mode, aspect, single_eye, auto_eye, projection) = {
             let s = control.settings.read();
-            (s.effective_swap_eyes(), s.stabilize, s.output_view_adjust(), s.fisheye_output_mode, s.reframe_aspect, s.single_eye, s.auto_eye_match)
+            (s.effective_swap_eyes(), s.stabilize, s.output_view_adjust(), s.fisheye_output_mode, s.reframe_aspect, s.single_eye, s.auto_eye_match, s.export_projection())
         };
         let readout_s = vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0;
         let pose = vr180_pipeline::render::FramePose::new(
@@ -2899,13 +2880,9 @@ fn run_fisheye_frames<F: PreviewFeed>(
         let phase_t1 = std::time::Instant::now();
         let one_eye = single_eye || feed.one_eye();
         let (out_w, out_h) = view_out_dims(mode, aspect, eye_w, eye_h, lens_dims);
-        let (left_tex, right_tex) = feed.project(&pipeline, &EyeView {
-            src_w, src_h, out_w, out_h,
-            fisheye_out: mode == FisheyeOutputMode::Fisheye,
-            one_eye,
-            rot_left: pose.rot_left, rot_right: pose.rot_right,
-            calib_left, calib_right,
-            rows_left: pose.rows_left.as_deref(), rows_right: pose.rows_right.as_deref(),
+        let (left_tex, right_tex) = feed.project(&pipeline, &EyeJob {
+            src_w, src_h, eye_w: out_w, eye_h: out_h, pose: &pose,
+            calib_left, calib_right, source_calib, projection, mono: one_eye,
         })?;
         let (preview_eye_w, preview_eye_h) = (left_tex.width(), left_tex.height());
         let phase_project = phase_t1.elapsed();
@@ -2998,31 +2975,6 @@ fn stab_diagnostic_line(
     let pitch = r21.atan2(r22).to_degrees();
     let roll = (-r10).asin().to_degrees();
     tracing::info!("f={frame_idx:>4} stab={stab_mag:>6.2}° (yaw={yaw:+6.2} pitch={pitch:+6.2} roll={roll:+6.2}) intra-Δ={intra_d:.3}°");
-}
-
-/// Project one eye that is already a GPU texture. An 8-bit eye (a zero-copy
-/// Blackmagic RAW slot) goes through the 8-bit kernels as before; a 16-bit
-/// one (a raw take's demosaiced eye) through the rgba16 kernels, so its
-/// linear values reach the colour stack at full precision. `slot` is the
-/// projection cache slot of those kernels (one per eye in flight).
-fn project_gpu_eye(
-    pipeline: &Device,
-    eye: &wgpu::Texture,
-    out_w: u32, out_h: u32,
-    rot: EquirectRotation,
-    calib: vr180_pipeline::gpu::FisheyeCalib,
-    rs_rows: Option<&[f32]>,
-    fisheye_out: bool,
-    slot: u32,
-) -> vr180_pipeline::Result<wgpu::Texture> {
-    let view = eye.create_view(&Default::default());
-    let request = EyeProjection::new(EyePicture::Rgba(&view), out_w, out_h, rot, calib)
-        .fisheye_out(fisheye_out).rs_rows(rs_rows.filter(|r| !r.is_empty()));
-    if eye.format() == wgpu::TextureFormat::Rgba16Unorm {
-        pipeline.project_eye(&request.wide().slot(slot))
-    } else {
-        pipeline.project_eye(&request)
-    }
 }
 
 /// Holds one source frame's GPU-resident resources alive together: the shared
@@ -3621,11 +3573,11 @@ impl PreviewFeed for VtFeed {
     fn pts_s(&self) -> f64 { self.held.as_ref().map_or(0.0, |f| f.pts_s()) }
     fn source_dims(&self, reframe: bool) -> (u32, u32) { if reframe { self.native } else { self.work } }
 
-    fn project(&mut self, pipeline: &Device, view: &EyeView<'_>) -> anyhow::Result<(wgpu::Texture, wgpu::Texture)> {
+    fn project(&mut self, pipeline: &Device, job: &EyeJob<'_>) -> anyhow::Result<(wgpu::Texture, wgpu::Texture)> {
         use vr180_pipeline::fisheye_decode::VtZcFisheyeFrame;
         let frame = self.held.as_ref().ok_or_else(|| anyhow::anyhow!("no frame in hand"))?;
         let (native_w, native_h) = self.native;
-        let (src_w, src_h) = (view.src_w, view.src_h);
+        let (src_w, src_h) = (job.src_w, job.src_h);
         // The eyes at the size they are projected from. The two resolves
         // keep their outputs in slots 0 and 1, which MUST differ: both eyes
         // have the same size. A frame of one eye resolves only its left.
@@ -3635,7 +3587,7 @@ impl PreviewFeed for VtFeed {
                     &p.left_y.texture, &p.left_uv.texture,
                     native_w, native_h, 0, 0, vr180_pipeline::gpu::YUV_RANGE_P010_LIMITED,
                     vr180_pipeline::gpu::YUV_MAT_BT709, src_w, src_h, 0)?;
-                let r = if view.one_eye { l.clone() } else { pipeline.resolve_p010_planes_to_rgba16(
+                let r = if job.mono { l.clone() } else { pipeline.resolve_p010_planes_to_rgba16(
                     &p.right_y.texture, &p.right_uv.texture,
                     native_w, native_h, 0, 0, vr180_pipeline::gpu::YUV_RANGE_P010_LIMITED,
                     vr180_pipeline::gpu::YUV_MAT_BT709, src_w, src_h, 1)? };
@@ -3660,15 +3612,9 @@ impl PreviewFeed for VtFeed {
             }
         };
         // The per-row correction works on the source ray, so it is the same
-        // for every output; both eyes take it or neither.
-        let (rows_l, rows_r) = vr180_pipeline::gpu::rows_for_both(view.rows_left, view.rows_right);
-        let (view_l, view_r) = (l_tex.create_view(&Default::default()), r_tex.create_view(&Default::default()));
-        // Outputs kept in slots 0 / 1: the preview's two eyes.
-        let left = EyeProjection::new(EyePicture::Rgba(&view_l), view.out_w, view.out_h, view.rot_left, view.calib_left)
-            .wide().fisheye_out(view.fisheye_out).rs_rows(rows_l).slot(0);
-        let right = EyeProjection::new(EyePicture::Rgba(&view_r), view.out_w, view.out_h, view.rot_right, view.calib_right)
-            .wide().fisheye_out(view.fisheye_out).rs_rows(rows_r).slot(1);
-        Ok(pipeline.project_eyes(&left, (!view.one_eye).then_some(&right))?)
+        // for every output. Outputs kept in slots 0 / 1: the preview's two
+        // eyes.
+        Ok(job.project_textures(pipeline, &l_tex, &r_tex, EyeDepth::Wide, (0, 1))?)
     }
 
     fn perf_cadence(&self) -> (u32, u32) { (10, 60) }
@@ -5888,9 +5834,7 @@ fn render_still_from_pair(
         .and_then(|v| v.get(stab_idx).copied())
         .unwrap_or(EquirectRotation::IDENTITY);
 
-    let vr180_pipeline::render::FramePose {
-        rot_left, rot_right, rows_left: rs_rows_l, rows_right: rs_rows_r,
-    } = vr180_pipeline::render::FramePose::new(
+    let pose = vr180_pipeline::render::FramePose::new(
         rot, imu, stab_idx, s.effective_swap_eyes(), &s.output_view_adjust(),
         (s.stabilize && stab_rotations.is_some()).then(|| vr180_pipeline::render::RowReadout {
             readout_s: vr180_pipeline::dji_imu::readout_ms_for(kind, fps, imu) / 1000.0,
@@ -5904,9 +5848,6 @@ fn render_still_from_pair(
     let raw_eyes = if pair.bit_depth == vr180_pipeline::x6_raw::MOSAIC_BIT_DEPTH {
         Some(vr180_pipeline::x6_raw::demosaic_pair(pipeline, pair, mosaic.unwrap_or(&vr180_pipeline::x6_raw::BAYER))?)
     } else { None };
-    let (eye_l, eye_r) = (raw_eyes.as_ref().map(|e| &e.0), raw_eyes.as_ref().map(|e| &e.1));
-    // Per-row correction needs both eyes' rows, as before.
-    let (rs_l, rs_r) = vr180_pipeline::gpu::rows_for_both(rs_rows_l.as_deref(), rs_rows_r.as_deref());
     let (left_tex, right_tex) = {
         let fisheye_out = s.fisheye_output_mode == FisheyeOutputMode::Fisheye;
         let (out_w, out_h) = if fisheye_out {
@@ -5921,24 +5862,19 @@ fn render_still_from_pair(
             out_eye.unwrap_or_else(||
                 preview_out_dims(s.fisheye_output_mode, s.reframe_aspect, oeq_w, oeq_h))
         };
-        // One eye through the build its source asks for: an eye already on
-        // the GPU (output slots 20 / 21), or the decoded bytes (upload slots
-        // 20 / 21: the still's own, apart from the preview's).
-        let project = |bytes: &[u8], eye: Option<&wgpu::Texture>, rot: EquirectRotation,
-                       calib: vr180_pipeline::gpu::FisheyeCalib, rows: Option<&[f32]>, slot: u32|
-            -> vr180_pipeline::Result<wgpu::Texture>
-        {
-            match eye {
-                Some(eye) => project_gpu_eye(pipeline, eye, out_w, out_h, rot, calib, rows, fisheye_out, slot),
-                None => pipeline.project_eye(&EyeProjection::new(
-                    EyePicture::Bytes8 { rgba: bytes, w: src_w, h: src_h, slot },
-                    out_w, out_h, rot, calib,
-                ).fisheye_out(fisheye_out).rs_rows(rows)),
-            }
+        let job = EyeJob {
+            src_w, src_h, eye_w: out_w, eye_h: out_h, pose: &pose,
+            calib_left, calib_right, source_calib: view.source,
+            projection: s.export_projection(), mono: one_eye,
         };
-        let l = project(&pair.left, eye_l, rot_left, calib_left, rs_l, 20)?;
-        let r = if one_eye { l.clone() } else { project(&pair.right, eye_r, rot_right, calib_right, rs_r, 21)? };
-        (l, r)
+        match raw_eyes.as_ref() {
+            // Eyes already on the GPU, through the build of their depth
+            // (output slots 20 / 21).
+            Some((l, r)) => job.project_textures(pipeline, l, r, EyeDepth::AsHeld, (20, 21))?,
+            // The decoded bytes (upload slots 20 / 21: the still's own,
+            // apart from the preview's).
+            None => job.project_bytes_8(pipeline, &pair.left, &pair.right, (20, 21))?,
+        }
     };
     let (ew, eh) = (left_tex.width(), left_tex.height());
     // A still is one frame: a fresh state measures it without history (the
@@ -5949,8 +5885,8 @@ fn render_still_from_pair(
     // A raw clip in a view that is not the half-equirect is developed from
     // the half-equirect of the same frame.
     let raw_reference = raw_view_reference(
-        pipeline, s, eye_l.zip(eye_r), one_eye, &calib_left, (ew, eh), view.source,
-        (rot_left, rot_right), (rs_l, rs_r), RAW_REFERENCE_SLOT_STILL)?;
+        pipeline, s, raw_eyes.as_ref().map(|e| (&e.0, &e.1)), one_eye, &calib_left, (ew, eh), view.source,
+        (pose.rot_left, pose.rot_right), (pose.rows_left.as_deref(), pose.rows_right.as_deref()), RAW_REFERENCE_SLOT_STILL)?;
     let (sbs, ow, oh) = compose_view_with_color_and_mode(
         pipeline, s, &left_tex, &right_tex, ew, eh,
         eye_match_state.as_ref().and_then(|st| eye_match_arg(st, kind, stab_idx, true)),
