@@ -311,6 +311,19 @@ impl FisheyeExportConfig {
 impl FisheyeExportConfig {
     /// What decides this export's two lens models (see [`crate::lens_model`]).
     /// A reframed view's shape is the eye frame's.
+    /// How this export's frames are posed ([`crate::render::Motion`]). The
+    /// correction cap is stored as 0 for "none".
+    pub fn motion(&self) -> crate::render::Motion {
+        crate::render::Motion {
+            stabilize: self.stabilize,
+            max_corr_deg: if self.dji_max_corr_deg > 0.0 { self.dji_max_corr_deg } else { f32::INFINITY },
+            smooth_ms: self.dji_smooth_ms,
+            responsiveness: self.dji_responsiveness,
+            view_adjust: self.view_adjust,
+            swap_eyes: self.fisheye_swap_eyes,
+        }
+    }
+
     pub fn lens_request(&self) -> crate::lens_model::LensRequest<'_> {
         use crate::lens_model::{EyeLensOverride, LensOutput, LensRequest};
         LensRequest {
@@ -2351,12 +2364,7 @@ fn export_row_readout(
     imu: Option<&vr180_fisheye::DjiOsvImu>,
     src_h: u32,
 ) -> Option<crate::render::RowReadout> {
-    let on = cfg.stabilize && cfg.source_kind.has_frame_imu() && imu.is_some();
-    on.then(|| crate::render::RowReadout {
-        readout_s: crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, imu) / 1000.0,
-        src_h,
-        fps: cfg.fps,
-    })
+    cfg.motion().row_readout(cfg.source_kind, imu, src_h, cfg.fps)
 }
 
 /// Both eyes of a frame whose pictures are 16-bit textures on the GPU (the
@@ -2408,24 +2416,11 @@ fn run_fisheye_frames<F: FrameFeed>(
     // were dropped. A chain indexes by absolute frame across its segments.
     let timeline = export_timeline(cfg);
     let total_clip_frames = timeline_frames_or(timeline.as_ref(), clip_slots);
-    let stab_rotations: Option<Vec<EquirectRotation>> = if cfg.stabilize {
-        match cfg.source_kind {
-            SourceKind::DjiOsv | SourceKind::Insta360Insv | SourceKind::KandaoQoocam | SourceKind::BlackmagicRaw | SourceKind::X6Raw => {
-                dji_osv_imu.as_ref().and_then(|osv| {
-                    // Slider=0 → legacy camera-lock (∞ cap, no
-                    // smoothing). User-set values activate the cap /
-                    // smoothing as in the preview.
-                    let max_corr = if cfg.dji_max_corr_deg > 0.0 {
-                        cfg.dji_max_corr_deg
-                    } else { f32::INFINITY };
-                    crate::dji_imu::compute_dji_stabilization(
-                        osv, total_clip_frames, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness,
-                    ).ok().map(|s| { let mut v = s.per_frame; crate::dji_imu::apply_lock_ref_diag(&mut v, cfg.dji_smooth_ms); v })
-                })
-            }
-            _ => None,
-        }
-    } else { None };
+    let motion = cfg.motion();
+    let stab_rotations: Option<Vec<EquirectRotation>> = motion
+        .stabilization(cfg.source_kind, dji_osv_imu.as_ref(), total_clip_frames, cfg.fps)
+        .and_then(|stab| stab.ok())
+        .map(|stab| { let mut v = stab.per_frame; crate::dji_imu::apply_lock_ref_diag(&mut v, cfg.dji_smooth_ms); v });
     tracing::info!(
         "{tag}: stab = {}",
         if stab_rotations.is_some() { "engaged" } else { "off" }
@@ -2576,9 +2571,7 @@ fn run_fisheye_frames<F: FrameFeed>(
         // Each eye's rotation (stab, then the view adjustment) and, when
         // stabilizing a source with an IMU, its per-row matrices (<200 KB
         // at 3840 rows, built on the CPU).
-        let pose = crate::render::FramePose::new(
-            rot, dji_osv_imu.as_ref(), stab_idx, cfg.fisheye_swap_eyes, &cfg.view_adjust, row_readout,
-        );
+        let pose = motion.pose(rot, dji_osv_imu.as_ref(), stab_idx, row_readout);
         let job = EyeJob {
             src_w, src_h, eye_w: cfg.eye_w, eye_h: cfg.eye_h, pose: &pose,
             calib_left, calib_right, source_calib, projection: cfg.projection, mono,

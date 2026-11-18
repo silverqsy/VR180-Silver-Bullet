@@ -295,7 +295,8 @@ struct FrameSource {
     stab: Option<Vec<EquirectRotation>>,
     timeline: Option<crate::frame_timeline::FrameTimeline>,
     src: (u32, u32),
-    readout_s: f32,
+    /// The clip holds one eye: a frame is that eye, not two side by side.
+    mono: bool,
 }
 
 impl FrameSource {
@@ -338,15 +339,11 @@ impl FrameSource {
         let frames = timeline.as_ref().map(|t| t.len()).filter(|n| *n > 0)
             .or_else(|| crate::decode::probe_video(&cfg.source_path).ok().map(|p| (p.duration_sec * p.fps as f64).round() as usize))
             .unwrap_or(1).max(1);
-        let stab = if cfg.stabilize {
-            imu.as_ref().and_then(|osv| {
-                let max_corr = if cfg.dji_max_corr_deg > 0.0 { cfg.dji_max_corr_deg } else { f32::INFINITY };
-                crate::dji_imu::compute_dji_stabilization(osv, frames, max_corr, cfg.dji_smooth_ms, cfg.fps, cfg.dji_responsiveness)
-                    .ok().map(|s| { let mut v = s.per_frame; crate::dji_imu::apply_lock_ref_diag(&mut v, cfg.dji_smooth_ms); v })
-            })
-        } else { None };
-        let readout_s = crate::dji_imu::readout_ms_for(cfg.source_kind, cfg.fps, imu.as_ref()) / 1000.0;
-        Ok(Self { pipeline, cfg: cfg.clone(), decoder, imu, source_calib, calib, stab, timeline, src, readout_s })
+        let stab = cfg.motion().stabilization(cfg.source_kind, imu.as_ref(), frames, cfg.fps)
+            .and_then(|stab| stab.ok())
+            .map(|stab| { let mut v = stab.per_frame; crate::dji_imu::apply_lock_ref_diag(&mut v, cfg.dji_smooth_ms); v });
+        let mono = crate::source_kind::is_single_eye(cfg.source_kind, &cfg.source_path);
+        Ok(Self { pipeline, cfg: cfg.clone(), decoder, imu, source_calib, calib, stab, timeline, src, mono })
     }
 
     /// The frame's row in the per-frame tables.
@@ -357,13 +354,9 @@ impl FrameSource {
     /// The frame's pose: each eye's rotation and per-row matrices.
     fn pose(&self, row: usize) -> crate::render::FramePose {
         let cfg = &self.cfg;
+        let motion = cfg.motion();
         let rot = self.stab.as_ref().and_then(|v| v.get(row).copied()).unwrap_or(EquirectRotation::IDENTITY);
-        crate::render::FramePose::new(
-            rot, self.imu.as_ref(), row, cfg.fisheye_swap_eyes, &cfg.view_adjust,
-            (cfg.stabilize && self.readout_s > 0.0).then(|| crate::render::RowReadout {
-                readout_s: self.readout_s, src_h: self.src.1, fps: cfg.fps,
-            }),
-        )
+        motion.pose(rot, self.imu.as_ref(), row, motion.row_readout(cfg.source_kind, self.imu.as_ref(), self.src.1, cfg.fps))
     }
 
     /// The frame's projection, as the export of the clip asks for it.
@@ -372,8 +365,7 @@ impl FrameSource {
         crate::render::EyeJob {
             src_w: self.src.0, src_h: self.src.1, eye_w: cfg.eye_w, eye_h: cfg.eye_h, pose,
             calib_left: self.calib.0, calib_right: self.calib.1, source_calib: self.source_calib,
-            projection: cfg.projection,
-            mono: crate::source_kind::is_single_eye(cfg.source_kind, &cfg.source_path),
+            projection: cfg.projection, mono: self.mono,
         }
     }
 

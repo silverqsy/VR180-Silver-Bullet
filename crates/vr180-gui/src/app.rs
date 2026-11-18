@@ -1201,6 +1201,42 @@ mod export_size_tests {
         assert_eq!((opts.resolution, opts.crop_resolution), (Native, Sharp));
     }
 
+    /// The export poses its frames as the preview does: the stabilization's
+    /// parameters, the view adjustment and the eye swap reach the
+    /// configuration whole, under every way the settings say them.
+    #[test]
+    fn the_export_poses_its_frames_as_the_preview_does() {
+        use crate::decoder::{FisheyeOutputMode, Settings};
+        use vr180_pipeline::SourceKind;
+        let cfg = |settings: &Settings| App::build_export_cfg(
+            std::path::Path::new("/nonexistent/in.insv"), std::path::Path::new("/nonexistent/out.mp4"),
+            29.97, SourceKind::Insta360Insv, 3840, 3840, 3840, 3840, None, settings, &ExportOptions::default(), Vec::new(),
+        );
+        let cases = [
+            Settings::default(),
+            Settings { stabilize: true, dji_camera_lock: true, ..Default::default() },
+            Settings { stabilize: true, dji_camera_lock: false, dji_smooth_ms: 0.0, dji_max_corr_deg: 0.0, ..Default::default() },
+            Settings { stabilize: true, dji_camera_lock: false, dji_smooth_ms: 800.0, dji_max_corr_deg: 12.0, dji_responsiveness: 1.7, ..Default::default() },
+            Settings { fisheye_swap_eyes: true, ..Default::default() },
+            Settings { camera_upside_down: true, ..Default::default() },
+            Settings { fisheye_swap_eyes: true, camera_upside_down: true, pano_yaw_deg: 3.0, stereo_yaw_deg: -0.4, ..Default::default() },
+            Settings {
+                fisheye_output_mode: FisheyeOutputMode::Reframe, reframe_yaw_deg: 20.0, reframe_pitch_deg: -8.0, reframe_roll_deg: 2.0,
+                stabilize: true, ..Default::default()
+            },
+        ];
+        for settings in &cases {
+            assert_eq!(cfg(settings).motion(), settings.motion(), "{settings:?}");
+        }
+        // The cases do differ: a lock has no window and no cap, a soft
+        // stabilization keeps its window off the lock's value.
+        assert_eq!((cases[1].motion().max_corr_deg, cases[1].motion().smooth_ms), (f32::INFINITY, 0.0));
+        assert_eq!((cases[2].motion().max_corr_deg, cases[2].motion().smooth_ms), (f32::INFINITY, 1.0));
+        assert_eq!((cases[3].motion().max_corr_deg, cases[3].motion().smooth_ms, cases[3].motion().responsiveness), (12.0, 800.0, 1.7));
+        assert!(cases[4].motion().swap_eyes && cases[5].motion().swap_eyes && !cases[6].motion().swap_eyes);
+        assert_ne!(cases[7].motion().view_adjust, cases[0].motion().view_adjust);
+    }
+
     /// The Lens Space view through the camera's lens exports a lens frame,
     /// at the size and shape the eye was recorded; its equidistant lens and
     /// every other view export as they always did.

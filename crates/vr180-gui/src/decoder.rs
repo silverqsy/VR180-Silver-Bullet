@@ -757,6 +757,21 @@ impl Settings {
         }
     }
 
+    /// How the clip's frames are posed under these settings
+    /// ([`vr180_pipeline::render::Motion`]): what an export's configuration
+    /// carries as its own fields.
+    pub fn motion(&self) -> vr180_pipeline::render::Motion {
+        let (max_corr_deg, smooth_ms) = self.stab_cap_and_window();
+        vr180_pipeline::render::Motion {
+            stabilize: self.stabilize,
+            max_corr_deg,
+            smooth_ms,
+            responsiveness: self.dji_responsiveness,
+            view_adjust: self.output_view_adjust(),
+            swap_eyes: self.effective_swap_eyes(),
+        }
+    }
+
     /// The L↔R eye swap that should actually be applied: the manual
     /// "Swap L↔R" toggle XOR the upside-down mount (flipping the rig
     /// 180° mirrors the physical eye positions, so upside-down implies
@@ -2582,16 +2597,11 @@ fn run_fisheye_frames<F: PreviewFeed>(
     //    pass; the rotations are computed when it comes on (or when the IMU
     //    finishes loading) and dropped when it goes off.
     let compute_stab = |imu: Option<&vr180_fisheye::DjiOsvImu>, control: &DecoderControl| -> Option<Vec<EquirectRotation>> {
-        let osv = imu?;
         // The whole recording's frames (a merged one's segments together,
         // as its IMU is); the sample table's count when known.
         let total_frames = timeline_frames_or(timeline.as_deref(), segments_total_frames(&cfg.segments)).max(1);
-        let (max_corr_deg, smooth_ms, responsiveness) = {
-            let s = control.settings.read();
-            let (max_corr_deg, smooth_ms) = s.stab_cap_and_window();
-            (max_corr_deg, smooth_ms, s.dji_responsiveness)
-        };
-        match vr180_pipeline::dji_imu::compute_dji_stabilization(osv, total_frames, max_corr_deg, smooth_ms, fps, responsiveness) {
+        let motion = control.settings.read().motion();
+        match motion.stabilization(kind, imu, total_frames, fps)? {
             Ok(stab) => {
                 tracing::info!("decoder ({tag}): stab ready, {} frames, {} with HR quats", stab.per_frame.len(), stab.frames_with_hr_quat);
                 Some(stab.per_frame)
@@ -2860,17 +2870,14 @@ fn run_fisheye_frames<F: PreviewFeed>(
         // stabilization (it goes with `stabilize`, not `rs_correct`), as on
         // the paused-still path. The readout is the source's own, or the
         // one its frame rate implies.
-        let (swapped_eyes, stabilize, view_adjust, mode, aspect, single_eye, auto_eye, projection, raw_source) = {
+        let (motion, mode, aspect, single_eye, auto_eye, projection, raw_source) = {
             let s = control.settings.read();
-            (s.effective_swap_eyes(), s.stabilize, s.output_view_adjust(), s.fisheye_output_mode, s.reframe_aspect, s.single_eye, s.auto_eye_match, s.export_projection(), s.raw_source)
+            (s.motion(), s.fisheye_output_mode, s.reframe_aspect, s.single_eye, s.auto_eye_match, s.export_projection(), s.raw_source)
         };
-        let readout_s = vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0;
-        let pose = vr180_pipeline::render::FramePose::new(
-            rot, dji_osv_imu.as_ref(), stab_idx, swapped_eyes, &view_adjust,
-            stabilize.then_some(vr180_pipeline::render::RowReadout { readout_s, src_h, fps }),
-        );
+        let pose = motion.pose(rot, dji_osv_imu.as_ref(), stab_idx, motion.row_readout(kind, dji_osv_imu.as_ref(), src_h, fps));
         let phase_pose = phase_t0.elapsed();
-        if feed.stab_diagnostics() && stabilize && frame_idx % 10 == 0 {
+        if feed.stab_diagnostics() && motion.stabilize && frame_idx % 10 == 0 {
+            let readout_s = vr180_pipeline::dji_imu::readout_ms_for(kind, fps, dji_osv_imu.as_ref()) / 1000.0;
             stab_diagnostic_line(frame_idx, rot, dji_osv_imu.as_ref(), stab_idx, readout_s, src_h, fps);
         }
 
@@ -5721,17 +5728,7 @@ fn compute_stab_for(
         vr180_pipeline::decode::probe_video(path)
             .map(|p| (p.duration_sec * p.fps as f64).round() as usize).unwrap_or(0),
     ).max(1);
-    match kind {
-        vr180_pipeline::SourceKind::DjiOsv | vr180_pipeline::SourceKind::Insta360Insv
-        | vr180_pipeline::SourceKind::KandaoQoocam | vr180_pipeline::SourceKind::BlackmagicRaw
-        | vr180_pipeline::SourceKind::X6Raw => imu.and_then(|osv| {
-            let (max_corr, smooth_ms) = s.stab_cap_and_window();
-            vr180_pipeline::dji_imu::compute_dji_stabilization(
-                osv, total, max_corr, smooth_ms, fps, s.dji_responsiveness)
-                .ok().map(|st| st.per_frame)
-        }),
-        _ => None,
-    }
+    s.motion().stabilization(kind, imu, total, fps)?.ok().map(|stab| stab.per_frame)
 }
 
 /// Project + compose ONE already-decoded native fisheye pair into an SBS
@@ -5800,13 +5797,8 @@ fn render_still_from_pair(
         .and_then(|v| v.get(stab_idx).copied())
         .unwrap_or(EquirectRotation::IDENTITY);
 
-    let pose = vr180_pipeline::render::FramePose::new(
-        rot, imu, stab_idx, s.effective_swap_eyes(), &s.output_view_adjust(),
-        (s.stabilize && stab_rotations.is_some()).then(|| vr180_pipeline::render::RowReadout {
-            readout_s: vr180_pipeline::dji_imu::readout_ms_for(kind, fps, imu) / 1000.0,
-            src_h, fps,
-        }),
-    );
+    let motion = s.motion();
+    let pose = motion.pose(rot, imu, stab_idx, motion.row_readout(kind, imu, src_h, fps));
 
     // A raw source's still arrives as its mosaics (`mosaic`: what their
     // codes mean; a paired take's when the caller names none): demosaiced

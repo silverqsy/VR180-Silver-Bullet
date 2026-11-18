@@ -8,6 +8,7 @@
 use crate::fisheye_export::FisheyeExportProjection;
 use crate::gpu::{Device, EquirectRotation, EyePicture, EyeProjection, FisheyeCalib};
 use crate::panomap::ViewAdjust;
+use crate::source_kind::SourceKind;
 use vr180_fisheye::DjiOsvImu;
 
 /// The per-row rolling-shutter correction of a clip: what turns the IMU's
@@ -64,6 +65,61 @@ impl FramePose {
             _ => (None, None),
         };
         Self { rot_left, rot_right, rows_left, rows_right }
+    }
+}
+
+/// How a clip's frames are posed: what its stabilization is computed from,
+/// the view adjustment that goes on top of it, and the eye swap. The
+/// preview's settings and an export's configuration both say it this way,
+/// and every arm takes the stabilization table, the per-row correction and
+/// a frame's pose from here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Motion {
+    pub stabilize: bool,
+    /// The largest correction, degrees; infinite: none.
+    pub max_corr_deg: f32,
+    /// The smoothing window, ms; 0 locks the view to where the first frame
+    /// looked.
+    pub smooth_ms: f32,
+    /// The shape of the soft stabilization's velocity curve.
+    pub responsiveness: f32,
+    pub view_adjust: ViewAdjust,
+    pub swap_eyes: bool,
+}
+
+impl Motion {
+    /// The stabilization of a clip of `frames` frames: a rotation for every
+    /// frame. `None` where there is nothing to compute: the stabilization
+    /// is off, the source has no per-frame IMU, or none is loaded.
+    pub fn stabilization(
+        &self,
+        kind: SourceKind,
+        imu: Option<&DjiOsvImu>,
+        frames: usize,
+        fps: f32,
+    ) -> Option<crate::Result<crate::dji_imu::DjiStabResult>> {
+        if !self.stabilize || !kind.has_frame_imu() {
+            return None;
+        }
+        Some(crate::dji_imu::compute_dji_stabilization(
+            imu?, frames, self.max_corr_deg, self.smooth_ms, fps, self.responsiveness))
+    }
+
+    /// The per-row rolling-shutter correction of a clip whose eyes are
+    /// projected from `src_h` rows: part of the stabilization, for a source
+    /// with a per-frame IMU that is loaded.
+    pub fn row_readout(&self, kind: SourceKind, imu: Option<&DjiOsvImu>, src_h: u32, fps: f32) -> Option<RowReadout> {
+        (self.stabilize && kind.has_frame_imu() && imu.is_some()).then(|| RowReadout {
+            readout_s: crate::dji_imu::readout_ms_for(kind, fps, imu) / 1000.0,
+            src_h,
+            fps,
+        })
+    }
+
+    /// One frame's pose ([`FramePose::new`]): `rot` is the frame's row of
+    /// the stabilization table, the identity without one.
+    pub fn pose(&self, rot: EquirectRotation, imu: Option<&DjiOsvImu>, stab_idx: usize, rows: Option<RowReadout>) -> FramePose {
+        FramePose::new(rot, imu, stab_idx, self.swap_eyes, &self.view_adjust, rows)
     }
 }
 
@@ -332,6 +388,30 @@ mod tests {
             assert_eq!((a.rs_rows.is_some(), b.rs_rows.is_some()), (both, both), "left {l}, right {r}");
             assert_eq!(job.rows().0.is_some(), both);
         }
+    }
+
+    #[test]
+    fn nothing_is_stabilized_without_the_switch_an_imu_or_a_kind_that_has_one() {
+        let on = Motion {
+            stabilize: true, max_corr_deg: f32::INFINITY, smooth_ms: 0.0, responsiveness: 1.0,
+            view_adjust: ViewAdjust::IDENTITY, swap_eyes: false,
+        };
+        let off = Motion { stabilize: false, ..on };
+        let imu = DjiOsvImu::default();
+        // Off, or a kind with no per-frame IMU, or no IMU loaded.
+        assert!(off.stabilization(SourceKind::DjiOsv, Some(&imu), 10, 30.0).is_none());
+        assert!(on.stabilization(SourceKind::SbsFisheye, Some(&imu), 10, 30.0).is_none());
+        assert!(on.stabilization(SourceKind::DjiOsv, None, 10, 30.0).is_none());
+        assert!(off.row_readout(SourceKind::DjiOsv, Some(&imu), 1920, 30.0).is_none());
+        assert!(on.row_readout(SourceKind::SbsFisheye, Some(&imu), 1920, 30.0).is_none());
+        assert!(on.row_readout(SourceKind::DjiOsv, None, 1920, 30.0).is_none());
+        // On, with an IMU: a table of the clip's length (the identity while
+        // the IMU holds no orientations yet), and rows of the source's height.
+        let table = on.stabilization(SourceKind::DjiOsv, Some(&imu), 10, 30.0).expect("asked").expect("computed");
+        assert_eq!(table.per_frame.len(), 10);
+        let rows = on.row_readout(SourceKind::DjiOsv, Some(&imu), 1920, 30.0).expect("on");
+        assert_eq!((rows.src_h, rows.fps), (1920, 30.0));
+        assert!(rows.readout_s > 0.0);
     }
 
     #[test]
