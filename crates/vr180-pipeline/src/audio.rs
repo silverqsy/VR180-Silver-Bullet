@@ -873,6 +873,31 @@ pub fn stereo_to_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Opti
     Ok(n)
 }
 
+/// The one track of `input`, which has to hold four channels.
+fn four_channel_stream(input: &Path) -> Result<usize> {
+    match probe_any_audio(input)? {
+        Some((index, 4, _)) => Ok(index),
+        Some((_, n, _)) => Err(Error::Ffmpeg(format!("a four-channel track is wanted, {input:?} holds {n} channels"))),
+        None => Err(Error::Ffmpeg(format!("no audio track in {input:?}"))),
+    }
+}
+
+/// Encode a four-channel track (first-order ambisonics, its channels in
+/// the order they decode) to a four-channel AAC in an `.m4a`, whole: the
+/// counterpart of [`stereo_to_aac`] for a sound that is a sound field
+/// already. Returns the samples written.
+pub fn four_channel_to_aac(input: &Path, output_m4a: &Path, bit_rate: usize) -> Result<u64> {
+    let stream_index = four_channel_stream(input)?;
+    transcode_audio_window(input, stream_index, output_m4a, 0.0, None, None, AudioOut::Aac4 { bit_rate })
+}
+
+/// The same track as a 24-bit WAV that states no channel layout: what the
+/// APAC encoder is given ([`ambisonic_layout`] has why).
+pub fn four_channel_to_wav(input: &Path, output_wav: &Path) -> Result<u64> {
+    let stream_index = four_channel_stream(input)?;
+    transcode_audio_window(input, stream_index, output_wav, 0.0, None, None, AudioOut::Pcm24 { channels: 4 })
+}
+
 /// Decode the X6's 4-channel 360° Audio (first-order AmbiX) to a
 /// front-facing stereo AAC `.m4a` — see [`FOA_STEREO_MATRIX`]. Only the
 /// `[offset_s, offset_s + dur_s)` window (the whole track when `dur_s` is

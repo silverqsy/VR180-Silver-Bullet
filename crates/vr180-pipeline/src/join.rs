@@ -10,7 +10,9 @@
 //! milliseconds at its two ends, and encoded once for the whole length: no
 //! codec delay sits at a cut and the sound stays on the picture however
 //! many parts there are. The joined track is stereo at 48 kHz whatever
-//! the parts hold; a part without sound is silent for its length.
+//! the parts hold, and a part without sound is silent for its length; or,
+//! where every part holds four-channel first-order ambisonics, that sound
+//! field as one track ([`JoinSound`]).
 //!
 //! The pictures have to be of one shape: the same codec, frame size, frame
 //! rate and encoder parameters (they are, when one export run wrote them
@@ -31,6 +33,37 @@ use crate::{Error, Result};
 
 /// Bit rate of the joined file's stereo track.
 const AUDIO_BIT_RATE: usize = 256_000;
+/// And of its four-channel one: the same for each channel.
+const AMBISONIC_BIT_RATE: usize = 512_000;
+/// Bit rate the Apple Positional Audio encoder is asked for, as a single
+/// export asks.
+#[cfg(target_os = "macos")]
+const APAC_BIT_RATE: u32 = 256_000;
+
+/// The sound of a joined file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JoinSound {
+    /// One stereo track, from parts with any sound or none.
+    #[default]
+    Stereo,
+    /// The parts' four-channel first-order ambisonics (AmbiX, as an export
+    /// with that track writes it) as one four-channel track, tagged as
+    /// such. Every part has to hold a four-channel track.
+    Ambisonic,
+    /// The same sound field as Apple Positional Audio. macOS; where it
+    /// cannot be encoded the file gets the ambisonic track.
+    Apac,
+}
+
+impl JoinSound {
+    /// Channels of the sound as it is put together.
+    fn channels(self) -> usize {
+        match self {
+            JoinSound::Stereo => 2,
+            JoinSound::Ambisonic | JoinSound::Apac => 4,
+        }
+    }
+}
 /// Its sample rate: every camera here records sound at it.
 const SAMPLE_RATE: u32 = 48_000;
 /// The fade at each end of a part's sound, seconds: long enough that a cut
@@ -66,6 +99,8 @@ struct PartInfo {
     video_index: usize,
     frames: u64,
     has_sound: bool,
+    /// One of its tracks holds four channels.
+    four_channel_sound: bool,
 }
 
 fn describe(part: &Path) -> Result<PartInfo> {
@@ -95,19 +130,33 @@ fn describe(part: &Path) -> Result<PartInfo> {
         video_index: st.index(),
         frames: st.frames().max(0) as u64,
         has_sound: ictx.streams().any(|s| s.parameters().medium() == ffmpeg::media::Type::Audio),
+        four_channel_sound: ictx.streams().any(|s| is_audio_of(&s, 4)),
     })
 }
 
-/// Why `parts` cannot be joined, as far as their headers tell (`None`: they
-/// can). A caller may ask before it writes anything.
-pub fn join_obstacle(parts: &[PathBuf]) -> Result<Option<String>> {
-    crate::decode::init();
-    let infos: Vec<PartInfo> = parts.iter().map(|p| describe(p)).collect::<Result<_>>()?;
-    Ok(obstacle(parts, &infos))
+/// An audio stream; with `channels` above zero, one of that many channels.
+fn is_audio_of(stream: &ffmpeg::format::stream::Stream, channels: i32) -> bool {
+    let params = stream.parameters();
+    params.medium() == ffmpeg::media::Type::Audio
+        && (channels == 0 || unsafe { (*params.as_ptr()).ch_layout.nb_channels } == channels)
 }
 
-fn obstacle(parts: &[PathBuf], infos: &[PartInfo]) -> Option<String> {
+/// Why `parts` cannot be joined with the sound `sound`, as far as their
+/// headers tell (`None`: they can). A caller may ask before it writes
+/// anything.
+pub fn join_obstacle(parts: &[PathBuf], sound: JoinSound) -> Result<Option<String>> {
+    crate::decode::init();
+    let infos: Vec<PartInfo> = parts.iter().map(|p| describe(p)).collect::<Result<_>>()?;
+    Ok(obstacle(parts, &infos, sound))
+}
+
+fn obstacle(parts: &[PathBuf], infos: &[PartInfo], sound: JoinSound) -> Option<String> {
     let Some((first, rest)) = infos.split_first() else { return Some("no clips".into()) };
+    if sound != JoinSound::Stereo {
+        if let Some((path, _)) = parts.iter().zip(infos).find(|(_, i)| !i.four_channel_sound) {
+            return Some(format!("{} has no four-channel sound", name(path)));
+        }
+    }
     let a = &first.shape;
     for (path, part) in parts[1..].iter().zip(rest) {
         let b = &part.shape;
@@ -299,12 +348,13 @@ fn concat_video(
     Ok(lengths)
 }
 
-/// One part's sound on its way into the joined track: `want` stereo frames,
-/// faded in over the first `fade` and out over the last ones it holds, with
-/// silence after a track that ends before its picture does. The last `fade`
-/// frames are held back until the end is known.
+/// One part's sound on its way into the joined track: `want` frames of
+/// `channels` samples, faded in over the first `fade` and out over the last
+/// ones it holds, with silence after a track that ends before its picture
+/// does. The last `fade` frames are held back until the end is known.
 struct PartSound<'a, W: std::io::Write> {
     out: &'a mut W,
+    channels: usize,
     want: usize,
     fade: usize,
     /// Frames taken so far (written or held).
@@ -313,23 +363,24 @@ struct PartSound<'a, W: std::io::Write> {
 }
 
 impl<'a, W: std::io::Write> PartSound<'a, W> {
-    fn new(out: &'a mut W, want: usize) -> Self {
+    fn new(out: &'a mut W, channels: usize, want: usize) -> Self {
         let fade = ((EDGE_FADE_S * SAMPLE_RATE as f64) as usize).min(want / 2);
-        Self { out, want, fade, taken: 0, held: Vec::new() }
+        Self { out, channels, want, fade, taken: 0, held: Vec::new() }
     }
 
-    /// Interleaved stereo samples, in order. What lies past the picture is
+    /// Interleaved samples, in order. What lies past the picture is
     /// dropped.
     fn push(&mut self, samples: &[f32]) -> Result<()> {
+        let ch = self.channels;
         let room = self.want - self.taken;
-        let frames = (samples.len() / 2).min(room);
-        for (i, frame) in samples[..frames * 2].chunks_exact(2).enumerate() {
+        let frames = (samples.len() / ch).min(room);
+        for (i, frame) in samples[..frames * ch].chunks_exact(ch).enumerate() {
             let at = self.taken + i;
             let gain = if at < self.fade { at as f32 / self.fade as f32 } else { 1.0 };
-            self.held.extend_from_slice(&[frame[0] * gain, frame[1] * gain]);
+            self.held.extend(frame.iter().map(|v| v * gain));
         }
         self.taken += frames;
-        let keep = self.fade * 2;
+        let keep = self.fade * ch;
         if self.held.len() > keep {
             let ready = self.held.len() - keep;
             self.out.write_all(bytemuck::cast_slice(&self.held[..ready]))?;
@@ -341,40 +392,45 @@ impl<'a, W: std::io::Write> PartSound<'a, W> {
     /// The end of the part's sound: the fade out, then silence up to the
     /// picture's length.
     fn finish(mut self) -> Result<()> {
-        let n = self.held.len() / 2;
-        for (i, frame) in self.held.chunks_exact_mut(2).enumerate() {
+        let ch = self.channels;
+        let n = self.held.len() / ch;
+        for (i, frame) in self.held.chunks_exact_mut(ch).enumerate() {
             let gain = (n - i) as f32 / (n + 1) as f32;
-            frame[0] *= gain;
-            frame[1] *= gain;
+            frame.iter_mut().for_each(|v| *v *= gain);
         }
         self.out.write_all(bytemuck::cast_slice(&self.held))?;
-        let silence = vec![0f32; 2 * 4096];
+        let silence = vec![0f32; ch * 4096];
         let mut left = self.want - self.taken;
         while left > 0 {
             let n = left.min(4096);
-            self.out.write_all(bytemuck::cast_slice(&silence[..n * 2]))?;
+            self.out.write_all(bytemuck::cast_slice(&silence[..n * ch]))?;
             left -= n;
         }
         Ok(())
     }
 }
 
-/// A part's sound, decoded to stereo at [`SAMPLE_RATE`], into `sound`
-/// (nothing when it has no track). The codec's priming is not in it: the
-/// demuxer marks it and the decoder leaves it out, so the first sample is
-/// the picture's first moment.
+/// A part's sound at [`SAMPLE_RATE`] into `sound` (nothing when it has no
+/// track): mixed to stereo whatever it holds, or, for a `sound` of four
+/// channels, its four-channel track as it is, channel for channel. The
+/// codec's priming is not in it: the demuxer marks it and the decoder leaves
+/// it out, so the first sample is the picture's first moment.
 fn decode_into<W: std::io::Write>(part: &Path, sound: &mut PartSound<W>) -> Result<()> {
     use ffmpeg::format::sample::{Sample, Type};
+    let ch = sound.channels;
     let mut ictx = ffmpeg::format::input(&part).map_err(|e| err(format!("{}: {e}", name(part))))?;
-    let Some((index, params)) = ictx.streams().find(|s| s.parameters().medium() == ffmpeg::media::Type::Audio)
+    let wanted = if ch == 2 { 0 } else { ch as i32 };
+    let Some((index, params)) = ictx.streams().find(|s| is_audio_of(s, wanted))
         .map(|s| (s.index(), s.parameters())) else { return Ok(()) };
     let mut decoder = ffmpeg::codec::context::Context::from_parameters(params)
         .and_then(|c| c.decoder().audio())
         .map_err(|e| err(format!("{}: sound decoder: {e}", name(part))))?;
     let layout = crate::audio::normalized_layout(decoder.channel_layout());
+    // Stereo is a mix; a sound field keeps its channels as they are.
+    let out_layout = if ch == 2 { ffmpeg::ChannelLayout::STEREO } else { layout };
     let mut to_stereo = ffmpeg::software::resampling::Context::get(
         decoder.format(), layout, decoder.rate(),
-        Sample::F32(Type::Packed), ffmpeg::ChannelLayout::STEREO, SAMPLE_RATE,
+        Sample::F32(Type::Packed), out_layout, SAMPLE_RATE,
     ).map_err(|e| err(format!("{}: sound format: {e}", name(part))))?;
     let (mut decoded, mut converted) = (ffmpeg::frame::Audio::empty(), ffmpeg::frame::Audio::empty());
     let mut failed: Option<Error> = None;
@@ -382,7 +438,7 @@ fn decode_into<W: std::io::Write>(part: &Path, sound: &mut PartSound<W>) -> Resu
         while decoder.receive_frame(&mut decoded).is_ok() {
             decoded.set_channel_layout(layout);
             if to_stereo.run(&decoded, &mut converted).is_ok() && converted.samples() > 0 && failed.is_none() {
-                let samples: &[f32] = bytemuck::cast_slice(&converted.data(0)[..converted.samples() * 2 * 4]);
+                let samples: &[f32] = bytemuck::cast_slice(&converted.data(0)[..converted.samples() * ch * 4]);
                 failed = sound.push(samples).err();
             }
         }
@@ -396,32 +452,33 @@ fn decode_into<W: std::io::Write>(part: &Path, sound: &mut PartSound<W>) -> Resu
     take(&mut decoder, sound);
     // What the rate converter still holds.
     while failed.is_none() && to_stereo.flush(&mut converted).is_ok() && converted.samples() > 0 {
-        let samples: &[f32] = bytemuck::cast_slice(&converted.data(0)[..converted.samples() * 2 * 4]);
+        let samples: &[f32] = bytemuck::cast_slice(&converted.data(0)[..converted.samples() * ch * 4]);
         failed = sound.push(samples).err();
     }
     failed.map_or(Ok(()), Err)
 }
 
-/// The sound of the joined file as a 32-bit float WAV: each part's, cut or
-/// filled with silence to its picture's length (`lengths`, seconds; the
-/// cuts are placed by the running total, so nothing adds up) and faded at
-/// both ends.
-fn concat_sound(parts: &[PathBuf], lengths: &[f64], wav: &Path) -> Result<()> {
+/// The sound of the joined file as a 32-bit float WAV of `channels`
+/// channels: each part's, cut or filled with silence to its picture's
+/// length (`lengths`, seconds; the cuts are placed by the running total, so
+/// nothing adds up) and faded at both ends.
+fn concat_sound(parts: &[PathBuf], lengths: &[f64], channels: usize, wav: &Path) -> Result<()> {
     use std::io::Write;
     let total: u64 = (lengths.iter().sum::<f64>() * SAMPLE_RATE as f64).round() as u64;
-    let data_bytes = total.checked_mul(8).and_then(|b| u32::try_from(b).ok()).filter(|b| *b < u32::MAX - 36)
+    let frame_bytes = (channels * 4) as u32;
+    let data_bytes = total.checked_mul(frame_bytes as u64).and_then(|b| u32::try_from(b).ok()).filter(|b| *b < u32::MAX - 36)
         .ok_or_else(|| err("the joined sound is too long for one file"))?;
     let mut f = std::io::BufWriter::new(std::fs::File::create(wav)?);
-    // RIFF / WAVE, format 3 (IEEE float), 2 channels, 32 bits.
+    // RIFF / WAVE, format 3 (IEEE float), 32 bits.
     f.write_all(b"RIFF")?;
     f.write_all(&(36 + data_bytes).to_le_bytes())?;
     f.write_all(b"WAVEfmt ")?;
     f.write_all(&16u32.to_le_bytes())?;
     f.write_all(&3u16.to_le_bytes())?;
-    f.write_all(&2u16.to_le_bytes())?;
+    f.write_all(&(channels as u16).to_le_bytes())?;
     f.write_all(&SAMPLE_RATE.to_le_bytes())?;
-    f.write_all(&(SAMPLE_RATE * 8).to_le_bytes())?;
-    f.write_all(&8u16.to_le_bytes())?;
+    f.write_all(&(SAMPLE_RATE * frame_bytes).to_le_bytes())?;
+    f.write_all(&(frame_bytes as u16).to_le_bytes())?;
     f.write_all(&32u16.to_le_bytes())?;
     f.write_all(b"data")?;
     f.write_all(&data_bytes.to_le_bytes())?;
@@ -429,7 +486,7 @@ fn concat_sound(parts: &[PathBuf], lengths: &[f64], wav: &Path) -> Result<()> {
     for (part, length) in parts.iter().zip(lengths) {
         at_s += length;
         let end = ((at_s * SAMPLE_RATE as f64).round() as u64).min(total);
-        let mut sound = PartSound::new(&mut f, (end - at_frames) as usize);
+        let mut sound = PartSound::new(&mut f, channels, (end - at_frames) as usize);
         at_frames = end;
         decode_into(part, &mut sound)?;
         sound.finish()?;
@@ -438,18 +495,46 @@ fn concat_sound(parts: &[PathBuf], lengths: &[f64], wav: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Join `parts` (exported files of one shape, in order) into `output`.
-/// `progress` counts the video frames copied; `cancel` stops the copy and
-/// leaves no file.
+/// The four-channel sound `wav` as the joined file's ambisonic track: one
+/// four-channel AAC beside the picture `video`, tagged as first-order AmbiX.
+fn mux_ambisonic(wav: &Path, video: &Path, output: &Path, seconds: f64) -> Result<()> {
+    let sound_file = output.with_extension("joining.sound.mp4");
+    let made = crate::audio::four_channel_to_aac(wav, &sound_file, AMBISONIC_BIT_RATE)
+        .and_then(|_| crate::audio::mux_video_with_audio_stream(&sound_file, video, output, 0.0, Some(seconds), None));
+    let _ = std::fs::remove_file(&sound_file);
+    made?;
+    // As a single export: without the tag the track still plays, only not
+    // as a sound field.
+    if let Err(e) = crate::spherical_inject::inject_sa3d_ambix(output, 4) {
+        tracing::warn!("join: the ambisonic tag could not be written (the track is there): {e}");
+    }
+    Ok(())
+}
+
+/// The same sound as Apple Positional Audio: the encoder takes a 24-bit WAV
+/// that states no layout and writes the picture and the track into `output`.
+#[cfg(target_os = "macos")]
+fn mux_apac(wav: &Path, video: &Path, output: &Path) -> Result<()> {
+    let plain = output.with_extension("joining.ambi.wav");
+    let made = crate::audio::four_channel_to_wav(wav, &plain)
+        .and_then(|_| crate::helpers::spawn_apac_encode(&plain, Some(video), output, APAC_BIT_RATE));
+    let _ = std::fs::remove_file(&plain);
+    made
+}
+
+/// Join `parts` (exported files of one shape, in order) into `output`, with
+/// the sound `sound`. `progress` counts the video frames copied; `cancel`
+/// stops the copy and leaves no file.
 pub fn join_exports(
     parts: &[PathBuf],
     output: &Path,
+    sound: JoinSound,
     mut progress: impl FnMut(ExportProgress),
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     crate::decode::init();
     let infos: Vec<PartInfo> = parts.iter().map(|p| describe(p)).collect::<Result<_>>()?;
-    if let Some(why) = obstacle(parts, &infos) {
+    if let Some(why) = obstacle(parts, &infos, sound) {
         return Err(err(why));
     }
     let started = std::time::Instant::now();
@@ -459,16 +544,43 @@ pub fn join_exports(
     let video = if with_sound { output.with_extension(format!("joining.{ext}")) } else { output.to_path_buf() };
     let lengths = concat_video(parts, &infos, &video, &mut progress, &cancel)?;
     let seconds: f64 = lengths.iter().sum();
+    let mut written = "no sound";
     if with_sound {
         // One stretch of sound for the whole length, encoded once (in an
         // `mp4`, which carries an AAC track alone in every build).
         let wav = output.with_extension("joining.sound.wav");
-        let sound_file = output.with_extension("joining.sound.mp4");
-        let made = concat_sound(parts, &lengths, &wav)
-            .and_then(|()| crate::audio::stereo_to_aac(&wav, &sound_file, 0.0, None, AUDIO_BIT_RATE))
-            .and_then(|_| crate::audio::mux_video_with_passthrough_audio(&sound_file, &video, output, 0.0, Some(seconds)));
+        let made = concat_sound(parts, &lengths, sound.channels(), &wav).and_then(|()| match sound {
+            JoinSound::Stereo => {
+                written = "stereo sound encoded once";
+                let sound_file = output.with_extension("joining.sound.mp4");
+                let made = crate::audio::stereo_to_aac(&wav, &sound_file, 0.0, None, AUDIO_BIT_RATE)
+                    .and_then(|_| crate::audio::mux_video_with_passthrough_audio(&sound_file, &video, output, 0.0, Some(seconds)));
+                let _ = std::fs::remove_file(&sound_file);
+                made.map(|_| ())
+            }
+            JoinSound::Ambisonic => {
+                written = "four-channel ambisonic sound encoded once";
+                mux_ambisonic(&wav, &video, output, seconds)
+            }
+            JoinSound::Apac => {
+                #[cfg(target_os = "macos")]
+                {
+                    written = "Apple Positional Audio encoded once";
+                    mux_apac(&wav, &video, output).or_else(|e| {
+                        tracing::warn!("join: Apple Positional Audio could not be encoded ({e}): the file gets the ambisonic track");
+                        written = "four-channel ambisonic sound encoded once";
+                        let _ = std::fs::remove_file(output);
+                        mux_ambisonic(&wav, &video, output, seconds)
+                    })
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    written = "four-channel ambisonic sound encoded once";
+                    mux_ambisonic(&wav, &video, output, seconds)
+                }
+            }
+        });
         let _ = std::fs::remove_file(&wav);
-        let _ = std::fs::remove_file(&sound_file);
         let _ = std::fs::remove_file(&video);
         if let Err(e) = made {
             let _ = std::fs::remove_file(output);
@@ -476,9 +588,8 @@ pub fn join_exports(
         }
     }
     tracing::info!(
-        "join: {} clips, {:.2} s, {} → {} in {:.1?}",
-        parts.len(), seconds, if with_sound { "stereo sound encoded once" } else { "no sound" },
-        output.display(), started.elapsed());
+        "join: {} clips, {:.2} s, {written} → {} in {:.1?}",
+        parts.len(), seconds, output.display(), started.elapsed());
     Ok(())
 }
 
@@ -495,33 +606,45 @@ mod tests {
         dir
     }
 
-    /// A 16-bit stereo WAV of a `hz` tone at half scale.
-    fn write_tone(path: &Path, hz: f32, seconds: f64) {
+    /// A 16-bit WAV with one channel per entry of `hz`, each a tone of that
+    /// pitch at half scale.
+    fn write_tones(path: &Path, hz: &[f32], seconds: f64) {
         let n = (seconds * SAMPLE_RATE as f64).round() as u32;
+        let frame = 2 * hz.len() as u32;
         let mut wav = Vec::new();
         wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&(36 + n * 4).to_le_bytes());
+        wav.extend_from_slice(&(36 + n * frame).to_le_bytes());
         wav.extend_from_slice(b"WAVEfmt ");
         wav.extend_from_slice(&16u32.to_le_bytes());
         wav.extend_from_slice(&1u16.to_le_bytes());
-        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&(hz.len() as u16).to_le_bytes());
         wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-        wav.extend_from_slice(&(SAMPLE_RATE * 4).to_le_bytes());
-        wav.extend_from_slice(&4u16.to_le_bytes());
+        wav.extend_from_slice(&(SAMPLE_RATE * frame).to_le_bytes());
+        wav.extend_from_slice(&(frame as u16).to_le_bytes());
         wav.extend_from_slice(&16u16.to_le_bytes());
         wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&(n * 4).to_le_bytes());
+        wav.extend_from_slice(&(n * frame).to_le_bytes());
         for i in 0..n {
-            let v = ((std::f32::consts::TAU * hz * i as f32 / SAMPLE_RATE as f32).sin() * 16384.0) as i16;
-            wav.extend_from_slice(&v.to_le_bytes());
-            wav.extend_from_slice(&v.to_le_bytes());
+            for pitch in hz {
+                let v = ((std::f32::consts::TAU * pitch * i as f32 / SAMPLE_RATE as f32).sin() * 16384.0) as i16;
+                wav.extend_from_slice(&v.to_le_bytes());
+            }
         }
         std::fs::write(path, wav).unwrap();
     }
 
     /// A clip of `frames` flat grey frames `side` pixels a side, with a
-    /// tone of `(hz, seconds)` under it or no sound at all.
+    /// stereo tone of `(hz, seconds)` under it or no sound at all.
     fn part(dir: &Path, name: &str, side: u32, frames: usize, tone: Option<(f32, f64)>) -> PathBuf {
+        match tone {
+            Some((hz, seconds)) => part_with(dir, name, side, frames, &[hz, hz], seconds),
+            None => part_with(dir, name, side, frames, &[], 0.0),
+        }
+    }
+
+    /// The same with one tone per channel of its sound (`hz`; none: no
+    /// sound).
+    fn part_with(dir: &Path, name: &str, side: u32, frames: usize, hz: &[f32], seconds: f64) -> PathBuf {
         let video = dir.join(format!("{name}.picture.mov"));
         let mut encoder = H265Encoder::create_with_bit_depth(&video, side, side, FPS, 0, EncoderBackend::ProResKs, 10, 0).unwrap();
         let rgb = vec![96u8; (side * side * 3) as usize];
@@ -530,26 +653,31 @@ mod tests {
         }
         encoder.finish().unwrap();
         let out = dir.join(format!("{name}.mov"));
-        match tone {
-            None => std::fs::rename(&video, &out).unwrap(),
-            Some((hz, seconds)) => {
-                let wav = dir.join(format!("{name}.wav"));
-                write_tone(&wav, hz, seconds);
-                crate::audio::mux_video_with_passthrough_audio(&wav, &video, &out, 0.0, None).unwrap();
-                std::fs::remove_file(&wav).unwrap();
-                std::fs::remove_file(&video).unwrap();
-            }
+        if hz.is_empty() {
+            std::fs::rename(&video, &out).unwrap();
+        } else {
+            let wav = dir.join(format!("{name}.wav"));
+            write_tones(&wav, hz, seconds);
+            crate::audio::mux_video_with_passthrough_audio(&wav, &video, &out, 0.0, None).unwrap();
+            std::fs::remove_file(&wav).unwrap();
+            std::fs::remove_file(&video).unwrap();
         }
         out
     }
 
-    /// The joined file's sound, as it decodes: left channel.
-    fn left_channel(file: &Path, seconds: f64) -> Vec<f32> {
+    /// Channel `which` of a file's sound of `channels` channels, as it
+    /// decodes.
+    fn channel(file: &Path, seconds: f64, channels: usize, which: usize) -> Vec<f32> {
         let mut bytes: Vec<u8> = Vec::new();
-        let mut sound = PartSound::new(&mut bytes, (seconds * SAMPLE_RATE as f64).round() as usize);
+        let mut sound = PartSound::new(&mut bytes, channels, (seconds * SAMPLE_RATE as f64).round() as usize);
         decode_into(file, &mut sound).unwrap();
         sound.finish().unwrap();
-        bytes.chunks_exact(8).map(|f| f32::from_le_bytes([f[0], f[1], f[2], f[3]])).collect()
+        bytes.chunks_exact(4 * channels).map(|f| f32::from_le_bytes([f[4 * which], f[4 * which + 1], f[4 * which + 2], f[4 * which + 3]])).collect()
+    }
+
+    /// The joined file's sound, as it decodes: left channel.
+    fn left_channel(file: &Path, seconds: f64) -> Vec<f32> {
+        channel(file, seconds, 2, 0)
     }
 
     /// How much of `hz` the stretch `[from, to)` seconds holds (the
@@ -576,10 +704,10 @@ mod tests {
             part(&dir, "b", 64, 5, None),
             part(&dir, "c", 64, 5, Some((1760.0, 0.10))),
         ];
-        assert_eq!(join_obstacle(&parts).unwrap(), None);
+        assert_eq!(join_obstacle(&parts, JoinSound::Stereo).unwrap(), None);
         let out = dir.join("joined.mov");
         let mut last = None;
-        join_exports(&parts, &out, |p| last = Some(p), Arc::new(AtomicBool::new(false))).unwrap();
+        join_exports(&parts, &out, JoinSound::Stereo, |p| last = Some(p), Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(last.map(|p| (p.frame_idx, p.total_frames)), Some((15, 15)));
 
         let joined = describe(&out).unwrap();
@@ -606,12 +734,60 @@ mod tests {
     }
 
     #[test]
+    fn a_sound_field_stays_one_channel_for_channel() {
+        crate::decode::init();
+        let dir = scratch("field");
+        // Four channels, each with a pitch of its own; the second part's
+        // are other pitches, and its track ends before its picture.
+        let (first, second) = ([300.0, 500.0, 700.0, 900.0], [1100.0, 1300.0, 1500.0, 1700.0]);
+        let parts = [
+            part_with(&dir, "a", 64, 5, &first, 0.30),
+            part_with(&dir, "b", 64, 5, &second, 0.12),
+        ];
+        assert_eq!(join_obstacle(&parts, JoinSound::Ambisonic).unwrap(), None);
+        let out = dir.join("joined.mov");
+        join_exports(&parts, &out, JoinSound::Ambisonic, |_| {}, Arc::new(AtomicBool::new(false))).unwrap();
+        let joined = describe(&out).unwrap();
+        assert_eq!((joined.frames, joined.four_channel_sound), (10, true));
+        // Tagged as first-order ambisonics.
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.windows(4).any(|w| w == b"SA3D"), "no SA3D box");
+        // Every channel holds its own pitch and none of its neighbours',
+        // under the picture it belongs to.
+        for k in 0..4 {
+            let sound = channel(&out, 0.4, 4, k);
+            for (j, (a, b)) in first.iter().zip(&second).enumerate() {
+                let (in_first, in_second) = (tone_level(&sound, 0.02, 0.18, *a), tone_level(&sound, 0.22, 0.30, *b));
+                if j == k {
+                    assert!(in_first > 0.4 && in_second > 0.4, "channel {k}: its own pitches at {in_first} and {in_second}");
+                } else {
+                    assert!(in_first < 0.02 && in_second < 0.02, "channel {k} holds channel {j}'s pitch: {in_first}, {in_second}");
+                }
+            }
+            // The first part's pitch is gone where the second begins, and
+            // the second's where its track ended.
+            assert!(tone_level(&sound, 0.24, 0.38, first[k]) < 0.01);
+            assert!(tone_level(&sound, 0.35, 0.40, second[k]) < 0.01);
+        }
+        // A part with stereo sound, or none, has no place in a sound field.
+        let stereo = part(&dir, "stereo", 64, 5, Some((440.0, 0.2)));
+        let silent = part(&dir, "silent", 64, 5, None);
+        for odd in [stereo, silent] {
+            let why = join_obstacle(&[parts[0].clone(), odd.clone()], JoinSound::Apac).unwrap().expect("not a sound field");
+            assert!(why.contains(&name(&odd)) && why.contains("four-channel"), "{why}");
+            // As stereo the same two parts join.
+            assert_eq!(join_obstacle(&[parts[0].clone(), odd], JoinSound::Stereo).unwrap(), None);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn silent_parts_join_without_a_sound_track() {
         crate::decode::init();
         let dir = scratch("silent");
         let parts = [part(&dir, "a", 64, 3, None), part(&dir, "b", 64, 4, None)];
         let out = dir.join("joined.mov");
-        join_exports(&parts, &out, |_| {}, Arc::new(AtomicBool::new(false))).unwrap();
+        join_exports(&parts, &out, JoinSound::Stereo, |_| {}, Arc::new(AtomicBool::new(false))).unwrap();
         let joined = describe(&out).unwrap();
         assert_eq!((joined.frames, joined.has_sound), (7, false));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -622,10 +798,10 @@ mod tests {
         crate::decode::init();
         let dir = scratch("size");
         let parts = [part(&dir, "wide", 64, 2, None), part(&dir, "small", 32, 2, None)];
-        let why = join_obstacle(&parts).unwrap().expect("two sizes do not join");
+        let why = join_obstacle(&parts, JoinSound::Stereo).unwrap().expect("two sizes do not join");
         assert!(why.contains("wide.mov") && why.contains("small.mov") && why.contains("64") && why.contains("32"), "{why}");
         let out = dir.join("joined.mov");
-        assert!(join_exports(&parts, &out, |_| {}, Arc::new(AtomicBool::new(false))).is_err());
+        assert!(join_exports(&parts, &out, JoinSound::Stereo, |_| {}, Arc::new(AtomicBool::new(false))).is_err());
         assert!(!out.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -634,7 +810,7 @@ mod tests {
     fn a_part_sound_is_cut_filled_and_faded() {
         // 100 frames wanted; the fade is 5 ms = 240 frames, capped at half.
         let mut bytes: Vec<u8> = Vec::new();
-        let mut sound = PartSound::new(&mut bytes, 100);
+        let mut sound = PartSound::new(&mut bytes, 2, 100);
         assert_eq!(sound.fade, 50);
         sound.push(&vec![1.0f32; 2 * 60]).unwrap();
         sound.push(&vec![1.0f32; 2 * 60]).unwrap();
@@ -647,7 +823,7 @@ mod tests {
 
         // A track that ends before its picture: faded where it ends, then silence.
         let mut bytes: Vec<u8> = Vec::new();
-        let mut sound = PartSound::new(&mut bytes, 1000);
+        let mut sound = PartSound::new(&mut bytes, 2, 1000);
         sound.push(&vec![1.0f32; 2 * 600]).unwrap();
         sound.finish().unwrap();
         let v: Vec<f32> = bytes.chunks_exact(8).map(|f| f32::from_le_bytes([f[0], f[1], f[2], f[3]])).collect();

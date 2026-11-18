@@ -1479,7 +1479,7 @@ mod export_size_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Default::default(),
-            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, offline: None,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, four_channel_sound: false, offline: None,
         };
         let x6 = |single_eye| Some(X6ClipInfo { window: None, ilog: Some(true), paraxial_native: 2086.97, single_lens: single_eye, single_eye });
         let two = item(SourceKind::Insta360Insv, x6(false));
@@ -1600,12 +1600,32 @@ mod join_and_project_tests {
             "A DNG sequence is a folder of frames for each clip: it cannot be joined. Pick a video format in Format.",
             "A spatial video cannot be joined: export the clips one by one, or pick H.265 or ProRes in Format.",
             "is in the Lens Space view through the camera's lens, which states that clip's own lens in its file: such clips cannot be joined. Pick the Equidistant lens, or another view.",
+            "has no four-channel sound: a joined file with Ambisonic or APAC sound needs it in every clip. Set the first clip's Audio to Stereo, or leave this clip out.",
             "Project", "New project", "Open project…", "Save project", "Save project as…", "Save project…", "Don't save",
             "Replace the clip list?", "The clip list has changes that are not saved in a project file.", "looking…", "missing",
             "The file was not found where the project says it is. Click to look again.",
         ] {
             assert_ne!(tr_zh(text), text, "no Chinese text for: {text}");
         }
+    }
+
+    #[test]
+    fn the_joined_sound_is_the_first_clips_choice_where_every_clip_can_give_it() {
+        use super::joined_sound;
+        use crate::decoder::AudioFormat as AF;
+        use vr180_pipeline::join::JoinSound;
+        // Every clip has four-channel sound: what the first clip asks for.
+        assert_eq!(joined_sound(AF::Stereo, &[true, true]), Ok(JoinSound::Stereo));
+        assert_eq!(joined_sound(AF::Ambisonic, &[true, true, true]), Ok(JoinSound::Ambisonic));
+        assert_eq!(joined_sound(AF::Apac, &[true, true]), Ok(JoinSound::Apac));
+        // One clip has not: named by its place, before anything is exported.
+        assert_eq!(joined_sound(AF::Apac, &[true, false, true]), Err(1));
+        assert_eq!(joined_sound(AF::Ambisonic, &[true, true, false]), Err(2));
+        // Stereo takes any clips; and a first clip without such sound has
+        // no say, whatever its settings were left at.
+        assert_eq!(joined_sound(AF::Stereo, &[false, true]), Ok(JoinSound::Stereo));
+        assert_eq!(joined_sound(AF::Apac, &[false, true]), Ok(JoinSound::Stereo));
+        assert_eq!(joined_sound(AF::Apac, &[]), Ok(JoinSound::Stereo));
     }
 
     #[test]
@@ -1666,7 +1686,7 @@ mod ettr_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Settings { ettr_stops, ..Default::default() },
-            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, offline: None,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, four_channel_sound: false, offline: None,
         }
     }
 
@@ -2204,9 +2224,46 @@ struct BatchItem {
     x6: Option<X6ClipInfo>,
     /// A raw take of one lens ([`raw_take_of_one_lens`]).
     raw_one_lens: bool,
+    /// The clip has four-channel sound a spatial track can be made of
+    /// ([`four_channel_sound`]).
+    four_channel_sound: bool,
     /// The entry's file is not at hand (see [`OfflineClip`]); what the
     /// fields above say of the file is then empty.
     offline: Option<OfflineClip>,
+}
+
+/// A clip's sound is four channels an Ambisonic or APAC track can be
+/// written from: the X6's 360° Audio (a clip's own or a raw take's), the
+/// QooCam's four capsules, a `.360`'s ambisonic track. Reads a header.
+fn four_channel_sound(kind: vr180_pipeline::SourceKind, path: &std::path::Path) -> bool {
+    use vr180_pipeline::audio::{probe_foa_aac, probe_spatial_4ch};
+    use vr180_pipeline::SourceKind as K;
+    let found = |info: vr180_pipeline::Result<Option<vr180_pipeline::audio::AmbisonicInfo>>| info.ok().flatten().is_some();
+    match kind {
+        K::Insta360Insv => found(probe_foa_aac(&vr180_pipeline::x6_pair::audio_source(path).0)),
+        K::X6Raw => vr180_pipeline::x6_raw::audio_source(path).is_some_and(|(file, _)| found(probe_foa_aac(&file))),
+        K::KandaoQoocam => found(probe_foa_aac(path)),
+        K::GoProEac => found(probe_spatial_4ch(path)),
+        _ => false,
+    }
+}
+
+/// The sound of a joined file: the first clip's Audio choice (`wanted`).
+/// Ambisonic and APAC are for a run whose clips all have four-channel sound
+/// (`four_channel`, one entry a clip, in the run's order): `Err` is the
+/// place in the run of the first clip that has not.
+fn joined_sound(wanted: crate::decoder::AudioFormat, four_channel: &[bool]) -> Result<vr180_pipeline::join::JoinSound, usize> {
+    use crate::decoder::AudioFormat as AF;
+    use vr180_pipeline::join::JoinSound;
+    // A first clip without such sound has no say: its choice is not even
+    // shown, and may be one left over from another clip.
+    if wanted == AF::Stereo || !four_channel.first().copied().unwrap_or(false) {
+        return Ok(JoinSound::Stereo);
+    }
+    if let Some(odd) = four_channel.iter().position(|has| !has) {
+        return Err(odd);
+    }
+    Ok(if wanted == AF::Apac { JoinSound::Apac } else { JoinSound::Ambisonic })
 }
 
 /// A clip of an opened project, or of the last session, whose file is not
@@ -2236,6 +2293,7 @@ struct ClipFacts {
     fisheye_eye_h: u32,
     x6: Option<X6ClipInfo>,
     raw_one_lens: bool,
+    four_channel_sound: bool,
 }
 
 impl ClipFacts {
@@ -2287,6 +2345,7 @@ impl ClipFacts {
             // file's end) — a Crop clip's native-sharpness size follows from it.
             x6: (source_kind == vr180_pipeline::SourceKind::Insta360Insv).then(|| X6ClipInfo::read(path).0),
             raw_one_lens: raw_take_of_one_lens(source_kind, path),
+            four_channel_sound: four_channel_sound(source_kind, path),
         })
     }
 }
@@ -2331,6 +2390,7 @@ impl BatchItem {
             selected: clip.selected,
             x6: None,
             raw_one_lens: false,
+            four_channel_sound: false,
             offline: Some(OfflineClip { token, looking: true, file: clip.file.clone(), segments: clip.segments.clone(), base }),
         }
     }
@@ -2427,6 +2487,9 @@ struct JoinRun {
     /// The first clip's export, as it ran: the joined file is described to
     /// a player as that export described its own.
     first_cfg: Option<Box<vr180_pipeline::fisheye_export::FisheyeExportConfig>>,
+    /// The file's sound ([`joined_sound`]): every part is exported with the
+    /// track it is made of.
+    sound: vr180_pipeline::join::JoinSound,
     /// The parts are written; they are being put together.
     joining: bool,
 }
@@ -2512,7 +2575,7 @@ const MATCH_PLAYBACK_LABEL: &str = "Match QuickTime";
 const MATCH_PLAYBACK_HOVER: &str = "Show the preview the way Apple's players (QuickTime, Safari, Apple Vision Pro) show the exported file: read with Apple's Rec.709 video curve, so the mid-tones come out a little brighter. Off, the picture is shown as sRGB, which is closer to most players on Windows. Only the preview changes: the exported file is the same either way.";
 
 /// What the export bar's "Join into one file" says about itself.
-const JOIN_HOVER: &str = "Export the clips in the order of the list and write them as ONE file, one after the other, with hard cuts. Every clip keeps its own trim and settings. They have to come out at the same frame size and frame rate (pick one size for all of them in Format); the joined file's sound is stereo. Drag a clip by its handle (☰) to change the order.";
+const JOIN_HOVER: &str = "Export the clips in the order of the list and write them as ONE file, one after the other, with hard cuts. Every clip keeps its own trim and settings. They have to come out at the same frame size and frame rate (pick one size for all of them in Format). The file's sound is the first clip's Audio choice: stereo, or Ambisonic / APAC when every clip has four-channel sound. Drag a clip by its handle (☰) to change the order.";
 /// And the toolbar's Project menu.
 const PROJECT_HOVER: &str = "The clip list, with every clip's trim and settings and the export choices, as a file to save and open. The list also comes back by itself the next time the app starts.";
 
@@ -2973,7 +3036,8 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Remove both in/out points" => "清除入点与出点",
         // Several clips as one file
         "Join into one file" => "合成一个文件",
-        JOIN_HOVER => "按列表顺序导出各片段，并首尾相接写成一个文件（硬切）。每个片段保留自己的裁切和设置。各片段的输出尺寸和帧率必须相同（在“格式”里为它们选同一尺寸）；合成文件的声音为立体声。拖动片段左侧的手柄（☰）可以调整顺序。",
+        JOIN_HOVER => "按列表顺序导出各片段，并首尾相接写成一个文件（硬切）。每个片段保留自己的裁切和设置。各片段的输出尺寸和帧率必须相同（在“格式”里为它们选同一尺寸）。合成文件的声音跟随第一个片段的音频选项：立体声；当每个片段都有 4 声道声音时，也可以是 Ambisonic 或 APAC。拖动片段左侧的手柄（☰）可以调整顺序。",
+        "has no four-channel sound: a joined file with Ambisonic or APAC sound needs it in every clip. Set the first clip's Audio to Stereo, or leave this clip out." => "没有 4 声道声音：要让合成文件带 Ambisonic 或 APAC 音轨，每个片段都必须有 4 声道声音。请把第一个片段的音频改为立体声，或者不要包含这个片段。",
         "Join all" => "合成全部",
         "Join selected" => "合成所选",
         "Export the ticked clips as one file" => "把勾选的片段导出为一个文件",
@@ -4856,7 +4920,7 @@ impl App {
                 continue;
             }
             let Some(facts) = ClipFacts::read(&path) else { continue };
-            let ClipFacts { source_kind, fisheye_eye_w, fisheye_eye_h, x6, raw_one_lens, .. } = facts;
+            let ClipFacts { source_kind, fisheye_eye_w, fisheye_eye_h, x6, raw_one_lens, four_channel_sound, .. } = facts;
             let is_loaded_clip = self.loaded_path.as_deref() == Some(path.as_path());
             // A NEW clip inherits ITS kind's template (OSV / .360 / … kept
             // independent); the already-loaded clip keeps its live edits.
@@ -4908,6 +4972,7 @@ impl App {
                 selected: false,
                 x6,
                 raw_one_lens,
+                four_channel_sound,
                 offline: None,
             });
             if is_loaded_clip {
@@ -5037,6 +5102,11 @@ impl App {
             parts.push((item.path.clone(), format!("{:02}_{}", k + 1, clip_label(&own))));
         }
         let head = &self.batch[run[0]];
+        let four_channel: Vec<bool> = run.iter().map(|&i| self.batch[i].four_channel_sound).collect();
+        let sound = joined_sound(head.settings.audio_format, &four_channel).map_err(|odd| {
+            let name = clip_label(&self.batch[run[odd]].path);
+            format!("{name} {}", tr("has no four-channel sound: a joined file with Ambisonic or APAC sound needs it in every clip. Set the first clip's Audio to Stereo, or leave this clip out."))
+        })?;
         let mut output = joined_output_for(&head.path, opts.codec_for(&head.export_settings(), false), head.single_eye());
         if let Some(dir) = &self.batch_out_dir {
             if let Some(name) = output.file_name() {
@@ -5050,6 +5120,7 @@ impl App {
             output,
             parts_dir,
             first_cfg: None,
+            sound,
             joining: false,
         })
     }
@@ -5062,7 +5133,7 @@ impl App {
         if self.join_clips && run.len() >= 2 {
             match self.plan_join(&run, &self.export_opts) {
                 Ok(plan) => {
-                    tracing::info!("join: {} clips → {}", run.len(), plan.output.display());
+                    tracing::info!("join: {} clips → {} ({:?} sound)", run.len(), plan.output.display(), plan.sound);
                     self.join_run = Some(plan);
                 }
                 Err(why) => {
@@ -5102,13 +5173,14 @@ impl App {
         join.joining = true;
         let parts: Vec<PathBuf> = join.parts.iter().map(|(_, part)| part.clone()).collect();
         let output = join.output.clone();
+        let sound = join.sound;
         tracing::info!("join: {} parts → {}", parts.len(), output.display());
         let (progress_tx, progress_rx) = crossbeam_channel::bounded(256);
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_for_thread = cancel.clone();
         let out = output.clone();
         let handle = std::thread::spawn(move || {
-            vr180_pipeline::join::join_exports(&parts, &out, move |p| { let _ = progress_tx.try_send(p); }, cancel_for_thread)?;
+            vr180_pipeline::join::join_exports(&parts, &out, sound, move |p| { let _ = progress_tx.try_send(p); }, cancel_for_thread)?;
             let mut cfg = *cfg;
             cfg.output_path = out.clone();
             vr180_pipeline::fisheye_export::state_export_metadata(cfg, &out)
@@ -5213,18 +5285,22 @@ impl App {
         // A clip of a joined run is written to its part.
         let part = self.join_run.as_ref().and_then(|j| {
             let k = j.parts.iter().position(|(clip, _)| *clip == self.batch[idx].path)?;
-            Some((k, j.parts[k].1.clone(), j.parts_dir.clone()))
+            Some((k, j.parts[k].1.clone(), j.parts_dir.clone(), j.sound))
         });
         let output = match &part {
-            Some((_, file, _)) => file.clone(),
+            Some((_, file, _, _)) => file.clone(),
             None => self.batch_output_for(&self.batch[idx], &opts),
         };
         let item_path = self.batch[idx].path.clone();
         let segments = self.clip_segments(&item_path);
         let (mut cfg, eac_stab) = self.export_cfg_for(idx, &output, &opts, segments);
-        if let Some((k, _, dir)) = &part {
-            // The joined file's sound is one stereo track.
-            cfg.audio_track = vr180_pipeline::fisheye_export::AudioTrack::Stereo;
+        if let Some((k, _, dir, sound)) = &part {
+            // Every part carries what the joined file's one track is made
+            // of: stereo, or the clip's four-channel sound field.
+            cfg.audio_track = match sound {
+                vr180_pipeline::join::JoinSound::Stereo => vr180_pipeline::fisheye_export::AudioTrack::Stereo,
+                _ => vr180_pipeline::fisheye_export::AudioTrack::Ambisonic,
+            };
             if let Err(e) = std::fs::create_dir_all(dir) {
                 tracing::warn!("join: {}: {e}", dir.display());
             }
@@ -7716,6 +7792,7 @@ impl App {
         item.fisheye_eye_h = facts.fisheye_eye_h;
         item.x6 = facts.x6;
         item.raw_one_lens = facts.raw_one_lens;
+        item.four_channel_sound = facts.four_channel_sound;
         item.offline = None;
         if let Some(files) = segments {
             self.merge_groups.insert(path, files);

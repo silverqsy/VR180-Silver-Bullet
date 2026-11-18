@@ -343,8 +343,13 @@ closed. It is now also a simple timeline, and it is kept.
     together without encoding the picture again: a cut costs no quality
     and falls on a keyframe. The sound is cut to each clip's own picture to
     the sample, faded over 5 ms at a cut and encoded once for the whole
-    file, as stereo, so it stays on the picture however many clips there
-    are.
+    file, so it stays on the picture however many clips there are.
+  - The file's sound is the first clip's Audio choice. Stereo takes any
+    clips. Where every clip has four-channel sound (the X6's 360° Audio, a
+    `.360`, the QooCam's four capsules) the joined file can carry the
+    Ambisonic track or, on a Mac, Apple Positional Audio: the clips' sound
+    fields are put together channel for channel and encoded once. A clip
+    without such sound in the run is named before anything is exported.
   - The clips have to come out alike: the same frame size and frame rate,
     the same codec and bit depth, the same view. One size for all of them
     is picked in Format (8192 × 4096 takes clips of any camera). What does

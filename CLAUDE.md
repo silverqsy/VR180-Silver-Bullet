@@ -3573,9 +3573,18 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       encoded once (`stereo_to_aac`) and muxed. A part's track runs up to a
       codec frame past its picture: appended whole it puts every later part
       late (128 samples at the first cut of the test files), so each cut is
-      placed from the running total of the pictures' lengths. A part of
+      placed from the running total of the pictures' lengths. `JoinSound`
+      says what the one track is: `Stereo` (parts with any sound, or
+      none), or the parts' four-channel first-order ambisonics kept channel
+      for channel (decoded, cut and faded as the stereo is) and written as
+      `Ambisonic` (one four-channel AAC, `audio::four_channel_to_aac`, with
+      the SA3D tag) or `Apac` (macOS: `audio::four_channel_to_wav`, a 24-bit
+      WAV that states no layout, through the `apac_encode` helper, which
+      also writes the picture; where that fails, and off macOS, the
+      ambisonic track). A part of
       another codec, frame size, frame rate (0.01 fps apart is one rate) or
-      with other parameter sets is named in the error (`join_obstacle`).
+      with other parameter sets, or one without a four-channel track where
+      the sound is a sound field, is named in the error (`join_obstacle`).
       `planned_part` and `mismatch` tell the same BEFORE a run, from the
       export configurations: frame, frame rate, encoder with
       its depth or profile, how the file is described to a player.
@@ -3586,8 +3595,13 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       or `export_eac`, in their order.
     - **The run** (`app.rs`). `start_run` → `plan_join` (the checks, the
       file's name `<first clip>_Joined_<tag>.<ext>`, the parts as
-      `<that name>.parts/NN_<the clip's own output name>`) → the queue as
-      ever, each clip written to its part with `AudioTrack::Stereo` →
+      `<that name>.parts/NN_<the clip's own output name>`, the sound:
+      `joined_sound` = the FIRST clip's Audio choice, with Ambisonic / APAC
+      only where every clip has four-channel sound, a fact read with the
+      clip's header, `four_channel_sound`; a clip without it is named and
+      the run does not start) → the queue as ever, each clip written to its
+      part with `AudioTrack::Stereo` or, for a sound field,
+      `AudioTrack::Ambisonic` →
       `start_join` when the queue drains → `end_join` → `finish_run`. The
       join runs as the run's last `ExportJob`, so `logic()` hands over to it
       with the window covered like to any clip. One file or none: a clip
@@ -3617,8 +3631,8 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       `GuardStage` (`session.loading`): a launch that died putting the list
       back starts empty with the session put aside, one that died loading a
       clip gets its list without a clip on screen.
-    - **Checked on the Mac.** Tests: braw 6, core 63, fisheye 70, gui 55,
-      pipeline 241 (19 of them new). The stored sets are as they were: 65
+    - **Checked on the Mac.** Tests: braw 6, core 63, fisheye 70, gui 56,
+      pipeline 242 (21 of them new). The stored sets are as they were: 65
       exports, 169 preview lines. A joined file of five parts from three X6
       clips, written through the zero-copy loop, the portable loop and the
       noise-filter loop: the parts' parameter sets are byte for byte the
@@ -3626,7 +3640,13 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       sound sits at a shift of 0 samples against the part's own (cross
       correlation), and its projection boxes are those of a single export.
       The same for `.360` clips as VR180 and as a disc with its lens (`cams`
-      / `lnsc`) and for ProRes in `.mov`. In the app itself, started with a scratch home folder: a
+      / `lnsc`) and for ProRes in `.mov`. Three X6 clips recorded in 360°
+      Audio, joined as Ambisonic: every channel of every part sits in its
+      own channel at a shift of 0 samples, the SA3D box is there. Joined as
+      APAC: the system reads the track as four channels of ambisonics
+      (ACN / SN3D) of the picture's length, and decoded by the system each
+      of its channels is the ambisonic file's same channel (correlation
+      0.999 to 1.000 at lag 0). In the app itself, started with a scratch home folder: a
       session of two X6 clips set to join came back at launch (trims,
       ticks, output folder, Format choices; a clip named in it that does
       not exist stayed in the list as missing), and a run wrote the two
@@ -3635,7 +3655,11 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       was started by a line of test code, since removed: the buttons, the
       dragging of a row and the Project menu have not been worked by hand
       yet.
-    - **Windows, to look at.** (1) A joined run through NVENC and one
+    - **Windows, to look at.** (0) A joined run of X6 clips recorded in
+      360° Audio with the first clip's Audio at Ambisonic: one four-channel
+      AAC track with SA3D (an APAC choice carried over from a Mac is
+      written as Ambisonic there, in `join.rs` itself). (1) A joined run
+      through NVENC and one
       through libx265: the parts' parameter sets have to be byte for byte
       the same across clips (here the zero-copy loop, the portable loop and
       the noise-filter loop write the same ones for VideoToolbox). (2)
