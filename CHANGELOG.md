@@ -429,8 +429,10 @@ closed. It is now also a simple timeline, and it is kept.
       picture to its edge and nothing beyond it.
     - For Apple Vision Pro. The clips still have to come out at one frame
       size and frame rate (the 8K size in Format does that for every mode).
-    - Not seen on the headset yet. Not available on Windows: the camera
-      description is written by a framework of macOS.
+    - Played on Apple Vision Pro: a file of three clips in three recording
+      modes, as the app writes it, with stereo sound and with Apple
+      Positional Audio. Not available on Windows: the camera description is
+      written by a framework of macOS.
   - Not joined: stills, DNG sequences, spatial videos; and, where no Apple
     Immersive Video file can be written, the Lens Space view through the
     camera's own lens.

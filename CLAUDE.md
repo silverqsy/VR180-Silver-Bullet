@@ -3839,8 +3839,8 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       sound. **The video need not be MV-HEVC**: Apple's guide describes the
       format with MV-HEVC, but a side-by-side picture (view packing
       `SideBySide`, both eye flags) passes Apple's validator and renderer,
-      HEVC and ProRes alike, and the user had verified such files play.
-      So the parts go in packet for packet.
+      HEVC and ProRes alike, and a file written this way plays on Apple
+      Vision Pro (the checks below). So the parts go in packet for packet.
     - **The camera of a clip is a MESH the helper builds.** A venue's
       camera is drawn as a mesh for each eye: a piece of the unit sphere
       (x right, y up, forward −z), every vertex with the place in the eye's
@@ -3944,9 +3944,12 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       frame's edge). The same with ProRes parts, and with four-channel
       parts as Apple Positional Audio (`apac`, read back). Parts without a
       lens: the helper's reason comes back as the error and nothing is left
-      behind. **Not checked: the run through the app's own buttons (the
-      planning and the naming are tested, the function is run from a
-      harness), and the headset.** For whoever checks again, the
+      behind. **On Apple Vision Pro (the user, 2026-11-18):** that file,
+      side by side with stereo sound, plays; so does the one with Apple
+      Positional Audio, and a companion with the same cameras and the
+      picture as MV-HEVC. **Not checked: the run through the app's own
+      buttons (the planning and the naming are tested, the function is run
+      from a harness).** For whoever checks again, the
       renderer's `rotation` as `Rotation3D(eulerAngles:)` with x = pitch,
       y = yaw, order `.xyz`: a positive yaw turns the view to the RIGHT,
       and the yaw applies before the pitch.
