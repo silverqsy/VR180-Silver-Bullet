@@ -492,24 +492,38 @@ pub fn capture_timing(take: &Take) -> CaptureTiming {
     CaptureTiming { readout_ms, stamp_to_content_ms: readout_ms.map_or(0.0, |r| r as f64 * 0.5) }
 }
 
-/// The accelerometer (m/s²) at each gyro sample's time: the two streams
-/// share a clock, and nearly every stamp. Empty when the take has too
-/// little of it to be of use.
-fn accel_at_gyro(gyro: &[x6b::GyroSample], accel: &[x6b::GyroSample]) -> Vec<[f32; 3]> {
+/// The accelerometer (m/s²) at each gyro sample's time, and the gyro
+/// samples it speaks for: the two streams share a clock, and nearly every
+/// stamp. `frames` is the time of the take's first and last frame. Empty,
+/// with no samples, when the take has too little of it to be of use.
+///
+/// The camera opens the two streams one after the other (26 ms apart on a
+/// take of 2026-11-17; on some of the next night's the accelerometer came
+/// 1.65 s after the gyro, half a second into the frames). A gyro sample up
+/// to half a second outside the accelerometer's span takes its nearest
+/// reading: gravity is used slowly (the bias estimate, the trim), so that
+/// changes nothing. One further out has none (zeros: the pose builder
+/// leaves its trim alone there). Where every gyro sample has a reading the
+/// accelerometer speaks for all of them; else for those inside its own
+/// span, and the gyro's bias is estimated from that stretch.
+fn accel_at_gyro(gyro: &[x6b::GyroSample], accel: &[x6b::GyroSample], frames: (u64, u64)) -> (Vec<[f32; 3]>, std::ops::Range<usize>) {
     if accel.len() < 16 || gyro.is_empty() {
-        return Vec::new();
+        return (Vec::new(), 0..0);
     }
-    // It has to cover the gyro's span but for a short stretch at either end:
-    // the camera opens the two streams one after the other (26 ms apart on a
-    // take of 2026-11-17, which a tighter rule read as no accelerometer), and
-    // the samples outside take the nearest reading. Gravity is used slowly
-    // (the bias estimate, the trim), so half a second of that changes nothing.
     let slack = 500_000_000;
-    if accel[0].t_ns > gyro[0].t_ns + slack || accel[accel.len() - 1].t_ns + slack < gyro[gyro.len() - 1].t_ns {
-        return Vec::new();
+    let (first, last) = (accel[0].t_ns, accel[accel.len() - 1].t_ns);
+    let inside = |from: u64, to: u64| gyro.partition_point(|g| g.t_ns < from)..gyro.partition_point(|g| g.t_ns <= to);
+    let read = inside(first.saturating_sub(slack), last + slack);
+    let covered = if read.len() == gyro.len() { read.clone() } else { inside(first, last) };
+    // Of use when it has something to say about the frames.
+    if covered.len() < 16 || gyro[covered.start].t_ns > frames.1 || gyro[covered.end - 1].t_ns < frames.0 {
+        return (Vec::new(), 0..0);
     }
     let mut j = 0usize;
-    gyro.iter().map(|g| {
+    let at = gyro.iter().enumerate().map(|(i, g)| {
+        if !read.contains(&i) {
+            return [0.0; 3];
+        }
         while j + 2 < accel.len() && accel[j + 1].t_ns <= g.t_ns {
             j += 1;
         }
@@ -517,7 +531,48 @@ fn accel_at_gyro(gyro: &[x6b::GyroSample], accel: &[x6b::GyroSample]) -> Vec<[f3
         let span = b.t_ns.saturating_sub(a.t_ns).max(1) as f64;
         let f = ((g.t_ns as f64 - a.t_ns as f64) / span).clamp(0.0, 1.0) as f32;
         [0, 1, 2].map(|k| a.xyz[k] + (b.xyz[k] - a.xyz[k]) * f)
-    }).collect()
+    }).collect();
+    (at, covered)
+}
+
+/// The gyro's rates and the accelerometer at them as the samples of ONE
+/// rate, with that rate's step in seconds: what the 6-axis pass takes (it
+/// steps once a sample, each the same length of time).
+///
+/// A stream whose steps are all alike is handed over as it is, with its
+/// mean step. A take's stream may also run slower for a stretch (a camera
+/// build's gyro starts seconds ahead of the frames at a fifth of its rate,
+/// and falls back to that after the last): read as one rate, the turning
+/// of those stretches would count for a fifth of what it was, and the bias
+/// estimate follows the error. Such a stream is put on an even grid of its
+/// usual step (the median), each value taken between the two samples
+/// around it.
+fn evenly_sampled(gyro: &[x6b::GyroSample], accel: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, f32) {
+    let n = gyro.len();
+    let span_s = (gyro[n - 1].t_ns - gyro[0].t_ns) as f64 * 1e-9;
+    let mut steps: Vec<u64> = gyro.windows(2).map(|w| w[1].t_ns.saturating_sub(w[0].t_ns)).collect();
+    let longest = steps.iter().copied().max().unwrap_or(0);
+    let middle = steps.len() / 2;
+    let usual = *steps.select_nth_unstable(middle).1;
+    if usual == 0 || longest * 2 < usual * 3 {
+        return (gyro.iter().map(|g| g.xyz).collect(), accel.to_vec(), (span_s / (n - 1) as f64) as f32);
+    }
+    let dt = usual as f64 * 1e-9;
+    let count = (span_s / dt).floor() as usize + 1;
+    let (mut rates, mut acc) = (Vec::with_capacity(count), Vec::with_capacity(count));
+    let t0 = gyro[0].t_ns as f64;
+    let mut j = 0usize;
+    for k in 0..count {
+        let t = t0 + k as f64 * usual as f64;
+        while j + 2 < n && gyro[j + 1].t_ns as f64 <= t {
+            j += 1;
+        }
+        let (a, b) = (gyro[j].t_ns as f64, gyro[j + 1].t_ns as f64);
+        let f = ((t - a) / (b - a).max(1.0)).clamp(0.0, 1.0) as f32;
+        rates.push([0, 1, 2].map(|i| gyro[j].xyz[i] + (gyro[j + 1].xyz[i] - gyro[j].xyz[i]) * f));
+        acc.push([0, 1, 2].map(|i| accel[j][i] + (accel[j + 1][i] - accel[j][i]) * f));
+    }
+    (rates, acc, dt as f32)
 }
 
 /// Gyro bias in rad/s from the stillest half second of the stream, when one
@@ -576,7 +631,8 @@ pub fn build_imu(index: &TakeIndex, stream_w: u32, stream_h: u32) -> DjiOsvImu {
     // gyro's axes (it holds its direction in the gyro-integrated frame to
     // 1–2° through a hand-held minute, and reads as the camera's own video
     // files' does at rest).
-    let accel = accel_at_gyro(&gyro, &x6b::read_accel(&take.dir, hz));
+    let frames = (index.pairs[0].exposure_ns[0], index.pairs[index.pairs.len() - 1].exposure_ns[0]);
+    let (accel, covered) = accel_at_gyro(&gyro, &x6b::read_accel(&take.dir, hz), frames);
     let samples: Vec<InsvImuSample> = gyro.iter().enumerate()
         .map(|(i, g)| InsvImuSample {
             t_us: g.t_ns / 1000,
@@ -591,8 +647,12 @@ pub fn build_imu(index: &TakeIndex, stream_w: u32, stream_h: u32) -> DjiOsvImu {
     let (bias, trim_tau_s) = if accel.is_empty() {
         (rest_bias(&samples), 0.0)
     } else {
-        let rates: Vec<[f32; 3]> = gyro.iter().map(|g| g.xyz).collect();
-        let dt = ((gyro[gyro.len() - 1].t_ns - gyro[0].t_ns) as f64 * 1e-9 / (gyro.len() - 1) as f64) as f32;
+        // The bias: from the stretch the accelerometer speaks for, as samples of one rate.
+        let (rates, accel, dt) = evenly_sampled(&gyro[covered.clone()], &accel[covered.clone()]);
+        if rates.len() != covered.len() {
+            tracing::info!("raw take {}: the motion stream runs at more than one rate ({} samples): put on an even grid of {:.4} ms ({} samples) for the gyro's bias",
+                take.dir.display(), covered.len(), dt * 1e3, rates.len());
+        }
         (vr180_core::gyro::vqf::run(&rates, &accel, None, dt).bias_rad_s, crate::insv_imu::INSV_TAU_ACC_S)
     };
     let quats = crate::insv_imu::integrate_orientation_samples(&samples, bias, trim_tau_s);
@@ -623,7 +683,13 @@ pub fn build_imu(index: &TakeIndex, stream_w: u32, stream_h: u32) -> DjiOsvImu {
     tracing::info!(
         "raw take {}: {} gyro samples @ {:.1} Hz, bias {:?} rad/s, {}, covers {:+.3} s before the first frame to {:+.3} s after the last; {} frame poses, {}",
         take.dir.display(), gyro.len(), (gyro.len() - 1) as f64 / (last - first).max(1e-9), bias,
-        if accel.is_empty() { "no accelerometer".to_string() } else { format!("accelerometer (trim {trim_tau_s} s)") },
+        if accel.is_empty() {
+            "no accelerometer".to_string()
+        } else if covered.len() < gyro.len() {
+            format!("accelerometer for {} of them (trim {trim_tau_s} s)", covered.len())
+        } else {
+            format!("accelerometer (trim {trim_tau_s} s)")
+        },
         f0 - first, last - f1, out.frame_quats.len(),
         match timing.readout_ms {
             Some(r) => format!("readout {r:.3} ms, centre row {:.3} ms after the stamp", timing.stamp_to_content_ms),
@@ -1350,23 +1416,35 @@ mod tests {
         let gyro: Vec<_> = (0..40).map(|i| at(100 + i, 0.0)).collect();
         // The same stamps: the readings themselves.
         let same: Vec<_> = (0..45).map(|i| at(100 + i, i as f32)).collect();
-        let a = accel_at_gyro(&gyro, &same);
-        assert_eq!((a.len(), a[0], a[39]), (40, [0.0, 0.0, 0.0], [39.0, -39.0, 78.0]));
+        let ms = |a: u64, b: u64| (a * 1_000_000, b * 1_000_000);
+        let (a, covered) = accel_at_gyro(&gyro, &same, ms(100, 139));
+        assert_eq!((a.len(), a[0], a[39], covered), (40, [0.0, 0.0, 0.0], [39.0, -39.0, 78.0], 0..40));
         // Stamps half a sample off: the reading in between.
         let off: Vec<_> = (0..45).map(|i| x6b::GyroSample { t_ns: (100 + i) * 1_000_000 - 500_000, xyz: [i as f32, 0.0, 0.0] }).collect();
-        let a = accel_at_gyro(&gyro, &off);
+        let (a, _) = accel_at_gyro(&gyro, &off, ms(100, 139));
         assert!((a[10][0] - 10.5).abs() < 1e-4 && (a[39][0] - 39.5).abs() < 1e-4, "{:?} {:?}", a[10], a[39]);
-        // Too few samples, or a stream that stops well short of the gyro's: none.
-        assert!(accel_at_gyro(&gyro, &same[..10]).is_empty());
+        // Too few samples, or a stream that ends before the frames begin: none.
+        assert!(accel_at_gyro(&gyro, &same[..10], ms(100, 139)).0.is_empty());
         let short: Vec<_> = (0..16).map(|i| at(100 + i, 1.0)).collect();
         let long_gyro: Vec<_> = (0..2000).map(|i| at(100 + i, 0.0)).collect();
-        assert!(accel_at_gyro(&long_gyro, &short).is_empty());
+        assert_eq!(accel_at_gyro(&long_gyro, &short, ms(100 + 500, 2099)), (Vec::new(), 0..0));
         // One that starts a little after the gyro and ends a little before
-        // it serves: the samples outside take its nearest reading.
+        // it serves: the samples outside take its nearest reading, and it
+        // speaks for every one of them.
         let inner: Vec<_> = (26..1980).map(|i| at(100 + i, i as f32)).collect();
-        let a = accel_at_gyro(&long_gyro, &inner);
-        assert_eq!((a.len(), a[0][0], a[26][0], a[1000][0], a[1999][0]), (2000, 26.0, 26.0, 1000.0, 1979.0));
-        assert!(accel_at_gyro(&[], &same).is_empty());
+        let (a, covered) = accel_at_gyro(&long_gyro, &inner, ms(100, 2099));
+        assert_eq!((a.len(), a[0][0], a[26][0], a[1000][0], a[1999][0], covered), (2000, 26.0, 26.0, 1000.0, 1979.0, 0..2000));
+        assert!(accel_at_gyro(&[], &same, ms(100, 139)).0.is_empty());
+        // One that starts 1.65 s after the gyro, half a second into the
+        // frames: it serves. It speaks for the gyro samples inside its own
+        // span; those up to half a second ahead take its first reading, and
+        // the ones before have none.
+        let late: Vec<_> = (1650..2000).map(|i| at(100 + i, i as f32)).collect();
+        let (a, covered) = accel_at_gyro(&long_gyro, &late, ms(100 + 1100, 2099));
+        assert_eq!((a.len(), a[0], a[1149], a[1150][0], a[1650][0], a[1999][0], covered), (2000, [0.0; 3], [0.0; 3], 1650.0, 1650.0, 1999.0, 1650..2000));
+        // A short stream with frames inside it serves them, and no further.
+        let (a, covered) = accel_at_gyro(&long_gyro, &short, ms(100, 110));
+        assert_eq!((a.len(), a[515][0], a[516], covered), (2000, 1.0, [0.0; 3], 0..16));
     }
 
     /// A take's frame timing is its sensor record's: the readout, and the
@@ -1697,6 +1775,43 @@ mod tests {
         let index = TakeIndex::new(take(1), vec![entry, PairEntry { request: 43, exposure_ns: [7_066_733_333; 2], ..entry }]);
         assert_eq!((index.frames(), index.missing.clone()), (2, vec![42]));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_motion_stream_of_two_rates_is_put_on_one() {
+        // Rates that rise evenly with time: a value between two samples is known exactly.
+        let sample = |t_ns: u64| x6b::GyroSample { t_ns, xyz: [t_ns as f32 * 1e-9, -2.0 * t_ns as f32 * 1e-9, 0.5] };
+        let accel_of = |stream: &[x6b::GyroSample]| -> Vec<[f32; 3]> { stream.iter().map(|g| [3.0 * g.xyz[0], 1.0, g.xyz[1]]).collect() };
+        // One rate, its stamps a few microseconds off the beat: handed over as it is, with its mean step.
+        let even: Vec<x6b::GyroSample> = (0..200u64).map(|k| sample(k * 1_000_000 + (k % 3) * 2_000)).collect();
+        let accel = accel_of(&even);
+        let (rates, at_rates, dt) = evenly_sampled(&even, &accel);
+        assert_eq!(rates, even.iter().map(|g| g.xyz).collect::<Vec<_>>());
+        assert_eq!(at_rates, accel);
+        assert_eq!(dt, ((even[199].t_ns - even[0].t_ns) as f64 * 1e-9 / 199.0) as f32);
+        // A stream that starts at a fifth of its rate (40 samples 5 ms apart, then 400 a millisecond apart) and
+        // falls back to it (10 more): 5 + 1 samples of its usual step for each slow one.
+        let (mut t, mut two) = (0u64, Vec::new());
+        for k in 0..450 {
+            two.push(sample(t));
+            t += if (40..439).contains(&k) { 1_000_000 } else { 5_000_000 };
+        }
+        let accel = accel_of(&two);
+        let span_ms = (two[449].t_ns / 1_000_000) as usize;
+        assert_eq!(span_ms, 40 * 5 + 399 + 10 * 5);
+        let (rates, at_rates, dt) = evenly_sampled(&two, &accel);
+        assert_eq!((rates.len(), at_rates.len()), (span_ms + 1, span_ms + 1));
+        assert!((dt - 1e-3).abs() < 1e-9, "{dt}");
+        for (k, (rate, acc)) in rates.iter().zip(&at_rates).enumerate() {
+            let want = sample(k as u64 * 1_000_000).xyz;
+            assert!((rate[0] - want[0]).abs() < 1e-6 && (rate[1] - want[1]).abs() < 1e-6 && rate[2] == 0.5, "sample {k}: {rate:?}");
+            assert!((acc[0] - 3.0 * want[0]).abs() < 1e-5 && acc[1] == 1.0 && (acc[2] - want[1]).abs() < 1e-6, "sample {k}: {acc:?}");
+        }
+        // A single sample missing is a second rate as well: the hole is filled.
+        let holed: Vec<x6b::GyroSample> = (0..100u64).filter(|k| *k != 50).map(|k| sample(k * 1_000_000)).collect();
+        let (rates, _, dt) = evenly_sampled(&holed, &accel_of(&holed));
+        assert_eq!(rates.len(), 100);
+        assert!((dt - 1e-3).abs() < 1e-9 && (rates[50][0] - 0.05).abs() < 1e-6);
     }
 
     /// A take of one lens on disk (`VR180_ONE_LENS_TAKE=<folder>`; skipped

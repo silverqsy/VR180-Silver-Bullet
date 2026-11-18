@@ -448,7 +448,8 @@ pub fn integrate_orientation_samples(imu: &[vr180_fisheye::insta360::InsvImuSamp
         if k + 1 >= n { break; }
         let dt = (t[k + 1] - t[k]).clamp(0.0, 0.05);
         q = q.mul(step(k)).normalize();
-        if tau_s > 0.0 {
+        // A sample without an accelerometer reading (zeros) leaves the trim where it is.
+        if tau_s > 0.0 && imu[k + 1].acc_g != [0.0; 3] {
             let a = imu[k + 1].acc_g;
             let ae = q.rotate([a[0] as f64, a[1] as f64, a[2] as f64]);
             let kf = (dt / INSV_TRIM_LP_S).min(1.0);
