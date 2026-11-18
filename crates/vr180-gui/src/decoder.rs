@@ -396,6 +396,12 @@ pub struct Settings {
     /// how it was exposed, so this is the clip's own value: a new clip
     /// starts at 0 whatever the last one had.
     pub ettr_stops: f32,
+    /// The tone controls of a clip that is not raw: Exposure, Contrast,
+    /// Highlights, Shadows, Whites and Blacks, each a change of exposure in
+    /// linear light ahead of the CDL and the LUT
+    /// (`vr180_pipeline::tone_linear`). A raw clip has the same controls in
+    /// its development (`raw`), and Blackmagic RAW in the SDK's.
+    pub tone: vr180_pipeline::tone_linear::ToneSettings,
     /// Optional 3D LUT file path. Empty string = no LUT.
     /// Equirect-aware unsharp-mask amount (0 = off, 0.5 subtle, 1 mod,
     /// 2 strong). Ported from the Python app; applies to every source.
@@ -550,6 +556,7 @@ impl Default for Settings {
             auto_eye_match: false,
             auto_eye_match_mode: vr180_pipeline::gpu::EyeMatchMode::Average,
             ettr_stops: 0.0,
+            tone: Default::default(),
             lut_path: String::new(),
             lut_intensity: 1.0,
             braw_color: Default::default(),
@@ -670,6 +677,7 @@ pub fn restrict_to_dng_metadata(plan: &mut vr180_pipeline::gpu::ColorStackPlan) 
     plan.sharpen = Default::default();
     plan.auto_eye_match = None;
     plan.log_exposure = None;
+    plan.tone = None;
 }
 
 impl Settings {
@@ -836,6 +844,22 @@ impl Settings {
             plan.log_exposure = Some(vr180_pipeline::gpu::LogExposure {
                 curve: vr180_core::LogCurve::INSTA360_ILOG,
                 stops: -self.ettr_stops,
+            });
+        }
+        // The tone controls, in linear light ahead of the CDL and the LUT
+        // (a raw clip has them in its development). Where the source's log
+        // curve is known the light is the scene's, and the exposure taken
+        // back out above is made by the same stage; for every other clip it
+        // is the light the picture shows. With nothing moved the stage is
+        // not in the plan at all, and the clip renders as it always has.
+        if !self.raw_source && !self.tone.is_identity() {
+            use vr180_pipeline::tone_linear::{LinearTone, ToneLight};
+            let pre_stops = plan.log_exposure.take().map_or(0.0, |e| e.stops);
+            plan.tone = Some(LinearTone {
+                settings: self.tone,
+                light: if self.ilog_source { ToneLight::Scene(vr180_core::LogCurve::INSTA360_ILOG) } else { ToneLight::Shown },
+                pre_stops,
+                measure: vr180_pipeline::raw_tone::Measure::Wait,
             });
         }
         if !self.lut_path.is_empty() {
@@ -1803,23 +1827,37 @@ pub fn start_decoder(
         .map_err(|e| { tracing::error!("decoder: source detect failed: {e}"); e })?;
     tracing::info!("decoder: source kind = {:?} ({})", kind, kind.display());
 
-    // This thread draws the live preview: a raw clip's tone keys must not
-    // be waited for here (see `compose_with_color_and_mode`). When a
-    // measurement lands that changes them, the frame on screen is drawn
-    // again, as on a settings change. Cleared with the worker.
+    // This thread draws the live preview: the levels a frame's tone is
+    // derived from (a raw clip's development, the tone controls of any
+    // other clip) must not be waited for here (see
+    // `compose_with_color_and_mode`). When a measurement lands that changes
+    // them, the frame on screen is drawn again, as on a settings change:
+    // while it stands, that is. A video that is playing draws its next
+    // frame with the new levels anyway, and telling the worker then had it
+    // work out the clip's view again for every frame it played.
+    // Cleared with the worker.
     LIVE_PREVIEW.with(|live| live.set(true));
-    struct RawToneNotifier(Arc<Device>);
-    impl Drop for RawToneNotifier {
-        fn drop(&mut self) { self.0.set_raw_tone_notifier(None); }
+    struct ToneNotifier { device: Arc<Device>, raw: bool }
+    impl ToneNotifier {
+        fn set(&self, notify: Option<Arc<dyn Fn() + Send + Sync>>) {
+            if self.raw { self.device.set_raw_tone_notifier(notify) } else { self.device.set_linear_tone_notifier(notify) }
+        }
     }
-    let _raw_tone = kind.is_raw_video().then(|| {
+    impl Drop for ToneNotifier {
+        fn drop(&mut self) { self.set(None); }
+    }
+    let _tone = {
         let control = control.clone();
-        pipeline.set_raw_tone_notifier(Some(Arc::new(move || {
-            control.settings_generation.fetch_add(1, Ordering::SeqCst);
-            control.wake_ui();
+        let notifier = ToneNotifier { device: pipeline.clone(), raw: kind.is_raw_video() };
+        let still = kind.is_still();
+        notifier.set(Some(Arc::new(move || {
+            if still || control.paused.load(Ordering::SeqCst) {
+                control.settings_generation.fetch_add(1, Ordering::SeqCst);
+                control.wake_ui();
+            }
         })));
-        RawToneNotifier(pipeline.clone())
-    });
+        notifier
+    };
 
     // Still photo (Insta360 X6 `.dng`): not a video — nothing to probe, no
     // timeline. One developed + projected frame, re-rendered on every
@@ -5270,12 +5308,17 @@ fn compose_view_with_color_and_mode(
     }
     // A raw clip's tone keys: the live preview takes the last measurement
     // that came back; a still drawn on demand measures its own frame.
+    let measure = if LIVE_PREVIEW.with(|live| live.get()) {
+        vr180_pipeline::raw_tone::Measure::Latest
+    } else {
+        vr180_pipeline::raw_tone::Measure::Wait
+    };
     if let Some(stage) = color_plan.raw_develop.as_mut() {
-        stage.measure = if LIVE_PREVIEW.with(|live| live.get()) {
-            vr180_pipeline::raw_tone::Measure::Latest
-        } else {
-            vr180_pipeline::raw_tone::Measure::Wait
-        };
+        stage.measure = measure;
+    }
+    // The same for the tone controls of a clip that is not raw.
+    if let Some(stage) = color_plan.tone.as_mut() {
+        stage.measure = measure;
     }
     // Automatic eye matching needs the pair state. Without one (a source
     // whose sensors expose together, or a caller that has none) the plan

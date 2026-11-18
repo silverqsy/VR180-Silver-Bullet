@@ -191,6 +191,56 @@ converter's controls for it, and every frame can be had as a DNG.
 - **What a take does not carry.** No white balance of its own: As shot is
   the camera's reference white.
 
+### Color: Exposure, Contrast, Highlights, Shadows, Whites and Blacks for every clip
+
+The six tone controls a raw clip has in its development are now in the
+Color panel of every video clip and still, under **Tone**. Each of them is a
+change of exposure made in linear light, ahead of Lift / Gamma / Gain and
+the LUT, and not a curve laid over the picture the LUT left.
+
+- **Why ahead of the LUT.** A log clip's LUT presses the top stops of the
+  recording into a narrow band below white. A control that works on the
+  picture after it can only darken that band. Here Highlights takes the
+  light itself down and the LUT then renders what the file holds. Two
+  highlights one stop apart in the scene, both on the shoulder of the X6's
+  own LUT, are shown 1.5 % of the range apart; with Highlights at −100
+  they are shown 4.2 % apart, where the same pull made on the picture
+  after the LUT leaves 0.9 %.
+- **Which light.** An Insta360 I-Log clip is decoded with the camera's log
+  curve: the light is the scene's and a stop is a stop of exposure. The
+  ETTR recovery of such a clip is made by the same stage. Every other clip
+  (D-Log M, GP-Log, HLG, plain video, a still) is worked on in the light
+  its picture shows: the stage looks through the clip's own Lift / Gamma /
+  Gain and LUT to know what a value is displayed as, changes that light,
+  and writes the value that displays the result. A neutral tone then moves
+  exactly as the displayed light says, whatever LUT is loaded.
+- **The controls are the raw development's.** Shadows and Highlights are
+  local: they lift or hold back an area as a whole and leave the texture
+  inside it alone, and what counts as a shadow follows the frame's own
+  levels. Whites, Blacks and Contrast follow the frame's levels too. Every
+  frame is measured, both eyes as one frame, so the two eyes are toned
+  alike. The numbers are not Camera Raw's for a video clip: the picture is
+  rendered by the camera's LUT, not by a raw converter's curve.
+- **Nothing moved is nothing run.** With the six at zero the stage is not
+  part of a clip's rendering at all: the 65 stored exports and 169 stored
+  preview frames of the test set came out identical to the bytes they had
+  before the controls existed.
+- **Lift / Gamma / Gain** are as they were. The Shadow and Highlight
+  sliders that sat with them are replaced by the two above; a clip graded
+  with them keeps its values, shown as "earlier", until that section is
+  reset.
+- **Cost.** Exposure alone costs nothing. A control that needs the frame
+  measured adds about 10 ms a frame at 8192 × 4096 (39 to 42 ms a frame
+  became 48 to 51 on the test machine).
+- **Not offered** for a raw clip (its development has the six), for
+  Blackmagic RAW (the SDK's own controls), and for a still written as a
+  linear DNG (a DNG has no place for them).
+- **Limits.** A reframed view and a Lens Space frame are measured as they
+  are drawn, not from the whole half-sphere. Black outside the picture (a
+  Crop mask, a lens frame's border) is lifted by Blacks above zero, as Lift
+  lifts it. The Matching Eyes exposure trim acts after the stage.
+- Not yet run on Windows.
+
 ### Insta360 X6: ETTR recovery for I-Log clips
 
 A clip exposed brighter than normal on purpose (exposing to the right: more

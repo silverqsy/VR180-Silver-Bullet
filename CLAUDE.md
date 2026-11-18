@@ -3667,6 +3667,162 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       with the clips, opened again. (4) The list across a restart, and a
       restart with the clips' drive away.
 
+37. **Tone controls in linear light for every clip that is not raw
+    (2026-11-17, Mac; UNRELEASED).** The user-facing text is in the
+    CHANGELOG. Exposure, Contrast, Highlights, Shadows, Whites and Blacks,
+    the six of a raw clip's development, as ONE stage of the colour stack
+    that works in linear light ahead of the CDL and the LUT. Lift / Gamma /
+    Gain stay where they were (the CDL, on the codes ahead of the LUT).
+    - **`vr180_pipeline::tone_linear`** (the arithmetic, no GPU).
+      `ToneSettings` (the six numbers, serde), `LinearTone { settings,
+      light, pre_stops, measure }` (the plan's stage), `ToneConstants` (one
+      frame's tables; `apply` is the CPU twin of the shader). The stage:
+      `codes → light → × exposure → Shadows / Highlights → Whites → Blacks →
+      Contrast → codes`.
+      - *Which light* (`ToneLight`). `Scene(LogCurve)`: the codes are
+        decoded with the camera's log curve and divided by the light of
+        code 1, so 1 is the brightest a code can say. Used where the curve
+        is known: Insta360 I-Log. `Shown`: the light the picture SHOWS. The
+        code goes through the neutral curve of what renders it after the
+        stage (`Shown` = the CDL, then the LUT at its intensity, on greys:
+        `ColorStackPlan::shown`, a CPU port of `cdl.wgsl` and of
+        `lut3d.wgsl`'s eight-corner mix, 4097 nodes so a 17 / 33 / 65 point
+        lattice's kinks fall on nodes) and is decoded as sRGB; the result
+        goes back through that curve's inverse (`Shown::code_of`: a level
+        stretch at either end is entered from inside). Every other clip
+        takes this one. It needs no vendor formula: D-Log M has no published
+        one and GP-Log's base is not confirmed, and a wrong curve would be
+        worse than none. Should one be confirmed, `Settings::build_color_stack`
+        is the one place that picks the light.
+      - *Shadows / Highlights* are the raw development's own: the bilateral
+        grid of the frame's log₂ luminance (`raw_local`), the curves from
+        the frame's levels (`raw_local::local_curves`, which follow the
+        frame down the scale, so the light's unit does not matter), the
+        white limiter (`limit_gain`, white = light 1).
+      - *Whites / Blacks / Contrast* are Camera Raw's maps of the DISPLAYED
+        value (`raw_global`). A map `m` becomes a change of light through
+        the rendering: a light `x` shows as `e`, so it goes to the light
+        that shows as `m(e)` (`Light::through`; where the rendering is level
+        at `x` the pixel keeps its ratio to that light, next to black its
+        distance). The frame's levels are handed to the maps as the level
+        Camera Raw's default rendering would have been fed to show the same
+        (`equivalent_level`). Stored as the CHANGE of a light (`LightMap`),
+        so a control at zero passes a light exactly; 1025 samples, 57 to the
+        stop, made again for every frame.
+      - *The tables that do not depend on the frame* (`LightTables`: light
+        over the code, and the code over the sRGB encoding of the light,
+        16385 samples: laid out that way the inverse of a LUT's shoulder is
+        sampled evenly where it is steep) are kept from frame to frame
+        (`Device::linear_tone_tables`).
+      - *Under black.* A log curve's straight toe runs on under its black,
+        where a clip's noise lies: such a code is light BELOW none. It is
+        not cut off: it keeps its sign through the exposure and the gain, a
+        stage's change runs on under zero along the line it starts with
+        (`LightMap::at`), and the light goes back to a code along the toe
+        (`LightTables::below`, read off the decode table's first two
+        codes). Exposure alone is then `LogCurve::expose` for every code,
+        as the ETTR stage is, and noise about black keeps its mean.
+    - **`vr180_pipeline::tone_gpu`** (`shaders/tone_measure.wgsl`,
+      `tone_reduce.wgsl`, `tone_linear.wgsl`). `Device::linear_tone_constants(eyes,
+      plan)` measures the frame (the eyes as they enter the stack, two side
+      by side as one frame: 126 cells along the long side, read back) and
+      returns its constants; `record_linear_tone` records the stage (the
+      reduce pass and the raw stage's own `grid_build` / `grid_blur` when
+      Shadows or Highlights are moved, one empty grid cell and gains of zero
+      otherwise). The raw module's helpers it shares are `pub(crate)` now;
+      its pipelines are built when a frame first needs the stage, not when
+      a clip is opened.
+      `Measure::Wait` (exports, stills) waits for the frame's own levels;
+      `Measure::Latest` (the live preview) takes the last ones that came
+      back, queues a measurement and has the frame drawn again when it
+      lands differently (`set_linear_tone_notifier`; the decoder thread sets
+      it for every clip that is not raw). A frame and its enlargement for
+      the zoom view are one picture at two sizes: across sizes only a change
+      six times the usual tolerance counts (`ACROSS_SIZES`), or the two
+      would have each other drawn again without end.
+      - **The notifier fires only while the frame stands** (the worker is
+        paused, or the clip is a still), for a raw clip too. Before, a raw
+        clip that played bumped `settings_generation` for every frame: the
+        worker resolved the clip's view again and logged "live calib
+        update" 30 times a second (1277 such lines in one evening's log). A
+        playing video draws its next frame with the new levels anyway.
+    - **The stack** (`gpu.rs`). `ColorStackPlan.tone`; the stage is `0c`,
+      after the eye offset and the log exposure and ahead of the CDL, at 8
+      and at 16 bits (`record_color_stack` takes the frame's constants as a
+      parameter; every entry point reads them off ALL the eyes it is given,
+      so both eyes are toned alike: a test). A plan whose stage moves
+      nothing (`active_tone()` is `None`) records nothing and
+      `any_active()` does not count it. The app never puts the ETTR
+      recovery and the stage in one plan: with a control moved the recovery
+      is the stage's `pre_stops`, one decode and one encode for both.
+      - Two arms graded the eyes with two `apply_color_stack_per_eye_16`
+        calls: the `.360` export's 10-bit surface arm (macOS) and the
+        GPU-resident `.360` arm (**Windows only: edited blind, same call as
+        the Mac one, `apply_color_stack_pair_16(.., &color_plan, None)`**).
+        Both are one pair call now. For a plan without the stage the result
+        is the same textures as before.
+      - The 8-bit path that grades on the host
+        (`apply_color_stack_rgb8_sbs`) runs the stages ahead of the CDL on
+        the whole frame first: the log exposure table (moved there from
+        `apply_color_stack_rgb8`, byte for byte the same) and then
+        `Device::apply_linear_tone_rgb8`, which uploads the eyes, tones them
+        with one set of constants and reads them back (a test holds it to
+        the GPU stack's bytes).
+    - **GUI.** `Settings.tone` (serde, default = nothing moved; kept per
+      clip like the rest of the grade). `build_color_stack`: the stage only
+      when a control is moved and the clip is not raw; `Scene(I-Log)` for
+      `ilog_source`, `Shown` otherwise; a linear DNG has no place for it
+      (`restrict_to_dng_metadata`). Color panel: section **Tone** (not for a
+      raw clip, Blackmagic RAW or DNG output), then **Lift / Gamma / Gain**.
+      The CDL's own Shadow / Highlight sliders are offered only while a
+      grade still holds a value in one ("earlier"), and until that section
+      is reset. Blackmagic RAW keeps the six neutral at load, as it keeps
+      the CDL.
+    - **What it costs** (8192 × 4096, 10-bit HEVC, M-series, 100 frames):
+      39 to 42 ms a frame without the stage; the same with Exposure alone
+      (nothing is measured); 48 to 51 ms with a measured control. Of that
+      about 12 ms is the wait for the frame's levels (it also ends the
+      overlap of the GPU's work with the next frame's decode) and 0.5 to
+      1 ms the tables.
+    - **Known limits.** A reframed view or a lens frame is measured as it
+      is drawn, not from the half-equirect (the raw development has a
+      reference frame for that; this stage does not). The frame is measured
+      as it enters the stack, ahead of the automatic eye offset. The
+      "Matching Eyes" exposure trim stays a gain of the CDL, after the
+      stage. Black outside the picture (a mask, a lens frame's border) is
+      lifted by Blacks above zero, as Lift lifts it. Clips in other log
+      curves work in the light their picture shows until a curve is
+      confirmed. The controls are the raw development's operators, measured
+      on Camera Raw with raw files: what Camera Raw does to a rendered file
+      was never measured, and a log clip is rendered by its camera's LUT,
+      so the numbers are not claimed to be Camera Raw's for video.
+    - **Checked on the Mac.** Tests: braw 6, core 63, fisheye 70, gui 57,
+      pipeline 259 (the stage's own: nine of the arithmetic, eight on the
+      GPU, one of the GUI's plan). With nothing moved the stored sets are as
+      they were: 65 exports, 169 preview lines. The stage's exposure on
+      I-Log codes is the ETTR stage's to an eighth of a 10-bit step, every
+      16-bit code (a test). On an I-Log clip shot two stops over, through
+      the X6's LUT: Highlights −100 takes the brightest hundredth of the
+      frame from 0.67 to 0.41 of the range and the picture keeps its edges,
+      Shadows +100 the median from 0.10 to 0.19 with no halo at the window
+      frame (looked at as stills). The live preview's frame, the zoom still
+      and the export of one moment, stabilization off, with five settings:
+      preview and still within 0.002 to 0.003 of the range (8 × 8 block
+      means), and what a setting CHANGES is the same in the preview and in
+      the export to 0.0014 to 0.0019 on changes of 0.03 to 0.05. Every
+      export arm with the six in use, 19 runs (the X6 clip through the
+      hardware encoder at 10 and 8 bits, the software one at both, ProRes,
+      a reframed view, no LUT; an Osmo clip; a `.360` through its five
+      arms): none failed, the 10-bit arms agree to 0.001 to 0.002, the 8-bit
+      ones differ from them by what they differ by with no control moved,
+      a second run gave the same bytes. Not seen in the app's window: the
+      sliders, the redraw when a measurement lands, the zoom view.
+    - **Windows, to look at.** (1) The GPU-resident `.360` arm compiles and
+      a `.360` export with and without a moved control comes out right
+      (both eyes alike). (2) The stage through the D3D11 / NVENC arms, 8 and
+      10 bit. (3) The live preview's redraw when a measurement lands (the
+      notifier), with the zoom view open.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

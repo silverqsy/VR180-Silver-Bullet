@@ -52,8 +52,11 @@ Studio).
   work; Matching Eyes white-balance and exposure trims, plus automatic
   per-frame eye-exposure matching for the X6's independently exposing
   sensors.
-- **Color**, 10-bit end to end: CDL, 3D LUT, white balance, saturation,
-  sharpen, mid-detail. ETTR recovery for X6 I-Log clips: the exposure a
+- **Color**, 10-bit end to end: Exposure, Contrast, Highlights, Shadows,
+  Whites and Blacks for every clip, made in linear light ahead of the LUT
+  (a highlight the LUT presses against white comes back from what the file
+  holds); lift / gamma / gain, 3D LUT, white balance, saturation, sharpen,
+  mid-detail. ETTR recovery for X6 I-Log clips: the exposure a
   clip was given beyond normal is taken back out in scene-linear light,
   ahead of the LUT. Temporal noise reduction on macOS (export only).
 - **Stills** (X6 and QooCam `.dng`): the raw stage (gain maps, demosaic) feeds the

@@ -71,13 +71,13 @@ pub(crate) struct RawPipelines {
     measure_layout: wgpu::BindGroupLayout,
     reduce: wgpu::ComputePipeline,
     reduce_layout: wgpu::BindGroupLayout,
-    grid_build: wgpu::ComputePipeline,
-    grid_build_layout: wgpu::BindGroupLayout,
-    grid_blur: wgpu::ComputePipeline,
-    grid_blur_layout: wgpu::BindGroupLayout,
+    pub(crate) grid_build: wgpu::ComputePipeline,
+    pub(crate) grid_build_layout: wgpu::BindGroupLayout,
+    pub(crate) grid_blur: wgpu::ComputePipeline,
+    pub(crate) grid_blur_layout: wgpu::BindGroupLayout,
     develop_local: wgpu::ComputePipeline,
     develop_local_layout: wgpu::BindGroupLayout,
-    grid_sampler: wgpu::Sampler,
+    pub(crate) grid_sampler: wgpu::Sampler,
     sharpen_level: wgpu::ComputePipeline,
     sharpen_edge: wgpu::ComputePipeline,
     sharpen_level_layout: wgpu::BindGroupLayout,
@@ -147,8 +147,8 @@ struct ReduceParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GridParams {
-    cell: [f32; 4],
+pub(crate) struct GridParams {
+    pub(crate) cell: [f32; 4],
 }
 
 #[repr(C)]
@@ -238,11 +238,11 @@ pub const RAW_REFERENCE_SIDE: u32 = 1008;
 
 /// Cells along the longer side of the frame the keys are read from: three
 /// to a cell of the reduced copy the curves are derived from.
-const KEY_CELLS: u32 = 126;
+pub(crate) const KEY_CELLS: u32 = 126;
 /// Key cells along one side of a cell of that reduced copy.
 const STAT_BLOCK: usize = 3;
 /// Most taps along one side of a cell.
-const KEY_TAPS: u32 = 64;
+pub(crate) const KEY_TAPS: u32 = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -528,7 +528,7 @@ impl RawPipelines {
     }
 }
 
-fn bgl_texture(binding: u32, dim: wgpu::TextureViewDimension, filterable: bool) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn bgl_texture(binding: u32, dim: wgpu::TextureViewDimension, filterable: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -537,7 +537,7 @@ fn bgl_texture(binding: u32, dim: wgpu::TextureViewDimension, filterable: bool) 
     }
 }
 
-fn bgl_storage(binding: u32, format: wgpu::TextureFormat, dim: wgpu::TextureViewDimension) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn bgl_storage(binding: u32, format: wgpu::TextureFormat, dim: wgpu::TextureViewDimension) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -546,7 +546,7 @@ fn bgl_storage(binding: u32, format: wgpu::TextureFormat, dim: wgpu::TextureView
     }
 }
 
-fn bgl_uniform(binding: u32, size: usize) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn bgl_uniform(binding: u32, size: usize) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -559,7 +559,7 @@ fn bgl_uniform(binding: u32, size: usize) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn bgl_storage_buffer(binding: u32) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn bgl_storage_buffer(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -568,7 +568,7 @@ fn bgl_storage_buffer(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn compute_pipeline(device: &wgpu::Device, label: &str, wgsl: &str, entry: &str, layout: &wgpu::BindGroupLayout) -> wgpu::ComputePipeline {
+pub(crate) fn compute_pipeline(device: &wgpu::Device, label: &str, wgsl: &str, entry: &str, layout: &wgpu::BindGroupLayout) -> wgpu::ComputePipeline {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(wgsl.into()) });
     let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[Some(layout)], immediate_size: 0 });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -582,7 +582,7 @@ fn compute_pipeline(device: &wgpu::Device, label: &str, wgsl: &str, entry: &str,
 }
 
 impl Device {
-    fn raw_pipelines(&self) -> &RawPipelines {
+    pub(crate) fn raw_pipelines(&self) -> &RawPipelines {
         self.raw.get_or_init(|| RawPipelines::create(&self.device))
     }
 
@@ -761,7 +761,7 @@ fn luma4(w: f32) -> [f32; 4] {
 /// What a mapped measurement says of the frame: `bytes` holds the cells of
 /// every eye measured (`cx × cy` each, eye after eye), 16 bytes (four
 /// `f32`: the mean scene RGB and the mean log₂ luminance) each.
-fn stats_from_cells(bytes: &[u8], cx: usize, cy: usize) -> Option<FrameStats> {
+pub(crate) fn stats_from_cells(bytes: &[u8], cx: usize, cy: usize) -> Option<FrameStats> {
     let word = |c: &[u8], i: usize| f32::from_le_bytes([c[4 * i], c[4 * i + 1], c[4 * i + 2], c[4 * i + 3]]);
     let cells: Vec<[f32; 3]> = bytes.chunks_exact(16).map(|c| [0, 1, 2].map(|i| word(c, i))).collect();
     let keys = ToneKeys::from_cells(&cells)?;
@@ -793,14 +793,25 @@ fn stats_from_cells(bytes: &[u8], cx: usize, cy: usize) -> Option<FrameStats> {
 }
 
 /// Two measurements say the same about a frame (nothing to draw again for).
-fn same_stats(a: &FrameStats, b: &FrameStats) -> bool {
+pub(crate) fn same_stats(a: &FrameStats, b: &FrameStats) -> bool {
+    a.levels.len() == b.levels.len() && stats_within(a, b, 1.0)
+}
+
+/// [`same_stats`] with its tolerances `slack` times as wide: for two
+/// measurements of one picture drawn at two sizes, which sample it at
+/// other places.
+pub(crate) fn stats_within(a: &FrameStats, b: &FrameStats, slack: f32) -> bool {
     let stops = |x: f32, y: f32| (x.max(1e-9).log2() - y.max(1e-9).log2()).abs();
-    if stops(a.keys.max, b.keys.max) >= 0.01 || stops(a.keys.dark, b.keys.dark) >= 0.03 || a.levels.len() != b.levels.len() {
+    if stops(a.keys.max, b.keys.max) >= 0.01 * slack || stops(a.keys.dark, b.keys.dark) >= 0.03 * slack {
         return false;
     }
-    // The levels at a few ranks.
-    let n = a.levels.len();
-    n == 0 || (0..=8).all(|i| { let k = i * (n - 1) / 8; (a.levels[k] - b.levels[k]).abs() < 0.02 })
+    // The levels at a few ranks (by their place in the frame, so that two
+    // sizes with other counts of them compare too).
+    let (n, m) = (a.levels.len(), b.levels.len());
+    if n == 0 || m == 0 {
+        return n == m;
+    }
+    (0..=8).all(|i| (a.levels[i * (n - 1) / 8] - b.levels[i * (m - 1) / 8]).abs() < 0.02 * slack)
 }
 
 impl Device {
@@ -882,7 +893,7 @@ impl Device {
 
     /// The cells of a mapped measurement without the padding of its rows:
     /// 16 bytes each, `cx × cy` an eye, eye after eye.
-    fn measured_cells(bytes: &[u8], cx: usize, cy: usize) -> Vec<u8> {
+    pub(crate) fn measured_cells(bytes: &[u8], cx: usize, cy: usize) -> Vec<u8> {
         let padded = cx.div_ceil(16) * 16;
         let mut out = Vec::with_capacity(bytes.len());
         for eye in bytes.chunks_exact(padded * cy * 16) {
@@ -1086,7 +1097,7 @@ impl Device {
         (smoothed, cell * n as f32)
     }
 
-    fn curve_buffer(&self, label: &str, samples: &[f32]) -> wgpu::Buffer {
+    pub(crate) fn curve_buffer(&self, label: &str, samples: &[f32]) -> wgpu::Buffer {
         let bytes: &[u8] = bytemuck::cast_slice(samples);
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),

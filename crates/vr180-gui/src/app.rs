@@ -1753,6 +1753,67 @@ mod ettr_tests {
         let dng = Settings { ettr_stops: 2.0, ilog_source: true, still_dng_mode: true, ..Default::default() };
         assert!(dng.build_color_stack().log_exposure.is_none());
     }
+
+    /// The tone controls reach a clip's colour stack as one stage in linear
+    /// light: the scene's where the clip is I-Log, with the exposure it was
+    /// shot over taken out by the same stage; the light the picture shows
+    /// for any other clip. Nothing moved is no stage, and the clip's stack
+    /// is what it was before the controls existed.
+    #[test]
+    fn the_tone_controls_reach_a_clip_as_one_stage_in_linear_light() {
+        use vr180_pipeline::tone_linear::{ToneLight, ToneSettings};
+        let insv = SourceKind::Insta360Insv;
+        let tone = ToneSettings { highlights: -60.0, shadows: 30.0, ..Default::default() };
+        let with = |mut it: BatchItem| { it.settings.tone = tone; it };
+
+        // Nothing moved: no stage, and the recovery is the stage it was.
+        let idle = item(insv, Some(x6(Some(true))), 2.0).export_settings().build_color_stack();
+        assert!(idle.tone.is_none() && idle.active_tone().is_none());
+        assert_eq!(idle.log_exposure.map(|e| e.stops), Some(-2.0));
+        assert!(!Settings::default().build_color_stack().any_active());
+
+        // An I-Log clip: the scene's light, the recovery in the same stage.
+        let plan = with(item(insv, Some(x6(Some(true))), 2.0)).export_settings().build_color_stack();
+        let stage = plan.tone.expect("the stage");
+        assert_eq!((stage.settings, stage.light, stage.pre_stops), (tone, ToneLight::Scene(LogCurve::INSTA360_ILOG), -2.0));
+        assert!(plan.log_exposure.is_none() && plan.any_active());
+        let plan = with(item(insv, Some(x6(Some(true))), 0.0)).export_settings().build_color_stack();
+        assert_eq!(plan.tone.map(|t| t.pre_stops), Some(0.0));
+
+        // Any other clip: the light its picture shows, and no recovery.
+        for it in [item(insv, Some(x6(Some(false))), 2.0), item(SourceKind::DjiOsv, None, 0.0), item(SourceKind::GoProEac, None, 0.0)] {
+            let plan = with(it).export_settings().build_color_stack();
+            let stage = plan.tone.expect("the stage");
+            assert_eq!((stage.light, stage.pre_stops), (ToneLight::Shown, 0.0));
+            assert!(plan.log_exposure.is_none());
+        }
+
+        // A raw clip has the controls in its development, a linear DNG no
+        // place for them.
+        let raw = Settings { tone, raw_source: true, ..Default::default() }.build_color_stack();
+        assert!(raw.tone.is_none() && raw.raw_develop.is_some());
+        assert!(Settings { tone, still_dng_mode: true, ..Default::default() }.build_color_stack().tone.is_none());
+
+        // The export carries the stage, and waits for each frame's levels.
+        let it = with(item(insv, Some(x6(Some(true))), 1.0));
+        let cfg = App::build_export_cfg(
+            &it.path, std::path::Path::new("/nonexistent/out.mov"),
+            it.fps, it.source_kind, it.width, it.height, it.fisheye_eye_w, it.fisheye_eye_h, None,
+            &it.export_settings(), &ExportOptions::default(), Vec::new(),
+        );
+        let stage = cfg.color_stack.tone.expect("the stage");
+        assert_eq!((stage.pre_stops, stage.measure), (-1.0, vr180_pipeline::raw_tone::Measure::Wait));
+
+        // Kept with the clip's settings; a file from before they existed has none.
+        let json = serde_json::to_string(&it.settings).expect("json");
+        let back: Settings = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back.tone, tone);
+        let old: Settings = serde_json::from_str("{}").expect("parse");
+        assert!(old.tone.is_identity());
+        // A single-eye clip is toned the same way.
+        let one = with(BatchItem { x6: Some(X6ClipInfo { single_eye: true, ..x6(Some(true)) }), ..item(insv, None, 0.0) });
+        assert_eq!(one.export_settings().build_color_stack().tone.map(|t| t.settings), Some(tone));
+    }
 }
 
 #[cfg(test)]
@@ -2682,9 +2743,9 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Stereo AAC decoded from the ambisonics (virtual cardioids ±45°, camera front) — universal." => "由 Ambisonics 解码的立体声 AAC（±45° 虚拟心形，以相机正前为准）——通用。",
         "Shared by this camera's video and stills — one camera, one eye alignment." => "同一台相机的视频与照片共用——同一台机器，同一个双眼错位。",
         "Still photo — use Export for the full-size file" => "静态照片——请用导出获得全尺寸文件",
-        "DNG output: the 3D LUT, sharpening and automatic eye matching cannot travel as DNG metadata — hidden, and not applied to the preview." => "DNG 输出：3D LUT、锐化和自动眼间匹配无法作为 DNG 元数据保存——已隐藏，预览中也不应用。",
+        "DNG output: the Tone section (Exposure to Blacks), the 3D LUT, sharpening and automatic eye matching cannot travel as DNG metadata — hidden, and not applied to the preview." => "DNG 输出：“影调”一组（曝光到黑色色阶）、3D LUT、锐化和自动眼间匹配无法作为 DNG 元数据保存——已隐藏，预览中也不应用。",
         "Still" => "照片",
-        "Your grade travels as metadata: white balance → AsShotNeutral, tone (lift/gamma/gain/shadow/highlight) → profile tone curve, saturation → profile look table (Adobe); per-eye trims are baked. Not carried: 3D LUT, sharpen." => "调色以元数据形式写入：白平衡 → AsShotNeutral，影调（提升/伽马/增益/阴影/高光）→ 配置文件色调曲线，饱和度 → 配置文件 Look 表（Adobe）；双眼微调会烘入像素。不带入：3D LUT、锐化。",
+        "Your grade travels as metadata: white balance → AsShotNeutral, lift / gamma / gain → profile tone curve, saturation → profile look table (Adobe); per-eye trims are baked. Not carried: the Tone section, 3D LUT, sharpen." => "调色以元数据形式写入：白平衡 → AsShotNeutral，提升 / 伽马 / 增益 → 配置文件色调曲线，饱和度 → 配置文件 Look 表（Adobe）；双眼微调会烘入像素。不带入：“影调”一组、3D LUT、锐化。",
         "single photo, 14-bit raw" => "单张照片，14 位 RAW",
         "DNG keeps the camera-native linear data with the raw colour tags — grade it in a raw developer." => "DNG 保留相机原生线性数据和 RAW 色彩标签——可在 RAW 软件里继续调色。",
         "Still photo — no stabilization. Use the View adjust / stereo controls to level and align." => "静态照片——没有防抖。用视角调整 / 立体控制来调平和对齐。",
@@ -2789,7 +2850,25 @@ fn tr_zh(en: &'static str) -> &'static str {
         "firmware" => "固件",
         "no-firmware" => "无固件",
         // Color
-        "Tone (CDL)" => "影调 (CDL)",
+        "Tone" => "影调",
+        "Lift / Gamma / Gain" => "Lift / Gamma / Gain（提升 / 伽马 / 增益）",
+        "Shadow (earlier)" => "阴影（旧）",
+        "Highlight (earlier)" => "高光（旧）",
+        "Reset lift / gamma / gain" => "重置提升 / 伽马 / 增益",
+        "From a grade made before Shadows and Highlights above existed. They work on the codes; the ones above work in linear light. Reset takes them away."
+            => "来自上方“阴影”“高光”出现之前做的调色。它们作用在码值上，上方的两个在线性光里工作。按重置即可去掉。",
+        "In stops, as a change of the light itself: ahead of the LUT, so what the LUT presses against white or black is still there to bring back."
+            => "以档为单位，直接改变光量：在 LUT 之前进行，所以被 LUT 压到纯白或纯黑的部分仍然可以拉回来。",
+        "More or less contrast about the middle of the frame's own levels."
+            => "围绕画面自身亮度的中部增减对比度。",
+        "Darkens or brightens the bright parts of the frame and leaves their texture: the change follows the frame's large areas, not each pixel. Below zero, highlights the LUT shows as white come back from what the file holds."
+            => "压暗或提亮画面的亮部并保留其中的纹理：变化跟随画面的大块区域，而不是逐个像素。小于零时，被 LUT 显示成纯白的高光会从文件里实际记录的信息中恢复出来。",
+        "Brightens or darkens the dark parts of the frame and leaves their texture: the change follows the frame's large areas, not each pixel."
+            => "提亮或压暗画面的暗部并保留其中的纹理：变化跟随画面的大块区域，而不是逐个像素。",
+        "Moves the brightest levels: where white sits." => "移动最亮的部分：决定白点的位置。",
+        "Moves the darkest levels: where black sits." => "移动最暗的部分：决定黑点的位置。",
+        "Changes of exposure in linear light, made ahead of Lift / Gamma / Gain and the LUT. Each frame is measured, so the result follows the scene as a raw converter's does."
+            => "都是线性光里的曝光变化，在 Lift / Gamma / Gain 和 LUT 之前进行。每一帧都会被测量，所以效果像 RAW 转换软件那样跟随画面内容。",
         "White balance" => "白平衡",
         "Lift" => "提升",
         "Gamma" => "伽马",
@@ -6289,6 +6368,7 @@ impl App {
         if source_kind == vr180_pipeline::SourceKind::BlackmagicRaw {
             let s = &mut self.settings;
             s.lift = 0.0; s.gamma = 1.0; s.gain = 1.0; s.shadow = 0.0; s.highlight = 0.0;
+            s.tone = Default::default();
             s.temperature = 0.0; s.tint = 0.0; s.saturation = 1.0;
             if let (Some(info), Some(lut)) = (meta.braw_color.as_ref(), meta.braw_lut.as_deref()) {
                 if !vr180_braw::BrawColorInfo::is_film_gamma(s.braw_color.effective_gamma(info)) && s.lut_path == lut { s.lut_path.clear(); }
@@ -7346,7 +7426,7 @@ impl App {
             ui.label(RichText::new(tr("DNG keeps the camera-native linear data with the raw colour tags — grade it in a raw developer."))
                 .small().color(Color32::GRAY));
             if opts.still_format == StillFormatChoice::LinearDng {
-                ui.label(RichText::new(tr("Your grade travels as metadata: white balance → AsShotNeutral, tone (lift/gamma/gain/shadow/highlight) → profile tone curve, saturation → profile look table (Adobe); per-eye trims are baked. Not carried: 3D LUT, sharpen."))
+                ui.label(RichText::new(tr("Your grade travels as metadata: white balance → AsShotNeutral, lift / gamma / gain → profile tone curve, saturation → profile look table (Adobe); per-eye trims are baked. Not carried: the Tone section, 3D LUT, sharpen."))
                     .small().color(Color32::GRAY));
             }
             ui.add_space(8.0);
@@ -10060,6 +10140,8 @@ impl App {
         let raw_status: Option<String> = self.raw_settings_status.as_ref()
             .filter(|(take, _)| Some(take) == self.loaded_path.as_ref()).map(|(_, text)| text.clone());
         let raw_reading = self.raw_settings_job.is_some();
+        // What a clip's own bits of interface state are kept under.
+        let loaded = self.loaded_path.clone();
         let s = &mut self.settings;
 
         if is_raw {
@@ -10089,22 +10171,43 @@ impl App {
                 "Blackmagic RAW colour controls need the clip probe's colour block — rebuild the helper (helpers/braw/build_braw.sh)."
             )).small().color(Color32::GRAY));
         } else {
-            // CDL: lift / gamma / gain / shadow / highlight.
-            ui.label(RichText::new(tr("Tone (CDL)")).strong());
+            // The tone controls: changes of exposure in linear light, made
+            // ahead of the LUT. A raw clip has them in its development
+            // above, and a linear DNG has no place for them.
+            if !is_raw && !dng_mode {
+                draw_tone_section(ui, &mut s.tone);
+                ui.separator();
+            }
+            // CDL: lift / gamma / gain, on the codes ahead of the LUT.
+            ui.label(RichText::new(tr("Lift / Gamma / Gain")).strong());
             ui.add(egui::Slider::new(&mut s.lift, -1.0..=1.0)
                 .text(tr("Lift")).fixed_decimals(2));
             ui.add(egui::Slider::new(&mut s.gamma, 0.2..=3.0)
                 .text(tr("Gamma")).fixed_decimals(2));
             ui.add(egui::Slider::new(&mut s.gain, 0.2..=3.0)
                 .text(tr("Gain")).fixed_decimals(2));
-            ui.add(egui::Slider::new(&mut s.shadow, -1.0..=1.0)
-                .text(tr("Shadow")).fixed_decimals(2));
-            ui.add(egui::Slider::new(&mut s.highlight, -1.0..=1.0)
-                .text(tr("Highlight")).fixed_decimals(2));
-            if ui.button(tr("Reset tone")).clicked() {
+            // The two zone controls this section had before Shadows and
+            // Highlights above took their place: offered while a grade
+            // still holds a value in one (and until the section is reset,
+            // so a slider does not go while it is being moved through 0).
+            let zones_id = egui::Id::new(("cdl_zones_shown", loaded));
+            let zones = s.shadow != 0.0 || s.highlight != 0.0
+                || ui.data(|d| d.get_temp::<bool>(zones_id)).unwrap_or(false);
+            if zones {
+                ui.add(egui::Slider::new(&mut s.shadow, -1.0..=1.0)
+                    .text(tr("Shadow (earlier)")).fixed_decimals(2));
+                ui.add(egui::Slider::new(&mut s.highlight, -1.0..=1.0)
+                    .text(tr("Highlight (earlier)")).fixed_decimals(2));
+                ui.label(RichText::new(tr(
+                    "From a grade made before Shadows and Highlights above existed. They work on the codes; the ones above work in linear light. Reset takes them away."
+                )).small().color(Color32::GRAY));
+            }
+            let reset = ui.button(tr("Reset lift / gamma / gain")).clicked();
+            if reset {
                 s.lift = 0.0; s.gamma = 1.0; s.gain = 1.0;
                 s.shadow = 0.0; s.highlight = 0.0;
             }
+            ui.data_mut(|d| d.insert_temp(zones_id, zones && !reset));
 
             ui.separator();
 
@@ -10198,7 +10301,7 @@ impl App {
             // (`still_export::grade_metadata`), and the preview plan drops
             // them too (`Settings::still_dng_mode`) — so they are not offered.
             ui.label(RichText::new(tr(
-                "DNG output: the 3D LUT, sharpening and automatic eye matching cannot travel as DNG metadata — hidden, and not applied to the preview."
+                "DNG output: the Tone section (Exposure to Blacks), the 3D LUT, sharpening and automatic eye matching cannot travel as DNG metadata — hidden, and not applied to the preview."
             )).small().color(Color32::GRAY));
         } else {
             // ── ETTR recovery: a clip exposed brighter than normal on purpose
@@ -11147,6 +11250,29 @@ fn draw_eye_lens(
 /// `status`: what the last read of the clip's Camera Raw settings came to,
 /// shown under its button; `can_read`: no such read is under way. Returns
 /// whether that button was pressed.
+/// The tone controls of a clip that is not raw: the six a raw clip has in
+/// its development, each a change of exposure in linear light ahead of the
+/// LUT (`vr180_pipeline::tone_linear`).
+fn draw_tone_section(ui: &mut egui::Ui, tone: &mut vr180_pipeline::tone_linear::ToneSettings) {
+    ui.label(RichText::new(tr("Tone")).strong());
+    ui.add(egui::Slider::new(&mut tone.exposure, -5.0..=5.0).text(tr("Exposure")).fixed_decimals(2))
+        .on_hover_text(tr("In stops, as a change of the light itself: ahead of the LUT, so what the LUT presses against white or black is still there to bring back."));
+    let amount = |ui: &mut egui::Ui, v: &mut f32, label: &'static str, hover: &'static str| {
+        ui.add(egui::Slider::new(v, -100.0..=100.0).text(tr(label)).fixed_decimals(0)).on_hover_text(tr(hover));
+    };
+    amount(ui, &mut tone.contrast, "Contrast", "More or less contrast about the middle of the frame's own levels.");
+    amount(ui, &mut tone.highlights, "Highlights", "Darkens or brightens the bright parts of the frame and leaves their texture: the change follows the frame's large areas, not each pixel. Below zero, highlights the LUT shows as white come back from what the file holds.");
+    amount(ui, &mut tone.shadows, "Shadows", "Brightens or darkens the dark parts of the frame and leaves their texture: the change follows the frame's large areas, not each pixel.");
+    amount(ui, &mut tone.whites, "Whites", "Moves the brightest levels: where white sits.");
+    amount(ui, &mut tone.blacks, "Blacks", "Moves the darkest levels: where black sits.");
+    if ui.button(tr("Reset tone")).clicked() {
+        *tone = Default::default();
+    }
+    ui.label(RichText::new(tr(
+        "Changes of exposure in linear light, made ahead of Lift / Gamma / Gain and the LUT. Each frame is measured, so the result follows the scene as a raw converter's does."
+    )).small().color(Color32::GRAY));
+}
+
 fn draw_raw_develop_section(
     ui: &mut egui::Ui,
     raw: &mut vr180_pipeline::raw_tone::RawSettings,

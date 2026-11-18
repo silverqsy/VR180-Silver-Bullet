@@ -153,6 +153,9 @@ pub struct Device {
     readback_staging: Mutex<HashMap<u64, wgpu::Buffer>>,
     /// Pipelines of the raw (Bayer) video path, built on first use.
     pub(crate) raw: std::sync::OnceLock<crate::raw_gpu::RawPipelines>,
+    /// The linear-light tone stage: its pipelines, built on first use, and
+    /// what it keeps between frames.
+    pub(crate) tone: crate::tone_gpu::ToneState,
 }
 
 #[derive(Debug)]
@@ -422,6 +425,7 @@ impl Device {
             p010_resolve_out_cache: Mutex::new(HashMap::new()),
             readback_staging: Mutex::new(HashMap::new()),
             raw: std::sync::OnceLock::new(),
+            tone: Default::default(),
         })
     }
 
@@ -4765,6 +4769,14 @@ pub struct ColorStackPlan {
     /// eye-exposure offset, which is measured on the source's own codes, and
     /// ahead of the CDL and the LUT. `None` = off.
     pub log_exposure: Option<LogExposure>,
+    /// The tone controls in linear light (Exposure, Contrast, Highlights,
+    /// Shadows, Whites, Blacks: [`crate::tone_linear`]) of a clip that is
+    /// not raw. Runs after the log exposure change and ahead of the CDL and
+    /// the LUT, through whose neutral curve it knows what the picture
+    /// shows. Both eyes of a frame are toned with one set of constants
+    /// ([`Device::linear_tone_constants`]), read off the frame by the entry
+    /// point. `None`, or a stage that moves nothing: not run.
+    pub tone: Option<crate::tone_linear::LinearTone>,
     /// "BeyondVR Hack": scale each eye about its own (half-)center at the
     /// very END of the stack, padding the revealed border with black.
     /// 1.0 = off. Export-only — the preview plan never sets it.
@@ -4801,6 +4813,7 @@ impl Default for ColorStackPlan {
             eye_match_exposure: 0.0,
             auto_eye_match: None,
             log_exposure: None,
+            tone: None,
             eye_scale: 1.0,
             raw_develop: None,
             raw_reference: None,
@@ -4813,6 +4826,7 @@ impl ColorStackPlan {
     pub fn any_active(&self) -> bool {
         !self.cdl.is_identity()
             || self.log_exposure.is_some()
+            || self.active_tone().is_some()
             || self.lut.is_some()
             || !self.sharpen.is_identity()
             || !self.mid_detail.is_identity()
@@ -5057,6 +5071,17 @@ impl Device {
                     | wgpu::TextureUsages::STORAGE_BINDING
                     | wgpu::TextureUsages::COPY_SRC);
             self.record_log_exposure(&mut encoder, equirect_tex, &next, exposure, false);
+            intermediates.push(next);
+        }
+
+        // Stage 0c: the tone controls, in linear light.
+        if let Some(constants) = self.linear_tone_constants(&[equirect_tex], plan) {
+            let next = make_rw_texture(&self.device, "stack_tone_out", w, h,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC);
+            let prev = intermediates.last().unwrap_or(equirect_tex);
+            self.record_linear_tone(&mut encoder, prev, &next, &constants, false);
             intermediates.push(next);
         }
 
@@ -6483,13 +6508,15 @@ impl Device {
         // offset (left +, right −). `for_eye` borrows the plan when the trim is
         // off (no clone). The LUT is unchanged by the trim, so the pre-uploaded
         // `lut_resources` apply to both eyes.
+        // One set of tone constants for the frame, read off both eyes.
+        let tone = self.linear_tone_constants(&[left_eq, right_eq], plan);
         let left_idx = self.record_color_stack(
             &mut encoder, left_eq, eye_w, eye_h, &plan.for_eye(true), &lut_resources, &mut intermediates,
-            false, "stack_l", matching.map(|s| (s, 0)), None,
+            false, "stack_l", matching.map(|s| (s, 0)), None, tone.as_ref(),
         );
         let right_idx = self.record_color_stack(
             &mut encoder, right_eq, eye_w, eye_h, &plan.for_eye(false), &lut_resources, &mut intermediates,
-            false, "stack_r", matching.map(|s| (s, 1)), None,
+            false, "stack_r", matching.map(|s| (s, 1)), None, tone.as_ref(),
         );
         let left_final = match left_idx {
             Some(i) => &intermediates[i],
@@ -6564,8 +6591,9 @@ impl Device {
             Some(self.upload_lut3d_resources(lut))
         } else { None };
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(8);
+        let tone = self.linear_tone_constants(&[eye], plan);
         let idx = self.record_color_stack(
-            &mut encoder, eye, eye_w, eye_h, plan, &lut_resources, &mut intermediates, false, "stack_eye", None, None);
+            &mut encoder, eye, eye_w, eye_h, plan, &lut_resources, &mut intermediates, false, "stack_eye", None, None, tone.as_ref());
         let graded = match idx {
             Some(i) => &intermediates[i],
             None => eye,
@@ -6622,9 +6650,10 @@ impl Device {
             Some(self.upload_lut3d_resources(lut))
         } else { None };
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(4);
+        let tone = self.linear_tone_constants(&[src], plan);
         let final_idx = self.record_color_stack(
             &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates,
-            false, "stack8_per_eye", None, None,
+            false, "stack8_per_eye", None, None, tone.as_ref(),
         );
         let Some(final_idx) = final_idx else {
             // Only the automatic eye-exposure stage was requested; it needs
@@ -6644,12 +6673,15 @@ impl Device {
     /// the same order either way. Returns the index into `intermediates` of
     /// the final texture, or `None` when no stage ran (the caller then uses
     /// `src`). Order:
-    ///   eye-exposure offset → log exposure → CDL → LUT3D → sharpen →
-    ///   white balance → mid-detail → saturation → eye scale.
+    ///   eye-exposure offset → log exposure → tone in linear light → CDL →
+    ///   LUT3D → sharpen → white balance → mid-detail → saturation → eye
+    ///   scale.
     /// `label` names the working textures. `eye_offset` = the automatic
     /// eye-exposure state and this eye's index (0 = left, 1 = right);
     /// `None` skips that stage. `raw` = a raw source's development, which
-    /// then runs ahead of all of them (16 bits only).
+    /// then runs ahead of all of them (16 bits only). `tone` = the frame's
+    /// constants of the plan's tone stage ([`Device::linear_tone_constants`],
+    /// the same for both eyes); `None` skips it.
     #[allow(clippy::too_many_arguments)]
     fn record_color_stack(
         &self,
@@ -6663,6 +6695,7 @@ impl Device {
         label: &str,
         eye_offset: Option<(&EyeMatchState, u32)>,
         raw: Option<&crate::raw_tone::DevelopConstants>,
+        tone: Option<&crate::tone_linear::ToneConstants>,
     ) -> Option<usize> {
         // A working texture of the stack's depth. (Only the 16-bit ones
         // are ever read back.)
@@ -6736,6 +6769,19 @@ impl Device {
                 None => src,
             };
             self.record_log_exposure(encoder, prev, &next, exposure, wide);
+            intermediates.push(next);
+            current_idx = Some(intermediates.len() - 1);
+        }
+
+        // 0c. The tone controls, in linear light: after everything that
+        //     says what the file holds, ahead of what renders it.
+        if let Some(constants) = tone {
+            let next = make("tone", w, h);
+            let prev = match current_idx {
+                Some(i) => &intermediates[i],
+                None => src,
+            };
+            self.record_linear_tone(encoder, prev, &next, constants, wide);
             intermediates.push(next);
             current_idx = Some(intermediates.len() - 1);
         }
@@ -6866,8 +6912,10 @@ impl Device {
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(12);
         // A raw source: this frame's tone keys, read off the eye itself.
         let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[src], plan.raw_reference.as_ref(), stage, plan.raw_pixel_scale));
+        // The tone stage of a clip that is not raw: this eye is the frame.
+        let tone = self.linear_tone_constants(&[src], plan);
         let idx = self.record_color_stack(
-            &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates, true, "stack16", None, raw.as_ref());
+            &mut encoder, src, w, h, plan, &lut_resources, &mut intermediates, true, "stack16", None, raw.as_ref(), tone.as_ref());
         self.queue.submit(Some(encoder.finish()));
         Ok(idx.map(|i| intermediates.swap_remove(i)))
     }
@@ -6903,12 +6951,14 @@ impl Device {
         // A raw source: ONE set of tone keys for the frame, read off both
         // eyes together, so the two are developed alike.
         let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[left, right], plan.raw_reference.as_ref(), stage, plan.raw_pixel_scale));
+        // And one set of tone constants where the clip is not raw.
+        let tone = self.linear_tone_constants(&[left, right], plan);
         let li = self.record_color_stack(
             &mut encoder, left, w, h, &plan.for_eye(true), &lut_resources, &mut intermediates,
-            true, "stack16_l", matching.map(|s| (s, 0)), raw.as_ref());
+            true, "stack16_l", matching.map(|s| (s, 0)), raw.as_ref(), tone.as_ref());
         let ri = self.record_color_stack(
             &mut encoder, right, w, h, &plan.for_eye(false), &lut_resources, &mut intermediates,
-            true, "stack16_r", matching.map(|s| (s, 1)), raw.as_ref());
+            true, "stack16_r", matching.map(|s| (s, 1)), raw.as_ref(), tone.as_ref());
         self.queue.submit(Some(encoder.finish()));
         // `wgpu::Texture` is a cheap handle clone; both indices may point into
         // the same Vec, so clone rather than swap_remove twice.

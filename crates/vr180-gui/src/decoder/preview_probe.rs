@@ -20,6 +20,7 @@
 //! | `VR180_PROBE_LUT` | a `.cube` file, applied at full strength | none |
 //! | `VR180_PROBE_AUTO_EYE` | `1` keeps the automatic eye match | off |
 //! | `VR180_PROBE_ETTR` | stops the clip was shot over (the ETTR recovery; I-Log clips only, as in the app) | `0` |
+//! | `VR180_PROBE_TONE` | the tone controls of a clip that is not raw: exposure, contrast, highlights, shadows, whites, blacks | all `0` |
 //! | `VR180_PROBE_JPEG` | a folder to write each frame into | none |
 //! | `VR180_PROBE_RAW` | a folder to write each frame's bytes into (`<label>.rgb`: R, G, B per pixel, row by row) | none |
 //! | `VR180_PROBE_STILL` | `1` also renders each moment's zoom still (the magnifier's and the snapshot's picture) | off |
@@ -70,6 +71,11 @@ fn settings_for(path: &Path) -> anyhow::Result<Settings> {
     }
     if let Some(stops) = switch("VR180_PROBE_ETTR") {
         s.ettr_stops = stops.parse()?;
+    }
+    if let Some(v) = switch("VR180_PROBE_TONE") {
+        let v: Vec<f32> = v.split(',').map(|x| x.trim().parse()).collect::<Result<_, _>>()?;
+        let g = |i: usize| v.get(i).copied().unwrap_or(0.0);
+        s.tone = vr180_pipeline::tone_linear::ToneSettings { exposure: g(0), contrast: g(1), highlights: g(2), shadows: g(3), whites: g(4), blacks: g(5) };
     }
     let kind = vr180_pipeline::source_kind::detect(path)?;
     if switch("VR180_PROBE_LENS").as_deref() == Some("equidistant") {

@@ -3435,10 +3435,10 @@ fn run_eac_frames<F: EacFeed>(
                 {
                     let (left, right) = frame.project_16(pipeline, &job)
                         .ok_or_else(|| Error::Ffmpeg("a 10-bit surface from a frame held at 8 bits".into()))??;
-                    let left_g = pipeline.apply_color_stack_per_eye_16(
-                        &left, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true))?;
-                    let right_g = pipeline.apply_color_stack_per_eye_16(
-                        &right, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false))?;
+                    // As a pair: what the stack reads off the frame (the
+                    // tone controls' levels) is then one thing for both eyes.
+                    let (left_g, right_g) = pipeline.apply_color_stack_pair_16(
+                        &left, &right, cfg.eye_w, cfg.eye_h, color_plan, None)?;
                     let l_final = left_g.as_ref().unwrap_or(&left);
                     let r_final = right_g.as_ref().unwrap_or(&right);
                     encode_wide_surface(
@@ -3860,8 +3860,9 @@ fn export_eac_gpu_resident(
             (pipeline.project_cross_texture_to_equirect_texture_16(&cross_b, cfg.eye_w, cfg.eye_h, rl, sl, &lens_l)?,
              pipeline.project_cross_texture_to_equirect_texture_16(&cross_a, cfg.eye_w, cfg.eye_h, rr, sr, &lens_r)?)
         };
-        let left_g = pipeline.apply_color_stack_per_eye_16(&left16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(true))?;
-        let right_g = pipeline.apply_color_stack_per_eye_16(&right16, cfg.eye_w, cfg.eye_h, &color_plan.for_eye(false))?;
+        // As a pair: what the stack reads off the frame (the tone controls'
+        // levels) is then one thing for both eyes.
+        let (left_g, right_g) = pipeline.apply_color_stack_pair_16(&left16, &right16, cfg.eye_w, cfg.eye_h, &color_plan, None)?;
         let l_final = left_g.as_ref().unwrap_or(&left16);
         let r_final = right_g.as_ref().unwrap_or(&right16);
 
@@ -5042,24 +5043,17 @@ pub(crate) fn build_eye_eq_16(
     Ok((left, right))
 }
 
-/// Apply the color stack to an Rgba8 SBS readback buffer. Walks the
-/// existing `apply_cdl` / `apply_lut3d` / `apply_color_grade` helpers on
-/// the host (`Vec<u8>` in / out) — slow, only used by the 8-bit non-VT
-/// fallback path.
+/// Apply the color stack from the CDL on to an Rgba8 SBS readback buffer.
+/// Walks the existing `apply_cdl` / `apply_lut3d` / `apply_color_grade`
+/// helpers on the host (`Vec<u8>` in / out) — slow, only used by the 8-bit
+/// non-VT fallback path. The stages ahead of the CDL are
+/// [`apply_color_stack_rgb8_sbs`]'s.
 fn apply_color_stack_rgb8(
     pipeline: &Device,
     plan: &ColorStackPlan,
     mut rgb: Vec<u8>,
     w: u32, h: u32,
 ) -> Result<Vec<u8>> {
-    // The exposure change on log footage comes first, as in the GPU stacks:
-    // per channel and on bytes here, so a table does it.
-    if let Some(exposure) = plan.log_exposure {
-        let table = exposure.table8();
-        for v in rgb.iter_mut() {
-            *v = table[*v as usize];
-        }
-    }
     // Python order: CDL → LUT → temp/tint → saturation (this fallback has
     // no sharpen / mid-detail stage).
     if !plan.cdl.is_identity() {
@@ -5093,10 +5087,25 @@ fn apply_color_stack_rgb8(
 fn apply_color_stack_rgb8_sbs(
     pipeline: &Device,
     plan: &ColorStackPlan,
-    rgb: Vec<u8>,
+    mut rgb: Vec<u8>,
     sbs_w: u32, sbs_h: u32,
     eye_w: u32,
 ) -> Result<Vec<u8>> {
+    // The stages ahead of the CDL are the same for both eyes, so they run
+    // on the frame before any split. The exposure change on log footage
+    // comes first, as in the GPU stacks: per channel and on bytes here, so
+    // a table does it.
+    if let Some(exposure) = plan.log_exposure {
+        let table = exposure.table8();
+        for v in rgb.iter_mut() {
+            *v = table[*v as usize];
+        }
+    }
+    // Then the tone controls in linear light: a GPU stage, each eye with
+    // its own base, both with the frame's one set of constants.
+    if plan.active_tone().is_some() {
+        rgb = pipeline.apply_linear_tone_rgb8(&rgb, sbs_w, sbs_h, eye_w, plan)?;
+    }
     // `for_eye` borrows when every trim is off - the cheap way to ask
     // "does this plan differ per eye?" without duplicating the condition.
     let per_eye = matches!(plan.for_eye(true), std::borrow::Cow::Owned(_));
