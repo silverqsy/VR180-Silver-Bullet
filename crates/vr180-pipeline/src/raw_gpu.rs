@@ -1002,21 +1002,29 @@ impl Device {
         Ok(RawReference { eyes: drawn, long_side })
     }
 
-    /// The per-frame constants of `stage` for the given eyes (measured as
-    /// the stage asks). The eyes are one frame: side by side when two.
+    /// The constants of `stage` for a frame of the given eyes. `clip`: the
+    /// statistics of the clip the frame belongs to, which every frame of it
+    /// is developed by; without them the frame is measured as the stage
+    /// asks. The eyes are one frame: side by side when two.
     /// `reference`: the frame to read instead, when the eyes are another
     /// view of the clip than its half-equirect. `pixel_scale`: pixels of
     /// these eyes to one pixel of the frame an export writes (what the
     /// sharpening's radius is counted in).
-    pub fn raw_develop_constants(&self, eyes: &[&wgpu::Texture], reference: Option<&RawReference>, stage: &RawDevelop, pixel_scale: f32) -> DevelopConstants {
+    pub fn raw_develop_constants(
+        &self, eyes: &[&wgpu::Texture], reference: Option<&RawReference>, stage: &RawDevelop, pixel_scale: f32,
+        clip: Option<&crate::clip_stats::ClipStats>,
+    ) -> DevelopConstants {
         let reference = reference.filter(|r| !r.eyes.is_empty());
-        let stats = match reference {
-            Some(r) => self.raw_frame_stats(&r.eyes.iter().collect::<Vec<_>>(), stage),
-            None => self.raw_frame_stats(eyes, stage),
+        // A clip's frames are all developed by the clip's statistics; a
+        // frame that has none is measured by itself.
+        let stats = match (clip, reference) {
+            (Some(clip), _) => clip.raw(&stage.geometry()),
+            (None, Some(r)) => self.raw_frame_stats(&r.eyes.iter().collect::<Vec<_>>(), stage),
+            (None, None) => self.raw_frame_stats(eyes, stage),
         };
         tracing::debug!(
-            "raw development: dark {:.5} max {:.4}, {} levels (reference: {})",
-            stats.keys.dark, stats.keys.max, stats.levels.len(), reference.is_some());
+            "raw development: dark {:.5} max {:.4}, {} levels (reference: {}, the clip's: {})",
+            stats.keys.dark, stats.keys.max, stats.levels.len(), reference.is_some(), clip.is_some());
         let curves = self.raw_pipelines().memory.lock().ok().and_then(|m| m.curves.clone());
         let mut k = stage.constants_for(&stats, curves.as_deref());
         if let (Some(local), Some(eye)) = (k.local.as_mut(), eyes.first()) {
@@ -1514,7 +1522,7 @@ mod tests {
             RawSettings { shadows: 70.0, blacks: 60.0, whites: -40.0, ..Default::default() },
         ] {
             let stage = RawDevelop { camera: RawCamera::X6, settings, measure: Measure::Wait };
-            let mut k = dev.raw_develop_constants(&[&src], None, &stage, 1.0);
+            let mut k = dev.raw_develop_constants(&[&src], None, &stage, 1.0, None);
             let local = k.local.as_mut().expect("local stage");
             // A long side that gives more than one pixel per texel of the reduced copy.
             local.long_side = 2048;
@@ -1649,9 +1657,9 @@ mod tests {
         let settings = RawSettings { shadows: 60.0, highlights: -40.0, ..Default::default() };
         let stage = RawDevelop { camera: RawCamera::X6, settings, measure: Measure::Wait };
         let reference = RawReference { eyes: vec![ref_l.clone(), ref_r.clone()], long_side: 1234 };
-        let of_view = dev.raw_develop_constants(&[&view, &view], None, &stage, 1.0);
-        let of_reference = dev.raw_develop_constants(&[&ref_l, &ref_r], None, &stage, 1.0);
-        let with_reference = dev.raw_develop_constants(&[&view, &view], Some(&reference), &stage, 1.0);
+        let of_view = dev.raw_develop_constants(&[&view, &view], None, &stage, 1.0, None);
+        let of_reference = dev.raw_develop_constants(&[&ref_l, &ref_r], None, &stage, 1.0, None);
+        let with_reference = dev.raw_develop_constants(&[&view, &view], Some(&reference), &stage, 1.0, None);
         // Read off the reference, not off the view's own eyes.
         assert_eq!(with_reference.curve, of_reference.curve);
         assert_ne!(with_reference.curve, of_view.curve);
@@ -1664,7 +1672,7 @@ mod tests {
         assert_eq!((a.long_side, b.long_side, c.long_side), (1234, 504, 640));
         // An empty reference is none.
         let none = RawReference { eyes: Vec::new(), long_side: 99 };
-        assert_eq!(dev.raw_develop_constants(&[&view, &view], Some(&none), &stage, 1.0).local.expect("local").long_side, 640);
+        assert_eq!(dev.raw_develop_constants(&[&view, &view], Some(&none), &stage, 1.0, None).local.expect("local").long_side, 640);
     }
 
     /// The sharpening on the GPU against its CPU twin: a picture with

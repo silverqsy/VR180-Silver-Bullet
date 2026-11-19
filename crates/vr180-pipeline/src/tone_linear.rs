@@ -30,8 +30,11 @@
 //! **Shadows and Highlights** are the raw development's: a gain in stops
 //! read off a curve at the pixel's base level, the base being the frame's
 //! log₂ luminance smoothed without crossing strong edges
-//! ([`crate::raw_local`]), the curves derived from the frame's own levels.
-//! A gain above zero is limited toward white as there.
+//! ([`crate::raw_local`]), the curves derived from the picture's own
+//! levels: a still's, and for a clip those of the whole clip, read once off
+//! frames spread over it ([`crate::clip_stats`]), so that the rendering
+//! does not follow what each frame happens to hold. A gain above zero is
+//! limited toward white as there.
 //!
 //! **Whites, Blacks and Contrast** are, as in a raw converter, curves of
 //! the picture as it is displayed ([`crate::raw_global`]). They become

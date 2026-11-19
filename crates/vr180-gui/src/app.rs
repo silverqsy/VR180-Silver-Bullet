@@ -43,6 +43,12 @@ enum DialogResult {
 /// The app's project file: the list with the export bar's choices.
 type Project = crate::project::Project<ExportOptions>;
 
+/// What a clip's statistics were sampled for: its path, and what makes its
+/// decoder give other pictures (`App::clip_stats_for`).
+type ClipStatsFor = (PathBuf, String);
+/// Where a sampling's outcome arrives.
+type ClipStatsRx = Receiver<std::result::Result<Arc<vr180_pipeline::clip_stats::ClipStats>, String>>;
+
 pub struct App {
     /// The UI context, handed to decoder workers so they can repaint the
     /// window when a frame lands (`DecoderControl::wake_ui`).
@@ -256,6 +262,26 @@ pub struct App {
     align_rx: Option<crossbeam_channel::Receiver<Result<vr180_pipeline::stereo_align::StereoAlignResult, String>>>,
     /// Last Auto align outcome, shown under the button.
     align_status: Option<String>,
+    /// The loaded clip's own statistics ([`vr180_pipeline::clip_stats`]) and
+    /// what they were sampled for, once they are in: its preview, its stills
+    /// and an export of it are all rendered by them.
+    clip_stats: Option<(ClipStatsFor, crate::decoder::ClipStatsRef)>,
+    /// The sampling in flight: what it is for, how to call it off, where
+    /// its outcome arrives.
+    clip_stats_job: Option<(ClipStatsFor, Arc<std::sync::atomic::AtomicBool>, ClipStatsRx)>,
+    /// What the last sampling failed for: not tried again while it is loaded.
+    clip_stats_failed: Option<ClipStatsFor>,
+    /// What a sampling is about to start for, and the moment it may: once
+    /// what it is for has stood for a while, so a control that changes
+    /// what the decoder gives (a Blackmagic RAW clip's colour settings,
+    /// dragged) does not start one at every step.
+    clip_stats_asked: Option<(ClipStatsFor, std::time::Instant)>,
+    /// The handle of them the decoder was last given.
+    last_pushed_clip_stats: Option<crate::decoder::ClipStatsRef>,
+    /// The device the sampling runs on ([`Self::export_device`]'s: its
+    /// readbacks must stay off the one the window presents with), made
+    /// when a clip first needs it.
+    clip_stats_device: Option<Arc<vr180_pipeline::gpu::Device>>,
     /// True while the export queue is draining (one item exports at a time).
     batch_running: bool,
     /// Index of the item the current `export_job` belongs to (only
@@ -836,7 +862,7 @@ impl ProResProfile {
 /// takes its default.)
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-struct ExportOptions {
+pub(crate) struct ExportOptions {
     codec: ExportCodec,
     /// A raw video clip exports as a folder of DNG frames instead of a
     /// video file (used only when the source is a raw video).
@@ -3740,6 +3766,12 @@ impl App {
             active_clip: None,
             align_rx: None,
             align_status: None,
+            clip_stats: None,
+            clip_stats_job: None,
+            clip_stats_failed: None,
+            clip_stats_asked: None,
+            last_pushed_clip_stats: None,
+            clip_stats_device: None,
             batch_running: false,
             batch_current: None,
             batch_opts: None,
@@ -4188,7 +4220,7 @@ impl App {
     /// used by both the single export (current clip + live settings) and
     /// the batch (per-item probe + per-item settings snapshot).
     #[allow(clippy::too_many_arguments)]
-    fn build_export_cfg(
+    pub(crate) fn build_export_cfg(
         source_path: &std::path::Path,
         output_path: &std::path::Path,
         fps: f32,
@@ -6944,7 +6976,131 @@ impl App {
         let mut s = if self.clip_single_eye() { self.settings.for_single_eye() } else { self.settings.clone() };
         s.ilog_source = self.clip.as_ref().is_some_and(|c| c.ilog());
         s.raw_source = self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
+        s.clip_stats = self.loaded_clip_stats();
         s
+    }
+
+    /// What the loaded clip's statistics are sampled for: the clip, and
+    /// what makes its decoder give other pictures (a Blackmagic RAW clip's
+    /// colour settings). `None`: nothing loaded, or a still, which is its
+    /// own one frame.
+    fn clip_stats_for(&self) -> Option<ClipStatsFor> {
+        let clip = self.clip.as_ref().filter(|c| !c.source_kind.is_still())?;
+        let decode = if clip.source_kind == vr180_pipeline::SourceKind::BlackmagicRaw { format!("{:?}", self.settings.braw_color) } else { String::new() };
+        Some((self.loaded_path.clone()?, decode))
+    }
+
+    /// The loaded clip's statistics, where they are in.
+    fn loaded_clip_stats(&self) -> Option<crate::decoder::ClipStatsRef> {
+        let what = self.clip_stats_for()?;
+        self.clip_stats.as_ref().filter(|(of, _)| *of == what).map(|(_, stats)| stats.clone())
+    }
+
+    /// The loaded clip is rendered by something that goes by the picture's
+    /// statistics: a raw clip always (its development), any other when a
+    /// tone control that follows the levels is moved.
+    fn clip_wants_stats(&self) -> bool {
+        match &self.clip {
+            Some(clip) if clip.source_kind.is_raw_video() => true,
+            Some(_) => self.settings.tone.needs_stats(),
+            None => false,
+        }
+    }
+
+    /// Keep the loaded clip's statistics coming: take in a sampling that
+    /// has finished, call one off that is for a clip no longer loaded, and
+    /// start one when the clip needs them and has none. They are sampled
+    /// once per clip, on a thread of their own; until they are in, the
+    /// preview measures each frame by itself, as a still does.
+    fn drive_clip_stats(&mut self, ctx: &egui::Context) {
+        let what = self.clip_stats_for();
+        if let Some((of, cancel, rx)) = &self.clip_stats_job {
+            if Some(of) != what.as_ref() {
+                cancel.store(true, Ordering::SeqCst);
+                self.clip_stats_job = None;
+            } else {
+                match rx.try_recv() {
+                    Ok(Ok(stats)) => {
+                        self.clip_stats = Some((of.clone(), crate::decoder::ClipStatsRef(stats)));
+                        self.clip_stats_job = None;
+                        ctx.request_repaint();
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("clip statistics: {e}: each frame of this clip is measured by itself");
+                        self.clip_stats_failed = Some(of.clone());
+                        self.clip_stats_job = None;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        self.clip_stats_failed = Some(of.clone());
+                        self.clip_stats_job = None;
+                    }
+                }
+            }
+        }
+        let Some(what) = what else {
+            self.clip_stats = None;
+            return;
+        };
+        if self.clip_stats.as_ref().is_some_and(|(of, _)| *of != what) {
+            self.clip_stats = None;
+        }
+        if self.clip_stats.is_some() || self.clip_stats_job.is_some()
+            || !self.clip_wants_stats() || self.clip_stats_failed.as_ref() == Some(&what)
+        {
+            return;
+        }
+        // Once what it is for has stood for a moment.
+        const SETTLED: std::time::Duration = std::time::Duration::from_millis(400);
+        let now = std::time::Instant::now();
+        match &self.clip_stats_asked {
+            Some((of, at)) if *of == what && now >= *at => {}
+            Some((of, at)) if *of == what => {
+                ctx.request_repaint_after(*at - now);
+                return;
+            }
+            _ => {
+                self.clip_stats_asked = Some((what, now + SETTLED));
+                ctx.request_repaint_after(SETTLED);
+                return;
+            }
+        }
+        let Some(item) = self.batch.iter().find(|b| b.path == what.0) else { return };
+        let cfg = Self::build_export_cfg(
+            &item.path, std::path::Path::new("/tmp/vr180-clip-stats-unused.mp4"), item.fps, item.source_kind,
+            item.fisheye_eye_w, item.fisheye_eye_h, item.width, item.height, item.sharp_eye(),
+            &self.settings, &self.export_opts, self.clip_segments(&item.path));
+        // An export has the GPU: nothing is sampled while it runs. An
+        // export samples the clip it writes by itself, and what it sampled
+        // is taken here as it is; else the clip is looked at again shortly.
+        if self.batch_running {
+            match vr180_pipeline::clip_stats::cached(&cfg) {
+                Some(stats) => self.clip_stats = Some((what, crate::decoder::ClipStatsRef(stats))),
+                None => {
+                    const AGAIN: std::time::Duration = std::time::Duration::from_secs(2);
+                    self.clip_stats_asked = Some((what, now + AGAIN));
+                    ctx.request_repaint_after(AGAIN);
+                }
+            }
+            return;
+        }
+        let pipeline = match &self.clip_stats_device {
+            Some(device) => device.clone(),
+            None => {
+                let device = self.export_device();
+                self.clip_stats_device = Some(device.clone());
+                device
+            }
+        };
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = cancel.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(vr180_pipeline::clip_stats::for_clip(&pipeline, &cfg, &stop).map_err(|e| e.to_string()));
+        });
+        self.clip_stats_job = Some((what, cancel, rx));
     }
 
     /// Diff `self.settings` against `last_pushed_settings`; if changed,
@@ -6954,9 +7110,13 @@ impl App {
         // What a raw clip's sharpening counts its radius in: the width of
         // one eye of the frame an export would write now.
         self.settings.export_eye_w = if self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) { self.raw_export_eye_w() } else { 0 };
-        if self.settings == self.last_pushed_settings {
+        // The clip's statistics arriving is a change too: the frame on
+        // screen is drawn again by them.
+        let clip_stats = self.loaded_clip_stats();
+        if self.settings == self.last_pushed_settings && clip_stats == self.last_pushed_clip_stats {
             return;
         }
+        self.last_pushed_clip_stats = clip_stats;
         if let Some(ctl) = &self.control {
             *ctl.settings.write() = self.worker_settings();
             ctl.settings_generation.fetch_add(1, Ordering::SeqCst);
@@ -8321,6 +8481,7 @@ impl eframe::App for App {
         self.poll_updater(ctx);
         self.poll_dialogs();
         self.poll_auto_align(ctx);
+        self.drive_clip_stats(ctx);
         self.draw_update_popover(ctx);
         if self.update_installing {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));

@@ -1405,6 +1405,26 @@ fn resolve_export_braw_imu(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::D
     Some(imu)
 }
 
+/// The statistics of the clip an export of `cfg` renders by
+/// ([`crate::clip_stats`]): the configuration's own where it brings them
+/// (the app's, which its preview reads too), else the clip is sampled here,
+/// before its first frame. Every frame of the export is then developed and
+/// toned alike. A plan with no stage that goes by the picture's statistics
+/// needs none.
+///
+/// `VR180_TONE_PER_FRAME=1` leaves every frame to its own statistics, as a
+/// still has them: for comparing the two, never for a clip that is kept.
+pub(crate) fn provide_clip_stats(pipeline: &Device, cfg: &mut FisheyeExportConfig, cancel: &AtomicBool) -> Result<()> {
+    if std::env::var("VR180_TONE_PER_FRAME").as_deref() == Ok("1") {
+        cfg.color_stack.clip_stats = None;
+        return Ok(());
+    }
+    if cfg.color_stack.clip_stats.is_none() && cfg.color_stack.wants_clip_stats() && !cfg.source_kind.is_still() {
+        cfg.color_stack.clip_stats = Some(crate::clip_stats::for_clip(pipeline, cfg, cancel)?);
+    }
+    Ok(())
+}
+
 pub fn export_fisheye(
     pipeline: Arc<Device>,
     mut cfg: FisheyeExportConfig,
@@ -1436,6 +1456,7 @@ pub fn export_fisheye(
         cfg.color_stack = cfg.color_stack.single_eye();
     }
     prepare_spatial(&mut cfg)?;
+    provide_clip_stats(&pipeline, &mut cfg, &cancel)?;
     // A lens frame: fix its lens before the first frame, and state it in the
     // file once the file is whole (after the audio, which rewrites it). The
     // disc states its own lens the same way.
@@ -2827,6 +2848,7 @@ pub fn export_eac(
         cfg.inject_youtube_vr180 = false;
     }
     prepare_spatial(&mut cfg)?;
+    provide_clip_stats(&pipeline, &mut cfg, &cancel)?;
     // A lens frame: as in `export_fisheye`, its lens is fixed before the
     // first frame and stated in the file once the file is whole; the disc
     // states its own.

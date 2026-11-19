@@ -161,6 +161,24 @@ pub(crate) fn osv_is_osmo_ii(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// A clip's own statistics ([`vr180_pipeline::clip_stats`]) as the settings
+/// of a worker carry them: two are equal when they are the same sampling of
+/// the clip, so settings that got another one count as changed.
+#[derive(Clone)]
+pub struct ClipStatsRef(pub Arc<vr180_pipeline::clip_stats::ClipStats>);
+
+impl PartialEq for ClipStatsRef {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for ClipStatsRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -453,6 +471,13 @@ pub struct Settings {
     /// the app from its export options; never persisted.
     #[serde(skip)]
     pub export_eye_w: u32,
+    /// The clip's own statistics: what its raw development or its tone
+    /// controls go by, one set for every frame of it, so that the picture
+    /// does not brighten or darken with what each frame happens to hold.
+    /// Only ever set on the copy a worker gets, once the app has sampled
+    /// the clip (until then a frame is measured by itself); never persisted.
+    #[serde(skip)]
+    pub clip_stats: Option<ClipStatsRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +593,7 @@ impl Default for Settings {
             raw: Default::default(),
             raw_source: false,
             export_eye_w: 0,
+            clip_stats: None,
         }
     }
 }
@@ -906,6 +932,7 @@ impl Settings {
         if self.still_dng_mode {
             restrict_to_dng_metadata(&mut plan);
         }
+        plan.clip_stats = self.clip_stats.as_ref().map(|c| c.0.clone());
         plan
     }
 

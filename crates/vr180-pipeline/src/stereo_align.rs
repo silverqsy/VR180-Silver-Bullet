@@ -58,6 +58,46 @@ struct PatchObs {
     dy: f32,    // vertical disparity (rad)
 }
 
+/// What carries a clip's own lens record for the measurements that draw it
+/// without its motion data (the alignment here, [`crate::clip_stats`]): the
+/// record alone where the file has one, read the cheap way. `None`: the
+/// preset the configuration names.
+pub(crate) fn lens_carrier(cfg: &FisheyeExportConfig) -> Option<vr180_fisheye::DjiOsvImu> {
+    if cfg.source_kind == crate::SourceKind::DjiOsv {
+        crate::decode::extract_dji_calib_blob(&cfg.source_path).ok()
+            .and_then(|b| vr180_fisheye::DjiOsvImu::parse(&b).ok())
+    } else if cfg.source_kind == crate::SourceKind::Insta360Insv {
+        // Calib-only synthetic IMU at the native stream size (the resolver
+        // rescales it to the decoded working size).
+        let (w, h) = crate::decode::probe_video(&cfg.source_path)
+            .map(|p| (p.width, p.height)).unwrap_or((3840, 3840));
+        crate::x6_pair::read_identity(&cfg.source_path).ok()
+            .map(|m| crate::insv_imu::insv_calib_only(&m, w, h, cfg.insv_view))
+    } else if cfg.source_kind == crate::SourceKind::KandaoQoocam {
+        // The stacked stream: one eye is half the frame height.
+        let (w, h) = crate::decode::probe_video(&cfg.source_path)
+            .map(|p| crate::source_kind::EyeLayout::TopBottom.eye_dims(p.width, p.height))
+            .unwrap_or((3840, 3840));
+        vr180_fisheye::kandao::read_kandao_meta(&cfg.source_path, false).ok()
+            .map(|m| crate::kandao_imu::kandao_calib_only(&m, w, h))
+    } else if cfg.source_kind == crate::SourceKind::BlackmagicRaw {
+        // The GUI's carrier (the lens the preview shows) first, else the
+        // same circle seed every other BRAW entry point builds.
+        cfg.preloaded_imu.as_ref().map(|a| (**a).clone()).or_else(|| {
+            vr180_braw::BrawInfo::probe(&cfg.source_path).ok().map(|i| {
+                let layout = crate::braw_imu::braw_layout(&cfg.source_path, &i);
+                let (w, h) = layout.eye_dims(&i);
+                crate::braw_imu::braw_calib_only(&i, w, h, layout.circles)
+            })
+        })
+    } else if cfg.source_kind.is_raw_video() {
+        // The take's own lens record, as an export resolves it.
+        crate::fisheye_export::resolve_export_imu(cfg)
+    } else {
+        None
+    }
+}
+
 /// Measure the stereo alignment correction for `cfg` (built exactly like
 /// an export config from the current GUI state). Ignores `cfg.eye_w/h`
 /// (renders at its own measurement size), stabilization, and encode
@@ -149,39 +189,7 @@ pub fn measure_stereo_align(
         };
 
         // per-lens calib (same resolver as export/preview)
-        let osv = if cfg.source_kind == crate::SourceKind::DjiOsv {
-            crate::decode::extract_dji_calib_blob(&cfg.source_path).ok()
-                .and_then(|b| vr180_fisheye::DjiOsvImu::parse(&b).ok())
-        } else if cfg.source_kind == crate::SourceKind::Insta360Insv {
-            // Calib-only synthetic IMU at the native stream size (the resolver
-            // rescales it to the decoded working size).
-            let (w, h) = crate::decode::probe_video(&cfg.source_path)
-                .map(|p| (p.width, p.height)).unwrap_or((3840, 3840));
-            crate::x6_pair::read_identity(&cfg.source_path).ok()
-                .map(|m| crate::insv_imu::insv_calib_only(&m, w, h, cfg.insv_view))
-        } else if cfg.source_kind == crate::SourceKind::KandaoQoocam {
-            // The stacked stream: one eye is half the frame height.
-            let (w, h) = crate::decode::probe_video(&cfg.source_path)
-                .map(|p| crate::source_kind::EyeLayout::TopBottom.eye_dims(p.width, p.height))
-                .unwrap_or((3840, 3840));
-            vr180_fisheye::kandao::read_kandao_meta(&cfg.source_path, false).ok()
-                .map(|m| crate::kandao_imu::kandao_calib_only(&m, w, h))
-        } else if cfg.source_kind == crate::SourceKind::BlackmagicRaw {
-            // The GUI's carrier (the lens the preview shows) first, else the
-            // same circle seed every other BRAW entry point builds.
-            cfg.preloaded_imu.as_ref().map(|a| (**a).clone()).or_else(|| {
-                vr180_braw::BrawInfo::probe(&cfg.source_path).ok().map(|i| {
-                    let layout = crate::braw_imu::braw_layout(&cfg.source_path, &i);
-                    let (w, h) = layout.eye_dims(&i);
-                    crate::braw_imu::braw_calib_only(&i, w, h, layout.circles)
-                })
-            })
-        } else if cfg.source_kind.is_raw_video() {
-            // The take's own lens record, as an export resolves it.
-            crate::fisheye_export::resolve_export_imu(cfg)
-        } else {
-            None
-        };
+        let osv = lens_carrier(cfg);
         let mut calib_pair = None;
 
         for &ts in &sample_ts {

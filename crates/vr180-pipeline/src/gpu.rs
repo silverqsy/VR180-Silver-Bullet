@@ -4798,6 +4798,12 @@ pub struct ColorStackPlan {
     /// raw clip's sharpening counts its radius in the export's pixels
     /// ([`crate::raw_sharpen`]).
     pub raw_pixel_scale: f32,
+    /// The clip's own statistics ([`crate::clip_stats`]): what its raw
+    /// development and its tone controls are derived from, the same for
+    /// every frame, so that a clip's rendering does not follow what happens
+    /// to be in each frame. `None`: a frame is measured by itself (a still,
+    /// and a preview that has not sampled its clip yet).
+    pub clip_stats: Option<std::sync::Arc<crate::clip_stats::ClipStats>>,
 }
 
 impl Default for ColorStackPlan {
@@ -4818,6 +4824,7 @@ impl Default for ColorStackPlan {
             raw_develop: None,
             raw_reference: None,
             raw_pixel_scale: 1.0,
+            clip_stats: None,
         }
     }
 }
@@ -4837,6 +4844,13 @@ impl ColorStackPlan {
             || self.auto_eye_match.is_some()
             || self.eye_scale != 1.0
             || self.raw_develop.is_some()
+    }
+
+    /// The plan has a stage that is derived from the picture's statistics
+    /// (a raw development; tone controls that follow the levels): a clip
+    /// rendered by it wants its own ([`Self::clip_stats`]).
+    pub fn wants_clip_stats(&self) -> bool {
+        self.raw_develop.is_some() || self.active_tone().is_some_and(|t| t.settings.needs_stats())
     }
 
     /// This plan for a source that holds ONE eye: everything that sets the two
@@ -6911,7 +6925,7 @@ impl Device {
         } else { None };
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(12);
         // A raw source: this frame's tone keys, read off the eye itself.
-        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[src], plan.raw_reference.as_ref(), stage, plan.raw_pixel_scale));
+        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[src], plan.raw_reference.as_ref(), stage, plan.raw_pixel_scale, plan.clip_stats.as_deref()));
         // The tone stage of a clip that is not raw: this eye is the frame.
         let tone = self.linear_tone_constants(&[src], plan);
         let idx = self.record_color_stack(
@@ -6950,7 +6964,7 @@ impl Device {
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(24);
         // A raw source: ONE set of tone keys for the frame, read off both
         // eyes together, so the two are developed alike.
-        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[left, right], plan.raw_reference.as_ref(), stage, plan.raw_pixel_scale));
+        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[left, right], plan.raw_reference.as_ref(), stage, plan.raw_pixel_scale, plan.clip_stats.as_deref()));
         // And one set of tone constants where the clip is not raw.
         let tone = self.linear_tone_constants(&[left, right], plan);
         let li = self.record_color_stack(

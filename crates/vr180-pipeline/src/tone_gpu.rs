@@ -384,10 +384,12 @@ impl Device {
         let shown = plan.shown();
         let tables = self.linear_tone_tables(stage.light, &shown);
         let tabled = started.elapsed();
-        let stats = if stage.settings.needs_stats() {
-            self.linear_tone_stats(eyes, &tables.decode, stage.measure)
-        } else {
-            FrameStats::unknown()
+        // A clip's frames are all toned by the clip's statistics; a frame
+        // that has none is measured by itself.
+        let stats = match &plan.clip_stats {
+            _ if !stage.settings.needs_stats() => FrameStats::unknown(),
+            Some(clip) => clip.tone(&tables.decode),
+            None => self.linear_tone_stats(eyes, &tables.decode, stage.measure),
         };
         let measured = started.elapsed();
         let mut k = stage.constants_with(&tables, &stats, &shown, None);

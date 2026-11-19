@@ -25,6 +25,7 @@
 //! | `VR180_PROBE_RAW` | a folder to write each frame's bytes into (`<label>.rgb`: R, G, B per pixel, row by row) | none |
 //! | `VR180_PROBE_STILL` | `1` also renders each moment's zoom still (the magnifier's and the snapshot's picture) | off |
 //! | `VR180_PROBE_STILL_CAP` | width cap of that still's eye, `0` = native | `2048` |
+//! | `VR180_PROBE_FRAME_STATS` | `1` leaves the clip unsampled: every frame is developed and toned by its own statistics, as the app shows it until the clip's are in | the clip's |
 
 use super::{
     start_decoder, DecodedFrame, DecoderCommand, DecoderConfig, DecoderControl, DetailCache,
@@ -151,7 +152,7 @@ pub(crate) fn run(clip: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
 
-    let settings = settings_for(&path)?;
+    let mut settings = settings_for(&path)?;
     let stabilized = settings.stabilize;
     let pipeline = Device::new()?;
     // On Windows the zero-copy preview is gated on the P010 texture format,
@@ -163,6 +164,18 @@ pub(crate) fn run(clip: &Path) -> anyhow::Result<()> {
     } else {
         pipeline
     });
+    // As the app does for a clip it has loaded: the clip's own statistics,
+    // sampled once, which every frame is then developed and toned by.
+    let kind = vr180_pipeline::source_kind::detect(&path)?;
+    let wanted = !kind.is_still() && (settings.raw_source || settings.tone.needs_stats());
+    if wanted && switch("VR180_PROBE_FRAME_STATS").as_deref() != Some("1") {
+        let probe = vr180_pipeline::decode::probe_video(&path)?;
+        let cfg = crate::app::App::build_export_cfg(
+            &path, Path::new("/tmp/vr180-probe-unused.mp4"), probe.fps, kind, 0, 0, probe.width, probe.height, None,
+            &settings, &crate::app::ExportOptions::default(), vec![path.clone()]);
+        let stats = vr180_pipeline::clip_stats::for_clip(&pipeline, &cfg, &std::sync::atomic::AtomicBool::new(false))?;
+        settings.clip_stats = Some(super::ClipStatsRef(stats));
+    }
     let control = Arc::new(DecoderControl {
         paused: true.into(),
         settings: parking_lot::RwLock::new(settings.clone()),

@@ -12,6 +12,7 @@ pub mod audio;
 pub mod bayer;
 pub mod braw_imu;
 pub mod circles;
+pub mod clip_stats;
 pub mod decode;
 pub mod dji_imu;
 pub mod raw_chroma;

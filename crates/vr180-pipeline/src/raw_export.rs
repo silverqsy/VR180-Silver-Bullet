@@ -419,6 +419,10 @@ pub fn export_frame_dng(pipeline: Arc<Device>, cfg: &FisheyeExportConfig, t_s: f
 /// clip's whole colour stack) into a 16-bit PNG at `out`: the picture the
 /// DNG of [`export_frame_dng`] should give in a raw converter.
 pub fn export_frame_png16(pipeline: Arc<Device>, cfg: &FisheyeExportConfig, t_s: f64, out: &Path) -> Result<()> {
+    // The frame is developed as every frame of its clip is.
+    let mut cfg = cfg.clone();
+    crate::fisheye_export::provide_clip_stats(&pipeline, &mut cfg, &std::sync::atomic::AtomicBool::new(false))?;
+    let cfg = &cfg;
     let mut source = FrameSource::open(pipeline.clone(), cfg, (Some(t_s), Some(t_s + 1.0 / cfg.fps.max(1.0) as f64)))?;
     source.decoder.seek(t_s.max(0.0))?;
     let pair = source.decoder.decode_forward_to(t_s.max(0.0), 1.0 / cfg.fps as f64)?

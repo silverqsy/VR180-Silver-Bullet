@@ -22,7 +22,7 @@ converter's controls for it, and every frame can be had as a DNG.
     average, and a white balance by a tenth to seven tenths;
   - Shadows and Highlights are local, as there: they lift or hold back an
     object as a whole and leave the texture inside it alone, they belong to
-    the frame (what counts as a shadow follows the frame's own levels), and
+    the picture (what counts as a shadow follows the clip's own levels), and
     moved together they do not simply add. Half the slider is within about
     one step, the whole slider within one and a half to two and a half;
   - Blacks and Whites below zero are within half a step to one; Contrast
@@ -75,12 +75,23 @@ converter's controls for it, and every frame can be had as a DNG.
   export's picture reduced: judge sharpening in the zoom view or on a
   snapshot. It adds about half to the export time at full size. The
   settings travel in the DNG.
-- **It follows the footage.** The frame's brightest and darkest levels and
-  the spread of its levels are measured on every frame, as a raw converter
-  does per picture; over three seconds of a sample take this adds no
-  flicker (the picture's mean changes from frame to frame by 0.18 of an
-  8-bit step with and without Shadows and Highlights, 0.22 with every
-  slider in use).
+- **One development for the whole clip.** The rendering is derived from
+  the picture: its brightest and darkest levels and the spread of its
+  levels. A raw converter reads them off each picture it is given. A clip
+  developed that way follows its own content: when a pan lets more sky in,
+  everything else is rendered differently, and a clip shot at one fixed
+  exposure brightens and darkens by itself. (On a test take with
+  Highlights at −100, a patch of sky whose recorded values did not move
+  went from 130 to 169 of 255 within seven seconds, most of it in one.)
+  So they are read once per clip, off sixteen frames spread over it and
+  taken together as one picture, and every frame is developed by them: the
+  same patch then stays within one step (148 to 149). The preview, a
+  snapshot and the export read the same sixteen frames and agree; a change
+  of white balance is read off them again without a frame being decoded.
+  Sampling takes a few seconds when a clip is first opened or exported;
+  until it is in, the preview measures each frame by itself. The DNG of a
+  frame opened in a raw converter is developed from that frame alone, so
+  it matches the clip's frame where the frame is like the rest of the clip.
 - **One grade, one look, in every view.** A reframed view shows a part of
   the scene and a Lens Space frame has a black border, so measured on their
   own they would be developed differently from the VR180 picture (with
@@ -216,11 +227,15 @@ the LUT, and not a curve laid over the picture the LUT left.
   exactly as the displayed light says, whatever LUT is loaded.
 - **The controls are the raw development's.** Shadows and Highlights are
   local: they lift or hold back an area as a whole and leave the texture
-  inside it alone, and what counts as a shadow follows the frame's own
-  levels. Whites, Blacks and Contrast follow the frame's levels too. Every
-  frame is measured, both eyes as one frame, so the two eyes are toned
-  alike. The numbers are not Camera Raw's for a video clip: the picture is
-  rendered by the camera's LUT, not by a raw converter's curve.
+  inside it alone, and what counts as a shadow follows the picture's own
+  levels. Whites, Blacks and Contrast follow those levels too. For a video
+  clip they are the levels of the whole clip, read once off sixteen frames
+  spread over it (both eyes together, so the two eyes are toned alike): a
+  control set for the clip then does the same to every frame, and the
+  picture does not brighten or darken with what each frame happens to
+  hold. A still is measured by itself. The numbers are not Camera Raw's
+  for a video clip: the picture is rendered by the camera's LUT, not by a
+  raw converter's curve.
 - **Nothing moved is nothing run.** With the six at zero the stage is not
   part of a clip's rendering at all: the 65 stored exports and 169 stored
   preview frames of the test set came out identical to the bytes they had
@@ -229,9 +244,9 @@ the LUT, and not a curve laid over the picture the LUT left.
   sliders that sat with them are replaced by the two above; a clip graded
   with them keeps its values, shown as "earlier", until that section is
   reset.
-- **Cost.** Exposure alone costs nothing. A control that needs the frame
-  measured adds about 10 ms a frame at 8192 × 4096 (39 to 42 ms a frame
-  became 48 to 51 on the test machine).
+- **Cost.** Exposure alone costs nothing. A control that goes by the
+  levels has the clip sampled once, a few seconds before the first frame;
+  no frame is measured after that.
 - **Not offered** for a raw clip (its development has the six), for
   Blackmagic RAW (the SDK's own controls), and for a still written as a
   linear DNG (a DNG has no place for them).

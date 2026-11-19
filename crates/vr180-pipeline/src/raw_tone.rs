@@ -31,6 +31,14 @@
 //! frame's maximum and darkest level ([`ToneKeys`]) are measured on a
 //! reduced copy of the frame as it is graded (`raw_measure.wgsl`).
 //!
+//! **A clip has one set of statistics.** Measured on every frame by itself,
+//! all of the above follows the frame: a pan that lets more sky in changes
+//! how everything else is rendered, and a clip shot at one exposure
+//! brightens and darkens. So a clip's frames are all developed by the
+//! statistics of the clip, read once off frames spread over it
+//! ([`crate::clip_stats`]); "the frame" below is then the clip taken as one
+//! picture. A still is its own one picture and is measured by itself.
+//!
 //! Then: ProPhoto → Rec.709 primaries, clipped to 0..1, sRGB encoding.
 //!
 //! **Shadows and Highlights** are a gain between the default black and the
@@ -284,14 +292,18 @@ pub fn limit_gain(gain: f32, room: f32) -> f32 {
     if gain <= 0.5 * room { gain } else { room - room * room / (4.0 * gain) }
 }
 
-/// When the frame's keys are measured.
+/// How a frame that has no clip's statistics to go by is measured (a clip's
+/// frames are all rendered by the clip's: [`crate::clip_stats`], through
+/// [`crate::gpu::ColorStackPlan::clip_stats`]; then nothing is measured).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Measure {
-    /// Measure this frame and wait for the result (an export, a still).
+    /// Measure this frame and wait for the result (a still, which is its
+    /// own one picture).
     #[default]
     Wait,
     /// Use the last measurement that has come back and queue one of this
-    /// frame (the live preview, which must not wait on the GPU).
+    /// frame (the live preview of a clip that has not been sampled yet: it
+    /// must not wait on the GPU).
     Latest,
 }
 

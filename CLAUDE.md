@@ -3963,6 +3963,75 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       (`join_immersive`'s other branch, `aivu_wrap_available`). (2) That
       refusal appears.
 
+39. **A clip is rendered by ONE set of tone statistics (2026-11-18, Mac;
+    UNRELEASED).** The user-facing text is in the CHANGELOG (the raw
+    development's "One development for the whole clip", the tone
+    controls' "The controls are the raw development's").
+    - **What was wrong.** A raw clip's development (item 34) and the tone
+      controls of every other clip (item 37) are derived from statistics
+      of the picture (`raw_tone::FrameStats`: brightest cell, darkest
+      cell, the levels of a reduced copy, the peaks). Every frame was
+      measured by itself (`Measure::Wait` in an export, `Measure::Latest`
+      in the preview), so the rendering followed each frame's content. On
+      a take shot at one manual exposure, with Highlights at −100, a pan
+      that took a tree out of the frame made the sky 39 of 255 brighter
+      within seven seconds while its recorded values fell 2 %: the
+      Highlights curve comes from the level histogram, which had moved.
+      The white point, the default black, Contrast and Whites above zero
+      go by the same statistics.
+    - **What it is now.** `clip_stats.rs`. `measure` reads 16 frames
+      spread evenly over the WHOLE clip (not the trimmed part: a clip's
+      look does not move with its trim), draws each eye as the
+      half-equirect its own lens sees (identity rotation: no
+      stabilization, no view adjustment, so every output view of a clip
+      gets one look), and keeps a 126 × 126 copy of each (the mean of
+      8 × 8 pixels of a 1008 square). `ClipStats::raw(geometry)` and
+      `ClipStats::tone(decode)` work the statistics out of the copies on
+      the CPU, as the two measuring shaders do on a frame, with all the
+      frames as ONE picture (`stats_from_cells`, the frames as so many
+      eyes). They depend on how the picture is read (a raw clip's white
+      balance; the light a code stands for, which follows the grade), so
+      they are worked out when asked for and kept until that changes: no
+      frame is decoded again for a slider.
+    - **How a frame gets them.** `ColorStackPlan::clip_stats`. The two
+      places a frame's statistics are taken (`raw_develop_constants`,
+      `linear_tone_constants`) read the clip's when the plan has them and
+      measure the frame only when it has none (a still photo; a preview
+      that has not sampled its clip yet). `provide_clip_stats` at the top
+      of `export_fisheye`, `export_eac` and `export_frame_png16` puts
+      them in for an export; `for_clip` keeps what was sampled in the
+      process (key: the files, their size and date, the source kind, the
+      eye order, a Blackmagic RAW clip's colour settings), so the
+      preview, a snapshot and the export of a clip read the same copies.
+      In the app: `drive_clip_stats` samples the loaded clip on a thread
+      of its own when its settings need statistics (a raw clip always;
+      another once a tone control that goes by the levels is moved), on
+      `export_device()` (lesson 1: no readbacks on the window's device),
+      and `worker_settings` hands the result to the preview worker
+      (`Settings::clip_stats`, never saved).
+    - **`VR180_TONE_PER_FRAME=1`** leaves every frame of an export to its
+      own statistics, for comparing; `VR180_PROBE_FRAME_STATS=1` the same
+      for the preview probe, which otherwise samples as the app does.
+    - **Verified on the Mac.** The take above, 36 to 43 s, Lens Space at
+      1024 px, the user's settings: per frame the sky's green goes from
+      130 to 170 as in the user's own export (130 to 169); with the
+      clip's statistics 148 to 149, every frame "dark 0.00050 max 1.9865,
+      14112 levels", three runs the same bytes, and 15 % faster per frame
+      (no readback). GPU tests: the copies give what a frame gives on the
+      GPU within 0.02 stops (a raw picture, one of code values), and
+      a bright and a dark frame of one clip get the same constants.
+    - **Not done.** The reference frame of a view that is not the
+      half-equirect is still drawn for every frame, though with the
+      clip's statistics only its size is used. The sampled copies are not
+      kept on disk: a clip is sampled again in every run of the app.
+    - **Windows, to look at.** No code is platform-specific. (1) It
+      builds. (2) A raw clip and an I-Log clip with Highlights at −100:
+      the log says "clip statistics: 16 frames of … sampled", the
+      preview's look settles within seconds of opening, and an export
+      shows no brightening over a pan. (3) The sampling runs on the
+      dedicated device `export_device()` makes; the window must stay
+      responsive while it runs.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`
