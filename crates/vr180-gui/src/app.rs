@@ -296,6 +296,11 @@ pub struct App {
     clip_stats_device: Option<Arc<vr180_pipeline::gpu::Device>>,
     /// True while the export queue is draining (one item exports at a time).
     batch_running: bool,
+    /// The system's word that the app is at work, held from a run's first
+    /// job to its last ([`Self::logic`]): a run goes on at full speed with
+    /// the window covered or another app in front, and the machine stays
+    /// awake through it.
+    busy: Option<crate::activity::Busy>,
     /// Index of the item the current `export_job` belongs to (only
     /// meaningful while `batch_running`).
     batch_current: Option<usize>,
@@ -3926,6 +3931,7 @@ impl App {
             last_pushed_clip_stats: None,
             clip_stats_device: None,
             batch_running: false,
+            busy: None,
             batch_current: None,
             batch_opts: None,
             batch_out_dir: None,
@@ -5557,6 +5563,19 @@ impl App {
                 }
                 self.join_notice = Some(text);
             }
+        }
+    }
+
+    /// Hold the system's exemption while a run is in flight (`at_work`) and
+    /// give it back when none is.
+    fn tell_the_system(&mut self, at_work: bool) {
+        if at_work && self.busy.is_none() {
+            self.busy = crate::activity::Busy::begin("Exporting");
+            if self.busy.is_some() {
+                tracing::info!("export run: the system is told the app is at work (full speed behind other windows, no idle sleep)");
+            }
+        } else if !at_work && self.busy.take().is_some() {
+            tracing::info!("export run: over, the system may rest the app again");
         }
     }
 
@@ -8607,13 +8626,16 @@ impl eframe::App for App {
     /// `update()` is skipped then. A finished export has to hand over to
     /// the next queued one with nobody looking, so that hand-over lives
     /// here, together with the wake-up that brings this back while a run
-    /// is in flight.
+    /// is in flight. And the system is told the app is at work for as long
+    /// as one is: left to itself it rests an app that is not in front.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drain export-job progress + check for completion.
         self.poll_export_job();
-        if self.batch_running || self.export_job.is_some() {
+        let at_work = self.batch_running || self.export_job.is_some();
+        if at_work {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
+        self.tell_the_system(at_work);
     }
 
     #[allow(deprecated)]

@@ -577,6 +577,15 @@ and 8-bit output are unchanged.
 
 ### Fixes
 
+- **Exports slowed down whenever the app was not in front (macOS).** macOS
+  rests an app whose window is covered or that is behind another app, and
+  an export is when the app is left alone: with the same settings a run
+  went at 10.3 frames a second with the window in front and at 5.4 behind
+  another app, and a clip with noise reduction at 1.65 against 0.46. The
+  app now tells the system it is at work for as long as a run lasts, from
+  its first clip to its last (a joined file included): it keeps its speed
+  wherever its window is, and the Mac does not go to sleep in the middle of
+  a long batch. Its display may still sleep.
 - **The 3D LUT was applied at 8-bit precision.** The cube was stored on the
   GPU with 8 bits a channel and read through a hardware sampler, so a 10-bit
   export sat up to two codes away from the LUT's own values, by a different

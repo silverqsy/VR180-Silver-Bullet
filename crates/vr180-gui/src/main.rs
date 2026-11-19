@@ -13,6 +13,7 @@
 // Debug builds keep the console so `cargo run` still prints to the terminal.
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
+mod activity;
 mod app;
 mod audio_player;
 mod decoder;

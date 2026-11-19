@@ -4279,6 +4279,47 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       goes. (2) An X6 clip with dropped frames shows the orange line in
       File info and the marks on the timeline.
 
+45. **A run keeps its speed behind other windows, and the Mac awake
+    (2026-11-19, Mac; UNRELEASED).** The user-facing text is in the
+    CHANGELOG (Fixes).
+    - **What was wrong.** The app never told macOS it was working, so App
+      Nap applied to it whenever it was not the front app or its window was
+      covered: `ps -M -p <pid>` shows every thread at priority 4 then
+      (31 to 47 in front). Measured on one batch, same settings: 10.3
+      against 5.4 frames a second (two raw clips at 8192×4096), 1.65
+      against 0.46 (a 7680² raw clip with Noise Reduction), and a 60p Lens
+      Space export at about 4.5 where a night run with the app left in
+      front made 11.2. The share (10 GbE, 930 MB/s on a test read), memory
+      and the GPU (25 %) were not the limit. Nothing kept the machine from
+      idle sleep during a run either.
+    - **What it does now.** `activity::Busy` (`crates/vr180-gui/src/
+      activity.rs`): `NSProcessInfo beginActivityWithOptions:reason:` with
+      `NSActivityUserInitiated` (no App Nap, no idle system sleep; the
+      display may sleep), ended when the value is dropped. `App::logic`
+      (the one function eframe still calls while the window is covered)
+      holds one in `App::busy` while `batch_running || export_job.is_some()`
+      and drops it when neither is true (`tell_the_system`): from a run's
+      first job to its last, the join of a one-file run and a run stopped
+      by the user included. The log says when it is taken and given back.
+    - **How to tell.** `pmset -g assertions` lists the app with
+      `PreventUserIdleSystemSleep` named "Exporting" while a run is in
+      flight; `ps -M -p <pid>` keeps its priorities with another app in
+      front.
+    - **Verified.** Two tests in `activity.rs` ask the system itself: the
+      activity is listed under its reason with `PreventUserIdleSystemSleep`
+      while the value is held, is gone once it is dropped, and of two the
+      one that ends leaves the other in force. NOT yet measured: the speed
+      of a run behind another window with this build (it needs a run in
+      the window).
+    - **Windows, to look at.** `activity::platform` is empty off macOS and
+      `Busy::begin` returns `None` there, so nothing changes on Windows.
+      Whether a run is slowed there when the window is minimised or behind
+      another (Windows throttles background processes on some power
+      plans) and whether the PC sleeps during a long batch has not been
+      looked at; if it is, the Windows half belongs in that module
+      (`SetThreadExecutionState` for sleep, the process power-throttling
+      opt-out for speed) behind the same `Busy`.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`
