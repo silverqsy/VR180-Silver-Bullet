@@ -2,8 +2,11 @@
 // columns): every pixel of the half-size picture takes the weighted sum of
 // its neighbours along the pass's direction — the spatial taps times a
 // Gaussian of how far the neighbour's colour (its values over its
-// luminance) is from the pixel's own, so a colour edge is not smeared. The
-// rows' pass puts the sum back at the pixel's own luminance.
+// luminance) is from the pixel's own, so a colour edge is not smeared,
+// times a Gaussian of how many stops its luminance is from the pixel's own,
+// so no colour crosses an edge of light (the sum is of values: a bright
+// neighbour would weigh by its brightness). The rows' pass puts the sum
+// back at the pixel's own luminance.
 //
 // Bindings:
 //   (0) src  — Rgba16Float, half size
@@ -36,8 +39,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i = 1; i <= p.dir.z; i = i + 1) {
         for (var s = -1; s <= 1; s = s + 2) {
             let n = textureLoad(src, clamp(at + s * i * p.dir.xy, vec2<i32>(0), last), 0).rgb;
-            let d = n / max(dot(p.luma.xyz, n), p.luma.w) - qc;
-            sum = sum + taps[i] * exp(-dot(d, d) * p.range.x) * n;
+            let ln = max(dot(p.luma.xyz, n), p.luma.w);
+            let d = n / ln - qc;
+            let stops = log2(ln / lc);
+            sum = sum + taps[i] * exp(-dot(d, d) * p.range.x - stops * stops * p.range.y) * n;
         }
     }
     let own = lc / max(dot(p.luma.xyz, sum), p.luma.w);

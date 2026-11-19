@@ -4146,6 +4146,23 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       passes. (2) A raw clip opens and looks as before away from its
       brightest parts.
 
+42. **Colour noise reduction: neighbours count by brightness too
+    (2026-11-19, Mac; UNRELEASED).** `raw_chroma.rs` weighed a neighbour
+    by how near its colour was and summed VALUES, so a bright neighbour
+    counted by its brightness and a sky coloured the dark pixels beside
+    it. Camera Raw measured with edges of light: no colour crosses a
+    step of a stop or more beyond the first four pixels at any amount,
+    and the mixing falls with the step as a Gaussian of about a fifth of
+    a stop. `LEVEL_SIGMA = 0.3` stops, a second Gaussian in the weight
+    (`raw_chroma::smooth`, `shaders/raw_chroma_smooth.wgsl`, the uniform's
+    `range.y`). Tests: the model's numbers (the numpy twin's),
+    `a_bright_neighbour_does_not_colour_a_dark_pixel`, the GPU stage
+    against the CPU one. Against Camera Raw at amount 25 (rms of the
+    white-balanced camera values × 1000, R / G / B) on two frames:
+    0.90 / 0.33 / 0.76 to 0.83 / 0.31 / 0.70 and 0.59 / 0.23 / 0.49 to
+    0.56 / 0.22 / 0.47. The width that fits frames best (0.3) is a little
+    over what the edge charts gave at amount 100 (0.2).
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

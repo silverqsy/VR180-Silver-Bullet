@@ -21,6 +21,8 @@
 //!    the weighted mean of its neighbours' `w`: a Gaussian of half the
 //!    radius, times a Gaussian (of `tau`) of how far the neighbour's colour
 //!    `w / L` is from the pixel's own — so a colour edge is not smeared —
+//!    times a Gaussian (of [`LEVEL_SIGMA`] stops) of how far its luminance
+//!    is from the pixel's own — so no colour crosses an edge of light —
 //!    and the mean is put back at the pixel's own luminance;
 //! 3. back at full size (bilinear), every pixel takes that smoothed colour
 //!    at its OWN luminance: `w' = s · L / (LUMA · s)`.
@@ -34,6 +36,19 @@
 //! 0.75 / 0.24 / 0.45. Camera Raw reaches further at high amounts — it
 //! flattens faint colour over tens of pixels — than one pass at half size
 //! does: at 100 a third to a half of its change is still missing.
+//!
+//! **The edge of light.** The mean is of values, so a bright neighbour
+//! weighs by its brightness: without the luminance term, leaves against
+//! the sky (five stops under it, and not far from it in colour as the
+//! sensor sees them) took the sky's colour over the whole radius, and with
+//! the highlights pulled down a tree stood in a pale blue haze. Measured on
+//! charts (two colours side by side, the darker one 0 to 6 stops under the
+//! other): Camera Raw carries no colour across a step of a stop or more
+//! beyond the first four pixels, at any amount, and what it carries across
+//! a smaller step falls as a Gaussian of about 0.2 stops of the step. On
+//! the sample takes' frames a term of 0.3 to 0.5 stops also brings the
+//! stage nearer Camera Raw's result at 10 to 50 (0.83 / 0.31 / 0.70 at 25
+//! where it was 0.90 / 0.33 / 0.76) and leaves 100 about where it was.
 
 /// The luminance the stage keeps: weights of the white-balanced camera
 /// values.
@@ -42,6 +57,10 @@ pub const LUMA: [f32; 3] = [0.195, 0.667, 0.138];
 pub const FLOOR: f32 = 1e-4;
 /// The widest smoothing a pass runs, taps to each side.
 pub const MAX_RADIUS: usize = 32;
+/// How near in luminance a neighbour has to be to count, stops (a
+/// Gaussian's sigma): colour is smoothed within a level of light, not
+/// across an edge of it.
+pub const LEVEL_SIGMA: f32 = 0.3;
 /// Amount → the smoothing's radius (a Gaussian's sigma, pixels of the
 /// exported frame) and the colour distance `tau` it weighs neighbours by.
 const TABLE: [(f32, f32, f32); 5] = [(0.0, 0.0, 0.0), (10.0, 4.0, 0.1), (25.0, 6.0, 0.2), (50.0, 12.0, 0.3), (100.0, 16.0, 0.5)];
@@ -97,6 +116,7 @@ fn luminance(w: [f32; 3]) -> f32 {
 /// at the pixel's own luminance when `own_level`.
 fn smooth(src: &[[f32; 3]], w: usize, h: usize, taps: &[f32], tau: f32, vertical: bool, own_level: bool) -> Vec<[f32; 3]> {
     let range = 1.0 / (2.0 * tau * tau);
+    let level_range = 1.0 / (2.0 * LEVEL_SIGMA * LEVEL_SIGMA);
     let r = taps.len() as isize - 1;
     (0..w * h).map(|i| {
         let (x, y) = ((i % w) as isize, (i / w) as isize);
@@ -109,7 +129,8 @@ fn smooth(src: &[[f32; 3]], w: usize, h: usize, taps: &[f32], tau: f32, vertical
             let n = src[ny as usize * w + nx as usize];
             let ln = luminance(n);
             let dist: f32 = (0..3).map(|k| { let e = n[k] / ln - qc[k]; e * e }).sum();
-            let wt = taps[d.unsigned_abs()] * (-dist * range).exp();
+            let step = (ln / lc).log2();
+            let wt = taps[d.unsigned_abs()] * (-dist * range - step * step * level_range).exp();
             for k in 0..3 {
                 sum[k] += wt * n[k];
             }
@@ -195,19 +216,19 @@ mod tests {
         let k = constants(25.0, 1.0, NEUTRAL).unwrap();
         let out = denoise_picture(&cam, w, h, &k);
         for ((x, y), before, after) in [
-            ((0usize, 0usize), [0.12f32, 0.2, 0.07], [0.110458f32, 0.203817, 0.072166]),
-            ((4, 3), [0.144825, 0.281702, 0.089136], [0.164033, 0.269156, 0.094207]),
-            ((9, 5), [0.25988, 0.353985, 0.098826], [0.23809, 0.349014, 0.130326]),
-            ((10, 6), [0.187067, 0.29227, 0.163802], [0.21426, 0.298938, 0.123589]),
-            ((15, 11), [0.293222, 0.409037, 0.224728], [0.317518, 0.416495, 0.185891]),
-            ((2, 8), [0.186413, 0.230384, 0.125614], [0.17794, 0.242458, 0.11069]),
+            ((0usize, 0usize), [0.12f32, 0.2, 0.07], [0.107707f32, 0.20496, 0.072709]),
+            ((4, 3), [0.144825, 0.281702, 0.089136], [0.161636, 0.271879, 0.091328]),
+            ((9, 5), [0.25988, 0.353985, 0.098826], [0.238559, 0.35023, 0.127497]),
+            ((10, 6), [0.187067, 0.29227, 0.163802], [0.215394, 0.298392, 0.123512]),
+            ((15, 11), [0.293222, 0.409037, 0.224728], [0.317617, 0.41593, 0.186888]),
+            ((2, 8), [0.186413, 0.230384, 0.125614], [0.177668, 0.241852, 0.112138]),
         ] {
             let (got_in, got) = (cam[y * w + x], out[y * w + x]);
             assert!(got_in.iter().zip(&before).all(|(a, b)| (a - b).abs() < 2e-6), "({x}, {y}) in: {got_in:?}");
             assert!(got.iter().zip(&after).all(|(a, b)| (a - b).abs() < 2e-5), "({x}, {y}): {got:?}, want {after:?}");
         }
         let sum: f64 = out.iter().flat_map(|p| p.iter()).map(|v| *v as f64).sum();
-        assert!((sum - 116.230449).abs() < 2e-3, "{sum}");
+        assert!((sum - 116.172062).abs() < 2e-3, "{sum}");
     }
 
     #[test]
@@ -236,6 +257,40 @@ mod tests {
         for p in denoise_picture(&grey, w, h, &k) {
             assert!((p[0] - 0.3 * NEUTRAL[0]).abs() < 1e-6 && (p[1] - 0.3).abs() < 1e-6 && (p[2] - 0.3 * NEUTRAL[2]).abs() < 1e-6);
         }
+    }
+
+    /// No colour crosses an edge of light: leaves beside a sky five stops
+    /// brighter, the two not far apart in colour as the sensor sees them
+    /// (a take's own values). A mean of values lets the bright side weigh
+    /// by its brightness: the leaves took the sky's colour over the whole
+    /// radius. They keep their own beyond the first pixels of the edge, as
+    /// they do in Camera Raw; the same two colours at one level of light
+    /// are still smoothed into each other.
+    #[test]
+    fn a_bright_neighbour_does_not_colour_a_dark_pixel() {
+        let (w, h) = (96usize, 16usize);
+        let (sky, leaf) = ([0.217f32, 0.761, 0.597], [0.005f32, 0.016, 0.010]);
+        let k = constants(25.0, 1.0, NEUTRAL).unwrap();
+        let ratios = |p: [f32; 3]| [p[0] / p[1], p[2] / p[1]];
+        let cam: Vec<[f32; 3]> = (0..w * h).map(|i| if i % w < 48 { sky } else { leaf }).collect();
+        let out = denoise_picture(&cam, w, h, &k);
+        for y in 0..h {
+            for x in (0..44).chain(52..w) {
+                let (want, got) = (ratios(cam[y * w + x]), ratios(out[y * w + x]));
+                assert!((got[0] - want[0]).abs() < 0.004 && (got[1] - want[1]).abs() < 0.004, "({x}, {y}): {got:?} for {want:?}");
+            }
+        }
+        // At one level of light the same two colours do go toward each
+        // other beside their border (a tenth of their distance and more):
+        // it is the edge of light that kept them apart, not their colours.
+        let level = |p: [f32; 3], to: f32| { let l = luminance([p[0] / NEUTRAL[0], p[1], p[2] / NEUTRAL[2]]); p.map(|v| v * to / l) };
+        let (a, b) = (level(sky, 0.2), level(leaf, 0.2));
+        let cam: Vec<[f32; 3]> = (0..w * h).map(|i| if i % w < 48 { a } else { b }).collect();
+        let out = denoise_picture(&cam, w, h, &k);
+        let (left, right) = (ratios(out[8 * w + 46])[1], ratios(out[8 * w + 49])[1]);
+        let (own_left, own_right) = (ratios(a)[1], ratios(b)[1]);
+        let apart = own_left - own_right;
+        assert!(apart > 0.1 && own_left - left > 0.1 * apart && right - own_right > 0.1 * apart, "{left} {right} of {own_left} {own_right}");
     }
 
     /// A real colour edge is not smeared: red beside blue, far apart in

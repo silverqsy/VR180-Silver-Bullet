@@ -17,7 +17,7 @@ struct Params {
     luma: vec4<f32>,
     // xy = the pass's direction; z = taps to each side; w = 1: back at the pixel's own luminance
     dir: vec4<i32>,
-    // x = 1 / (2 tau²)
+    // x = 1 / (2 tau²); y = 1 / (2 s²), s the stops of luminance a neighbour may be away
     range: vec4<f32>,
 }
 @group(0) @binding(2) var<uniform> p: Params;

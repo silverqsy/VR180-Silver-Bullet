@@ -1283,7 +1283,7 @@ impl Device {
             balance: [1.0 / k.neutral[0], 1.0 / k.neutral[1], 1.0 / k.neutral[2], 0.0],
             luma: [LUMA[0], LUMA[1], LUMA[2], FLOOR],
             dir,
-            range: [1.0 / (2.0 * k.tau * k.tau), 0.0, 0.0, 0.0],
+            range: [1.0 / (2.0 * k.tau * k.tau), 1.0 / (2.0 * crate::raw_chroma::LEVEL_SIGMA * crate::raw_chroma::LEVEL_SIGMA), 0.0, 0.0],
         });
         let run = |encoder: &mut wgpu::CommandEncoder, label: &str, pipeline: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, size: (u32, u32)| {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });

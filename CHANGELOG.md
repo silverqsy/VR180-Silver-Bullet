@@ -64,7 +64,13 @@ converter's controls for it, and every frame can be had as a DNG.
   Raw takes out up to 50 and the two changes correlate at 0.88 to 0.95;
   at 100 Camera Raw reaches further (it flattens faint colour over tens
   of pixels). Costs about 10 ms a frame at 8192×4096. The setting travels
-  in the DNG. A clip graded before this gets the default 25.
+  in the DNG. A clip graded before this gets the default 25. A bright
+  pixel no longer lends its colour to a much darker one beside it: the
+  smoothing weighed its neighbours by their values, so a sky coloured
+  the edge of every leaf in front of it. Neighbours now count by how
+  near their brightness is as well (measured on Camera Raw with edges
+  of light: nothing crosses a step of a stop, and the mixing dies away
+  over about a fifth of a stop).
 - **Sharpening.** The detail panel's four controls, Amount, Radius, Detail
   and Masking, on the developed picture, done the way Camera Raw does it:
   on the luminance alone, fading out toward black and toward white, held
