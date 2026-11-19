@@ -28,18 +28,8 @@ struct Params {
 }
 @group(0) @binding(2) var<uniform> p: Params;
 
-fn scene(camera: vec3<f32>) -> vec3<f32> {
-    let n = p.neutral.xyz;
-    let c = max(camera, vec3<f32>(0.0));
-    let wb = c / n;
-    let est = max(wb.r, max(wb.g, wb.b));
-    let w = smoothstep(vec3<f32>(p.clip.x), vec3<f32>(p.clip.y), c);
-    let rebuilt = (wb + w * (vec3<f32>(est) - wb)) * n;
-    return vec3<f32>(
-        dot(p.cam_to_work_0.xyz, rebuilt),
-        dot(p.cam_to_work_1.xyz, rebuilt),
-        dot(p.cam_to_work_2.xyz, rebuilt));
-}
+// `scene`: camera pixel -> scene RGB, clipped channels rebuilt (`raw_scene.wgsl`).
+//#use SCENE
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

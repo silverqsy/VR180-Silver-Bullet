@@ -4103,6 +4103,49 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       under the controls, then the range; the Exposure control follows
       playback; the log says "… metered for the automatic exposure".
 
+41. **Raw development: clipped channels rebuilt as Camera Raw does it
+    (2026-11-18, Mac; UNRELEASED).** The user-facing text is in the
+    CHANGELOG (raw development, "a highlight keeps its colour").
+    - **What was wrong.** `scene()` raised a channel near its clip point
+      (0.92 to 0.995 of the sensor's white) to the LARGEST white-balanced
+      channel. Right for a neutral, the only case it had been measured
+      on. A coloured highlight was repainted: orange with its green at
+      the clip point became pure yellow (red = green, blue pushed to zero
+      by the matrix), in hard-edged patches.
+    - **The rule** (`raw_tone::DevelopGeometry::rebuilt`, the one WGSL
+      copy `shaders/raw_scene.wgsl`): white-balanced by the white in
+      force, `w(x) = clamp((x − ¼) / ¾, 0, 1)²` with `x` the channel's
+      camera value (`CLIP_FROM`, `CLIP_TO`, `rebuild_weight`). The channel
+      that clips first (the largest of the white's camera values; green,
+      then red, on a tie) goes to `own + w · max(0, mean of the other two
+      − own)`; of the other two the lower goes to `own + w · (higher −
+      own)`, which is done first. Per pixel, nothing of the surroundings.
+    - **One source for the shaders.** The four raw shaders that read a
+      camera pixel had a copy each. They now say `//#use SCENE` and
+      `raw_gpu::with_scene` composes `raw_scene.wgsl` in
+      (`shader_compose`). A test parses and validates the four composed
+      sources without a GPU.
+    - **Verified.** Camera Raw's own values for sixteen patches are a
+      test; the take's case is another (orange through the clip point of
+      green: no step above 0.012, blue stays within 0.25 of green). The
+      GPU stage against the CPU twin: the ignored tests pass. On the take
+      (7000 K / +23, Exposure +1): pixels with red and green at 255 and
+      blue under 240 in a frame, 1060 and 919 before, 0 and 0 now; with Exposure alone the wall's brightest parts are within one
+      8-bit step of Camera Raw's render of the same linear DNG.
+    - **Known, not changed.** (a) With Highlights below zero the
+      brightest coloured parts come out more saturated than Camera Raw's
+      (green 9, blue 22 of 255 under on that wall at −43): the
+      Highlights gain there, not the rebuilding. (b) A view with a black
+      surround (the lens frame, a fisheye view) gets a much stronger
+      Shadows / Highlights from Camera Raw than from the app at the same
+      numbers: its statistics count the surround, the app's are the
+      clip's, read off a view without one. In the half-equirect view the
+      two agree (1.5 of 255 for either slider on that frame).
+    - **Windows, to look at.** No code is platform-specific. (1) It
+      builds and `the_scene_is_composed_into_every_shader_that_reads_it`
+      passes. (2) A raw clip opens and looks as before away from its
+      brightest parts.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

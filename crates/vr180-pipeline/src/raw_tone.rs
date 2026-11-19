@@ -10,9 +10,11 @@
 //! the first sensor channel clips = 1):
 //!
 //! 1. **Highlights are kept past the first clipped channel.** A clipped
-//!    channel is rebuilt from the ones that still read, so a neutral goes
-//!    on rising to the level at which its LAST channel clips: the sensor's
-//!    white `W`.
+//!    channel is rebuilt from the ones that still read
+//!    ([`DevelopGeometry::rebuilt`]: measured the same way, on charts of
+//!    coloured patches stored clipped), so a neutral goes on rising to the
+//!    level at which its LAST channel clips, the sensor's white `W`, and a
+//!    coloured highlight keeps its colour.
 //! 2. **Default black.** Shadows are pulled down by an amount that follows
 //!    the frame's darkest level (a table measured over that level): from a
 //!    quarter of a per cent at the very bottom to the plain DNG black point
@@ -592,29 +594,60 @@ pub struct DevelopGeometry {
 
 impl DevelopGeometry {
     /// Scene RGB (linear ProPhoto, exposure 0) of a camera pixel, its
-    /// clipped channels rebuilt: white-balanced, every channel reads what a
-    /// neutral of that level would; a channel near its clip point is raised
-    /// to what the brightest channel says.
+    /// clipped channels rebuilt ([`Self::rebuilt`]).
     pub fn scene(&self, camera: [f32; 3]) -> [f32; 3] {
-        let wb = [0, 1, 2].map(|i| camera[i].max(0.0) / self.neutral[i]);
-        let est = wb[0].max(wb[1]).max(wb[2]);
-        let rebuilt = [0, 1, 2].map(|i| {
-            let w = smoothstep(CLIP_FROM, CLIP_TO, camera[i]);
-            (wb[i] + w * (est - wb[i])) * self.neutral[i]
-        });
         let m = self.camera_to_work.map(|r| r.map(|x| x as f64));
-        apply(&m, rebuilt.map(|x| x as f64)).map(|x| x as f32)
+        apply(&m, self.rebuilt(camera).map(|x| x as f64)).map(|x| x as f32)
+    }
+
+    /// A camera pixel with its clipped channels rebuilt (camera values, the
+    /// sensor's white = 1; a rebuilt channel may pass 1).
+    ///
+    /// White-balanced, a neutral reads the same in every channel, and a
+    /// channel's own reading is trusted less the nearer it is to its clip
+    /// point ([`rebuild_weight`]). The channel that clips first (the largest
+    /// of the white's camera values) rises toward the mean of the other two
+    /// by its weight and never falls; of those two, the lower one rises
+    /// toward the higher by its own weight. So a neutral goes on rising to
+    /// the level at which its last channel clips, and a coloured highlight
+    /// keeps its colour where its first channel clips: an orange one stays
+    /// orange, it is not turned yellow by a green rebuilt up to its red.
+    ///
+    /// This is what Camera Raw 18.7 does, measured on charts of coloured
+    /// patches stored clipped (three white balances, a chart whose red
+    /// clips first, a Bayer and a linear file, per-pixel noise): 0.7 % rms
+    /// over a thousand patches, pixel by pixel with no part for the
+    /// surroundings, in the white balance in force.
+    pub fn rebuilt(&self, camera: [f32; 3]) -> [f32; 3] {
+        let n = self.neutral;
+        let c = camera.map(|v| v.max(0.0));
+        let v = [0, 1, 2].map(|i| c[i] / n[i]);
+        let w = c.map(rebuild_weight);
+        // Green before red before blue where two clip together.
+        let top = n[0].max(n[1]).max(n[2]);
+        let first = if n[1] >= top { 1 } else if n[0] >= top { 0 } else { 2 };
+        let (a, b) = match first { 0 => (1, 2), 1 => (0, 2), _ => (0, 1) };
+        let hi = v[a].max(v[b]);
+        let mut out = v;
+        out[a] = v[a] + w[a] * (hi - v[a]);
+        out[b] = v[b] + w[b] * (hi - v[b]);
+        out[first] = v[first] + w[first] * (0.5 * (out[a] + out[b]) - v[first]).max(0.0);
+        [0, 1, 2].map(|i| out[i] * n[i])
     }
 }
 
-/// A camera channel counts as clipped from here (of the sensor's white)…
-pub const CLIP_FROM: f32 = 0.92;
-/// …to here, where it is taken as fully clipped.
-pub const CLIP_TO: f32 = 0.995;
+/// A camera channel's own reading is trusted whole up to here (of the
+/// sensor's white)…
+pub const CLIP_FROM: f32 = 0.25;
+/// …and not at all from here, where it is clipped.
+pub const CLIP_TO: f32 = 1.0;
 
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
+/// How far a channel at the camera value `x` (the sensor's white = 1) is
+/// taken from its own reading toward what the other channels say: the
+/// square of its place between [`CLIP_FROM`] and [`CLIP_TO`].
+pub fn rebuild_weight(x: f32) -> f32 {
+    let t = ((x - CLIP_FROM) / (CLIP_TO - CLIP_FROM)).clamp(0.0, 1.0);
+    t * t
 }
 
 // ── The measured default rendering ─────────────────────────────────────
@@ -1060,6 +1093,113 @@ mod tests {
         let px = n.map(|v| v * 0.2);
         let (w, c) = (warm.develop(px), cool.develop(px));
         assert!(w[0] > w[2] && c[2] > c[0], "9000 K {w:?}, 3000 K {c:?}");
+    }
+
+    /// Camera values with clipped channels rebuilt, white-balanced: for a
+    /// white whose camera values are `neutral`.
+    fn rebuilt_wb(neutral: [f32; 3], camera: [f32; 3]) -> [f32; 3] {
+        let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let g = DevelopGeometry { neutral, camera_to_work: id, work_to_out: id };
+        let out = g.rebuilt(camera);
+        // With no matrix `scene` is the rebuilt pixel itself.
+        assert_eq!(g.scene(camera), out);
+        [0, 1, 2].map(|i| out[i] / neutral[i])
+    }
+
+    #[test]
+    fn clipped_channels_are_rebuilt_as_measured() {
+        // Camera Raw 18.7's own values for patches stored clipped (camera
+        // RGB, the sensor's white = 1 → white-balanced RGB as it rendered
+        // them), read off charts with a neutral strip for the tone map.
+        let as_shot = [0.5654297, 1.0, 0.4013672];
+        let warm = [0.406327, 1.0, 0.676949];      // 7000 K, tint +23
+        let cool = [0.680945, 1.0, 0.427276];      // 3200 K, tint −10
+        let red_first = [1.0, 0.85, 0.6];
+        let measured: [([f32; 3], [f32; 3], [f32; 3]); 16] = [
+            // green near its clip point, red and blue above it and equal
+            (as_shot, [0.769, 0.8, 0.5459], [1.366, 1.102, 1.353]),
+            (as_shot, [0.6616, 0.9, 0.4696], [1.175, 1.103, 1.164]),
+            // green clipped, red near its clip point under blue
+            (as_shot, [0.6, 1.0, 0.5537], [1.134, 1.253, 1.371]),
+            (as_shot, [0.8, 1.0, 0.7382], [1.638, 1.737, 1.836]),
+            (as_shot, [0.7, 1.0, 0.8447], [1.549, 1.826, 2.102]),
+            // green below its clip point, red and blue unequal
+            (as_shot, [0.4976, 0.8, 0.5138], [0.926, 0.961, 1.271]),
+            // red and green clipped, blue half way
+            (as_shot, [1.0, 1.0, 0.5], [1.779, 1.54, 1.301]),
+            // another white balance: blue is the second channel to clip
+            (warm, [0.8163, 1.0, 0.8], [2.01, 1.818, 1.625]),
+            (warm, [0.7023, 1.0, 0.9], [1.728, 1.678, 1.627]),
+            (warm, [1.0, 1.0, 0.5], [2.484, 1.708, 0.933]),
+            (warm, [1.0, 1.0, 0.8], [2.457, 2.163, 1.869]),
+            (warm, [0.3698, 0.7, 0.616], [0.907, 0.771, 0.907]),
+            (cool, [1.0, 0.9, 0.6537], [1.528, 1.369, 1.528]),
+            (cool, [1.0, 1.0, 0.6], [1.473, 1.445, 1.416]),
+            // a white whose red clips first: the rule goes by the order of
+            // clipping, not by the channel
+            (red_first, [1.0, 0.8, 0.7626], [1.193, 1.116, 1.27]),
+            (red_first, [0.9, 0.9, 0.7944], [1.189, 1.256, 1.322]),
+        ];
+        for (neutral, camera, want) in measured {
+            let got = rebuilt_wb(neutral, camera);
+            for i in 0..3 {
+                assert!((got[i] - want[i]).abs() < 0.012 * want[i].max(0.5), "{neutral:?} {camera:?}: {got:?} for {want:?}");
+            }
+        }
+        // The weight: nothing below a quarter of the sensor's white, the
+        // square of the way from there to the clip point.
+        assert_eq!(rebuild_weight(0.1), 0.0);
+        assert_eq!(rebuild_weight(0.25), 0.0);
+        assert!((rebuild_weight(0.7) - 0.36).abs() < 1e-6 && (rebuild_weight(0.9) - 0.7511111).abs() < 1e-6);
+        assert_eq!(rebuild_weight(1.0), 1.0);
+        assert_eq!(rebuild_weight(1.3), 1.0);
+        // A pixel far from every clip point is left as it is, and so is
+        // one whose first channel is clipped with the other two below it.
+        assert_eq!(rebuilt_wb(as_shot, [0.1, 0.2, 0.05]), [0.1 / as_shot[0], 0.2, 0.05 / as_shot[2]]);
+        let green = rebuilt_wb(as_shot, [0.3, 1.0, 0.2]);
+        assert!((green[1] - 1.0).abs() < 1e-6 && (green[0] - 0.3 / as_shot[0]).abs() < 2e-3, "{green:?}");
+        // Every channel clipped: the white of the level where the last
+        // one clips, whichever it is.
+        for neutral in [as_shot, warm, cool, red_first] {
+            let top = 1.0 / neutral.iter().cloned().fold(f32::MAX, f32::min);
+            let all = rebuilt_wb(neutral, [1.0, 1.0, 1.0]);
+            assert!(all.iter().all(|v| (v - top).abs() < 1e-4), "{neutral:?}: {all:?}");
+        }
+    }
+
+    #[test]
+    fn a_coloured_highlight_keeps_its_colour_where_a_channel_clips() {
+        // A sunlit wall under a white balance set bluer than its light: red
+        // well above green, blue well below (camera ratios 0.71 : 1 : 0.33,
+        // a take of 2026-11-18). Raised through the level where green
+        // clips, its green was rebuilt up to its red and its blue fell
+        // away: saturated yellow patches with hard edges. Its colour moves
+        // little now, and by small steps.
+        let dev = x6(RawSettings { temperature: Some(7000.0), tint: Some(23.0), exposure: 1.0, ..Default::default() });
+        let k = dev.constants(ToneKeys { max: 2.0, dark: 0.001 });
+        let wall = |green: f32| [0.713 * green, green.min(1.0), 0.326 * green];
+        let mut last: Option<[f32; 3]> = None;
+        let mut level = 0.5f32;
+        while level <= 1.0 {
+            let out = k.develop(wall(level));
+            // Orange: red over green over blue, blue never far under green.
+            assert!(out[0] >= out[1] && out[1] > out[2], "green {level}: {out:?}");
+            assert!(out[1] - out[2] < 0.25, "green {level}: blue has fallen away, {out:?}");
+            if let Some(l) = last {
+                for i in 0..3 {
+                    assert!((out[i] - l[i]).abs() < 0.012, "green {level}: a step of {} in channel {i}", out[i] - l[i]);
+                }
+            }
+            last = Some(out);
+            level += 0.01;
+        }
+        // In scene light, at the clip point: green has risen to the mean of
+        // red and blue as they are white-balanced, not to red.
+        let g = dev.geometry();
+        let n = g.neutral;
+        let px = g.rebuilt(wall(1.0));
+        let wb = [0, 1, 2].map(|i| px[i] / n[i]);
+        assert!((wb[1] - 0.5 * (wb[0] + wb[2])).abs() < 1e-4 && wb[1] < 0.75 * wb[0], "{wb:?}");
     }
 
     #[test]

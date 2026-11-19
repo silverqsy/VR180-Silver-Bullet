@@ -9,6 +9,7 @@ use crate::{Error, Result};
 const BAYER_MEASURE_WGSL: &str = include_str!("shaders/bayer_measure.wgsl");
 const BAYER_GREEN_WGSL: &str = include_str!("shaders/bayer_green.wgsl");
 const BAYER_DEMOSAIC_WGSL: &str = include_str!("shaders/bayer_demosaic.wgsl");
+const RAW_SCENE_WGSL: &str = include_str!("shaders/raw_scene.wgsl");
 const RAW_DEVELOP_WGSL: &str = include_str!("shaders/raw_develop.wgsl");
 const RAW_MEASURE_WGSL: &str = include_str!("shaders/raw_measure.wgsl");
 const RAW_REDUCE_WGSL: &str = include_str!("shaders/raw_reduce.wgsl");
@@ -295,7 +296,7 @@ impl RawPipelines {
         let demosaic = compute_pipeline(device, "bayer_demosaic", BAYER_DEMOSAIC_WGSL, "main", &demosaic_layout);
         let develop_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raw_develop"),
-            source: wgpu::ShaderSource::Wgsl(RAW_DEVELOP_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(with_scene(RAW_DEVELOP_WGSL).into()),
         });
         let develop_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("raw_develop_bgl"),
@@ -357,7 +358,7 @@ impl RawPipelines {
         });
         let measure_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raw_measure"),
-            source: wgpu::ShaderSource::Wgsl(RAW_MEASURE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(with_scene(RAW_MEASURE_WGSL).into()),
         });
         let measure_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("raw_measure_bgl"),
@@ -417,7 +418,7 @@ impl RawPipelines {
                 bgl_uniform(2, std::mem::size_of::<ReduceParams>()),
             ],
         });
-        let reduce = compute_pipeline(device, "raw_reduce", RAW_REDUCE_WGSL, "main", &reduce_layout);
+        let reduce = compute_pipeline(device, "raw_reduce", &with_scene(RAW_REDUCE_WGSL), "main", &reduce_layout);
         let grid_build_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("raw_grid_build_bgl"),
             entries: &[
@@ -453,7 +454,7 @@ impl RawPipelines {
                 bgl_storage_buffer(10),
             ],
         });
-        let develop_local = compute_pipeline(device, "raw_develop_local", RAW_DEVELOP_LOCAL_WGSL, "main", &develop_local_layout);
+        let develop_local = compute_pipeline(device, "raw_develop_local", &with_scene(RAW_DEVELOP_LOCAL_WGSL), "main", &develop_local_layout);
         // Sharpening of the developed picture: its level, the kernel's
         // blurs summed, the change put back.
         let sharpen_level_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -566,6 +567,12 @@ pub(crate) fn bgl_storage_buffer(binding: u32) -> wgpu::BindGroupLayoutEntry {
         ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
         count: None,
     }
+}
+
+/// A raw shader with the one `scene` (`shaders/raw_scene.wgsl`: camera pixel
+/// → scene RGB, clipped channels rebuilt) composed in where it asks for it.
+fn with_scene(wgsl: &str) -> String {
+    crate::shader_compose::compose(&format!("{RAW_SCENE_WGSL}\n{wgsl}"), &[])
 }
 
 pub(crate) fn compute_pipeline(device: &wgpu::Device, label: &str, wgsl: &str, entry: &str, layout: &wgpu::BindGroupLayout) -> wgpu::ComputePipeline {
@@ -1432,6 +1439,21 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four shaders that read a camera pixel take the one `scene`, and
+    /// each is valid WGSL with it in.
+    #[test]
+    fn the_scene_is_composed_into_every_shader_that_reads_it() {
+        for (name, wgsl) in [("raw_develop", RAW_DEVELOP_WGSL), ("raw_develop_local", RAW_DEVELOP_LOCAL_WGSL), ("raw_measure", RAW_MEASURE_WGSL), ("raw_reduce", RAW_REDUCE_WGSL)] {
+            let composed = with_scene(wgsl);
+            assert_eq!(composed.matches("fn scene(").count(), 1, "{name}");
+            assert!(!composed.contains("//#"), "{name}: a directive is left in");
+            let module = wgpu::naga::front::wgsl::parse_str(&composed).unwrap_or_else(|e| panic!("{name}: {e}"));
+            wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+    }
 
     /// The GPU stage against its CPU twin on random camera pixels.
     #[test]

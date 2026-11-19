@@ -30,7 +30,22 @@ converter's controls for it, and every frame can be had as a DNG.
     above zero within one to two and a half steps up to the middle of the
     slider and coarser beyond it;
   - a grade with every slider in use lands within one to two steps for
-    moderate amounts, three to five at the extremes.
+    moderate amounts, three to five at the extremes;
+  - a highlight keeps its colour where one of the sensor's channels clips.
+    A clipped channel is rebuilt from the other two, and how was first
+    taken from neutral highlights only: a clipped green was raised to the
+    red beside it. On a neutral that is right. On a sunlit wall, orange
+    under the white balance in use, it turned the brightest parts into
+    flat, hard-edged patches of pure yellow. The rule is now the one
+    Camera Raw itself goes by, measured on charts of coloured patches
+    stored clipped (three white balances, a chart whose red clips first,
+    a mosaic and a linear file, per-pixel noise: 0.7 % rms over a thousand
+    patches): a channel's own reading counts for less the nearer it is to
+    its clip point, the channel that clips first rises toward the mean of
+    the other two, and of those two the lower rises toward the higher. On
+    the take that showed it, the clipped-yellow pixels of a frame went
+    from about a thousand to none, and the wall's brightest parts are
+    within one step of Camera Raw's with the exposure raised.
 - **Demosaic.** The step that makes a full-colour picture of the sensor's
   mosaic is a new one, shaped after Camera Raw's: the same frames were
   developed there and here, and the method that reproduces its result was

@@ -28,28 +28,15 @@ struct Params {
     // x = log2 of the first sample, y = samples per stop, z = last index,
     // w = scene value of the first sample
     curve: vec4<f32>,
-    // x, y = a channel counts as clipped from x to y (of the sensor's white);
-    // z = output light of a scene value of zero
+    // x, y = a channel is trusted up to x and counts as clipped at y (of the
+    // sensor's white); z = output light of a scene value of zero
     clip: vec4<f32>,
 }
 @group(0) @binding(2) var<uniform> p: Params;
 @group(0) @binding(3) var<storage, read> curve: array<f32>;
 
-// Scene RGB (linear ProPhoto) of a camera pixel, clipped channels rebuilt:
-// white-balanced, a neutral reads the same in every channel, so a channel
-// near its clip point is raised to what the brightest channel says.
-fn scene(camera: vec3<f32>) -> vec3<f32> {
-    let n = p.neutral.xyz;
-    let c = max(camera, vec3<f32>(0.0));
-    let wb = c / n;
-    let est = max(wb.r, max(wb.g, wb.b));
-    let w = smoothstep(vec3<f32>(p.clip.x), vec3<f32>(p.clip.y), c);
-    let rebuilt = (wb + w * (vec3<f32>(est) - wb)) * n;
-    return vec3<f32>(
-        dot(p.cam_to_work_0.xyz, rebuilt),
-        dot(p.cam_to_work_1.xyz, rebuilt),
-        dot(p.cam_to_work_2.xyz, rebuilt));
-}
+// `scene`: camera pixel -> scene RGB, clipped channels rebuilt (`raw_scene.wgsl`).
+//#use SCENE
 
 fn tone(x: f32) -> f32 {
     if (x <= 0.0) { return p.clip.z; }

@@ -46,7 +46,7 @@ struct Params {
     // `gains`: x = level of the first sample, y = samples per stop, z = last index;
     // w = output light of a fed value of zero
     gains: vec4<f32>,
-    // x, y = a channel counts as clipped from x to y; z = luminance floor; w = fallback weight
+    // x, y = a channel is trusted up to x and counts as clipped at y; z = luminance floor; w = fallback weight
     clip: vec4<f32>,
     // xyz = luminance weights; w = grid cell in pixels of the eye
     luma: vec4<f32>,
@@ -69,18 +69,8 @@ struct Params {
 @group(0) @binding(9) var<storage, read> blacks: array<f32>;
 @group(0) @binding(10) var<storage, read> tone: array<f32>;
 
-fn scene(camera: vec3<f32>) -> vec3<f32> {
-    let n = p.neutral.xyz;
-    let c = max(camera, vec3<f32>(0.0));
-    let wb = c / n;
-    let est = max(wb.r, max(wb.g, wb.b));
-    let w = smoothstep(vec3<f32>(p.clip.x), vec3<f32>(p.clip.y), c);
-    let rebuilt = (wb + w * (vec3<f32>(est) - wb)) * n;
-    return vec3<f32>(
-        dot(p.cam_to_work_0.xyz, rebuilt),
-        dot(p.cam_to_work_1.xyz, rebuilt),
-        dot(p.cam_to_work_2.xyz, rebuilt));
-}
+// `scene`: camera pixel -> scene RGB, clipped channels rebuilt (`raw_scene.wgsl`).
+//#use SCENE
 
 fn black_of(x: f32) -> f32 {
     if (x <= 0.0) { return 0.0; }
