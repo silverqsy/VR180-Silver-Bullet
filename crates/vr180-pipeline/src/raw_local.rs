@@ -1,22 +1,37 @@
 //! The local part of raw development (Shadows / Highlights) on the CPU:
 //! the base — a bilateral grid of the frame's log₂ luminance, the twin of
 //! `shaders/raw_reduce.wgsl`, `raw_grid_build.wgsl`, `raw_grid_blur.wgsl`
-//! and the lookup in `raw_develop_local.wgsl` — and the frame's curves.
+//! and the lookup in `raw_gain.wgsl` —, the smoothing of the gain that base
+//! gives (`gain_cells.wgsl` and the read in `raw_develop_local.wgsl`), and
+//! the frame's curves.
 //!
 //! See [`crate::raw_tone`] for what the stage does with them.
 
 use crate::raw_tone::{
-    LocalCurves, BASE_FALLBACK, BASE_FLOOR, BASE_LEVELS, BASE_LO, BASE_RANGE, LOCAL_LO, LOCAL_PER_STOP, LOCAL_SAMPLES,
+    LocalCurves, BASE_CELL, BASE_FALLBACK, BASE_FLOOR, BASE_LEVELS, BASE_LO, BASE_POWER, BASE_RANGE, GAIN_CELL, LOCAL_LO, LOCAL_PER_STOP,
+    LOCAL_SAMPLES,
 };
 
-/// Pixels of an eye per texel of the reduced copy the grid is built from,
-/// and the grid's cell in those texels, for a frame whose long side is
-/// `long` pixels: the cell is [`crate::raw_tone::BASE_CELL`] of the long
-/// side, about six texels of the copy.
-pub fn base_layout(long: u32) -> (u32, f32) {
-    let cell_px = (crate::raw_tone::BASE_CELL * long as f32).max(1.0);
-    let n = ((cell_px / 6.0).round() as u32).clamp(1, 16);
-    (n, cell_px / n as f32)
+/// Pixels of an eye per cell of the smoothed gain — and per texel of the
+/// reduced copy the grid is gathered from — for a picture drawn at
+/// `pixel_scale` pixels to one pixel of the exported frame (1 for the export
+/// itself): [`GAIN_CELL`] pixels of the exported frame.
+pub fn gain_cell(pixel_scale: f32) -> u32 {
+    let scale = if pixel_scale.is_finite() && pixel_scale > 0.0 { pixel_scale } else { 1.0 };
+    ((GAIN_CELL * scale).round() as u32).clamp(1, 16)
+}
+
+/// The grid's cell, in texels of a reduced copy of `n` pixels per texel,
+/// for a frame whose long side is `long` pixels: [`BASE_CELL`] of the long
+/// side, one texel at least.
+pub fn base_cell(long: u32, n: u32) -> f32 {
+    (BASE_CELL * long as f32 / n.max(1) as f32).max(1.0)
+}
+
+/// The weight of the plain local average in a grid whose cells are `cell`
+/// texels wide ([`BASE_FALLBACK`] of the texels a cell holds).
+pub fn base_fallback(cell: f32) -> f32 {
+    BASE_FALLBACK * cell * cell
 }
 
 /// The grid's size for a reduced copy of `rw × rh` texels and cells of
@@ -25,9 +40,12 @@ pub fn grid_dims(rw: u32, rh: u32, cell: f32) -> (u32, u32, u32) {
     ((rw as f32 / cell).ceil() as u32 + 2, (rh as f32 / cell).ceil() as u32 + 2, BASE_LEVELS)
 }
 
-/// The reduced copy: the mean of log₂ luminance over every `n × n` pixels
-/// (the last row / column of blocks repeats the edge pixels).
-pub fn reduce_log(luminance: &[f32], w: usize, h: usize, n: usize) -> (Vec<f32>, usize, usize) {
+/// The reduced copy: log₂ of the power mean ([`BASE_POWER`]) of the
+/// luminance over every `n × n` pixels (the last row / column of blocks
+/// repeats the edge pixels). A mean of light, not of levels: a block of
+/// bright and dark counts nearer its bright part, as a mixture too fine to
+/// be seen apart does.
+pub fn reduce_levels(luminance: &[f32], w: usize, h: usize, n: usize) -> (Vec<f32>, usize, usize) {
     let (rw, rh) = (w.div_ceil(n), h.div_ceil(n));
     let mut out = vec![0f32; rw * rh];
     for ry in 0..rh {
@@ -37,13 +55,83 @@ pub fn reduce_log(luminance: &[f32], w: usize, h: usize, n: usize) -> (Vec<f32>,
                 let y = (ry * n + j).min(h - 1);
                 for i in 0..n {
                     let x = (rx * n + i).min(w - 1);
-                    sum += luminance[y * w + x].max(BASE_FLOOR).log2();
+                    sum += luminance[y * w + x].max(BASE_FLOOR).powf(BASE_POWER);
                 }
             }
-            out[ry * rw + rx] = sum / (n * n) as f32;
+            out[ry * rw + rx] = (sum / (n * n) as f32).log2() / BASE_POWER;
         }
     }
     (out, rw, rh)
+}
+
+/// The means of a picture's gain (`w × h`, stops) over cells of `c × c`
+/// pixels (the last row / column of cells repeats the edge pixels).
+pub fn gain_cells(gain: &[f32], w: usize, h: usize, c: usize) -> (Vec<f32>, usize, usize) {
+    let (cw, ch) = (w.div_ceil(c), h.div_ceil(c));
+    let mut out = vec![0f32; cw * ch];
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let mut sum = 0f32;
+            for j in 0..c {
+                let y = (cy * c + j).min(h - 1);
+                for i in 0..c {
+                    sum += gain[y * w + (cx * c + i).min(w - 1)];
+                }
+            }
+            out[cy * cw + cx] = sum / (c * c) as f32;
+        }
+    }
+    (out, cw, ch)
+}
+
+/// Pixels to either side over which a pixel's own gain is smoothed for the
+/// limit of [`smooth_gain`], for cells of `c` pixels: the binomial kernel
+/// of `2r + 1` pixels a side.
+pub fn limit_radius(c: usize) -> usize {
+    (c / 2).min(2)
+}
+
+/// The binomial weight of the pixel `d` away, of `2r + 1` (`r` ≤ 2).
+pub fn limit_weight(d: isize, r: usize) -> f32 {
+    match (r, d.unsigned_abs()) {
+        (2, 0) => 6.0 / 16.0,
+        (2, 1) => 4.0 / 16.0,
+        (2, 2) => 1.0 / 16.0,
+        (1, 0) => 0.5,
+        (1, 1) => 0.25,
+        (0, 0) => 1.0,
+        _ => 0.0,
+    }
+}
+
+/// The gain (stops) the picture gives the pixel `(x, y)`: the mean of the
+/// gain over the cells ([`gain_cells`]: `cells`, `cw × ch`, of `c` pixels),
+/// linear between the cells' centres, held between zero and the pixel's own
+/// gain lightly smoothed ([`limit_radius`]). So a pixel takes what the few
+/// pixels round it take together — a bright one among dark ones the share
+/// of bright among them — but never more than itself (and what touches it)
+/// would, and never the other way: beside an edge the side the gain moves
+/// fades toward it, the other side is left alone.
+#[allow(clippy::too_many_arguments)]
+pub fn smooth_gain(gain: &[f32], w: usize, h: usize, cells: &[f32], cw: usize, ch: usize, c: usize, x: usize, y: usize) -> f32 {
+    let between = |v: usize, n: usize| {
+        let f = ((v as f32 + 0.5) / c as f32 - 0.5).clamp(0.0, n as f32 - 1.0);
+        let i = (f.floor() as usize).min(n.saturating_sub(2));
+        (i, (i + 1).min(n - 1), f - i as f32)
+    };
+    let ((x0, x1, tx), (y0, y1, ty)) = (between(x, cw), between(y, ch));
+    let at = |cx: usize, cy: usize| cells[cy * cw + cx];
+    let smooth = (at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx) * (1.0 - ty) + (at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx) * ty;
+    let r = limit_radius(c) as isize;
+    let mut own = 0f32;
+    for dy in -r..=r {
+        let yy = (y as isize + dy).clamp(0, h as isize - 1) as usize;
+        for dx in -r..=r {
+            let xx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
+            own += limit_weight(dx, r as usize) * limit_weight(dy, r as usize) * gain[yy * w + xx];
+        }
+    }
+    smooth.clamp(own.min(0.0), own.max(0.0))
 }
 
 /// A frame's bilateral grid: per vertex `(Σ w·(level − lo), Σ w, column mean − lo)`.
@@ -159,7 +247,8 @@ impl BaseGrid {
                 }
             }
         }
-        (v[0] + BASE_FALLBACK * v[2]) / (v[1] + BASE_FALLBACK) + BASE_LO
+        let fallback = base_fallback(self.cell);
+        (v[0] + fallback * v[2]) / (v[1] + fallback) + BASE_LO
     }
 }
 
@@ -334,7 +423,7 @@ mod tests {
         // up to the border (the grid separates them by level).
         let (w, h) = (96usize, 64usize);
         let lum: Vec<f32> = (0..w * h).map(|i| if i % w < w / 2 { 0.01 } else { 0.08 }).collect();
-        let (red, rw, rh) = reduce_log(&lum, w, h, 2);
+        let (red, rw, rh) = reduce_levels(&lum, w, h, 2);
         let g = BaseGrid::build(&red, rw, rh, 6.0);
         for (x, want) in [(4.0, 0.01f32), (44.0, 0.01), (47.0, 0.01), (48.0, 0.08), (52.0, 0.08), (90.0, 0.08)] {
             let b = g.base(x, 30.0, 2.0, want.log2());
@@ -349,24 +438,111 @@ mod tests {
 
     #[test]
     fn texture_is_smoothed_into_its_region() {
-        // A fine pattern half a stop peak to peak: the base is its mean.
+        // A fine pattern half a stop peak to peak: the base is its mean
+        // (of light to the power the reduced copy is taken at).
         let (w, h) = (128usize, 128usize);
         let lum: Vec<f32> = (0..w * h).map(|i| if (i % w + i / w) % 2 == 0 { 0.02 } else { 0.02 * 1.4142 }).collect();
-        let (red, rw, rh) = reduce_log(&lum, w, h, 4);
+        let (red, rw, rh) = reduce_levels(&lum, w, h, 4);
         let g = BaseGrid::build(&red, rw, rh, 6.0);
-        let mean = (0.02f32.log2() + (0.02f32 * 1.4142).log2()) / 2.0;
+        let mean = ((0.02f32.powf(BASE_POWER) + (0.02f32 * 1.4142).powf(BASE_POWER)) / 2.0).log2() / BASE_POWER;
         for level in [0.02f32.log2(), (0.02f32 * 1.4142).log2()] {
             assert!((g.base(60.0, 60.0, 4.0, level) - mean).abs() < 0.01);
         }
     }
 
     #[test]
+    fn a_block_of_bright_and_dark_counts_nearer_its_bright_part() {
+        // Half at 2⁻¹, half at 2⁻⁵: the mean of the square roots, squared.
+        let lum: Vec<f32> = (0..64).map(|i| if i % 2 == 0 { 0.5 } else { 0.03125 }).collect();
+        let (red, rw, rh) = reduce_levels(&lum, 8, 8, 4);
+        assert_eq!((rw, rh), (2, 2));
+        let want = (((0.5f32).sqrt() + (0.03125f32).sqrt()) / 2.0).powi(2).log2();
+        assert!(red.iter().all(|l| (l - want).abs() < 1e-4), "{red:?} vs {want}");
+        // 0.64 stops above the mean of the two levels (−3).
+        assert!(want > -3.0 + 0.6 && want < -3.0 + 0.7, "{want}");
+    }
+
+    #[test]
     fn layout_follows_the_frame() {
-        assert_eq!(base_layout(4096).0, 4);
-        assert!((base_layout(4096).1 - 6.144).abs() < 1e-3);
-        assert_eq!(base_layout(1024).0, 1);
-        assert_eq!(base_layout(16384).0, 16);
+        // Four pixels of the exported frame, whatever its size; fewer in a
+        // frame drawn smaller.
+        assert_eq!((gain_cell(1.0), gain_cell(0.5), gain_cell(0.3), gain_cell(0.1), gain_cell(2.0)), (4, 2, 1, 1, 8));
+        assert_eq!((gain_cell(0.0), gain_cell(f32::NAN)), (4, 4));
+        // The grid's cell: a fraction of the long side, a texel at least.
+        assert!((base_cell(4096, 4) - 6.144).abs() < 1e-3 && (base_cell(8192, 4) - 12.288).abs() < 1e-3);
+        assert_eq!(base_cell(256, 4), 1.0);
+        assert!((base_fallback(6.144) - 0.502).abs() < 1e-3);
         assert_eq!(grid_dims(1024, 512, 6.0), (173, 88, BASE_LEVELS));
+        assert_eq!((limit_radius(4), limit_radius(3), limit_radius(2), limit_radius(1), limit_radius(8)), (2, 1, 1, 0, 2));
+        for r in 0..=2usize {
+            let sum: f32 = (-2..=2).map(|d| limit_weight(d, r)).sum();
+            assert!((sum - 1.0).abs() < 1e-6);
+        }
+    }
+
+    /// The smoothed gain of every pixel of a picture's gain.
+    fn smoothed(gain: &[f32], w: usize, h: usize, c: usize) -> Vec<f32> {
+        let (cells, cw, ch) = gain_cells(gain, w, h, c);
+        (0..w * h).map(|i| smooth_gain(gain, w, h, &cells, cw, ch, c, i % w, i / w)).collect()
+    }
+
+    #[test]
+    fn a_gain_that_is_the_same_all_round_is_kept() {
+        let (w, h) = (37usize, 22usize);
+        for value in [-1.3f32, 0.0, 0.8] {
+            let out = smoothed(&vec![value; w * h], w, h, 4);
+            assert!(out.iter().all(|g| (g - value).abs() < 1e-6));
+        }
+        // Cells of one pixel: every pixel is its own cell.
+        let gain: Vec<f32> = (0..w * h).map(|i| ((i * 7919) % 13) as f32 * 0.2 - 1.2).collect();
+        assert_eq!(smoothed(&gain, w, h, 1), gain);
+    }
+
+    #[test]
+    fn bright_among_dark_takes_the_share_of_bright() {
+        // One pixel in four pulled down a stop, the others not at all (a
+        // sky seen through leaves): the bright ones take a quarter of it,
+        // the dark ones none.
+        let (w, h) = (64usize, 64usize);
+        let gain: Vec<f32> = (0..w * h).map(|i| if (i % w) % 2 == 0 && (i / w) % 2 == 0 { -1.0 } else { 0.0 }).collect();
+        let out = smoothed(&gain, w, h, 4);
+        for y in 8..56 {
+            for x in 8..56 {
+                let g = out[y * w + x];
+                if gain[y * w + x] < 0.0 {
+                    assert!((g + 0.25).abs() < 1e-5, "({x}, {y}): {g}");
+                } else {
+                    // Never more than itself and what touches it would take.
+                    assert!((-0.25..=0.0).contains(&g), "({x}, {y}): {g}");
+                }
+            }
+        }
+        // The same pattern lifted: the mirror.
+        let lifted: Vec<f32> = gain.iter().map(|g| -g).collect();
+        let up = smoothed(&lifted, w, h, 4);
+        assert!(up.iter().zip(&out).all(|(a, b)| (a + b).abs() < 1e-6));
+    }
+
+    #[test]
+    fn beside_an_edge_one_side_fades_and_the_other_is_left_alone() {
+        // Left of x = 50 a stop down, right of it nothing; the border is
+        // inside a cell (50 = 12 · 4 + 2).
+        let (w, h) = (96usize, 32usize);
+        let gain: Vec<f32> = (0..w * h).map(|i| if i % w < 50 { -1.0 } else { 0.0 }).collect();
+        let out = smoothed(&gain, w, h, 4);
+        let row = |x: usize| out[16 * w + x];
+        // Far from the border: as it was.
+        assert!((row(20) + 1.0).abs() < 1e-6 && row(80) == 0.0);
+        // The side the gain moves fades toward the border, monotonically…
+        assert!(row(49) > -0.8 && row(49) < -0.3, "{}", row(49));
+        assert!((40..50).all(|x| row(x + 1) >= row(x) - 1e-6));
+        assert!((row(42) + 1.0).abs() < 0.02);
+        // …the other side takes a little beside it and nothing beyond what
+        // touches it.
+        assert!(row(50) <= 0.0 && row(50) > -0.35, "{}", row(50));
+        assert!((53..96).all(|x| row(x) == 0.0));
+        // No pixel is moved the other way or by more than it was to be.
+        assert!(out.iter().zip(&gain).all(|(o, g)| *o <= 0.0 && *o >= g.min(-0.3125)));
     }
 
     #[test]

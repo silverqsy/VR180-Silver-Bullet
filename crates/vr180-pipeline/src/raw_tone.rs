@@ -51,7 +51,17 @@
 //! what surrounds it without crossing strong edges (a bilateral grid of
 //! log₂ luminance: cells [`BASE_CELL`] of the frame's long side by
 //! [`BASE_RANGE`] stops), so texture keeps its contrast and an object is
-//! lifted as a whole. The curves belong to the frame: Camera Raw derives
+//! lifted as a whole. That gain is then smoothed at the scale of a few
+//! pixels ([`GAIN_CELL`]): the mean over cells, taken between their
+//! centres, and held between zero and the pixel's own gain — so where
+//! bright and dark are finely mixed (leaves against a sky) the bright
+//! pixels are pulled down by the share of bright among them and not by the
+//! whole of what an open sky gets, the dark ones stay as they are, and the
+//! mixture keeps its contrast ([`crate::raw_local::smooth_gain`]; measured
+//! on Camera Raw with charts of fine mixtures and of steps: its gain is
+//! held on cells of four pixels, falls off toward an edge on the side the
+//! slider moves and is exactly zero on the other). The curves belong to the
+//! frame: Camera Raw derives
 //! them from a reduced copy of the picture ([`FrameStats::levels`]), and
 //! [`local_curves`] reproduces what it derives ([`LocalCurves`] has the
 //! rules by which the two sliders combine). Two more things follow the
@@ -194,10 +204,18 @@ pub const BASE_LO: f32 = -15.0;
 pub const BASE_LEVELS: u32 = 18;
 /// The darkest luminance the base distinguishes.
 pub const BASE_FLOOR: f32 = 6.103_515_6e-5;
+/// The power of the mean a texel of the reduced copy the grid is gathered
+/// from is of its pixels' luminance.
+pub const BASE_POWER: f32 = 0.5;
 /// Weight of the plain local average where the grid holds nothing at the
-/// pixel's own level (a speck unlike everything around it takes the gain
-/// of its surroundings).
-pub const BASE_FALLBACK: f32 = 0.5;
+/// pixel's own level, as a share of the texels a cell holds (a speck unlike
+/// everything around it takes the gain of its surroundings).
+pub const BASE_FALLBACK: f32 = 0.0133;
+/// A cell of the smoothed gain — and a texel of the reduced copy — in
+/// pixels of the exported frame ([`crate::raw_local::gain_cell`] has it for
+/// a frame drawn at another size). Camera Raw's own is four pixels of the
+/// picture it is given, whatever that picture's size (measured).
+pub const GAIN_CELL: f32 = 4.0;
 
 /// log₂ of the base level of the first sample of a local curve, samples
 /// per stop, and the sample count (levels −16 … +4).
@@ -513,6 +531,7 @@ impl RawDevelop {
                 white: white as f32,
                 floor,
                 long_side: 0,
+                cell: crate::raw_local::gain_cell(1.0),
             }
         });
         DevelopConstants { geometry, gain: gain as f32, curve: curve.into(), curve_hi: hi as f32, white_point: plain_white as f32, dark_key: dark_key as f32, floor, local: staged, sharpen: None, chroma: None }
@@ -862,6 +881,9 @@ pub struct LocalTone {
     /// The long side, in pixels, of the frame the eyes belong to (two eyes
     /// side by side count as one frame); 0 = the eye's own.
     pub long_side: u32,
+    /// Pixels of an eye per cell of the smoothed gain
+    /// ([`crate::raw_local::gain_cell`]).
+    pub cell: u32,
 }
 
 /// A table over log₂ of a value from [`OUT_LO`] to `hi`, at `v`; below the
@@ -899,12 +921,19 @@ impl LocalTone {
         staged_sample(&self.tone, 0.0, self.floor, v)
     }
 
+    /// The gain (linear) of a pixel that is given `stops` and whose own
+    /// luminance (scene value) is `luminance`: limited by the room the
+    /// pixel has below the white point.
+    pub fn gain_for(&self, stops: f32, luminance: f32) -> f32 {
+        let lit = self.black_of(luminance).max(1e-12);
+        2f32.powf(limit_gain(stops, self.white.log2() - lit.log2()))
+    }
+
     /// The gain (linear) of a pixel whose base level is `base` and whose own
     /// luminance (scene value) is `luminance`: the curve's, limited by the
     /// room the pixel has below the white point.
     pub fn gain_of(&self, base: f32, luminance: f32) -> f32 {
-        let lit = self.black_of(luminance).max(1e-12);
-        2f32.powf(limit_gain(self.gain_at(base), self.white.log2() - lit.log2()))
+        self.gain_for(self.gain_at(base), luminance)
     }
 }
 
@@ -948,16 +977,26 @@ impl DevelopConstants {
         (scene[0] * luma[0] + scene[1] * luma[1] + scene[2] * luma[2]).max(BASE_FLOOR)
     }
 
-    /// Develop one pixel whose base level (log₂) is `base`: the default
-    /// black, the Shadows / Highlights gain of that level (limited toward
-    /// the white point), the white point of the gained frame, Whites, then
-    /// Blacks, the tone curve. The GPU stage computes the same.
+    /// Develop one pixel whose base level (log₂) is `base`, with the gain
+    /// of that level as it is ([`Self::develop_gained`] has what follows
+    /// the gain).
     pub fn develop_local(&self, camera: [f32; 3], base: f32) -> [f32; 3] {
+        let Some(local) = &self.local else { return self.develop(camera) };
+        self.develop_gained(camera, local.gain_at(base))
+    }
+
+    /// Develop one pixel that the picture gives a Shadows / Highlights gain
+    /// of `stops` (the gain of its base, smoothed:
+    /// [`crate::raw_local::smooth_gain`]): the default black, that gain
+    /// (limited toward the white point), the white point of the gained
+    /// frame, Whites, then Blacks, the tone curve. The GPU stage computes
+    /// the same.
+    pub fn develop_gained(&self, camera: [f32; 3], stops: f32) -> [f32; 3] {
         let Some(local) = &self.local else { return self.develop(camera) };
         let scene = self.geometry.scene(camera).map(|v| (v * self.gain).max(0.0));
         let luma = prophoto_luma().map(|v| v as f32);
         let luminance = scene[0] * luma[0] + scene[1] * luma[1] + scene[2] * luma[2];
-        let g = local.gain_of(base, luminance);
+        let g = local.gain_for(stops, luminance);
         let hi = scene.iter().cloned().fold(f32::MIN, f32::max);
         let lo = scene.iter().cloned().fold(f32::MAX, f32::min);
         let (fhi, flo) = (local.fed_of(g * local.black_of(hi)), local.fed_of(g * local.black_of(lo)));

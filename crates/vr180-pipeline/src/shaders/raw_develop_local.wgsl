@@ -1,13 +1,14 @@
 // The staged raw development: `raw_develop.wgsl` with what sits between
 // the default black and the tone curve. The GPU twin of
-// `raw_tone::DevelopConstants::develop_local`.
+// `raw_tone::DevelopConstants::develop_gained`.
 //
-//   scene (ProPhoto, exposure applied) → its luminance's level
-//   → base = the frame's bilateral grid at the pixel's place and own level
-//     (where the grid holds nothing at that level, the local average)
-//   → Shadows / Highlights: gain = gains(base), in stops; above zero it is
-//     limited by the room r the pixel has below the white point: taken
-//     whole up to r/2, beyond that r − r²/(4·gain)
+//   scene (ProPhoto, exposure applied)
+//   → Shadows / Highlights: the gain of the pixel's base (`raw_gain.wgsl`),
+//     smoothed: the mean over the cells it lies between (`gain_cells.wgsl`),
+//     held between zero and the pixel's own gain lightly smoothed
+//     (`raw_local::smooth_gain`); above zero it is limited by the room r
+//     the pixel has below the white point: taken whole up to r/2, beyond
+//     that r − r²/(4·gain)
 //   → fed(x) = white point (of the gained frame) of 2^gain · black(x), for
 //     the largest and the smallest channel
 //   → Whites, then Blacks: each either a gain keyed to the pixel's fed
@@ -22,8 +23,8 @@
 //   (2) p     — Params
 //   (3) black — black-subtracted value over log2(scene)
 //   (4) fed   — the value the tone curve is fed over log2(gained value)
-//   (5) gains — log2 gain over the base level
-//   (6) grid  — the smoothed bilateral grid (Rgba16Float, 3D)
+//   (5) gain  — the gain of every pixel's base, in stops (R32Float, the eye's size)
+//   (6) cells — its means over cells (Rgba16Float, in x)
 //   (7) samp  — linear, clamped
 //   (8) whites, (9) blacks — what a fed value becomes, over its log2
 //   (10) tone — output light over log2(fed value)
@@ -43,15 +44,13 @@ struct Params {
     black: vec4<f32>,
     // `fed`: the same for the gained value
     fed: vec4<f32>,
-    // `gains`: x = level of the first sample, y = samples per stop, z = last index;
-    // w = output light of a fed value of zero
-    gains: vec4<f32>,
-    // x, y = a channel is trusted up to x and counts as clipped at y; z = luminance floor; w = fallback weight
+    // x = pixels per cell of `cells`; y = pixels to either side the limit is
+    // taken over; z = log2 of the white point; w = output light of a fed value of zero
+    spread: vec4<f32>,
+    // x, y = a channel is trusted up to x and counts as clipped at y
     clip: vec4<f32>,
-    // xyz = luminance weights; w = grid cell in pixels of the eye
+    // xyz = luminance weights
     luma: vec4<f32>,
-    // x = the grid's first level, y = 1 / range, z = log2 of the white point
-    grid: vec4<f32>,
     // `whites`, `blacks` and `tone` (from the first sample of `fed` up to 1):
     // x = samples per stop, y = last index
     stage: vec4<f32>,
@@ -62,8 +61,8 @@ struct Params {
 @group(0) @binding(2) var<uniform> p: Params;
 @group(0) @binding(3) var<storage, read> black: array<f32>;
 @group(0) @binding(4) var<storage, read> fed: array<f32>;
-@group(0) @binding(5) var<storage, read> gains: array<f32>;
-@group(0) @binding(6) var grid: texture_3d<f32>;
+@group(0) @binding(5) var gain: texture_2d<f32>;
+@group(0) @binding(6) var cells: texture_2d<f32>;
 @group(0) @binding(7) var samp: sampler;
 @group(0) @binding(8) var<storage, read> whites: array<f32>;
 @group(0) @binding(9) var<storage, read> blacks: array<f32>;
@@ -126,20 +125,37 @@ fn keyed_extremes(x: vec2<f32>, y: f32, to: f32) -> vec2<f32> {
 }
 
 fn tone_of(v: f32) -> f32 {
-    if (v <= 0.0) { return p.gains.w; }
-    if (v <= p.fed.w) { return mix(p.gains.w, tone[0], v / p.fed.w); }
+    if (v <= 0.0) { return p.spread.w; }
+    if (v <= p.fed.w) { return mix(p.spread.w, tone[0], v / p.fed.w); }
     let at = stage_at(v);
     let k = u32(at.x);
     return tone[k] * (1.0 - at.y) + tone[k + 1u] * at.y;
 }
 
-// The gain of a base level, in stops, before the white limiter.
-fn stops_of(base: f32) -> f32 {
-    let y = clamp((base - p.gains.x) * p.gains.y, 0.0, p.gains.z);
-    let i = min(floor(y), p.gains.z - 1.0);
-    let f = y - i;
-    let k = u32(i);
-    return gains[k] * (1.0 - f) + gains[k + 1u] * f;
+// The binomial weight of the pixel `d` away, of 2r + 1 (r up to 2).
+fn limit_weight(d: i32, r: i32) -> f32 {
+    let a = abs(d);
+    if (r == 2) { return select(select(1.0, 4.0, a == 1), 6.0, a == 0) / 16.0; }
+    if (r == 1) { return select(0.25, 0.5, a == 0); }
+    return 1.0;
+}
+
+// The gain the picture gives the pixel `at`, in stops, before the white
+// limiter: the cells' means, linear between their centres, held between
+// zero and the pixel's own gain lightly smoothed.
+fn spread_gain(at: vec2<i32>) -> f32 {
+    let last = vec2<i32>(textureDimensions(gain)) - vec2<i32>(1);
+    let r = i32(p.spread.y);
+    var own = 0.0;
+    for (var dy: i32 = -r; dy <= r; dy = dy + 1) {
+        for (var dx: i32 = -r; dx <= r; dx = dx + 1) {
+            let g = textureLoad(gain, clamp(at + vec2<i32>(dx, dy), vec2<i32>(0), last), 0).r;
+            own = own + limit_weight(dx, r) * limit_weight(dy, r) * g;
+        }
+    }
+    let size = vec2<f32>(textureDimensions(cells));
+    let around = textureSampleLevel(cells, samp, (vec2<f32>(at) + vec2<f32>(0.5)) / (p.spread.x * size), 0.0).r;
+    return clamp(around, min(own, 0.0), max(own, 0.0));
 }
 
 fn srgb(x: f32) -> f32 {
@@ -155,29 +171,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let texel = textureLoad(src, at, 0);
     let lit = max(scene(texel.rgb) * p.neutral.w, vec3<f32>(0.0));
 
-    // The base: the grid at this pixel's place and own level.
     let luminance = dot(p.luma.xyz, lit);
-    let level = log2(max(luminance, p.clip.z));
-    let dims = vec3<f32>(textureDimensions(grid));
-    let v = vec3<f32>(
-        (f32(gid.x) + 0.5) / p.luma.w + 0.5,
-        (f32(gid.y) + 0.5) / p.luma.w + 0.5,
-        clamp((level - p.grid.x) * p.grid.y + 0.5, 0.0, dims.z - 1.0));
-    let g = textureSampleLevel(grid, samp, (v + vec3<f32>(0.5)) / dims, 0.0);
-    let base = (g.x + p.clip.w * g.z) / (g.y + p.clip.w) + p.grid.x;
     // The room below the white point limits a gain above zero.
-    let wanted = stops_of(base);
-    let room = max(p.grid.z - log2(max(black_of(luminance), 1e-12)), 0.0);
+    let wanted = spread_gain(at);
+    let room = max(p.spread.z - log2(max(black_of(luminance), 1e-12)), 0.0);
     let limited = room - room * room / (4.0 * max(wanted, 1e-6));
-    let gain = exp2(select(wanted, limited, wanted > 0.5 * room));
+    let gain_of = exp2(select(wanted, limited, wanted > 0.5 * room));
 
     let hi = max(lit.r, max(lit.g, lit.b));
     let lo = min(lit.r, min(lit.g, lit.b));
-    let fhi = fed_of(gain * black_of(hi));
+    let fhi = fed_of(gain_of * black_of(hi));
     var flo = fhi;
     var between = 0.0;
     if (hi > lo) {
-        flo = fed_of(gain * black_of(lo));
+        flo = fed_of(gain_of * black_of(lo));
         between = (luminance - lo) / (hi - lo);
     }
     // Whites, then Blacks. `between` (where the luminance lies between the

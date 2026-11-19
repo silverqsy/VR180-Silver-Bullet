@@ -15,6 +15,8 @@ const RAW_MEASURE_WGSL: &str = include_str!("shaders/raw_measure.wgsl");
 const RAW_REDUCE_WGSL: &str = include_str!("shaders/raw_reduce.wgsl");
 const RAW_GRID_BUILD_WGSL: &str = include_str!("shaders/raw_grid_build.wgsl");
 const RAW_GRID_BLUR_WGSL: &str = include_str!("shaders/raw_grid_blur.wgsl");
+const RAW_GAIN_WGSL: &str = include_str!("shaders/raw_gain.wgsl");
+const GAIN_CELLS_WGSL: &str = include_str!("shaders/gain_cells.wgsl");
 const RAW_DEVELOP_LOCAL_WGSL: &str = include_str!("shaders/raw_develop_local.wgsl");
 const RAW_SHARPEN_LEVEL_WGSL: &str = include_str!("shaders/raw_sharpen_level.wgsl");
 const RAW_SHARPEN_BLUR_WGSL: &str = include_str!("shaders/raw_sharpen_blur.wgsl");
@@ -26,7 +28,7 @@ const RAW_CHROMA_APPLY_WGSL: &str = include_str!("shaders/raw_chroma_apply.wgsl"
 use crate::raw_color::prophoto_luma;
 use crate::raw_sharpen::SharpenConstants;
 use crate::raw_tone::{
-    DevelopConstants, DevelopGeometry, FrameStats, LocalCurves, LocalTone, Measure, RawDevelop, ToneKeys, BASE_FALLBACK, BASE_FLOOR,
+    DevelopConstants, DevelopGeometry, FrameStats, LocalCurves, LocalTone, Measure, RawDevelop, ToneKeys, BASE_FLOOR,
     BASE_LO, BASE_RANGE, CLIP_FROM, CLIP_TO, CURVE_LO, LOCAL_LO, LOCAL_PER_STOP, LOCAL_SAMPLES, OUT_LO,
 };
 use std::sync::{Arc, Mutex};
@@ -76,6 +78,10 @@ pub(crate) struct RawPipelines {
     pub(crate) grid_build_layout: wgpu::BindGroupLayout,
     pub(crate) grid_blur: wgpu::ComputePipeline,
     pub(crate) grid_blur_layout: wgpu::BindGroupLayout,
+    gain: wgpu::ComputePipeline,
+    gain_layout: wgpu::BindGroupLayout,
+    pub(crate) gain_cells: wgpu::ComputePipeline,
+    pub(crate) gain_cells_layout: wgpu::BindGroupLayout,
     develop_local: wgpu::ComputePipeline,
     develop_local_layout: wgpu::BindGroupLayout,
     pub(crate) grid_sampler: wgpu::Sampler,
@@ -160,12 +166,28 @@ struct DevelopLocalParams {
     work_to_out: [[f32; 4]; 3],
     black: [f32; 4],
     fed: [f32; 4],
-    gains: [f32; 4],
+    spread: [f32; 4],
+    clip: [f32; 4],
+    luma: [f32; 4],
+    stage: [f32; 4],
+    keyed: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GainParams {
+    neutral: [f32; 4],
+    cam_to_work: [[f32; 4]; 3],
     clip: [f32; 4],
     luma: [f32; 4],
     grid: [f32; 4],
-    stage: [f32; 4],
-    keyed: [f32; 4],
+    gains: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct CellsParams {
+    pub(crate) cell: [f32; 4],
 }
 
 #[repr(C)]
@@ -433,6 +455,34 @@ impl RawPipelines {
             entries: &[bgl_texture(0, D3, true), bgl_storage(1, wgpu::TextureFormat::Rgba16Float, D3)],
         });
         let grid_blur = compute_pipeline(device, "raw_grid_blur", RAW_GRID_BLUR_WGSL, "blur", &grid_blur_layout);
+        // The gain of every pixel's base, and its means over cells.
+        let filtering = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        let gain_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("raw_gain_bgl"),
+            entries: &[
+                bgl_texture(0, D2, true),
+                bgl_storage(1, wgpu::TextureFormat::R32Float, D2),
+                bgl_uniform(2, std::mem::size_of::<GainParams>()),
+                bgl_storage_buffer(3),
+                bgl_texture(4, D3, true),
+                filtering(5),
+            ],
+        });
+        let gain = compute_pipeline(device, "raw_gain", &with_scene(RAW_GAIN_WGSL), "main", &gain_layout);
+        let gain_cells_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gain_cells_bgl"),
+            entries: &[
+                bgl_texture(0, D2, false),
+                bgl_storage(1, wgpu::TextureFormat::Rgba16Float, D2),
+                bgl_uniform(2, std::mem::size_of::<CellsParams>()),
+            ],
+        });
+        let gain_cells = compute_pipeline(device, "gain_cells", GAIN_CELLS_WGSL, "main", &gain_cells_layout);
         let develop_local_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("raw_develop_local_bgl"),
             entries: &[
@@ -441,8 +491,8 @@ impl RawPipelines {
                 bgl_uniform(2, std::mem::size_of::<DevelopLocalParams>()),
                 bgl_storage_buffer(3),
                 bgl_storage_buffer(4),
-                bgl_storage_buffer(5),
-                bgl_texture(6, D3, true),
+                bgl_texture(5, D2, false),
+                bgl_texture(6, D2, true),
                 wgpu::BindGroupLayoutEntry {
                     binding: 7,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -521,7 +571,7 @@ impl RawPipelines {
             demosaic_measure, demosaic_measure_layout, demosaic_green, demosaic_green_layout,
             demosaic, demosaic_layout, demosaic_work: Mutex::new(None), develop, develop_layout, measure, measure_layout,
             reduce, reduce_layout, grid_build, grid_build_layout, grid_blur, grid_blur_layout,
-            develop_local, develop_local_layout, grid_sampler,
+            gain, gain_layout, gain_cells, gain_cells_layout, develop_local, develop_local_layout, grid_sampler,
             sharpen_level, sharpen_edge, sharpen_level_layout, sharpen_blur, sharpen_blur_layout, sharpen_apply, sharpen_apply_layout,
             chroma_reduce, chroma_reduce_layout, chroma_smooth, chroma_smooth_layout, chroma_apply, chroma_apply_layout,
             memory: Arc::default(),
@@ -1064,6 +1114,7 @@ impl Device {
                 Some(r) => r.long_side,
                 None => (eye.width() * eyes.len() as u32).max(eye.height()),
             };
+            local.cell = crate::raw_local::gain_cell(pixel_scale);
         }
         k.sharpen = stage.settings.sharpen.constants(pixel_scale);
         let neutral = stage.camera.as_shot_neutral.map(|v| v as f32);
@@ -1073,11 +1124,13 @@ impl Device {
 
     /// Record the bilateral grid of one eye for a frame's local tone: the
     /// reduced copy, the gathered grid, the smoothed grid. Returns the
-    /// smoothed grid and its cell in pixels of the eye.
-    fn record_raw_base(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, k: &DevelopConstants, local: &LocalTone) -> (wgpu::Texture, f32) {
+    /// smoothed grid, its cell in pixels of the eye and the weight of its
+    /// plain local average.
+    fn record_raw_base(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, k: &DevelopConstants, local: &LocalTone) -> (wgpu::Texture, f32, f32) {
         let pipes = self.raw_pipelines();
         let long = if local.long_side > 0 { local.long_side } else { src.width().max(src.height()) };
-        let (n, cell) = crate::raw_local::base_layout(long);
+        let n = local.cell.max(1);
+        let cell = crate::raw_local::base_cell(long, n);
         let (rw, rh) = (src.width().div_ceil(n), src.height().div_ceil(n));
         let (gx, gy, gz) = crate::raw_local::grid_dims(rw, rh, cell);
         let reduced = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -1100,7 +1153,7 @@ impl Device {
         let reduce_params = self.write_uniform("raw_reduce_params", &ReduceParams {
             neutral: [k.geometry.neutral[0], k.geometry.neutral[1], k.geometry.neutral[2], k.gain],
             cam_to_work: k.geometry.camera_to_work.map(row4),
-            clip: [CLIP_FROM, CLIP_TO, BASE_FLOOR, 0.0],
+            clip: [CLIP_FROM, CLIP_TO, BASE_FLOOR, crate::raw_tone::BASE_POWER],
             luma: luma4(n as f32),
         });
         let grid_params = self.write_uniform("raw_grid_params", &GridParams { cell: [cell, BASE_LO, 1.0 / BASE_RANGE, 0.0] });
@@ -1134,7 +1187,7 @@ impl Device {
             pass.set_bind_group(0, Some(bind), &[]);
             pass.dispatch_workgroups(x.div_ceil(8), y.div_ceil(8), 1);
         }
-        (smoothed, cell * n as f32)
+        (smoothed, cell * n as f32, crate::raw_local::base_fallback(cell))
     }
 
     pub(crate) fn curve_buffer(&self, label: &str, samples: &[f32]) -> wgpu::Buffer {
@@ -1149,10 +1202,94 @@ impl Device {
         buffer
     }
 
-    /// The development with Shadows / Highlights: the eye's base, then the
-    /// stage that reads it.
+    /// The means of a picture's gain (`gain`: `R32Float`, stops) over cells
+    /// of `c × c` pixels: `Rgba16Float`, the mean in its first channel.
+    pub(crate) fn record_gain_cells(&self, encoder: &mut wgpu::CommandEncoder, gain: &wgpu::Texture, c: u32) -> wgpu::Texture {
+        let pipes = self.raw_pipelines();
+        let (cw, ch) = (gain.width().div_ceil(c), gain.height().div_ceil(c));
+        let cells = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gain_cells"),
+            size: wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let params = self.write_uniform("gain_cells_params", &CellsParams { cell: [c as f32, 0.0, 0.0, 0.0] });
+        let (gain_view, cells_view) = (gain.create_view(&Default::default()), cells.create_view(&Default::default()));
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gain_cells_bg"),
+            layout: &pipes.gain_cells_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&gain_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&cells_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("gain_cells"), timestamp_writes: None });
+        pass.set_pipeline(&pipes.gain_cells);
+        pass.set_bind_group(0, Some(&bind), &[]);
+        pass.dispatch_workgroups(cw.div_ceil(8), ch.div_ceil(8), 1);
+        drop(pass);
+        cells
+    }
+
+    /// A texture the size of an eye for the gain of every pixel's base
+    /// (`R32Float`, stops).
+    pub(crate) fn gain_texture(&self, label: &str, width: u32, height: u32) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    }
+
+    /// Record the Shadows / Highlights gain of one eye: its base, the gain
+    /// of every pixel's base, that gain's means over cells. Returns the
+    /// last two.
+    fn record_raw_gain(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, k: &DevelopConstants, local: &LocalTone) -> (wgpu::Texture, wgpu::Texture) {
+        let (grid, cell_px, fallback) = self.record_raw_base(encoder, src, k, local);
+        let gain = self.gain_texture("raw_gain", src.width(), src.height());
+        let params = self.write_uniform("raw_gain_params", &GainParams {
+            neutral: [k.geometry.neutral[0], k.geometry.neutral[1], k.geometry.neutral[2], k.gain],
+            cam_to_work: k.geometry.camera_to_work.map(row4),
+            clip: [CLIP_FROM, CLIP_TO, BASE_FLOOR, fallback],
+            luma: luma4(cell_px),
+            grid: [BASE_LO, 1.0 / BASE_RANGE, 0.0, 0.0],
+            gains: [LOCAL_LO, LOCAL_PER_STOP, (local.gain.len() - 1) as f32, 0.0],
+        });
+        let gains = self.curve_buffer("raw_gain_gains", &local.gain);
+        let pipes = self.raw_pipelines();
+        let (src_view, gain_view, grid_view) = (src.create_view(&Default::default()), gain.create_view(&Default::default()), grid.create_view(&Default::default()));
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raw_gain_bg"),
+            layout: &pipes.gain_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&gain_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: gains.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&grid_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&pipes.grid_sampler) },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("raw_gain"), timestamp_writes: None });
+        pass.set_pipeline(&pipes.gain);
+        pass.set_bind_group(0, Some(&bind), &[]);
+        pass.dispatch_workgroups(src.width().div_ceil(8), src.height().div_ceil(8), 1);
+        drop(pass);
+        let cells = self.record_gain_cells(encoder, &gain, local.cell.max(1));
+        (gain, cells)
+    }
+
+    /// The development with Shadows / Highlights: the eye's gain and its
+    /// means over cells, then the stage that reads them.
     fn record_raw_develop_local(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, dst: &wgpu::Texture, k: &DevelopConstants, local: &LocalTone) {
-        let (grid, cell_px) = self.record_raw_base(encoder, src, k, local);
+        let (gain, cells) = self.record_raw_gain(encoder, src, k, local);
+        let cell = local.cell.max(1);
         let lo = CURVE_LO as f32;
         let last = (local.black.len() - 1) as f32;
         let out_lo = OUT_LO as f32;
@@ -1164,23 +1301,22 @@ impl Device {
             work_to_out: k.geometry.work_to_out.map(row4),
             black: [lo, last / (local.black_hi - lo), last, 2f32.powf(lo)],
             fed: [out_lo, fed_last / (local.fed_hi - out_lo), fed_last, 2f32.powf(out_lo)],
-            gains: [LOCAL_LO, LOCAL_PER_STOP, (local.gain.len() - 1) as f32, local.floor],
-            clip: [CLIP_FROM, CLIP_TO, BASE_FLOOR, BASE_FALLBACK],
-            luma: luma4(cell_px),
-            grid: [BASE_LO, 1.0 / BASE_RANGE, local.white.log2(), 0.0],
+            spread: [cell as f32, crate::raw_local::limit_radius(cell as usize) as f32, local.white.log2(), local.floor],
+            clip: [CLIP_FROM, CLIP_TO, 0.0, 0.0],
+            luma: luma4(0.0),
             stage: [stage_last / -out_lo, stage_last, 0.0, 0.0],
             keyed: [local.whites.floor, local.blacks.floor, if local.whites.keyed { 1.0 } else { 0.0 }, if local.blacks.keyed { 1.0 } else { 0.0 }],
         });
-        let (pre, outc, gains, whites, blacks, tone) = (
+        let (pre, outc, whites, blacks, tone) = (
             self.curve_buffer("raw_develop_black", &local.black),
             self.curve_buffer("raw_develop_fed", &local.fed),
-            self.curve_buffer("raw_develop_gains", &local.gain),
             self.curve_buffer("raw_develop_whites", &local.whites.map),
             self.curve_buffer("raw_develop_blacks", &local.blacks.map),
             self.curve_buffer("raw_develop_tone", &local.tone),
         );
         let pipes = self.raw_pipelines();
-        let (src_view, dst_view, grid_view) = (src.create_view(&Default::default()), dst.create_view(&Default::default()), grid.create_view(&Default::default()));
+        let (src_view, dst_view) = (src.create_view(&Default::default()), dst.create_view(&Default::default()));
+        let (gain_view, cells_view) = (gain.create_view(&Default::default()), cells.create_view(&Default::default()));
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("raw_develop_local_bg"),
             layout: &pipes.develop_local_layout,
@@ -1190,8 +1326,8 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: pre.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: outc.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: gains.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&grid_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&gain_view) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&cells_view) },
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&pipes.grid_sampler) },
                 wgpu::BindGroupEntry { binding: 8, resource: whites.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: blacks.as_entire_binding() },
@@ -1453,7 +1589,7 @@ mod tests {
     /// each is valid WGSL with it in.
     #[test]
     fn the_scene_is_composed_into_every_shader_that_reads_it() {
-        for (name, wgsl) in [("raw_develop", RAW_DEVELOP_WGSL), ("raw_develop_local", RAW_DEVELOP_LOCAL_WGSL), ("raw_measure", RAW_MEASURE_WGSL), ("raw_reduce", RAW_REDUCE_WGSL)] {
+        for (name, wgsl) in [("raw_develop", RAW_DEVELOP_WGSL), ("raw_develop_local", RAW_DEVELOP_LOCAL_WGSL), ("raw_measure", RAW_MEASURE_WGSL), ("raw_reduce", RAW_REDUCE_WGSL), ("raw_gain", RAW_GAIN_WGSL)] {
             let composed = with_scene(wgsl);
             assert_eq!(composed.matches("fn scene(").count(), 1, "{name}");
             assert!(!composed.contains("//#"), "{name}: a directive is left in");
@@ -1528,13 +1664,13 @@ mod tests {
     }
 
     /// Shadows / Highlights on the GPU against the CPU twin: the base read
-    /// from the bilateral grid, the gain of that base, the black-subtracted
-    /// signal through it.
+    /// from the bilateral grid, the gain of that base smoothed over its
+    /// cells, the black-subtracted signal through it.
     #[test]
     #[ignore = "needs a GPU"]
     fn gpu_local_tone_matches_the_cpu_one() {
         use crate::raw_color::RawCamera;
-        use crate::raw_local::{base_layout, reduce_log, BaseGrid};
+        use crate::raw_local::{base_cell, gain_cells, reduce_levels, smooth_gain, BaseGrid};
         use crate::raw_tone::RawSettings;
         let dev = Device::new().expect("device");
         let (w, h) = (192u32, 128u32);
@@ -1571,21 +1707,30 @@ mod tests {
             let stage = RawDevelop { camera: RawCamera::X6, settings, measure: Measure::Wait };
             let mut k = dev.raw_develop_constants(&[&src], None, &stage, 1.0, None, None);
             let local = k.local.as_mut().expect("local stage");
-            // A long side that gives more than one pixel per texel of the reduced copy.
+            // A long side like a real frame's: the grid's cells are a fraction of it.
             local.long_side = 2048;
             assert!(local.gain.iter().any(|g| g.abs() > 0.2), "{settings:?}: no gain");
-            let (n, cell) = base_layout(2048);
+            let n = local.cell as usize;
+            assert_eq!(n, 4);
+            let cell = base_cell(2048, n as u32);
             let lum: Vec<f32> = px.chunks_exact(4).map(|c| k.base_luminance([c[0], c[1], c[2]].map(|v| v as f32 / 65535.0))).collect();
-            let (red, rw, rh) = reduce_log(&lum, w as usize, h as usize, n as usize);
+            let (red, rw, rh) = reduce_levels(&lum, w as usize, h as usize, n);
             let grid = BaseGrid::build(&red, rw, rh, cell);
+            // Every pixel's own gain, then its means over the cells.
+            let local = k.local.as_ref().expect("local stage");
+            let own: Vec<f32> = lum.iter().enumerate().map(|(i, l)| local.gain_at(grid.base((i as u32 % w) as f32, (i as u32 / w) as f32, n as f32, l.log2()))).collect();
+            let (cells, cells_w, cells_h) = gain_cells(&own, w as usize, h as usize, n);
+            // The smoothing moves the picture (the test would pass on a
+            // stage that left it out otherwise).
+            let spread = (0..own.len()).filter(|i| (smooth_gain(&own, w as usize, h as usize, &cells, cells_w, cells_h, n, i % w as usize, i / w as usize) - own[*i]).abs() > 0.05).count();
+            assert!(spread > own.len() / 50, "{settings:?}: the smoothed gain differs at {spread} pixels only");
             let out = dev.develop_raw_eye(&src, &k);
             let got = dev.read_texture_rgba64(&out, w, h).unwrap();
             let got: Vec<u16> = got.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
             let (mut worst, mut sum) = (0f32, 0f64);
             for (i, (g, c)) in got.chunks_exact(4).zip(px.chunks_exact(4)).enumerate() {
-                let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
-                let base = grid.base(x, y, n as f32, lum[i].log2());
-                let want = k.develop_local([c[0], c[1], c[2]].map(|v| v as f32 / 65535.0), base);
+                let stops = smooth_gain(&own, w as usize, h as usize, &cells, cells_w, cells_h, n, i % w as usize, i / w as usize);
+                let want = k.develop_gained([c[0], c[1], c[2]].map(|v| v as f32 / 65535.0), stops);
                 for ch in 0..3 {
                     let d = (g[ch] as f32 / 65535.0 - want[ch]).abs();
                     worst = worst.max(d);

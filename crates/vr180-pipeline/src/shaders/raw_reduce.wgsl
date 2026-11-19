@@ -1,7 +1,8 @@
 // The reduced copy a raw frame's Shadows / Highlights base is built from:
-// every output texel is the mean of log2(scene luminance) over its n × n
-// pixels of the eye (scene = the same `scene` as `raw_develop.wgsl`, at the
-// frame's exposure; luminance not below the floor).
+// every output texel is log2 of the power mean of the scene luminance over
+// its n × n pixels of the eye (scene = the same `scene` as
+// `raw_develop.wgsl`, at the frame's exposure; luminance not below the
+// floor).
 //
 // Bindings:
 //   (0) src — the eye, camera-linear
@@ -17,7 +18,7 @@ struct Params {
     cam_to_work_0: vec4<f32>,
     cam_to_work_1: vec4<f32>,
     cam_to_work_2: vec4<f32>,
-    // x, y = a channel is trusted up to x and counts as clipped at y; z = luminance floor
+    // x, y = a channel is trusted up to x and counts as clipped at y; z = luminance floor; w = the mean's power
     clip: vec4<f32>,
     // xyz = luminance weights of the working space; w = pixels per texel (n)
     luma: vec4<f32>,
@@ -39,8 +40,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var i: i32 = 0; i < n; i = i + 1) {
             let at = min(origin + vec2<i32>(i, j), last);
             let lit = max(scene(textureLoad(src, at, 0).rgb) * p.neutral.w, vec3<f32>(0.0));
-            sum = sum + log2(max(dot(p.luma.xyz, lit), p.clip.z));
+            sum = sum + pow(max(dot(p.luma.xyz, lit), p.clip.z), p.clip.w);
         }
     }
-    textureStore(dst, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(sum / f32(n * n), 0.0, 0.0, 1.0));
+    textureStore(dst, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(log2(sum / f32(n * n)) / p.clip.w, 0.0, 0.0, 1.0));
 }

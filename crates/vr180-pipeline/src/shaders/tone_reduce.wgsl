@@ -1,7 +1,8 @@
 // The reduced copy the Shadows / Highlights base of a frame is built from,
 // for a picture that arrives as code values (`tone_linear.rs`): every output
-// texel is the mean of log2(luminance) over its n × n pixels of the eye, the
-// light being the code through the `decode` table, at the frame's exposure.
+// texel is log2 of the power mean of the luminance over its n × n pixels of
+// the eye, the light being the code through the `decode` table, at the
+// frame's exposure.
 // The counterpart of `raw_reduce.wgsl`; the grid is then built and smoothed
 // by the same passes (`raw_grid_build.wgsl`, `raw_grid_blur.wgsl`).
 //
@@ -17,7 +18,7 @@
 struct Params {
     // xyz = luminance weights; w = pixels per texel (n)
     luma: vec4<f32>,
-    // x = last index of `decode`; y = exposure gain; z = luminance floor
+    // x = last index of `decode`; y = exposure gain; z = luminance floor; w = the mean's power
     light: vec4<f32>,
 }
 @group(0) @binding(2) var<uniform> p: Params;
@@ -44,8 +45,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let at = min(origin + vec2<i32>(i, j), last);
             let code = textureLoad(src, at, 0).rgb;
             let lit = max(vec3<f32>(light1(code.r), light1(code.g), light1(code.b)) * p.light.y, vec3<f32>(0.0));
-            sum = sum + log2(max(dot(p.luma.xyz, lit), p.light.z));
+            sum = sum + pow(max(dot(p.luma.xyz, lit), p.light.z), p.light.w);
         }
     }
-    textureStore(dst, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(sum / f32(n * n), 0.0, 0.0, 1.0));
+    textureStore(dst, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(log2(sum / f32(n * n)) / p.light.w, 0.0, 0.0, 1.0));
 }

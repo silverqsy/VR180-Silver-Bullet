@@ -4163,6 +4163,81 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
     0.56 / 0.22 / 0.47. The width that fits frames best (0.3) is a little
     over what the edge charts gave at amount 100 (0.2).
 
+43. **Shadows / Highlights: the gain is smoothed over cells of four
+    pixels (2026-11-19, Mac; UNRELEASED).** For raw clips and for the tone
+    controls of every other clip. The user-facing text is in the
+    CHANGELOG (raw development, "leaves against a sky").
+    - **What was wrong.** `gain = curve(base)` pixel by pixel, the base
+      read from the grid at the pixel's own level. Fine mixtures of bright
+      and dark (leaves against a sky, Highlights −100) lost their
+      contrast: every bright pixel got the open sky's gain, the dark ones
+      none.
+    - **Camera Raw, measured** (charts through Photoshop, 2048 and 4096
+      wide): mixtures of two levels at feature sizes 1 to 16 px and dark
+      shares of 20 / 50 / 80 %, three contrasts, with and without a
+      lens-like blur, both sliders; steps placed at every position modulo
+      8. Its gain is on cells of FOUR PIXELS whatever the picture's size
+      (a step on a multiple of 4 is crisp, one inside a cell is not, the
+      same at 2048 and at 4096); on the side the slider moves it fades
+      toward an edge over about six pixels; on the other side it is
+      exactly zero; bright pixels in a fine mixture get about the share of
+      bright among them times the open area's gain; dark features of one
+      to three pixels take their surroundings' gain, of four and more
+      none.
+    - **The stage now.** (1) The reduced copy the grid is gathered from:
+      texels of `GAIN_CELL` (4) pixels of the exported frame
+      (`raw_local::gain_cell(pixel_scale)`: fewer in a frame drawn
+      smaller, so a preview shows the export's), each the POWER mean
+      (`BASE_POWER` 0.5) of its pixels' luminance, no longer the mean of
+      their levels. The grid's cell is unchanged (`BASE_CELL` of the long
+      side, `raw_local::base_cell`); `BASE_FALLBACK` is now a share of the
+      texels a cell holds. (2) The gain of every pixel's base is written
+      to a texture (`raw_gain.wgsl`, `tone_gain.wgsl`: `R32Float`), its
+      means over the cells to another (`gain_cells.wgsl`: `Rgba16Float`,
+      shared), and the stage (`raw_develop_local.wgsl`,
+      `tone_linear.wgsl`) takes the cells' means, linear between their
+      centres, held between zero and the pixel's own gain smoothed over
+      a 5 × 5 binomial kernel (3 × 3 for cells of 2 or 3 pixels, none for
+      1). CPU twin: `raw_local::{gain_cells, smooth_gain, limit_radius}`,
+      `DevelopConstants::develop_gained`, `ToneConstants::apply_gained`.
+      `LocalTone::cell` / `ToneConstants::cell` carry the cell
+      (`ColorStackPlan::raw_pixel_scale` sets it for both stages).
+    - **Verified.** Unit tests of the smoothing (a flat gain is kept,
+      bright among dark takes its share, an edge fades on one side and
+      is left alone on the other); the two GPU stages against the CPU
+      twins (ignored tests, pass). Against Camera Raw, gain in stops rms:
+      charts 0.120 to 0.067 (Highlights) and 0.276 to 0.142 (Shadows) for
+      the strict limit, 0.078 / 0.169 for the 5 × 5 one that is in (the
+      real frame wants the softer limit); three indoor frames at pixel
+      resolution: Highlights the same (0.071 / 0.080 / 0.067), Shadows
+      0.101 / 0.134 / 0.102 to 0.096 / 0.126 / 0.097; an outdoor one
+      0.097 to 0.099 and 0.117 to 0.111. The frame that showed it (a
+      half-equirect at 4096, Exposure +1.3, Highlights −100, the same
+      linear DNG in Camera Raw), over the tree: mean difference 5.27 to
+      4.27 of 255, the bright pixels −6.4 / −7.4 / −9.8 to +0.3 / −1.0 /
+      −3.0. Cost: 120 frames at 8448×4224 in 10.5 s with Highlights −100
+      against 9.5 s with no local stage at all.
+    - **Not reproduced.** Camera Raw's dark features of four pixels and
+      more inside a bright area get exactly no gain; here those within
+      two pixels of the bright take a part of it (the limit is a smooth
+      one because real pictures want it: with the strict limit the tree
+      was 4.7, with none 4.05). In a mixture that is 80 % dark Camera Raw
+      still pulls the bright pixels by a tenth of a stop or two, here
+      next to nothing. Camera Raw darkens dark specks in a bright area by
+      MORE than the area (its two finest scales look like detail added
+      back in another domain). The model behind it is a pyramid; this is
+      its first two levels' worth.
+    - **Every developed frame with Shadows or Highlights set changes**:
+      the stored regression baselines (already stale) are to be made
+      again from this commit.
+    - **Windows, to look at.** No code is platform-specific; three new
+      compute shaders (`R32Float` and `Rgba16Float` storage, a filtered
+      read of the second). (1) It builds; the two GPU tests
+      (`gpu_local_tone_matches_the_cpu_one`,
+      `gpu_tone_base_matches_the_cpu_one`) pass on D3D12. (2) A raw clip
+      and an I-Log clip with Highlights at −100 show a tree against a sky
+      with dark leaves and bright gaps, not a pale haze.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

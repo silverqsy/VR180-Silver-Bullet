@@ -12,12 +12,13 @@ use crate::raw_gpu::{
     GridParams, KEY_CELLS, KEY_TAPS,
 };
 use crate::raw_tone::{
-    FrameStats, Measure, BASE_FALLBACK, BASE_FLOOR, BASE_LO, BASE_RANGE, LOCAL_LO, LOCAL_PER_STOP, OUT_LO,
+    FrameStats, Measure, BASE_FLOOR, BASE_LO, BASE_RANGE, LOCAL_LO, LOCAL_PER_STOP, OUT_LO,
 };
-use crate::tone_linear::{flat_gains, LightTables, LinearTone, Shown, ToneConstants, ToneLight, LUMA};
+use crate::tone_linear::{LightTables, LinearTone, Shown, ToneConstants, ToneLight, LUMA};
 
 const TONE_MEASURE_WGSL: &str = include_str!("shaders/tone_measure.wgsl");
 const TONE_REDUCE_WGSL: &str = include_str!("shaders/tone_reduce.wgsl");
+const TONE_GAIN_WGSL: &str = include_str!("shaders/tone_gain.wgsl");
 const TONE_LINEAR_WGSL: &str = include_str!("shaders/tone_linear.wgsl");
 
 /// How much wider than between two frames of one size the live preview's
@@ -61,6 +62,9 @@ struct TonePipelines {
     measure_layout: wgpu::BindGroupLayout,
     reduce: wgpu::ComputePipeline,
     reduce_layout: wgpu::BindGroupLayout,
+    /// The gain of every pixel's base.
+    gain: wgpu::ComputePipeline,
+    gain_layout: wgpu::BindGroupLayout,
     /// The stage writing `Rgba8Unorm` and `Rgba16Unorm`.
     apply: wgpu::ComputePipeline,
     apply_layout: wgpu::BindGroupLayout,
@@ -88,11 +92,19 @@ struct ReduceParams {
 struct ApplyParams {
     light: [f32; 4],
     luma: [f32; 4],
-    gains: [f32; 4],
-    grid: [f32; 4],
+    spread: [f32; 4],
     stage: [f32; 4],
     floors: [f32; 4],
     keyed: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GainParams {
+    light: [f32; 4],
+    luma: [f32; 4],
+    gains: [f32; 4],
+    grid: [f32; 4],
 }
 
 impl TonePipelines {
@@ -118,6 +130,25 @@ impl TonePipelines {
             ],
         });
         let reduce = compute_pipeline(device, "tone_reduce", TONE_REDUCE_WGSL, "main", &reduce_layout);
+        let filtering = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        let gain_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tone_gain_bgl"),
+            entries: &[
+                bgl_texture(0, D2, false),
+                bgl_storage(1, wgpu::TextureFormat::R32Float, D2),
+                bgl_uniform(2, std::mem::size_of::<GainParams>()),
+                bgl_storage_buffer(3),
+                bgl_storage_buffer(4),
+                bgl_texture(5, D3, true),
+                filtering(6),
+            ],
+        });
+        let gain = compute_pipeline(device, "tone_gain", TONE_GAIN_WGSL, "main", &gain_layout);
         let apply_layout_for = |label: &str, format: wgpu::TextureFormat| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some(label),
             entries: &[
@@ -125,14 +156,9 @@ impl TonePipelines {
                 bgl_storage(1, format, D2),
                 bgl_uniform(2, std::mem::size_of::<ApplyParams>()),
                 bgl_storage_buffer(3),
-                bgl_storage_buffer(4),
-                bgl_texture(5, D3, true),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
+                bgl_texture(4, D2, false),
+                bgl_texture(5, D2, true),
+                filtering(6),
                 bgl_storage_buffer(7),
                 bgl_storage_buffer(8),
                 bgl_storage_buffer(9),
@@ -144,7 +170,7 @@ impl TonePipelines {
         let apply_16_layout = apply_layout_for("tone_linear_16_bgl", wgpu::TextureFormat::Rgba16Unorm);
         let apply_16 = compute_pipeline(
             device, "tone_linear_16", &TONE_LINEAR_WGSL.replace("rgba8unorm, write", "rgba16unorm, write"), "main", &apply_16_layout);
-        Self { measure, measure_layout, reduce, reduce_layout, apply, apply_layout, apply_16, apply_16_layout }
+        Self { measure, measure_layout, reduce, reduce_layout, gain, gain_layout, apply, apply_layout, apply_16, apply_16_layout }
     }
 }
 
@@ -399,6 +425,7 @@ impl Device {
         if let Some(eye) = eyes.first() {
             k.long_side = (eye.width() * eyes.len() as u32).max(eye.height());
         }
+        k.cell = crate::raw_local::gain_cell(plan.raw_pixel_scale);
         Some(k)
     }
 
@@ -461,10 +488,11 @@ impl Device {
     /// Highlights: the reduced copy (light through `decode`, exposed), then
     /// the raw stage's own gather and smoothing. Returns the smoothed grid
     /// and its cell in pixels of the eye.
-    fn record_linear_tone_base(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, k: &ToneConstants, decode: &wgpu::Buffer) -> (wgpu::Texture, f32) {
+    fn record_linear_tone_base(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, k: &ToneConstants, decode: &wgpu::Buffer) -> (wgpu::Texture, f32, f32) {
         let (pipes, raw) = (self.tone_pipelines(), self.raw_pipelines());
         let long = if k.long_side > 0 { k.long_side } else { src.width().max(src.height()) };
-        let (n, cell) = crate::raw_local::base_layout(long);
+        let n = k.cell.max(1);
+        let cell = crate::raw_local::base_cell(long, n);
         let (rw, rh) = (src.width().div_ceil(n), src.height().div_ceil(n));
         let (gx, gy, gz) = crate::raw_local::grid_dims(rw, rh, cell);
         let reduced = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -486,7 +514,7 @@ impl Device {
         let (gathered, smoothed) = (grid("tone_grid_gathered"), grid("tone_grid"));
         let reduce_params = self.write_uniform("tone_reduce_params", &ReduceParams {
             luma: [LUMA[0], LUMA[1], LUMA[2], n as f32],
-            light: [(k.decode.len() - 1) as f32, k.gain, BASE_FLOOR, 0.0],
+            light: [(k.decode.len() - 1) as f32, k.gain, BASE_FLOOR, crate::raw_tone::BASE_POWER],
         });
         let grid_params = self.write_uniform("tone_grid_params", &GridParams { cell: [cell, BASE_LO, 1.0 / BASE_RANGE, 0.0] });
         let view = |t: &wgpu::Texture| t.create_view(&Default::default());
@@ -523,41 +551,76 @@ impl Device {
             pass.set_bind_group(0, Some(bind), &[]);
             pass.dispatch_workgroups(x.div_ceil(8), y.div_ceil(8), 1);
         }
-        (smoothed, cell * n as f32)
+        (smoothed, cell * n as f32, crate::raw_local::base_fallback(cell))
+    }
+
+    /// Record the Shadows / Highlights gain of one eye: its base, the gain
+    /// of every pixel's base (`gains`: the frame's curve), that gain's means
+    /// over cells. Returns the last two.
+    fn record_linear_tone_gain(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, k: &ToneConstants, decode: &wgpu::Buffer, gains: &[f32]) -> (wgpu::Texture, wgpu::Texture) {
+        let (grid, cell_px, fallback) = self.record_linear_tone_base(encoder, src, k, decode);
+        let gain = self.gain_texture("tone_gain", src.width(), src.height());
+        let params = self.write_uniform("tone_gain_params", &GainParams {
+            light: [(k.decode.len() - 1) as f32, k.gain, BASE_FLOOR, fallback],
+            luma: [LUMA[0], LUMA[1], LUMA[2], cell_px],
+            gains: [LOCAL_LO, LOCAL_PER_STOP, (gains.len() - 1) as f32, 0.0],
+            grid: [BASE_LO, 1.0 / BASE_RANGE, 0.0, 0.0],
+        });
+        let gains = self.curve_buffer("tone_gains", gains);
+        let (pipes, raw) = (self.tone_pipelines(), self.raw_pipelines());
+        let (src_view, gain_view, grid_view) = (src.create_view(&Default::default()), gain.create_view(&Default::default()), grid.create_view(&Default::default()));
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tone_gain_bg"),
+            layout: &pipes.gain_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&gain_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: decode.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: gains.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&grid_view) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&raw.grid_sampler) },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tone_gain"), timestamp_writes: None });
+        pass.set_pipeline(&pipes.gain);
+        pass.set_bind_group(0, Some(&bind), &[]);
+        pass.dispatch_workgroups(src.width().div_ceil(8), src.height().div_ceil(8), 1);
+        drop(pass);
+        let cells = self.record_gain_cells(encoder, &gain, k.cell.max(1));
+        (gain, cells)
     }
 
     /// Record the tone stage: `src` (an eye, code values) → `dst` (the
     /// same size; `Rgba16Unorm` when `wide`, else `Rgba8Unorm`).
     pub(crate) fn record_linear_tone(&self, encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, dst: &wgpu::Texture, k: &ToneConstants, wide: bool) {
         let decode = self.curve_buffer("tone_decode", &k.decode);
-        // The frame's base, or one empty cell: with gains of zero that is a
-        // gain of exactly 1.
-        let (grid, cell_px, gains) = match &k.local {
+        // The frame's gain and its means over cells, or one texel of zero
+        // each: a gain of exactly 1.
+        let (gain, cells, cell) = match &k.local {
             Some(gains) => {
-                let (grid, cell_px) = self.record_linear_tone_base(encoder, src, k, &decode);
-                (grid, cell_px, self.curve_buffer("tone_gains", gains))
+                let (gain, cells) = self.record_linear_tone_gain(encoder, src, k, &decode, gains);
+                (gain, cells, k.cell.max(1))
             }
             None => {
-                let empty = self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("tone_grid_none"),
+                let one = |label: &str, format: wgpu::TextureFormat| self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
                     size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                    mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D3,
-                    format: wgpu::TextureFormat::Rgba16Float,
+                    mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                    format,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 });
-                (empty, 1.0, self.curve_buffer("tone_gains", &flat_gains()))
+                (one("tone_gain_none", wgpu::TextureFormat::R32Float), one("tone_cells_none", wgpu::TextureFormat::Rgba16Float), 1)
             }
         };
         let out_lo = OUT_LO as f32;
         // The three stages' tables are of one length.
         let stage_last = (k.whites.change.len() - 1) as f32;
-        let gains_last = (crate::raw_tone::LOCAL_SAMPLES - 1) as f32;
         let params = self.write_uniform("tone_linear_params", &ApplyParams {
-            light: [(k.decode.len() - 1) as f32, k.gain, BASE_FLOOR, BASE_FALLBACK],
-            luma: [LUMA[0], LUMA[1], LUMA[2], cell_px],
-            gains: [LOCAL_LO, LOCAL_PER_STOP, gains_last, 0.0],
-            grid: [BASE_LO, 1.0 / BASE_RANGE, 0.0, 0.0],
+            light: [(k.decode.len() - 1) as f32, k.gain, 0.0, 0.0],
+            luma: [LUMA[0], LUMA[1], LUMA[2], 0.0],
+            spread: [cell as f32, crate::raw_local::limit_radius(cell as usize) as f32, 0.0, 0.0],
             stage: [out_lo, stage_last / -out_lo, stage_last, 2f32.powf(out_lo)],
             floors: [k.whites.floor, k.blacks.floor, k.contrast.floor, (k.encode.len() - 1) as f32],
             keyed: [if k.whites.keyed { 1.0 } else { 0.0 }, if k.blacks.keyed { 1.0 } else { 0.0 }, k.below, 0.0],
@@ -570,7 +633,8 @@ impl Device {
         );
         let (pipes, raw) = (self.tone_pipelines(), self.raw_pipelines());
         let (pipeline, layout) = if wide { (&pipes.apply_16, &pipes.apply_16_layout) } else { (&pipes.apply, &pipes.apply_layout) };
-        let (src_view, dst_view, grid_view) = (src.create_view(&Default::default()), dst.create_view(&Default::default()), grid.create_view(&Default::default()));
+        let (src_view, dst_view) = (src.create_view(&Default::default()), dst.create_view(&Default::default()));
+        let (gain_view, cells_view) = (gain.create_view(&Default::default()), cells.create_view(&Default::default()));
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tone_linear_bg"),
             layout,
@@ -579,8 +643,8 @@ impl Device {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&dst_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: decode.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: gains.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&grid_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&gain_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&cells_view) },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&raw.grid_sampler) },
                 wgpu::BindGroupEntry { binding: 7, resource: whites.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: blacks.as_entire_binding() },
@@ -801,10 +865,11 @@ mod tests {
     }
 
     /// Shadows / Highlights on the GPU against the CPU twin: the base read
-    /// from the bilateral grid, the gain of that base.
+    /// from the bilateral grid, the gain of that base smoothed over its
+    /// cells.
     #[test]
     fn gpu_tone_base_matches_the_cpu_one() {
-        use crate::raw_local::{base_layout, reduce_log, BaseGrid};
+        use crate::raw_local::{base_cell, gain_cells, reduce_levels, smooth_gain, BaseGrid};
         let dev = Device::new().expect("device");
         let (w, h) = (192u32, 128u32);
         let px = scene(w, h);
@@ -818,13 +883,23 @@ mod tests {
         ] {
             let plan = ColorStackPlan { tone: Some(stage(settings, light)), lut: Some((lut(), 1.0)), ..Default::default() };
             let mut k = dev.linear_tone_constants(&[&src], &plan).expect("an active stage");
-            // A long side that gives more than one pixel per texel of the reduced copy.
+            // A long side like a real frame's: the grid's cells are a fraction of it.
             k.long_side = 2048;
             assert!(k.local.as_ref().expect("local stage").iter().any(|g| g.abs() > 0.2), "{settings:?}: no gain");
-            let (n, cell) = base_layout(2048);
+            let n = k.cell as usize;
+            assert_eq!(n, 4);
+            let cell = base_cell(2048, n as u32);
             let lum: Vec<f32> = px.chunks_exact(4).map(|c| k.base_luminance([c[0], c[1], c[2]].map(|v| v as f32 / 65535.0))).collect();
-            let (red, rw, rh) = reduce_log(&lum, w as usize, h as usize, n as usize);
+            let (red, rw, rh) = reduce_levels(&lum, w as usize, h as usize, n);
             let grid = BaseGrid::build(&red, rw, rh, cell);
+            // Every pixel's own gain, then its means over the cells.
+            let own: Vec<f32> = lum.iter().enumerate().map(|(i, l)| k.local_stops(grid.base((i as u32 % w) as f32, (i as u32 / w) as f32, n as f32, l.log2()))).collect();
+            let (cells, cells_w, cells_h) = gain_cells(&own, w as usize, h as usize, n);
+            let stops_at = |i: usize| smooth_gain(&own, w as usize, h as usize, &cells, cells_w, cells_h, n, i % w as usize, i / w as usize);
+            // The smoothing moves the picture (the test would pass on a
+            // stage that left it out otherwise).
+            let spread = (0..own.len()).filter(|i| (stops_at(*i) - own[*i]).abs() > 0.05).count();
+            assert!(spread > own.len() / 50, "{light:?} {settings:?}: the smoothed gain differs at {spread} pixels only");
             let dst = dev.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("tone_test_dst"),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -839,9 +914,8 @@ mod tests {
             let got = read16(&dev, &dst, w, h);
             let (mut worst, mut sum, mut moved) = (0f32, 0f64, 0usize);
             for (i, (g, c)) in got.chunks_exact(4).zip(px.chunks_exact(4)).enumerate() {
-                let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
                 let codes = [c[0], c[1], c[2]].map(|v| v as f32 / 65535.0);
-                let want = k.apply(codes, grid.base(x, y, n as f32, lum[i].log2()));
+                let want = k.apply_gained(codes, stops_at(i));
                 for ch in 0..3 {
                     let d = (g[ch] as f32 / 65535.0 - want[ch]).abs();
                     worst = worst.max(d);

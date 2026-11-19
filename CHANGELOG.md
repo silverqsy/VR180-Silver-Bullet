@@ -46,6 +46,27 @@ converter's controls for it, and every frame can be had as a DNG.
     the take that showed it, the clipped-yellow pixels of a frame went
     from about a thousand to none, and the wall's brightest parts are
     within one step of Camera Raw's with the exposure raised.
+  - leaves against a sky keep their contrast when Highlights is pulled
+    down. The gain went pixel by pixel: every bit of sky between the
+    leaves was pulled down as far as the open sky and the leaves were
+    left where they were, so a tree's edge turned into a pale, flat haze
+    in which the lens's colour fringes were the only thing left to see.
+    Camera Raw does not do that, and what it does was measured on charts
+    of bright and dark mixed at sizes from one pixel to sixteen and of
+    steps placed at every position: its gain is held on cells of four
+    pixels of the picture (whatever the picture's size), fades toward an
+    edge on the side the slider moves and is exactly zero on the other.
+    The gain is now smoothed the same way: where bright and dark are
+    finely mixed the bright pixels are pulled down by about the share of
+    bright among them, the dark ones stay, and the mixture keeps its
+    contrast; a large area is treated as before. Shadows gains the
+    mirror of it. On the charts the gain is a third nearer Camera Raw's
+    (0.12 to 0.08 stops for Highlights, 0.28 to 0.17 for Shadows); on
+    the frame that showed it the sky between the leaves went from 6 to
+    10 steps too dark to within 3; on four other frames Highlights is
+    as near as it was and Shadows a little nearer. A clip without the
+    two sliders pays nothing; with them the whole local stage is about
+    8 ms of a frame at 8448×4224.
 - **Demosaic.** The step that makes a full-colour picture of the sensor's
   mosaic is a new one, shaped after Camera Raw's: the same frames were
   developed there and here, and the method that reproduces its result was
@@ -274,8 +295,11 @@ the LUT, and not a curve laid over the picture the LUT left.
   exactly as the displayed light says, whatever LUT is loaded.
 - **The controls are the raw development's.** Shadows and Highlights are
   local: they lift or hold back an area as a whole and leave the texture
-  inside it alone, and what counts as a shadow follows the picture's own
-  levels. Whites, Blacks and Contrast follow those levels too. For a video
+  inside it alone (leaves against a sky keep their contrast when
+  Highlights is pulled down: the gain is smoothed over cells of four
+  pixels of the exported frame, as in the raw development), and what
+  counts as a shadow follows the picture's own levels. Whites, Blacks and
+  Contrast follow those levels too. For a video
   clip they are the levels of the whole clip, read once off sixteen frames
   spread over it (both eyes together, so the two eyes are toned alike): a
   control set for the clip then does the same to every frame, and the

@@ -343,6 +343,9 @@ pub struct ToneConstants {
     /// The long side, in pixels, of the frame the eyes belong to (two eyes
     /// side by side count as one frame); 0 = the eye's own.
     pub long_side: u32,
+    /// Pixels of an eye per cell of the smoothed gain
+    /// ([`crate::raw_local::gain_cell`]).
+    pub cell: u32,
 }
 
 /// The weights of a light's luminance (Rec.709's: what the picture is
@@ -507,6 +510,7 @@ impl LinearTone {
             encode: tables.encode.clone(),
             below: tables.below,
             long_side: 0,
+            cell: crate::raw_local::gain_cell(1.0),
         }
     }
 }
@@ -533,19 +537,36 @@ impl ToneConstants {
         (lit[0] * LUMA[0] + lit[1] * LUMA[1] + lit[2] * LUMA[2]).max(crate::raw_tone::BASE_FLOOR)
     }
 
-    /// One pixel through the stage: `codes` in, codes out; `base` is its
-    /// base level (log₂; its own level where the frame has none). The GPU
-    /// stage computes the same.
+    /// The Shadows / Highlights gain (log₂) of a base level, before the
+    /// white limiter; zero where the frame has none.
+    pub fn local_stops(&self, base: f32) -> f32 {
+        match &self.local {
+            Some(gains) => sample_curve(gains, (base - LOCAL_LO) * LOCAL_PER_STOP),
+            None => 0.0,
+        }
+    }
+
+    /// One pixel through the stage with the gain of its base level `base`
+    /// (log₂; its own level where the frame has none) as it is:
+    /// [`Self::apply_gained`] has what follows the gain.
     pub fn apply(&self, codes: [f32; 3], base: f32) -> [f32; 3] {
+        self.apply_gained(codes, self.local_stops(base))
+    }
+
+    /// One pixel through the stage: `codes` in, codes out; `stops` is the
+    /// Shadows / Highlights gain the picture gives it (the gain of its
+    /// base, smoothed: [`crate::raw_local::smooth_gain`]). The GPU stage
+    /// computes the same.
+    pub fn apply_gained(&self, codes: [f32; 3], stops: f32) -> [f32; 3] {
         // A channel may be below no light: a code under the curve's black.
         let lit = codes.map(|c| self.light(c) * self.gain);
         let luminance = lit[0] * LUMA[0] + lit[1] * LUMA[1] + lit[2] * LUMA[2];
-        // Shadows / Highlights: the gain of the base, limited by the room
-        // the pixel has below white.
+        // Shadows / Highlights: the gain, limited by the room the pixel
+        // has below white.
         let g = match &self.local {
-            Some(gains) => {
+            Some(_) => {
                 let room = (-luminance.max(1e-12).log2()).max(0.0);
-                2f32.powf(limit_gain(sample_curve(gains, (base - LOCAL_LO) * LOCAL_PER_STOP), room))
+                2f32.powf(limit_gain(stops, room))
             }
             None => 1.0,
         };
@@ -558,12 +579,6 @@ impl ToneConstants {
         // The middle channel keeps its place between the two, in light.
         lit.map(|v| self.code(if hi > lo { clo + (chi - clo) * (v - lo) / (hi - lo) } else { chi }))
     }
-}
-
-/// Samples of a gain curve that moves nothing (for a frame whose settings
-/// have no Shadows / Highlights the GPU stage still reads one).
-pub fn flat_gains() -> Vec<f32> {
-    vec![0.0; LOCAL_SAMPLES]
 }
 
 #[cfg(test)]
