@@ -49,6 +49,18 @@ type ClipStatsFor = (PathBuf, String);
 /// Where a sampling's outcome arrives.
 type ClipStatsRx = Receiver<std::result::Result<Arc<vr180_pipeline::clip_stats::ClipStats>, String>>;
 
+/// What a raw clip's automatic exposure is doing, as its controls show it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RawAutoShown {
+    /// Not in use.
+    Off,
+    /// The clip is being metered: the part done, 0..1 (`None`: about to start).
+    Metering(Option<f32>),
+    /// The exposure of the frame on screen, and the least and the most over
+    /// the clip, as the Exposure control would read them.
+    Now { stops: f32, range: (f32, f32) },
+}
+
 pub struct App {
     /// The UI context, handed to decoder workers so they can repaint the
     /// window when a frame lands (`DecoderControl::wake_ui`).
@@ -268,7 +280,7 @@ pub struct App {
     clip_stats: Option<(ClipStatsFor, crate::decoder::ClipStatsRef)>,
     /// The sampling in flight: what it is for, how to call it off, where
     /// its outcome arrives.
-    clip_stats_job: Option<(ClipStatsFor, Arc<std::sync::atomic::AtomicBool>, ClipStatsRx)>,
+    clip_stats_job: Option<(ClipStatsFor, Arc<std::sync::atomic::AtomicBool>, ClipStatsRx, Arc<vr180_pipeline::clip_stats::Progress>)>,
     /// What the last sampling failed for: not tried again while it is loaded.
     clip_stats_failed: Option<ClipStatsFor>,
     /// What a sampling is about to start for, and the moment it may: once
@@ -2961,8 +2973,8 @@ fn tr_zh(en: &'static str) -> &'static str {
             => "提亮或压暗画面的暗部并保留其中的纹理：变化跟随画面的大块区域，而不是逐个像素。",
         "Moves the brightest levels: where white sits." => "移动最亮的部分：决定白点的位置。",
         "Moves the darkest levels: where black sits." => "移动最暗的部分：决定黑点的位置。",
-        "Changes of exposure in linear light, made ahead of Lift / Gamma / Gain and the LUT. Each frame is measured, so the result follows the scene as a raw converter's does."
-            => "都是线性光里的曝光变化，在 Lift / Gamma / Gain 和 LUT 之前进行。每一帧都会被测量，所以效果像 RAW 转换软件那样跟随画面内容。",
+        "Changes of exposure in linear light, made ahead of Lift / Gamma / Gain and the LUT. They go by the levels of the whole clip, so a control does the same to every frame of it."
+            => "都是线性光里的曝光变化，在 Lift / Gamma / Gain 和 LUT 之前进行。依据的是整段素材的亮度分布，所以同一个设置对每一帧的作用相同。",
         "White balance" => "白平衡",
         "Lift" => "提升",
         "Gamma" => "伽马",
@@ -3115,6 +3127,16 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Raw development" => "RAW 显影",
         "Temperature (K)" => "色温 (K)",
         "Exposure" => "曝光",
+        "Auto exposure" => "自动曝光",
+        "The clip sets its own exposure, frame by frame: each frame gets the exposure at which its picture, developed with every other control as it is set here, comes out normally bright. The exposure follows the light smoothly, from both sides; nothing else in the rendering changes with it."
+            => "素材逐帧自己决定曝光：每一帧取这样一个曝光值，使它按这里其余设置显影出来的画面达到正常亮度。曝光从前后两侧平滑地跟随光线变化，渲染的其余部分不随之改变。",
+        "Stops added to what the automatic exposure finds: brighter or darker than its own target."
+            => "在自动曝光找到的数值上再加的档数：比它自己的目标更亮或更暗。",
+        "Smoothness (s)" => "平滑度（秒）",
+        "How slowly the exposure follows the picture: each frame's exposure is the average over about this many seconds of the clip on either side. 0 follows the picture as it changes; a large value gives the whole clip one exposure."
+            => "曝光跟随画面的快慢：每一帧的曝光是它前后各约这么多秒范围内的平均。0 表示紧跟画面变化；数值很大时整段素材用同一个曝光。",
+        "Metering the clip…" => "正在为素材测光…",
+        "Over the clip:" => "整段素材：",
         "Whites" => "白色色阶",
         "Blacks" => "黑色色阶",
         "As shot" => "原始设置",
@@ -6996,6 +7018,35 @@ impl App {
         self.clip_stats.as_ref().filter(|(of, _)| *of == what).map(|(_, stats)| stats.clone())
     }
 
+    /// The loaded clip is developed with an automatic exposure: it has to
+    /// be metered ([`vr180_pipeline::clip_stats::wants_meter`]).
+    fn clip_wants_meter(&self) -> bool {
+        self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) && self.settings.raw.auto_exposure
+    }
+
+    /// What the loaded raw clip's automatic exposure is doing, for its
+    /// controls.
+    fn raw_auto_shown(&self) -> RawAutoShown {
+        if !self.clip_wants_meter() {
+            return RawAutoShown::Off;
+        }
+        if let Some(stats) = self.loaded_clip_stats().filter(|s| s.0.has_meter()) {
+            let stage = vr180_pipeline::raw_tone::RawDevelop {
+                camera: vr180_pipeline::raw_color::RawCamera::X6, settings: self.settings.raw,
+                measure: vr180_pipeline::raw_tone::Measure::Wait,
+            };
+            if let Some(auto) = stats.0.auto_exposure(&stage) {
+                let t = self.current_display.as_ref().map_or(0.0, |d| d.timestamp_s as f64);
+                let (lo, hi) = auto.range();
+                return RawAutoShown::Now {
+                    stops: stage.exposure_control(auto.stops_at(t)),
+                    range: (stage.exposure_control(lo), stage.exposure_control(hi)),
+                };
+            }
+        }
+        RawAutoShown::Metering(self.clip_stats_job.as_ref().map(|job| job.3.fraction()))
+    }
+
     /// The loaded clip is rendered by something that goes by the picture's
     /// statistics: a raw clip always (its development), any other when a
     /// tone control that follows the levels is moved.
@@ -7014,7 +7065,7 @@ impl App {
     /// preview measures each frame by itself, as a still does.
     fn drive_clip_stats(&mut self, ctx: &egui::Context) {
         let what = self.clip_stats_for();
-        if let Some((of, cancel, rx)) = &self.clip_stats_job {
+        if let Some((of, cancel, rx, _)) = &self.clip_stats_job {
             if Some(of) != what.as_ref() {
                 cancel.store(true, Ordering::SeqCst);
                 self.clip_stats_job = None;
@@ -7047,7 +7098,11 @@ impl App {
         if self.clip_stats.as_ref().is_some_and(|(of, _)| *of != what) {
             self.clip_stats = None;
         }
-        if self.clip_stats.is_some() || self.clip_stats_job.is_some()
+        // What is there serves unless the clip has to be metered and was
+        // not: it is then sampled again, metered (its statistics stay in
+        // use meanwhile: they come out the same).
+        let metered = self.clip_wants_meter();
+        if self.clip_stats.as_ref().is_some_and(|(_, stats)| !metered || stats.0.has_meter()) || self.clip_stats_job.is_some()
             || !self.clip_wants_stats() || self.clip_stats_failed.as_ref() == Some(&what)
         {
             return;
@@ -7071,12 +7126,12 @@ impl App {
         let cfg = Self::build_export_cfg(
             &item.path, std::path::Path::new("/tmp/vr180-clip-stats-unused.mp4"), item.fps, item.source_kind,
             item.fisheye_eye_w, item.fisheye_eye_h, item.width, item.height, item.sharp_eye(),
-            &self.settings, &self.export_opts, self.clip_segments(&item.path));
+            &self.worker_settings(), &self.export_opts, self.clip_segments(&item.path));
         // An export has the GPU: nothing is sampled while it runs. An
         // export samples the clip it writes by itself, and what it sampled
         // is taken here as it is; else the clip is looked at again shortly.
         if self.batch_running {
-            match vr180_pipeline::clip_stats::cached(&cfg) {
+            match vr180_pipeline::clip_stats::cached(&cfg).filter(|stats| !metered || stats.has_meter()) {
                 Some(stats) => self.clip_stats = Some((what, crate::decoder::ClipStatsRef(stats))),
                 None => {
                     const AGAIN: std::time::Duration = std::time::Duration::from_secs(2);
@@ -7096,11 +7151,12 @@ impl App {
         };
         let (tx, rx) = crossbeam_channel::bounded(1);
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop = cancel.clone();
+        let progress = Arc::new(vr180_pipeline::clip_stats::Progress::default());
+        let (stop, shown) = (cancel.clone(), progress.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(vr180_pipeline::clip_stats::for_clip(&pipeline, &cfg, &stop).map_err(|e| e.to_string()));
+            let _ = tx.send(vr180_pipeline::clip_stats::for_clip_shown(&pipeline, &cfg, &stop, Some(&shown)).map_err(|e| e.to_string()));
         });
-        self.clip_stats_job = Some((what, cancel, rx));
+        self.clip_stats_job = Some((what, cancel, rx, progress));
     }
 
     /// Diff `self.settings` against `last_pushed_settings`; if changed,
@@ -10371,11 +10427,12 @@ impl App {
         let raw_reading = self.raw_settings_job.is_some();
         // What a clip's own bits of interface state are kept under.
         let loaded = self.loaded_path.clone();
+        let raw_auto = if is_raw { self.raw_auto_shown() } else { RawAutoShown::Off };
         let s = &mut self.settings;
 
         if is_raw {
             let read = draw_raw_develop_section(ui, &mut s.raw, vr180_pipeline::raw_color::RawCamera::X6,
-                if raw_reading { Some(tr("Reading…")) } else { raw_status.as_deref() }, !raw_reading);
+                if raw_reading { Some(tr("Reading…")) } else { raw_status.as_deref() }, !raw_reading, raw_auto);
             // Read the settings a frame was left with in Camera Raw: the
             // frame on screen, from the folder of camera-original DNGs
             // beside the take. On a thread: the folder may be on a share.
@@ -11498,7 +11555,7 @@ fn draw_tone_section(ui: &mut egui::Ui, tone: &mut vr180_pipeline::tone_linear::
         *tone = Default::default();
     }
     ui.label(RichText::new(tr(
-        "Changes of exposure in linear light, made ahead of Lift / Gamma / Gain and the LUT. Each frame is measured, so the result follows the scene as a raw converter's does."
+        "Changes of exposure in linear light, made ahead of Lift / Gamma / Gain and the LUT. They go by the levels of the whole clip, so a control does the same to every frame of it."
     )).small().color(Color32::GRAY));
 }
 
@@ -11508,6 +11565,7 @@ fn draw_raw_develop_section(
     camera: vr180_pipeline::raw_color::RawCamera,
     status: Option<&str>,
     can_read: bool,
+    auto: RawAutoShown,
 ) -> bool {
     ui.label(RichText::new(tr("Raw development")).strong());
     let (shot_k, shot_tint) = camera.as_shot_temperature();
@@ -11533,7 +11591,34 @@ fn draw_raw_develop_section(
             raw.tint = None;
         }
     });
-    ui.add(egui::Slider::new(&mut raw.exposure, -5.0..=5.0).text(tr("Exposure")).fixed_decimals(2));
+    // Exposure: set by hand, or found by the clip itself frame by frame.
+    // While it is found the control shows what the frame on screen has.
+    match auto {
+        RawAutoShown::Now { stops, .. } if raw.auto_exposure => {
+            let mut shown = stops;
+            ui.add_enabled(false, egui::Slider::new(&mut shown, -5.0..=8.0).text(tr("Exposure")).fixed_decimals(2));
+        }
+        _ => {
+            ui.add_enabled(!raw.auto_exposure, egui::Slider::new(&mut raw.exposure, -5.0..=5.0).text(tr("Exposure")).fixed_decimals(2));
+        }
+    }
+    ui.checkbox(&mut raw.auto_exposure, tr("Auto exposure")).on_hover_text(tr(
+        "The clip sets its own exposure, frame by frame: each frame gets the exposure at which its picture, developed with every other control as it is set here, comes out normally bright. The exposure follows the light smoothly, from both sides; nothing else in the rendering changes with it."));
+    if raw.auto_exposure {
+        ui.add(egui::Slider::new(&mut raw.auto_ev, -3.0..=3.0).text(tr("EV")).fixed_decimals(2))
+            .on_hover_text(tr("Stops added to what the automatic exposure finds: brighter or darker than its own target."));
+        ui.add(egui::Slider::new(&mut raw.auto_smooth, 0.0..=10.0).text(tr("Smoothness (s)")).fixed_decimals(1))
+            .on_hover_text(tr("How slowly the exposure follows the picture: each frame's exposure is the average over about this many seconds of the clip on either side. 0 follows the picture as it changes; a large value gives the whole clip one exposure."));
+        let text = match auto {
+            RawAutoShown::Metering(Some(done)) => Some(format!("{} {:.0} %", tr("Metering the clip…"), done * 100.0)),
+            RawAutoShown::Metering(None) => Some(tr("Metering the clip…").to_string()),
+            RawAutoShown::Now { range, .. } => Some(format!("{} {:+.2} … {:+.2}", tr("Over the clip:"), range.0, range.1)),
+            RawAutoShown::Off => None,
+        };
+        if let Some(text) = text {
+            ui.label(RichText::new(text).small().color(Color32::GRAY));
+        }
+    }
     let amount = |ui: &mut egui::Ui, v: &mut f32, label: &'static str| {
         ui.add(egui::Slider::new(v, -100.0..=100.0).text(tr(label)).fixed_decimals(0));
     };
@@ -11645,7 +11730,7 @@ mod camera_raw_tests {
         for _ in 0..2 {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 2000.0))), ..Default::default() };
             let out = ctx.run_ui(input, |ui| {
-                pressed |= draw_raw_develop_section(ui, &mut raw, vr180_pipeline::raw_color::RawCamera::X6, Some("Read from CAM0/000000364.dng"), true);
+                pressed |= draw_raw_develop_section(ui, &mut raw, vr180_pipeline::raw_color::RawCamera::X6, Some("Read from CAM0/000000364.dng"), true, super::RawAutoShown::Off);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -11656,6 +11741,31 @@ mod camera_raw_tests {
         // stays as shot (it used to become a custom one of the same kelvin).
         assert!(!pressed, "nothing was pressed");
         assert_eq!(raw, before);
+        // The automatic exposure: offered, its two controls only while it
+        // is on, and what it is doing said under them.
+        assert!(text.contains("Auto exposure") && !text.contains("Smoothness (s)") && !text.contains("Over the clip:"), "{text}");
+        let mut auto = vr180_pipeline::raw_tone::RawSettings { auto_exposure: true, ..Default::default() };
+        let before = auto;
+        for (shown, says) in [
+            (super::RawAutoShown::Metering(None), "Metering the clip…"),
+            (super::RawAutoShown::Metering(Some(0.431)), "Metering the clip… 43 %"),
+            (super::RawAutoShown::Now { stops: 1.7, range: (1.51, 2.72) }, "Over the clip: +1.51 … +2.72"),
+        ] {
+            for _ in 0..2 {
+                let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 2000.0))), ..Default::default() };
+                let out = ctx.run_ui(input, |ui| {
+                    draw_raw_develop_section(ui, &mut auto, vr180_pipeline::raw_color::RawCamera::X6, None, true, shown);
+                });
+                text.clear();
+                out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
+            }
+            assert!(text.contains("EV") && text.contains("Smoothness (s)") && text.contains(says), "{shown:?}: {text}");
+        }
+        // Shown, the frame's exposure is not written into the setting.
+        assert_eq!(auto, before);
+        for name in ["Auto exposure", "Smoothness (s)", "Metering the clip…", "Over the clip:"] {
+            assert_ne!(tr_zh(name), name, "{name} has no translation");
+        }
     }
 }
 

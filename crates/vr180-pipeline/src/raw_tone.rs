@@ -90,10 +90,28 @@ pub struct RawSettings {
     /// Colour noise reduction, 0..100 (a raw converter's default is 25):
     /// see [`crate::raw_chroma`].
     pub color_noise: f32,
+    /// The exposure is set by the clip itself, frame by frame, in place of
+    /// `exposure`: each frame gets the exposure at which its picture, as
+    /// the other settings here develop it, comes out at the brightness a
+    /// normally exposed picture has ([`crate::clip_stats::AutoExposure`]).
+    /// A clip only: a still keeps `exposure`.
+    pub auto_exposure: bool,
+    /// Stops added to what the automatic exposure finds: brighter or
+    /// darker than its own target.
+    pub auto_ev: f32,
+    /// How slowly the automatic exposure follows the picture, in seconds
+    /// (the width of the stretch of the clip each frame's exposure is
+    /// averaged over): 0 follows the picture as it changes, a large value
+    /// gives the whole clip one exposure.
+    pub auto_smooth: f32,
 }
 
 /// The colour noise reduction a clip starts with: a raw converter's default.
 pub const DEFAULT_COLOR_NOISE: f32 = 25.0;
+
+/// How slowly an automatic exposure follows the picture when nothing else
+/// is set, in seconds.
+pub const DEFAULT_AUTO_SMOOTH: f32 = 2.0;
 
 impl Default for RawSettings {
     fn default() -> Self {
@@ -101,6 +119,7 @@ impl Default for RawSettings {
             temperature: None, tint: None, exposure: 0.0, contrast: 0.0, highlights: 0.0, shadows: 0.0, whites: 0.0, blacks: 0.0,
             sharpen: crate::raw_sharpen::RawSharpen::default(),
             color_noise: DEFAULT_COLOR_NOISE,
+            auto_exposure: false, auto_ev: 0.0, auto_smooth: DEFAULT_AUTO_SMOOTH,
         }
     }
 }
@@ -307,6 +326,18 @@ pub enum Measure {
     Latest,
 }
 
+/// What the statistics of frames that were each given an exposure of their
+/// own no longer tell ([`RawDevelop::constants_exposed`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Exposed {
+    /// How far the top of the levels was below the sensor's clipping when
+    /// it was recorded, in stops ([`crate::raw_local::local_curves`]).
+    pub headroom: f32,
+    /// The largest of the exposures given, as a factor: where the sensor's
+    /// white lies among the exposed values.
+    pub sensor_gain: f64,
+}
+
 /// The raw development stage of a colour stack: a camera and the settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RawDevelop {
@@ -328,6 +359,17 @@ impl RawDevelop {
     /// Exposure in stops, the camera's own offset included.
     fn exposure(&self) -> f64 {
         self.settings.exposure as f64 + self.camera.baseline_exposure
+    }
+
+    /// This stage with its exposure set so that the whole of it, the
+    /// camera's own offset included, is `stops`.
+    pub fn with_whole_exposure(&self, stops: f32) -> Self {
+        Self { settings: RawSettings { exposure: stops - self.camera.baseline_exposure as f32, ..self.settings }, ..*self }
+    }
+
+    /// What the Exposure control would read for a whole exposure of `stops`.
+    pub fn exposure_control(&self, stops: f32) -> f32 {
+        stops - self.camera.baseline_exposure as f32
     }
 
     /// What does not depend on the frame: the camera's white and matrices.
@@ -361,9 +403,17 @@ impl RawDevelop {
     /// Everything the stage needs for one frame: `stats` measured on it;
     /// `curves` replaces the Shadows / Highlights curves derived from them.
     pub fn constants_for(&self, stats: &FrameStats, curves: Option<&LocalCurves>) -> DevelopConstants {
+        self.constants_exposed(stats, curves, None)
+    }
+
+    /// [`Self::constants_for`] for statistics that are not as the sensor
+    /// recorded them: those of a clip whose frames have each been given an
+    /// exposure of their own already (`exposed` says what the statistics
+    /// alone no longer tell), which this stage's exposure is then added to.
+    pub fn constants_exposed(&self, stats: &FrameStats, curves: Option<&LocalCurves>, exposed: Option<Exposed>) -> DevelopConstants {
         let geometry = self.geometry();
         let gain = 2f64.powf(self.exposure());
-        let sensor_white = self.sensor_white(gain);
+        let sensor_white = self.sensor_white(gain * exposed.map_or(1.0, |e| e.sensor_gain));
         let plain_white = white_point_of(stats.keys.max as f64 * gain, sensor_white);
         let dark_key = (stats.keys.dark as f64 * gain).max(2f64.powi(-30)).log2();
         // Shadows / Highlights: the gain over the base level, and the white
@@ -379,10 +429,10 @@ impl RawDevelop {
                     // clipping, as shot: exposure moves the curves with the
                     // frame, it does not change them (measured with
                     // exposure series).
-                    let headroom = stats.levels.last().map_or(0.0, |top| {
+                    let headroom = exposed.map(|e| e.headroom).unwrap_or_else(|| stats.levels.last().map_or(0.0, |top| {
                         let shot_key = (stats.keys.dark as f64).max(2f64.powi(-30)).log2();
                         -(default_black(2f64.powf(*top as f64), shot_key).max(1e-9).log2()) as f32
-                    });
+                    }));
                     derived = local_curves(&levels, headroom);
                     &derived
                 }

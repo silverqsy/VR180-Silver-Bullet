@@ -95,6 +95,13 @@ fn settings_for(path: &Path) -> anyhow::Result<Settings> {
         let g = |i: usize| v.get(i).copied().unwrap_or(0.0);
         s.raw = vr180_pipeline::raw_tone::RawSettings { exposure: g(0), contrast: g(1), highlights: g(2), shadows: g(3), whites: g(4), blacks: g(5), ..s.raw };
     }
+    // VR180_PROBE_RAWAUTO=<ev>,<smooth seconds>: a raw take's automatic exposure in place of the one VR180_PROBE_RAWDEV names.
+    if let Some(v) = switch("VR180_PROBE_RAWAUTO") {
+        let v: Vec<f32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+        s.raw.auto_exposure = true;
+        s.raw.auto_ev = v.first().copied().unwrap_or(0.0);
+        s.raw.auto_smooth = v.get(1).copied().unwrap_or(vr180_pipeline::raw_tone::DEFAULT_AUTO_SMOOTH);
+    }
     if let Some(v) = switch("VR180_PROBE_WB") {
         let v: Vec<f32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
         s.raw.temperature = v.first().copied();

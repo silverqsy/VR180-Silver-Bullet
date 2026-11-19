@@ -2934,6 +2934,7 @@ fn run_fisheye_frames<F: PreviewFeed>(
             preview_eye_w, preview_eye_h,
             eye_match_arg(&eye_match_state, kind, stab_idx, auto_eye),
             raw_reference, vr180_pipeline::raw_tone::Measure::Latest,
+            Some(frame_time_s(pts_s, absolute_frame_idx, dt)),
         )?;
         if matches!(kind, vr180_pipeline::SourceKind::Insta360Insv) && auto_eye {
             if let Some(r) = pipeline.eye_match_readback_poll(&eye_match_state, &mut eye_match_rb) {
@@ -5233,7 +5234,7 @@ fn compose_with_color_and_mode(
     } else {
         vr180_pipeline::raw_tone::Measure::Wait
     };
-    compose_view_with_color_and_mode(pipeline, s, left_tex, right_tex, eye_w, eye_h, eye_match, None, measure)
+    compose_view_with_color_and_mode(pipeline, s, left_tex, right_tex, eye_w, eye_h, eye_match, None, measure, None)
 }
 
 /// [`compose_with_color_and_mode`] for a view that may be a raw clip's:
@@ -5242,7 +5243,9 @@ fn compose_with_color_and_mode(
 /// measures the levels a frame's tone is derived from (a raw clip's
 /// development, the tone controls of any other clip): the live preview takes
 /// the last measurement that came back, a still drawn on demand measures its
-/// own frame and waits for it.
+/// own frame and waits for it. `frame_time`: the moment of the clip the
+/// frame is from, seconds, where the caller knows it: what a raw clip's
+/// automatic exposure is read at.
 #[allow(clippy::too_many_arguments)]
 fn compose_view_with_color_and_mode(
     pipeline: &Device,
@@ -5254,9 +5257,11 @@ fn compose_view_with_color_and_mode(
     eye_match: Option<(&vr180_pipeline::gpu::EyeMatchState, vr180_pipeline::gpu::EyeMatchFrame)>,
     raw_reference: Option<vr180_pipeline::raw_gpu::RawReference>,
     measure: vr180_pipeline::raw_tone::Measure,
+    frame_time: Option<f64>,
 ) -> anyhow::Result<(wgpu::Texture, u32, u32)> {
     let mut color_plan = s.build_color_stack();
     color_plan.raw_reference = raw_reference;
+    color_plan.frame_time_s = frame_time;
     // A raw clip's sharpening is the export's: a frame drawn at another
     // size scales its radius.
     if s.export_eye_w > 0 && eye_w > 0 {
@@ -5874,6 +5879,7 @@ fn render_still_from_pair(
         pipeline, s, &left_tex, &right_tex, ew, eh,
         eye_match_state.as_ref().and_then(|st| eye_match_arg(st, kind, stab_idx, true)),
         raw_reference, vr180_pipeline::raw_tone::Measure::Wait,
+        Some(pair.pts_s),
     )?;
     Ok(Some((sbs, ow, oh)))
 }

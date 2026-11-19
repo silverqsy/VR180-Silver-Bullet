@@ -4804,6 +4804,11 @@ pub struct ColorStackPlan {
     /// to be in each frame. `None`: a frame is measured by itself (a still,
     /// and a preview that has not sampled its clip yet).
     pub clip_stats: Option<std::sync::Arc<crate::clip_stats::ClipStats>>,
+    /// The moment of the clip the frame being graded is from, seconds:
+    /// what a raw clip's automatic exposure is read at
+    /// ([`crate::clip_stats::AutoExposure`]). `None`: not a frame of a
+    /// clip's timeline, or not known; the exposure that is set then stands.
+    pub frame_time_s: Option<f64>,
 }
 
 impl Default for ColorStackPlan {
@@ -4825,6 +4830,7 @@ impl Default for ColorStackPlan {
             raw_reference: None,
             raw_pixel_scale: 1.0,
             clip_stats: None,
+            frame_time_s: None,
         }
     }
 }
@@ -6925,7 +6931,7 @@ impl Device {
         } else { None };
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(12);
         // A raw source: this frame's tone keys, read off the eye itself.
-        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[src], plan.raw_reference.as_ref(), stage, plan.raw_pixel_scale, plan.clip_stats.as_deref()));
+        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[src], plan.raw_reference.as_ref(), stage, plan.raw_pixel_scale, plan.clip_stats.as_deref(), plan.frame_time_s));
         // The tone stage of a clip that is not raw: this eye is the frame.
         let tone = self.linear_tone_constants(&[src], plan);
         let idx = self.record_color_stack(
@@ -6964,7 +6970,7 @@ impl Device {
         let mut intermediates: Vec<wgpu::Texture> = Vec::with_capacity(24);
         // A raw source: ONE set of tone keys for the frame, read off both
         // eyes together, so the two are developed alike.
-        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[left, right], plan.raw_reference.as_ref(), stage, plan.raw_pixel_scale, plan.clip_stats.as_deref()));
+        let raw = plan.raw_develop.as_ref().map(|stage| self.raw_develop_constants(&[left, right], plan.raw_reference.as_ref(), stage, plan.raw_pixel_scale, plan.clip_stats.as_deref(), plan.frame_time_s));
         // And one set of tone constants where the clip is not raw.
         let tone = self.linear_tone_constants(&[left, right], plan);
         let li = self.record_color_stack(

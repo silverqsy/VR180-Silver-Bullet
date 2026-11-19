@@ -4032,6 +4032,77 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       dedicated device `export_device()` makes; the window must stay
       responsive while it runs.
 
+40. **Automatic exposure for raw clips (2026-11-18, Mac; UNRELEASED).** The
+    user-facing text is in the CHANGELOG (raw development, "Automatic
+    exposure"). `RawSettings::auto_exposure`, `auto_ev`, `auto_smooth`;
+    the Raw development panel has the switch under Exposure and the two
+    controls while it is on.
+    - **What it is.** One exposure per frame, smooth in time, and ONE
+      development for the clip (`clip_stats::AutoExposure`): a frame is
+      `F(camera × 2^E(t))` with `F` fixed. Nothing but the gain follows
+      the frame, which is what item 39 is about.
+    - **Metering.** `clip_stats::measure(.., meter = true, ..)` also reads
+      a frame every `METER_INTERVAL_S` (0.5 s; at most `METER_FRAMES` =
+      600 a clip): `meter_take` takes ONE eye (the left picture's channel)
+      straight off the capture with `x6b::decode_record(.., Channels::One)`
+      and picks the samples of a 21 × 21 half-equirect copy at places
+      found once (a 512 px picture whose pixels say their own position is
+      drawn through the lens; its blue channel says how much of the
+      picture shows there). No demosaic, no upload, no drawing per frame:
+      ~30 ms a frame from a share against ~330 ms through the frame
+      iterator. `for_clip` meters a clip that `wants_meter` and was
+      sampled without (the 16 statistics frames are read at the same
+      moments, so the statistics do not change).
+    - **What a frame asks for.** The exposure at which the mean of what
+      its picture is DISPLAYED as is `AUTO_TARGET` (0.38 of the encoded
+      range). The mean is over the copy, weighted cos²(latitude) ×
+      cos(longitude); what a part is displayed as is read off
+      `grey_response(F)`, the development's answer to a grey of each
+      exposed level (its base its own level), through a histogram of the
+      copy's levels. So the other controls enter the metering: that is the
+      "based on the other grading" the user asked for.
+    - **The loop.** `F` is derived from the clip's statistics, and those
+      are the statistics of the clip AS EXPOSED (`raw_exposed`: every
+      sampled frame's cells shifted by its own exposure, as a manual
+      exposure shifts them; `raw_tone::Exposed` carries the headroom of
+      the frame the top comes from and the largest gain, for the sensor's
+      white). Exposures and `F` are iterated until no exposure moves by
+      more than 0.002 stops (7 to 8 rounds from nothing, 25 to 40 ms for
+      300 frames; a changed setting starts from the last solution). The
+      search is a contraction because Highlights / Shadows curves follow
+      the exposed levels (about 0.45 of a shift comes back with Highlights
+      at −100). `auto_ev` is then a manual exposure of the clip as the
+      automatic one left it (`with_whole_exposure(ev).constants_exposed`).
+      Smoothing: a Gaussian over time, `auto_smooth` seconds wide, on the
+      metered exposures; between two of them a straight line. A frame's
+      exposure is kept within `AUTO_REACH` (3 stops) of the clip's median.
+    - **Where a frame's time comes from.** `ColorStackPlan::frame_time_s`:
+      `plan_with_raw_reference` sets it from the pair's `pts_s` in an
+      export, `compose_view_with_color_and_mode` gets it from the live
+      loop and from a still. Without a time, or for a clip not metered
+      yet, the exposure that is set stands.
+    - **Verified on the Mac** (same take as item 39, the user's settings).
+      A clip held at one exposure (smoothness 100000) and that exposure
+      set by hand give the same sky and whole-picture series; the preview
+      worker and the export read +1.529 and +1.427 stops at 36.503 s and
+      42.492 s alike; the fixed-exposure rendering is byte-identical to
+      what it was before the feature. On the user's ten graded takes the
+      automatic exposure's mean is −0.99 to +1.33 stops from the exposure
+      set by hand, median +0.05: `AUTO_TARGET` was set from their median
+      reading at their own exposures (0.375). Tests: 7 in `clip_stats`
+      (one brightness for all frames, EV, smoothness, a steady clip =
+      the same exposure by hand, the reach, the meter's reading), the raw
+      panel's test.
+    - **Limits.** The sensor's white is taken at the clip's LARGEST
+      exposure: in a frame exposed far below that, a blown area is shown
+      a little under white. One eye is metered. The copies are not kept on
+      disk: a clip is metered again in every run of the app. Not seen in
+      the app's window.
+    - **Windows, to look at.** No code is platform-specific. (1) It
+      builds. (2) Auto exposure on a raw clip: "Metering the clip… N %"
+      under the controls, then the range; the Exposure control follows
+      playback; the log says "… metered for the automatic exposure".
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

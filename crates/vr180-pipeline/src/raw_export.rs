@@ -313,6 +313,11 @@ impl FrameSource {
         // and a frame is no spatial video, whatever the clip's export is.
         let mut cfg = cfg.clone();
         cfg.spatial = None;
+        // A clip developed with an automatic exposure: metered, so that a
+        // frame's file can say the exposure the frame has.
+        if crate::clip_stats::wants_meter(&cfg) {
+            crate::fisheye_export::provide_clip_stats(&pipeline, &mut cfg, &std::sync::atomic::AtomicBool::new(false))?;
+        }
         // Enhanced frames, and the size that goes with them, where this
         // stretch has some.
         cfg.settle_raw_enhanced(stretch.0, stretch.1);
@@ -391,10 +396,17 @@ impl FrameSource {
         let frame = if mono { left } else { self.pipeline.compose_sbs_textures_16(&left, &right, cfg.eye_w, cfg.eye_h)? };
         let bytes = self.pipeline.read_texture_rgb48(&frame, w, h)?;
         let rgb16: Vec<u16> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-        let (camera, settings) = match &cfg.color_stack.raw_develop {
+        let (camera, mut settings) = match &cfg.color_stack.raw_develop {
             Some(stage) => (stage.camera, stage.settings),
             None => (RawCamera::X6, RawSettings::default()),
         };
+        // An automatic exposure: the file carries the exposure of its own
+        // frame, as the Exposure a raw converter reads.
+        if let (true, Some(stage), Some(clip)) = (settings.auto_exposure, &cfg.color_stack.raw_develop, &cfg.color_stack.clip_stats) {
+            if let Some(auto) = clip.auto_exposure(stage) {
+                settings.exposure = stage.exposure_control(auto.stops_at(pair.pts_s));
+            }
+        }
         let description = format!("frame {row} at {:.4} s", pair.pts_s);
         let meta = frame_meta(&camera, &settings, mono, description);
         write_linear_dng(path, &LinearDngImage { width: w, height: h, rgb16: &rgb16, white_level: 65535 }, &meta, compression, None)
@@ -538,7 +550,7 @@ mod tests {
         for s in [
             RawSettings::default(),
             RawSettings { temperature: Some(5200.0), tint: Some(-12.0), exposure: -1.25, contrast: 15.0, highlights: -65.0, shadows: 40.0, whites: 8.0, blacks: -22.0,
-                sharpen: crate::raw_sharpen::RawSharpen { amount: 55.0, radius: 1.4, detail: 30.0, masking: 20.0 }, color_noise: 60.0 },
+                sharpen: crate::raw_sharpen::RawSharpen { amount: 55.0, radius: 1.4, detail: 30.0, masking: 20.0 }, color_noise: 60.0, ..Default::default() },
             RawSettings { exposure: 2.5, shadows: 100.0, color_noise: 0.0, ..Default::default() },
         ] {
             let back = read_develop_xmp(&develop_xmp(&s, &cam)).expect("settings in the packet");

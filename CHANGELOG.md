@@ -92,6 +92,32 @@ converter's controls for it, and every frame can be had as a DNG.
   until it is in, the preview measures each frame by itself. The DNG of a
   frame opened in a raw converter is developed from that frame alone, so
   it matches the clip's frame where the frame is like the rest of the clip.
+- **Automatic exposure.** Under Exposure, **Auto exposure** lets the clip
+  set its own exposure, frame by frame. A frame gets the exposure at which
+  its picture comes out normally bright as the clip is developed, with
+  every other control where it stands: the picture is metered as it will
+  be shown (white balance, Highlights, Shadows and the rest included),
+  weighted toward where the lens looks. Pull the highlights down and the
+  frames are exposed up to keep the picture where it was. Two controls go
+  with it. **EV** adds stops to what it finds. **Smoothness** is how many
+  seconds of the clip, on either side, a frame's exposure is averaged
+  over: 0 follows the light as it changes, a few seconds follow it the way
+  an eye does, a large value gives the whole clip one exposure. Because
+  the whole clip is known, the exposure moves ahead of a change as much as
+  after it, and never jumps. The exposure is the only thing that moves:
+  the development stays one for the whole clip, a fixed rendering of
+  exposed values, as if the camera had exposed each frame so. A clip
+  given one exposure this way is developed exactly as that exposure set by
+  hand develops it. The clip is metered at half-second steps when the
+  control is first switched on (ten to twenty seconds for a take of two
+  and a half minutes on a network share; the panel says how far it is).
+  After that every control answers at once. The Exposure control shows the
+  exposure of the frame on screen, the preview and the export read the
+  same exposures, and a frame's DNG carries its own. At EV 0 the target is
+  the middle of ten daylight takes graded by hand, which themselves lie up
+  to a stop either side of it: a meter does not know what a picture is
+  meant to look like, and EV is for that. A frame the lens saw nothing in
+  is not lifted more than three stops beyond the clip's middle.
 - **One grade, one look, in every view.** A reframed view shows a part of
   the scene and a Lens Space frame has a black border, so measured on their
   own they would be developed differently from the VR180 picture (with

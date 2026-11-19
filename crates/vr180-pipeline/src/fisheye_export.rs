@@ -4880,18 +4880,22 @@ pub(crate) fn plan_with_raw_reference<'a>(
     pair: &FisheyePair,
     job: &EyeJob,
 ) -> Result<std::borrow::Cow<'a, ColorStackPlan>> {
-    if plan.raw_develop.is_none() {
+    let Some(stage) = &plan.raw_develop else {
+        return Ok(std::borrow::Cow::Borrowed(plan));
+    };
+    let eyes = pair.gpu.as_deref().map(|g| (&g.left, &g.right));
+    let reference = job.raw_reference(pipeline, eyes, RAW_REFERENCE_SLOT)?;
+    // An automatic exposure is read at the frame's own moment.
+    let timed = stage.settings.auto_exposure;
+    if reference.is_none() && !timed {
         return Ok(std::borrow::Cow::Borrowed(plan));
     }
-    let eyes = pair.gpu.as_deref().map(|g| (&g.left, &g.right));
-    Ok(match job.raw_reference(pipeline, eyes, RAW_REFERENCE_SLOT)? {
-        Some(reference) => {
-            let mut plan = plan.clone();
-            plan.raw_reference = Some(reference);
-            std::borrow::Cow::Owned(plan)
-        }
-        None => std::borrow::Cow::Borrowed(plan),
-    })
+    let mut plan = plan.clone();
+    plan.raw_reference = reference;
+    if timed {
+        plan.frame_time_s = Some(pair.pts_s);
+    }
+    Ok(std::borrow::Cow::Owned(plan))
 }
 
 /// Both eyes of a pair at 16 bits a channel (`Rgba16Unorm`), for the 10-bit
