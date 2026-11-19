@@ -411,6 +411,9 @@ pub struct App {
     /// A raw video clip's snapshot also writes the frame as a linear DNG, on
     /// its own thread: the file and where its outcome arrives.
     frame_dng_job: Option<(PathBuf, crossbeam_channel::Receiver<std::result::Result<(), String>>)>,
+    /// The frame on screen being written as the sensor recorded it (the
+    /// transport row's Original DNG): what it says once it is written.
+    original_dng_job: Option<crossbeam_channel::Receiver<std::result::Result<String, String>>>,
     /// The loaded raw take's enhanced frames, as last looked up.
     enhanced_probe: EnhancedProbe,
     /// A raw clip's Camera Raw settings being read from its camera-original
@@ -962,6 +965,51 @@ mod file_info_tests {
         assert_eq!(bitrate_label(&[], Some(1_234_560_000), true).as_deref(), Some("≈ 1234.6 Mbps"));
         // Nothing known (a still).
         assert_eq!(bitrate_label(&[], None, true), None);
+    }
+
+    #[test]
+    fn dropped_frames_text() {
+        use super::{dropped_frames_hover, dropped_frames_label, dropped_hole_text, DROPPED_LISTED};
+        use vr180_pipeline::frame_timeline::Hole;
+        let hole = |row: usize, at_s: f64, frames: usize| Hole { row, at_s, frames };
+        // None missing.
+        assert_eq!((dropped_frames_label(&[], false), dropped_frames_label(&[], true)), ("none".to_string(), "无".to_string()));
+        assert!(dropped_frames_hover(&[], false).starts_with("No frame is missing"));
+        // One place, several: the frames are summed.
+        let one = [hole(10, 0.2, 1)];
+        assert_eq!((dropped_frames_label(&one, false), dropped_frames_label(&one, true)), ("1 in 1 place".to_string(), "1 帧，1 处".to_string()));
+        let three = [hole(10, 0.2, 1), hole(700, 12.5, 3), hole(4000, 75.25, 5)];
+        assert_eq!((dropped_frames_label(&three, false), dropped_frames_label(&three, true)), ("9 in 3 places".to_string(), "9 帧，3 处".to_string()));
+        // A place: when and how many.
+        assert_eq!(dropped_hole_text(&three[0], false), "00:00.20: 1 frame dropped");
+        assert_eq!(dropped_hole_text(&three[2], false), "01:15.25: 5 frames dropped");
+        assert_eq!(dropped_hole_text(&three[1], true), "00:12.50：丢 3 帧");
+        // The hover text lists the places, each on its own line, after what they are.
+        let text = dropped_frames_hover(&three, false);
+        assert_eq!(text.lines().count(), 4);
+        assert!(text.lines().nth(2) == Some("00:12.50: 3 frames dropped"));
+        // More places than it lists: the rest are counted.
+        let many: Vec<Hole> = (0..DROPPED_LISTED + 7).map(|i| hole(i * 10, i as f64, 1)).collect();
+        let text = dropped_frames_hover(&many, true);
+        assert_eq!(text.lines().count(), 1 + DROPPED_LISTED + 1);
+        assert_eq!(text.lines().last(), Some("……另有 7 处"));
+    }
+
+    #[test]
+    fn a_frame_as_the_sensor_recorded_it_goes_to_the_clips_folder() {
+        use super::{original_frame_saved, original_frames_dir};
+        use std::path::Path;
+        // Beside the clip, or in the export folder when one is set: the
+        // folder a camera original DNG sequence of the clip is named.
+        let take = Path::new("/media/card/RAWVIDEO-20261118-154401");
+        assert_eq!(original_frames_dir(take, None), Path::new("/media/card/RAWVIDEO-20261118-154401_OriginalDNG"));
+        assert_eq!(original_frames_dir(take, Some(Path::new("/out"))), Path::new("/out/RAWVIDEO-20261118-154401_OriginalDNG"));
+        let pair = vr180_pipeline::sensor_dng::WrittenPair {
+            request: 5324, exposure_ns: [1, 2], signature: String::new(), files: vec![(0, 10), (1, 11)],
+        };
+        assert_eq!(
+            original_frame_saved(&pair, Path::new("/out/RAWVIDEO-20261118-154401_OriginalDNG")),
+            "CAM0/000005324.dng + CAM1/000005324.dng (RAWVIDEO-20261118-154401_OriginalDNG)");
     }
 }
 
@@ -2715,6 +2763,26 @@ fn unused_path(out: PathBuf) -> PathBuf {
     (2..).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|cand| !cand.exists()).unwrap_or(out)
 }
 
+/// The folder the frames of the clip at `source` go to as the sensor
+/// recorded them when they are written one at a time: `<name>_OriginalDNG`
+/// in `out_dir`, or beside the clip when there is none. An existing folder
+/// is added to.
+fn original_frames_dir(source: &std::path::Path, out_dir: Option<&std::path::Path>) -> PathBuf {
+    let beside = App::default_frames_dir_for(source, true);
+    match (out_dir, beside.file_name()) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => beside,
+    }
+}
+
+/// What the status line says of a frame written as the sensor recorded it:
+/// its files (`CAM0/000005324.dng + CAM1/000005324.dng`) and their folder.
+fn original_frame_saved(pair: &vr180_pipeline::sensor_dng::WrittenPair, out: &std::path::Path) -> String {
+    let files: Vec<String> = pair.files.iter().map(|f| vr180_pipeline::sensor_dng::frame_file(f.0, pair.request)).collect();
+    let folder = out.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+    format!("{} ({folder})", files.join(" + "))
+}
+
 /// UI language. English is the source of truth; `tr` maps the core chrome
 /// strings to Chinese, falling back to the English literal for anything not
 /// in the table (so untranslated strings degrade gracefully).
@@ -2797,6 +2865,10 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Every frame as a DNG in a folder: the developed view, or the sensor's own frames." => "每一帧导出为文件夹里的一个 DNG：可以是显影后的画面，也可以是传感器原片。",
         "Every frame as a linear DNG in a folder, with this clip's raw development settings inside each file." => "每一帧导出为一个线性 DNG，放进同一个文件夹，每个文件里带着这个片段的 RAW 显影设置。",
         "📷 Snapshot" => "📷 截图",
+        "Original DNG" => "原片 DNG",
+        "Save this frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number, in the clip's OriginalDNG folder (Shift+S)" => "把当前帧按传感器记录的原样保存：每眼一个 Bayer DNG，以相机的帧号命名，放进这个片段的 OriginalDNG 文件夹（Shift+S）",
+        "Writing the camera's frame" => "正在写出相机原片",
+        "Camera original frame failed" => "相机原片导出失败",
         "Save this frame as a JPEG in the export folder (S)" => "把当前帧存为 JPEG 到导出文件夹（S）",
         "Save this frame as a JPEG and as a linear DNG in the export folder (S)" => "把当前帧存为 JPEG 和线性 DNG 到导出文件夹（S）",
         "Nothing to snapshot yet" => "还没有可截图的画面",
@@ -2916,6 +2988,7 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Stream" => "视频流",
         "FPS" => "帧率",
         "Duration" => "时长",
+        "Dropped frames" => "丢帧",
         "EAC tile" => "EAC 瓦片",
         "Eye dims" => "单眼尺寸",
         "No file loaded." => "未加载文件。",
@@ -3510,9 +3583,21 @@ struct ClipInfo {
     /// The clip's size over its duration, bits per second — shown when the
     /// container states no stream rate (Blackmagic RAW). `None` for a still.
     file_bitrate_bps: Option<u64>,
+    /// Where frames are missing from the clip's track, in order (empty: none
+    /// are); `None` when the track's own frame times could not be read.
+    holes: Option<Vec<vr180_pipeline::frame_timeline::Hole>>,
 }
 
 impl ClipInfo {
+    /// The frames the camera dropped, for a clip of the Insta360 X6 (its
+    /// video files and its raw takes leave a hole in the track where the
+    /// sensor lost frames): the places, in order. `None` for another camera
+    /// and when the track could not be read.
+    fn x6_holes(&self) -> Option<&[vr180_pipeline::frame_timeline::Hole]> {
+        let x6 = self.source_kind == vr180_pipeline::SourceKind::Insta360Insv || self.source_kind.is_raw_video();
+        self.holes.as_deref().filter(|_| x6)
+    }
+
     /// The source holds ONE eye: the preview shows it alone and an export
     /// writes it as the whole frame.
     fn single_eye(&self) -> bool {
@@ -3622,6 +3707,8 @@ struct LoadedMeta {
     fps: f32,
     duration_sec: f64,
     frame_count: u32,
+    /// See [`ClipInfo::holes`].
+    holes: Option<Vec<vr180_pipeline::frame_timeline::Hole>>,
     segments: Vec<PathBuf>,
     cori_count: usize,
     grav_count: usize,
@@ -3836,6 +3923,7 @@ impl App {
             snapshot_status: None,
             snapshot_pending: None,
             frame_dng_job: None,
+            original_dng_job: None,
             enhanced_probe: EnhancedProbe::default(),
             raw_settings_job: None,
             raw_settings_status: None,
@@ -6275,12 +6363,17 @@ impl App {
         // Frames actually in the track: a clip with dropped frames has fewer
         // than duration × fps (the X6 leaves holes where the sensor dropped
         // frames). BRAW and stills have no MP4 sample table — keep the count.
-        let frame_count = if source_kind == vr180_pipeline::SourceKind::BlackmagicRaw || source_kind.is_still() {
-            frame_count
+        let timeline = if source_kind == vr180_pipeline::SourceKind::BlackmagicRaw || source_kind.is_still() {
+            None
         } else {
-            vr180_pipeline::frame_timeline::FrameTimeline::from_segments(&segments)
-                .map(|t| t.len() as u32).filter(|n| *n > 0).unwrap_or(frame_count)
+            vr180_pipeline::frame_timeline::FrameTimeline::from_segments(&segments).filter(|t| !t.is_empty())
         };
+        let frame_count = timeline.as_ref().map(|t| t.len() as u32).unwrap_or(frame_count);
+        // The same table says where frames are missing (file info, timeline).
+        let holes = timeline.as_ref().map(|t| t.holes());
+        if let Some(t) = timeline.as_ref().filter(|t| t.dropped_frames() > 0) {
+            tracing::info!("load: frame timeline — {}", t.summary());
+        }
 
         // Bit rate for the file info: the video streams' own rates come with
         // the probe; the whole clip's bytes over its duration stand in where
@@ -6362,7 +6455,7 @@ impl App {
         Ok(LoadedMeta {
             token, path, preserve_clip_settings, source_kind, raw_one_lens,
             width: probe.width, height: probe.height, fps: probe.fps,
-            duration_sec, frame_count, segments,
+            duration_sec, frame_count, holes, segments,
             cori_count, grav_count, srot_ms,
             detected_rs_mode, fisheye_eye_w, fisheye_eye_h,
             eac_cal_dim, foa_audio, quad_audio, hlg: probe.hlg, braw_lut, braw_color, x6,
@@ -6523,6 +6616,7 @@ impl App {
             raw_one_lens: meta.raw_one_lens,
             video_bitrates_bps: meta.video_bitrates_bps,
             file_bitrate_bps: meta.file_bitrate_bps,
+            holes: meta.holes,
         });
         self.loaded_path = Some(meta.path);
         // A single-eye clip has nothing to put on a 3D display.
@@ -6871,6 +6965,28 @@ impl App {
                     [egui::pos2(x_out, track_y0 - 3.0), egui::pos2(x_out, track_y1 + 3.0)],
                     egui::Stroke::new(2.0, Color32::from_rgb(120, 200, 255)),
                 );
+            }
+
+            // Where the camera dropped frames (an X6 clip): a mark as wide as
+            // the hole, two pixels at least, over the track's upper part.
+            let holes = self.clip.as_ref().and_then(|c| c.x6_holes()).unwrap_or(&[]);
+            let dt = self.clip.as_ref().map(|c| 1.0 / c.fps.max(1e-3) as f64).unwrap_or(0.0);
+            for hole in holes {
+                let x0 = t_to_x(hole.at_s);
+                let x1 = t_to_x(hole.at_s + hole.frames as f64 * dt).max(x0 + 2.0);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(x0, track_y0 - 4.0), egui::pos2(x1, track_y0 + 4.0)),
+                    0.0, DROPPED_COLOR);
+            }
+            // The pointer on a mark says what is missing there.
+            if let Some(pos) = resp.hover_pos() {
+                let near = holes.iter()
+                    .map(|h| (h, (t_to_x(h.at_s) - pos.x).abs().min((t_to_x(h.at_s + h.frames as f64 * dt) - pos.x).abs())))
+                    .filter(|(_, d)| *d <= 4.0)
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                if let Some((hole, _)) = near {
+                    resp.clone().on_hover_text_at_pointer(dropped_hole_text(hole, cur_lang() == Lang::Zh));
+                }
             }
 
             // Playhead.
@@ -8546,6 +8662,7 @@ impl eframe::App for App {
         self.poll_full_res(ctx);
         self.poll_snapshot(ctx);
         self.poll_frame_dng(ctx);
+        self.poll_original_dng(ctx);
         self.poll_raw_settings(ctx);
         // Import merge/individual prompt (shown when a multi-file recording
         // is picked). Modal-ish: it sits on top until resolved.
@@ -8579,6 +8696,7 @@ impl eframe::App for App {
         let mut pending_trim_in:  Option<Option<f64>> = None;
         let mut pending_trim_out: Option<Option<f64>> = None;
         let mut pending_snapshot = false;
+        let mut pending_original = false;
         let mut pending_project_save = false;
         if !ctx.wants_keyboard_input() {
             ctx.input(|i| {
@@ -8590,6 +8708,11 @@ impl eframe::App for App {
                 // accident too easily; the ■ Stop button remains.)
                 if i.key_pressed(egui::Key::S) && i.modifiers.is_none() {
                     pending_snapshot = true;
+                }
+                // Shift+S — the frame on screen as the sensor recorded it
+                // (a raw video clip).
+                if i.key_pressed(egui::Key::S) && i.modifiers.shift_only() {
+                    pending_original = true;
                 }
                 if i.key_pressed(egui::Key::Space) {
                     self.toggle_play_pause();
@@ -8613,6 +8736,7 @@ impl eframe::App for App {
         if let Some(t) = pending_trim_in  { self.set_trim_in(t); }
         if let Some(t) = pending_trim_out { self.set_trim_out(t); }
         if pending_snapshot { self.request_snapshot(); }
+        if pending_original { self.request_original_dng(); }
         if pending_project_save && !self.batch.is_empty() && !self.batch_running && self.export_job.is_none() {
             self.save_project(ctx);
         }
@@ -9063,6 +9187,14 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.request_snapshot();
+                    }
+                    // A raw video clip: the frame as the sensor recorded it.
+                    if self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video())
+                        && ui.add_enabled(has_frame && self.original_dng_job.is_none(), egui::Button::new(tr("Original DNG")))
+                            .on_hover_text(tr("Save this frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number, in the clip's OriginalDNG folder (Shift+S)"))
+                            .clicked()
+                    {
+                        self.request_original_dng();
                     }
                 });
                 ui.separator();
@@ -9839,6 +9971,57 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// Original DNG (the transport row's button / Shift+S): the frame on
+    /// screen of a raw video clip as the sensor recorded it, one Bayer DNG
+    /// per eye, into the clip's `<name>_OriginalDNG` folder in the export
+    /// folder (beside the clip when none is set) — the folder a camera
+    /// original DNG sequence of the clip goes to by default, so frames
+    /// written one at a time gather there under the names a sequence gives
+    /// them. Playback pauses on the frame; the files are written on their
+    /// own thread.
+    fn request_original_dng(&mut self) {
+        if self.original_dng_job.is_some() {
+            return;
+        }
+        let (Some(src), Some(t_s)) = (self.loaded_path.clone(), self.current_display.as_ref().map(|d| d.timestamp_s)) else {
+            self.snapshot_status = Some((tr("Nothing to snapshot yet").to_string(), std::time::Instant::now()));
+            return;
+        };
+        if !self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) {
+            return;
+        }
+        if self.playing { self.toggle_play_pause(); }
+        let out = original_frames_dir(&src, self.batch_out_dir.as_deref());
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = vr180_pipeline::sensor_dng::export_sensor_dng_frame(&src, &out, t_s)
+                .map(|pair| original_frame_saved(&pair, &out))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.original_dng_job = Some(rx);
+        self.snapshot_status = Some((format!("{}…", tr("Writing the camera's frame")), std::time::Instant::now()));
+    }
+
+    /// Report the camera's frame once it is written.
+    fn poll_original_dng(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.original_dng_job.as_ref() else { return; };
+        match rx.try_recv() {
+            Ok(Ok(saved)) => {
+                tracing::info!("original DNG: {saved}");
+                self.snapshot_status = Some((format!("{} {saved}", tr("Saved")), std::time::Instant::now()));
+                self.original_dng_job = None;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("original DNG failed: {e}");
+                self.snapshot_status = Some((format!("{}: {e}", tr("Camera original frame failed")), std::time::Instant::now()));
+                self.original_dng_job = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => self.original_dng_job = None,
+        }
+    }
+
     /// Report the frame DNG of a snapshot once it is written.
     fn poll_frame_dng(&mut self, ctx: &egui::Context) {
         let Some((path, rx)) = self.frame_dng_job.as_ref() else { return; };
@@ -10196,6 +10379,15 @@ impl App {
                         ui.label(RichText::new(tr("Duration")).color(Color32::GRAY).small());
                         ui.label(format!("{:.2}s ({} frames)", c.duration_sec, c.frame_count));
                     });
+                    // An X6 clip: the frames the camera dropped.
+                    if let Some(holes) = c.x6_holes() {
+                        let zh = cur_lang() == Lang::Zh;
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr("Dropped frames")).color(Color32::GRAY).small());
+                            let text = RichText::new(dropped_frames_label(holes, zh));
+                            ui.label(if holes.is_empty() { text } else { text.color(DROPPED_COLOR) });
+                        }).response.on_hover_text(dropped_frames_hover(holes, zh));
+                    }
                     if let Some(rate) = bitrate_label(&c.video_bitrates_bps, c.file_bitrate_bps, true) {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(tr("Bitrate")).color(Color32::GRAY).small());
@@ -11980,6 +12172,56 @@ fn seed_tone_curve(p: &mut vr180_braw::BrawColorParams, base: vr180_braw::TonePr
     p.white_level.get_or_insert(base.white_level);
     p.video_black_level.get_or_insert(base.video_black_level);
 }
+
+/// The colour of a place where frames are missing (file info, timeline).
+const DROPPED_COLOR: Color32 = Color32::from_rgb(255, 120, 70);
+
+/// The file info's word on the frames a clip's camera dropped.
+fn dropped_frames_label(holes: &[vr180_pipeline::frame_timeline::Hole], zh: bool) -> String {
+    let frames: usize = holes.iter().map(|h| h.frames).sum();
+    match (holes.len(), zh) {
+        (0, true) => "无".to_string(),
+        (0, false) => "none".to_string(),
+        (places, true) => format!("{frames} 帧，{places} 处"),
+        (1, false) => format!("{frames} in 1 place"),
+        (places, false) => format!("{frames} in {places} places"),
+    }
+}
+
+/// One place where frames are missing: when, and how many.
+fn dropped_hole_text(hole: &vr180_pipeline::frame_timeline::Hole, zh: bool) -> String {
+    match (zh, hole.frames) {
+        (true, n) => format!("{}：丢 {n} 帧", format_time(hole.at_s)),
+        (false, 1) => format!("{}: 1 frame dropped", format_time(hole.at_s)),
+        (false, n) => format!("{}: {n} frames dropped", format_time(hole.at_s)),
+    }
+}
+
+/// The file info line's explanation: what a dropped frame is here, then the
+/// places (the first [`DROPPED_LISTED`] of them).
+fn dropped_frames_hover(holes: &[vr180_pipeline::frame_timeline::Hole], zh: bool) -> String {
+    if holes.is_empty() {
+        return if zh { "这个片段的画面轨道里没有缺帧。" } else { "No frame is missing from this clip's picture track." }.to_string();
+    }
+    let mut text = if zh {
+        "相机没有记录下来的帧。预览在每一处停在前一帧上；导出时重复那一帧，画面和声音保持同步。时间线上以橙色标出。".to_string()
+    } else {
+        "Frames the camera did not record. The preview holds the frame before each place; an export repeats that frame, so picture and sound stay in step. Marked in orange on the timeline.".to_string()
+    };
+    for hole in holes.iter().take(DROPPED_LISTED) {
+        text.push('\n');
+        text.push_str(&dropped_hole_text(hole, zh));
+    }
+    if holes.len() > DROPPED_LISTED {
+        let more = holes.len() - DROPPED_LISTED;
+        text.push('\n');
+        text.push_str(&if zh { format!("……另有 {more} 处") } else { format!("… and {more} more") });
+    }
+    text
+}
+
+/// Places the file info's hover text lists one by one.
+const DROPPED_LISTED: usize = 24;
 
 /// Bit rate text for the file info. The video streams' total — and, with
 /// `per_stream`, each eye's stream of a dual-stream file in brackets

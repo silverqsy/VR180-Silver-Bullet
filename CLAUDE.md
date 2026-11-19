@@ -4238,6 +4238,42 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       and an I-Log clip with Highlights at −100 show a tree against a sky
       with dark leaves and bright gaps, not a pale haze.
 
+44. **Original DNG of the frame on screen; dropped frames in the file
+    info and on the timeline (2026-11-19, Mac; UNRELEASED).** Two small
+    GUI additions the user asked for.
+    - **Original DNG** (transport row, beside Snapshot; Shift+S; raw
+      video clips only): `App::request_original_dng` pauses, then a thread
+      runs `sensor_dng::export_sensor_dng_frame(take, folder, t)` — the
+      frame the timeline has on screen at `t` (`FrameTimeline::row`), its
+      files written by the same `PairWriter` the sequence uses (the two
+      share it now), `frames.jsonl` merged (`index_with`: other lines
+      kept, the same request replaced, request order), the take's small
+      files copied only where missing or of another length. Folder:
+      `original_frames_dir` = `<name>_OriginalDNG` in the export folder or
+      beside the clip, an existing one added to (a sequence export still
+      takes an unused name). `poll_original_dng` reports through the
+      snapshot status line.
+    - **Dropped frames** (an X6 video file or raw take:
+      `ClipInfo::x6_holes`): `FrameTimeline::holes()` → `Hole { row, at_s,
+      frames }`, taken in the load worker from the timeline it already
+      built for the frame count (`LoadedMeta::holes` → `ClipInfo::holes`).
+      File info: `dropped_frames_label` / `dropped_frames_hover` (the
+      first 24 places). Timeline: an orange mark per hole over the track's
+      upper edge, as wide as the hole and 2 px at least; within 4 px of
+      one the pointer shows `dropped_hole_text`.
+    - **Verified.** Unit tests (the hole list, the index merge, the
+      texts, the folder); on a sample take a frame written alone is byte
+      for byte the file a one-frame sequence writes, and three calls
+      leave two lines in request order; the hole list on the takes and
+      video files at hand (one take with 9 in 9 places = its own count of
+      unsaved requests, the rest none; video files with up to 53 in 29
+      places). NOT seen in the window: no windowed run while the user was
+      at work in the app.
+    - **Windows, to look at.** No code is platform-specific. (1) The
+      Original DNG button appears for a raw clip only and writes
+      `CAM0/…dng` + `CAM1/…dng`. (2) An X6 clip with dropped frames shows
+      the orange line in File info and the marks on the timeline.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

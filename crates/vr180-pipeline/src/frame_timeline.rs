@@ -37,6 +37,17 @@ pub struct FrameTimeline {
     dt_s: f64,
 }
 
+/// A place where frames are missing from a track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hole {
+    /// The last frame before the hole: the one a player keeps showing.
+    pub row: usize,
+    /// Where the first missing frame would have been, seconds.
+    pub at_s: f64,
+    /// Frames missing.
+    pub frames: usize,
+}
+
 /// What the video track's sample tables say about its frame rate: the media
 /// timescale and the dominant sample delta (in ticks), i.e. the nominal rate
 /// `timescale / delta`.
@@ -197,6 +208,17 @@ impl FrameTimeline {
     /// Rows followed by a hole (places where frames are missing).
     pub fn gaps(&self) -> usize {
         (0..self.pts_s.len()).filter(|&r| self.hold_after(r) > 0).count()
+    }
+
+    /// Every hole of the track, in order: where frames are missing and how
+    /// many.
+    pub fn holes(&self) -> Vec<Hole> {
+        (0..self.pts_s.len())
+            .filter_map(|row| {
+                let frames = self.hold_after(row);
+                (frames > 0).then(|| Hole { row, at_s: self.pts_s[row] + self.dt_s, frames })
+            })
+            .collect()
     }
 
     /// Frames missing from the track: the sum of every hole's extra slots.
@@ -503,6 +525,12 @@ mod tests {
         assert_eq!(tl.hold_after(10), 0);
         assert_eq!(tl.dropped_frames(), 2);
         assert_eq!(tl.gaps(), 1);
+        // The one hole: after row 5, where the first missing frame would be.
+        let holes = tl.holes();
+        assert_eq!(holes.len(), 1);
+        assert_eq!((holes[0].row, holes[0].frames), (5, 2));
+        assert!((holes[0].at_s - 0.12).abs() < 1e-9);
+        assert!(FrameTimeline::cfr(40, 0.02).holes().is_empty());
         assert!((tl.nominal_fps() - 50.0).abs() < 1e-9);
     }
 

@@ -186,6 +186,13 @@ converter's controls for it, and every frame can be had as a DNG.
   gyro, sound) and a list of the frames with their exposure times are
   written beside them. Trim points apply. From a fast disk a one-minute
   30 fps take (1800 frame pairs, 43 GB) writes in about half a minute.
+- **One frame as the camera recorded it.** Beside Snapshot, a raw clip has
+  **Original DNG** (Shift+S): the frame on screen as its two Bayer DNGs,
+  the same files under the same names the Camera original sequence gives
+  them, into the clip's `…_OriginalDNG` folder in the export folder (beside
+  the clip when none is set). Frames written one at a time gather in that
+  folder, its list of frames grows with them, and the take's small files
+  are copied once. Playback pauses on the frame.
 - **Frames enhanced in a raw converter come back in.** Camera Raw's
   Super Resolution can be run on the Camera original DNGs, and the export
   then uses its result. Camera Raw 18 enhances a DNG in place: the file
@@ -326,6 +333,23 @@ the LUT, and not a curve laid over the picture the LUT left.
   Crop mask, a lens frame's border) is lifted by Blacks above zero, as Lift
   lifts it. The Matching Eyes exposure trim acts after the stage.
 - Not yet run on Windows.
+
+### Insta360 X6: dropped frames shown
+
+The X6 leaves a hole in a clip where its sensor lost frames, in its video
+files and in its raw takes alike. The app has held the frame before each
+hole since 2.5.5, in the preview and in exports; it now also says where
+they are.
+
+- **File info** has a **Dropped frames** line for an X6 clip: `none`, or
+  how many frames in how many places (`9 in 9 places`), in orange. Pointing
+  at it lists the places with their times.
+- **The timeline** marks every place in orange, as wide as the hole; the
+  pointer on a mark says when and how many.
+- Read from the clip's own frame times (the video track's table, a raw
+  take's frame stamps), with the rest of the file info, at no cost to
+  loading. Checked on the takes at hand against the camera's own count of
+  frames it never saved: nine in one take, none in the others, as it says.
 
 ### Insta360 X6: ETTR recovery for I-Log clips
 
