@@ -188,11 +188,12 @@ converter's controls for it, and every frame can be had as a DNG.
   30 fps take (1800 frame pairs, 43 GB) writes in about half a minute.
 - **One frame as the camera recorded it.** Beside Snapshot, a raw clip has
   **Original DNG** (Shift+S): the frame on screen as its two Bayer DNGs,
-  the same files under the same names the Camera original sequence gives
-  them, into the clip's `…_OriginalDNG` folder in the export folder (beside
-  the clip when none is set). Frames written one at a time gather in that
-  folder, its list of frames grows with them, and the take's small files
-  are copied once. Playback pauses on the frame.
+  the files the Camera original sequence holds for that frame. They go
+  where the snapshot goes and under its name, one per eye:
+  `<clip>_frame<N>_CAM0.dng` and `…_CAM1.dng` in the export folder (beside
+  the clip when none is set). A frame written again takes the next free
+  name, as a snapshot does, so a file adjusted in a raw converter is never
+  written over. Playback pauses on the frame.
 - **Frames enhanced in a raw converter come back in.** Camera Raw's
   Super Resolution can be run on the Camera original DNGs, and the export
   then uses its result. Camera Raw 18 enhances a DNG in place: the file

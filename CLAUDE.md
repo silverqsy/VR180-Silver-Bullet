@@ -4243,16 +4243,20 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
     GUI additions the user asked for.
     - **Original DNG** (transport row, beside Snapshot; Shift+S; raw
       video clips only): `App::request_original_dng` pauses, then a thread
-      runs `sensor_dng::export_sensor_dng_frame(take, folder, t)` — the
+      runs `sensor_dng::export_sensor_dng_frame(take, dir, name, t)` — the
       frame the timeline has on screen at `t` (`FrameTimeline::row`), its
       files written by the same `PairWriter` the sequence uses (the two
-      share it now), `frames.jsonl` merged (`index_with`: other lines
-      kept, the same request replaced, request order), the take's small
-      files copied only where missing or of another length. Folder:
-      `original_frames_dir` = `<name>_OriginalDNG` in the export folder or
-      beside the clip, an existing one added to (a sequence export still
-      takes an unused name). `poll_original_dng` reports through the
-      snapshot status line.
+      share it; `Place::Lone` puts them side by side as
+      `<name>_CAM<channel>.dng`, `sensor_dng::lone_frame_file`, and writes
+      nothing else: no folder, no index, none of the take's files). Place
+      and name are the snapshot's: `saved_frame_place` = `<stem>_frame<N>`
+      in the export folder or beside the clip (the snapshot takes its own
+      from the same function), and `unused_frame_name` /
+      `unused_original_name` go on to `-2`, `-3` … while a file of the name
+      is there, looked for on the writing thread. `poll_original_dng`
+      reports through the snapshot status line. (Built first into a
+      `<name>_OriginalDNG` folder with its index, `746fdcc`; the user
+      asked the same day for the files beside the snapshots.)
     - **Dropped frames** (an X6 video file or raw take:
       `ClipInfo::x6_holes`): `FrameTimeline::holes()` → `Hole { row, at_s,
       frames }`, taken in the load worker from the timeline it already
@@ -4261,18 +4265,19 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       first 24 places). Timeline: an orange mark per hole over the track's
       upper edge, as wide as the hole and 2 px at least; within 4 px of
       one the pointer shows `dropped_hole_text`.
-    - **Verified.** Unit tests (the hole list, the index merge, the
-      texts, the folder); on a sample take a frame written alone is byte
-      for byte the file a one-frame sequence writes, and three calls
-      leave two lines in request order; the hole list on the takes and
-      video files at hand (one take with 9 in 9 places = its own count of
-      unsaved requests, the rest none; video files with up to 53 in 29
-      places). NOT seen in the window: no windowed run while the user was
-      at work in the app.
+    - **Verified.** Unit tests (the hole list, the texts, the place and
+      the names, the next free name); on a sample take a frame written
+      alone is byte for byte the file a one-frame sequence writes, and
+      its folder holds those files and nothing else; the hole list on the
+      takes and video files at hand (one take with 9 in 9 places = its own
+      count of unsaved requests, the rest none; video files with up to 53
+      in 29 places). NOT seen in the window: no windowed run while the
+      user was at work in the app.
     - **Windows, to look at.** No code is platform-specific. (1) The
       Original DNG button appears for a raw clip only and writes
-      `CAM0/…dng` + `CAM1/…dng`. (2) An X6 clip with dropped frames shows
-      the orange line in File info and the marks on the timeline.
+      `<clip>_frame<N>_CAM0.dng` + `…_CAM1.dng` where the snapshot's JPEG
+      goes. (2) An X6 clip with dropped frames shows the orange line in
+      File info and the marks on the timeline.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

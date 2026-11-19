@@ -2,8 +2,7 @@
 //! per frame, nothing of this app's rendering in them.
 //!
 //! [`export_sensor_dng_sequence`] writes a take (or a stretch of it) into a
-//! folder, [`export_sensor_dng_frame`] one frame of it into the same kind
-//! of folder (frames written one at a time gather there):
+//! folder:
 //!
 //! ```text
 //! <folder>/CAM0/000000094.dng     channel 0 of request 94
@@ -15,6 +14,10 @@
 //! A file is named by the camera's request number (nine digits), the pair's
 //! identity in the take, so a frame keeps its name whatever stretch is
 //! written and a request the camera never saved leaves its number out.
+//!
+//! [`export_sensor_dng_frame`] writes one frame by itself: the same files
+//! and nothing else, side by side under a name the caller gives
+//! (`<name>_CAM0.dng`, `<name>_CAM1.dng`).
 //!
 //! ## The file
 //!
@@ -101,6 +104,12 @@ pub fn channel_dir(channel: usize) -> String {
 /// File of one channel of one request, relative to the folder written.
 pub fn frame_file(channel: usize, request: u32) -> String {
     format!("{}/{request:09}.dng", channel_dir(channel))
+}
+
+/// File of one channel of a frame written by itself, `name` being what the
+/// frame is called: `<name>_CAM<channel>.dng` in `dir`.
+pub fn lone_frame_file(dir: &Path, name: &str, channel: usize) -> PathBuf {
+    dir.join(format!("{name}_{}.dng", channel_dir(channel)))
 }
 
 /// A value as a fraction with a denominator of at most a million (the
@@ -339,10 +348,8 @@ pub fn frames_in(index: &crate::x6_raw::TakeIndex, t_in: Option<f64>, t_out: Opt
 }
 
 /// Copy the take's own small files (everything in its folder but the
-/// capture and the camera's closing record of it) into `out`. With
-/// `only_new` a file that is already there at the same length is left
-/// alone. Returns the names copied.
-fn copy_take_files(take_dir: &Path, out: &Path, only_new: bool) -> std::io::Result<Vec<String>> {
+/// capture and the camera's closing record of it) into `out`.
+fn copy_take_files(take_dir: &Path, out: &Path) -> std::io::Result<Vec<String>> {
     let mut copied = Vec::new();
     for entry in std::fs::read_dir(take_dir)? {
         let entry = entry?;
@@ -353,18 +360,23 @@ fn copy_take_files(take_dir: &Path, out: &Path, only_new: bool) -> std::io::Resu
         if name.eq_ignore_ascii_case(x6b::CAPTURE_FILE) || name.eq_ignore_ascii_case(x6b::SEAL_FILE) || name.eq_ignore_ascii_case(FRAMES_FILE) {
             continue;
         }
-        let to = out.join(&name);
-        if only_new && std::fs::metadata(&to).is_ok_and(|have| entry.metadata().is_ok_and(|want| have.len() == want.len())) {
-            continue;
-        }
-        std::fs::copy(entry.path(), to)?;
+        std::fs::copy(entry.path(), out.join(&name))?;
         copied.push(name);
     }
     copied.sort();
     Ok(copied)
 }
 
-/// What writes the files of a take's pairs into a folder.
+/// Where the files of a take's pairs go.
+#[derive(Clone, Copy)]
+enum Place<'a> {
+    /// A folder of the take's frames: [`frame_file`] in it.
+    Folder(&'a Path),
+    /// One frame by itself: [`lone_frame_file`] of this folder and name.
+    Lone(&'a Path, &'a str),
+}
+
+/// What writes the files of a take's pairs.
 struct PairWriter<'a> {
     format: x6b::Format,
     /// The sensor channel of each of a record's channels: a paired take's
@@ -372,20 +384,34 @@ struct PairWriter<'a> {
     channels: Vec<usize>,
     mosaic: Mosaic,
     camera: RawCamera,
-    out: &'a Path,
+    place: Place<'a>,
 }
 
 impl<'a> PairWriter<'a> {
-    /// For the take of `index`, into `out`: the channels' folders are made.
-    fn new(index: &crate::x6_raw::TakeIndex, out: &'a Path) -> std::io::Result<Self> {
+    /// For the take of `index`, to `place`: the folders its files go into
+    /// are made.
+    fn new(index: &crate::x6_raw::TakeIndex, place: Place<'a>) -> std::io::Result<Self> {
         let channels: Vec<usize> = match index.take.layout.single_channel() {
             Some(channel) => vec![channel],
             None => vec![0, 1],
         };
-        for &channel in &channels {
-            std::fs::create_dir_all(out.join(channel_dir(channel)))?;
+        match place {
+            Place::Folder(out) => {
+                for &channel in &channels {
+                    std::fs::create_dir_all(out.join(channel_dir(channel)))?;
+                }
+            }
+            Place::Lone(dir, _) => std::fs::create_dir_all(dir)?,
         }
-        Ok(Self { format: index.take.format(), channels, mosaic: Mosaic::of(&index.take), camera: RawCamera::X6, out })
+        Ok(Self { format: index.take.format(), channels, mosaic: Mosaic::of(&index.take), camera: RawCamera::X6, place })
+    }
+
+    /// The file of one channel of the request.
+    fn file(&self, channel: usize, request: u32) -> PathBuf {
+        match self.place {
+            Place::Folder(out) => out.join(frame_file(channel, request)),
+            Place::Lone(dir, name) => lone_frame_file(dir, name, channel),
+        }
     }
 
     /// Samples a record of the take decodes to.
@@ -403,56 +429,34 @@ impl<'a> PairWriter<'a> {
         for (&channel, eye) in self.channels.iter().zip(samples.chunks(self.mosaic.samples())) {
             let tag = FrameTag { channel, request: entry.request, exposure_ns: entry.exposure_ns[channel] };
             let (head, body) = eye_dng(eye, &self.mosaic, tag, &self.camera, scratch);
-            files.push((channel, write_whole(&self.out.join(frame_file(channel, entry.request)), &[&head, body])?));
+            files.push((channel, write_whole(&self.file(channel, entry.request), &[&head, body])?));
         }
         let signature = String::from_utf8_lossy(entry.profile.signature()).trim_end_matches('\0').to_owned();
         Ok(WrittenPair { request: entry.request, exposure_ns: entry.exposure_ns, signature, files })
     }
 }
 
-/// The request number a line of `frames.jsonl` is of.
-fn line_request(line: &str) -> Option<u64> {
-    serde_json::from_str::<serde_json::Value>(line).ok()?.get("request")?.as_u64()
-}
-
-/// The index of a folder with `pair` in it: the lines it had, without an
-/// older one of the same request, and the pair's own, in request order.
-fn index_with(had: &str, pair: &WrittenPair) -> String {
-    let mut lines: Vec<(u64, String)> = had.lines()
-        .filter_map(|l| Some((line_request(l)?, l.to_owned())))
-        .filter(|(request, _)| *request != pair.request as u64)
-        .collect();
-    lines.push((pair.request as u64, pair.line()));
-    lines.sort_by_key(|l| l.0);
-    lines.into_iter().map(|(_, l)| l + "\n").collect()
-}
-
 /// Write the frame of the take at `source` that is on screen at `t_s`
-/// (seconds on the take's timeline: the last frame at or before it) into
-/// the folder `out` (created if needed) as the sensor recorded it, the way
-/// [`export_sensor_dng_sequence`] writes a stretch: the same files under
-/// the same names. A folder that already holds frames keeps them and its
-/// index gains this one's line; the take's small files are copied where
-/// they are not there yet.
-pub fn export_sensor_dng_frame(source: &Path, out: &Path, t_s: f64) -> Result<WrittenPair> {
+/// (seconds on the take's timeline: the last frame at or before it) as the
+/// sensor recorded it, by itself: [`lone_frame_file`] of `dir` (created if
+/// needed) and `name` for each channel the take holds, each the file
+/// [`export_sensor_dng_sequence`] writes for that frame. Nothing else is
+/// written; a file of that name is replaced.
+pub fn export_sensor_dng_frame(source: &Path, dir: &Path, name: &str, t_s: f64) -> Result<WrittenPair> {
     let index = crate::x6_raw::open(source)?;
     if index.frames() == 0 {
         return Err(Error::Ffmpeg(format!("{} holds no frames", source.display())));
     }
-    let entry = &index.pairs[index.timeline.row(t_s).min(index.frames() - 1)];
-    let writer = PairWriter::new(&index, out)?;
+    let row = index.timeline.row(t_s).min(index.frames() - 1);
+    let entry = &index.pairs[row];
+    let writer = PairWriter::new(&index, Place::Lone(dir, name))?;
     let mut record = Vec::new();
     x6b::read_record(&mut File::open(index.take.capture_path())?, entry, &mut record).map_err(|e| Error::Ffmpeg(e.to_string()))?;
     let mut samples = vec![0u16; writer.samples()];
     let pair = writer.write(&record, &mut samples, &mut EyeScratch::default(), entry)?;
-    let index_file = out.join(FRAMES_FILE);
-    let had = std::fs::read_to_string(&index_file).unwrap_or_default();
-    std::fs::write(&index_file, index_with(&had, &pair))?;
-    let copied = copy_take_files(&index.take.dir, out, true)?;
     tracing::info!(
-        "sensor frame: request {} at {:.4} s ({:.1} MB) in {}; copied beside it: {}",
-        pair.request, index.pts_s(index.timeline.row(t_s)), pair.bytes() as f64 / 1e6, out.display(),
-        if copied.is_empty() { "nothing new".to_owned() } else { copied.join(", ") });
+        "sensor frame: request {} at {:.4} s ({:.1} MB) as {name} in {}",
+        pair.request, index.pts_s(row), pair.bytes() as f64 / 1e6, dir.display());
     Ok(pair)
 }
 
@@ -472,7 +476,7 @@ pub fn export_sensor_dng_sequence(
     let index = crate::x6_raw::open(source)?;
     let frames = frames_in(&index, t_in, t_out);
     let total = frames.len();
-    let writer = PairWriter::new(&index, out)?;
+    let writer = PairWriter::new(&index, Place::Folder(out))?;
     let capture = index.take.capture_path();
     // Two cores stay free for the app's own threads.
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -570,7 +574,7 @@ pub fn export_sensor_dng_sequence(
     if let Some(e) = failed {
         return Err(e);
     }
-    let copied = copy_take_files(&index.take.dir, out, false)?;
+    let copied = copy_take_files(&index.take.dir, out)?;
     let bytes: u64 = written.iter().map(|p| p.bytes()).sum();
     if cancel.load(Ordering::SeqCst) && written.len() < total {
         tracing::info!("sensor frames: cancelled after {} of {total} pairs", written.len());
@@ -736,6 +740,9 @@ mod tests {
     fn names_and_index_lines() {
         assert_eq!(frame_file(0, 94), "CAM0/000000094.dng");
         assert_eq!(frame_file(1, 123_456_789), "CAM1/123456789.dng");
+        // A frame by itself: what it is called, then its channel. A dot in the name stays.
+        assert_eq!(lone_frame_file(Path::new("/out"), "TAKE_frame12", 1), Path::new("/out/TAKE_frame12_CAM1.dng"));
+        assert_eq!(lone_frame_file(Path::new("/out"), "a.b_frame3-2", 0), Path::new("/out/a.b_frame3-2_CAM0.dng"));
         let pair = WrittenPair { request: 94, exposure_ns: [416_279_938_533, 416_279_938_901], signature: "L1024___".into(), files: vec![(0, 11), (1, 12)] };
         let v: serde_json::Value = serde_json::from_str(&pair.line()).unwrap();
         assert_eq!(v["request"], 94);
@@ -752,61 +759,42 @@ mod tests {
         assert_eq!(FrameTag::parse("frame 12 at 0.4 s"), None);
     }
 
+    /// A frame of a sample take written by itself (skipped when the volume
+    /// is not mounted): the frame on screen at that time, each file the one
+    /// a stretch holds for it, and nothing else beside them.
     #[test]
-    fn a_folder_s_index_gains_a_frame() {
-        let pair = |request: u32| WrittenPair { request, exposure_ns: [10, 11], signature: "X6S8".into(), files: vec![(0, 5), (1, 6)] };
-        // An empty folder: the one line.
-        let one = index_with("", &pair(94));
-        assert_eq!(one, pair(94).line() + "\n");
-        // Another frame: both, in request order whichever came first.
-        let two = index_with(&one, &pair(12));
-        assert_eq!(two, pair(12).line() + "\n" + &pair(94).line() + "\n");
-        // The same frame again replaces its line; a line that is no record is dropped.
-        let mut again = pair(94);
-        again.files = vec![(0, 7), (1, 8)];
-        let three = index_with(&format!("{two}not a line\n"), &again);
-        assert_eq!(three, pair(12).line() + "\n" + &again.line() + "\n");
-        assert_eq!(line_request(&again.line()), Some(94));
-    }
-
-    /// Frames of a sample take written one at a time (skipped when the
-    /// volume is not mounted): each is the file a stretch would hold, and
-    /// the folder gathers them.
-    #[test]
-    fn frames_of_a_sample_take_one_at_a_time() {
+    fn a_frame_of_a_sample_take_by_itself() {
         let take = Path::new("/Volumes/Database/x6/1115 raw video/RAWVIDEO-20261116-011809");
         if !take.exists() { return; }
         let out = std::env::temp_dir().join(format!("vr180-sensor-dng-frame-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
         let index = crate::x6_raw::open(take).unwrap();
         let dt = index.dt_s();
-        // The frame on screen a little after frame 4's time is frame 4; then frame 2; then 4 again.
-        let a = export_sensor_dng_frame(take, &out, index.pts_s(4) + 0.3 * dt).unwrap();
-        let b = export_sensor_dng_frame(take, &out, index.pts_s(2)).unwrap();
-        let c = export_sensor_dng_frame(take, &out, index.pts_s(4)).unwrap();
+        // The frame on screen a little after frame 4's time is frame 4; then frame 2 under a name of its own.
+        let a = export_sensor_dng_frame(take, &out, "TAKE_frame4", index.pts_s(4) + 0.3 * dt).unwrap();
+        let b = export_sensor_dng_frame(take, &out, "TAKE_frame2", index.pts_s(2)).unwrap();
         assert_eq!((a.request, b.request), (index.pairs[4].request, index.pairs[2].request));
-        assert_eq!(a, c);
-        let lines: Vec<serde_json::Value> = std::fs::read_to_string(out.join(FRAMES_FILE)).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert_eq!(lines.iter().map(|l| l["request"].as_u64().unwrap()).collect::<Vec<_>>(), [b.request as u64, a.request as u64]);
         let mut iter = crate::x6_raw::X6RawIter::new(take, false, false, 1, None).unwrap();
         let samples = iter.decode_frame(4).unwrap().to_vec();
         for channel in 0..2 {
-            let file = std::fs::read(out.join(frame_file(channel, a.request))).unwrap();
+            let file = std::fs::read(lone_frame_file(&out, "TAKE_frame4", channel)).unwrap();
             assert_eq!(file.len() as u64, a.files[channel].1);
-            assert!(read_back(&file).samples == samples[channel * x6b::EYE_SAMPLES..(channel + 1) * x6b::EYE_SAMPLES], "channel {channel}");
+            let back = read_back(&file);
+            assert!(back.samples == samples[channel * x6b::EYE_SAMPLES..(channel + 1) * x6b::EYE_SAMPLES], "channel {channel}");
+            assert_eq!(FrameTag::parse(&back.text(270)), Some(FrameTag { channel, request: a.request, exposure_ns: a.exposure_ns[channel] }));
         }
         // The same files a stretch of the take holds for that frame.
         let stretch = std::env::temp_dir().join(format!("vr180-sensor-dng-frame-ref-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&stretch);
         export_sensor_dng_sequence(take, &stretch, Some(4.0 * dt), Some(4.5 * dt), |_| {}, Arc::default()).unwrap();
         for channel in 0..2 {
-            let name = frame_file(channel, a.request);
-            assert!(std::fs::read(out.join(&name)).unwrap() == std::fs::read(stretch.join(&name)).unwrap(), "{name}");
+            let alone = std::fs::read(lone_frame_file(&out, "TAKE_frame4", channel)).unwrap();
+            assert!(alone == std::fs::read(stretch.join(frame_file(channel, a.request))).unwrap(), "channel {channel}");
         }
-        for name in ["clip.json", "calibration.json", "gyro.csv", "gyro-info.json"] {
-            assert!(out.join(name).is_file(), "{name}");
-        }
-        assert!(!out.join("capture.x6b").exists() && !out.join("seal.json").exists());
+        // The four files and nothing else: no folders, no index, none of the take's files.
+        let mut names: Vec<String> = std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["TAKE_frame2_CAM0.dng", "TAKE_frame2_CAM1.dng", "TAKE_frame4_CAM0.dng", "TAKE_frame4_CAM1.dng"]);
         let _ = std::fs::remove_dir_all(&out);
         let _ = std::fs::remove_dir_all(&stretch);
     }
