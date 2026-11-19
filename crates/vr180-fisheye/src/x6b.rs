@@ -99,6 +99,10 @@ pub const SINGLE_SIDE: usize = 7680;
 pub const BLOCK: u64 = 4096;
 /// The header's threshold field.
 const THRESHOLD: u32 = 13472;
+/// A record of one lens: where its header holds the tiles' checksums, and
+/// the flag that says they were computed.
+const CRC_AT: usize = 144;
+const CRC_FLAG_AT: usize = 240;
 /// Bayer pattern of the samples, row-major 2×2 (0 = R, 1 = G, 2 = B).
 pub const CFA: [u8; 4] = [1, 2, 0, 1];
 /// Sensor black level of a paired take.
@@ -199,7 +203,7 @@ impl Layout {
     }
 
     /// Tiles of one record.
-    fn tiles(self) -> usize {
+    pub fn tiles(self) -> usize {
         self.channels() * TILES_PER_EYE
     }
 }
@@ -620,6 +624,9 @@ struct Header {
     /// The payload lengths of the record's tiles (`tiles` of them).
     tile_len: [u32; 2 * TILES_PER_EYE],
     tiles: usize,
+    /// The checksums of the tiles' samples, where the record carries them
+    /// (a take of one lens).
+    tile_crc: Option<[u32; TILES_PER_EYE]>,
 }
 
 impl Header {
@@ -657,12 +664,36 @@ impl Header {
                 return Err(err(format!("invalid tile size at byte {at}")));
             }
         }
-        Ok(Self { profile, request, exposure_ns, tile_len, tiles })
+        let tile_crc = (matches!(layout, Layout::Single { .. }) && u32_at(CRC_FLAG_AT) == 1)
+            .then(|| std::array::from_fn(|i| u32_at(CRC_AT + 4 * i)));
+        Ok(Self { profile, request, exposure_ns, tile_len, tiles, tile_crc })
     }
 
     /// Length of the record, header and padding included.
     fn record_len(&self) -> u64 {
-        BLOCK + self.tile_len[..self.tiles].iter().map(|&n| pad(n as u64)).sum::<u64>()
+        self.tile_at(self.tiles)
+    }
+
+    /// Where tile `t`'s payload starts, from the record's first byte.
+    fn tile_at(&self, t: usize) -> u64 {
+        BLOCK + self.tile_len[..t].iter().map(|&n| pad(n as u64)).sum::<u64>()
+    }
+
+    /// Both headers state tile `t` alike: the same stored length and, where
+    /// both carry checksums, the same checksum.
+    fn states_tile_as(&self, other: &Header, t: usize) -> bool {
+        self.tile_len[t] == other.tile_len[t] && match (&self.tile_crc, &other.tile_crc) {
+            (Some(a), Some(b)) => a[t] == b[t],
+            _ => true,
+        }
+    }
+
+    /// The stored bytes of tile `t` of the record at `entry`, into `buf`.
+    fn read_tile(&self, file: &mut File, entry: &PairEntry, t: usize, buf: &mut Vec<u8>) -> Result<()> {
+        buf.resize(self.tile_len[t] as usize, 0);
+        file.seek(SeekFrom::Start(entry.offset + self.tile_at(t)))?;
+        file.read_exact(buf).map_err(|_| err(format!("truncated pair at byte {}", entry.offset)))?;
+        Ok(())
     }
 }
 
@@ -736,6 +767,72 @@ pub fn missing_requests(take: &Take, pairs: &[PairEntry]) -> Vec<u32> {
         if have.peek() == Some(&r) { have.next(); } else { out.push(r); }
     }
     out
+}
+
+/// Records before the last one in which the frame an unfinished record was
+/// left with is looked for (the camera's own distance is twenty requests).
+const LEFTOVER_REACH: usize = 32;
+
+/// What the camera left in a record it did not finish
+/// ([`leftover_in_last_record`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Leftover {
+    /// The earlier record whose tiles the last one still holds.
+    pub of_request: u32,
+    /// How many of the last record's tiles are that record's.
+    pub tiles: usize,
+}
+
+/// Whether the last record of a take of one lens is one the camera did not
+/// finish.
+///
+/// Such a recording can stop while its last frame is being taken over. The
+/// record is written all the same: the top of the frame and, below it, what
+/// the camera's buffer held before, which is the frame of twenty requests
+/// earlier, unchanged. Neither the record nor the take's lists say so: the
+/// request number and the stamp are the next ones, the checksums are of the
+/// samples as they stand, and the camera's closing record counts a frame.
+/// It shows in the tiles: one stored with the bytes of the same tile of an
+/// earlier record was not written for this frame, since two exposures never
+/// give the same samples. (Seen on four takes of five, in the last record
+/// only and nowhere in 23 paired takes, whose last record is not looked
+/// at.)
+///
+/// `pairs` in request order. Reads the header of the last record and of up
+/// to [`LEFTOVER_REACH`] before it, nearest first, and a tile's stored
+/// bytes only where the two headers state it alike.
+pub fn leftover_in_last_record(take: &Take, pairs: &[PairEntry]) -> Result<Option<Leftover>> {
+    if take.layout.channels() != 1 {
+        return Ok(None);
+    }
+    let Some((last, before)) = pairs.split_last() else { return Ok(None) };
+    let before = &before[before.len().saturating_sub(LEFTOVER_REACH)..];
+    if before.is_empty() {
+        return Ok(None);
+    }
+    let mut file = File::open(take.capture_path())?;
+    let format = take.format();
+    let mut head = vec![0u8; BLOCK as usize];
+    let mut header_of = |file: &mut File, entry: &PairEntry| -> Result<Header> {
+        file.seek(SeekFrom::Start(entry.offset))?;
+        file.read_exact(&mut head).map_err(|_| err(format!("truncated header at byte {}", entry.offset)))?;
+        Header::parse(&head, format, entry.offset)
+    };
+    let mine = header_of(&mut file, last)?;
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for entry in before.iter().rev() {
+        let theirs = header_of(&mut file, entry)?;
+        let alike: Vec<usize> = (0..mine.tiles.min(theirs.tiles)).filter(|&t| mine.states_tile_as(&theirs, t)).collect();
+        // The stored bytes settle it, and one tile is enough.
+        for &t in &alike {
+            mine.read_tile(&mut file, last, t, &mut a)?;
+            theirs.read_tile(&mut file, entry, t, &mut b)?;
+            if a == b {
+                return Ok(Some(Leftover { of_request: entry.request, tiles: alike.len() }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Which channels of a pair to decode.
@@ -1860,6 +1957,48 @@ mod tests {
         let first = u32::from_le_bytes(b[48..52].try_into().unwrap());
         longer[48..52].copy_from_slice(&(first + 1).to_le_bytes());
         assert!(decode_record(&longer, single, Channels::Both, &mut out, 0).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A last record the camera did not finish (the top of its frame, then
+    /// what the buffer held of an earlier one) is told from a whole one.
+    #[test]
+    fn a_last_record_left_unfinished_is_told() {
+        let dir = temp_dir("unfinished");
+        let layout = Layout::Single { channel: 0 };
+        let (early, between, late) = (single_test_samples(21), single_test_samples(22), single_test_samples(23));
+        let record = |request: u32, samples: &[u16]| encode_single_record(Profile::Single10Split, request, 100 + request as u64, 1_000_000_000 + request as u64 * 33_366_667, 4_000_000, samples);
+        let (a, b) = (record(10, &early), record(11, &between));
+        // Whole: three frames, each its own.
+        write_single_take(&dir, 0, (110, 112), &[a.clone(), b.clone(), record(12, &late)]);
+        let take = read_take(&dir).unwrap().unwrap();
+        let pairs = scan_pairs(&take, |_, _| true).unwrap().unwrap();
+        assert_eq!(leftover_in_last_record(&take, &pairs).unwrap(), None);
+        // Unfinished: the last frame's first nine tiles, then request 10's.
+        let cut = 9 * layout.tile_samples();
+        let mixed: Vec<u16> = late[..cut].iter().chain(&early[cut..]).copied().collect();
+        let unfinished = record(12, &mixed);
+        write_single_take(&dir, 0, (110, 112), &[a.clone(), b.clone(), unfinished.clone()]);
+        let take = read_take(&dir).unwrap().unwrap();
+        let pairs = scan_pairs(&take, |_, _| true).unwrap().unwrap();
+        assert_eq!(leftover_in_last_record(&take, &pairs).unwrap(), Some(Leftover { of_request: 10, tiles: 15 }));
+        // The records before it are whole: only the last one is looked at.
+        assert_eq!(leftover_in_last_record(&take, &pairs[..2]).unwrap(), None);
+        // One record, or none: nothing to hold it against.
+        assert_eq!(leftover_in_last_record(&take, &pairs[..1]).unwrap(), None);
+        assert_eq!(leftover_in_last_record(&take, &[]).unwrap(), None);
+        // With the checksums in the headers the answer is the same.
+        let with_crcs = |mut r: Vec<u8>, samples: &[u16]| {
+            for (i, tile) in samples.chunks(layout.tile_samples()).enumerate() {
+                r[CRC_AT + 4 * i..CRC_AT + 4 * i + 4].copy_from_slice(&packed_crc(tile).to_le_bytes());
+            }
+            r[CRC_FLAG_AT..CRC_FLAG_AT + 4].copy_from_slice(&1u32.to_le_bytes());
+            r
+        };
+        write_single_take(&dir, 0, (110, 112), &[with_crcs(a, &early), with_crcs(b, &between), with_crcs(unfinished, &mixed)]);
+        let take = read_take(&dir).unwrap().unwrap();
+        let pairs = scan_pairs(&take, |_, _| true).unwrap().unwrap();
+        assert_eq!(leftover_in_last_record(&take, &pairs).unwrap(), Some(Leftover { of_request: 10, tiles: 15 }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

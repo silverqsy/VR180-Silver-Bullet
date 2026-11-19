@@ -325,6 +325,24 @@ fn store_index(file: &Path, take: &Take, pairs: &[PairEntry]) {
     }
 }
 
+/// A take's frames: the capture's records in request order, without a last
+/// one the camera did not finish ([`x6b::leftover_in_last_record`]: part of
+/// it is an earlier frame). A record that cannot be looked at stays.
+fn whole_frames(take: &Take, mut pairs: Vec<PairEntry>) -> Vec<PairEntry> {
+    match x6b::leftover_in_last_record(take, &pairs) {
+        Ok(Some(left)) => {
+            if let Some(last) = pairs.pop() {
+                tracing::warn!(
+                    "raw take {}: the camera did not finish its last record (request {}: {} of its {} tiles still hold request {}): left out, {} frames",
+                    take.dir.display(), last.request, left.tiles, take.layout.tiles(), left.of_request, pairs.len());
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("raw take {}: its last record could not be looked at ({e}): kept", take.dir.display()),
+    }
+    pairs
+}
+
 /// Open the take `path` names (the folder or one of its files). The first
 /// call lists the pairs; later calls, from any thread, share the result.
 pub fn open(path: &Path) -> Result<Arc<TakeIndex>> {
@@ -336,7 +354,7 @@ pub fn open(path: &Path) -> Result<Arc<TakeIndex>> {
         let on_disk = index_file(&take, modified);
         if let Some(pairs) = on_disk.as_deref().and_then(|f| load_index(f, &take)) {
             tracing::info!("raw take {}: {} pairs (kept list)", take.dir.display(), pairs.len());
-            return Ok(Arc::new(TakeIndex::new(take.clone(), pairs)));
+            return Ok(Arc::new(TakeIndex::new(take.clone(), whole_frames(&take, pairs))));
         }
         let t0 = std::time::Instant::now();
         let dir = take.dir.clone();
@@ -347,15 +365,16 @@ pub fn open(path: &Path) -> Result<Arc<TakeIndex>> {
         progress_slot().lock().unwrap().remove(&dir);
         match walked {
             Ok(Some(pairs)) => {
-                let index = TakeIndex::new(take.clone(), pairs);
+                // The list is kept as the capture holds it.
+                if let Some(f) = on_disk {
+                    store_index(&f, &take, &pairs);
+                }
+                let index = TakeIndex::new(take.clone(), whole_frames(&take, pairs));
                 tracing::info!(
                     "raw take {}: {} {} at {} fps listed in {:.1?} ({} missing, {:.0} MB/s {})",
                     take.dir.display(), index.frames(), if take.layout.channels() == 1 { "frames of one lens" } else { "pairs" },
                     take.fps_setting, t0.elapsed(), index.missing.len(), index.bytes_per_second() / 1e6,
                     if take.layout.channels() == 1 { "its one eye" } else { "both eyes" });
-                if let Some(f) = on_disk {
-                    store_index(&f, &take, &index.pairs);
-                }
                 Ok(Arc::new(index))
             }
             Ok(None) => Err("stopped".into()),
