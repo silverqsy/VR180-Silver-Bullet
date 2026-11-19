@@ -1050,6 +1050,15 @@ impl Device {
                 stage.constants_for(&stats, curves.as_deref())
             }
         };
+        if let (Some(local), true) = (&k.local, tracing::enabled!(tracing::Level::DEBUG)) {
+            // Shadows / Highlights as this frame has them: the gain at whole
+            // stops of the base level from 8 below 1 up to 2 above.
+            let at = |level: f32| local.gain[(((level - crate::raw_tone::LOCAL_LO) * LOCAL_PER_STOP).round() as usize).min(local.gain.len() - 1)];
+            let gains: Vec<String> = (-8..=2).map(|l| format!("{:+.2}", at(l as f32))).collect();
+            tracing::debug!(
+                "raw development: white point {:.3}, with the gain in {:.3}; gain in stops at levels -8..+2: {}",
+                k.white_point, local.white, gains.join(" "));
+        }
         if let (Some(local), Some(eye)) = (k.local.as_mut(), eyes.first()) {
             local.long_side = match reference {
                 Some(r) => r.long_side,
