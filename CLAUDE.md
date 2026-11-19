@@ -4308,9 +4308,13 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
     - **Verified.** Two tests in `activity.rs` ask the system itself: the
       activity is listed under its reason with `PreventUserIdleSystemSleep`
       while the value is held, is gone once it is dropped, and of two the
-      one that ends leaves the other in force. NOT yet measured: the speed
-      of a run behind another window with this build (it needs a run in
-      the window).
+      one that ends leaves the other in force. MEASURED on the first run
+      with this build, another app in front the whole time: a 60p raw clip
+      at 8192×4096 at 12.0 to 12.9 frames a second (133 to 143 MB/s read
+      from the share), where the same clip's Lens Space export had made
+      5.1 behind another app before and 11.2 with the app left in front;
+      the app was listed with the system, and its threads read 20 to 47
+      (4 before).
     - **Windows, to look at.** `activity::platform` is empty off macOS and
       `Busy::begin` returns `None` there, so nothing changes on Windows.
       Whether a run is slowed there when the window is minimised or behind
