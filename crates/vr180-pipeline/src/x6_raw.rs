@@ -11,8 +11,10 @@
 //! - [`probe`] / [`timeline`] — frame size, rate, duration and the time of
 //!   every frame, from the exposure stamps: a pair that was never saved
 //!   leaves its gap in the timeline.
-//! - [`build_imu`] — the lens calibration (the factory string, placed like
-//!   the camera's own 8K video frame) and the gyro as per-frame poses.
+//! - [`build_imu`] — the lens calibration (the factory string, the frame
+//!   placed where the take's sensor record says the sensor was read, or
+//!   like the camera's own 8K video frame for a take without one) and the
+//!   gyro as per-frame poses.
 //! - [`X6RawIter`] — the frames. With a GPU device a pair is decoded,
 //!   uploaded as two mosaics and demosaiced there into camera-linear 16-bit
 //!   eyes; without one it is demosaiced on the CPU.
@@ -25,6 +27,11 @@
 //! A take of one lens ([`x6b::Layout::Single`]) is a single-eye source
 //! ([`crate::source_kind::is_single_eye`]): its frames are one 7680×7680
 //! eye, a pair's left with no right, under that lens's calibration entry.
+//!
+//! A paired take of another frame size ([`x6b::Layout::PairedOf`]) is a
+//! paired take in everything but its frame: 5504×5504 holds more of the
+//! sensor than the video frame, scaled; 4912×4912 and 3968×3968 hold the
+//! middle of it at its own pixels, a crop of the lens's view.
 //!
 //! The frames are the sensor's linear values (black level subtracted, white
 //! level at 1.0, no white balance): they need the raw development stage of
@@ -301,7 +308,7 @@ fn load_index(file: &Path, take: &Take) -> Option<Vec<PairEntry>> {
     let (lo, hi) = take.seal.request_window;
     let in_window = |p: &PairEntry| !take.window_numbers_records() || (p.request >= lo && p.request <= hi);
     let ok = out.windows(2).all(|w| w[0].request < w[1].request)
-        && out.iter().all(|p| in_window(p) && p.profile.fps() == take.fps_setting && p.profile.layout_is(take.layout) && p.offset + p.len <= take.capture_bytes);
+        && out.iter().all(|p| in_window(p) && p.profile.records(take.layout, take.fps_setting) && p.offset + p.len <= take.capture_bytes);
     ok.then_some(out)
 }
 
@@ -365,6 +372,10 @@ pub fn open(path: &Path) -> Result<Arc<TakeIndex>> {
         progress_slot().lock().unwrap().remove(&dir);
         match walked {
             Ok(Some(pairs)) => {
+                if let Some((black, white)) = take.stated_levels {
+                    tracing::warn!("raw take {}: it states a black level of {black} and a white level of {white}, another frame's; its samples are read by the sensor's own, {} and {}",
+                        take.dir.display(), take.black_level, take.white_level);
+                }
                 // The list is kept as the capture holds it.
                 if let Some(f) = on_disk {
                     store_index(&f, &take, &pairs);
@@ -440,10 +451,36 @@ pub fn audio_source(path: &Path) -> Option<(PathBuf, f64)> {
 
 // ── Lens and motion ────────────────────────────────────────────────────
 
+/// Where the factory calibration's frame (the 7744² of each sensor half)
+/// starts on the sensor, in the register coordinates a take's sensor record
+/// is written in: the 7680² window of the camera's own 8K video lies 32
+/// pixels inside that frame and starts at 256 on the sensor.
+const CALIBRATION_ORIGIN: (f64, f64) = (224.0, 224.0);
+
+/// The place of a take's frame in the calibration's frame, from its sensor
+/// record ([`x6b::read_sensor_windows`]); `None` for a take without one.
+/// The two sensors are read alike; channel 0's window stands for both.
+pub fn stated_frame(take: &Take) -> Option<vr180_fisheye::insta360::StatedFrame> {
+    let eyes = x6b::read_sensor_windows(take)?;
+    if eyes[0].origin != eyes[1].origin || eyes[0].scale != eyes[1].scale {
+        tracing::warn!("raw take {}: its two sensors are read from different windows ({:?} and {:?}): the first is used for both",
+            take.dir.display(), eyes[0].origin, eyes[1].origin);
+    }
+    let w = eyes[0];
+    Some(vr180_fisheye::insta360::StatedFrame {
+        width: take.width,
+        height: take.height,
+        origin: (w.origin.0 - CALIBRATION_ORIGIN.0, w.origin.1 - CALIBRATION_ORIGIN.1),
+        scale: w.scale,
+    })
+}
+
 /// What the camera's metadata would say about the take's frames, as far as
-/// the take states it: the factory lens string, the frame placed like the
-/// camera's own 8K video frame (the 7680² window of each sensor half,
-/// binned 2×2), channel 0 = calibration entry 2. No motion data.
+/// the take states it: the factory lens string, the frame placed where its
+/// sensor record says the sensor was read ([`stated_frame`]), channel 0 =
+/// calibration entry 2. No motion data. A take without a sensor record is
+/// placed like the camera's own 8K video frame (the 7680² window of each
+/// sensor half, binned 2×2).
 ///
 /// A take of one lens: that lens's entry alone, as the camera's own
 /// single-lens video states it, and the same window at the sensor's own
@@ -471,6 +508,7 @@ pub fn lens_meta(take: &Take) -> Insta360Meta {
         frame_rate: Some(take.fps_setting),
         track_order_reversed: Some(true),
         single_lens: single.is_some(),
+        stated_frame: stated_frame(take),
         ..Default::default()
     }
 }
@@ -1103,7 +1141,7 @@ impl X6RawIter {
         let Some(source) = source else { return self };
         let dir = &source.dir;
         if self.index.take.layout != Layout::Paired {
-            tracing::info!("raw take: enhanced frames are read for a paired take only: the capture's frames are used");
+            tracing::info!("raw take: enhanced frames are read for a paired take of 3840 x 3840 only: the capture's frames are used");
             return self;
         }
         if !crate::enhanced_dng::decodable() {
@@ -1386,6 +1424,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let take = Take {
+            stated_levels: None,
             layout: Layout::Paired, cfa: x6b::CFA, black_level: x6b::BLACK_LEVEL, white_level: x6b::WHITE_LEVEL,
             dir: dir.clone(), fps_setting: 60, width: 3840, height: 3840, clock_start: None,
             audio_file: None, audio_timing: None, sensor_metadata: None, exposure_file: None,
@@ -1483,6 +1522,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vr180-take-timing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut take = Take {
+            stated_levels: None,
             layout: Layout::Paired, cfa: x6b::CFA, black_level: x6b::BLACK_LEVEL, white_level: x6b::WHITE_LEVEL,
             dir: dir.clone(), fps_setting: 30, width: 3840, height: 3840, clock_start: None,
             audio_file: None, audio_timing: None, sensor_metadata: None, exposure_file: None,
@@ -1514,6 +1554,7 @@ mod tests {
         let eye = r#"{"bayer_output_wh":[3840,3840],"line_period_ns":4000.0,"rolling_shutter_first_to_last_row_ns":15356000}"#;
         std::fs::write(dir.join("sensor-metadata.json"), format!(r#"{{"eyes":{{"CAM0":{eye},"CAM1":{eye}}}}}"#)).unwrap();
         let take = Take {
+            stated_levels: None,
             layout: Layout::Paired, cfa: x6b::CFA, black_level: x6b::BLACK_LEVEL, white_level: x6b::WHITE_LEVEL,
             dir: dir.clone(), fps_setting: 50, width: 3840, height: 3840,
             clock_start: Some(x6b::ClockAnchor { counter_ticks: 0, counter_hz: hz, ..Default::default() }),
@@ -1767,6 +1808,7 @@ mod tests {
         let lens = "2_2.455430_7216.620_7216.620_3855.460_3884.530_0.276_-0.042_89.578_0.000000_0.000000_0.000000_1.32059765_-1.38414502_4.43894196_5.25202703_0.00000000_-0.00032840_0.00113587_0.00412989_0.00653467_-0.00106616_-0.00235222_0.02084749_-0.01150168_15488_7744_193_2.455430_7227.070_7227.070_11569.100_3877.970_-0.132_0.081_89.544_-0.000064_-0.000049_-0.032576_1.31835759_-1.57224715_5.29361629_3.47188210_0.00000000_0.00016541_-0.00072159_-0.00095306_0.01344961_-0.00061933_-0.00056505_0.01970853_-0.02243911_15488_7744_193_394240";
         std::fs::write(dir.join(x6b::CALIBRATION_FILE), format!(r#"{{"eis_calib":{{"offset_v6":"{lens}"}}}}"#)).unwrap();
         let take = |channel: usize| Take {
+            stated_levels: None,
             layout: Layout::Single { channel }, cfa: x6b::CFA, black_level: 64, white_level: 1023,
             dir: dir.clone(), fps_setting: 30, width: 7680, height: 7680, clock_start: None,
             audio_file: None, audio_timing: None, sensor_metadata: Some("sensor-metadata.json".into()), exposure_file: None,
@@ -1804,6 +1846,65 @@ mod tests {
         assert!(load_index(&file, &as_paired).is_none());
         let index = TakeIndex::new(take(1), vec![entry, PairEntry { request: 43, exposure_ns: [7_066_733_333; 2], ..entry }]);
         assert_eq!((index.frames(), index.missing.clone()), (2, vec![42]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A take is placed in the calibration's frame by its sensor record:
+    /// the frames this app placed like the camera's own video keep their
+    /// place, a frame of part of the view is a crop, and a reduced copy of
+    /// a frame keeps its origin.
+    #[test]
+    fn a_take_is_placed_by_its_sensor_record() {
+        use vr180_fisheye::x6b::{PairedFrame, PAIRED_FRAMES};
+        let dir = std::env::temp_dir().join(format!("vr180-take-placed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let take = |layout: Layout, side: u32, record: Option<&str>| Take {
+            stated_levels: None,
+            layout, cfa: x6b::CFA, black_level: 64, white_level: 1023,
+            dir: dir.clone(), fps_setting: 30, width: side, height: side, clock_start: None,
+            audio_file: None, audio_timing: None, sensor_metadata: record.map(str::to_owned), exposure_file: None,
+            seal: x6b::Seal { fps_setting: 30, request_window: (1, 1), received_pairs: 1, pairs: 1, bytes: 8192 },
+            capture_bytes: 8192,
+        };
+        let eye = |roi_y: [u32; 2], bin: u32, kept: [u32; 4], out: [u32; 2], window: Option<[u32; 4]>| format!(
+            r#"{{"analog_roi_register_xyxy_inclusive":[0,{},8191,{}],"binning_xy":[{bin},{bin}],"digital_crop_after_binning_xywh":{kept:?},"bayer_output_wh":{out:?},"line_period_ns":4000.0,"rolling_shutter_first_to_last_row_ns":null{}}}"#,
+            roi_y[0], roi_y[1], window.map_or(String::new(), |w| format!(r#","recorded_bayer_window_xywh":{w:?}"#)));
+        let write = |eye: String| std::fs::write(dir.join("r.json"), format!(r#"{{"eyes":{{"CAM0":{eye},"CAM1":{eye}}}}}"#)).unwrap();
+        let frame = |side: u16| -> PairedFrame { PAIRED_FRAMES.into_iter().find(|f| f.side == side).unwrap() };
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // No record: nothing stated, the frame placed like the camera's own video.
+        let bare = take(Layout::Paired, 3840, None);
+        assert!(stated_frame(&bare).is_none() && lens_meta(&bare).stated_frame.is_none());
+        let as_video = lens_meta(&bare).stream_geometry(3840, 3840, X6ViewChoice::Auto);
+        assert_eq!((as_video.scale_x, as_video.origin_x, as_video.origin_y, as_video.cropped), (0.5, 32.0, 32.0, false));
+        // 3840×3840, binned: the same place by its record.
+        write(eye([256, 7935], 2, [128, 0, 3840, 3840], [3840, 3840], None));
+        let placed = take(Layout::Paired, 3840, Some("r.json"));
+        let g = lens_meta(&placed).stream_geometry(3840, 3840, X6ViewChoice::Auto);
+        assert_eq!((g.scale_x, g.scale_y, g.origin_x, g.origin_y, g.cropped, g.readout_fraction), (as_video.scale_x, as_video.scale_y, 32.0, 32.0, false, 1.0));
+        // A preview's half-size copy: half the scale, the same origin.
+        let half = lens_meta(&placed).stream_geometry(1920, 1920, X6ViewChoice::Auto);
+        assert_eq!((half.scale_x, half.origin_x, half.cropped), (0.25, 32.0, false));
+        // One lens at 7680×7680.
+        write(eye([256, 7935], 1, [256, 0, 7680, 7680], [7680, 7680], None));
+        let one = take(Layout::Single { channel: 0 }, 7680, Some("r.json"));
+        let g = lens_meta(&one).stream_geometry(7680, 7680, X6ViewChoice::Auto);
+        assert_eq!((g.scale_x, g.origin_x, g.origin_y, g.cropped, g.mode), (1.0, 32.0, 32.0, false, vr180_fisheye::X6Mode::SingleLens));
+        // 5504×5504: more than the video's window, scaled by 16/23. Not a crop.
+        write(eye([128, 8063], 1, [136, 12, 7920, 7912], [5504, 5504], None));
+        let g = lens_meta(&take(Layout::PairedOf(frame(5504)), 5504, Some("r.json"))).stream_geometry(5504, 5504, X6ViewChoice::Auto);
+        assert!(close(g.scale_x, 16.0 / 23.0) && close(g.scale_y, 16.0 / 23.0) && close(g.origin_x, -80.0) && close(g.origin_y, -84.0) && !g.cropped, "{g:?}");
+        // 4912×4912 and 3968×3968: the sensor's own pixels around its middle, part of the view.
+        write(eye([1632, 6559], 1, [1640, 8, 4912, 4912], [4912, 4912], Some([0, 0, 4912, 4912])));
+        let g = lens_meta(&take(Layout::PairedOf(frame(4912)), 4912, Some("r.json"))).stream_geometry(4912, 4912, X6ViewChoice::Auto);
+        assert_eq!((g.scale_x, g.origin_x, g.origin_y, g.cropped), (1.0, 1416.0, 1416.0, true));
+        write(eye([2112, 6079], 1, [1640, 0, 4912, 3968], [4912, 3968], Some([472, 0, 3968, 3968])));
+        let small = take(Layout::PairedOf(frame(3968)), 3968, Some("r.json"));
+        let g = lens_meta(&small).stream_geometry(3968, 3968, X6ViewChoice::Auto);
+        assert_eq!((g.scale_x, g.origin_x, g.origin_y, g.cropped), (1.0, 1888.0, 1888.0, true));
+        // Its rows: the record's line period over the rows read.
+        assert!((capture_timing(&small).readout_ms.unwrap() - 4000.0 * 3967.0 * 1e-6).abs() < 1e-4);
+        assert_eq!(bayer_of(&small), BayerLayout { cfa: x6b::CFA, black: 64.0, white: 1023.0, neutral: BAYER.neutral });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

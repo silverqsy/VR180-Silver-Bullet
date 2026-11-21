@@ -12,6 +12,15 @@ stabilization, eye alignment, every output format. What is new is the
 developing: a raw clip has no look of its own, so the Color panel gets a raw
 converter's controls for it, and every frame can be had as a DNG.
 
+- **Other frame sizes.** A take whose eyes are 5504 × 5504, 4912 × 4912
+  or 3968 × 3968 opens like one of 3840 × 3840: the same preview,
+  stabilization, development and exports, the Camera original DNGs
+  included. The 5504 frame holds the lens's whole view. The 4912 and the
+  3968 frame hold the middle of it at the sensor's own pixels: outside the
+  frame the picture is black, the Crop mask applies, and the Resolution
+  list offers the native-sharpness size, as for a Crop video clip. Every
+  frame is placed in the lens's view, and its rows are timed, by the
+  take's own sensor record.
 - **Raw development.** Temperature and Tint (or As shot), Exposure,
   Contrast, Highlights, Shadows, Whites, Blacks, in a raw converter's own
   terms. The rendering follows Adobe Camera Raw's, control by control, so a

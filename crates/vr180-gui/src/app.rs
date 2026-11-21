@@ -1631,7 +1631,7 @@ mod export_size_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Default::default(),
-            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, four_channel_sound: false, offline: None,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, offline: None,
         };
         let x6 = |single_eye| Some(X6ClipInfo { window: None, ilog: Some(true), paraxial_native: 2086.97, single_lens: single_eye, single_eye });
         let two = item(SourceKind::Insta360Insv, x6(false));
@@ -1657,6 +1657,24 @@ mod export_size_tests {
         // An unconfirmed 3712² clip: only once the user says it is the Crop.
         assert_eq!(info(None).sharp_eye(3712, 3712, X6ViewChoice::Auto), None);
         assert_eq!(info(None).sharp_eye(3712, 3712, X6ViewChoice::Crop), Some(6560));
+    }
+    /// A raw take's frame is placed by its own record: one that holds part
+    /// of the lens's view has a native-sharpness size (the one a Crop video
+    /// clip of the same pixels has), one that holds the whole view has
+    /// none, and a reduced copy of a frame is the same frame.
+    #[test]
+    fn a_raw_takes_crop_features_follow_its_frame() {
+        use vr180_fisheye::insta360::StatedFrame;
+        let frame = |side: u32, origin: f64, scale: f64| super::RawFrame {
+            stated: StatedFrame { width: side, height: side, origin: (origin, origin), scale: (scale, scale) },
+            paraxial_native: 2086.97, one_lens: false,
+        };
+        assert_eq!(frame(4912, 1416.0, 1.0).sharp_eye(4912, 4912), Some(6560));
+        assert_eq!(frame(3968, 1888.0, 1.0).sharp_eye(3968, 3968), Some(6560));
+        assert_eq!(frame(3840, 32.0, 0.5).sharp_eye(3840, 3840), None);
+        assert_eq!(frame(5504, -84.0, 16.0 / 23.0).sharp_eye(5504, 5504), None);
+        let half = frame(4912, 1416.0, 1.0).geometry(2456, 2456);
+        assert_eq!((half.scale_x, half.origin_x, half.cropped), (0.5, 1416.0, true));
     }
 }
 
@@ -1863,7 +1881,7 @@ mod ettr_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Settings { ettr_stops, ..Default::default() },
-            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, four_channel_sound: false, offline: None,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, offline: None,
         }
     }
 
@@ -2462,6 +2480,8 @@ struct BatchItem {
     x6: Option<X6ClipInfo>,
     /// A raw take of one lens ([`raw_take_of_one_lens`]).
     raw_one_lens: bool,
+    /// A raw take's frame in its lens's view ([`RawFrame`]).
+    raw_frame: Option<RawFrame>,
     /// The clip has four-channel sound a spatial track can be made of
     /// ([`four_channel_sound`]).
     four_channel_sound: bool,
@@ -2531,6 +2551,7 @@ struct ClipFacts {
     fisheye_eye_h: u32,
     x6: Option<X6ClipInfo>,
     raw_one_lens: bool,
+    raw_frame: Option<RawFrame>,
     four_channel_sound: bool,
 }
 
@@ -2583,6 +2604,7 @@ impl ClipFacts {
             // file's end) — a Crop clip's native-sharpness size follows from it.
             x6: (source_kind == vr180_pipeline::SourceKind::Insta360Insv).then(|| X6ClipInfo::read(path).0),
             raw_one_lens: raw_take_of_one_lens(source_kind, path),
+            raw_frame: RawFrame::read(source_kind, path),
             four_channel_sound: four_channel_sound(source_kind, path),
         })
     }
@@ -2628,6 +2650,7 @@ impl BatchItem {
             selected: clip.selected,
             x6: None,
             raw_one_lens: false,
+            raw_frame: None,
             four_channel_sound: false,
             offline: Some(OfflineClip { token, looking: true, file: clip.file.clone(), segments: clip.segments.clone(), base }),
         }
@@ -2668,7 +2691,10 @@ impl BatchItem {
     /// its own view choice (`None` unless its frame is a crop of the lens'
     /// view — see `ExportResolution::Sharp`).
     fn sharp_eye(&self) -> Option<u32> {
-        self.x6.and_then(|x| x.sharp_eye(self.fisheye_eye_w, self.fisheye_eye_h, self.settings.insv_view))
+        match self.raw_frame {
+            Some(frame) => frame.sharp_eye(self.fisheye_eye_w, self.fisheye_eye_h),
+            None => self.x6.and_then(|x| x.sharp_eye(self.fisheye_eye_w, self.fisheye_eye_h, self.settings.insv_view)),
+        }
     }
 }
 
@@ -3624,6 +3650,8 @@ struct ClipInfo {
     x6: Option<X6ClipInfo>,
     /// A raw take of one lens ([`raw_take_of_one_lens`]).
     raw_one_lens: bool,
+    /// A raw take's frame in its lens's view ([`RawFrame`]).
+    raw_frame: Option<RawFrame>,
     /// Bit rate of each video stream of the recording, bits per second, as
     /// the container reports it (two entries = the two eyes of a
     /// dual-stream file; the first chapter's for a chain). Empty when the
@@ -3658,20 +3686,69 @@ impl ClipInfo {
         takes_ilog(self.source_kind, self.x6.as_ref())
     }
 
-    /// Stream geometry of an X6 clip under `view` (`None` for other sources).
+    /// Stream geometry of an X6 clip under `view` (`None` for other
+    /// sources): a video file's by its recording mode, a raw take's as its
+    /// sensor record places it (no view to choose).
     fn x6_geometry(&self, view: vr180_fisheye::X6ViewChoice) -> Option<vr180_fisheye::InsvStreamGeometry> {
-        self.x6.map(|x| x.geometry(self.fisheye_eye_w, self.fisheye_eye_h, view))
+        match self.raw_frame {
+            Some(frame) => Some(frame.geometry(self.fisheye_eye_w, self.fisheye_eye_h)),
+            None => self.x6.map(|x| x.geometry(self.fisheye_eye_w, self.fisheye_eye_h, view)),
+        }
     }
 
     /// Per-eye side of the native-sharpness canvas (`None` unless the clip's
     /// frame is a crop of the lens' view — see `ExportResolution::Sharp`).
     fn sharp_eye(&self, view: vr180_fisheye::X6ViewChoice) -> Option<u32> {
-        self.x6.and_then(|x| x.sharp_eye(self.fisheye_eye_w, self.fisheye_eye_h, view))
+        match self.raw_frame {
+            Some(frame) => frame.sharp_eye(self.fisheye_eye_w, self.fisheye_eye_h),
+            None => self.x6.and_then(|x| x.sharp_eye(self.fisheye_eye_w, self.fisheye_eye_h, view)),
+        }
     }
 }
 
 /// A raw video take that holds one lens's frames: a single-eye source (the
 /// take's own description says so; read once per take).
+/// Where a raw take's frame sits in its lens's view, as the take's sensor
+/// record states it: what the crop features of such a clip go by (the mask
+/// of a frame that is part of the view, its native-sharpness size).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RawFrame {
+    stated: vr180_fisheye::insta360::StatedFrame,
+    /// Mean centre scale of the take's lenses, native pixels per radian.
+    paraxial_native: f64,
+    one_lens: bool,
+}
+
+impl RawFrame {
+    /// Read it from a take's small files. `None` for a source that is no
+    /// raw take, and for a take without a sensor record (its frame is the
+    /// camera's own video frame, the whole view).
+    fn read(kind: vr180_pipeline::SourceKind, path: &std::path::Path) -> Option<Self> {
+        if !kind.is_raw_video() {
+            return None;
+        }
+        let take = vr180_pipeline::x6_raw::describe(path).ok()?;
+        Some(Self {
+            stated: vr180_pipeline::x6_raw::stated_frame(&take)?,
+            paraxial_native: vr180_pipeline::insv_imu::x6_paraxial_native(&vr180_pipeline::x6_raw::lens_meta(&take)),
+            one_lens: take.layout.single_channel().is_some(),
+        })
+    }
+
+    /// The frame's geometry, worked at `eye_w × eye_h`.
+    fn geometry(&self, eye_w: u32, eye_h: u32) -> vr180_fisheye::InsvStreamGeometry {
+        vr180_fisheye::InsvStreamGeometry::stated(&self.stated, eye_w, eye_h, self.one_lens)
+    }
+
+    /// Per-eye side of the 180° canvas at the frame's native sharpness,
+    /// when the frame is a crop of the lens' view (see
+    /// `ExportResolution::Sharp`).
+    fn sharp_eye(&self, eye_w: u32, eye_h: u32) -> Option<u32> {
+        let g = self.geometry(eye_w, eye_h);
+        g.cropped.then(|| vr180_pipeline::insv_imu::native_sharpness_side(self.paraxial_native * g.scale_x))
+    }
+}
+
 fn raw_take_of_one_lens(kind: vr180_pipeline::SourceKind, path: &std::path::Path) -> bool {
     vr180_pipeline::source_kind::is_single_eye(kind, path) && kind.is_raw_video()
 }
@@ -3783,6 +3860,8 @@ struct LoadedMeta {
     x6: Option<X6ClipInfo>,
     /// A raw take of one lens ([`raw_take_of_one_lens`]).
     raw_one_lens: bool,
+    /// A raw take's frame in its lens's view ([`RawFrame`]).
+    raw_frame: Option<RawFrame>,
     /// See `ClipInfo::video_bitrates_bps` / `file_bitrate_bps`.
     video_bitrates_bps: Vec<u64>,
     file_bitrate_bps: Option<u64>,
@@ -5250,7 +5329,7 @@ impl App {
                 continue;
             }
             let Some(facts) = ClipFacts::read(&path) else { continue };
-            let ClipFacts { source_kind, fisheye_eye_w, fisheye_eye_h, x6, raw_one_lens, four_channel_sound, .. } = facts;
+            let ClipFacts { source_kind, fisheye_eye_w, fisheye_eye_h, x6, raw_one_lens, raw_frame, four_channel_sound, .. } = facts;
             let is_loaded_clip = self.loaded_path.as_deref() == Some(path.as_path());
             // A NEW clip inherits ITS kind's template (OSV / .360 / … kept
             // independent); the already-loaded clip keeps its live edits.
@@ -5302,6 +5381,7 @@ impl App {
                 selected: false,
                 x6,
                 raw_one_lens,
+                raw_frame,
                 four_channel_sound,
                 offline: None,
             });
@@ -6515,8 +6595,9 @@ impl App {
             tracing::warn!("load: BRAW probe has no colour block — the Blackmagic RAW colour section needs a rebuilt helper");
         }
         let raw_one_lens = raw_take_of_one_lens(source_kind, &path);
+        let raw_frame = RawFrame::read(source_kind, &path);
         Ok(LoadedMeta {
-            token, path, preserve_clip_settings, source_kind, raw_one_lens,
+            token, path, preserve_clip_settings, source_kind, raw_one_lens, raw_frame,
             width: probe.width, height: probe.height, fps: probe.fps,
             duration_sec, frame_count, holes, segments,
             cori_count, grav_count, srot_ms,
@@ -6677,6 +6758,7 @@ impl App {
             braw_lut: meta.braw_lut.clone(),
             x6: meta.x6,
             raw_one_lens: meta.raw_one_lens,
+            raw_frame: meta.raw_frame,
             video_bitrates_bps: meta.video_bitrates_bps,
             file_bitrate_bps: meta.file_bitrate_bps,
             holes: meta.holes,
@@ -8335,6 +8417,7 @@ impl App {
         item.fisheye_eye_h = facts.fisheye_eye_h;
         item.x6 = facts.x6;
         item.raw_one_lens = facts.raw_one_lens;
+        item.raw_frame = facts.raw_frame;
         item.four_channel_sound = facts.four_channel_sound;
         item.offline = None;
         if let Some(files) = segments {

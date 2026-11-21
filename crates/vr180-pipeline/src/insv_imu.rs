@@ -320,8 +320,13 @@ pub fn insv_calib_only(meta: &Insta360Meta, stream_w: u32, stream_h: u32, view: 
     // (the file's window record + the encoded size; see `X6Mode`).
     let geom = meta.stream_geometry(stream_w, stream_h, view);
     tracing::info!(
-        "insv: {}x{} window {:?} → mode {:?}{} — scale {:.6}, origin ({:.1}, {:.1}), rows span {:.4} of the readout{}",
-        stream_w, stream_h, meta.window_crop.map(|w| (w.dst_w, w.dst_h, w.offset_x, w.offset_y)), geom.mode,
+        "insv: {}x{} {} → mode {:?}{} — scale {:.6}, origin ({:.1}, {:.1}), rows span {:.4} of the readout{}",
+        stream_w, stream_h,
+        match &meta.stated_frame {
+            Some(f) => format!("placed by its source (a frame of {}x{})", f.width, f.height),
+            None => format!("window {:?}", meta.window_crop.map(|w| (w.dst_w, w.dst_h, w.offset_x, w.offset_y))),
+        },
+        geom.mode,
         if geom.detected != geom.mode { format!(" (file: {:?}, view {:?})", geom.detected, view) } else { String::new() },
         geom.scale_x, geom.origin_x, geom.origin_y, geom.readout_fraction,
         if geom.cropped { ", frame = crop of the image circle" } else { "" },

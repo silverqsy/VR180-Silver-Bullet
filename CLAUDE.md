@@ -4324,6 +4324,107 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       (`SetThreadExecutionState` for sleep, the process power-throttling
       opt-out for speed) behind the same `Busy`.
 
+46. **Raw takes of other frame sizes (2026-11-21, Mac; UNRELEASED).** The
+    user-facing text is in the CHANGELOG (the raw video section, "Other
+    frame sizes"). A paired take may hold frames of 5504×5504 or 3968×3968
+    (10 bits) or 4912×4912 (14 bits) in place of 3840×3840.
+    - **The capture** (`vr180_fisheye::x6b`, module header). `Layout::
+      PairedOf(PairedFrame { side, coded, bits })`, told from `clip.json`'s
+      `size` (`PAIRED_FRAMES`; `encoded_bayer_size` and `sensor_bits` are
+      held against it, and the frame rate setting: 30 for the two larger
+      frames, 50 or 60 for 3968). The record header is the paired one with
+      16 tiles an eye, a zero where the 3840 layout has its threshold and
+      32 payload lengths. `Profile::Frame10` (`X6D5B02`): a tile is a
+      predictor stream in the split block layout and nothing else
+      (`unpack_split`, as a take of one lens in its later layout).
+      `Profile::Frame14` (`X6D4B01`): a tile is coded as a 30 fps 3840
+      take's (`unpack_symbols`, the table that keeps every value, the tail
+      of low bits) on a canvas of 4928×4928, of which the frame is the
+      first 4912 columns of the first 4912 rows (`decode_tile` decodes the
+      canvas tile into scratch space and copies the frame's part; the last
+      tile holds 292 of its 308 rows). `Layout::coded_side`,
+      `tiles_per_eye`, `bits`; `Profile::records(layout, fps)` replaces
+      `fps()`; the kept pair lists name a profile by its place in
+      `Profile::ALL` (the two new ones are last).
+    - **The 14-bit frame's levels.** Its samples are the sensor's 10-bit
+      values four bits up: on a take of it no sample of six eye frames has
+      one of its low four bits set, none lies below 976, the darkest patch
+      of a night scene sits at 1048 and saturated lights read 16368. So
+      black is 1024 and white 16368. A take that states 64 and 15408 for
+      such a frame states the levels of the 3840 layout (whose values are
+      the sensor's less 960): `x6b::sensor_levels` then reads it by the
+      sensor's own, `Take::stated_levels` keeps what was stated and the
+      log says so once when the take is listed. A take that states any
+      other pair is read as it says.
+    - **Where a frame sits.** `x6b::read_sensor_windows` reads each eye's
+      place from the take's sensor record: the area read
+      (`analog_roi_register_xyxy_inclusive`), the binning, the kept part
+      (`digital_crop_after_binning_xywh`), the size it leaves the sensor at
+      (`bayer_output_wh`, smaller where the sensor scales it) and the
+      frame's window in that output (`recorded_bayer_window_xywh`).
+      `x6_raw::stated_frame` puts it in the calibration's frame
+      (`CALIBRATION_ORIGIN` = 224: the 7680² video window lies 32 inside
+      the 7744² calibration frame and at 256 on the sensor) and
+      `Insta360Meta::stated_frame` → `InsvStreamGeometry::stated` hands it
+      to the lens calibration in place of the recording-mode table. By
+      their records: 3840 binned and 7680 of one lens → origin 32, scale
+      0.5 / 1 (what they were placed at before, now from the file); 5504 →
+      origin (−80, −84), scale 16/23; 4912 → 1416; 3968 → 1888, both at
+      scale 1 and both a crop of the image circle (`cropped`: the frame
+      covers less than the video window). The 5504 frame is 7912 columns
+      of a kept part of 7920: it is taken to hold the last 7912, which is
+      where the camera's own video files place that window (their record:
+      4 pixels right of the middle). Not measured: the other readings lie
+      4 and 8 sensor pixels to the left (0.03° and 0.06°), and an origin
+      fitted from gyro against tracked features scatters by 20 to 30
+      pixels on every mode.
+    - **Rows.** `EyeWindow::first_to_last_row_ns` = the sensor rows read ×
+      the record's line period, the record's own figure where it agrees.
+      For the scaled 5504 frame the record has none: 7912 rows at 4000 ns =
+      31.644 ms (the camera's video files of the same window state 31.65).
+    - **The app.** `RawFrame` (app.rs: `BatchItem`, `ClipFacts`,
+      `ClipInfo`, `LoadedMeta` carry one beside `raw_one_lens`) gives a raw
+      take its `x6_geometry` and `sharp_eye`: a take whose frame is a crop
+      gets the Crop mask section and the native-sharpness size of the
+      Resolution list (6560 an eye), as a Crop video clip does. Nothing
+      else of the GUI asks which frame a take has.
+    - **DNG.** `sensor_dng::tile_rows_for`: the capture's own tile rows
+      where a whole number of them is the frame (344, 248), else the
+      fewest even rows that are with at most 24 tiles: 614 for the 4912
+      frame. `eye_dng` writes as many tile entries as the file has tiles
+      (it wrote 24 whatever the frame). Levels and bits are the take's as
+      read (1024 / 16368 at 14 bits for the 4912 frame).
+    - **Verified.** Unit tests: records of all three frames decode to what
+      was stored, tile for tile (two tile pictures in a known order, so a
+      misplaced tile would show), on one thread and many, one channel
+      alone, read from a take whose records lie out of request order;
+      refusals (a signature of the other depth, a frame rate the frame is
+      not recorded at, header fields of another layout, bytes after a
+      10-bit tile's stream, a 14-bit tail cut short or over-marked, a
+      canvas or depth that is not the frame's); the levels rule; the
+      sensor record's five frames; the placement of each and that 3840 /
+      7680 keep theirs; a DNG of 4912 and of 3968 read back sample for
+      sample with 8 and 16 tiles; the crop features. On three takes (one
+      of each frame, 5504 at 30, 4912 at 30, 3968 at 60): first, middle
+      and last record of each decode sample for sample as an independent
+      reader decodes them (18 eye frames); each exports through the real
+      pipeline and the pictures were looked at (the whole view; the crops
+      with black outside the frame; neutral walls and true blacks,
+      including the 4912 take read by the sensor's levels); stabilized,
+      shake of a locked export at 1024 px an eye, median / 90th
+      percentile px a frame: 5504 1.28 / 5.3 → 0.067 / 0.21, 4912 0.44 /
+      0.89 → 0.038 / 0.079, 3968 0.30 / 0.70 → 0.050 / 0.105, and with the
+      row correction scaled 0 / 0.5 / 1 / 1.5 / 2 the 5504 take's 90th
+      percentile reads 0.38 / 0.28 / 0.21 / 0.24 / 0.30 (least at 1, with
+      the 31.6 ms above); Camera original DNGs of each written and the
+      4912 one opened by the system's raw decoder. NOT seen in the app's
+      window. NOT found: pixels that read high in every frame (looked for,
+      to measure the frames' places on the sensor directly: none in 120
+      frames of each take).
+    - **Windows, to look at.** No code is platform-specific. A take of
+      each frame size should open, preview and export; a 4912 or 3968 take
+      shows the Crop mask section and offers the native-sharpness size.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

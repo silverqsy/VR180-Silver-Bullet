@@ -437,6 +437,26 @@ impl InsvStreamGeometry {
         g
     }
 
+    /// A frame whose place is stated ([`StatedFrame`]), worked at
+    /// `stream_w × stream_h` (its own size or a reduced copy of it). It is a
+    /// crop of the image circle when it covers less than the window the
+    /// camera's own video takes: a ray that leaves it has no data.
+    pub fn stated(frame: &StatedFrame, stream_w: u32, stream_h: u32, single_lens: bool) -> Self {
+        let (kx, ky) = (stream_w as f64 / frame.width.max(1) as f64, stream_h as f64 / frame.height.max(1) as f64);
+        let covered = (frame.width as f64 / frame.scale.0, frame.height as f64 / frame.scale.1);
+        let mode = if single_lens { X6Mode::SingleLens } else { X6Mode::Stock };
+        Self {
+            mode,
+            detected: mode,
+            scale_x: frame.scale.0 * kx,
+            scale_y: frame.scale.1 * ky,
+            origin_x: frame.origin.0,
+            origin_y: frame.origin.1,
+            readout_fraction: 1.0,
+            cropped: covered.0 < X6_DEFAULT_WINDOW.dst_w as f64 - 1.0 || covered.1 < X6_DEFAULT_WINDOW.dst_h as f64 - 1.0,
+        }
+    }
+
     /// Principal point of a factory entry in stream coordinates.
     pub fn principal_point(&self, entry: &InsvLensCalib) -> (f64, f64) {
         (
@@ -514,6 +534,23 @@ pub struct Insta360Meta {
     pub acc_range_g: Option<u32>,
     pub single_lens: bool,
     pub back_to_back: bool,
+    /// Where the stream's frame sits in the calibration's frame, stated
+    /// outright (a raw take's sensor record). It takes the place of what
+    /// `window_crop` and the frame's size would be read as.
+    pub stated_frame: Option<StatedFrame>,
+}
+
+/// A frame's place in the factory calibration's native frame (one 7744²
+/// sensor half per lens), as its source states it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StatedFrame {
+    /// The frame's size in its own samples.
+    pub width: u32,
+    pub height: u32,
+    /// Native coordinates, within the lens' half, of the frame's origin.
+    pub origin: (f64, f64),
+    /// Frame samples per native pixel, across and down.
+    pub scale: (f64, f64),
 }
 
 impl Insta360Meta {
@@ -539,6 +576,9 @@ impl Insta360Meta {
 
     /// Geometry of this clip's video streams (see [`InsvStreamGeometry`]).
     pub fn stream_geometry(&self, stream_w: u32, stream_h: u32, choice: X6ViewChoice) -> InsvStreamGeometry {
+        if let Some(frame) = &self.stated_frame {
+            return InsvStreamGeometry::stated(frame, stream_w, stream_h, self.single_lens);
+        }
         if self.single_lens {
             return InsvStreamGeometry::resolve_single_lens(self.window_crop.as_ref(), stream_w, stream_h);
         }

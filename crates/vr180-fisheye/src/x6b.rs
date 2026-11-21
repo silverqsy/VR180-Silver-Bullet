@@ -76,6 +76,22 @@
 //!   block of `n` values of `b` bits is `n × b / 8` bytes: every lane's
 //!   whole bytes interleaved, then the bits left over of each lane, lane
 //!   after lane, low bits first.
+//!
+//! ## Other frames of both sensors
+//!
+//! A paired take may hold frames of another size ([`PAIRED_FRAMES`]), which
+//! `clip.json` states with the sample format (`size`, `sensor_bits`,
+//! `cfa_pattern`, `black_level`, `white_level`, and `encoded_bayer_size`
+//! where the tiles are coded on a larger canvas): 5504×5504 or 3968×3968
+//! samples of 10 bits, or 4912×4912 of 14 bits, every sensor value kept.
+//! Their records have the paired header with 16 tiles an eye and a zero
+//! where the threshold was, and 32 payload lengths.
+//!
+//! - `X6D5B02\0` (the 10-bit frames): a tile is a predictor stream in the
+//!   block layout of `X6S8B02` and nothing else, a symbol is the sample.
+//! - `X6D4B01\0` (the 14-bit frame): a tile is coded as a 30 fps paired
+//!   take's, predictor stream and tail stream, on a canvas of 4928×4928 of
+//!   which the frame is the first 4912 columns of the first 4912 rows.
 
 use crate::{Error, Result};
 use std::fs::File;
@@ -87,7 +103,8 @@ use std::sync::OnceLock;
 pub const EYE_SIDE: usize = 3840;
 /// Rows of one of its tiles.
 pub const TILE_ROWS: usize = 160;
-/// Tiles of one eye (either layout).
+/// Tiles of one eye of a 3840×3840 paired take and of a take of one lens
+/// (the most a layout has: [`Layout::tiles_per_eye`]).
 pub const TILES_PER_EYE: usize = 24;
 /// Samples of one tile of a paired take.
 pub const TILE_SAMPLES: usize = EYE_SIDE * TILE_ROWS;
@@ -126,6 +143,35 @@ pub const EXPOSURE_FILE: &str = "exposure.csv";
 /// per pair) in place of the capture.
 pub const FRAMES_FILE: &str = "frames.jsonl";
 
+/// A frame both sensors may record besides 3840×3840.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PairedFrame {
+    /// Samples a side.
+    pub side: u16,
+    /// Side of the canvas the tiles are coded on: the frame's columns and
+    /// rows come first, padding after them.
+    pub coded: u16,
+    /// Bits of a sample.
+    pub bits: u8,
+}
+
+impl PairedFrame {
+    /// Tiles of one eye.
+    pub const TILES: usize = 16;
+
+    /// The frame rate settings this frame is recorded at.
+    fn rates(self) -> &'static [u32] {
+        if self.side == 3968 { &[50, 60] } else { &[30] }
+    }
+}
+
+/// The frames a paired take may hold besides 3840×3840.
+pub const PAIRED_FRAMES: [PairedFrame; 3] = [
+    PairedFrame { side: 5504, coded: 5504, bits: 10 },
+    PairedFrame { side: 4912, coded: 4928, bits: 14 },
+    PairedFrame { side: 3968, coded: 3968, bits: 10 },
+];
+
 /// How a capture holds its frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Layout {
@@ -134,21 +180,32 @@ pub enum Layout {
     /// One sensor (`channel`: the channel a paired take stores it as): a
     /// 7680×7680 frame per record, 10 bits.
     Single { channel: usize },
+    /// Both sensors, a frame of another size of each per record.
+    PairedOf(PairedFrame),
 }
 
 impl Layout {
     /// The `layout` of `clip.json`.
     fn name(self) -> &'static str {
         match self {
-            Self::Paired => "paired-bayer-v1",
+            Self::Paired | Self::PairedOf(_) => "paired-bayer-v1",
             Self::Single { .. } => "single-bayer-v1",
         }
     }
 
-    /// The layout a `clip.json` states (`eye` names a single layout's sensor).
+    /// The layout a `clip.json` states (`eye` names a single layout's
+    /// sensor, `size` a paired layout's frame: one this module does not
+    /// know reads as the 3840×3840 layout, whose size check then names it).
     fn of_clip(clip: &serde_json::Value) -> Option<Self> {
         match clip.get("layout").and_then(|l| l.as_str())? {
-            "paired-bayer-v1" => Some(Self::Paired),
+            "paired-bayer-v1" => {
+                let side = |k: &str| -> Option<(u64, u64)> {
+                    let a = clip.get(k)?.as_array()?;
+                    Some((a.first()?.as_u64()?, a.get(1)?.as_u64()?))
+                };
+                let frame = side("size").and_then(|(w, h)| PAIRED_FRAMES.into_iter().find(|f| (w, h) == (f.side as u64, f.side as u64)));
+                Some(frame.map_or(Self::Paired, Self::PairedOf))
+            }
             "single-bayer-v1" => match clip.get("eye").and_then(|e| e.as_str())? {
                 "CAM0" => Some(Self::Single { channel: 0 }),
                 "CAM1" => Some(Self::Single { channel: 1 }),
@@ -161,7 +218,7 @@ impl Layout {
     /// Channels a record holds.
     pub fn channels(self) -> usize {
         match self {
-            Self::Paired => 2,
+            Self::Paired | Self::PairedOf(_) => 2,
             Self::Single { .. } => 1,
         }
     }
@@ -169,7 +226,7 @@ impl Layout {
     /// The one sensor a take of one lens holds, as a paired take's channel.
     pub fn single_channel(self) -> Option<usize> {
         match self {
-            Self::Paired => None,
+            Self::Paired | Self::PairedOf(_) => None,
             Self::Single { channel } => Some(channel),
         }
     }
@@ -179,17 +236,44 @@ impl Layout {
         match self {
             Self::Paired => EYE_SIDE,
             Self::Single { .. } => SINGLE_SIDE,
+            Self::PairedOf(frame) => frame.side as usize,
+        }
+    }
+
+    /// Side of the canvas a channel's tiles are coded on: the frame's own,
+    /// or a larger one the frame is the first columns and rows of.
+    pub fn coded_side(self) -> usize {
+        match self {
+            Self::PairedOf(frame) => frame.coded as usize,
+            _ => self.side(),
+        }
+    }
+
+    /// Bits of a sample.
+    pub fn bits(self) -> u8 {
+        match self {
+            Self::Paired => 14,
+            Self::Single { .. } => 10,
+            Self::PairedOf(frame) => frame.bits,
+        }
+    }
+
+    /// Tiles of one channel.
+    pub fn tiles_per_eye(self) -> usize {
+        match self {
+            Self::PairedOf(_) => PairedFrame::TILES,
+            _ => TILES_PER_EYE,
         }
     }
 
     /// Rows of one tile.
     pub fn tile_rows(self) -> usize {
-        self.side() / TILES_PER_EYE
+        self.coded_side() / self.tiles_per_eye()
     }
 
-    /// Samples of one tile.
+    /// Samples of one tile as it is coded.
     pub fn tile_samples(self) -> usize {
-        self.side() * self.tile_rows()
+        self.coded_side() * self.tile_rows()
     }
 
     /// Samples of one channel.
@@ -204,7 +288,7 @@ impl Layout {
 
     /// Tiles of one record.
     pub fn tiles(self) -> usize {
-        self.channels() * TILES_PER_EYE
+        self.channels() * self.tiles_per_eye()
     }
 }
 
@@ -243,11 +327,20 @@ pub enum Profile {
     Single10,
     /// The same samples in the later block layout: a bit width for every 16.
     Single10Split,
+    /// Both sensors at another frame size, 10 bits: every sensor value, in
+    /// the block layout of [`Self::Single10Split`].
+    Frame10,
+    /// Both sensors at another frame size, 14 bits: every sensor value,
+    /// coded as [`Self::Exact30`].
+    Frame14,
 }
 
 impl Profile {
     /// A kept pair list names a profile by its place here: new ones go last.
-    pub const ALL: [Profile; 7] = [Self::Exact30, Self::Mid50, Self::Raised50, Self::Coarse60, Self::Raised60, Self::Single10, Self::Single10Split];
+    pub const ALL: [Profile; 9] = [
+        Self::Exact30, Self::Mid50, Self::Raised50, Self::Coarse60, Self::Raised60, Self::Single10, Self::Single10Split,
+        Self::Frame10, Self::Frame14,
+    ];
 
     /// The record signature.
     pub fn signature(self) -> &'static [u8; 8] {
@@ -259,37 +352,50 @@ impl Profile {
             Self::Raised60 => b"X6QBLK0B",
             Self::Single10 => b"X6S8B01\0",
             Self::Single10Split => b"X6S8B02\0",
+            Self::Frame10 => b"X6D5B02\0",
+            Self::Frame14 => b"X6D4B01\0",
         }
     }
 
-    /// The frame rate setting this signature belongs to.
-    pub fn fps(self) -> u32 {
-        match self {
-            Self::Exact30 | Self::Single10 | Self::Single10Split => 30,
-            Self::Mid50 | Self::Raised50 => 50,
-            Self::Coarse60 | Self::Raised60 => 60,
+    /// Records of a take set to `fps` in `layout` may carry this signature.
+    pub fn records(self, layout: Layout, fps: u32) -> bool {
+        match (self, layout) {
+            (Self::Exact30, Layout::Paired) => fps == 30,
+            (Self::Mid50 | Self::Raised50, Layout::Paired) => fps == 50,
+            (Self::Coarse60 | Self::Raised60, Layout::Paired) => fps == 60,
+            (Self::Single10 | Self::Single10Split, Layout::Single { .. }) => fps == 30,
+            (Self::Frame10, Layout::PairedOf(frame)) => frame.bits == 10 && frame.rates().contains(&fps),
+            (Self::Frame14, Layout::PairedOf(frame)) => frame.bits == 14 && frame.rates().contains(&fps),
+            _ => false,
         }
     }
 
-    /// The profile of a signature recorded at `fps`; `None` for an unknown
-    /// signature or one that belongs to another frame rate.
-    pub fn from_signature(signature: &[u8], fps: u32) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.signature()[..] == *signature && p.fps() == fps)
+    /// The profile of a signature in a take of `format`; `None` for an
+    /// unknown signature or one that belongs to another layout or frame
+    /// rate.
+    pub fn from_signature(signature: &[u8], format: Format) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.signature()[..] == *signature && p.records(format.layout, format.fps))
     }
 
-    /// The records of a take of one lens carry this signature.
-    fn is_single(self) -> bool {
-        matches!(self, Self::Single10 | Self::Single10Split)
-    }
-
-    /// The layout whose records carry this signature.
+    /// Records of a take in `layout` may carry this signature, at one frame
+    /// rate setting or another.
     pub fn layout_is(self, layout: Layout) -> bool {
-        self.is_single() == matches!(layout, Layout::Single { .. })
+        [30, 50, 60].into_iter().any(|fps| self.records(layout, fps))
+    }
+
+    /// A tile is its predictor stream alone: a symbol is the sample.
+    fn plain(self) -> bool {
+        matches!(self, Self::Single10 | Self::Single10Split | Self::Frame10)
+    }
+
+    /// The predictor stream has a bit width for every 16 samples.
+    fn split(self) -> bool {
+        matches!(self, Self::Single10Split | Self::Frame10)
     }
 
     /// Widest bit width a block may use.
     fn max_width(self) -> usize {
-        if self == Self::Exact30 { 15 } else { 11 }
+        if matches!(self, Self::Exact30 | Self::Frame14) { 15 } else { 11 }
     }
 
     /// `(first value, step, count)` runs of the level table.
@@ -300,13 +406,14 @@ impl Profile {
             Self::Raised50 => &[(0, 4, 64), (256, 16, 48), (1024, 32, 32), (2048, 64, 32), (4096, 128, 73), (13440, 32, 1), (13472, 16, 182)],
             Self::Coarse60 => &[(0, 8, 32), (256, 32, 24), (1024, 128, 24), (4096, 256, 16), (8192, 512, 10), (13312, 160, 1), (13472, 16, 182)],
             Self::Raised60 => &[(0, 8, 32), (256, 32, 24), (1024, 64, 16), (2048, 128, 16), (4096, 256, 16), (8192, 512, 10), (13312, 160, 1), (13472, 16, 182)],
-            Self::Single10 | Self::Single10Split => &[(0, 1, 1024)],
+            Self::Single10 | Self::Single10Split | Self::Frame10 => &[(0, 1, 1024)],
+            Self::Frame14 => &[(0, 1, 1024), (1024, 16, 960)],
         }
     }
 
     /// Symbol → sensor level, in symbol order.
     pub fn levels(self) -> &'static [u16] {
-        static TABLES: OnceLock<[Vec<u16>; 7]> = OnceLock::new();
+        static TABLES: OnceLock<[Vec<u16>; 9]> = OnceLock::new();
         let tables = TABLES.get_or_init(|| {
             Profile::ALL.map(|p| {
                 p.runs().iter()
@@ -319,7 +426,7 @@ impl Profile {
 
     /// The values of this profile are every sensor value (no coarser steps).
     pub fn is_exact(self) -> bool {
-        matches!(self, Self::Exact30 | Self::Single10 | Self::Single10Split)
+        matches!(self, Self::Exact30 | Self::Single10 | Self::Single10Split | Self::Frame10 | Self::Frame14)
     }
 }
 
@@ -407,6 +514,9 @@ pub struct Take {
     pub black_level: u16,
     /// Saturated samples read this.
     pub white_level: u16,
+    /// The black and white level `clip.json` states, where they are not the
+    /// ones above ([`sensor_levels`]).
+    pub stated_levels: Option<(u16, u16)>,
     pub clock_start: Option<ClockAnchor>,
     /// Sound file inside the folder (`clip.json` → `audio_file`).
     pub audio_file: Option<String>,
@@ -437,17 +547,14 @@ impl Take {
     /// The largest value a sample of the take can have (the top of its
     /// profiles' level tables, low bits included).
     pub fn sample_max(&self) -> u16 {
-        match self.layout {
-            Layout::Paired => 16383,
-            Layout::Single { .. } => *Profile::Single10.levels().last().unwrap_or(&1023),
-        }
+        (1u32 << self.layout.bits()).saturating_sub(1) as u16
     }
 
     /// The seal's window is of the numbers the records carry (a paired
     /// take's request numbers), so every record lies inside it and a number
     /// of it without a record is a frame that was never saved.
     pub fn window_numbers_records(&self) -> bool {
-        self.layout == Layout::Paired
+        self.layout.channels() == 2
     }
 
     /// Frame rate of a constant-rate file made from the take.
@@ -511,13 +618,24 @@ pub fn read_take(dir: &Path) -> Result<std::result::Result<Take, TakeProblem>> {
     if size != [side as u64, side as u64] {
         return Err(err(format!("unsupported frame size {size:?}")));
     }
-    if !Profile::ALL.iter().any(|p| p.fps() == fps_setting && p.layout_is(layout)) {
-        return Err(err(format!("unsupported frame rate setting {fps_setting}")));
+    if !Profile::ALL.iter().any(|p| p.records(layout, fps_setting)) {
+        return Err(err(format!("unsupported frame rate setting {fps_setting} for frames of {side} x {side}")));
     }
-    // The sample format: a paired take's is fixed, a take of one lens states its own.
+    // What the take says of its frames has to be what this layout is.
+    if let Layout::PairedOf(frame) = layout {
+        let stated = |k: &str| clip.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64()).collect::<Vec<u64>>());
+        if stated("encoded_bayer_size").is_some_and(|coded| coded != [frame.coded as u64, frame.coded as u64]) {
+            return Err(err(format!("unsupported coded frame size {:?} for frames of {side} x {side}", stated("encoded_bayer_size").unwrap_or_default())));
+        }
+        if clip.get("sensor_bits").and_then(|v| v.as_u64()).is_some_and(|bits| bits != frame.bits as u64) {
+            return Err(err(format!("unsupported sample depth for frames of {side} x {side}")));
+        }
+    }
+    // The sample format: a 3840×3840 paired take's is fixed, any other take states its own.
+    let mut stated_levels = None;
     let (cfa, black_level, white_level) = match layout {
         Layout::Paired => (CFA, BLACK_LEVEL, WHITE_LEVEL),
-        Layout::Single { .. } => {
+        Layout::Single { .. } | Layout::PairedOf(_) => {
             let pattern: Vec<u64> = clip.get("cfa_pattern").and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_u64()).collect()).unwrap_or_default();
             let cfa = match pattern.as_slice() {
@@ -531,11 +649,19 @@ pub fn read_take(dir: &Path) -> Result<std::result::Result<Take, TakeProblem>> {
                 return Err(err(format!("unsupported Bayer pattern {cfa:?}")));
             }
             let level = |k: &str, or: u16| clip.get(k).and_then(|v| v.as_u64()).map_or(Ok(or), |v| u16::try_from(v).map_err(|_| err(format!("{k} {v} out of range"))));
-            let (black, white) = (level("black_level", SINGLE_BLACK_LEVEL)?, level("white_level", SINGLE_WHITE_LEVEL)?);
-            let top = *Profile::Single10.levels().last().unwrap_or(&0);
+            let unstated = if layout.bits() == 14 { (BLACK_LEVEL, WHITE_LEVEL) } else { (SINGLE_BLACK_LEVEL, SINGLE_WHITE_LEVEL) };
+            let (black, white) = (level("black_level", unstated.0)?, level("white_level", unstated.1)?);
+            let top = (1u32 << layout.bits()).saturating_sub(1) as u16;
             if black >= white || white > top {
                 return Err(err(format!("unsupported levels: black {black}, white {white}")));
             }
+            let (black, white) = match sensor_levels(layout, (black, white)) {
+                Some(own) => {
+                    stated_levels = Some((black, white));
+                    own
+                }
+                None => (black, white),
+            };
             (cfa, black, white)
         }
     };
@@ -548,7 +674,7 @@ pub fn read_take(dir: &Path) -> Result<std::result::Result<Take, TakeProblem>> {
     let seal: serde_json::Value = serde_json::from_slice(&seal_bytes)?;
     let u = |k: &str| seal.get(k).and_then(|v| v.as_u64());
     let (window_key, count_key) = match layout {
-        Layout::Paired => ("request_window", "pairs"),
+        Layout::Paired | Layout::PairedOf(_) => ("request_window", "pairs"),
         Layout::Single { .. } => ("hardware_window", "frames"),
     };
     let window: Vec<u64> = seal.get(window_key).and_then(|v| v.as_array())
@@ -582,6 +708,7 @@ pub fn read_take(dir: &Path) -> Result<std::result::Result<Take, TakeProblem>> {
         cfa,
         black_level,
         white_level,
+        stated_levels,
         clock_start: clip.get("clock_start").and_then(ClockAnchor::from_json),
         audio_file: text("audio_file"),
         audio_timing: text("audio_timing"),
@@ -590,6 +717,24 @@ pub fn read_take(dir: &Path) -> Result<std::result::Result<Take, TakeProblem>> {
         seal: Seal { fps_setting, request_window: (lo as u32, hi as u32), received_pairs: received, pairs, bytes },
         capture_bytes: meta.len(),
     }))
+}
+
+/// The black and white level of `layout`'s samples where the levels a take
+/// `states` are another layout's; `None` where the stated ones stand.
+///
+/// A 14-bit frame of [`PAIRED_FRAMES`] holds the sensor's 10-bit values four
+/// bits up: black 64 << 4, saturation 1023 << 4. (Measured on a take of
+/// 4912×4912: no sample of six frames has one of its low four bits set,
+/// none lies below 976, the darkest patch of a night scene sits at 1048 and
+/// saturated lights read 16368.) A take that states 64 and 15408 for such a
+/// frame states the levels of the 3840×3840 layout, whose values are the
+/// sensor's less 960.
+pub fn sensor_levels(layout: Layout, states: (u16, u16)) -> Option<(u16, u16)> {
+    match layout {
+        Layout::PairedOf(frame) if frame.bits == 14 && states == (BLACK_LEVEL, WHITE_LEVEL) =>
+            Some((SINGLE_BLACK_LEVEL << 4, SINGLE_WHITE_LEVEL << 4)),
+        _ => None,
+    }
 }
 
 /// One pair of the capture (one record: a take of one lens has one frame
@@ -637,19 +782,22 @@ impl Header {
         let u32_at = |o: usize| u32::from_le_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
         let u64_at = |o: usize| u64::from_le_bytes([h[o], h[o + 1], h[o + 2], h[o + 3], h[o + 4], h[o + 5], h[o + 6], h[o + 7]]);
         let layout = format.layout;
-        let profile = Profile::from_signature(&h[..8], format.fps).filter(|p| p.layout_is(layout)).ok_or_else(|| {
+        let profile = Profile::from_signature(&h[..8], format).ok_or_else(|| {
             let shown: String = h[..8].iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '.' }).collect();
-            err(format!("unsupported signature \"{shown}\" for {} fps at byte {at}", format.fps))
+            err(format!("unsupported signature \"{shown}\" for frames of {side} x {side} at {} fps at byte {at}", format.fps, side = layout.side()))
         })?;
-        let side = layout.side() as u32;
-        // Where the fields sit: a paired record's header, or one lens's.
+        let (side, per_eye) = (layout.side() as u32, layout.tiles_per_eye() as u32);
+        // Where the fields sit: a paired record's header, or one lens's. The
+        // field after the tile count is the threshold of a 3840×3840 record
+        // and zero in any other paired one.
         let (fields_ok, request, exposure_ns, lens_at) = match layout {
-            Layout::Paired => (
-                (u32_at(8), u32_at(16), u32_at(20), u32_at(24), u32_at(28)) == (BLOCK as u32, side, side, TILES_PER_EYE as u32, THRESHOLD),
+            Layout::Paired | Layout::PairedOf(_) => (
+                (u32_at(8), u32_at(16), u32_at(20), u32_at(24), u32_at(28))
+                    == (BLOCK as u32, side, side, per_eye, if layout == Layout::Paired { THRESHOLD } else { 0 }),
                 u32_at(12), [u64_at(32), u64_at(40)], 48,
             ),
             Layout::Single { .. } => (
-                (u32_at(12), u32_at(16), u32_at(20)) == (side, side, TILES_PER_EYE as u32),
+                (u32_at(12), u32_at(16), u32_at(20)) == (side, side, per_eye),
                 u32_at(8), [u64_at(32); 2], 48,
             ),
         };
@@ -853,9 +1001,9 @@ pub fn read_record(file: &mut File, entry: &PairEntry, buf: &mut Vec<u8>) -> Res
 }
 
 /// Decode a record read by [`read_record`] into `out`, `format.layout`'s
-/// samples: a paired take's channel 0 (3840×3840, 14-bit), then its channel
-/// 1; a take of one lens's one channel (7680×7680, 10-bit). Tiles decode on
-/// `threads` threads (0 = one per core, at most one per tile).
+/// samples: a paired take's channel 0 (its frame, row after row), then its
+/// channel 1; a take of one lens's one channel. Tiles decode on `threads`
+/// threads (0 = one per core, at most one per tile).
 pub fn decode_record(record: &[u8], format: Format, channels: Channels, out: &mut [u16], threads: usize) -> Result<PairEntry> {
     let layout = format.layout;
     if out.len() != layout.samples() {
@@ -873,11 +1021,14 @@ pub fn decode_record(record: &[u8], format: Format, channels: Channels, out: &mu
         at += pad(n as u64) as usize;
     }
     let wanted = |tile: usize| match channels {
-        Channels::One(c) if layout.channels() > 1 => tile / TILES_PER_EYE == c,
+        Channels::One(c) if layout.channels() > 1 => tile / layout.tiles_per_eye() == c,
         _ => true,
     };
+    // Each tile's rows of its channel's frame: a tile's worth, and what is
+    // left of the frame for the last tile of a larger canvas.
+    let frame_rows = layout.side() * layout.tile_rows();
     let jobs: Vec<(&[u8], &mut [u16])> = tiles.iter()
-        .zip(out.chunks_mut(layout.tile_samples()))
+        .zip(out.chunks_mut(layout.eye_samples()).flat_map(|eye| eye.chunks_mut(frame_rows)))
         .filter(|((i, _), _)| wanted(*i))
         .map(|((_, bytes), dst)| (*bytes, dst))
         .collect();
@@ -887,20 +1038,24 @@ pub fn decode_record(record: &[u8], format: Format, channels: Channels, out: &mu
         n => n,
     }.clamp(1, jobs.len().max(1));
     if workers == 1 {
+        let mut canvas = Vec::new();
         for (bytes, dst) in jobs {
-            decode_tile(bytes, profile, layout, dst)?;
+            decode_tile(bytes, profile, layout, dst, &mut canvas)?;
         }
     } else {
         let queue = std::sync::Mutex::new(jobs.into_iter());
         let failed: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
         std::thread::scope(|scope| {
             for _ in 0..workers {
-                scope.spawn(|| loop {
-                    let job = queue.lock().ok().and_then(|mut q| q.next());
-                    let Some((bytes, dst)) = job else { break };
-                    if let Err(e) = decode_tile(bytes, profile, layout, dst) {
-                        if let Ok(mut slot) = failed.lock() { slot.get_or_insert(e); }
-                        break;
+                scope.spawn(|| {
+                    let mut canvas = Vec::new();
+                    loop {
+                        let job = queue.lock().ok().and_then(|mut q| q.next());
+                        let Some((bytes, dst)) = job else { break };
+                        if let Err(e) = decode_tile(bytes, profile, layout, dst, &mut canvas) {
+                            if let Ok(mut slot) = failed.lock() { slot.get_or_insert(e); }
+                            break;
+                        }
                     }
                 });
             }
@@ -912,23 +1067,41 @@ pub fn decode_record(record: &[u8], format: Format, channels: Channels, out: &mu
     Ok(PairEntry { request: h.request, offset: 0, len: h.record_len(), profile, exposure_ns: h.exposure_ns })
 }
 
-/// Decode one tile (`bytes` = its payload without padding) into its
-/// samples (`layout`'s tile: 3840×160 or 7680×320).
-fn decode_tile(bytes: &[u8], profile: Profile, layout: Layout, dst: &mut [u16]) -> Result<()> {
-    debug_assert_eq!(dst.len(), layout.tile_samples());
+/// Decode one tile (`bytes` = its payload without padding) into `dst`, the
+/// rows of the frame it holds (`layout.side()` samples each). A tile coded
+/// on a larger canvas is decoded whole into `canvas` (scratch space, reused
+/// from call to call) and its part of the frame copied out: the canvas's
+/// first columns, and its first rows where the frame ends inside the tile.
+fn decode_tile(bytes: &[u8], profile: Profile, layout: Layout, dst: &mut [u16], canvas: &mut Vec<u16>) -> Result<()> {
+    let (side, coded) = (layout.side(), layout.coded_side());
+    debug_assert!(dst.len() % side == 0 && dst.len() / side <= layout.tile_rows());
+    if coded == side {
+        debug_assert_eq!(dst.len(), layout.tile_samples());
+        return decode_coded_tile(bytes, profile, coded, dst);
+    }
+    canvas.resize(layout.tile_samples(), 0);
+    decode_coded_tile(bytes, profile, coded, canvas)?;
+    for (row, coded_row) in dst.chunks_exact_mut(side).zip(canvas.chunks_exact(coded)) {
+        row.copy_from_slice(&coded_row[..side]);
+    }
+    Ok(())
+}
+
+/// Decode one tile as it is coded: rows of `width` samples filling `dst`.
+fn decode_coded_tile(bytes: &[u8], profile: Profile, width: usize, dst: &mut [u16]) -> Result<()> {
     let main = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     if main > bytes.len() - 4 {
         return Err(err("invalid predictor length"));
     }
     let levels = profile.levels();
     let (stream, tail) = bytes[4..].split_at(main);
-    if profile == Profile::Single10Split {
-        unpack_split(stream, dst, layout.side(), profile.max_width(), levels.len() as i32)?;
+    if profile.split() {
+        unpack_split(stream, dst, width, profile.max_width(), levels.len() as i32)?;
     } else {
-        unpack_symbols(stream, dst, layout.side(), profile.max_width(), levels.len() as i32)?;
+        unpack_symbols(stream, dst, width, profile.max_width(), levels.len() as i32)?;
     }
-    // One lens's symbols are its samples: nothing follows the predictor stream.
-    if profile.is_single() {
+    // Where a symbol is the sample nothing follows the predictor stream.
+    if profile.plain() {
         return if tail.is_empty() { Ok(()) } else { Err(err("tile has bytes left over")) };
     }
     apply_levels(tail, levels, dst)
@@ -1225,30 +1398,125 @@ pub struct EyeReadout {
     pub first_to_last_row_ns: f64,
 }
 
+/// Where one eye's frame sits on its sensor, as the take's sensor record
+/// states it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EyeWindow {
+    /// The sensor pixel (its register coordinates) the frame's first sample
+    /// starts at.
+    pub origin: (f64, f64),
+    /// Frame samples per sensor pixel, across and down.
+    pub scale: (f64, f64),
+    /// Sensor rows the frame was read from, top to bottom.
+    pub rows_read: f64,
+    /// From one of those rows' start to the next, ns.
+    pub line_period_ns: f64,
+    /// From the first of them to the last, where the record states it, ns.
+    pub stated_span_ns: Option<f64>,
+}
+
+impl EyeWindow {
+    /// From the frame's first row to its last, ns: the rows read, a line
+    /// period apart. The record's own figure where it agrees with that
+    /// (within 1 %); it has none for a frame the sensor scales, and its
+    /// rows-of-the-frame figure does not count the rows the scaler took in.
+    pub fn first_to_last_row_ns(&self) -> f64 {
+        let rows = self.line_period_ns * (self.rows_read - 1.0);
+        self.stated_span_ns.filter(|s| (s - rows).abs() <= rows * 0.01).unwrap_or(rows)
+    }
+}
+
+/// The place of the take's two eyes on their sensors (channel 0, then 1)
+/// from its sensor record. Per eye the record gives the sensor area read
+/// (`analog_roi_register_xyxy_inclusive`), its binning (`binning_xy`), the
+/// part of the binned picture kept (`digital_crop_after_binning_xywh`), the
+/// size that part leaves the sensor at (`bayer_output_wh`: smaller where
+/// the sensor scales it) and, where the frame is a window of that output,
+/// the window (`recorded_bayer_window_xywh`). `None` when the take has no
+/// such record or it does not describe the take's frame. A take of one lens
+/// has its one sensor in both places.
+///
+/// A scaled frame is as tall as its kept part scaled and narrower than the
+/// kept part's width scaled would be: it holds the kept part's last
+/// columns. That is where the camera's own video files place the same
+/// window of the sensor (their window record: 7912 pixels wide, 4 right of
+/// the middle of the sensor half), and it is not measured here: the two
+/// other ways of taking 7912 columns from 7920 lie 4 and 8 pixels of the
+/// sensor to the left, 0.03° and 0.06° of the lens's view.
+pub fn read_sensor_windows(take: &Take) -> Option<[EyeWindow; 2]> {
+    let name = take.sensor_metadata.as_deref()?;
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(take.dir.join(name)).ok()?).ok()?;
+    let eyes = v.get("eyes")?;
+    let eye = |key: &str| -> Option<EyeWindow> {
+        let e = eyes.get(key)?;
+        let list = |k: &str| -> Option<Vec<f64>> { Some(e.get(k)?.as_array()?.iter().filter_map(|x| x.as_f64()).collect()) };
+        let (roi, bin, kept, out) = (list("analog_roi_register_xyxy_inclusive")?, list("binning_xy")?, list("digital_crop_after_binning_xywh")?, list("bayer_output_wh")?);
+        if roi.len() != 4 || bin.len() != 2 || kept.len() != 4 || out.len() != 2 || bin.iter().chain(&kept[2..]).chain(&out).any(|v| *v < 1.0) {
+            return None;
+        }
+        // The frame inside the sensor's output: all of it unless a window is named.
+        let window = list("recorded_bayer_window_xywh").filter(|w| w.len() == 4).unwrap_or(vec![0.0, 0.0, out[0], out[1]]);
+        if (window[2], window[3]) != (take.width as f64, take.height as f64) || window[0] + window[2] > out[0] || window[1] + window[3] > out[1] {
+            return None;
+        }
+        // Output samples per binned pixel: one, or the sensor's scale, which
+        // the rows give (the output holds every kept row).
+        let scale = out[1] / kept[3];
+        if !(scale > 0.0 && scale <= 1.0) || out[0] > kept[2] * scale + 0.5 {
+            return None;
+        }
+        // Binned pixels of the kept part the output's columns leave out, ahead of them.
+        let ahead = kept[2] - out[0] / scale;
+        let line = e.get("line_period_ns")?.as_f64().filter(|l| l.is_finite() && *l > 0.0)?;
+        let window = EyeWindow {
+            origin: (
+                roi[0] + bin[0] * (kept[0] + ahead + window[0] / scale),
+                roi[1] + bin[1] * (kept[1] + window[1] / scale),
+            ),
+            scale: (scale / bin[0], scale / bin[1]),
+            rows_read: take.height as f64 / scale,
+            line_period_ns: line,
+            stated_span_ns: e.get("rolling_shutter_first_to_last_row_ns").and_then(|x| x.as_f64()),
+        };
+        (window.first_to_last_row_ns() < 1e9).then_some(window)
+    };
+    match take.layout {
+        Layout::Paired | Layout::PairedOf(_) => Some([eye("CAM0")?, eye("CAM1")?]),
+        Layout::Single { channel } => eye(["CAM0", "CAM1"][channel.min(1)]).map(|e| [e, e]),
+    }
+}
+
 /// The row timing of the take's two eyes (channel 0, then 1) from its
-/// sensor record: a frame's stamp is the start of its first row's exposure
-/// and every row starts a line period after the one above it. `None` when
-/// the take has no such record, or the record is of another frame size. A
-/// take of one lens has its one sensor's timing in both places.
+/// sensor record ([`read_sensor_windows`]): a frame's stamp is the start of
+/// its first row's exposure and every row the sensor reads starts a line
+/// period after the one above it. `None` when the take has no such record,
+/// or the record is of another frame.
 pub fn read_sensor_readout(take: &Take) -> Option<[EyeReadout; 2]> {
+    if let Some(eyes) = read_sensor_windows(take) {
+        return Some(eyes.map(|w| EyeReadout { line_period_ns: w.line_period_ns, first_to_last_row_ns: w.first_to_last_row_ns() }));
+    }
+    // A record that states the timing without the sensor's windows: of the
+    // take's own frame, read row for row.
     let name = take.sensor_metadata.as_deref()?;
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(take.dir.join(name)).ok()?).ok()?;
     let eyes = v.get("eyes")?;
     let eye = |key: &str| -> Option<EyeReadout> {
         let e = eyes.get(key)?;
+        if e.get("analog_roi_register_xyxy_inclusive").is_some() {
+            return None;
+        }
         let size: Vec<u64> = e.get("bayer_output_wh")?.as_array()?.iter().filter_map(|x| x.as_u64()).collect();
         if size != [take.width as u64, take.height as u64] {
             return None;
         }
         let line = e.get("line_period_ns")?.as_f64()?;
         let rows = line * (take.height as f64 - 1.0);
-        // The record's own span where it agrees with its line period.
         let span = e.get("rolling_shutter_first_to_last_row_ns").and_then(|x| x.as_f64())
             .filter(|s| (s - rows).abs() <= rows * 0.01).unwrap_or(rows);
         (line.is_finite() && line > 0.0 && span < 1e9).then_some(EyeReadout { line_period_ns: line, first_to_last_row_ns: span })
     };
     match take.layout {
-        Layout::Paired => Some([eye("CAM0")?, eye("CAM1")?]),
+        Layout::Paired | Layout::PairedOf(_) => Some([eye("CAM0")?, eye("CAM1")?]),
         Layout::Single { channel } => eye(["CAM0", "CAM1"][channel.min(1)]).map(|e| [e, e]),
     }
 }
@@ -1552,6 +1820,85 @@ pub(crate) mod test_support {
             window.0, window.1, (window.1 + 1 - window.0) as usize - records.len(), bytes.len(), n = records.len())).unwrap();
     }
 
+    /// One tile's picture for a paired take of another frame size, as it is
+    /// coded: `width` samples a row, `rows` rows, of `bits` bits. `which`
+    /// names the picture (two tiles of different pictures tell a tile put
+    /// in the wrong place). A 14-bit one has values with low bits set above
+    /// 1024 and without them, and runs of 128 samples that need no tail.
+    pub fn frame_tile_picture(width: usize, rows: usize, bits: u8, which: u32) -> Vec<u16> {
+        let top = (1u32 << bits) - 1;
+        let mut s = (which + 1).wrapping_mul(2654435761).max(1);
+        let mut next = move || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; s };
+        (0..width * rows).map(|i| {
+            let (x, y) = (i % width, i / width);
+            let ramp = ((x * (3 + which as usize) + y * 5) as u32) % (top + 1);
+            let v = (ramp + next() % 48).min(top);
+            // Rows of a 14-bit picture in turn: whole values, and values on the 16-step grid.
+            (if bits == 14 && (y / 4) % 2 == 1 { v & !15 } else { v }) as u16
+        }).collect()
+    }
+
+    /// Which of the two tile pictures tile `t` of channel `eye` holds.
+    pub fn frame_tile_which(eye: usize, t: usize) -> u32 {
+        ((t * 7 + eye * 3) % 5 < 2) as u32
+    }
+
+    /// The frames (channel 0, then channel 1) of a paired take of `frame`
+    /// whose tiles hold the two pictures of [`frame_tile_picture`] in the
+    /// order of [`frame_tile_which`], and one record of them.
+    pub fn frame_record(profile: Profile, frame: PairedFrame, request: u32, exposure_ns: [u64; 2]) -> (Vec<u16>, Vec<u8>) {
+        let layout = Layout::PairedOf(frame);
+        let (side, coded, rows) = (layout.side(), layout.coded_side(), layout.tile_rows());
+        let pictures: Vec<Vec<u16>> = (0..2).map(|which| frame_tile_picture(coded, rows, frame.bits, which)).collect();
+        let coded_tiles: Vec<Vec<u8>> = pictures.iter().map(|p| match profile {
+            Profile::Frame10 => encode_tile_split(p, coded),
+            _ => encode_tile(profile, p, coded),
+        }).collect();
+        let mut samples = Vec::with_capacity(layout.samples());
+        let mut tiles: Vec<&Vec<u8>> = Vec::new();
+        for eye in 0..2 {
+            for t in 0..layout.tiles_per_eye() {
+                let which = frame_tile_which(eye, t) as usize;
+                tiles.push(&coded_tiles[which]);
+                // The frame's part of the tile: its first columns, and the rows the frame still has.
+                let kept = rows.min(side - (t * rows).min(side));
+                for row in pictures[which].chunks(coded).take(kept) {
+                    samples.extend_from_slice(&row[..side]);
+                }
+            }
+        }
+        assert_eq!(samples.len(), layout.samples());
+        let mut out = vec![0u8; BLOCK as usize];
+        out[..8].copy_from_slice(profile.signature());
+        for (o, v) in [(8, BLOCK as u32), (12, request), (16, side as u32), (20, side as u32), (24, PairedFrame::TILES as u32), (28, 0)] {
+            out[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        out[32..40].copy_from_slice(&exposure_ns[0].to_le_bytes());
+        out[40..48].copy_from_slice(&exposure_ns[1].to_le_bytes());
+        for (i, t) in tiles.iter().enumerate() {
+            out[48 + 4 * i..52 + 4 * i].copy_from_slice(&(t.len() as u32).to_le_bytes());
+        }
+        for t in &tiles {
+            out.extend_from_slice(t);
+            out.resize(pad(out.len() as u64) as usize, 0);
+        }
+        (samples, out)
+    }
+
+    /// Write a finished paired take of `frame` holding `records` into `dir`,
+    /// stating the black and white level `levels`.
+    pub fn write_frame_take(dir: &Path, frame: PairedFrame, fps: u32, levels: (u16, u16), window: (u32, u32), records: &[Vec<u8>]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let bytes: Vec<u8> = records.concat();
+        std::fs::write(dir.join(CAPTURE_FILE), &bytes).unwrap();
+        std::fs::write(dir.join(CLIP_FILE), format!(
+            r#"{{"layout":"paired-bayer-v1","fps_setting":{fps},"size":[{side},{side}],"encoded_bayer_size":[{coded},{coded}],"sensor_bits":{bits},"black_level":{},"white_level":{},"cfa_pattern":[1,2,0,1],"frames_file":"frames.csv","exposure_file":"exposure.csv","sensor_metadata":"sensor-metadata.json","clock_start":{{"counter_ticks":1920000,"counter_hz":19200000,"mono_before_ns":1,"mono_after_ns":2,"boottime_ns":1}}}}"#,
+            levels.0, levels.1, side = frame.side, coded = frame.coded, bits = frame.bits)).unwrap();
+        std::fs::write(dir.join(SEAL_FILE), format!(
+            r#"{{"fps_setting":{fps},"request_window":[{},{}],"received_pairs":{n},"pairs":{n},"bytes":{}}}"#,
+            window.0, window.1, bytes.len(), n = records.len())).unwrap();
+    }
+
     /// A deterministic test picture: a smooth ramp with noise, both channels.
     pub fn test_samples(seed: u32) -> Vec<u16> {
         let mut s = seed.wrapping_mul(2654435761).max(1);
@@ -1582,6 +1929,21 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    /// The profile of a signature in a 3840×3840 paired take set to `fps`.
+    fn of_pair(signature: &[u8], fps: u32) -> Option<Profile> {
+        Profile::from_signature(signature, Format::paired(fps))
+    }
+
+    /// The profile of a signature in a take of one lens set to `fps`.
+    fn of_one_lens(signature: &[u8], fps: u32) -> Option<Profile> {
+        Profile::from_signature(signature, Format { layout: Layout::Single { channel: 0 }, fps })
+    }
+
+    /// The frame rate setting a 3840×3840 paired take's profile belongs to.
+    fn rate(profile: Profile) -> u32 {
+        [30, 50, 60].into_iter().find(|&fps| profile.records(Layout::Paired, fps)).expect("a paired profile")
+    }
 
     fn fnv(values: &[u16]) -> u64 {
         values.iter().flat_map(|v| v.to_le_bytes()).fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
@@ -1619,19 +1981,19 @@ mod tests {
 
     #[test]
     fn a_signature_belongs_to_one_frame_rate() {
-        assert_eq!(Profile::from_signature(b"L1024___", 30), Some(Profile::Exact30));
-        assert_eq!(Profile::from_signature(b"X6QBLK0B", 60), Some(Profile::Raised60));
-        assert_eq!(Profile::from_signature(b"X6QBLK0B", 50), None);
-        assert_eq!(Profile::from_signature(b"X6M50AB2", 60), None);
-        assert_eq!(Profile::from_signature(b"UNKNOWN!", 30), None);
+        assert_eq!(of_pair(b"L1024___", 30), Some(Profile::Exact30));
+        assert_eq!(of_pair(b"X6QBLK0B", 60), Some(Profile::Raised60));
+        assert_eq!(of_pair(b"X6QBLK0B", 50), None);
+        assert_eq!(of_pair(b"X6M50AB2", 60), None);
+        assert_eq!(of_pair(b"UNKNOWN!", 30), None);
         // Two signatures at 30 fps, one for each layout.
-        assert_eq!(Profile::from_signature(b"X6S8B01\0", 30), Some(Profile::Single10));
-        assert_eq!(Profile::from_signature(b"X6S8B01\0", 60), None);
+        assert_eq!(of_one_lens(b"X6S8B01\0", 30), Some(Profile::Single10));
+        assert_eq!(of_one_lens(b"X6S8B01\0", 60), None);
         assert!(Profile::Single10.layout_is(Layout::Single { channel: 1 }) && !Profile::Single10.layout_is(Layout::Paired));
         // One lens has a second signature, for its later block layout.
-        assert_eq!(Profile::from_signature(b"X6S8B02\0", 30), Some(Profile::Single10Split));
-        assert_eq!(Profile::from_signature(b"X6S8B02\0", 50), None);
-        assert_eq!(Profile::from_signature(b"X6S8B03\0", 30), None);
+        assert_eq!(of_one_lens(b"X6S8B02\0", 30), Some(Profile::Single10Split));
+        assert_eq!(of_one_lens(b"X6S8B02\0", 50), None);
+        assert_eq!(of_one_lens(b"X6S8B03\0", 30), None);
         assert!(Profile::Single10Split.layout_is(Layout::Single { channel: 0 }) && !Profile::Single10Split.layout_is(Layout::Paired));
         // A kept pair list names a profile by its place: the earlier ones stay where they were.
         assert_eq!(Profile::ALL[..6], [Profile::Exact30, Profile::Mid50, Profile::Raised50, Profile::Coarse60, Profile::Raised60, Profile::Single10]);
@@ -1644,7 +2006,7 @@ mod tests {
             let samples = test_samples(7 + n as u32);
             let record = encode_record(profile, 100 + n as u32, [1_000_000, 999_971], &samples);
             let mut out = vec![0u16; 2 * EYE_SAMPLES];
-            let got = decode_record(&record, Format::paired(profile.fps()), Channels::Both, &mut out, 0).unwrap();
+            let got = decode_record(&record, Format::paired(rate(profile)), Channels::Both, &mut out, 0).unwrap();
             assert_eq!((got.request, got.exposure_ns, got.len as usize), (100 + n as u32, [1_000_000, 999_971], record.len()));
             let want: Vec<u16> = samples.iter().map(|&v| stored_value(profile, v)).collect();
             assert_eq!(fnv(&out), fnv(&want), "{profile:?}");
@@ -1653,10 +2015,10 @@ mod tests {
             }
             // One thread, and one channel only, give the same samples.
             let mut one = vec![0u16; 2 * EYE_SAMPLES];
-            decode_record(&record, Format::paired(profile.fps()), Channels::Both, &mut one, 1).unwrap();
+            decode_record(&record, Format::paired(rate(profile)), Channels::Both, &mut one, 1).unwrap();
             assert_eq!(fnv(&one), fnv(&out));
             let mut right = vec![7u16; 2 * EYE_SAMPLES];
-            decode_record(&record, Format::paired(profile.fps()), Channels::One(1), &mut right, 0).unwrap();
+            decode_record(&record, Format::paired(rate(profile)), Channels::One(1), &mut right, 0).unwrap();
             assert!(right[..EYE_SAMPLES].iter().all(|&v| v == 7));
             assert_eq!(fnv(&right[EYE_SAMPLES..]), fnv(&out[EYE_SAMPLES..]));
         }
@@ -2047,5 +2409,206 @@ mod tests {
             decode_pair(&mut file, entry, take.format(), Channels::Both, &mut record, &mut out, 0).unwrap();
             assert_eq!(fnv(&out), want, "{take_name} request {request}");
         }
+    }
+
+    /// The frame of [`PAIRED_FRAMES`] with this side.
+    fn frame_of(side: u16) -> PairedFrame {
+        PAIRED_FRAMES.into_iter().find(|f| f.side == side).expect("a frame of that side")
+    }
+
+    /// Paired takes of the other frame sizes: each reads as its own layout
+    /// with the sample format it states, its records decode to what was
+    /// stored tile for tile (the 4912 frame out of its larger canvas), and a
+    /// signature belongs to the frames of its own depth and frame rates.
+    #[test]
+    fn a_paired_take_of_another_frame_size_reads_and_decodes() {
+        for (side, fps, profile, levels) in [(5504u16, 30u32, Profile::Frame10, (64u16, 1023u16)), (4912, 30, Profile::Frame14, (1024, 16368)), (3968, 60, Profile::Frame10, (64, 1023))] {
+            let frame = frame_of(side);
+            let layout = Layout::PairedOf(frame);
+            let format = Format { layout, fps };
+            assert_eq!((layout.side(), layout.channels(), layout.tiles(), layout.bits()), (side as usize, 2, 32, frame.bits));
+            assert_eq!(layout.tile_rows() * 16, frame.coded as usize);
+            assert_eq!(Profile::from_signature(profile.signature(), format), Some(profile));
+            let (samples, record) = frame_record(profile, frame, 300, [5_000_000, 5_000_711]);
+            assert_eq!(samples.len(), 2 * side as usize * side as usize);
+            let mut out = vec![0u16; layout.samples()];
+            let got = decode_record(&record, format, Channels::Both, &mut out, 0).unwrap();
+            assert_eq!((got.request, got.profile, got.exposure_ns, got.len as usize), (300, profile, [5_000_000, 5_000_711], record.len()));
+            assert!(out == samples, "{side}: the frame is not what was stored");
+            // The two tile pictures differ, so a tile in the wrong place would show.
+            let rows = layout.tile_rows() * side as usize;
+            assert_ne!(fnv(&samples[..rows]), fnv(&samples[2 * rows..3 * rows]), "{side}: tiles 0 and 2 hold different pictures");
+            // One thread, and one channel only, give the same samples.
+            let mut one = vec![0u16; layout.samples()];
+            decode_record(&record, format, Channels::Both, &mut one, 1).unwrap();
+            assert!(one == out, "{side}: one thread");
+            let mut second = vec![9u16; layout.samples()];
+            decode_record(&record, format, Channels::One(1), &mut second, 0).unwrap();
+            let per = layout.eye_samples();
+            assert!(second[..per].iter().all(|&v| v == 9) && second[per..] == out[per..], "{side}: channel 1 alone");
+
+            // As a take: the layout, the format it states, its pairs.
+            let dir = temp_dir(&format!("frame{side}"));
+            let (_, earlier) = frame_record(profile, frame, 299, [4_000_000, 4_000_500]);
+            write_frame_take(&dir, frame, fps, levels, (299, 301), &[record.clone(), earlier]);
+            assert_eq!(take_layout(&dir), Some(layout));
+            let take = read_take(&dir).unwrap().unwrap();
+            assert_eq!((take.layout, take.width, take.height, take.fps_setting), (layout, side as u32, side as u32, fps));
+            assert_eq!((take.cfa, take.black_level, take.white_level, take.stated_levels), (CFA, levels.0, levels.1, None));
+            assert_eq!(take.sample_max(), if frame.bits == 14 { 16383 } else { 1023 });
+            assert!(take.window_numbers_records() && take.missing_pairs() == 1);
+            // Records land in the capture in any order: pairs come back by request.
+            let pairs = scan_pairs(&take, |_, _| true).unwrap().unwrap();
+            assert_eq!(pairs.iter().map(|p| p.request).collect::<Vec<_>>(), vec![299, 300]);
+            assert!(pairs[0].offset > pairs[1].offset && pairs[0].profile == profile);
+            assert_eq!(missing_requests(&take, &pairs), vec![301]);
+            let mut file = File::open(take.capture_path()).unwrap();
+            let mut scratch = Vec::new();
+            decode_pair(&mut file, &pairs[1], take.format(), Channels::Both, &mut scratch, &mut one, 0).unwrap();
+            assert!(one == samples, "{side}: read from the take");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// What does not belong to a frame is refused: a signature of the other
+    /// depth, a frame rate the frame is not recorded at, header fields of
+    /// another layout, bytes after a 10-bit tile's stream, a 14-bit tile's
+    /// tail cut short.
+    #[test]
+    fn a_record_of_another_frame_size_is_checked() {
+        let (wide, crop, small) = (frame_of(5504), frame_of(4912), frame_of(3968));
+        let at = |frame: PairedFrame, fps: u32| Format { layout: Layout::PairedOf(frame), fps };
+        // Signatures: the 10-bit one for the 10-bit frames at their rates, the 14-bit one for the 14-bit frame.
+        for (signature, format, want) in [
+            (b"X6D5B02\0", at(wide, 30), Some(Profile::Frame10)), (b"X6D5B02\0", at(small, 50), Some(Profile::Frame10)),
+            (b"X6D5B02\0", at(small, 60), Some(Profile::Frame10)), (b"X6D4B01\0", at(crop, 30), Some(Profile::Frame14)),
+            (b"X6D5B02\0", at(crop, 30), None), (b"X6D4B01\0", at(wide, 30), None), (b"X6D5B02\0", at(wide, 60), None),
+            (b"X6D5B02\0", at(small, 30), None), (b"X6D5B02\0", Format::paired(30), None), (b"L1024___", at(crop, 30), None),
+            (b"X6S8B02\0", at(wide, 30), None), (b"X6D5B03\0", at(wide, 30), None),
+        ] {
+            assert_eq!(Profile::from_signature(signature, format), want, "{:?} in {format:?}", std::str::from_utf8(signature));
+        }
+        assert!(Profile::Frame10.layout_is(Layout::PairedOf(small)) && !Profile::Frame10.layout_is(Layout::Paired) && !Profile::Frame14.layout_is(Layout::PairedOf(small)));
+
+        let (_, good) = frame_record(Profile::Frame10, small, 12, [10, 20]);
+        let format = at(small, 60);
+        let mut out = vec![0u16; format.layout.samples()];
+        assert!(decode_record(&good, format, Channels::Both, &mut out, 0).is_ok());
+        let with = |o: usize, v: u32| { let mut r = good.clone(); r[o..o + 4].copy_from_slice(&v.to_le_bytes()); r };
+        // 24 tiles an eye, the threshold of the 3840 layout, another side, another header length.
+        for (what, record) in [("tiles", with(24, 24)), ("threshold", with(28, 13472)), ("width", with(16, 3840)), ("height", with(20, 3840)), ("header", with(8, 2048))] {
+            assert!(decode_record(&record, format, Channels::Both, &mut out, 0).is_err(), "{what}");
+        }
+        // The other layouts do not take it, nor it theirs.
+        assert!(decode_record(&good, Format::paired(60), Channels::Both, &mut vec![0u16; 2 * EYE_SAMPLES], 0).is_err());
+        assert!(decode_record(&good, at(wide, 30), Channels::Both, &mut vec![0u16; at(wide, 30).layout.samples()], 0).is_err());
+        // A 10-bit tile is its predictor stream and nothing else: a byte more in its stated length is left over.
+        let first = u32::from_le_bytes(good[48..52].try_into().unwrap());
+        assert!(decode_record(&with(48, first + 1), format, Channels::Both, &mut out, 0).is_err());
+
+        // A 14-bit tile: its tail cut short, and a tail that says more groups carry low bits than it holds.
+        let (stored, good) = frame_record(Profile::Frame14, crop, 13, [10, 20]);
+        let format = at(crop, 30);
+        let mut out = vec![0u16; format.layout.samples()];
+        decode_record(&good, format, Channels::Both, &mut out, 0).unwrap();
+        assert!(out == stored);
+        assert!(stored.iter().any(|v| *v >= 1024 && v & 15 != 0), "the picture has low bits above 1024");
+        let first = u32::from_le_bytes(good[48..52].try_into().unwrap());
+        let mut short = good.clone();
+        short[48..52].copy_from_slice(&(first - 64).to_le_bytes());
+        assert!(decode_record(&short, format, Channels::Both, &mut out, 0).is_err());
+        let stream = u32::from_le_bytes(good[BLOCK as usize..BLOCK as usize + 4].try_into().unwrap()) as usize;
+        let mut marked = good.clone();
+        let bitmap = BLOCK as usize + 4 + stream;
+        marked[bitmap..bitmap + 8].copy_from_slice(&[0xff; 8]);
+        assert!(marked != good && decode_record(&marked, format, Channels::Both, &mut out, 0).is_err());
+
+        // A take: a frame rate the frame is not recorded at, a canvas or a depth that is not the frame's.
+        let dir = temp_dir("frame-checks");
+        write_frame_take(&dir, small, 30, (64, 1023), (12, 12), &[good.clone()]);
+        assert!(read_take(&dir).is_err(), "3968 at 30 fps");
+        write_frame_take(&dir, wide, 60, (64, 1023), (12, 12), &[good.clone()]);
+        assert!(read_take(&dir).is_err(), "5504 at 60 fps");
+        write_frame_take(&dir, PairedFrame { coded: 4912, ..crop }, 30, (1024, 16368), (13, 13), &[good.clone()]);
+        assert!(read_take(&dir).is_err(), "a 4912 frame coded on a 4912 canvas");
+        write_frame_take(&dir, PairedFrame { bits: 10, ..crop }, 30, (64, 1023), (13, 13), &[good.clone()]);
+        assert!(read_take(&dir).is_err(), "a 4912 frame of 10 bits");
+        // A frame size this module does not know is named.
+        std::fs::write(dir.join(CLIP_FILE), r#"{"layout":"paired-bayer-v1","fps_setting":30,"size":[4000,4000]}"#).unwrap();
+        assert!(read_take(&dir).unwrap_err().to_string().contains("4000"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 14-bit frame's levels: the sensor's own where the take states the
+    /// 3840×3840 layout's, the take's where it states any other.
+    #[test]
+    fn a_14_bit_frame_is_read_by_the_sensors_levels() {
+        let (crop, wide) = (frame_of(4912), frame_of(5504));
+        assert_eq!(sensor_levels(Layout::PairedOf(crop), (64, 15408)), Some((1024, 16368)));
+        assert_eq!(sensor_levels(Layout::PairedOf(crop), (1024, 16368)), None);
+        assert_eq!(sensor_levels(Layout::PairedOf(crop), (256, 16000)), None);
+        assert_eq!(sensor_levels(Layout::PairedOf(wide), (64, 1023)), None);
+        assert_eq!(sensor_levels(Layout::Paired, (64, 15408)), None);
+        let (_, record) = frame_record(Profile::Frame14, crop, 5, [10, 20]);
+        let dir = temp_dir("frame-levels");
+        write_frame_take(&dir, crop, 30, (64, 15408), (5, 5), &[record.clone()]);
+        let take = read_take(&dir).unwrap().unwrap();
+        assert_eq!((take.black_level, take.white_level, take.stated_levels), (1024, 16368, Some((64, 15408))));
+        write_frame_take(&dir, crop, 30, (1000, 16000), (5, 5), &[record]);
+        let take = read_take(&dir).unwrap().unwrap();
+        assert_eq!((take.black_level, take.white_level, take.stated_levels), (1000, 16000, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sensor record places every frame: where the sensor was read,
+    /// through its binning, its kept part, its scale and the frame's window.
+    #[test]
+    fn the_sensor_record_places_every_frame() {
+        let dir = temp_dir("windows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let eye = |roi: [u32; 4], bin: u32, kept: [u32; 4], out: [u32; 2], line: f64, span: &str, window: Option<[u32; 4]>| format!(
+            r#"{{"analog_roi_register_xyxy_inclusive":{roi:?},"binning_xy":[{bin},{bin}],"digital_crop_after_binning_xywh":{kept:?},"bayer_output_wh":{out:?},"line_period_ns":{line},"rolling_shutter_first_to_last_row_ns":{span}{}}}"#,
+            window.map_or(String::new(), |w| format!(r#","recorded_bayer_window_xywh":{w:?}"#)));
+        let take_of = |layout: Layout, side: u32| Take {
+            dir: dir.clone(), layout, fps_setting: 30, width: side, height: side, cfa: CFA, black_level: 64, white_level: 1023, stated_levels: None,
+            clock_start: None, audio_file: None, audio_timing: None, sensor_metadata: Some("sensor-metadata.json".into()), exposure_file: None,
+            seal: Seal { fps_setting: 30, request_window: (1, 1), received_pairs: 1, pairs: 1, bytes: 0 }, capture_bytes: 0,
+        };
+        let placed = |take: &Take, cam0: String, cam1: Option<String>| -> Option<[EyeWindow; 2]> {
+            let other = cam1.map_or(String::new(), |e| format!(r#","CAM1":{e}"#));
+            std::fs::write(dir.join("sensor-metadata.json"), format!(r#"{{"schema":"raw-sensor-metadata-v1","eyes":{{"CAM0":{cam0}{other}}}}}"#)).unwrap();
+            read_sensor_windows(take)
+        };
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        // 3840×3840: the sensor binned 2×2, the middle 3840 columns of its 4096.
+        let binned = || eye([0, 256, 8191, 7935], 2, [128, 0, 3840, 3840], [3840, 3840], 3791.6666628749995, "14556208", None);
+        let w = placed(&take_of(Layout::Paired, 3840), binned(), Some(binned())).unwrap();
+        assert_eq!((w[0].origin, w[0].scale, w[0].rows_read), ((256.0, 256.0), (0.5, 0.5), 3840.0));
+        assert!(close(w[1].first_to_last_row_ns(), 14_556_208.0));
+        // One lens at 7680×7680: the same window, every pixel.
+        let full = eye([0, 256, 8191, 7935], 1, [256, 0, 7680, 7680], [7680, 7680], 4000.000009472, "30716000", None);
+        let w = placed(&take_of(Layout::Single { channel: 0 }, 7680), full, None).unwrap();
+        assert_eq!((w[0].origin, w[0].scale, w[0]), ((256.0, 256.0), (1.0, 1.0), w[1]));
+        // 5504×5504: 7912 rows scaled by 16/23, and the last 7912 of the 7920 columns kept. No stated span: the rows read, a line apart.
+        let scaled = || eye([0, 128, 8191, 8063], 1, [136, 12, 7920, 7912], [5504, 5504], 4000.000055296001, "null", None);
+        let w = placed(&take_of(Layout::PairedOf(frame_of(5504)), 5504), scaled(), Some(scaled())).unwrap();
+        assert!(close(w[0].origin.0, 144.0) && close(w[0].origin.1, 140.0) && close(w[0].scale.0, 16.0 / 23.0) && close(w[0].scale.1, 16.0 / 23.0), "{:?}", w[0]);
+        assert!(close(w[0].rows_read, 7912.0) && (w[0].first_to_last_row_ns() - 7911.0 * 4000.000055296001).abs() < 1.0);
+        assert!(close(read_sensor_readout(&take_of(Layout::PairedOf(frame_of(5504)), 5504)).unwrap()[0].first_to_last_row_ns, w[0].first_to_last_row_ns()));
+        // 4912×4912: the sensor's own pixels, the middle of it.
+        let crop = || eye([0, 1632, 8191, 6559], 1, [1640, 8, 4912, 4912], [4912, 4912], 4333.333329, "21281000", Some([0, 0, 4912, 4912]));
+        let w = placed(&take_of(Layout::PairedOf(frame_of(4912)), 4912), crop(), Some(crop())).unwrap();
+        assert_eq!((w[0].origin, w[0].scale), ((1640.0, 1640.0), (1.0, 1.0)));
+        assert!(close(w[0].first_to_last_row_ns(), 21_281_000.0));
+        // 3968×3968: a window of a 4912×3968 output.
+        let window = || eye([0, 2112, 8191, 6079], 1, [1640, 0, 4912, 3968], [4912, 3968], 4041.6666551074995, "16033292", Some([472, 0, 3968, 3968]));
+        let take = take_of(Layout::PairedOf(frame_of(3968)), 3968);
+        let w = placed(&take, window(), Some(window())).unwrap();
+        assert_eq!((w[0].origin, w[0].scale, w[0].rows_read), ((2112.0, 2112.0), (1.0, 1.0), 3968.0));
+        assert!(close(w[0].first_to_last_row_ns(), 16_033_292.0));
+        // A record of another frame places nothing, and one eye missing of a pair neither.
+        assert!(placed(&take, crop(), Some(crop())).is_none());
+        assert!(placed(&take, window(), None).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
