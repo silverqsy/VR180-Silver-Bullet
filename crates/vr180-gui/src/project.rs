@@ -53,15 +53,18 @@ impl FileRef {
 }
 
 /// `path` from the folder `base`, `/` between the parts: `None` unless both
-/// are absolute and share a folder below the root (two volumes do not).
+/// are absolute and share a folder below the root (two volumes do not). On
+/// Windows the volume is the drive or the network share the two begin with,
+/// and being on one is enough: a disk that comes up under another letter
+/// still holds a project and its clips at the same places.
 pub fn relative_to(path: &Path, base: &Path) -> Option<String> {
     if !path.is_absolute() || !base.is_absolute() {
         return None;
     }
     let (p, b): (Vec<Component>, Vec<Component>) = (path.components().collect(), base.components().collect());
     let common = p.iter().zip(&b).take_while(|(x, y)| x == y).count();
-    // The root alone (or a drive's) is no shared folder.
-    if !p[..common].iter().any(|c| matches!(c, Component::Normal(_))) {
+    // The root alone is no shared folder; a drive or a share is one.
+    if !p[..common].iter().any(|c| matches!(c, Component::Normal(_) | Component::Prefix(_))) {
         return None;
     }
     let mut parts: Vec<String> = vec!["..".to_string(); b.len() - common];
@@ -333,6 +336,27 @@ mod tests {
         // And back.
         assert_eq!(join_relative(Path::new("/mnt/B/trip/projects"), "../../clips/a.insv"), PathBuf::from("/mnt/B/clips/a.insv"));
         assert_eq!(join_relative(Path::new("/mnt/B/trip"), "day 1/a.insv"), PathBuf::from("/mnt/B/trip/day 1/a.insv"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_file_is_named_from_the_project_folder() {
+        let rel = |p: &str, b: &str| relative_to(Path::new(p), Path::new(b));
+        // Beside the project, below it, and in a sibling folder.
+        assert_eq!(rel(r"E:\trip\a.insv", r"E:\trip").as_deref(), Some("a.insv"));
+        assert_eq!(rel(r"E:\trip\day 1\a.insv", r"E:\trip").as_deref(), Some("day 1/a.insv"));
+        assert_eq!(rel(r"E:\media\clips\a.insv", r"E:\media\trip\projects").as_deref(), Some("../../clips/a.insv"));
+        // One drive, or one share, and nothing else shared: still a name.
+        assert_eq!(rel(r"E:\clips\a.insv", r"E:\trip").as_deref(), Some("../clips/a.insv"));
+        assert_eq!(rel(r"\\nas\media\clips\a.insv", r"\\nas\media\trip").as_deref(), Some("../clips/a.insv"));
+        // Two drives, a drive and a share, two shares: no relative name.
+        assert_eq!(rel(r"C:\Users\x\a.insv", r"E:\trip"), None);
+        assert_eq!(rel(r"\\nas\media\a.insv", r"E:\trip"), None);
+        assert_eq!(rel(r"\\nas\media\a.insv", r"\\nas\other\trip"), None);
+        assert_eq!(rel("a.insv", r"E:\trip"), None);
+        // And back, on another letter.
+        assert_eq!(join_relative(Path::new(r"F:\trip"), "../clips/a.insv"), PathBuf::from(r"F:\clips\a.insv"));
+        assert_eq!(join_relative(Path::new(r"F:\trip"), "day 1/a.insv"), PathBuf::from(r"F:\trip\day 1\a.insv"));
     }
 
     #[test]
