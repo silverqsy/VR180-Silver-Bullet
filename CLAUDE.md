@@ -4597,6 +4597,124 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       white balance shows it as As shot. The placement correction is
       shared code: a stored list of a 5504 take's exports changes.
 
+48. **Items 36 to 46 on Windows (2026-11-21, Windows box, RTX 4090; on
+    `main`).** Pulled `9fd483d` → `0251879` (31 commits). It builds as
+    pushed; tests core 63, fisheye 78, braw 6, pipeline 297 of 298 with the
+    GPU ones (the one is `projection_fingerprints`, a tool that wants its
+    file), gui 63 (66 with the tests of the changes below); on D3D12
+    pipeline 296 of 298 (the lens frame's outermost pixels, as before),
+    with `gpu_local_tone_matches_the_cpu_one`,
+    `gpu_tone_base_matches_the_cpu_one` and
+    `the_scene_is_composed_into_every_shader_that_reads_it` among those
+    that pass.
+    - **Nothing that is not raw moved.** The 61 exports of the A/B set
+      against the build before the pull: 55 byte-identical per stream, the
+      six raw-take cases different (mean 2.1 to 2.7 of 255 with Shadows +100
+      / Highlights −100: items 39 and 41 to 43), all 61 written, the same 38
+      engagements of a fast arm. The preview probe, 36 cases: 32 print the
+      same lines, the four raw ones differ.
+      - The probe's three software-decode cases of two 3840² streams
+        (`VR180_NO_HW_DECODE=1`) first ended "no frame for t = 0.5 s". Not a
+        picture: `frame_at` asked again every 2 s, a request starts the
+        worker's seek over (a frame that arrives with a request waiting is
+        let go, in the one loop as in the zero-copy workers), and such a
+        seek takes 4 s there. It now waits twice as long before each
+        repeat; the three print the lines of the build before.
+        Known from this and left alone: while the timeline is dragged a
+        seek is sent with every repaint, so where a seek is slower than
+        that the frame lands when the pointer is let go.
+      - The comparison script read packets at `pos, size`; ffprobe prints
+        `size, pos` whatever is asked. With that put right the verdicts are
+        the same, those of 2026-11-17 included (the stored sets were
+        compared again: 61 of 61 both times).
+    - **Item 37, the tone stage** (harness `VR180_TONE="e,c,h,s,w,b"`,
+      `VR180_TONE_LIGHT=ilog`). 23 exports with a control moved, none
+      failed: an X6 I-Log clip through the portable loop, the D3D11
+      readback arm, the GPU-resident NVENC arm and ProRes, 10 and 8 bit, a
+      lens frame; an Osmo clip; a `.360` through its GPU-resident arm (the
+      pair call written without a compile), the portable loop and ProRes,
+      10 and 8 bit. Arms against each other with Highlights −100 / Shadows
+      +100: signed difference within 0.14 of 255, what they differ by with
+      nothing moved. The two eyes get one treatment: the change by level
+      band is the same in both halves to 1.2 (Osmo) and 1.7 (`.360`) of
+      255; 6.4 on the X6 clip in its darkest band, the same on all three
+      arms. The ETTR recovery through the stage is the ETTR stage (signed
+      difference under 0.005 of 255). In the app: the Tone section is
+      there for a clip that is not raw, a slider dragged while paused draws
+      the frame again on the D3D11 worker, and the zoom still shows the
+      same look.
+    - **Item 36, joined files** (harness `VR180_MODE=join`). Three X6 clips
+      recorded in 360° Audio: Ambisonic gives one four-channel AAC with
+      SA3D, an APAC choice the same file, Stereo a two-channel track; three
+      libx265 parts (two from the readback arm, one from the portable
+      loop) join; two `prores_ks` parts in `.mov` join. In every joined
+      file the frames are the parts' frames, packet for packet. From the
+      app's own button: two clips at 8192 × 4096 written as parts, joined
+      (1200 frames, 40.04 s, the parts' folder gone), with the window in
+      front and again minimised from 1.5 s in: the second clip started and
+      the join ran while it was minimised. A row dragged by its handle
+      changes place. The session comes back at launch; with two more clips
+      named on a drive that is not there and on a host that does not
+      answer the list was up at once, the first marked missing at once and
+      the second after 21 s, the window answering all the while. A project
+      whose folder was moved with its clips opens and finds them.
+      - **The NVENC arms wrote two sets of parameter sets — FIXED.** The
+        GPU-resident arm (`nvenc_cuda.rs`) asked for preset p4, the encoder
+        the readback arms and the portable loop feed (`encode.rs`) for p5:
+        the SPS differs in two bits and the PPS is another one, and a run
+        whose clips took different arms (a camera file and a raw take, or a
+        clip that fell off its fast arm) ended "encoded with different
+        parameters".
+        `encode::NVENC_PRESET` (p4) is the one value for both now. With it
+        the three arms write the same sets byte for byte, a mixed run
+        joins, and the readback arm writes the GPU-resident arm's packets
+        for the same frames, byte for byte. Of the 61 exports the eight
+        that reach NVENC
+        without the GPU-resident arm changed (raw takes, Blackmagic RAW,
+        8-bit, the portable loop with NVENC), the other 53 are
+        byte-identical.
+      - `project::relative_to` on Windows: a drive or a share in common is
+        enough for a relative name (the rule asked for a common folder
+        below the root, which two folders at a drive's root do not have),
+        with a Windows twin of the naming test the Mac's is gated out of.
+    - **Item 38.** `immersive_available()` is false; a joined run of Lens
+      Space clips is refused before anything is exported, with the new
+      wording; `join_immersive` answers "written on macOS only".
+    - **Items 39 to 43, raw development.** A raw take in the app: "clip
+      statistics: 16 frames … sampled in 3.8 s" on the dedicated device,
+      the window answering every second of it, the frame drawn again when
+      they land; with Auto exposure on, "63 metered for the automatic
+      exposure", the panel's range line, the Exposure control following.
+      Playback at 28 to 30 shown a second once the share has the file
+      cached.
+    - **Item 44.** Original DNG is in the transport row for a raw clip only
+      and Shift+S writes `<take>_frame0_CAM0.dng` and `_CAM1.dng` beside
+      the take; an X6 clip with dropped frames has the orange line in File
+      info and the marks on the timeline.
+    - **Item 45, the Windows half** (`activity.rs`). A `Busy` is a power
+      request of the kind "the system is needed" (`PowerCreateRequest` /
+      `PowerSetRequest`: no sleep by the idle timer, the display may still
+      turn off), and while any is held the process is taken out of the
+      system's power throttling (`ProcessPowerThrottling`, execution
+      speed). Two tests ask the system for what it holds. NOT confirmed by
+      name: `powercfg /requests` lists requests per program but needs an
+      elevated prompt (run it during an export; the app should be under
+      SYSTEM with "Exporting"). On this desktop on mains power a minimised
+      run was as fast as one in front (30.8 against 31.5 frames a second),
+      so the throttling half is for laptops on battery and is not measured.
+    - **Item 46.** The three takes of 2026-11-21 (5504 at 30, 4912 at 30
+      and 14 bits, 3968 at 60) and a take of one lens (7680²) each export:
+      half-equirect, lens frame, a crop mask, NVENC, libx265 and ProRes, 11
+      runs. The log states what item 46 says: the 4912 take read by the
+      sensor's levels, placed at 1416 as a crop of the image circle, rows
+      of 21.3 ms. The pictures were looked at (the crop with black outside
+      its frame, neutral walls).
+    - **For whoever drives the app by script on Windows.** A process's
+      `MainWindowHandle` is winit's event-target window while the app's own
+      window is minimised: find the window by its title. `APPDATA` set to a
+      scratch folder for the launch keeps the user's settings and session
+      out of a test.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

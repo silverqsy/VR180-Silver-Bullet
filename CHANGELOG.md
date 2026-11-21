@@ -543,6 +543,14 @@ closed. It is now also a simple timeline, and it is kept.
     not fit is said, with the clips' names, before anything is exported.
   - The file is named after the first clip (`<name>_Joined_SBS.mp4`) and
     carries the projection metadata a single export carries.
+  - On Windows the NVIDIA encoder is set up alike on every export path. A
+    camera file, a raw take and a Blackmagic RAW clip reach it by different
+    paths, and those asked for two presets (p4 on the GPU-resident path, p5
+    on the others). The preset is written into a file's parameter sets, so
+    clips that had taken different paths were refused at the end of the run
+    as "encoded with different parameters". Every path uses p4 now, the
+    GPU-resident path's value from the start, and such clips join; an
+    H.265 export through the other paths changes by that much.
   - One file or none: when a clip fails or the run is stopped no joined
     file is written, and the clips exported by then stay in a folder beside
     where it would have been.
@@ -583,6 +591,9 @@ closed. It is now also a simple timeline, and it is kept.
   (`.vr180proj`) and opens one: New, Open, Save, Save as; Cmd/Ctrl+S saves.
   A project holds no media, only where the clips are, and that also from
   its own folder: a project moved together with its clips still finds them.
+  On Windows that includes a project and its clips on one drive or network
+  share with no folder in common: the disk may come up under another
+  letter.
 
 ### Windows: faster exports of sources without a fast path
 
@@ -612,6 +623,14 @@ and 8-bit output are unchanged.
   its first clip to its last (a joined file included): it keeps its speed
   wherever its window is, and the Mac does not go to sleep in the middle of
   a long batch. Its display may still sleep.
+  **On Windows** the same notice is given in Windows's terms. A PC goes to
+  sleep once its power plan's idle time is over whatever a program is
+  computing: for as long as a run lasts it now stays awake (its display may
+  still turn off). And a program whose windows are all minimised or covered
+  can be run at reduced speed on battery power: the app is exempt during a
+  run. On a desktop PC on mains power a minimised run measures the same as
+  one in front (two 8192 × 4096 clips at 31 frames a second either way), so
+  there the gain is the sleep.
 - **The 3D LUT was applied at 8-bit precision.** The cube was stored on the
   GPU with 8 bits a channel and read through a hardware sampler, so a 10-bit
   export sat up to two codes away from the LUT's own values, by a different
