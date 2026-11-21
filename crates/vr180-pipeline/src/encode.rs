@@ -573,13 +573,15 @@ impl H265Encoder {
                     // and --crf knobs later if we want a quality dial.
                 }
                 EncoderBackend::HevcNvenc => {
-                    // NVIDIA hardware HEVC. preset p1(fastest)..p7(slowest);
-                    // p5 + tune=hq is high quality and still many times
-                    // faster than libx265 on a discrete GPU. VBR targets the
-                    // configured bit_rate (set above); maxrate gives VBR
-                    // headroom so high-detail VR180 frames aren't starved.
+                    // NVIDIA hardware HEVC, set up as the GPU-resident arm
+                    // sets it up (`nvenc_cuda`): the two have to write the
+                    // same parameter sets, see `NVENC_PRESET`. tune=hq is
+                    // high quality and still many times faster than libx265
+                    // on a discrete GPU. VBR targets the configured bit_rate
+                    // (set above); maxrate gives VBR headroom so high-detail
+                    // VR180 frames aren't starved.
                     let prof = if bit_depth == 10 { "main10" } else { "main" };
-                    set_opt(raw, "preset",  "p5")?;
+                    set_opt(raw, "preset",  NVENC_PRESET)?;
                     set_opt(raw, "tune",    "hq")?;
                     set_opt(raw, "rc",      "vbr")?;
                     set_opt(raw, "profile", prof)?;
@@ -1454,6 +1456,22 @@ pub struct EncodeStage {
 /// Frames waiting for the encoder at most (each is 100 to 135 MB at
 /// 8192 × 4096): enough that neither side waits on the other's jitter.
 const ENCODE_STAGE_QUEUE: usize = 2;
+
+/// The NVENC preset (p1 fastest .. p7 slowest) of every arm that encodes
+/// with `hevc_nvenc`: the encoder opened here, which the readback arms and
+/// the portable loop feed, and the GPU-resident one (`nvenc_cuda`). It is
+/// ONE value because the preset decides what the encoder writes into a
+/// file's parameter sets, and the clips of a run that is joined into one
+/// file may come through any of those arms: with p5 here and p4 there the
+/// parts' picture parameter sets differed and the join refused them at the
+/// end of the run ("encoded with different parameters"). With one preset
+/// the three arms write the same sets, byte for byte, and a frame fed from
+/// the same planes comes out as the same packet.
+///
+/// p4 is the GPU-resident arm's value from the start: visually transparent
+/// at the bit rates an 8K export runs at, where p5 and up cost speed for
+/// little.
+pub(crate) const NVENC_PRESET: &str = "p4";
 
 impl EncodeStage {
     pub fn inline(encoder: ExportEncoder) -> Self {

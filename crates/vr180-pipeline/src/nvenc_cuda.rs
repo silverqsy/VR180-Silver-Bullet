@@ -244,8 +244,10 @@ impl CudaNvencEncoder {
             };
             // p4 = NVENC's visually-transparent quality/speed sweet spot at 8K
             // (slr-studio-neo's measured default; p5+ are slower for marginal
-            // quality, p1-p3 trade real quality for speed).
-            set("preset", "p4");
+            // quality, p1-p3 trade real quality for speed). The readback
+            // encoder takes the same value and the same three options below:
+            // a joined run's parts come through either (`encode::NVENC_PRESET`).
+            set("preset", crate::encode::NVENC_PRESET);
             set("tune", "hq");
             set("rc", "vbr");
             set("profile", "main10");
