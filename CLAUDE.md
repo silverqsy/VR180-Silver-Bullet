@@ -4696,12 +4696,29 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       `PowerSetRequest`: no sleep by the idle timer, the display may still
       turn off), and while any is held the process is taken out of the
       system's power throttling (`ProcessPowerThrottling`, execution
-      speed). Two tests ask the system for what it holds. NOT confirmed by
-      name: `powercfg /requests` lists requests per program but needs an
-      elevated prompt (run it during an export; the app should be under
-      SYSTEM with "Exporting"). On this desktop on mains power a minimised
+      speed). Two tests ask the system for what it holds, and the system's
+      own list says the same (`powercfg /requests` from an elevated shell,
+      during a joined run of two clips started from the app's button):
+      1.3 s after the app logged that it told the system, `vr180-gui.exe`
+      is under SYSTEM with "Exporting"; 4 s after the run's last line it is
+      gone. PowerToys Awake holds a SYSTEM request of its own on this box,
+      which is why the execution state alone says nothing here. On this
+      desktop on mains power a minimised
       run was as fast as one in front (30.8 against 31.5 frames a second),
       so the throttling half is for laptops on battery and is not measured.
+    - **Seen in that run, not acted on.** A run leaves the preview of a
+      DIFFERENT loaded clip alive (on purpose, `spawn_export_job`), and on
+      Windows that preview's two d3d11va decoders keep their 7 GB: the
+      export of the other X6 clip started with 15.5 GB of headroom where
+      it has 22 GB with no preview open, and ran with 1.7 GB left. 33 s in,
+      a zoom on the paused preview asked for the native still (decoded in
+      software: the VRAM gate declined), and from that frame the
+      GPU-resident export fell from 33 frames a second to 6 until the clip
+      ended (1799 frames in 198 s); the next clip, whose own preview a run
+      stops, made 32.9. Probably the card's memory going over its budget:
+      seen once, not reproduced on purpose. By the gate's arithmetic a
+      16 GB card has about 8 GB left with such a preview open, against the
+      8.1 GB the export's hardware decode asks for.
     - **Item 46.** The three takes of 2026-11-21 (5504 at 30, 4912 at 30
       and 14 bits, 3968 at 60) and a take of one lens (7680²) each export:
       half-equirect, lens frame, a crop mask, NVENC, libx265 and ProRes, 11
