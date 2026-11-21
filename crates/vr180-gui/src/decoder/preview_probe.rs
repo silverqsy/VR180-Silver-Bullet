@@ -113,9 +113,13 @@ fn settings_for(path: &Path) -> anyhow::Result<Settings> {
 
 /// The frame the worker settles on for the moment `t`: the first one at
 /// that moment, then whatever replaces it within a quiet third of a second.
-/// The request is repeated every two seconds until a frame answers it: one
-/// that lands while the worker is busy (taking in the stabilization data it
-/// just finished loading) is not acted on.
+/// The request is repeated until a frame answers it: one that lands while
+/// the worker is busy (taking in the stabilization data it just finished
+/// loading) is not acted on. After two seconds first, then after twice as
+/// long each time: a request starts the worker's seek over, so one repeated
+/// at a fixed step is never answered where a seek takes longer than the
+/// step (two 3840² streams decoded in software up to the frame: four
+/// seconds).
 fn frame_at(
     frames: &crossbeam_channel::Receiver<DecodedFrame>,
     commands: &crossbeam_channel::Sender<DecoderCommand>,
@@ -123,6 +127,7 @@ fn frame_at(
 ) -> anyhow::Result<DecodedFrame> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut asked = Instant::now();
+    let mut patience = Duration::from_secs(2);
     commands.send(DecoderCommand::Seek(t))?;
     let mut found: Option<DecodedFrame> = None;
     loop {
@@ -136,8 +141,9 @@ fn frame_at(
                     return Ok(f);
                 }
                 anyhow::ensure!(Instant::now() < deadline, "no frame for t = {t} s");
-                if asked.elapsed() > Duration::from_secs(2) {
+                if asked.elapsed() > patience {
                     asked = Instant::now();
+                    patience *= 2;
                     commands.send(DecoderCommand::Seek(t))?;
                 }
             }
