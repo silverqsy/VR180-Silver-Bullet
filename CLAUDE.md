@@ -4596,6 +4596,81 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       each frame should open, preview and export; a take that records a
       white balance shows it as As shot. The placement correction is
       shared code: a stored list of a 5504 take's exports changes.
+    - **WINDOWS VERIFIED (2026-11-23, Windows box, RTX 4090).** It builds as
+      pushed; tests core 63, fisheye 85, braw 6, pipeline 299 of 300 with the
+      GPU ones (the one is the fingerprint tool), gui 66; on D3D12 pipeline
+      298 of 300 (the lens frame's outermost pixels, as before). No code was
+      changed for it.
+      - **Nothing that was there moved.** The 61 exports of the A/B set are
+        byte-identical per stream to the build before, with the same 38
+        engagements of a fast arm, and the 36 preview-probe cases print the
+        same lines. The capture reader of the commit before and this one,
+        run over every take on the share (53 takes: 3840 paired at 30 / 50 /
+        60, one lens, 5504, 4912, 3968; the first, middle and last pair of
+        each), give the same pairs, stamps and samples. The exports of the
+        5504, 4912, 3968 and one-lens takes are the stored ones (libx265 and
+        ProRes byte for byte, NVENC the same decoded picture).
+      - **Takes of the new layout were made here too**, none from a camera
+        being at hand. `examples/eye_take_make` (gitignored) resamples each
+        eye of a real 3840 take into the frame's window of the sensor (per
+        Bayer site, bilinear), packs the stripes with a packer written from
+        the format's description, and writes the take around them: the
+        sensor record from the camera side's own mode files (the line period
+        set to the content's) and the Mac's three irregularities (the two
+        sensors' records alternating, a frame of the second sensor before
+        the first pair, one of the first sensor missing). The reader they
+        are held against is the camera side's: its two scalar unpackers
+        compiled here as they are (x86-64, clang), inside a walk of the file
+        that makes its verifier's checks. All five signatures: every record
+        passes; the first pair's samples are the packed ones for both
+        readers; every pair of every take (15 pairs of the four 30 fps
+        takes, 29 of the 60 fps one) has the same samples from the app's
+        reader as from the reference one (`examples/eye_take_check`); the
+        two records with no partner are in no pair, and the frame number
+        without a pair is the hole.
+        `independent_records_for_one_eye_decode_to_the_same_samples` passes
+        on those records. A pair decodes in 8 to 15 ms.
+      - **Exports** (`export_smoke`, 36 runs, none failed). Each take
+        through the portable loop's plane feed and NVENC, with the pairs
+        read ahead (the Windows opener) and read in line: the same bytes,
+        five of five. libx265, ProRes (`prores_ks_vulkan`), lens frame,
+        reframed view, crop mask, a graded development, 8192 × 4096. The
+        hole is filled: 16 frames from 15 pairs, 30 from 29. Vulkan against
+        D3D12: signed difference 0.01 of 255, mean |Δ| 0.8. Each take's
+        first frame against its source take's, unstabilized at 1536 px an
+        eye: the picture within 0.02 px, both eyes, all five (mean |Δ| 1.3
+        to 1.9 of 255: the resampling and the 10-bit copy).
+      - **White balance.** The camera side's sample (one pair of a 3840
+        60 fps take with its white balance record): the record's bytes and
+        both eyes' decoded pixels have the hashes it states; set up as a
+        take of one pair it is developed for neutral [0.6102, 1, 0.3932],
+        "about 3465 K, tint +17" (against the reference neutral: R −5.1 of
+        255), and its walls come out grey. A test take given that record:
+        the Raw development section shows 3465 / 17 with As shot in force (a
+        take without one: 3730 / 27), and each sensor's Camera original DNG
+        carries the record's neutral (the reference one where there is no
+        record). DNGs of the three frames: 5760² and 6000² in 24 tiles of
+        240 and 250 rows, 4608 × 3968 in 16 of 248, 10 bits, 64 / 1023.
+      - **In the app** (a scratch app folder). The takes open as "Insta360
+        X6 raw video" with their frame and rate, and the hole in File info
+        and on the timeline. The 4608 × 3968 one previews as 2304 × 1984
+        eyes and plays at its 30 shown a second; the clip's statistics are
+        sampled in 4 to 7 s with the window answering. The two Crop takes
+        opened (5760² and 4608 × 3968) have the Crop mask section, and the
+        second's Resolution list the native-sharpness size. Export all
+        writes 8192 × 4096 through NVENC (30 frames, stereo sound from the
+        take's four channels, 16 frames a second); Shift+S writes the
+        frame's two DNGs; the kept pair list is written in its second form
+        and read at the next launch ("29 pairs (kept list)").
+      - **Seen, left alone.** (1) "Native" in the Resolution list of the
+        4608 × 3968 take is 9216 × 3968: a half-equirect whose eye is not
+        square, and past NVENC's 8192 a side (software H.265 on Windows).
+        (2) A take whose `clip.json` names a sound file that is not there
+        exports without sound, after "one-pass audio attach failed: open
+        audio src <the take's folder>: Permission denied". (3) A Camera
+        original sequence copies every file beside the capture, whatever it
+        is. (4) The preview probe on a take of one pair ends "the worker
+        ended before t = 0 s": the worker has shown its one frame and gone.
 
 48. **Items 36 to 46 on Windows (2026-11-21, Windows box, RTX 4090; on
     `main`).** Pulled `9fd483d` → `0251879` (31 commits). It builds as
