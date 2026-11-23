@@ -2684,6 +2684,7 @@ impl BatchItem {
         let mut s = if self.single_eye() { self.settings.for_single_eye() } else { self.settings.clone() };
         s.ilog_source = self.ilog();
         s.raw_source = self.source_kind.is_raw_video();
+        s.raw_camera = s.raw_source.then(|| vr180_pipeline::x6_raw::camera_at(&self.path));
         s
     }
 
@@ -7259,8 +7260,19 @@ impl App {
         let mut s = if self.clip_single_eye() { self.settings.for_single_eye() } else { self.settings.clone() };
         s.ilog_source = self.clip.as_ref().is_some_and(|c| c.ilog());
         s.raw_source = self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
+        s.raw_camera = s.raw_source.then(|| self.loaded_raw_camera());
         s.clip_stats = self.loaded_clip_stats();
         s
+    }
+
+    /// The camera the loaded raw clip is developed as: its take's own white
+    /// balance where the take records one, the sensor's reference else (and
+    /// for a clip that is no raw take).
+    fn loaded_raw_camera(&self) -> vr180_pipeline::raw_color::RawCamera {
+        match (&self.clip, &self.loaded_path) {
+            (Some(clip), Some(path)) if clip.source_kind.is_raw_video() => vr180_pipeline::x6_raw::camera_at(path),
+            _ => vr180_pipeline::raw_color::RawCamera::X6,
+        }
     }
 
     /// What the loaded clip's statistics are sampled for: the clip, and
@@ -7293,7 +7305,7 @@ impl App {
         }
         if let Some(stats) = self.loaded_clip_stats().filter(|s| s.0.has_meter()) {
             let stage = vr180_pipeline::raw_tone::RawDevelop {
-                camera: vr180_pipeline::raw_color::RawCamera::X6, settings: self.settings.raw,
+                camera: self.loaded_raw_camera(), settings: self.settings.raw,
                 measure: vr180_pipeline::raw_tone::Measure::Wait,
             };
             if let Some(auto) = stats.0.auto_exposure(&stage) {
@@ -10765,10 +10777,11 @@ impl App {
         // What a clip's own bits of interface state are kept under.
         let loaded = self.loaded_path.clone();
         let raw_auto = if is_raw { self.raw_auto_shown() } else { RawAutoShown::Off };
+        let raw_camera = self.loaded_raw_camera();
         let s = &mut self.settings;
 
         if is_raw {
-            let read = draw_raw_develop_section(ui, &mut s.raw, vr180_pipeline::raw_color::RawCamera::X6,
+            let read = draw_raw_develop_section(ui, &mut s.raw, raw_camera,
                 if raw_reading { Some(tr("Reading…")) } else { raw_status.as_deref() }, !raw_reading, raw_auto);
             // Read the settings a frame was left with in Camera Raw: the
             // frame on screen, from the folder of camera-original DNGs

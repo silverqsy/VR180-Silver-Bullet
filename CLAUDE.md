@@ -4425,6 +4425,133 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       each frame size should open, preview and export; a 4912 or 3968 take
       shows the Crop mask section and offers the native-sharpness size.
 
+47. **Raw takes with a record for each eye (2026-11-22, Mac; UNRELEASED).**
+    The user-facing text is in the CHANGELOG (the raw video section, "A
+    record for each eye" and "The camera's white balance").
+    - **The capture** (`vr180_fisheye::x6b`; the module header has the
+      record header's table). `Layout::EyeRecords(EyeFrame { width, height,
+      coded })`, told from `clip.json`'s `layout`
+      (`paired-bayer-eye-records-v2`) and `size` (`EYE_FRAMES`: 5760×5760,
+      6000×6000 coded 6016 wide, 4608×3968; a size that is none of them is
+      refused by name). A record is ONE sensor's frame: a 4096-byte header
+      of its own (`EyeHeader`), then stripes of 32 rows, each a `u32`
+      length and a predictor stream in the split block layout
+      (`unpack_split`), its prediction starting anew. Five signatures →
+      `Profile::EyeScaled` / `EyeScaledNear` / `EyeNative` /
+      `EyeNativeNear` / `EyeWideNear` (`Profile::eye_record`: the readout
+      mode and the quantiser such a record's header must state). The
+      "Near" ones store a value to within one code: their symbols are a
+      level table like the 50 / 60 fps ones (`runs`: 0…84, every other
+      value to 894, 896…1023; 618 levels), so a stripe is decoded like a
+      tile with no tail. The 6000 frame is decoded stripe by stripe on its
+      6016-wide canvas and its part copied out (`decode_tile`, as the 4912
+      frame; the last stripe holds 16 of its 32 rows). `Layout::side` and
+      `coded_side` are gone: `width`, `height`, `coded_width` (a frame need
+      not be square).
+    - **Pairs.** `scan_pairs` → `scan_eye_records` reads every header (two
+      a pair) and `pair_eye_records` pairs sensor 0's frames with sensor
+      1's by when their exposures started: the nearest within a
+      millisecond, each frame once. The request numbers in the headers are
+      not used (the two sensors' do not agree). A pair goes by sensor 0's
+      frame number (`PairEntry::request`), which is what the closing
+      record's window and `exposure.csv` count in. `PairEntry::other` is
+      sensor 1's record and `shutter_ns` what each header says of its
+      integration time (`TakeIndex::new` takes that before the take's
+      list). `read_record` reads the two records one after the other and
+      `decode_record` → `decode_eye_records` takes them apart, so the
+      consumers (preview, export, DNG writer, clip statistics) read a pair
+      as they did. A frame with no partner is in no pair; a frame number of
+      the window without a pair is a missing one, and the timeline's hole
+      is filled as ever. The closing record's `eye_frames` is held against
+      what the walk finds, and the log says how many frames of each sensor
+      were left out.
+    - **Checks.** Header: the version, the frame's and the canvas's size,
+      the stripe count, the quantiser, zeros where the predictor and block
+      coder are named, the readout mode, sensor 0 or 1, a length that is a
+      multiple of 4096 and no longer than a frame can be, stripe lengths
+      that add up to the stated total. Walk: one signature through the
+      capture, places in the file rising, positive stamps, every record
+      inside the file, a sensor's frame numbers once each with rising
+      stamps. Decode: each stripe's own length against the header's, and
+      the CRC-32C of the stripes (`x6b::crc32c`: tables, eight bytes a
+      step, no `unsafe`; it runs on threads of its own beside the stripe
+      workers, so a pair still decodes in 10–13 ms).
+    - **The kept pair list** has a second form for these takes
+      (`X6BIDX02`, rows of 69 bytes: the second record's place and the two
+      integration times after the 37 bytes of `X6BIDX01`). A list of one
+      form is not read as the other.
+    - **Where a frame sits** (`x6b::read_sensor_windows`). The scale of a
+      frame the sensor scales is the scaler's own setting where the record
+      carries the sensor's registers (`scaling_registers`: 16 / M with the
+      scaler on), else what the rows give, as before. 5760 scaled: origin
+      (136, 136), 16/22, all of the kept part. 6000 scaled: 16/21, that is
+      7875 pixels each way of a kept 7880; which ones is not known. The
+      last columns are taken (as for the 5504 frame, by the window record
+      of the camera's own video files) and the middle rows: origin (161,
+      158.5), at most 5 and 2.5 sensor pixels from the truth (0.13° and
+      0.065°). The frames at the sensor's own pixels: (1216, 1216) for
+      5760, (1096, 1096) for 6000, (1792, 2112) for 4608×3968; all three
+      are crops (`cropped`). Rows: the rows read × the line period, which
+      gives the two scaled frames 31.676 and 31.496 ms (their records
+      state no span).
+    - **White balance.** `x6b::read_white_balance`: the file `clip.json`
+      names (`white_balance_file`), else `white-balance.json`; per sensor a
+      status, the gains and the neutral that follows from them; any record
+      whose `schema` ends in `white-balance-v1`. `x6_raw::eye_cameras` →
+      each sensor's own neutral in its Camera original DNGs
+      (`PairWriter::cameras`). `x6_raw::camera_of` / `camera_at` → the
+      camera the take is developed as: the two sensors' neutrals met
+      halfway, so both eyes are developed alike. The app carries it as
+      `Settings::raw_camera` (set beside `raw_source` in the three places
+      that make a worker's settings) and the Raw development section's As
+      shot reads from it (`App::loaded_raw_camera`). The demosaic's own
+      neutral (`BAYER.neutral`) and the noise filter's stay the reference:
+      they only steer interpolation.
+    - **DNG.** `Mosaic { width, height }`. `tile_rows_for` no longer takes
+      the capture's tile rows where there are more than 24 of them: 240,
+      250 and 248 rows for the three frames.
+    - **Verified.** Not on a camera's own take: none was at hand. What
+      stood in for one: an independent packer and reader of the format,
+      and whole takes made with them. (1) Records of the five signatures
+      packed by that packer from test pictures (the quantiser's
+      thresholds, every bit width, blocks of 16 beside blocks of 32,
+      full-range noise): the independent reader takes them, and this
+      reader gives its samples, 66 to 72 million a pair
+      (`independent_records_for_one_eye_decode_to_the_same_samples`, run
+      with `VR180_EYE_RECORDS`). (2) Unit tests: the signatures and
+      their frames and rates, the level table against the rule value by
+      value, takes whose records lie out of step with one sensor a frame
+      ahead and a frame of the other never written, the pairing rule, the
+      refusals (every header field, lengths that do not add up, a wrong
+      checksum, a byte changed, records cut short, two records of one
+      sensor, two kinds in one capture, counts that are not the closing
+      record's), the kept list's second form, the sensor record's five
+      frames, the white balance record and what is made of it, DNGs of the
+      new sizes with a sensor's own neutral. (3) Five takes made from two
+      real 3840 takes (each eye resampled into the frame's window of the
+      sensor and packed by the independent packer, the stamps and the row
+      period those of the content): every record passes the independent
+      reader's own checks; each take opens with the pairs, the hole and
+      the frames left out it was made with; the windowless preview worker
+      shows it (the 4608×3968 one as 2304×1984 eyes); it exports, and the
+      export's picture lies on the source take's within 0.003 px at
+      1024 px an eye, both eyes, all five; a locked export shakes as the
+      source's does (median px a frame 0.69 for 0.75 at 30 fps, 0.71 for
+      0.72 at 60); Camera original DNGs carry the frame's size, tiles,
+      levels and each sensor's neutral, and the system's raw decoder opens
+      them. That stretch does not tell a row timing apart: a row period
+      three times too long raised the 90th percentile from 1.84 to 2.09
+      only.
+    - **NOT verified.** A camera's own take: of its small files this
+      reader needs `layout`, `size` and `fps_setting` of `clip.json` and
+      `fps_setting`, `request_window`, `pairs` and `bytes` of the closing
+      record. The sensors' real row timing and the scaled frames' real
+      place (the figures above are the records' own, not measured). The
+      app's window.
+    - **Windows, to look at.** No code is platform-specific. A take of
+      each frame should open, preview and export; a take that records a
+      white balance shows it as As shot.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

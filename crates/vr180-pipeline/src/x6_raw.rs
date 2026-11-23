@@ -33,9 +33,17 @@
 //! sensor than the video frame, scaled; 4912×4912 and 3968×3968 hold the
 //! middle of it at its own pixels, a crop of the lens's view.
 //!
+//! A take with a record for each eye ([`x6b::Layout::EyeRecords`]) is a
+//! paired take too: its pairs are the two sensors' frames whose exposures
+//! started together, each pair two records of the capture. 5760×5760 and
+//! 6000×6000 hold either the sensor's whole view, scaled, or the middle of
+//! it at its own pixels; 4608×3968 is a wider than tall part of the middle.
+//!
 //! The frames are the sensor's linear values (black level subtracted, white
 //! level at 1.0, no white balance): they need the raw development stage of
-//! the colour stack before anything display-referred.
+//! the colour stack before anything display-referred. A take that records
+//! the white balance the camera had found ([`white_balance`]) is developed
+//! for that white unless another is set ([`camera_of`]).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -51,6 +59,7 @@ use crate::decode::VideoProbe;
 use crate::fisheye_decode::{FisheyePair, FisheyePairIter, GpuPair};
 use crate::frame_timeline::FrameTimeline;
 use crate::gpu::Device;
+use crate::raw_color::RawCamera;
 use crate::raw_gpu::BayerLayout;
 use crate::{Error, Result};
 
@@ -110,6 +119,73 @@ pub fn bayer_at(path: &Path) -> BayerLayout {
     describe(path).map_or(BAYER, |take| bayer_of(&take))
 }
 
+/// The white balance the camera had found when `take` began, as the take
+/// records it ([`x6b::read_white_balance`]): each sensor's neutral, channel
+/// 0 then channel 1; `None` for a sensor the take records none for. A take
+/// of one lens has its one sensor's in both places.
+pub fn white_balance(take: &Take) -> [Option<[f64; 3]>; 2] {
+    let eyes = x6b::read_white_balance(take);
+    match take.layout.single_channel() {
+        Some(channel) => [eyes[channel.min(1)]; 2],
+        None => eyes,
+    }
+}
+
+/// The camera each of `take`'s channels is written as, frame for frame
+/// ([`crate::sensor_dng`]): the sensor's colours with the white balance the
+/// take records for that sensor as its as-shot neutral, the reference
+/// neutral for a sensor it records none for.
+pub fn eye_cameras(take: &Take) -> [RawCamera; 2] {
+    white_balance(take).map(|neutral| match neutral {
+        Some(n) => RawCamera { as_shot_neutral: n, ..RawCamera::X6 },
+        None => RawCamera::X6,
+    })
+}
+
+/// The camera `take`'s frames are developed as: the sensor's colours with
+/// the white balance the take records as its as-shot neutral. The two eyes
+/// of a pair are developed alike: where the take records a white balance
+/// for each sensor, the one halfway between the two (channel by channel, as
+/// ratios); where for one sensor only, that one. A take that records none
+/// keeps the reference neutral.
+pub fn camera_of(take: &Take) -> RawCamera {
+    let eyes = white_balance(take);
+    let neutral = match (eyes[0], eyes[1]) {
+        (Some(a), Some(b)) => Some([0, 1, 2].map(|i| (a[i] * b[i]).sqrt())),
+        (a, b) => a.or(b),
+    };
+    match neutral {
+        Some(n) => RawCamera { as_shot_neutral: [n[0] / n[1], 1.0, n[2] / n[1]], ..RawCamera::X6 },
+        None => RawCamera::X6,
+    }
+}
+
+/// [`camera_of`] the take `path` names; the reference camera for a path
+/// that names none. A take is looked at once (its small files); later calls
+/// touch no file.
+pub fn camera_at(path: &Path) -> RawCamera {
+    static KNOWN: OnceLock<Mutex<HashMap<PathBuf, RawCamera>>> = OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some(camera) = known.lock().ok().and_then(|k| k.get(path).copied()) {
+        return camera;
+    }
+    let Ok(take) = describe(path) else { return RawCamera::X6 };
+    let camera = camera_of(&take);
+    if camera == RawCamera::X6 {
+        tracing::info!("raw take {}: it records no white balance: developed from the sensor's reference neutral", take.dir.display());
+    } else {
+        let eyes = white_balance(&take);
+        let (kelvin, tint) = camera.as_shot_temperature();
+        tracing::info!(
+            "raw take {}: developed for the white balance it records: neutral {:.4?} (about {kelvin:.0} K, tint {tint:+.0}; its sensors: {:.4?} and {:.4?})",
+            take.dir.display(), camera.as_shot_neutral, eyes[0], eyes[1]);
+    }
+    if let Ok(mut k) = known.lock() {
+        k.insert(path.to_path_buf(), camera);
+    }
+    camera
+}
+
 /// The take `path` names holds one lens's frames: a single-eye source. A
 /// take is looked at once (its `clip.json`); later calls touch no file. A
 /// path that names no take (yet: a folder still being copied) is asked
@@ -156,7 +232,11 @@ impl TakeIndex {
     /// frame period it looks as if a frame were missing before it.
     fn new(take: Take, pairs: Vec<PairEntry>) -> Self {
         let listed = x6b::read_exposures(&take);
-        let shutter_ns: Vec<[Option<u64>; 2]> = pairs.iter().map(|p| listed.get(&p.request).copied().unwrap_or([None; 2])).collect();
+        // A record's own word on its integration time comes first, then the take's list.
+        let shutter_ns: Vec<[Option<u64>; 2]> = pairs.iter().map(|p| {
+            let list = listed.get(&p.request).copied().unwrap_or([None; 2]);
+            [0, 1].map(|channel| Some(p.shutter_ns[channel]).filter(|ns| *ns > 0 && *ns < 1_000_000_000).or(list[channel]))
+        }).collect();
         let read_out: Option<Vec<u64>> = pairs.iter().zip(&shutter_ns)
             .map(|(p, s)| Some(p.time_ns() + s[0].or(s[1])? / 2 + s[1].or(s[0])? / 2))
             .collect();
@@ -268,7 +348,21 @@ pub fn describe(path: &Path) -> Result<Take> {
     x6b::read_take(&dir).map_err(take_err)?.map_err(|why| take_err(format!("{}: {why}", dir.display())))
 }
 
+/// A kept pair list starts with one of these: a row per pair of a capture
+/// whose pairs are one record each, or of one with a record for each eye
+/// (the second record's place and both integration times after the rest).
 const INDEX_MAGIC: &[u8; 8] = b"X6BIDX01";
+const INDEX_MAGIC_EYES: &[u8; 8] = b"X6BIDX02";
+const INDEX_ROW: usize = 37;
+const INDEX_ROW_EYES: usize = INDEX_ROW + 32;
+
+/// The start and the row length of `take`'s kept pair list.
+fn index_form(take: &Take) -> (&'static [u8; 8], usize) {
+    match take.layout {
+        Layout::EyeRecords(_) => (INDEX_MAGIC_EYES, INDEX_ROW_EYES),
+        _ => (INDEX_MAGIC, INDEX_ROW),
+    }
+}
 
 fn index_file(take: &Take, modified: Option<std::time::SystemTime>) -> Option<PathBuf> {
     let dir = cache_dir_slot().lock().unwrap().clone()?;
@@ -282,38 +376,50 @@ fn index_file(take: &Take, modified: Option<std::time::SystemTime>) -> Option<Pa
 
 fn load_index(file: &Path, take: &Take) -> Option<Vec<PairEntry>> {
     let bytes = std::fs::read(file).ok()?;
-    let rest = bytes.strip_prefix(INDEX_MAGIC)?;
+    let (magic, row) = index_form(take);
+    let rest = bytes.strip_prefix(magic)?;
     if rest.len() < 16 {
         return None;
     }
     let (head, rows) = rest.split_at(16);
     let capture = u64::from_le_bytes(head[..8].try_into().ok()?);
     let count = u64::from_le_bytes(head[8..].try_into().ok()?);
-    const ROW: usize = 37;
-    if capture != take.capture_bytes || count != take.seal.pairs || rows.len() != count as usize * ROW {
+    if capture != take.capture_bytes || count != take.seal.pairs || rows.len() != count as usize * row {
         return None;
     }
     let mut out = Vec::with_capacity(count as usize);
-    for r in rows.chunks_exact(ROW) {
+    for r in rows.chunks_exact(row) {
         let u64_at = |o: usize| u64::from_le_bytes(r[o..o + 8].try_into().unwrap());
+        let (other, shutter_ns) = if row == INDEX_ROW_EYES {
+            (Some((u64_at(37), u64_at(45))), [u64_at(53), u64_at(61)])
+        } else {
+            (None, [0; 2])
+        };
         out.push(PairEntry {
             request: u32::from_le_bytes(r[..4].try_into().unwrap()),
             profile: *x6b::Profile::ALL.get(r[4] as usize)?,
             offset: u64_at(5),
             len: u64_at(13),
             exposure_ns: [u64_at(21), u64_at(29)],
+            other,
+            shutter_ns,
         });
     }
     // The same checks the walk makes on what the rows claim.
     let (lo, hi) = take.seal.request_window;
     let in_window = |p: &PairEntry| !take.window_numbers_records() || (p.request >= lo && p.request <= hi);
+    let inside = |p: &PairEntry| {
+        let fits = |offset: u64, len: u64| offset.checked_add(len).is_some_and(|end| end <= take.capture_bytes);
+        fits(p.offset, p.len) && p.other.map_or(true, |(offset, len)| fits(offset, len))
+    };
     let ok = out.windows(2).all(|w| w[0].request < w[1].request)
-        && out.iter().all(|p| in_window(p) && p.profile.records(take.layout, take.fps_setting) && p.offset + p.len <= take.capture_bytes);
+        && out.iter().all(|p| in_window(p) && p.profile.records(take.layout, take.fps_setting) && inside(p));
     ok.then_some(out)
 }
 
 fn store_index(file: &Path, take: &Take, pairs: &[PairEntry]) {
-    let mut bytes = INDEX_MAGIC.to_vec();
+    let (magic, row) = index_form(take);
+    let mut bytes = magic.to_vec();
     bytes.extend_from_slice(&take.capture_bytes.to_le_bytes());
     bytes.extend_from_slice(&(pairs.len() as u64).to_le_bytes());
     for p in pairs {
@@ -323,6 +429,12 @@ fn store_index(file: &Path, take: &Take, pairs: &[PairEntry]) {
         bytes.extend_from_slice(&p.len.to_le_bytes());
         bytes.extend_from_slice(&p.exposure_ns[0].to_le_bytes());
         bytes.extend_from_slice(&p.exposure_ns[1].to_le_bytes());
+        if row == INDEX_ROW_EYES {
+            let (offset, len) = p.other.unwrap_or((0, 0));
+            for v in [offset, len, p.shutter_ns[0], p.shutter_ns[1]] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+        }
     }
     if let Some(parent) = file.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -386,6 +498,13 @@ pub fn open(path: &Path) -> Result<Arc<TakeIndex>> {
                     take.dir.display(), index.frames(), if take.layout.channels() == 1 { "frames of one lens" } else { "pairs" },
                     take.fps_setting, t0.elapsed(), index.missing.len(), index.bytes_per_second() / 1e6,
                     if take.layout.channels() == 1 { "its one eye" } else { "both eyes" });
+                if let Some(frames) = take.seal.eye_frames {
+                    let alone = frames.map(|n| n.saturating_sub(take.seal.pairs));
+                    let skipped = take.seal.eye_gaps.unwrap_or([0; 2]);
+                    tracing::info!(
+                        "raw take {}: a record for each eye, {} and {} frames of the two sensors; {} and {} have no partner and are left out; the sensors numbered {} and {} frames the capture does not hold",
+                        take.dir.display(), frames[0], frames[1], alone[0], alone[1], skipped[0], skipped[1]);
+                }
                 Ok(Arc::new(index))
             }
             Ok(None) => Err("stopped".into()),
@@ -1192,12 +1311,14 @@ impl X6RawIter {
         &self.index
     }
 
-    fn eye_side(&self) -> u32 {
-        let side = self.index.take.layout.side() as u32;
+    /// Width and height of the eyes handed out.
+    fn eye_size(&self) -> (u32, u32) {
+        let layout = self.index.take.layout;
+        let (w, h) = (layout.width() as u32, layout.height() as u32);
         match &self.enhanced {
-            Some(e) => e.side as u32,
-            None if self.half => side / 2,
-            None => side,
+            Some(e) => (e.side as u32, e.side as u32),
+            None if self.half => (w / 2, h / 2),
+            None => (w, h),
         }
     }
 
@@ -1278,17 +1399,17 @@ impl X6RawIter {
 
     fn gpu_pair(&mut self, dev: &Arc<Device>) -> Result<GpuPair> {
         let layout = self.index.take.layout;
-        let (side, channels, per) = (layout.side() as u32, layout.channels(), layout.eye_samples());
-        let out_side = self.eye_side();
+        let (w, h, channels, per) = (layout.width() as u32, layout.height() as u32, layout.channels(), layout.eye_samples());
+        let (out_w, out_h) = self.eye_size();
         if self.mosaics.len() != channels {
-            self.mosaics = (0..channels).map(|_| dev.new_bayer_texture(side, side)).collect();
+            self.mosaics = (0..channels).map(|_| dev.new_bayer_texture(w, h)).collect();
         }
         for (mosaic, samples) in self.mosaics.iter().zip(self.samples.chunks(per)) {
             dev.write_bayer_texture(mosaic, samples);
         }
         let pooled = self.pool.free.lock().ok().and_then(|mut f| f.pop())
-            .filter(|eyes| eyes.len() == channels && eyes.iter().all(|e| e.width() == out_side));
-        let eyes = pooled.unwrap_or_else(|| (0..channels).map(|_| dev.new_linear_eye_texture(out_side, out_side)).collect());
+            .filter(|eyes| eyes.len() == channels && eyes.iter().all(|e| (e.width(), e.height()) == (out_w, out_h)));
+        let eyes = pooled.unwrap_or_else(|| (0..channels).map(|_| dev.new_linear_eye_texture(out_w, out_h)).collect());
         for (mosaic, eye) in self.mosaics.iter().zip(&eyes) {
             dev.demosaic_bayer(mosaic, &self.bayer, eye)?;
         }
@@ -1303,10 +1424,10 @@ impl X6RawIter {
 
     fn cpu_pair(&self) -> (Vec<u8>, Vec<u8>) {
         let layout = self.index.take.layout;
-        let (side, per) = (layout.side(), layout.eye_samples());
+        let (w, h, per) = (layout.width(), layout.height(), layout.eye_samples());
         // The GPU demosaic's twin, one channel at a time.
         let eye = |channel: usize| -> Vec<u8> {
-            let rgb = crate::bayer::demosaic(&self.samples[channel * per..(channel + 1) * per], side, side, &self.bayer, self.half);
+            let rgb = crate::bayer::demosaic(&self.samples[channel * per..(channel + 1) * per], w, h, &self.bayer, self.half);
             let mut bytes = Vec::with_capacity(rgb.len() * 8);
             for px in &rgb {
                 for v in [px[0], px[1], px[2], 1.0] {
@@ -1354,9 +1475,11 @@ impl FisheyePairIter for X6RawIter {
         if i >= self.index.frames() || (self.frame_limit > 0 && i >= self.frame_limit) {
             return Ok(None);
         }
-        let side = self.eye_side();
+        let (eye_w, eye_h) = self.eye_size();
         let pts_s = self.index.pts_s(i);
         if self.enhanced.is_some() && !self.mosaics_out {
+            // Enhanced pictures are square.
+            let side = eye_w;
             let [c0, c1] = self.enhanced_channels(i)?;
             self.next = i + self.step;
             let (left, right) = if self.swap_eyes { (c1, c0) } else { (c0, c1) };
@@ -1380,7 +1503,7 @@ impl FisheyePairIter for X6RawIter {
         if let Some(dev) = self.gpu.clone() {
             let pair = self.gpu_pair(&dev)?;
             return Ok(Some(FisheyePair {
-                left: Vec::new(), right: Vec::new(), eye_w: side, eye_h: side, bit_depth: 16, pts_s,
+                left: Vec::new(), right: Vec::new(), eye_w, eye_h, bit_depth: 16, pts_s,
                 gpu: Some(Arc::new(pair)),
             }));
         }
@@ -1392,10 +1515,10 @@ impl FisheyePairIter for X6RawIter {
                 (false, true) => (bytes(1), bytes(0)),
                 (false, false) => (bytes(0), bytes(1)),
             };
-            return Ok(Some(FisheyePair { left, right, eye_w: side, eye_h: side, bit_depth: MOSAIC_BIT_DEPTH, pts_s, gpu: None }));
+            return Ok(Some(FisheyePair { left, right, eye_w, eye_h, bit_depth: MOSAIC_BIT_DEPTH, pts_s, gpu: None }));
         }
         let (left, right) = self.cpu_pair();
-        Ok(Some(FisheyePair { left, right, eye_w: side, eye_h: side, bit_depth: 16, pts_s, gpu: None }))
+        Ok(Some(FisheyePair { left, right, eye_w, eye_h, bit_depth: 16, pts_s, gpu: None }))
     }
 
     fn seek(&mut self, target_s: f64) -> Result<()> {
@@ -1404,7 +1527,7 @@ impl FisheyePairIter for X6RawIter {
     }
 
     fn eye_dims(&self) -> (u32, u32) {
-        (self.eye_side(), self.eye_side())
+        self.eye_size()
     }
 
     fn source_decimation(&self) -> u32 {
@@ -1424,15 +1547,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let take = Take {
-            stated_levels: None,
+            stated_levels: None, white_balance_file: None,
             layout: Layout::Paired, cfa: x6b::CFA, black_level: x6b::BLACK_LEVEL, white_level: x6b::WHITE_LEVEL,
             dir: dir.clone(), fps_setting: 60, width: 3840, height: 3840, clock_start: None,
             audio_file: None, audio_timing: None, sensor_metadata: None, exposure_file: None,
-            seal: x6b::Seal { fps_setting: 60, request_window: (10, 13), received_pairs: 3, pairs: 3, bytes: 3 * 8192 },
+            seal: x6b::Seal { fps_setting: 60, request_window: (10, 13), received_pairs: 3, pairs: 3, bytes: 3 * 8192, eye_frames: None, eye_gaps: None },
             capture_bytes: 3 * 8192,
         };
         let pair = |request: u32, offset: u64| PairEntry {
-            request, offset, len: 8192, profile: x6b::Profile::Raised60, exposure_ns: [16_683_333 * request as u64, 16_683_333 * request as u64 - 29_000],
+            request, offset, len: 8192, profile: x6b::Profile::Raised60, exposure_ns: [16_683_333 * request as u64, 16_683_333 * request as u64 - 29_000], other: None, shutter_ns: [0; 2],
         };
         let pairs = vec![pair(10, 8192), pair(11, 0), pair(13, 16384)];
         let file = dir.join("t.pairs");
@@ -1522,11 +1645,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vr180-take-timing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut take = Take {
-            stated_levels: None,
+            stated_levels: None, white_balance_file: None,
             layout: Layout::Paired, cfa: x6b::CFA, black_level: x6b::BLACK_LEVEL, white_level: x6b::WHITE_LEVEL,
             dir: dir.clone(), fps_setting: 30, width: 3840, height: 3840, clock_start: None,
             audio_file: None, audio_timing: None, sensor_metadata: None, exposure_file: None,
-            seal: x6b::Seal { fps_setting: 30, request_window: (1, 1), received_pairs: 1, pairs: 1, bytes: 8192 },
+            seal: x6b::Seal { fps_setting: 30, request_window: (1, 1), received_pairs: 1, pairs: 1, bytes: 8192, eye_frames: None, eye_gaps: None },
             capture_bytes: 8192,
         };
         assert_eq!(capture_timing(&take), CaptureTiming { readout_ms: None, stamp_to_content_ms: 0.0 });
@@ -1554,17 +1677,18 @@ mod tests {
         let eye = r#"{"bayer_output_wh":[3840,3840],"line_period_ns":4000.0,"rolling_shutter_first_to_last_row_ns":15356000}"#;
         std::fs::write(dir.join("sensor-metadata.json"), format!(r#"{{"eyes":{{"CAM0":{eye},"CAM1":{eye}}}}}"#)).unwrap();
         let take = Take {
-            stated_levels: None,
+            stated_levels: None, white_balance_file: None,
             layout: Layout::Paired, cfa: x6b::CFA, black_level: x6b::BLACK_LEVEL, white_level: x6b::WHITE_LEVEL,
             dir: dir.clone(), fps_setting: 50, width: 3840, height: 3840,
             clock_start: Some(x6b::ClockAnchor { counter_ticks: 0, counter_hz: hz, ..Default::default() }),
             audio_file: None, audio_timing: None, sensor_metadata: Some("sensor-metadata.json".into()), exposure_file: None,
-            seal: x6b::Seal { fps_setting: 50, request_window: (10, 13), received_pairs: 4, pairs: 4, bytes: 4 * 8192 },
+            seal: x6b::Seal { fps_setting: 50, request_window: (10, 13), received_pairs: 4, pairs: 4, bytes: 4 * 8192, eye_frames: None, eye_gaps: None },
             capture_bytes: 4 * 8192,
         };
         let pair = |request: u32| PairEntry {
             request, offset: 0, len: 8192, profile: x6b::Profile::ALL[0],
             exposure_ns: [500_000_000 + 20_000_000 * (request as u64 - 10), 500_000_000 + 20_000_000 * (request as u64 - 10)],
+            other: None, shutter_ns: [0; 2],
         };
         let index = TakeIndex::new(take.clone(), (10..14).map(pair).collect());
         assert!(index.shutter_ns.iter().all(|s| *s == [None, None]) && index.shutter_s(0, 0).is_none());
@@ -1592,7 +1716,7 @@ mod tests {
         let stamps = [500_000_000u64, 520_000_000, 554_000_000, 574_000_000];
         let shutters = [18_000_000u64, 18_000_000, 4_000_000, 4_000_000];
         let pairs: Vec<PairEntry> = stamps.iter().enumerate()
-            .map(|(i, t)| PairEntry { request: 10 + i as u32, offset: 0, len: 8192, profile: x6b::Profile::ALL[0], exposure_ns: [*t, *t] }).collect();
+            .map(|(i, t)| PairEntry { request: 10 + i as u32, offset: 0, len: 8192, profile: x6b::Profile::ALL[0], exposure_ns: [*t, *t], other: None, shutter_ns: [0; 2] }).collect();
         std::fs::remove_file(dir.join(x6b::EXPOSURE_FILE)).unwrap();
         let bare = TakeIndex::new(take.clone(), pairs.clone());
         assert_eq!((bare.timeline.dropped_frames(), bare.t0_ns()), (1, 500_000_000));
@@ -1808,11 +1932,11 @@ mod tests {
         let lens = "2_2.455430_7216.620_7216.620_3855.460_3884.530_0.276_-0.042_89.578_0.000000_0.000000_0.000000_1.32059765_-1.38414502_4.43894196_5.25202703_0.00000000_-0.00032840_0.00113587_0.00412989_0.00653467_-0.00106616_-0.00235222_0.02084749_-0.01150168_15488_7744_193_2.455430_7227.070_7227.070_11569.100_3877.970_-0.132_0.081_89.544_-0.000064_-0.000049_-0.032576_1.31835759_-1.57224715_5.29361629_3.47188210_0.00000000_0.00016541_-0.00072159_-0.00095306_0.01344961_-0.00061933_-0.00056505_0.01970853_-0.02243911_15488_7744_193_394240";
         std::fs::write(dir.join(x6b::CALIBRATION_FILE), format!(r#"{{"eis_calib":{{"offset_v6":"{lens}"}}}}"#)).unwrap();
         let take = |channel: usize| Take {
-            stated_levels: None,
+            stated_levels: None, white_balance_file: None,
             layout: Layout::Single { channel }, cfa: x6b::CFA, black_level: 64, white_level: 1023,
             dir: dir.clone(), fps_setting: 30, width: 7680, height: 7680, clock_start: None,
             audio_file: None, audio_timing: None, sensor_metadata: Some("sensor-metadata.json".into()), exposure_file: None,
-            seal: x6b::Seal { fps_setting: 30, request_window: (900, 900), received_pairs: 1, pairs: 1, bytes: 8192 },
+            seal: x6b::Seal { fps_setting: 30, request_window: (900, 900), received_pairs: 1, pairs: 1, bytes: 8192, eye_frames: None, eye_gaps: None },
             capture_bytes: 8192,
         };
         for (channel, fx, second) in [(0usize, 7227.07f32, true), (1, 7216.62, false)] {
@@ -1838,7 +1962,7 @@ mod tests {
         assert!((t.readout_ms.unwrap() - 30.716).abs() < 1e-4 && (t.stamp_to_content_ms - 15.358).abs() < 1e-4, "{t:?}");
         // A kept list of one lens's records is not held to the seal's window
         // (sensor frame numbers), and is another layout's for a paired take.
-        let entry = PairEntry { request: 41, offset: 0, len: 8192, profile: x6b::Profile::Single10, exposure_ns: [7_000_000_000; 2] };
+        let entry = PairEntry { request: 41, offset: 0, len: 8192, profile: x6b::Profile::Single10, exposure_ns: [7_000_000_000; 2], other: None, shutter_ns: [0; 2] };
         let file = dir.join("t.pairs");
         store_index(&file, &take(1), &[entry]);
         assert_eq!(load_index(&file, &take(1)).as_deref(), Some(&[entry][..]));
@@ -1859,11 +1983,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vr180-take-placed-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let take = |layout: Layout, side: u32, record: Option<&str>| Take {
-            stated_levels: None,
+            stated_levels: None, white_balance_file: None,
             layout, cfa: x6b::CFA, black_level: 64, white_level: 1023,
             dir: dir.clone(), fps_setting: 30, width: side, height: side, clock_start: None,
             audio_file: None, audio_timing: None, sensor_metadata: record.map(str::to_owned), exposure_file: None,
-            seal: x6b::Seal { fps_setting: 30, request_window: (1, 1), received_pairs: 1, pairs: 1, bytes: 8192 },
+            seal: x6b::Seal { fps_setting: 30, request_window: (1, 1), received_pairs: 1, pairs: 1, bytes: 8192, eye_frames: None, eye_gaps: None },
             capture_bytes: 8192,
         };
         let eye = |roi_y: [u32; 2], bin: u32, kept: [u32; 4], out: [u32; 2], window: Option<[u32; 4]>| format!(
@@ -1998,5 +2122,93 @@ mod tests {
             assert!(file.ends_with("audio.aac"));
             assert!(start > 0.3 && start < 0.7, "{start}");
         }
+    }
+
+    /// A take of `frame` with a record for each eye, as far as its
+    /// description goes: `pairs` pairs in the window 500..=503.
+    fn eye_take(dir: &Path, frame: x6b::EyeFrame, pairs: u64, capture_bytes: u64) -> Take {
+        Take {
+            stated_levels: None, white_balance_file: None,
+            layout: Layout::EyeRecords(frame), cfa: x6b::CFA, black_level: 64, white_level: 1023,
+            dir: dir.to_path_buf(), fps_setting: 60, width: frame.width as u32, height: frame.height as u32, clock_start: None,
+            audio_file: None, audio_timing: None, sensor_metadata: None, exposure_file: None,
+            seal: x6b::Seal { fps_setting: 60, request_window: (500, 503), received_pairs: pairs, pairs, bytes: capture_bytes, eye_frames: Some([pairs, pairs + 2]), eye_gaps: Some([1, 0]) },
+            capture_bytes,
+        }
+    }
+
+    /// A pair of two records: both places are kept, with what each record
+    /// says of its integration time, and a list of one kind is not read as
+    /// the other.
+    #[test]
+    fn a_kept_list_of_pairs_of_two_records_reads_back() {
+        let dir = std::env::temp_dir().join(format!("vr180-x6raw-eyeindex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let take = eye_take(&dir, x6b::EYE_FRAMES[2], 3, 8 * 8192);
+        let step = 16_683_333u64;
+        let pair = |request: u32, first: u64, second: u64| PairEntry {
+            request, offset: first * 8192, len: 8192, profile: x6b::Profile::EyeWideNear,
+            exposure_ns: [step * request as u64, step * request as u64 + 29_000],
+            other: Some((second * 8192, 8192)), shutter_ns: [4_000_000, 4_000_100],
+        };
+        let pairs = vec![pair(500, 1, 2), pair(501, 4, 3), pair(503, 7, 6)];
+        let file = dir.join("t.pairs");
+        store_index(&file, &take, &pairs);
+        assert_eq!(load_index(&file, &take).as_deref(), Some(&pairs[..]));
+        // Not a list of pairs of one record, nor such a list one of these.
+        let paired = Take { layout: Layout::PairedOf(x6b::PAIRED_FRAMES[2]), width: 3968, height: 3968, ..take.clone() };
+        assert!(load_index(&file, &paired).is_none());
+        store_index(&file, &paired, &pairs.iter().map(|p| PairEntry { profile: x6b::Profile::Frame10, other: None, shutter_ns: [0; 2], ..*p }).collect::<Vec<_>>());
+        assert!(load_index(&file, &take).is_none() && load_index(&file, &paired).is_some());
+        // A second record outside the capture, or a profile of another frame: refused.
+        store_index(&file, &take, &[pair(500, 1, 2), pair(501, 4, 3), pair(503, 7, 8)]);
+        assert!(load_index(&file, &take).is_none());
+        store_index(&file, &take, &pairs.iter().map(|p| PairEntry { profile: x6b::Profile::EyeNative, ..*p }).collect::<Vec<_>>());
+        assert!(load_index(&file, &take).is_none());
+
+        // The index: a pair's integration times are its records' own, its
+        // time the middle of the two stamps and of the two integrations
+        // after them, and the frame number no pair has is missing.
+        let index = TakeIndex::new(take, pairs);
+        assert_eq!((index.frames(), &index.missing[..]), (3, &[502u32][..]));
+        assert_eq!(index.shutter_ns[1], [Some(4_000_000), Some(4_000_100)]);
+        assert!((index.shutter_s(0, 1).unwrap() - 0.004_000_1).abs() < 1e-12);
+        assert_eq!(index.t0_ns(), step * 500 + 14_500 + 4_000_050);
+        assert!((index.pts_s(2) - 3.0 * step as f64 * 1e-9).abs() < 1e-9, "{}", index.pts_s(2));
+        assert_eq!(index.timeline.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The white a take is developed for: the one it records, the two
+    /// sensors' met halfway; each sensor's own in that sensor's files; the
+    /// reference where the take records none.
+    #[test]
+    fn a_take_is_developed_for_the_white_balance_it_records() {
+        let dir = std::env::temp_dir().join(format!("vr180-x6raw-white-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let take = eye_take(&dir, x6b::EYE_FRAMES[0], 3, 8 * 8192);
+        // No record: the reference, for the development and for both sensors' files.
+        assert_eq!((camera_of(&take), eye_cameras(&take), white_balance(&take)), (RawCamera::X6, [RawCamera::X6; 2], [None; 2]));
+        let eye = |status: &str, r: f64, b: f64| format!(r#"{{"status":"{status}","rgb_gains":[{r},1.0,{b}],"as_shot_neutral":[{},1.0,{}]}}"#, 1.0 / r, 1.0 / b);
+        let write = |cam0: String, cam1: String| std::fs::write(dir.join(x6b::WHITE_BALANCE_FILE),
+            format!(r#"{{"schema":"sample-white-balance-v1","eyes":{{"CAM0":{cam0},"CAM1":{cam1}}}}}"#)).unwrap();
+        let close = |a: [f64; 3], b: [f64; 3]| a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-12);
+        // Both sensors: each its own in its files, the development halfway between them.
+        write(eye("ok", 1.6, 2.5), eye("ok", 2.5, 1.6));
+        let files = eye_cameras(&take);
+        assert!(close(files[0].as_shot_neutral, [0.625, 1.0, 0.4]) && close(files[1].as_shot_neutral, [0.4, 1.0, 0.625]), "{files:?}");
+        assert!(close(camera_of(&take).as_shot_neutral, [0.5, 1.0, 0.5]), "{:?}", camera_of(&take));
+        assert_eq!((camera_of(&take).color_matrix, camera_of(&take).baseline_exposure), (RawCamera::X6.color_matrix, RawCamera::X6.baseline_exposure));
+        // One sensor only: its files carry it, the other's the reference; the pair is developed for the one there is.
+        write(eye("ok", 1.6, 2.5), eye("unavailable", 2.5, 1.6));
+        assert_eq!(eye_cameras(&take)[1], RawCamera::X6);
+        assert!(close(camera_of(&take).as_shot_neutral, [0.625, 1.0, 0.4]) && close(eye_cameras(&take)[0].as_shot_neutral, [0.625, 1.0, 0.4]));
+        // A take of one lens: that sensor's.
+        write(eye("ok", 1.6, 2.5), eye("ok", 2.5, 1.6));
+        let one = Take { layout: Layout::Single { channel: 1 }, width: 7680, height: 7680, ..take.clone() };
+        assert!(close(camera_of(&one).as_shot_neutral, [0.4, 1.0, 0.625]) && white_balance(&one)[0] == white_balance(&one)[1]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

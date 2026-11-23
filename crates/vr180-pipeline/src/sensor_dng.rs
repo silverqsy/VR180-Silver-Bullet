@@ -30,9 +30,12 @@
 //! level stay as they are. `ImageDescription` holds the channel, the
 //! request number and the exposure start.
 //!
-//! The colour description is the take's reference one (a raw take records
-//! no white balance of its own), the same this app develops with, so a raw
-//! converter opening a file starts from the colours the app shows.
+//! The colour description is the sensor's reference one, the same this
+//! app develops with, so a raw converter opening a file starts from the
+//! colours the app shows. Where the take records the white balance the
+//! camera had found for a sensor, that sensor's files carry it as their
+//! `AsShotNeutral` ([`crate::x6_raw::eye_cameras`]); the samples are never
+//! multiplied by it.
 //!
 //! A take of one lens writes its one channel's folder, and its files are
 //! that take's frames: 7680×7680, 10-bit samples, tiles of 7680×320.
@@ -41,6 +44,10 @@
 //! its samples have: 5504×5504 or 3968×3968 at 10 bits, 4912×4912 at 14.
 //! Its tiles are the capture's where they fill the frame; the 4912 frame,
 //! whose capture pads to a larger canvas, is written in tiles of 4912×614.
+//!
+//! A take with a record for each eye writes its frames at 10 bits in tiles
+//! of their own (the capture's stripes of 32 rows are too many for a file):
+//! 5760×240, 6000×250, and 4608×248 for the 4608×3968 frame.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -61,9 +68,10 @@ pub const BITS: u8 = 14;
 /// The mosaic a file holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mosaic {
-    /// Side of the frame.
-    pub side: usize,
-    /// Rows of one of its tiles (the capture's own).
+    /// The frame's size.
+    pub width: usize,
+    pub height: usize,
+    /// Rows of one of its tiles ([`tile_rows_for`]).
     pub tile_rows: usize,
     /// Bits of a sample.
     pub bits: u8,
@@ -75,7 +83,7 @@ pub struct Mosaic {
 impl Mosaic {
     /// One channel of a paired take.
     pub const PAIRED: Mosaic = Mosaic {
-        side: EYE_SIDE, tile_rows: TILE_ROWS, bits: BITS,
+        width: EYE_SIDE, height: EYE_SIDE, tile_rows: TILE_ROWS, bits: BITS,
         cfa: x6b::CFA, black_level: x6b::BLACK_LEVEL, white_level: x6b::WHITE_LEVEL,
     };
 
@@ -84,30 +92,32 @@ impl Mosaic {
     pub fn of(take: &x6b::Take) -> Self {
         let top = take.sample_max();
         Mosaic {
-            side: take.layout.side(), tile_rows: tile_rows_for(take.layout.side(), take.layout.tile_rows()),
+            width: take.layout.width(), height: take.layout.height(),
+            tile_rows: tile_rows_for(take.layout.height(), take.layout.tile_rows()),
             bits: (16 - top.leading_zeros()) as u8,
             cfa: take.cfa, black_level: take.black_level, white_level: take.white_level,
         }
     }
 
     fn samples(&self) -> usize {
-        self.side * self.side
+        self.width * self.height
     }
 
     /// Tiles of a file.
     fn tiles(&self) -> usize {
-        self.side / self.tile_rows
+        self.height / self.tile_rows
     }
 }
 
 /// Rows of a file's tiles for a frame of `side` rows whose capture has
-/// tiles of `own` rows: `own` where a whole number of them is the frame.
-/// Else (a capture coded on a canvas larger than its frame) the fewest rows
-/// that are: an even number, so every tile starts on the same row of the
-/// colour pattern, of which the frame holds no more tiles than a file has
-/// room for ([`TILES_PER_EYE`]).
+/// tiles of `own` rows: `own` where a whole number of them is the frame and
+/// a file has room for that many ([`TILES_PER_EYE`]). Else (a capture coded
+/// on a canvas larger than its frame, or in many thin stripes) the fewest
+/// rows that are: an even number, so every tile starts on the same row of
+/// the colour pattern, of which the frame holds no more tiles than a file
+/// has room for.
 pub fn tile_rows_for(side: usize, own: usize) -> usize {
-    if own > 0 && side % own == 0 && own % 2 == 0 {
+    if own > 0 && side % own == 0 && own % 2 == 0 && side / own <= TILES_PER_EYE {
         return own;
     }
     (2..=side).step_by(2).find(|rows| side % rows == 0 && side / rows <= TILES_PER_EYE).unwrap_or(side)
@@ -269,8 +279,8 @@ pub fn eye_dng<'a>(samples: &[u16], mosaic: &Mosaic, tag: FrameTag, camera: &Raw
     let fields = |offsets: &[u32], counts: &[u32]| {
         let mut f = Fields::default();
         f.longs(254, &[0]);
-        f.longs(256, &[mosaic.side as u32]);
-        f.longs(257, &[mosaic.side as u32]);
+        f.longs(256, &[mosaic.width as u32]);
+        f.longs(257, &[mosaic.height as u32]);
         f.shorts(258, &[mosaic.bits as u16]);
         f.shorts(259, &[7]);
         f.shorts(262, &[32803]);
@@ -281,7 +291,7 @@ pub fn eye_dng<'a>(samples: &[u16], mosaic: &Mosaic, tag: FrameTag, camera: &Raw
         f.shorts(277, &[1]);
         f.shorts(284, &[1]);
         f.text(305, concat!("VR180 Silver Bullet ", env!("CARGO_PKG_VERSION")));
-        f.longs(322, &[mosaic.side as u32]);
+        f.longs(322, &[mosaic.width as u32]);
         f.longs(323, &[mosaic.tile_rows as u32]);
         f.longs(324, offsets);
         f.longs(325, counts);
@@ -300,13 +310,13 @@ pub fn eye_dng<'a>(samples: &[u16], mosaic: &Mosaic, tag: FrameTag, camera: &Raw
     };
     // The head's length does not depend on the tiles' sizes.
     let tiles = mosaic.tiles();
-    assert!(tiles >= 1 && tiles <= TILES_PER_EYE && tiles * mosaic.tile_rows == mosaic.side, "tiles of {} rows do not make a frame of {}", mosaic.tile_rows, mosaic.side);
+    assert!(tiles >= 1 && tiles <= TILES_PER_EYE && tiles * mosaic.tile_rows == mosaic.height, "tiles of {} rows do not make a frame of {} rows", mosaic.tile_rows, mosaic.height);
     let head_len = fields(&[0; TILES_PER_EYE][..tiles], &[0; TILES_PER_EYE][..tiles]).head().len();
     scratch.body.clear();
     let mut offsets = [0u32; TILES_PER_EYE];
     let mut counts = [0u32; TILES_PER_EYE];
-    for (i, tile) in samples.chunks_exact(mosaic.side * mosaic.tile_rows).enumerate() {
-        crate::ljpeg::encode_tile_cfa_into(tile, mosaic.side, mosaic.tile_rows, mosaic.bits, &mut scratch.tile);
+    for (i, tile) in samples.chunks_exact(mosaic.width * mosaic.tile_rows).enumerate() {
+        crate::ljpeg::encode_tile_cfa_into(tile, mosaic.width, mosaic.tile_rows, mosaic.bits, &mut scratch.tile);
         offsets[i] = (head_len + scratch.body.len()) as u32;
         counts[i] = scratch.tile.len() as u32;
         scratch.body.extend_from_slice(&scratch.tile);
@@ -409,7 +419,9 @@ struct PairWriter<'a> {
     /// two, the one a take of one lens holds.
     channels: Vec<usize>,
     mosaic: Mosaic,
-    camera: RawCamera,
+    /// The camera each sensor channel's files describe (its white balance
+    /// is the take's for that sensor).
+    cameras: [RawCamera; 2],
     place: Place<'a>,
 }
 
@@ -429,7 +441,7 @@ impl<'a> PairWriter<'a> {
             }
             Place::Lone(dir, _) => std::fs::create_dir_all(dir)?,
         }
-        Ok(Self { format: index.take.format(), channels, mosaic: Mosaic::of(&index.take), camera: RawCamera::X6, place })
+        Ok(Self { format: index.take.format(), channels, mosaic: Mosaic::of(&index.take), cameras: crate::x6_raw::eye_cameras(&index.take), place })
     }
 
     /// The file of one channel of the request.
@@ -454,7 +466,7 @@ impl<'a> PairWriter<'a> {
         let mut files = Vec::with_capacity(self.channels.len());
         for (&channel, eye) in self.channels.iter().zip(samples.chunks(self.mosaic.samples())) {
             let tag = FrameTag { channel, request: entry.request, exposure_ns: entry.exposure_ns[channel] };
-            let (head, body) = eye_dng(eye, &self.mosaic, tag, &self.camera, scratch);
+            let (head, body) = eye_dng(eye, &self.mosaic, tag, &self.cameras[channel.min(1)], scratch);
             files.push((channel, write_whole(&self.file(channel, entry.request), &[&head, body])?));
         }
         let signature = String::from_utf8_lossy(entry.profile.signature()).trim_end_matches('\0').to_owned();
@@ -769,24 +781,33 @@ mod tests {
     fn a_frame_of_another_size_is_written_in_whole_tiles() {
         assert_eq!((tile_rows_for(3840, 160), tile_rows_for(7680, 320), tile_rows_for(5504, 344), tile_rows_for(3968, 248)), (160, 320, 344, 248));
         assert_eq!(tile_rows_for(4912, 308), 614);
+        // A capture in stripes of 32 rows: more of them than a file has room for.
+        assert_eq!((tile_rows_for(5760, 32), tile_rows_for(6000, 32), tile_rows_for(3968, 32)), (240, 250, 248));
         let tag = FrameTag { channel: 0, request: 7, exposure_ns: 1_000 };
-        for (side, own, bits, black, white, tiles) in [(4912usize, 308usize, 14u8, 1024u16, 16368u16, 8usize), (3968, 248, 10, 64, 1023, 16)] {
-            let m = Mosaic { side, tile_rows: tile_rows_for(side, own), bits, cfa: x6b::CFA, black_level: black, white_level: white };
+        // A sensor whose white balance the take records: the file's neutral is that one.
+        let warm = RawCamera { as_shot_neutral: [0.6101593922240429, 1.0, 0.3932034174906403], ..RawCamera::X6 };
+        for (width, height, own, bits, black, white, tiles, camera) in [
+            (4912usize, 4912usize, 308usize, 14u8, 1024u16, 16368u16, 8usize, RawCamera::X6), (3968, 3968, 248, 10, 64, 1023, 16, RawCamera::X6),
+            (4608, 3968, 32, 10, 64, 1023, 16, warm), (6000, 6000, 32, 10, 64, 1023, 24, warm),
+        ] {
+            let m = Mosaic { width, height, tile_rows: tile_rows_for(height, own), bits, cfa: x6b::CFA, black_level: black, white_level: white };
             let top = (1u32 << bits) - 1;
             let mut s = 0x9e37_79b9u32;
-            let samples: Vec<u16> = (0..side * side).map(|i| {
+            let samples: Vec<u16> = (0..width * height).map(|i| {
                 s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-                (((i % side) as u32 * 3 + (i / side) as u32 * 5) % (top + 1) + s % 32).min(top) as u16
+                (((i % width) as u32 * 3 + (i / width) as u32 * 5) % (top + 1) + s % 32).min(top) as u16
             }).collect();
             let mut scratch = EyeScratch::default();
-            let (head, body) = eye_dng(&samples, &m, tag, &RawCamera::X6, &mut scratch);
+            let (head, body) = eye_dng(&samples, &m, tag, &camera, &mut scratch);
             let file = [head, body.to_vec()].concat();
             let back = read_back(&file);
-            assert!(back.samples == samples, "{side}: the samples differ");
-            assert_eq!((back.longs(256), back.longs(257), back.longs(258)), (vec![side as u32], vec![side as u32], vec![bits as u32]));
-            assert_eq!((back.longs(322), back.longs(323)), (vec![side as u32], vec![(side / tiles) as u32]));
+            assert!(back.samples == samples, "{width} x {height}: the samples differ");
+            assert_eq!((back.longs(256), back.longs(257), back.longs(258)), (vec![width as u32], vec![height as u32], vec![bits as u32]));
+            assert_eq!((back.longs(322), back.longs(323)), (vec![width as u32], vec![(height / tiles) as u32]));
             assert_eq!((back.longs(324).len(), back.longs(325).len()), (tiles, tiles));
             assert_eq!((back.longs(50714), back.longs(50717)), (vec![black as u32], vec![white as u32]));
+            let neutral = back.fractions(50728);
+            assert!(neutral.iter().zip(&camera.as_shot_neutral).all(|(a, b)| (a - b).abs() < 1e-6), "{width} x {height}: {neutral:?}");
         }
     }
 

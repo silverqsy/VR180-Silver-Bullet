@@ -836,7 +836,7 @@ fn meter_take(
     // The channel the left picture is made of, and where it lies among a
     // record's samples.
     let (channel, at) = match take.layout {
-        x6b::Layout::Paired | x6b::Layout::PairedOf(_) => {
+        x6b::Layout::Paired | x6b::Layout::PairedOf(_) | x6b::Layout::EyeRecords(_) => {
             let c = if cfg.source_kind.dual_stream_iter_swap(cfg.fisheye_swap_eyes) { 1 } else { 0 };
             (c, c * w * h)
         }

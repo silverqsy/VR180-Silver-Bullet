@@ -21,6 +21,23 @@ converter's controls for it, and every frame can be had as a DNG.
   list offers the native-sharpness size, as for a Crop video clip. Every
   frame is placed in the lens's view, and its rows are timed, by the
   take's own sensor record.
+- **A record for each eye.** A take that stores each eye's frame as a
+  record of its own opens like the others: eyes of 5760 × 5760 or
+  6000 × 6000 at 30 fps, or 4608 × 3968 at 60 fps, with every sensor
+  value kept or stored to within one code value. The two sensors' frames
+  are paired by when their exposures started; a frame whose partner was
+  never written is left out, and the gap is filled like any dropped
+  frame. The two square frames hold either the lens's whole view or the
+  middle of it at the sensor's own pixels, and the 4608 × 3968 frame is a
+  wider than tall part of the middle: a frame that is part of the view
+  gets the Crop mask and the native-sharpness size. Every record's
+  checksum is checked as the record is read, so damaged data stops an
+  export instead of ending up in it.
+- **The camera's white balance.** A take that records the white balance
+  the camera had found when it began is developed for that white: As shot
+  is then the take's own, and each eye's Camera original DNGs carry its
+  sensor's neutral. A take without that record keeps the reference
+  neutral, as before.
 - **Raw development.** Temperature and Tint (or As shot), Exposure,
   Contrast, Highlights, Shadows, Whites, Blacks, in a raw converter's own
   terms. The rendering follows Adobe Camera Raw's, control by control, so a

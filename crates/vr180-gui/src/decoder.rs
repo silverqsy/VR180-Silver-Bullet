@@ -465,6 +465,12 @@ pub struct Settings {
     /// from the clip's kind; never persisted.
     #[serde(skip)]
     pub raw_source: bool,
+    /// The camera a raw clip is developed as: the sensor's colours with the
+    /// white balance the take records, where it records one
+    /// (`vr180_pipeline::x6_raw::camera_at`). `None`: the sensor's
+    /// reference. Set beside `raw_source`; never persisted.
+    #[serde(skip)]
+    pub raw_camera: Option<vr180_pipeline::raw_color::RawCamera>,
     /// The width of one eye of the frame an export of the clip would write
     /// now (0 = not known): a raw clip's sharpening counts its radius in
     /// that frame's pixels, and a preview drawn smaller scales it. Set by
@@ -592,6 +598,7 @@ impl Default for Settings {
             ilog_source: false,
             raw: Default::default(),
             raw_source: false,
+            raw_camera: None,
             export_eye_w: 0,
             clip_stats: None,
         }
@@ -890,7 +897,7 @@ impl Settings {
         // A raw clip's eyes are the camera's linear RGB: developed first.
         if self.raw_source {
             plan.raw_develop = Some(vr180_pipeline::raw_tone::RawDevelop {
-                camera: vr180_pipeline::raw_color::RawCamera::X6,
+                camera: self.raw_camera.unwrap_or(vr180_pipeline::raw_color::RawCamera::X6),
                 settings: self.raw,
                 measure: vr180_pipeline::raw_tone::Measure::Wait,
             });

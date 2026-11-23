@@ -90,6 +90,7 @@ fn settings_for(path: &Path) -> anyhow::Result<Settings> {
     s.ilog_source = switch("VR180_PROBE_ILOG").as_deref() == Some("1");
     // A raw take: VR180_PROBE_RAWDEV=<exposure>,<contrast>,<highlights>,<shadows>,<whites>,<blacks>; VR180_PROBE_WB=<kelvin>,<tint>.
     s.raw_source = kind.is_raw_video();
+    s.raw_camera = s.raw_source.then(|| vr180_pipeline::x6_raw::camera_at(path));
     if let Some(v) = switch("VR180_PROBE_RAWDEV") {
         let v: Vec<f32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
         let g = |i: usize| v.get(i).copied().unwrap_or(0.0);
