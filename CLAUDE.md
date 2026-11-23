@@ -4369,15 +4369,16 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       to the lens calibration in place of the recording-mode table. By
       their records: 3840 binned and 7680 of one lens → origin 32, scale
       0.5 / 1 (what they were placed at before, now from the file); 5504 →
-      origin (−80, −84), scale 16/23; 4912 → 1416; 3968 → 1888, both at
+      origin (−88, −84), scale 16/23; 4912 → 1416; 3968 → 1888, both at
       scale 1 and both a crop of the image circle (`cropped`: the frame
       covers less than the video window). The 5504 frame is 7912 columns
-      of a kept part of 7920: it is taken to hold the last 7912, which is
-      where the camera's own video files place that window (their record:
-      4 pixels right of the middle). Not measured: the other readings lie
-      4 and 8 sensor pixels to the left (0.03° and 0.06°), and an origin
-      fitted from gyro against tracked features scatters by 20 to 30
-      pixels on every mode.
+      of a kept part of 7920: the FIRST 7912. It was taken to hold the
+      last 7912 at first (origin −80: where the camera's own video files
+      place that window, 4 pixels right of the middle) and that was 8
+      sensor pixels, 0.19°, off: measured 2026-11-23 by the sensor's
+      fixed pattern (item 47, "On a camera's own takes"). An origin
+      fitted from gyro against tracked features cannot tell: it scatters
+      by 20 to 30 pixels on every mode.
     - **Rows.** `EyeWindow::first_to_last_row_ns` = the sensor rows read ×
       the record's line period, the record's own figure where it agrees.
       For the scaled 5504 frame the record has none: 7912 rows at 4000 ns =
@@ -4485,11 +4486,12 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       carries the sensor's registers (`scaling_registers`: 16 / M with the
       scaler on), else what the rows give, as before. 5760 scaled: origin
       (136, 136), 16/22, all of the kept part. 6000 scaled: 16/21, that is
-      7875 pixels each way of a kept 7880; which ones is not known. The
-      last columns are taken (as for the 5504 frame, by the window record
-      of the camera's own video files) and the middle rows: origin (161,
-      158.5), at most 5 and 2.5 sensor pixels from the truth (0.13° and
-      0.065°). The frames at the sensor's own pixels: (1216, 1216) for
+      7875 pixels each way of a kept 7880: the first ones, origin (156,
+      156). A scaled frame that holds less than its kept part starts
+      where the kept part starts (measured, see "On a camera's own
+      takes"; the first guess, the last columns and the middle rows, put
+      this frame at (161, 158.5)). The frames at the sensor's own
+      pixels: (1216, 1216) for
       5760, (1096, 1096) for 6000, (1792, 2112) for 4608×3968; all three
       are crops (`cropped`). Rows: the rows read × the line period, which
       gives the two scaled frames 31.676 and 31.496 ms (their records
@@ -4510,9 +4512,9 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
     - **DNG.** `Mosaic { width, height }`. `tile_rows_for` no longer takes
       the capture's tile rows where there are more than 24 of them: 240,
       250 and 248 rows for the three frames.
-    - **Verified.** Not on a camera's own take: none was at hand. What
-      stood in for one: an independent packer and reader of the format,
-      and whole takes made with them. (1) Records of the five signatures
+    - **Verified before a camera's own take was at hand.** What stood in
+      for one: an independent packer and reader of the format, and whole
+      takes made with them. (1) Records of the five signatures
       packed by that packer from test pictures (the quantiser's
       thresholds, every bit width, blocks of 16 beside blocks of 32,
       full-range noise): the independent reader takes them, and this
@@ -4542,15 +4544,58 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       them. That stretch does not tell a row timing apart: a row period
       three times too long raised the 90th percentile from 1.84 to 2.09
       only.
-    - **NOT verified.** A camera's own take: of its small files this
-      reader needs `layout`, `size` and `fps_setting` of `clip.json` and
-      `fps_setting`, `request_window`, `pairs` and `bytes` of the closing
-      record. The sensors' real row timing and the scaled frames' real
-      place (the figures above are the records' own, not measured). The
-      app's window.
+    - **On a camera's own takes (2026-11-23).** Nine takes: seven of this
+      layout (all five signatures) and two of the paired one. (1) Each
+      opens at once: `clip.json` and the closing record have every field
+      the reader goes by, the walk finds the closing record's counts, and
+      the pairs are the take's own list of them row for row (9903
+      pairs: number, both stamps, both records' places and lengths, both
+      integration times). Most of them have holes, each sensor's own; the
+      timeline holds the frame before a hole as ever. The request
+      numbers in the take's lists are one above the headers' (the reader
+      goes by neither). (2) An independent reader over five whole
+      captures, one of each signature (148 GB,
+      12506 records): every header, order and checksum right, and the
+      pair it wrote out of each is this reader's, sample for sample (18
+      to 36 million a sensor). (3) Row timing. Features tracked from
+      frame to frame against the gyro through the lens model, the span
+      from first row to last fitted, ms (fitted | the app's): 5760 scaled
+      31.47 and 31.32 for the two sensors | 31.676; 6000 scaled 32.16
+      (slow motion) | 31.496; 6000 at the sensor's own pixels 26.03 |
+      25.996; 5760 so 24.93 | 24.956; 4608×3968 16.16 | 16.033; the
+      middle row's time within 0.25 ms of the app's on all. "Rows of the
+      frame × line" (24.0 ms for the scaled frames) is ruled out. In the
+      app: a turning stretch exported locked with the per-row correction
+      at 0 / 0.5 / 1 / 1.5 / 2 times (`VR180_RS_SCALE`), far-field shake
+      in px a frame at 1024 px an eye: 5760 scaled 0.40 / 0.29 / 0.12 /
+      0.26 / 0.40; 4608×3968 0.097 / 0.059 / 0.045 / 0.070 / 0.109; 5760
+      at the sensor's own pixels 0.109 / 0.065 / 0.054 / 0.071 / 0.135;
+      6000 scaled 0.072 / – / 0.044 / – / 0.071. (4) Where a frame sits,
+      by the sensor's fixed pattern: the mean of 80 frames of a take, its
+      dark corners outside the image circle (there the pattern of two
+      takes of one mode correlates 0.6), one frame's pattern taken to
+      sensor coordinates and laid on another's, colour plane by colour
+      plane, the origin of the best fit read off. A second take of the
+      same frame: (136.00, 136.00) of 136, each corner within 0.02. 6000
+      scaled against 5760 scaled: (155.93, 155.94), both sensors, two
+      pairs of takes, each of the four corners within 0.12 (so the scale
+      is the scaler's 16/21 too): the first columns and rows, where the
+      code had (161, 158.5). 5504 against 5760 scaled: (136.00, 140.00),
+      where the code had 144 across. 5760 scaled against 6000 at the
+      sensor's own pixels: (136.18, 136.18), a fifth of a pixel that is
+      the scaler's own sample phase and is left alone; the three frames
+      at the sensor's own pixels lie on each other to 0.02. The
+      correction moves a 6000 scaled picture by 0.12° across and 0.08°
+      down, a 5504 one by 0.19° across, both eyes alike, so nothing
+      between the eyes changes; a 5760 scaled export is the same file as
+      before.
+    - **NOT verified.** The app's window by this session (takes of every
+      frame were opened and played there by hand that day). Whether the
+      white balance the camera records is the one the scene wants.
     - **Windows, to look at.** No code is platform-specific. A take of
       each frame should open, preview and export; a take that records a
-      white balance shows it as As shot.
+      white balance shows it as As shot. The placement correction is
+      shared code: a stored list of a 5504 take's exports changes.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

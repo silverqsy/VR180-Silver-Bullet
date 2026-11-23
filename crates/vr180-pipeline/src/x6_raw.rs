@@ -2017,7 +2017,7 @@ mod tests {
         // 5504×5504: more than the video's window, scaled by 16/23. Not a crop.
         write(eye([128, 8063], 1, [136, 12, 7920, 7912], [5504, 5504], None));
         let g = lens_meta(&take(Layout::PairedOf(frame(5504)), 5504, Some("r.json"))).stream_geometry(5504, 5504, X6ViewChoice::Auto);
-        assert!(close(g.scale_x, 16.0 / 23.0) && close(g.scale_y, 16.0 / 23.0) && close(g.origin_x, -80.0) && close(g.origin_y, -84.0) && !g.cropped, "{g:?}");
+        assert!(close(g.scale_x, 16.0 / 23.0) && close(g.scale_y, 16.0 / 23.0) && close(g.origin_x, -88.0) && close(g.origin_y, -84.0) && !g.cropped, "{g:?}");
         // 4912×4912 and 3968×3968: the sensor's own pixels around its middle, part of the view.
         write(eye([1632, 6559], 1, [1640, 8, 4912, 4912], [4912, 4912], Some([0, 0, 4912, 4912])));
         let g = lens_meta(&take(Layout::PairedOf(frame(4912)), 4912, Some("r.json"))).stream_geometry(4912, 4912, X6ViewChoice::Auto);

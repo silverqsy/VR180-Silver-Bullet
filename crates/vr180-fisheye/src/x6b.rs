@@ -1988,16 +1988,15 @@ impl EyeWindow {
 /// every `M` in), else what the rows give: the output holding every kept
 /// row.
 ///
-/// A scaled frame may hold less than its kept part scaled. Where it is
-/// narrower, it holds the kept part's last columns: that is where the
-/// camera's own video files place such a window of the sensor (their
-/// window record of a 5504-wide frame: 7912 pixels wide, 4 right of the
-/// middle of the sensor half), and it is not measured here: the two other
-/// ways of taking 7912 columns from 7920 lie 4 and 8 pixels of the sensor
-/// to the left, 0.03° and 0.06° of the lens's view. Where it is less tall
-/// (the 6000×6000 frame scaled 16 / 21: 7875 rows of a kept 7880) nothing
-/// says which rows it holds: the middle ones are taken, at most 2.5 pixels
-/// of the sensor from where they are.
+/// A scaled frame may hold less than its kept part scaled (5504 columns
+/// are 7912 of a kept 7920; 6000 columns and rows scaled 16 / 21 are 7875
+/// of a kept 7880). It then holds the kept part's first columns and rows:
+/// the frame starts where the kept part starts. Measured on takes: the
+/// sensor's fixed pattern in the dark corners of such a frame lies on that
+/// of a frame whose place is not in doubt (5760×5760, which is all of its
+/// kept part, itself checked against the frames at the sensor's own
+/// pixels) within a fifth of a sensor pixel, in both sensors and in each
+/// of the four corners, which also bears out the scaler's own scale.
 pub fn read_sensor_windows(take: &Take) -> Option<[EyeWindow; 2]> {
     let name = take.sensor_metadata.as_deref()?;
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(take.dir.join(name)).ok()?).ok()?;
@@ -2025,14 +2024,11 @@ pub fn read_sensor_windows(take: &Take) -> Option<[EyeWindow; 2]> {
         if !(scale > 0.0 && scale <= 1.0) || out[0] > kept[2] * scale + 0.5 || out[1] > kept[3] * scale + 0.5 {
             return None;
         }
-        // Binned pixels of the kept part the output leaves out: the columns
-        // ahead of it, the rows half above it and half below.
-        let ahead = (kept[2] - out[0] / scale, (kept[3] - out[1] / scale) * 0.5);
         let line = e.get("line_period_ns")?.as_f64().filter(|l| l.is_finite() && *l > 0.0)?;
         let window = EyeWindow {
             origin: (
-                roi[0] + bin[0] * (kept[0] + ahead.0 + window[0] / scale),
-                roi[1] + bin[1] * (kept[1] + ahead.1 + window[1] / scale),
+                roi[0] + bin[0] * (kept[0] + window[0] / scale),
+                roi[1] + bin[1] * (kept[1] + window[1] / scale),
             ),
             scale: (scale / bin[0], scale / bin[1]),
             rows_read: take.height as f64 / scale,
@@ -3238,10 +3234,10 @@ mod tests {
         let full = eye([0, 256, 8191, 7935], 1, [256, 0, 7680, 7680], [7680, 7680], 4000.000009472, "30716000", None);
         let w = placed(&take_of(Layout::Single { channel: 0 }), full, None).unwrap();
         assert_eq!((w[0].origin, w[0].scale, w[0]), ((256.0, 256.0), (1.0, 1.0), w[1]));
-        // 5504×5504: 7912 rows scaled by 16/23, and the last 7912 of the 7920 columns kept. No stated span: the rows read, a line apart.
+        // 5504×5504: 7912 rows scaled by 16/23, and the first 7912 of the 7920 columns kept. No stated span: the rows read, a line apart.
         let scaled = || eye([0, 128, 8191, 8063], 1, [136, 12, 7920, 7912], [5504, 5504], 4000.000055296001, "null", None);
         let w = placed(&take_of(Layout::PairedOf(frame_of(5504))), scaled(), Some(scaled())).unwrap();
-        assert!(close(w[0].origin.0, 144.0) && close(w[0].origin.1, 140.0) && close(w[0].scale.0, 16.0 / 23.0) && close(w[0].scale.1, 16.0 / 23.0), "{:?}", w[0]);
+        assert!(close(w[0].origin.0, 136.0) && close(w[0].origin.1, 140.0) && close(w[0].scale.0, 16.0 / 23.0) && close(w[0].scale.1, 16.0 / 23.0), "{:?}", w[0]);
         assert!(close(w[0].rows_read, 7912.0) && (w[0].first_to_last_row_ns() - 7911.0 * 4000.000055296001).abs() < 1.0);
         assert!(close(read_sensor_readout(&take_of(Layout::PairedOf(frame_of(5504)))).unwrap()[0].first_to_last_row_ns, w[0].first_to_last_row_ns()));
         // 4912×4912: the sensor's own pixels, the middle of it.
@@ -3269,11 +3265,11 @@ mod tests {
         assert!(close(w[0].origin.0, 136.0) && close(w[0].origin.1, 136.0) && close(w[0].scale.0, 16.0 / 22.0) && close(w[0].scale.1, 16.0 / 22.0), "{:?}", w[0]);
         assert!(close(w[0].rows_read, 7920.0) && (w[0].first_to_last_row_ns() - 7919.0 * 4000.000055296001).abs() < 1.0);
         // 6000×6000 scaled by 16/21 is 7875 pixels each way of a kept 7880:
-        // the last columns, the middle rows. The scale is the scaler's, not
-        // what 6000 rows of 7880 would give.
+        // its first columns and rows. The scale is the scaler's, not what
+        // 6000 rows of 7880 would give.
         let take = take_of(Layout::EyeRecords(EYE_FRAMES[1]));
         let w = placed(&take, scaled_eye([156, 28, 7880, 7880], 6000, 21), Some(scaled_eye([156, 28, 7880, 7880], 6000, 21))).unwrap();
-        assert!(close(w[0].origin.0, 161.0) && close(w[0].origin.1, 158.5) && close(w[0].scale.0, 16.0 / 21.0) && close(w[0].scale.1, 16.0 / 21.0), "{:?}", w[0]);
+        assert!(close(w[0].origin.0, 156.0) && close(w[0].origin.1, 156.0) && close(w[0].scale.0, 16.0 / 21.0) && close(w[0].scale.1, 16.0 / 21.0), "{:?}", w[0]);
         assert!(close(w[0].rows_read, 7875.0) && (w[0].first_to_last_row_ns() - 7874.0 * 4000.000055296001).abs() < 1.0);
         // A scaler that is off states no scale: the rows give it.
         let unscaled = scaled_eye([156, 28, 7880, 7880], 6000, 21).replace(r#""0x401":2"#, r#""0x401":0"#);
