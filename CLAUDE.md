@@ -4875,6 +4875,20 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       window is minimised: find the window by its title. `APPDATA` set to a
       scratch folder for the launch keeps the user's settings and session
       out of a test.
+    - **MAC SIDE PULLED IT (2026-11-24, Mac):** fast-forward `c4fd70a` →
+      `0f31051`: the four code commits of this item and the Windows notes
+      of items 47 and 48. It builds; tests braw 6, core 63, fisheye 85,
+      gui 64, pipeline 289 (the GPU ones not asked for). By reading,
+      nothing in the range runs differently on a Mac. The preset is set in
+      the `hevc_nvenc` arm of `encode.rs` alone, and `build_export_cfg`
+      names that encoder off macOS only. `activity.rs` gains the Windows
+      module and leaves the empty one to the systems that are neither; the
+      macOS module is untouched, and no other line inside a macOS-gated
+      item changed. A path on a Mac has no `Component::Prefix`, so
+      `relative_to` answers as before (its naming test here passes as it
+      was). The probe's longer wait is taken only where a seek lasts more
+      than two seconds. The stored export and preview sets were not run
+      for it.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
