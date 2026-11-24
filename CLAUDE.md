@@ -4889,6 +4889,38 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       was). The probe's longer wait is taken only where a seek lasts more
       than two seconds. The stored export and preview sets were not run
       for it.
+    - **THE MAC'S STORED SETS AT `79cefc2`, AND MADE AGAIN (2026-11-24,
+      Mac).** Run after that. Against the stored listings: of the 65
+      exports 56 have the checksums they had, the encoder arms of both
+      loops and the `.360` arms all of them, and of the 169 preview lines
+      149 print the same, every line of a clip that is not a raw take
+      among them. The 9 and the 20 that differ are developed raw takes.
+      The lists stored later differ the same way: a developed raw picture,
+      or a tone control that goes by the picture's levels (17 of the tone
+      stage's 19 exports; the two that are the same have exposure alone
+      and no control). Those are what item 39 and the raw work after it
+      changed on purpose (item 43 says the listings are to be made
+      again). They are this run's now, every changed list run twice with
+      the same lines.
+      Two lists are new, so every kind of source the app opens has stored
+      export and preview cases: Blackmagic RAW (one sensor, and two
+      tracks), QooCam 3 Ultra video, an X6 and a QooCam DNG still (PNG,
+      JPEG, linear DNG, a disc), raw takes of every later frame (5504, 4912,
+      3968, the five with a record for each eye, the two that carry a
+      white balance record) as a half-equirect, lens frames with and
+      without a crop mask, a disc, a reframed view, the portable loop,
+      ProRes, a second with missing pairs (30 frames written), the
+      camera's own DNGs of a stretch and a developed DNG frame: 43 export
+      lines and 59 preview lines, twice the same. In no list yet: joined
+      runs, AIVU, the spatial video of a reframed view, clips of several
+      segments, Ambisonic and APAC sound.
+      Known from this and left alone (the user's call): a QooCam 3 Ultra
+      frame cuts the lens's image circle, and a source that is not marked
+      as a crop repeats its rim past the recorded frame, so a stabilized
+      half-equirect or disc of it shows stretched bands at the edge while
+      the correction is large (about 15° in the sample's first second with
+      the default settings). None where the camera is steady, none
+      unstabilized, none in a lens frame, which is black there.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
