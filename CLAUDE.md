@@ -4671,6 +4671,75 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
         original sequence copies every file beside the capture, whatever it
         is. (4) The preview probe on a take of one pair ends "the worker
         ended before t = 0 s": the worker has shown its one frame and gone.
+    - **WINDOWS, ON THE CAMERA'S OWN TAKES (2026-11-24, Windows box, RTX
+      4090).** Pulled the placement correction (`c4fd70a`). It builds as
+      pushed; tests core 63, fisheye 85, braw 6, pipeline 299 of 300 with the
+      GPU ones (the one is the fingerprint tool), gui 66. No code was
+      changed for it.
+      - **What moved is the 5504 frame, by what the correction says.** The
+        61 exports of the A/B set are byte-identical per stream to the build
+        before, with the same 38 engagements of a fast arm, and the 36
+        preview-probe cases print the same lines. Of the stored exports of
+        the older raw frames, those of the 4912, 3968 and one-lens takes are
+        the same bytes; the 5504 take's picture lies 1.85 to 1.9 px to the
+        left at 1536 px an eye in the half-equirect and 1.2 px in its lens
+        frame, the two eyes within 0.01 px of each other, nothing up or down
+        (origin −88 where it was −80).
+      - **The nine takes of 2026-11-23, read.** All open. Pairs, missing
+        pairs and frames left out are the Mac's table's (540 pairs with 259
+        missing and 132 and 147 frames without a partner on the take that
+        lost a third; none missing on the first). Every 97th pair and the
+        last of each take (143 pairs of the seven takes of this layout):
+        the stamps are those of the take's own list, and both sensors'
+        samples, stamps and frame number are the reference reader's on the
+        same records (the camera side's two scalar unpackers compiled here,
+        2026-11-23, given the records' places in the file). A pair decodes
+        in 7 to 17 ms. The frames sit where the Mac measured them: 5760
+        scaled (136, 136), 6000 scaled (156, 156), the three at the sensor's
+        own pixels (1216, 1216), (1096, 1096) and (1792, 2112).
+      - **Camera original DNGs.** Four frames the Mac's app had written
+        beside the takes (5760 scaled and 6000 scaled, two takes of each),
+        written again here from the same pairs: both sensors' files are the
+        same bytes as the Mac's, eight of eight. A frame of each of the nine
+        takes: the frame's size, its tiles (24 of 240 or 250 rows; 16 of 248
+        for 4608 × 3968 and 3968²; the 3840 take's 24 of 160), its levels
+        (64 / 1023 at 10 bits, the 3840 take's 64 / 15408 at 14) and the
+        take's recorded neutral.
+      - **Exports** (`export_smoke`, 44 runs, none failed). Each of the nine
+        takes through the plane feed and NVENC over a second that has
+        missing pairs: one pts step in every file and the holes filled (18
+        pairs written as 30 frames on the take that lost a third, 22 as 30,
+        55 as 60 at 60 fps), stereo sound from the take's four channels,
+        read ahead and read in line the same bytes, nine of nine. libx265,
+        ProRes (`prores_ks_vulkan`), lens frame, lens frame with a crop
+        mask, reframed view, a graded development, 8192 × 4096. Vulkan
+        against D3D12 on three takes: signed difference 0.01 of 255, mean
+        |Δ| 0.7 to 0.8. The lens frame of a 6000² take at the recording's
+        own size is 13200 × 6600 with the stabilizer's margin (the size the
+        Mac writes): NVENC refuses it and libx265 takes over with the
+        export-bar note, 0.5 fps; ProRes stays on the GPU. Asked for 4096 an
+        eye, that lens frame is a reduced copy, 8192 × 4096 through NVENC. A
+        take developed for its own white ([0.410, 1, 0.623], "about 6350 K,
+        tint +32", the Mac's figure) against the reference white: R −21.6,
+        B +25.3 of 255; the two takes of the paired layout record a white
+        too and are developed for it.
+      - **Preview and the app.** The windowless preview worker on a take of
+        each signature (half-equirect with the zoom still, Lens Space, a
+        reframed view, unstabilized): every case draws, no warning. In the
+        app (a scratch app folder, the export folder set to one of its own):
+        a 6000² scaled take opens as "Insta360 X6 raw video" 6000 × 6000 at
+        29.970, with "17 in 16 places" in File info and the marks on the
+        timeline; the clip's statistics are sampled in 10 s. Play shows 12.7
+        frames a second: the wait for a frame is 77 to 94 ms, the share's
+        reading (the take holds 895 MB a second of both eyes; the share
+        gives 500 here), not the decode. Export all over two seconds: 8192 ×
+        4096 through NVENC, 60 frames from 55 pairs in 4.4 s; Shift+S writes
+        the frame's two DNGs; the kept pair list (its second form, 69 bytes
+        a pair) is read at the next launch.
+      - `examples/eye_take_make` (gitignored) starts a scaled frame where
+        the kept part starts now; the test takes of 2026-11-23 were made and
+        read by the rule of that day, so their agreement with their source
+        takes says nothing of the placement.
 
 48. **Items 36 to 46 on Windows (2026-11-21, Windows box, RTX 4090; on
     `main`).** Pulled `9fd483d` → `0251879` (31 commits). It builds as
