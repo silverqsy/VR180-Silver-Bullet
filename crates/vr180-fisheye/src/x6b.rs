@@ -138,6 +138,8 @@
 //! - `X6C6Q02\0`: 6000×6000 of the same, to within one code value.
 //! - `X6C9Q02\0`: 4608×3968 of the same at 60 fps, to within one code
 //!   value.
+//! - `X6F5Q02\0`: the frame of `X6F5O02`, stored to within one code value.
+//! - `X6C5Q02\0`: the frame of `X6C5O02`, stored to within one code value.
 //!
 //! "To within one code value": a symbol is the value itself up to 84,
 //! `84 + (value − 84 + 1) / 2` up to 895 and `value − 406` from 896, and
@@ -459,14 +461,21 @@ pub enum Profile {
     EyeNativeNear,
     /// The same at 4608×3968 and 60 fps, stored to within one code value.
     EyeWideNear,
+    /// The frame of [`Self::EyeScaled`], 5760×5760 of the whole view, stored
+    /// to within one code value.
+    EyeScaled5760Near,
+    /// The frame of [`Self::EyeNative`], 5760×5760 of the middle of the
+    /// sensor, stored to within one code value.
+    EyeNative5760Near,
 }
 
 impl Profile {
     /// A kept pair list names a profile by its place here: new ones go last.
-    pub const ALL: [Profile; 14] = [
+    pub const ALL: [Profile; 16] = [
         Self::Exact30, Self::Mid50, Self::Raised50, Self::Coarse60, Self::Raised60, Self::Single10, Self::Single10Split,
         Self::Frame10, Self::Frame14,
         Self::EyeScaled, Self::EyeScaledNear, Self::EyeNative, Self::EyeNativeNear, Self::EyeWideNear,
+        Self::EyeScaled5760Near, Self::EyeNative5760Near,
     ];
 
     /// The record signature.
@@ -486,6 +495,8 @@ impl Profile {
             Self::EyeNative => b"X6C5O02\0",
             Self::EyeNativeNear => b"X6C6Q02\0",
             Self::EyeWideNear => b"X6C9Q02\0",
+            Self::EyeScaled5760Near => b"X6F5Q02\0",
+            Self::EyeNative5760Near => b"X6C5Q02\0",
         }
     }
 
@@ -498,7 +509,9 @@ impl Profile {
             (Self::Single10 | Self::Single10Split, Layout::Single { .. }) => fps == 30,
             (Self::Frame10, Layout::PairedOf(frame)) => frame.bits == 10 && frame.rates().contains(&fps),
             (Self::Frame14, Layout::PairedOf(frame)) => frame.bits == 14 && frame.rates().contains(&fps),
-            (Self::EyeScaled | Self::EyeNative, Layout::EyeRecords(frame)) => frame == EYE_FRAMES[0] && fps == 30,
+            (Self::EyeScaled | Self::EyeNative | Self::EyeScaled5760Near | Self::EyeNative5760Near, Layout::EyeRecords(frame)) => {
+                frame == EYE_FRAMES[0] && fps == 30
+            }
             (Self::EyeScaledNear | Self::EyeNativeNear, Layout::EyeRecords(frame)) => frame == EYE_FRAMES[1] && fps == 30,
             (Self::EyeWideNear, Layout::EyeRecords(frame)) => frame == EYE_FRAMES[2] && fps == 60,
             _ => false,
@@ -518,6 +531,8 @@ impl Profile {
             Self::EyeNative => Some((61, EXACT)),
             Self::EyeNativeNear => Some((61, NEAR)),
             Self::EyeWideNear => Some((36, NEAR)),
+            Self::EyeScaled5760Near => Some((83, NEAR)),
+            Self::EyeNative5760Near => Some((61, NEAR)),
             _ => None,
         }
     }
@@ -561,13 +576,15 @@ impl Profile {
             Self::Single10 | Self::Single10Split | Self::Frame10 | Self::EyeScaled | Self::EyeNative => &[(0, 1, 1024)],
             Self::Frame14 => &[(0, 1, 1024), (1024, 16, 960)],
             // Every value up to 84 and from 896, every other one between them.
-            Self::EyeScaledNear | Self::EyeNativeNear | Self::EyeWideNear => &[(0, 1, 85), (86, 2, 405), (896, 1, 128)],
+            Self::EyeScaledNear | Self::EyeNativeNear | Self::EyeWideNear | Self::EyeScaled5760Near | Self::EyeNative5760Near => {
+                &[(0, 1, 85), (86, 2, 405), (896, 1, 128)]
+            }
         }
     }
 
     /// Symbol → sensor level, in symbol order.
     pub fn levels(self) -> &'static [u16] {
-        static TABLES: OnceLock<[Vec<u16>; 14]> = OnceLock::new();
+        static TABLES: OnceLock<[Vec<u16>; 16]> = OnceLock::new();
         let tables = TABLES.get_or_init(|| {
             Profile::ALL.map(|p| {
                 p.runs().iter()
@@ -3318,7 +3335,7 @@ mod tests {
         Format { layout: Layout::EyeRecords(frame), fps }
     }
 
-    /// The five signatures of a record for one eye, each with its frame and
+    /// The seven signatures of a record for one eye, each with its frame and
     /// frame rate; the values stored to within one code value.
     #[test]
     fn a_record_for_one_eye_has_its_signature_and_levels() {
@@ -3328,6 +3345,8 @@ mod tests {
             (b"X6F5O02\0", eyes_at(square, 30), Some(Profile::EyeScaled)), (b"X6C5O02\0", eyes_at(square, 30), Some(Profile::EyeNative)),
             (b"X6F6Q02\0", eyes_at(larger, 30), Some(Profile::EyeScaledNear)), (b"X6C6Q02\0", eyes_at(larger, 30), Some(Profile::EyeNativeNear)),
             (b"X6C9Q02\0", eyes_at(wide, 60), Some(Profile::EyeWideNear)),
+            (b"X6F5Q02\0", eyes_at(square, 30), Some(Profile::EyeScaled5760Near)), (b"X6C5Q02\0", eyes_at(square, 30), Some(Profile::EyeNative5760Near)),
+            (b"X6F5Q02\0", eyes_at(larger, 30), None), (b"X6C5Q02\0", eyes_at(square, 60), None), (b"X6C5Q02\0", eyes_at(wide, 60), None),
             (b"X6F5O02\0", eyes_at(larger, 30), None), (b"X6F6Q02\0", eyes_at(square, 30), None), (b"X6C9Q02\0", eyes_at(wide, 30), None),
             (b"X6C9Q02\0", eyes_at(square, 60), None), (b"X6F5O02\0", eyes_at(square, 60), None), (b"X6F5O03\0", eyes_at(square, 30), None),
             (b"X6F5O02\0", Format::paired(30), None), (b"X6D5B02\0", eyes_at(square, 30), None), (b"L1024___", eyes_at(square, 30), None),
@@ -3347,6 +3366,11 @@ mod tests {
         let near = Profile::EyeScaledNear.levels();
         assert_eq!((near.len(), near[84], near[85], near[86], near[489], near[490], near[617]), (618, 84, 86, 88, 894, 896, 1023));
         assert!(Profile::EyeNativeNear.levels() == near && Profile::EyeWideNear.levels() == near);
+        // The 5760 frames stored the same way: the same levels, and what a header of theirs states.
+        for (profile, exact) in [(Profile::EyeScaled5760Near, Profile::EyeScaled), (Profile::EyeNative5760Near, Profile::EyeNative)] {
+            assert!(profile.levels() == near && !profile.is_exact() && !profile.plain() && profile.split());
+            assert_eq!(profile.eye_record().map(|(mode, quantiser)| (Some(mode), quantiser)), Some((exact.eye_record().map(|e| e.0), [2, 84, 896])));
+        }
         for value in 0..1024u16 {
             let back = near[eye_symbol(Profile::EyeScaledNear, value) as usize];
             let exact = value <= 84 || value >= 896 || value % 2 == 0;
@@ -3354,7 +3378,8 @@ mod tests {
         }
         // The profiles a kept pair list already names keep their places.
         assert_eq!(Profile::ALL[7..9], [Profile::Frame10, Profile::Frame14]);
-        assert_eq!(Profile::ALL[9..], [Profile::EyeScaled, Profile::EyeScaledNear, Profile::EyeNative, Profile::EyeNativeNear, Profile::EyeWideNear]);
+        assert_eq!(Profile::ALL[9..14], [Profile::EyeScaled, Profile::EyeScaledNear, Profile::EyeNative, Profile::EyeNativeNear, Profile::EyeWideNear]);
+        assert_eq!(Profile::ALL[14..], [Profile::EyeScaled5760Near, Profile::EyeNative5760Near]);
     }
 
     /// A take with a record for each eye: the records lie in any order, one
@@ -3367,6 +3392,7 @@ mod tests {
         for (profile, frame, fps) in [
             (Profile::EyeScaled, EYE_FRAMES[0], 30u32), (Profile::EyeScaledNear, EYE_FRAMES[1], 30), (Profile::EyeNative, EYE_FRAMES[0], 30),
             (Profile::EyeNativeNear, EYE_FRAMES[1], 30), (Profile::EyeWideNear, EYE_FRAMES[2], 60),
+            (Profile::EyeScaled5760Near, EYE_FRAMES[0], 30), (Profile::EyeNative5760Near, EYE_FRAMES[0], 30),
         ] {
             let layout = Layout::EyeRecords(frame);
             let format = Format { layout, fps };

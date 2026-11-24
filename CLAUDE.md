@@ -4740,6 +4740,22 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
         the kept part starts now; the test takes of 2026-11-23 were made and
         read by the rule of that day, so their agreement with their source
         takes says nothing of the placement.
+      - **TWO MORE SIGNATURES (2026-11-24, Mac; UNRELEASED, after 2.6.0).**
+        A take may store the 5760² frame to within one code value as well,
+        the whole view or the middle of the sensor: two signatures 2.6.0
+        does not know, so it refuses such a take ("unsupported signature").
+        Their headers state what the 5760² frames with every value kept
+        state (the frame, its 180 stripes, the readout mode) and the
+        quantiser of the 6000² ones, nothing else differs:
+        `Profile::EyeScaled5760Near` and `Profile::EyeNative5760Near`, last
+        in `Profile::ALL` so that a kept pair list's places hold. Read on
+        three takes: the first, middle and last frame of each decode with
+        their checksums, hold no value the table cannot give, and the
+        counts of values run on where the step changes as they do in a
+        6000² take; the sensor windows come out as the 5760² takes' with
+        every value kept; a half-equirect of each and a lens frame export
+        through the release build. Not opened in the window on the Mac.
+        Nothing here is gated by platform; Windows has not built it.
 
 48. **Items 36 to 46 on Windows (2026-11-21, Windows box, RTX 4090; on
     `main`).** Pulled `9fd483d` → `0251879` (31 commits). It builds as

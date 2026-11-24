@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Insta360 X6: raw video
+
+- **A 5760 × 5760 frame stored to within one code value.** A take with a
+  record for each eye may store its 5760 × 5760 frames that way too, the
+  whole view or the middle of the sensor. 2.6.0 read that frame only with
+  every value kept, and refused such a take as one it did not know. It
+  opens now, like a take of 6000 × 6000.
+
 ## 2.6.0 — 2026-11-24
 
 ### Insta360 X6: raw video
