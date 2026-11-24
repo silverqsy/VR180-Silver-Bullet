@@ -21,6 +21,7 @@ One self-contained binary per platform, **macOS (Apple Silicon)** and
 | **[OSMO VR180 Mod][osmo]** — DJI Osmo 360 and Osmo 360 II | `.osv` | Per-lens factory calibration, IMU, rolling-shutter timing |
 | **Insta360 X6 VR180 Mod** | `.insv` | Factory lens model, ~1 kHz gyro, per-sensor exposure timing; the 8K, 7.4K and 10K recording modes and their Crop variants, told apart from the file |
 | **Insta360 X6 VR180 Mod** — stills | `.dng` | Factory lens model, gain maps, DNG colour tags → PNG / JPEG / **linear DNG** |
+| **Insta360 X6 VR180 Mod** — raw video | take folder | The two sensors' own Bayer frames, factory lens record, gyro and accelerometer, the sensor's row timing and each frame's shutter time; developed in the app, any frame or the whole clip also as **DNG** |
 | **[GoPro Max 2 VR180 Mod][gopro]** | `.360` | EAC dual-fisheye, gyro, firmware rolling-shutter auto-detect |
 | **Kandao QooCam 3 Ultra VR180 Mod** | `.mp4` | Factory lens record (the stitcher's own model), 1 kHz gyro, per-frame exposure, HLG |
 | **Kandao QooCam 3 Ultra VR180 Mod** — stills | `.dng` | Factory lens record, shading grids, DNG colour tags → PNG / JPEG / **linear DNG** |
@@ -62,6 +63,16 @@ Studio).
 - **Stills** (X6 and QooCam `.dng`): the raw stage (gain maps, demosaic) feeds the
   same fisheye projection; export a VR180 still as 16-bit PNG, JPEG, or a
   linear DNG that raw developers open as the camera's own raw.
+- **Raw video** (Insta360 X6 raw takes): a take opens as one clip, with
+  preview, stabilization and every output format, and is developed in the
+  app with a raw converter's controls: white balance, Exposure, Contrast,
+  Highlights, Shadows, Whites and Blacks, sharpening, colour noise
+  reduction, automatic exposure. The development is one for the whole
+  clip, so a frame is not rendered differently for what it happens to
+  hold. Any frame, or the whole clip, can be written as DNG: the projected
+  picture, or the two frames as the sensors recorded them. On macOS,
+  frames enhanced with Camera Raw's Super Resolution are used for exports
+  up to 16384×8192.
 - **Export**: hardware H.265 or ProRes 4:2:2, up to 8K (8192×4096), on a
   zero-copy GPU path (VideoToolbox on macOS, NVDEC → CUDA → NVENC on
   Windows). Audio is muxed inline — stereo, ambisonic, or APAC spatial on
