@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.6.0 — 2026-11-24
 
 ### Insta360 X6: raw video
 
@@ -300,8 +300,6 @@ converter's controls for it, and every frame can be had as a DNG.
   are sampled where the row starts, as before, which on a hand-held take
   leaves the 0.4 pixels above (0.06 with the 3 ms those takes turn out to
   need).
-- **What a take does not carry.** No white balance of its own: As shot is
-  the camera's reference white.
 
 ### Color: Exposure, Contrast, Highlights, Shadows, Whites and Blacks for every clip
 
@@ -358,7 +356,9 @@ the LUT, and not a curve laid over the picture the LUT left.
   are drawn, not from the whole half-sphere. Black outside the picture (a
   Crop mask, a lens frame's border) is lifted by Blacks above zero, as Lift
   lifts it. The Matching Eyes exposure trim acts after the stage.
-- Not yet run on Windows.
+- **Windows.** Checked there too (an NVIDIA RTX 4090): X6, Osmo 360 and
+  GoPro `.360` clips through the hardware and the software export paths
+  and as ProRes, 10 and 8 bit.
 
 ### Insta360 X6: dropped frames shown
 
