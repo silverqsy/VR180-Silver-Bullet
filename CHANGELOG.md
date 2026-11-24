@@ -254,8 +254,8 @@ converter's controls for it, and every frame can be had as a DNG.
   An 8192×4096 export runs at about 10 frames a second with tone and
   sharpening in use and 15 with the default development, through NVENC
   or as ProRes.
-- **Rolling shutter and the accelerometer.** Takes from the camera build
-  that records the sensor's row timing and the accelerometer use both.
+- **Rolling shutter and the accelerometer.** A take that records the
+  sensor's row timing and the accelerometer is stabilized with both.
   Each frame's pose is taken where its centre row starts exposing (the
   frame's stamp plus half the readout the take states: 14.6 ms at 30 and
   60 fps, 15.4 ms at 50), every row is corrected for its own time, top
@@ -264,8 +264,8 @@ converter's controls for it, and every frame can be had as a DNG.
   Measured on six hand-held takes against the picture itself: the readout
   the take states is the one the picture shows, and on the hardest of
   them the far-field shake of a locked export fell from 1.5 to 0.4 pixels
-  a frame at 1024 pixels an eye (2.6 without stabilization). Takes of the
-  earlier build have neither and stabilize as before.
+  a frame at 1024 pixels an eye (2.6 without stabilization). A take
+  without the two stabilizes as before.
 - **Auto align.** The View adjustment panel's Auto align works on raw
   takes: the two eyes' camera-linear frames are turned into a picture the
   matcher can read (white-balanced, lifted, on a display curve) and
@@ -291,11 +291,10 @@ converter's controls for it, and every frame can be had as a DNG.
   their contrast and a clear sky gets no banding. It costs about 0.3 s a
   frame pair.
 - **Shutter time.** A take that lists each frame's integration time
-  (`exposure.csv`, written by the camera build that follows the one
-  above) has its poses taken at the centre row's mid-exposure: half the
-  frame's own shutter time later than where the row starts. Its frames
-  are also timed by when the sensor read them out, which is even, and not
-  by when their exposures began, which moves with every change of
+  (`exposure.csv`) has its poses taken at the centre row's mid-exposure:
+  half the frame's own shutter time later than where the row starts. Its
+  frames are also timed by when the sensor read them out, which is even,
+  and not by when their exposures began, which moves with every change of
   shutter: a take whose shutter dropped from 16.4 to 7.9 ms in one step
   no longer reads as having lost a frame there. Takes without the list
   are sampled where the row starts, as before, which on a hand-held take
