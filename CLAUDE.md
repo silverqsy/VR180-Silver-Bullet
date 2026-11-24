@@ -4615,13 +4615,13 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
         eye of a real 3840 take into the frame's window of the sensor (per
         Bayer site, bilinear), packs the stripes with a packer written from
         the format's description, and writes the take around them: the
-        sensor record from the camera side's own mode files (the line period
-        set to the content's) and the Mac's three irregularities (the two
+        sensor record a take of that frame carries (the line period set to
+        the content's) and the Mac's three irregularities (the two
         sensors' records alternating, a frame of the second sensor before
         the first pair, one of the first sensor missing). The reader they
-        are held against is the camera side's: its two scalar unpackers
+        are held against is an independent one: two scalar unpackers
         compiled here as they are (x86-64, clang), inside a walk of the file
-        that makes its verifier's checks. All five signatures: every record
+        that makes a verifier's checks. All five signatures: every record
         passes; the first pair's samples are the packed ones for both
         readers; every pair of every take (15 pairs of the four 30 fps
         takes, 29 of the 60 fps one) has the same samples from the app's
@@ -4640,9 +4640,9 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
         first frame against its source take's, unstabilized at 1536 px an
         eye: the picture within 0.02 px, both eyes, all five (mean |Δ| 1.3
         to 1.9 of 255: the resampling and the 10-bit copy).
-      - **White balance.** The camera side's sample (one pair of a 3840
-        60 fps take with its white balance record): the record's bytes and
-        both eyes' decoded pixels have the hashes it states; set up as a
+      - **White balance.** A sample of one pair of a 3840 60 fps take with
+        its white balance record and the hashes of both: the record's bytes
+        and both eyes' decoded pixels have those hashes; set up as a
         take of one pair it is developed for neutral [0.6102, 1, 0.3932],
         "about 3465 K, tint +17" (against the reference neutral: R −5.1 of
         255), and its walls come out grey. A test take given that record:
@@ -4692,11 +4692,11 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
         last of each take (143 pairs of the seven takes of this layout):
         the stamps are those of the take's own list, and both sensors'
         samples, stamps and frame number are the reference reader's on the
-        same records (the camera side's two scalar unpackers compiled here,
-        2026-11-23, given the records' places in the file). A pair decodes
-        in 7 to 17 ms. The frames sit where the Mac measured them: 5760
-        scaled (136, 136), 6000 scaled (156, 156), the three at the sensor's
-        own pixels (1216, 1216), (1096, 1096) and (1792, 2112).
+        same records (the independent reader's two scalar unpackers compiled
+        here, 2026-11-23, given the records' places in the file). A pair
+        decodes in 7 to 17 ms. The frames sit where the Mac measured them:
+        5760 scaled (136, 136), 6000 scaled (156, 156), the three at the
+        sensor's own pixels (1216, 1216), (1096, 1096) and (1792, 2112).
       - **Camera original DNGs.** Four frames the Mac's app had written
         beside the takes (5760 scaled and 6000 scaled, two takes of each),
         written again here from the same pairs: both sensors' files are the
