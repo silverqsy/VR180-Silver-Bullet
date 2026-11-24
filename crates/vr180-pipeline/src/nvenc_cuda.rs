@@ -2,11 +2,10 @@
 //! VRAM and hand it to `hevc_nvenc` via CUDA, eliminating the CPU readback
 //! that otherwise caps 8K export.
 //!
-//! Adapted from slr-studio-neo's `interop.rs` (proven at the 8K NVENC ceiling)
-//! with one change forced by wgpu 29: that project shares an exportable Vulkan
-//! *buffer* (`buffer_from_raw`), but wgpu-hal 29 dropped Vulkan `buffer_from_raw`
-//! — so we share an exportable **linear image** via the surviving
-//! `texture_from_raw` instead (validated in `examples/vk_cuda_smoke.rs`).
+//! The frame is shared with CUDA as an exportable **linear image**
+//! (`texture_from_raw`) rather than as an exportable Vulkan *buffer*:
+//! wgpu-hal 29 dropped Vulkan `buffer_from_raw` (validated in
+//! `examples/vk_cuda_smoke.rs`).
 //!
 //! Two components:
 //! - [`CudaNvencEncoder`] — ffmpeg CUDA hwdevice + P010 hwframes pool +
@@ -243,10 +242,10 @@ impl CudaNvencEncoder {
                 ffmpeg::ffi::av_opt_set((*enc).priv_data, k.as_ptr(), v.as_ptr(), 0);
             };
             // p4 = NVENC's visually-transparent quality/speed sweet spot at 8K
-            // (slr-studio-neo's measured default; p5+ are slower for marginal
-            // quality, p1-p3 trade real quality for speed). The readback
-            // encoder takes the same value and the same three options below:
-            // a joined run's parts come through either (`encode::NVENC_PRESET`).
+            // (p5+ are slower for marginal quality, p1-p3 trade real quality
+            // for speed). The readback encoder takes the same value and the
+            // same three options below: a joined run's parts come through
+            // either (`encode::NVENC_PRESET`).
             set("preset", crate::encode::NVENC_PRESET);
             set("tune", "hq");
             set("rc", "vbr");

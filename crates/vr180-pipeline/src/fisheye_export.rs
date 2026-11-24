@@ -4461,9 +4461,8 @@ fn export_fisheye_osv_zerocopy_d3d11(
 // plane textures (wgpu/Vulkan) → copy into exportable linear images shared
 // with CUDA → intra-VRAM `cuMemcpy2DAsync` (DtoD) into NVENC's CUDA frame →
 // `hevc_nvenc`. Eliminates the ~24 ms/frame CPU readback that caps the
-// readback path at ~23 fps at 8K. Modeled on slr-studio-neo's proven
-// CUDA↔Vulkan interop, adapted for wgpu 29 (linear image via `texture_from_raw`
-// since wgpu-hal 29 dropped Vulkan `buffer_from_raw`).
+// readback path at ~23 fps at 8K. The CUDA↔Vulkan interop shares a linear
+// image (`texture_from_raw`): wgpu-hal 29 dropped Vulkan `buffer_from_raw`.
 //
 // Gated behind `VR180_GPU_RESIDENT`; NVENC + 10-bit + HalfEquirect only.
 // Single-threaded CUDA (the primary context is current on this thread);
