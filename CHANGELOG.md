@@ -13,16 +13,21 @@ frame with its number and its timing, the gyro log, the lens record and the
 sound beside it, the same development, stabilization and exports. There are
 three sizes to pick from.
 
-- **Lossless.** Every sample is kept as the camera recorded it. Most takes
-  come out a quarter to a third smaller (23 to 40 % on the takes measured);
-  a 14-bit take that keeps every value is noise for the most part and comes
-  out about an eighth smaller. Each sample is predicted from its
-  neighbours, and what is left of it is stored with the odds it has where
-  the picture is that restless. Before a frame is written it is read back
-  and compared with the take's, sample for sample; a copy of a whole take
-  exports to the same file as the take does. A frame of the copy is read in
-  about a quarter more time than the take's own (13 ms against 10.5 ms for
-  a pair of 5760 × 5760 on an M5 Max).
+- **Lossless.** Every sample of the picture is kept as the camera recorded
+  it. Most takes come out a quarter to two fifths smaller (23 to 42 % on
+  24 takes of every frame size, a third in the middle). A take that is
+  noise for the most part, shot at a high gain at night or holding every
+  value of fourteen bits, gains little, and the camera has packed some as
+  well as can be done: the copy looks at a few frames first, and where it
+  would not come out smaller none is made and the panel says so. Each
+  sample is predicted from its neighbours, and what is left of it is
+  stored with the odds it has where the picture is that restless. Before a
+  frame is written it is read back and compared with the frame it was made
+  from, sample for sample; the frames developed from a copy of a whole
+  take are the frames developed from the take, byte for byte, stabilized
+  or not. A frame of the copy is read in about a quarter more time than
+  the take's own (13 ms against 10.5 ms for a pair of 5760 × 5760 on an M5
+  Max).
 - **High quality** aims at 1 bit a pixel, where a take holds about 3: 13 to
   16 GB a minute for the frames the camera records. **Custom** takes any
   size from 0.5 to 1 bit a pixel. The panel shows what the copy comes to.
@@ -36,6 +41,18 @@ three sizes to pick from.
   they did, and a deep shadow lifted hard keeps a grain, a coarser one.
   Towards 0.5 bit lifted shadows turn to flat patches and fine texture
   softens. Saturated samples stay saturated, and none becomes one.
+- **The corners outside the image circle.** A frame that holds a lens's
+  whole view is larger than the lens's picture: its four corners, 13 to
+  16 % of its samples, lie outside the image circle, where no light of the
+  scene falls, only stray light and the sensor's noise. A copy of either
+  kind stores them as black. The circle is the lens's own: its centre from
+  the take's lens record, its radius measured on takes of three frame sizes
+  (the picture fades out 4050 to 4080 calibration pixels from the centre,
+  on both lenses alike; black begins a little past that). A lossless copy
+  of a 5504, 5760 or 6000 frame comes out 8 to 10 % smaller for it, a
+  lossy one 6 to 14 % smaller at the same setting; a 3840 frame gains 1 to
+  9 %, and a frame that is the middle of the sensor has no such corners.
+  The panel says how much of a frame they are before the copy is made.
 - **A stretch, or the whole take.** A trimmed take is copied from In to
   Out, or whole: leaving out what is not wanted of a take often saves more
   than the packing does. Before the copy is made the panel says how much
@@ -47,9 +64,9 @@ three sizes to pick from.
 - **What is kept.** Every picture stands alone: the copy seeks and plays
   like the take. The take is not touched, and a copy is made from a
   camera's take, never from another copy. A clip that is a copy says so
-  under its name: the bits a pixel it came to, or that every sample is
-  kept, and which frames of its take it holds when that is not all of
-  them.
+  under its name: the bits a pixel it came to, or that every sample of the
+  picture is kept, that its corners are black, and which frames of its
+  take it holds when that is not all of them.
 - **Going on with the copy.** Once a copy is written, **Use the copy** puts
   it in the take's place in the list with the take's settings (the trim
   moves with a copy of a stretch). Nothing is deleted. A copy goes on

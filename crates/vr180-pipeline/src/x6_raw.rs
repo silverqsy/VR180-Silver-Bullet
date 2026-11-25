@@ -685,6 +685,109 @@ pub fn lens_meta(take: &Take) -> Insta360Meta {
     }
 }
 
+/// How far from a lens's principal point its image reaches on the sensor,
+/// in the pixels of the factory calibration's frame, with room to spare.
+///
+/// The lens's picture does not fill a frame that holds its whole view: it
+/// fades out towards a rim, and past the rim no light of the scene falls,
+/// only stray light and the sensor's own noise. Measured on takes of three
+/// frame sizes (the brightest 16 × 16 block of every ring around the
+/// principal point, over frames spread through a take): the last ring that
+/// holds light ends 4048 to 4080 pixels out, on both lenses alike, where
+/// the lens model puts a ray of more than 110° from the axis. This is that,
+/// and a little over one percent more.
+pub const IMAGE_CIRCLE: f64 = 4128.0;
+
+/// The middle of a lens's half of the calibration's frame: where its
+/// principal point is taken to be when the take has no lens record.
+const SENSOR_MIDDLE: f64 = 3872.0;
+
+/// The part of a take's frames its lenses put a picture on: what lies
+/// within [`IMAGE_CIRCLE`] of each lens's principal point. A frame that
+/// holds the lens's whole view has four corners outside it; a frame that
+/// is the middle of the sensor has nothing outside.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PictureArea {
+    width: usize,
+    height: usize,
+    /// For each channel, each row's samples inside: `from..to`.
+    rows: Vec<Vec<(u32, u32)>>,
+    /// For each channel, its circle in the frame's own samples: the centre,
+    /// and how far it reaches across and down.
+    circles: Vec<[f64; 4]>,
+}
+
+impl PictureArea {
+    /// The area of the take's frames: each channel's lens through the place
+    /// the take states for its frame ([`lens_meta`]).
+    pub fn of(take: &Take) -> Self {
+        let (width, height) = (take.layout.width(), take.layout.height());
+        let meta = lens_meta(take);
+        let geom = meta.stream_geometry(width as u32, height as u32, X6ViewChoice::Auto);
+        let circles: Vec<[f64; 4]> = (0..take.layout.channels()).map(|channel| {
+            // Channel 0 is the lens string's second entry; a take of one lens has its one.
+            let entry = if meta.lenses.len() >= 2 { meta.lenses.get(1 - channel.min(1)) } else { meta.lenses.first() };
+            let (cx, cy) = match entry {
+                Some(entry) => geom.principal_point(entry),
+                None => ((SENSOR_MIDDLE - geom.origin_x) * geom.scale_x, (SENSOR_MIDDLE - geom.origin_y) * geom.scale_y),
+            };
+            [cx, cy, IMAGE_CIRCLE * geom.scale_x, IMAGE_CIRCLE * geom.scale_y]
+        }).collect();
+        Self::within(width, height, circles)
+    }
+
+    /// The area inside the given circles (centre, reach across, reach down;
+    /// one a channel) of frames `width` by `height`.
+    pub fn within(width: usize, height: usize, circles: Vec<[f64; 4]>) -> Self {
+        let rows = circles.iter().map(|&[cx, cy, rx, ry]| {
+            (0..height).map(|y| {
+                let dy = (y as f64 - cy) / ry.max(1e-9);
+                if dy.abs() >= 1.0 {
+                    return (0, 0);
+                }
+                let reach = rx * (1.0 - dy * dy).sqrt();
+                let from = (cx - reach).ceil().clamp(0.0, width as f64) as u32;
+                let to = ((cx + reach).floor() + 1.0).clamp(from as f64, width as f64) as u32;
+                (from, to)
+            }).collect()
+        }).collect();
+        Self { width, height, rows, circles }
+    }
+
+    /// Samples of one frame (all its channels) that lie outside.
+    pub fn outside(&self) -> usize {
+        self.rows.iter().flatten().map(|&(from, to)| self.width - (to - from) as usize).sum()
+    }
+
+    /// The same as a share of the frame's samples.
+    pub fn share_outside(&self) -> f64 {
+        self.outside() as f64 / (self.rows.len() * self.width * self.height).max(1) as f64
+    }
+
+    /// Each channel's circle in the frame's samples: the centre, and how
+    /// far it reaches across and down.
+    pub fn circles(&self) -> &[[f64; 4]] {
+        &self.circles
+    }
+
+    /// The sample at (`x`, `y`) of `channel` lies inside.
+    pub fn holds(&self, channel: usize, x: usize, y: usize) -> bool {
+        self.rows.get(channel).and_then(|rows| rows.get(y)).is_some_and(|&(from, to)| (from as usize..to as usize).contains(&x))
+    }
+
+    /// Set every sample outside to `value`, in a frame whose channels follow
+    /// one another.
+    pub fn blacken(&self, frame: &mut [u16], value: u16) {
+        let per = self.width * self.height;
+        for (rows, mosaic) in self.rows.iter().zip(frame.chunks_exact_mut(per)) {
+            for (&(from, to), row) in rows.iter().zip(mosaic.chunks_exact_mut(self.width)) {
+                row[..from as usize].fill(value);
+                row[to as usize..].fill(value);
+            }
+        }
+    }
+}
+
 /// How much later than a frame's content time its gyro samples are
 /// stamped, ms. A take states none: this is what the camera states in every
 /// one of its own video files (`gyro_timestamp`: the same on every body,
@@ -1589,6 +1692,53 @@ impl FisheyePairIter for X6RawIter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The part of a frame a lens puts a picture on: a circle around its
+    /// principal point, cut by the frame where the frame is the smaller.
+    #[test]
+    fn the_picture_area_is_the_lens_circle_within_the_frame() {
+        // A circle well inside a frame: what lies outside it is the frame less the disc.
+        let area = PictureArea::within(400, 300, vec![[200.0, 150.0, 100.0, 100.0]]);
+        let disc = std::f64::consts::PI * 100.0 * 100.0;
+        assert!((area.outside() as f64 - (400.0 * 300.0 - disc)).abs() < 300.0, "{}", area.outside());
+        assert!(area.holds(0, 200, 150) && area.holds(0, 101, 150) && area.holds(0, 299, 150) && area.holds(0, 200, 51));
+        assert!(!area.holds(0, 99, 150) && !area.holds(0, 301, 150) && !area.holds(0, 200, 49) && !area.holds(0, 0, 0) && !area.holds(0, 280, 230));
+        assert!(!area.holds(1, 200, 150) && !area.holds(0, 200, 300));
+        // A frame that holds a lens's whole view, scaled: the circle is cut on all four sides and only the corners
+        // lie outside (the two channels' centres apart, as two lenses' are).
+        let whole = PictureArea::within(6000, 6000, vec![[3007.5, 3006.3, 3145.1, 3145.1], [2992.5, 3008.1, 3145.1, 3145.1]]);
+        assert!((whole.share_outside() - 0.157).abs() < 0.002, "{}", whole.share_outside());
+        assert!(whole.holds(0, 0, 3000) && whole.holds(0, 5999, 3000) && whole.holds(1, 3000, 0) && whole.holds(1, 3000, 5999));
+        assert!(!whole.holds(0, 0, 0) && !whole.holds(1, 5999, 5999) && !whole.holds(0, 700, 700) && whole.holds(0, 900, 900));
+        // The middle of the sensor at its own pixels: nothing outside.
+        let middle = PictureArea::within(3968, 3968, vec![[1990.0, 1980.0, IMAGE_CIRCLE, IMAGE_CIRCLE]; 2]);
+        assert_eq!((middle.outside(), middle.share_outside()), (0, 0.0));
+        // Pixels that are wider than tall: the circle is an ellipse in the frame.
+        let wide = PictureArea::within(400, 300, vec![[200.0, 150.0, 150.0, 75.0]]);
+        assert!(wide.holds(0, 60, 150) && !wide.holds(0, 40, 150) && wide.holds(0, 200, 80) && !wide.holds(0, 200, 70));
+        assert_eq!(wide.circles(), &[[200.0, 150.0, 150.0, 75.0]]);
+    }
+
+    /// What lies outside is set to one value, the channels one after the
+    /// other, and nothing inside is touched.
+    #[test]
+    fn the_corners_are_set_to_black() {
+        let area = PictureArea::within(8, 6, vec![[3.5, 2.5, 3.0, 3.0], [100.0, 100.0, 1.0, 1.0]]);
+        let mut frame: Vec<u16> = (0..96).map(|v| 1000 + v as u16).collect();
+        let before = frame.clone();
+        area.blacken(&mut frame, 64);
+        for channel in 0..2 {
+            for y in 0..6 {
+                for x in 0..8 {
+                    let at = channel * 48 + y * 8 + x;
+                    assert_eq!(frame[at], if area.holds(channel, x, y) { before[at] } else { 64 }, "channel {channel} ({x}, {y})");
+                }
+            }
+        }
+        // The first channel keeps its middle, the second lies wholly outside its circle.
+        assert!(frame[..48].iter().any(|v| *v != 64) && frame[..48].iter().any(|v| *v == 64) && frame[48..].iter().all(|v| *v == 64));
+        assert_eq!(area.outside(), frame.iter().filter(|v| **v == 64).count());
+    }
 
     const SAMPLES: &str = "/Volumes/Database/x6/1115 raw video";
 

@@ -5162,6 +5162,73 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       stretch still goes to a new folder (` (2)`), which the lookup of
       enhanced frames does not read.
 
+51. **An archive copy stores the corners outside the image circle as black
+    (2026-11-25, Mac; UNRELEASED).** The user asked whether the black
+    outside the image circle was used to make a copy smaller (it was not),
+    expected a large cut, and on being shown the figures said to build it,
+    without a check of each frame: light that falls out there is stray
+    light, all the more reason to cut it.
+    - **Where the picture ends** (scratch modes `--edge`, `--corners`,
+      `--both` of `examples/raw_pack_bench.rs`). Around each lens's
+      principal point (the factory lens record through the frame's stated
+      place), the brightest 16 × 16 block of every ring over 16 frames of a
+      take: the picture fades from about 3900 calibration pixels out and the
+      last ring that holds light ends at 4048 to 4080, the same on seven
+      takes of three frame sizes and on both lenses (the lens model puts 105°
+      at 3936 to 3947 and 110° at 4001 to 4011). All of them are one body's:
+      the spread between bodies is not known. `x6_raw::IMAGE_CIRCLE` = 4128.
+      A frame that holds the whole view is CUT by the image circle's own
+      extent on all four sides, so what lies outside is four corners: 16.3 %
+      of a 5760 frame's samples, 15.7 % of a 6000 one, 16.2 % of a 5504 one,
+      13.2 % of a 3840 one, nothing of a frame that is the middle of the
+      sensor. (A first try, a circle fitted to the lit rows and columns,
+      gave 20 to 30 %: wrong, the lit part of a frame is not centred on the
+      lens.) At night and a high gain the corners are not black but glow by
+      a few codes: one more reason not to test them.
+    - **What is done** (`x6_raw::PictureArea`, `raw_archive::archive_take`):
+      each channel's circle from `lens_meta` (a take without a lens record:
+      the middle of the sensor half), a row table of what lies inside, and
+      `blacken` before a frame is coded, in both kinds of copy. Black is the
+      first value a sample of the take can have that is not below its black
+      level (`black_among`: a value outside the take's list would cost a
+      lossless frame its compact coding). A lossy copy finds its noise and
+      its encoder setting on the frames as recorded, corners in, so the
+      picture is as near the take as before and the file smaller by what
+      the corners cost. `ArchiveOptions::whole_frame` keeps the corners (no
+      control for it: tests and measurements). The note in `clip.json` says
+      it (`outside_image_circle`: the value, the share, the radius, each
+      channel's circle; `ArchiveNote::outside_black`), the panel says how
+      much of a frame the corners are before a copy is made
+      (`take_corners_note`, `TakeFacts::outside`), a clip that is such a
+      copy says "corners black", and *Lossless* now reads "every sample of
+      the picture kept".
+    - **Measured** (M5 Max). Lossless: 2.171 to 1.967 bits a pixel for the
+      5760 take (9.4 % smaller: 38.7 % below the take, was 32.3), 1.997 to
+      1.804 for the 6000 one (9.7 %), 2.047 to 2.031 for a 3840 60 fps one
+      (0.8 %: the camera's own processing leaves those corners nearly flat).
+      Lossy at one setting: 0.958 to 0.902 (5.8 %), 0.990 to 0.848 (14.4 %),
+      1.029 to 1.028. Over 24 takes of every frame size at hand, six frames
+      each: 22.9 to 41.9 % below the take (the whole frame: 21.0 to 35.7),
+      a third in the middle; the corners alone 0.8 to 9.9 % where a frame
+      has any.
+    - **A take that is noise is not copied losslessly.** The sweep found a
+      night take of 7.65 bits a pixel whose copy came to 8.14: the coder's
+      three-sample prediction adds noise of its own to noise, and the
+      camera's packing is near what such data allows. The writer now codes
+      `LOOKED_AT` frames first and makes no copy where they come out no
+      smaller than their records (`NOT_SMALLER`; said under the button, in
+      Chinese too: `take_failed_text`). A predictor that does not amplify
+      noise would be the cure: not written.
+    - **Checked.** The area's own tests; the real-take test (inside the
+      circle every sample is the take's, outside all of one value; the
+      whole-frame copy every sample, and larger) on the three takes and
+      through the sweep; **the frames developed from two whole takes and
+      from their copies with black corners (a 5504 take of 741 pairs, a
+      3840 one of 178) are the same files byte for byte, stabilized or
+      not** (the video files are no test of that: two exports of ONE take
+      differ in their video packets, the hardware encoder is not repeatable
+      from run to run). Not seen in the window; nothing on Windows.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

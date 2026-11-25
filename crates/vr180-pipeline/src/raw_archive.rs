@@ -26,6 +26,11 @@
 //!    found before the copy starts as the one at which a few of the take's
 //!    frames come to the bits a pixel asked for ([`archive_take`]).
 //!
+//! Either kind of copy stores the corners of a frame that lie outside the
+//! lens's image circle as black ([`x6_raw::PictureArea`]): no light of the
+//! scene falls there, only stray light and the sensor's noise, which cost a
+//! copy a tenth of its size for nothing a picture is made of.
+//!
 //! The container is [`vr180_fisheye::x6b`]'s (a record a pair, the files
 //! beside the capture copied as they are); this module makes the pictures
 //! and reads them back.
@@ -827,6 +832,9 @@ pub struct ArchiveOptions {
     /// The encoder to write the pictures with; `None`: the first of
     /// [`PictureEncoder::ALL`] that opens.
     pub encoder: Option<PictureEncoder>,
+    /// The samples outside the lens's image circle are kept as the camera
+    /// recorded them (`false`: they are stored as black).
+    pub whole_frame: bool,
 }
 
 /// The fewest and the most bits a pixel a lossy copy may be asked to hold:
@@ -837,8 +845,14 @@ pub const BITS_MOST: f64 = 1.0;
 
 impl Default for ArchiveOptions {
     fn default() -> Self {
-        Self { bits_per_pixel: Some(BITS_MOST), encoder: None }
+        Self { bits_per_pixel: Some(BITS_MOST), encoder: None, whole_frame: false }
     }
+}
+
+/// The value the samples outside the image circle are stored as: the first
+/// of `values` (what a sample can be, rising) that is not below `black`.
+fn black_among(values: &[u16], black: u16) -> u16 {
+    values.get(values.partition_point(|v| *v < black)).or(values.last()).copied().unwrap_or(black)
 }
 
 /// What an archive copy came to.
@@ -852,8 +866,12 @@ pub struct ArchiveReport {
     /// Bits a pixel of the copy, and of those pairs in the take.
     pub bits_per_pixel: f64,
     pub source_bits_per_pixel: f64,
-    /// Every sample of the copy is the take's.
+    /// Every sample of the copy is the take's (where the lens puts a
+    /// picture: see `outside`).
     pub exact: bool,
+    /// The share of a frame's samples that lie outside the lens's image
+    /// circle and are stored as black (0: none).
+    pub outside: f64,
     /// What wrote the pictures.
     pub encoder: &'static str,
     /// The encoder's own quality setting.
@@ -869,9 +887,13 @@ pub struct ArchiveReport {
     pub seconds: f64,
 }
 
-/// Frames looked at before the copy starts: for the noise, and for the
-/// encoder's setting.
+/// Frames looked at before the copy starts: for the noise and the encoder's
+/// setting of a lossy copy, and for whether a copy that keeps every sample
+/// would be smaller than the take at all.
 const LOOKED_AT: usize = 3;
+
+/// What the error says when it would not: no copy is made then.
+pub const NOT_SMALLER: &str = "a copy that keeps every sample would not be smaller than this take";
 
 /// The pictures of one channel of a pair, coded: its four planes through
 /// `encoder`. Returns nothing; the pictures come out of the encoder later.
@@ -972,6 +994,9 @@ pub fn archive_take(
         x6_raw::decode_pair(&mut file, &index.pairs[i], take.format(), Channels::Both, &mut record, out, 0)
     };
     let count = frames.len();
+    // The part of the frames a lens puts a picture on, where that is not all of them: the rest is stored as black.
+    let area = Some(x6_raw::PictureArea::of(take)).filter(|area| !options.whole_frame && area.outside() > 0);
+    let mut stored_as = None;
 
     let lossy = match options.bits_per_pixel {
         None => None,
@@ -1015,6 +1040,13 @@ pub fn archive_take(
                 }
             }
             let Some((kind, quality)) = opened else { return Err(err(format!("no encoder writes the pictures ({why})"))) };
+            // (The noise and the encoder's setting are found on the frames as the camera recorded them: a copy is as
+            // near its take where the picture is as it would be with the corners in it, and smaller by what they cost.)
+            if let Some(area) = &area {
+                let black = black_among(&values, take.black_level);
+                looked.iter_mut().for_each(|frame| area.blacken(frame, black));
+                stored_as = Some(black);
+            }
             Some(Lossy { target, places, looked, noise, curve, kind, quality })
         }
     };
@@ -1065,6 +1097,9 @@ pub fn archive_take(
                     return Err(err("stopped"));
                 }
                 decode(i, &mut frame)?;
+                if let (Some(area), Some(black)) = (&area, stored_as) {
+                    area.blacken(&mut frame, black);
+                }
                 let entry = &index.pairs[i];
                 source_bytes += entry.len + entry.other.map_or(0, |(_, len)| len);
                 // The channels' pictures are made side by side.
@@ -1091,28 +1126,30 @@ pub fn archive_take(
             Ok((bytes, source_bytes))
         })(),
         None => (|| -> Result<(u64, u64)> {
-            let mut out = std::io::BufWriter::with_capacity(1 << 22, File::create(&capture)?);
-            let (mut bytes, mut source_bytes) = (0u64, 0u64);
             let (mut frame, mut back) = (Vec::new(), vec![0u16; layout.samples()]);
             // The values a frame's samples can have go by the kind of record it was read from, and by
             // the power of two that all of the frame's are a multiple of (a take of ten bits to a sample
             // in a record of fourteen has every sixteenth value and none between).
-            let mut known: Option<((Profile, u32), Numbers)> = None;
+            let mut known: Option<((Profile, u32), Numbers, u16)> = None;
             let mut told = false;
-            for i in frames.clone() {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(err("stopped"));
-                }
+            let mut black = None;
+            // Frame `i` of the take as a record of the copy, read back as the frame it was made from.
+            let mut record_of = |i: usize| -> Result<Vec<u8>> {
                 decode(i, &mut frame)?;
                 let entry = &index.pairs[i];
-                source_bytes += entry.len + entry.other.map_or(0, |(_, len)| len);
                 let step = frame.iter().fold(0u16, |all, v| all | v).trailing_zeros().min(15);
-                if known.as_ref().map(|(kind, _)| *kind) != Some((entry.profile, step)) {
+                if known.as_ref().map(|(kind, _, _)| *kind) != Some((entry.profile, step)) {
                     let all = entry.profile.sample_values();
                     let stepped: Vec<u16> = all.iter().copied().filter(|v| v.trailing_zeros() >= step).collect();
-                    known = Some(((entry.profile, step), Numbers::of(if stepped.is_empty() { &all } else { &stepped })));
+                    let values = if stepped.is_empty() { &all } else { &stepped };
+                    known = Some(((entry.profile, step), Numbers::of(values), black_among(values, take.black_level)));
                 }
-                let listed = known.as_ref().map(|(_, numbers)| numbers).filter(|n| !n.is_empty() && n.runs().len() <= x6b::ARCHIVE_RUNS_MOST);
+                // The corners outside the image circle: black, as one of the values the frame's samples can have.
+                if let (Some(area), Some((_, _, value))) = (&area, &known) {
+                    area.blacken(&mut frame, *value);
+                    black = Some(*value);
+                }
+                let listed = known.as_ref().map(|(_, numbers, _)| numbers).filter(|n| !n.is_empty() && n.runs().len() <= x6b::ARCHIVE_RUNS_MOST);
                 let code = |numbers: &Numbers| -> Result<Vec<Vec<u8>>> {
                     let mut pictures = Vec::with_capacity(channels * ARCHIVE_PICTURES);
                     for mosaic in frame.chunks_exact(per) {
@@ -1138,11 +1175,38 @@ pub fn archive_take(
                 if back != frame {
                     return Err(err(format!("request {} did not read back as the frame it was made from", entry.request)));
                 }
+                Ok(record)
+            };
+            let length_in_take = |i: usize| index.pairs[i].len + index.pairs[i].other.map_or(0, |(_, len)| len);
+            // A take that is noise for the most part is packed by the camera about as well as it can be: where a few
+            // of its frames, spread over the stretch, come out no smaller than their records, no copy is made of it.
+            let looked = LOOKED_AT.min(count);
+            let (mut would, mut theirs) = (0u64, 0u64);
+            for k in 0..looked {
+                let i = frames.start + (2 * k + 1) * count / (2 * looked);
+                would += record_of(i)?.len() as u64;
+                theirs += length_in_take(i);
+            }
+            if would >= theirs {
+                let bits = |bytes: u64| bytes as f64 * 8.0 / (looked * layout.samples()) as f64;
+                return Err(err(format!(
+                    "{NOT_SMALLER} ({:.2} against {:.2} bits a pixel on {looked} of its frames): its frames are noise for the most part, which the camera packs about as well as can be done. A lossy copy is smaller",
+                    bits(would), bits(theirs))));
+            }
+            let mut out = std::io::BufWriter::with_capacity(1 << 22, File::create(&capture)?);
+            let (mut bytes, mut source_bytes) = (0u64, 0u64);
+            for i in frames.clone() {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(err("stopped"));
+                }
+                let record = record_of(i)?;
+                source_bytes += length_in_take(i);
                 out.write_all(&record)?;
                 bytes += record.len() as u64;
                 progress((i + 1 - frames.start) as f32 / count as f32 * 0.98);
             }
             out.flush()?;
+            stored_as = black;
             Ok((bytes, source_bytes))
         })(),
     };
@@ -1221,6 +1285,17 @@ pub fn archive_take(
         note.insert("error_rms".into(), thousandth(error_rms).into());
         note.insert("error_in_codes".into(), thousandth(error_in_codes).into());
     }
+    let outside = area.as_ref().map_or(0.0, |area| area.share_outside());
+    if let (Some(area), Some(note)) = (&area, note.as_object_mut()) {
+        // What lies outside the lens's image circle, and where that circle is in a channel's frame
+        // (the centre, and how far it reaches across and down).
+        note.insert("outside_image_circle".into(), serde_json::json!({
+            "stored_as": stored_as,
+            "share": thousandth(outside),
+            "radius": x6_raw::IMAGE_CIRCLE,
+            "circles": area.circles().iter().map(|circle| circle.map(|v| (v * 10.0).round() / 10.0)).collect::<Vec<_>>(),
+        }));
+    }
     if let Some(object) = clip.as_object_mut() {
         object.insert("archive".into(), note);
     }
@@ -1242,20 +1317,21 @@ pub fn archive_take(
     std::fs::write(dir.join(x6b::SEAL_FILE), serde_json::to_vec_pretty(&seal).map_err(err)?)?;
     progress(1.0);
     let seconds = started.elapsed().as_secs_f64();
-    let sizes = format!("{count} frames, {:.2} GB to {:.2} GB ({source_bits:.2} to {bits:.2} bits a pixel)", source_bytes as f64 / 1e9, bytes as f64 / 1e9);
+    let sizes = format!("{count} frames, {:.2} GB to {:.2} GB ({source_bits:.2} to {bits:.2} bits a pixel{})", source_bytes as f64 / 1e9, bytes as f64 / 1e9,
+        if outside > 0.0 { format!("; the {:.1} % of a frame outside the image circle stored as black", outside * 100.0) } else { String::new() });
     let report = match &lossy {
         Some(Lossy { noise, kind, quality, .. }) => {
             tracing::info!("archive copy of {}: {sizes} through {} at {:.2}, {error_rms:.2} values rms from the take ({error_in_codes:.2} codes), {seconds:.1} s",
                 take.dir.display(), kind.name(), kind.setting(*quality));
             ArchiveReport {
-                pairs: count, source_bytes, bytes, bits_per_pixel: bits, source_bits_per_pixel: source_bits, exact: false,
+                pairs: count, source_bytes, bytes, bits_per_pixel: bits, source_bits_per_pixel: source_bits, exact: false, outside,
                 encoder: kind.name(), setting: kind.setting(*quality), noise: *noise, error_rms, error_in_codes, seconds,
             }
         }
         None => {
             tracing::info!("archive copy of {}: {sizes}, every sample kept and every record read back, {seconds:.1} s", take.dir.display());
             ArchiveReport {
-                pairs: count, source_bytes, bytes, bits_per_pixel: bits, source_bits_per_pixel: source_bits, exact: true,
+                pairs: count, source_bytes, bytes, bits_per_pixel: bits, source_bits_per_pixel: source_bits, exact: true, outside,
                 encoder: "exact", setting: 0.0, noise: (0.0, 0.0), error_rms: 0.0, error_in_codes: 0.0, seconds,
             }
         }
@@ -1275,7 +1351,7 @@ pub fn export_archive(
     let frames = crate::sensor_dng::frames_in(&index, t_in, t_out);
     let total = frames.len() as u64;
     let started = std::time::Instant::now();
-    archive_take(source, dir, frames, &ArchiveOptions { bits_per_pixel, encoder: None }, |done| {
+    archive_take(source, dir, frames, &ArchiveOptions { bits_per_pixel, ..Default::default() }, |done| {
         let frame = ((done as f64 * total as f64).round() as u64).min(total);
         progress(crate::fisheye_export::ExportProgress {
             frame_idx: frame, total_frames: total, fps_avg: frame as f32 / started.elapsed().as_secs_f32().max(1e-3),
@@ -1426,10 +1502,24 @@ mod tests {
         assert!(decode_record(&record, layout, Channels::Both, &mut back[1..], 0).is_err());
     }
 
+    /// The corners are stored as black, which has to be a value the take's
+    /// samples can have.
+    #[test]
+    fn black_is_one_of_the_takes_values() {
+        assert_eq!(black_among(&[0, 16, 32, 64, 80], 64), 64);
+        // Between two of them: the one above, so that nothing lies below black.
+        assert_eq!(black_among(&[0, 48, 96, 144], 64), 96);
+        assert_eq!(black_among(&[0, 16, 32], 64), 32);
+        assert_eq!(black_among(&[], 64), 64);
+        assert!(!ArchiveOptions::default().whole_frame);
+    }
+
     /// A copy that keeps every sample of a stretch of a take on disk
     /// (`VR180_ARCHIVE_TAKE=<its folder>`): smaller than the take, every
-    /// sample of every frame of it is the take's, and it says which stretch
-    /// of the take it holds.
+    /// sample of every frame of it is the take's where the lens puts a
+    /// picture and black in the corners outside the image circle, and it
+    /// says which stretch of the take it holds. Asked to keep the whole
+    /// frame, it keeps the corners as they were recorded, and is larger.
     #[test]
     fn a_copy_that_keeps_every_sample_is_the_take() {
         let Some(take) = std::env::var_os("VR180_ARCHIVE_TAKE").map(std::path::PathBuf::from) else { return };
@@ -1439,11 +1529,22 @@ mod tests {
         let first = 2.min(index.frames().saturating_sub(1));
         let frames = first..index.frames().min(first + 6);
         let never = AtomicBool::new(false);
-        let report = archive_take(&take, &dir, frames.clone(), &ArchiveOptions { bits_per_pixel: None, encoder: None }, |_| {}, &never).unwrap();
+        let report = match archive_take(&take, &dir, frames.clone(), &ArchiveOptions { bits_per_pixel: None, ..Default::default() }, |_| {}, &never) {
+            Ok(report) => report,
+            // A take that is noise for the most part: no copy of it would be smaller, and none is left behind.
+            Err(e) => {
+                println!("{e}");
+                assert!(e.to_string().contains(NOT_SMALLER), "{e}");
+                assert!(!dir.exists());
+                return;
+            }
+        };
         println!("{report:?}");
         assert!(report.exact && report.pairs == frames.len() && report.error_rms == 0.0);
-        // (A third smaller for most takes; one of fourteen bits with every value kept is noise for the most part, and an eighth smaller.)
-        assert!(report.bits_per_pixel < 0.92 * report.source_bits_per_pixel, "{report:?}");
+        let area = x6_raw::PictureArea::of(&index.take);
+        assert_eq!(report.outside, if area.outside() > 0 { area.share_outside() } else { 0.0 });
+        // (A quarter to a half smaller for most takes; one that is noise for the most part gains little.)
+        assert!(report.bits_per_pixel < report.source_bits_per_pixel, "{report:?}");
         let copy = x6_raw::open(&dir).unwrap();
         assert_eq!((copy.frames(), copy.take.layout, copy.take.fps_setting), (frames.len(), index.take.layout, index.take.fps_setting));
         assert_eq!(copy.shutter_ns, index.shutter_ns[frames.clone()]);
@@ -1453,22 +1554,59 @@ mod tests {
         assert_eq!((note.pairs, note.pairs_of_source, note.first_pair), (Some(frames.len() as u64), Some(index.frames() as u64), Some(first as u64)));
         assert_eq!(note.stretch(), (frames.len() < index.frames()).then_some((first as u64, frames.len() as u64, index.frames() as u64)));
         assert!((note.first_pair_s.unwrap() - index.pts_s(first)).abs() < 1e-6, "{note:?}");
+        // What lies outside the image circle is said to be black, with its share of a frame.
+        assert_eq!(note.outside_black.is_some(), area.outside() > 0, "{note:?}");
+        assert!(note.outside_black.map_or(true, |share| (share - area.share_outside()).abs() < 0.001), "{note:?}");
         let layout = index.take.layout;
         let (mut record, mut theirs, mut ours) = (Vec::new(), vec![0u16; layout.samples()], vec![1u16; layout.samples()]);
         let (mut source, mut copied) = (File::open(index.take.capture_path()).unwrap(), File::open(copy.take.capture_path()).unwrap());
+        // The value the corners are stored as: black, as one of the values a sample of the take can have.
+        let black = (0..layout.width()).find(|&x| !area.holds(0, x, 0)).map(|x| {
+            x6_raw::decode_pair(&mut copied, &copy.pairs[0], copy.take.format(), Channels::Both, &mut record, &mut ours, 0).unwrap();
+            ours[x]
+        });
+        assert!(black.map_or(true, |b| b >= index.take.black_level && b - index.take.black_level < 64), "{black:?} for black {}", index.take.black_level);
         for i in frames.clone() {
             x6_raw::decode_pair(&mut source, &index.pairs[i], index.take.format(), Channels::Both, &mut record, &mut theirs, 0).unwrap();
             x6_raw::decode_pair(&mut copied, &copy.pairs[i - first], copy.take.format(), Channels::Both, &mut record, &mut ours, 0).unwrap();
-            assert!(theirs == ours, "frame {i} of the copy is not the take's");
+            if let Some(black) = black {
+                area.blacken(&mut theirs, black);
+            }
+            assert!(theirs == ours, "frame {i} of the copy is not the take's inside the image circle and black outside");
         }
         if layout.channels() == 2 {
             let mut one = vec![3u16; layout.samples()];
             x6_raw::decode_pair(&mut copied, &copy.pairs[0], copy.take.format(), Channels::One(0), &mut record, &mut one, 2).unwrap();
             x6_raw::decode_pair(&mut source, &index.pairs[first], index.take.format(), Channels::Both, &mut record, &mut theirs, 0).unwrap();
+            if let Some(black) = black {
+                area.blacken(&mut theirs, black);
+            }
             assert!(one[..layout.eye_samples()] == theirs[..layout.eye_samples()] && one[layout.eye_samples()..].iter().all(|v| *v == 3));
         }
         // A copy is not made of a copy, of whichever kind.
         assert!(archive_take(&dir, &dir.with_extension("again"), 0..2, &ArchiveOptions::default(), |_| {}, &never).unwrap_err().to_string().contains("already"));
+
+        // The whole frame, corners and all: every sample is the take's, and the copy is the larger for it.
+        let whole_dir = dir.with_extension("whole");
+        let _ = std::fs::remove_dir_all(&whole_dir);
+        let whole = archive_take(&take, &whole_dir, frames.clone(), &ArchiveOptions { bits_per_pixel: None, whole_frame: true, ..Default::default() }, |_| {}, &never).unwrap();
+        println!("the whole frame: {whole:?}");
+        assert!(whole.exact && whole.outside == 0.0);
+        assert!(x6_raw::archive_note(&whole_dir).is_some_and(|n| n.exact && n.outside_black.is_none()));
+        let kept = x6_raw::open(&whole_dir).unwrap();
+        let mut copied = File::open(kept.take.capture_path()).unwrap();
+        for i in frames.clone() {
+            x6_raw::decode_pair(&mut source, &index.pairs[i], index.take.format(), Channels::Both, &mut record, &mut theirs, 0).unwrap();
+            x6_raw::decode_pair(&mut copied, &kept.pairs[i - first], kept.take.format(), Channels::Both, &mut record, &mut ours, 0).unwrap();
+            assert!(theirs == ours, "frame {i} of the copy of the whole frame is not the take's");
+        }
+        if area.outside() > 0 {
+            println!("the corners ({:.1} % of a frame) as black: {:.1} % smaller", area.share_outside() * 100.0, (1.0 - report.bytes as f64 / whole.bytes as f64) * 100.0);
+            assert!(report.bytes < whole.bytes, "{} against {}", report.bytes, whole.bytes);
+        } else {
+            assert_eq!(report.bytes, whole.bytes);
+        }
+        let _ = std::fs::remove_dir_all(&whole_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1501,6 +1639,10 @@ mod tests {
         assert!(frames.clone().all(|i| (copy.pts_s(i) - index.pts_s(i)).abs() < 1e-9));
         assert!(x6_raw::archive_note(&dir).is_some_and(|n| !n.exact && n.target_bits_per_pixel == Some(1.0)));
         assert!(x6_raw::archive_note(&take).is_none());
+        // The corners outside the image circle are stored as black in this kind of copy too.
+        let area = x6_raw::PictureArea::of(&index.take);
+        assert_eq!(report.outside, if area.outside() > 0 { area.share_outside() } else { 0.0 });
+        assert_eq!(x6_raw::archive_note(&dir).and_then(|n| n.outside_black).is_some(), area.outside() > 0);
         // A frame of the copy against the take's.
         let layout = index.take.layout;
         let (mut record, mut theirs, mut ours) = (Vec::new(), vec![0u16; layout.samples()], vec![0u16; layout.samples()]);

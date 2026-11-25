@@ -196,6 +196,13 @@
 //! and what is left of it goes through a range coder; the pipeline's
 //! `raw_pack` module says how, bit for bit.
 //!
+//! The frame a record holds is the take's with one thing changed before it
+//! was coded, in either coding: the corners that lie outside the lens's
+//! image circle are black. The `archive` record of `clip.json` says so
+//! (`outside_image_circle`: the value they are stored as, their share of a
+//! frame, and each channel's circle in the frame), and says which stretch
+//! of the take the copy holds.
+//!
 //! This module reads the container; the pictures are decoded by the
 //! pipeline, which links the video libraries.
 
@@ -1803,6 +1810,10 @@ pub struct ArchiveNote {
     /// there, and that pair's time from the take's first, in seconds.
     pub first_pair: Option<u64>,
     pub first_pair_s: Option<f64>,
+    /// The share of a frame's samples that lie outside the lens's image
+    /// circle and are stored as black; `None`: the copy holds them as the
+    /// camera recorded them, or its frames have nothing outside.
+    pub outside_black: Option<f64>,
 }
 
 impl ArchiveNote {
@@ -1831,6 +1842,7 @@ pub fn read_archive_note(dir: &Path) -> Option<ArchiveNote> {
         pairs_of_source: count("pairs_of_source"),
         first_pair: count("first_pair"),
         first_pair_s: number("first_pair_s"),
+        outside_black: note.get("outside_image_circle").and_then(|o| o.get("share")).and_then(|v| v.as_f64()),
     })
 }
 
@@ -4121,15 +4133,16 @@ mod tests {
         std::fs::write(dir.join(CLIP_FILE), r#"{"layout":"paired-bayer-v1","fps_setting":60,"size":[3840,3840],"archive":{"version":1,"kind":"lossy","target_bits_per_pixel":1.0,"bits_per_pixel":0.97,"source":"a take"}}"#).unwrap();
         let plain = ArchiveNote {
             exact: false, target_bits_per_pixel: Some(1.0), bits_per_pixel: Some(0.97), source_bits_per_pixel: None, source: Some("a take".into()),
-            pairs: None, pairs_of_source: None, first_pair: None, first_pair_s: None,
+            pairs: None, pairs_of_source: None, first_pair: None, first_pair_s: None, outside_black: None,
         };
         assert_eq!(read_archive_note(&dir), Some(plain.clone()));
         assert_eq!(plain.stretch(), None);
         // A copy of a stretch says where in its take it lies; one of the whole take is no stretch.
-        std::fs::write(dir.join(CLIP_FILE), r#"{"layout":"paired-bayer-v1","fps_setting":60,"size":[3840,3840],"archive":{"version":1,"kind":"exact","bits_per_pixel":2.1,"source_bits_per_pixel":3.2,"source":"a take","pairs":300,"pairs_of_source":1800,"first_pair":368,"first_pair_s":6.1333}}"#).unwrap();
+        // (And what it stores as black: the corners outside the lens's image circle.)
+        std::fs::write(dir.join(CLIP_FILE), r#"{"layout":"paired-bayer-v1","fps_setting":60,"size":[3840,3840],"archive":{"version":1,"kind":"exact","bits_per_pixel":2.1,"source_bits_per_pixel":3.2,"source":"a take","pairs":300,"pairs_of_source":1800,"first_pair":368,"first_pair_s":6.1333,"outside_image_circle":{"stored_as":64,"share":0.132,"radius":4128.0,"circles":[[1923.7,1922.9,2064.0,2064.0],[1913.8,1924.1,2064.0,2064.0]]}}}"#).unwrap();
         let part = ArchiveNote {
             exact: true, target_bits_per_pixel: None, bits_per_pixel: Some(2.1), source_bits_per_pixel: Some(3.2), source: Some("a take".into()),
-            pairs: Some(300), pairs_of_source: Some(1800), first_pair: Some(368), first_pair_s: Some(6.1333),
+            pairs: Some(300), pairs_of_source: Some(1800), first_pair: Some(368), first_pair_s: Some(6.1333), outside_black: Some(0.132),
         };
         assert_eq!(read_archive_note(&dir), Some(part.clone()));
         assert_eq!(part.stretch(), Some((368, 300, 1800)));

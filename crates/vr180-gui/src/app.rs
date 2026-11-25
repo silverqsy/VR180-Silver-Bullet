@@ -740,6 +740,10 @@ struct TakeFacts {
     capture_bytes: u64,
     /// What it says of itself as an archive copy (`None`: a camera's take).
     archive: Option<vr180_fisheye::x6b::ArchiveNote>,
+    /// The share of a frame's samples that lie outside its lens's image
+    /// circle (`vr180_pipeline::x6_raw::PictureArea`): an archive copy
+    /// stores them as black.
+    outside: f64,
 }
 
 impl TakeFacts {
@@ -749,7 +753,11 @@ impl TakeFacts {
             return None;
         }
         let take = vr180_pipeline::x6_raw::describe(path).ok()?;
-        Some(Self { capture_bytes: take.capture_bytes, archive: vr180_pipeline::x6_raw::archive_note(path) })
+        Some(Self {
+            capture_bytes: take.capture_bytes,
+            archive: vr180_pipeline::x6_raw::archive_note(path),
+            outside: vr180_pipeline::x6_raw::PictureArea::of(&take).share_outside(),
+        })
     }
 }
 
@@ -775,6 +783,8 @@ struct TakeView {
     trim: (Option<f64>, Option<f64>),
     frame_samples: u64,
     capture_bytes: u64,
+    /// The share of a frame's samples outside its lens's image circle.
+    outside: f64,
     /// It is an archive copy, and one that does not hold every sample.
     copy: bool,
     lossy_copy: bool,
@@ -840,7 +850,8 @@ const TAKE_ARCHIVE_LABEL: &str = "Compressed archive";
 const TAKE_ORIGINALS_LABEL: &str = "Camera original DNGs";
 const TAKE_ARCHIVE_HOVER: &str = "A smaller copy of the take for keeping, which opens like the take.";
 const TAKE_ARCHIVE_NOTE: &str = "The take's folder again with a smaller capture, which opens like the take: every frame, its timing and the files beside it are kept. The take itself is left as it is.";
-const TAKE_EXACT_NOTE: &str = "Every sample is kept as the camera recorded it, and each frame is read back and compared before it is written. Most takes come out a quarter to a third smaller, a 14-bit take that keeps every value about an eighth.";
+const TAKE_EXACT_LABEL: &str = "Lossless: every sample of the picture kept";
+const TAKE_EXACT_NOTE: &str = "Every sample of the picture is kept as the camera recorded it, and each frame is read back and compared before it is written. Most takes come out a quarter to two fifths smaller. A take that is noise for the most part gains little: where its copy would not be smaller, none is made.";
 const TAKE_LOSSY_NOTE: &str = "The copy is lossy: at 1 bit a pixel a frame is off by less than its own noise; below that the shadows lose their grain when they are lifted.";
 const TAKE_STRETCH_NOTE: &str = "A copy of a stretch is a shorter clip. What the app takes from a whole clip, such as the tone statistics and the stabilizer's reference, is then taken from the stretch, so its picture can differ slightly from the same stretch of the take.";
 const TAKE_COPY_SOURCE_NOTE: &str = "This clip is an archive copy of a take: a copy is made from the camera's take, not from another copy.";
@@ -919,6 +930,21 @@ fn take_cut_warning(takes: &[TakeView], zh: bool) -> Option<String> {
     })
 }
 
+/// What an archive copy does with the corners of a frame that lie outside
+/// the lens's image circle, said before the copy is made; `None` when no
+/// take of the run has any (a frame that is the middle of the sensor).
+fn take_corners_note(takes: &[TakeView], zh: bool) -> Option<String> {
+    if !takes.iter().any(|t| t.outside > 0.0) {
+        return None;
+    }
+    Some(match (takes, zh) {
+        ([take], true) => format!("画幅四角在镜头成像圈之外，占样本的 {:.0}%，没有画面，只有杂散光和噪声：存成黑。", take.outside * 100.0),
+        ([take], false) => format!("The corners of the frame outside the lens's image circle, {:.0}% of its samples, hold no picture, only stray light and noise: they are stored as black.", take.outside * 100.0),
+        (_, true) => "画幅四角在镜头成像圈之外的部分没有画面，只有杂散光和噪声：存成黑。".to_string(),
+        (_, false) => "The corners of a frame outside the lens's image circle hold no picture, only stray light and noise: they are stored as black.".to_string(),
+    })
+}
+
 /// The sizes a run of archive copies comes to, before it is made: the
 /// takes', the part of them that is copied where that is less, and the
 /// copies' where it is known beforehand (a lossy copy's `bits` a pixel).
@@ -993,13 +1019,37 @@ fn take_copy_line(copy: &TakeCopy, zh: bool) -> String {
     if zh { format!("✓ {name} · {size}，是原素材同样这些帧的 {share:.0}%") } else { format!("✓ {name} · {size}, {share:.0}% of the same frames in the take") }
 }
 
+/// Why a take was not written, as the panel says it: the pipeline's own
+/// words, and in Chinese the one reason a user is likely to meet (a copy
+/// that keeps every sample would not be smaller than a take of noise).
+fn take_failed_text(why: &str, zh: bool) -> String {
+    if !zh || !why.contains(vr180_pipeline::raw_archive::NOT_SMALLER) {
+        return why.to_string();
+    }
+    // "(8.14 against 7.65 bits a pixel on 3 of its frames)"
+    match why.split_once('(').and_then(|(_, rest)| rest.split_once(" bits a pixel")).and_then(|(figures, _)| figures.split_once(" against ")) {
+        Some((copy, take)) => format!("无损副本不会比这条素材更小：每像素 {copy} bit，原素材 {take} bit。它的帧以噪声为主，相机已经压得差不多了。可改用有损档。"),
+        None => "无损副本不会比这条素材更小：它的帧以噪声为主，相机已经压得差不多了。可改用有损档。".to_string(),
+    }
+}
+
 /// What the Source panel says of a clip that is an archive copy: how it
 /// was made, and which stretch of its take it holds when it is not all of
 /// it.
 fn archive_note_text(note: &vr180_fisheye::x6b::ArchiveNote, zh: bool) -> String {
-    let kind = match note.bits_per_pixel {
-        Some(bits) if !note.exact => format!("{bits:.2} {}", if zh { tr_zh("bit a pixel") } else { "bit a pixel" }),
-        _ => (if zh { tr_zh("every sample kept") } else { "every sample kept" }).to_string(),
+    // (A copy that stores the corners outside the image circle as black keeps every sample of the picture.)
+    let corners = note.outside_black.is_some();
+    let kind = match (note.bits_per_pixel, corners, zh) {
+        (Some(bits), _, _) if !note.exact => format!("{bits:.2} {}", if zh { tr_zh("bit a pixel") } else { "bit a pixel" }),
+        (_, false, false) => "every sample kept".to_string(),
+        (_, false, true) => tr_zh("every sample kept").to_string(),
+        (_, true, false) => "every sample of the picture kept".to_string(),
+        (_, true, true) => "画面内每个样本都保留".to_string(),
+    };
+    let kind = match (corners, zh) {
+        (false, _) => kind,
+        (true, false) => format!("{kind} · corners black"),
+        (true, true) => format!("{kind} · 四角为黑"),
     };
     match (note.stretch(), zh) {
         (None, _) => kind,
@@ -2361,20 +2411,20 @@ mod take_tests {
     fn take(name: &str, duration_s: f64, trim: (Option<f64>, Option<f64>)) -> TakeView {
         TakeView {
             path: PathBuf::from(format!("/takes/{name}")), fps: 30.0, duration_s, trim,
-            frame_samples: 2 * 5760 * 5760, capture_bytes: (duration_s * 0.8e9) as u64, copy: false, lossy_copy: false,
+            frame_samples: 2 * 5760 * 5760, capture_bytes: (duration_s * 0.8e9) as u64, outside: 0.163, copy: false, lossy_copy: false,
         }
     }
 
     fn entry(path: &str, kind: SourceKind, selected: bool, archive: Option<bool>, status: BatchStatus) -> BatchItem {
         let note = |exact: bool| vr180_fisheye::x6b::ArchiveNote {
             exact, target_bits_per_pixel: (!exact).then_some(1.0), bits_per_pixel: Some(1.0), source_bits_per_pixel: Some(3.2), source: None,
-            pairs: None, pairs_of_source: None, first_pair: None, first_pair_s: None,
+            pairs: None, pairs_of_source: None, first_pair: None, first_pair_s: None, outside_black: None,
         };
         BatchItem {
             path: path.into(), fps: 30.0, duration_sec: 120.0, source_kind: kind,
             fisheye_eye_w: 5760, fisheye_eye_h: 5760, width: 5760, height: 5760,
             settings: Settings::default(), status, selected, x6: None, raw_one_lens: false, raw_frame: None, four_channel_sound: false,
-            take: kind.is_raw_video().then(|| TakeFacts { capture_bytes: 96_000_000_000, archive: archive.map(note) }),
+            take: kind.is_raw_video().then(|| TakeFacts { capture_bytes: 96_000_000_000, archive: archive.map(note), outside: 0.163 }),
             offline: None, before_take: None, copy: None, take_failed: None,
         }
     }
@@ -2523,7 +2573,8 @@ mod take_tests {
         let (text, ask) = shown(&mut tools, &view, Some("Compressed archive"));
         assert_eq!((tools.open, ask), (Some(TakeTool::Archive), None));
         for said in [
-            "Lossless: every sample kept", "High quality: 1 bit a pixel", "Custom", TAKE_ARCHIVE_NOTE, TAKE_LOSSY_NOTE,
+            TAKE_EXACT_LABEL, "High quality: 1 bit a pixel", "Custom", TAKE_ARCHIVE_NOTE, TAKE_LOSSY_NOTE,
+            "The corners of the frame outside the lens's image circle, 16% of its samples, hold no picture, only stray light and noise: they are stored as black.",
             "Range", "In to Out", "Whole take", "TAKE · 00:12.30 to 00:45.60 · 33.3 s of 2 min 0 s",
             "Only the 33.3 s between In and Out go into the copy", TAKE_STRETCH_NOTE,
             "Take 96.0 GB · the part copied 26.6 GB · the copy about 8.3 GB", "Written beside the take: TAKE_Archive", "Make the archive copy",
@@ -2541,9 +2592,10 @@ mod take_tests {
         assert!(text.contains("TAKE · whole take · 2 min 0 s") && text.contains("Take 96.0 GB · the copy about 29.9 GB"), "{text}");
         assert!(!text.contains("go into the copy") && !text.contains(TAKE_STRETCH_NOTE) && !text.contains("the part copied"), "{text}");
         // Every sample kept: the size picked is to be kept, and no size is promised.
-        let (text, ask) = shown(&mut tools, &view, Some("Lossless: every sample kept"));
+        let (text, ask) = shown(&mut tools, &view, Some(TAKE_EXACT_LABEL));
         assert_eq!((tools.size, ask), (ArchiveSize::Lossless, Some(TakeAsk::Keep)));
         assert!(text.contains(TAKE_EXACT_NOTE) && !text.contains(TAKE_LOSSY_NOTE) && !text.contains("the copy about"), "{text}");
+        assert!(text.contains("stored as black"), "{text}");
         let (_, ask) = shown(&mut tools, &view, Some("Make the archive copy"));
         assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(None), whole: true })));
         // A size picked by hand.
@@ -2557,13 +2609,20 @@ mod take_tests {
         let (text, ask) = shown(&mut tools, &busy, Some("Make the archive copy"));
         assert!(text.contains("Make the archive copy") && ask.is_none(), "{ask:?}");
 
-        // A take without a trim: no range to pick, nothing left out.
-        let plain = [take("PLAIN", 60.0, (None, None))];
+        // A take without a trim, whose frame is the middle of the sensor: no range to pick, nothing left out, no
+        // corner outside the image circle to say anything of.
+        let plain = [TakeView { outside: 0.0, ..take("PLAIN", 60.0, (None, None)) }];
         let mut tools = TakeTools { open: Some(TakeTool::Archive), ..Default::default() };
         let (text, _) = shown(&mut tools, &TakeToolsView { archive: &plain, originals: &plain, copies: &[], failed: &[], out_dir: Some("Disk"), idle: true }, None);
         assert!(text.contains("PLAIN · whole take · 1 min 0 s") && text.contains("Written into the output folder Disk: PLAIN_Archive"), "{text}");
-        assert!(!text.contains("Range") && !text.contains("In to Out") && !text.contains("left out"), "{text}");
+        assert!(!text.contains("Range") && !text.contains("In to Out") && !text.contains("left out") && !text.contains("image circle"), "{text}");
         assert_eq!(tools.archive_run(&plain), TakeRun { job: TakeJob::Archive(Some(1.0)), whole: true });
+        // What is said of the corners, for one take and for several, in both languages.
+        assert_eq!(take_corners_note(&plain, false), None);
+        assert_eq!(take_corners_note(&takes, true).unwrap(), "画幅四角在镜头成像圈之外，占样本的 16%，没有画面，只有杂散光和噪声：存成黑。");
+        let mixed = [plain[0].clone(), takes[0].clone()];
+        assert_eq!(take_corners_note(&mixed, false).unwrap(), "The corners of a frame outside the lens's image circle hold no picture, only stray light and noise: they are stored as black.");
+        assert!(take_corners_note(&mixed, true).unwrap().contains("存成黑"));
 
         // Several takes: each with what is written of it, the rest of a long run by their number.
         let many: Vec<TakeView> = (0..8).map(|k| take(&format!("T{k}"), 60.0, if k == 0 { (Some(10.0), None) } else { (None, None) })).collect();
@@ -2635,7 +2694,7 @@ mod take_tests {
         for text in [
             TAKE_ARCHIVE_HOVER, TAKE_ARCHIVE_NOTE, TAKE_EXACT_NOTE, TAKE_LOSSY_NOTE, TAKE_STRETCH_NOTE, TAKE_COPY_SOURCE_NOTE, TAKE_ORIGINALS_NOTE,
             TAKE_ORIGINALS_PLACE_NOTE, TAKE_LOSSY_SOURCE_NOTE, TAKE_USE_COPY_HOVER, TAKE_BUSY_HOVER,
-            TAKE_TOOLS_TITLE, TAKE_ARCHIVE_LABEL, TAKE_ORIGINALS_LABEL, "Archive copy", "Lossless: every sample kept", "High quality: 1 bit a pixel", "Custom", "bit a pixel",
+            TAKE_TOOLS_TITLE, TAKE_ARCHIVE_LABEL, TAKE_ORIGINALS_LABEL, "Archive copy", TAKE_EXACT_LABEL, "High quality: 1 bit a pixel", "Custom", "bit a pixel",
             "Range", "In to Out", "Whole take", "Use the copy", "Use all the copies",
         ] {
             assert_ne!(tr_zh(text), text, "{text}");
@@ -2708,6 +2767,11 @@ mod take_tests {
         assert!(text.contains("✗ T4: archive copy: the disk is full") && !text.contains("T2"), "{text}");
         let (text, _) = shown(&mut TakeTools { open: Some(TakeTool::Originals), ..Default::default() }, &view, None);
         assert!(text.contains("✗ T2: no room") && !text.contains("T4"), "{text}");
+        // A take of noise, of which no copy that keeps every sample would be smaller: the reason, in Chinese too.
+        let why = format!("archive copy: {} (8.14 against 7.65 bits a pixel on 3 of its frames): its frames are noise for the most part", vr180_pipeline::raw_archive::NOT_SMALLER);
+        assert_eq!(take_failed_text(&why, false), why);
+        assert_eq!(take_failed_text(&why, true), "无损副本不会比这条素材更小：每像素 8.14 bit，原素材 7.65 bit。它的帧以噪声为主，相机已经压得差不多了。可改用有损档。");
+        assert_eq!(take_failed_text("archive copy: the disk is full", true), "archive copy: the disk is full");
     }
 
     /// An archive copy reads the folder of camera-original DNGs of the take
@@ -2815,10 +2879,16 @@ mod take_tests {
     fn a_copy_says_which_stretch_of_its_take_it_holds() {
         let whole = vr180_fisheye::x6b::ArchiveNote {
             exact: true, target_bits_per_pixel: None, bits_per_pixel: Some(2.1), source_bits_per_pixel: Some(3.2), source: Some("TAKE".into()),
-            pairs: Some(1800), pairs_of_source: Some(1800), first_pair: Some(0), first_pair_s: Some(0.0),
+            pairs: Some(1800), pairs_of_source: Some(1800), first_pair: Some(0), first_pair_s: Some(0.0), outside_black: None,
         };
         assert_eq!(archive_note_text(&whole, false), "every sample kept");
         assert_eq!(archive_note_text(&whole, true), "每个样本都保留");
+        // A copy that stores the corners outside the image circle as black says so, of either kind.
+        let cornered = vr180_fisheye::x6b::ArchiveNote { outside_black: Some(0.163), ..whole.clone() };
+        assert_eq!(archive_note_text(&cornered, false), "every sample of the picture kept · corners black");
+        assert_eq!(archive_note_text(&cornered, true), "画面内每个样本都保留 · 四角为黑");
+        let cornered = vr180_fisheye::x6b::ArchiveNote { exact: false, bits_per_pixel: Some(0.9), ..cornered };
+        assert_eq!(archive_note_text(&cornered, false), "0.90 bit a pixel · corners black");
         let part = vr180_fisheye::x6b::ArchiveNote { pairs: Some(300), first_pair: Some(368), ..whole.clone() };
         assert_eq!(archive_note_text(&part, false), "every sample kept · frames 369 to 668 of the take's 1800");
         assert_eq!(archive_note_text(&part, true), "每个样本都保留 · 原素材 1800 帧中的第 369 到 668 帧");
@@ -3964,8 +4034,8 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Camera original DNGs" => "相机原片 DNG",
         "The take's folder again with a smaller capture, which opens like the take: every frame, its timing and the files beside it are kept. The take itself is left as it is."
             => "再写一份素材文件夹，采集文件更小，打开方式和原素材一样：每一帧、它的时间信息和旁边的文件都保留。原素材保持不动。",
-        "Every sample is kept as the camera recorded it, and each frame is read back and compared before it is written. Most takes come out a quarter to a third smaller, a 14-bit take that keeps every value about an eighth."
-            => "每个样本都和相机记录的一样，每一帧写入前都会读回来逐一核对。大多数素材能小四分之一到三分之一，每个值都保留的 14 bit 素材大约小八分之一。",
+        "Every sample of the picture is kept as the camera recorded it, and each frame is read back and compared before it is written. Most takes come out a quarter to two fifths smaller. A take that is noise for the most part gains little: where its copy would not be smaller, none is made."
+            => "画面内每个样本都和相机记录的一样，每一帧写入前都会读回来逐一核对。大多数素材能小四分之一到五分之二。以噪声为主的素材收益很小：副本不会更小时不制作。",
         "The copy is lossy: at 1 bit a pixel a frame is off by less than its own noise; below that the shadows lose their grain when they are lifted."
             => "副本是有损的：每像素 1 bit 时，一帧的偏差小于它自身的噪声；再低，暗部提亮后会失去颗粒。",
         "A copy of a stretch is a shorter clip. What the app takes from a whole clip, such as the tone statistics and the stabilizer's reference, is then taken from the stretch, so its picture can differ slightly from the same stretch of the take."
@@ -3985,7 +4055,7 @@ fn tr_zh(en: &'static str) -> &'static str {
         "every sample kept" => "每个样本都保留",
         "This clip is an archive copy of a take, made by this app: not the camera's own recording." => "这个片段是素材的存档副本，由本软件制作，不是相机自己的记录。",
         "High quality: 1 bit a pixel" => "高质量：每像素 1 bit",
-        "Lossless: every sample kept" => "无损：每个样本都保留",
+        "Lossless: every sample of the picture kept" => "无损：画面内每个样本都保留",
         "Custom" => "自定义",
         "bit a pixel" => "bit 每像素",
         "A smaller copy of the take for keeping, which opens like the take." => "素材的一个更小的副本，用于存档，打开方式和原素材一样。",
@@ -11592,6 +11662,7 @@ impl App {
             trim: (settings.trim_in_s, settings.trim_out_s),
             frame_samples: b.frame_samples(),
             capture_bytes: b.take.as_ref().map_or(0, |t| t.capture_bytes),
+            outside: b.take.as_ref().map_or(0.0, |t| t.outside),
             copy: b.take.as_ref().is_some_and(|t| t.archive.is_some()),
             lossy_copy: b.take.as_ref().and_then(|t| t.archive.as_ref()).is_some_and(|n| !n.exact),
         }
@@ -11674,7 +11745,7 @@ impl App {
         // The takes the last run of this kind could not write, and why.
         let failed = |ui: &mut egui::Ui, archive: bool| {
             for (_, name, why) in view.failed.iter().filter(|(job, _, _)| matches!(job, TakeJob::Archive(_)) == archive) {
-                ui.label(RichText::new(format!("✗ {name}: {why}")).small().color(Color32::from_rgb(230, 110, 110)));
+                ui.label(RichText::new(format!("✗ {name}: {}", take_failed_text(why, zh))).small().color(Color32::from_rgb(230, 110, 110)));
             }
         };
         let start = |ui: &mut egui::Ui, job: TakeJob, n: usize| -> bool {
@@ -11692,7 +11763,7 @@ impl App {
                     }
                 } else {
                     let before = (tools.size, tools.bits);
-                    ui.radio_value(&mut tools.size, ArchiveSize::Lossless, tr("Lossless: every sample kept"));
+                    ui.radio_value(&mut tools.size, ArchiveSize::Lossless, tr(TAKE_EXACT_LABEL));
                     ui.radio_value(&mut tools.size, ArchiveSize::HighQuality, tr("High quality: 1 bit a pixel"));
                     ui.radio_value(&mut tools.size, ArchiveSize::Custom, tr("Custom"));
                     if tools.size == ArchiveSize::Custom {
@@ -11703,6 +11774,9 @@ impl App {
                     }
                     note(ui, tr(TAKE_ARCHIVE_NOTE));
                     note(ui, tr(if tools.archive_bits().is_none() { TAKE_EXACT_NOTE } else { TAKE_LOSSY_NOTE }));
+                    if let Some(text) = take_corners_note(view.archive, zh) {
+                        note(ui, &text);
+                    }
                     ui.add_space(4.0);
                     range(ui, &mut tools.archive_whole, view.archive);
                     let run = tools.archive_run(view.archive);
