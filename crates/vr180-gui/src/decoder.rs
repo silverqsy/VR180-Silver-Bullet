@@ -331,6 +331,12 @@ pub struct Settings {
     /// (the rig flip mirrors the eye positions) — see
     /// [`Settings::effective_swap_eyes`].
     pub camera_upside_down: bool,
+    /// That switch follows the clip's accelerometer, which says which way
+    /// up the camera was: it is set from it when the clip joins the list
+    /// or comes back with a project. `false` once the user has set the
+    /// switch by hand, which then stays as they left it. (A clip without
+    /// an accelerometer record has nothing to follow, whatever this says.)
+    pub camera_upside_down_auto: bool,
     /// Insta360 X6: the answer for a clip whose view the file does not
     /// state — a 3712² clip without its window record can be the wide 7.4K
     /// or the 7.4K Crop. Binds at decoder start (it changes the lens
@@ -563,6 +569,7 @@ impl Default for Settings {
             fisheye_cy_norm_right: 0.5,
             fisheye_swap_eyes: false,
             camera_upside_down: false,
+            camera_upside_down_auto: true,
             insv_view: vr180_fisheye::X6ViewChoice::Auto,
             crop_mask: vr180_pipeline::gpu::CropMask::default(),
             fisheye_output_mode: FisheyeOutputMode::HalfEquirect,

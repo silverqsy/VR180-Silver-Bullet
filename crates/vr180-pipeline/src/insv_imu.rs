@@ -87,6 +87,38 @@ pub fn insv_x6_lens_imu_to_cam(second_lens: bool) -> [[f32; 3]; 3] {
     }
 }
 
+/// Whether the camera was mounted upside down, from where its accelerometer
+/// says up is. At rest an accelerometer reads one g along whichever of its
+/// axes points up; through the motion basis that is the top of the picture
+/// (the camera's −y) for a camera the right way up, and the bottom of it
+/// for one turned over. `acc_g`: accelerometer samples in g on the motion
+/// sensor's axes (a camera file's, or a raw take's, which records the same
+/// sensor). The median of them decides: a jolt does not, and the mount does
+/// not change within a recording.
+///
+/// `None`: too few samples, or a camera that lies on its side or points up
+/// or down (less than half a g along that axis), which says nothing.
+pub fn mounted_upside_down(acc_g: impl IntoIterator<Item = [f32; 3]>) -> Option<bool> {
+    let down = insv_x6_imu_to_cam()[1];
+    let mut along: Vec<f32> = acc_g.into_iter()
+        .filter(|a| *a != [0.0; 3])
+        .map(|a| down[0] * a[0] + down[1] * a[1] + down[2] * a[2])
+        .collect();
+    if along.len() < 16 {
+        return None;
+    }
+    along.sort_by(f32::total_cmp);
+    let median = along[along.len() / 2];
+    (median.abs() > 0.5).then_some(median > 0.0)
+}
+
+/// [`mounted_upside_down`] for a camera file: its first seconds of motion
+/// samples. `None` when the file has none.
+pub fn file_mounted_upside_down(path: &std::path::Path) -> Option<bool> {
+    let samples = vr180_fisheye::insta360::read_insta360_first_motion(path, 4000).ok()?;
+    mounted_upside_down(samples.iter().map(|s| s.acc_g))
+}
+
 /// Fallback centre-row content time relative to `t_end_of_exposure −
 /// exposure/2` (ms), used when the file has no `gyro_timestamp`. Best-fit
 /// sync of image motion vs gyro (R² plateau 1.0–2.5 ms); the X6 files
@@ -629,6 +661,28 @@ pub fn build_insv_imu(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which way up the camera was is read off where its accelerometer says
+    /// up is: toward the top of the picture, or toward its bottom.
+    #[test]
+    fn the_accelerometer_says_which_way_up_the_camera_was() {
+        // At rest the right way up the sensor reads one g against its x axis (a take's record: -9.84 m/s²).
+        let upright = vec![[-1.003, -0.021, -0.002]; 200];
+        assert_eq!(mounted_upside_down(upright.iter().copied()), Some(false));
+        let turned = vec![[1.005, -0.004, -0.026]; 200];
+        assert_eq!(mounted_upside_down(turned.iter().copied()), Some(true));
+        // A jolt among them does not decide, nor do samples that hold nothing.
+        let mut jolted = turned.clone();
+        jolted.extend(vec![[-3.0, 2.0, 1.0]; 40]);
+        jolted.extend(vec![[0.0; 3]; 400]);
+        assert_eq!(mounted_upside_down(jolted), Some(true));
+        // On its side, or pointing up: the axis that tells has less than half a g on it.
+        assert_eq!(mounted_upside_down(vec![[0.1, 0.99, 0.05]; 200]), None);
+        assert_eq!(mounted_upside_down(vec![[-0.3, 0.1, 0.95]; 200]), None);
+        // Too few samples to go by.
+        assert_eq!(mounted_upside_down(vec![[1.0, 0.0, 0.0]; 10]), None);
+        assert_eq!(mounted_upside_down(Vec::new()), None);
+    }
 
     #[test]
     fn basis_is_a_proper_rotation() {

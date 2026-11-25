@@ -72,10 +72,13 @@ impl AudioPlayer {
     /// codec does not say which it is. `None` leaves a 4-channel track to
     /// swresample's layout downmix.
     pub fn open_with_mix(path: PathBuf, start_paused: bool, mix: Option<StereoMix>) -> Result<Option<Self>> {
-        Self::open_at(path, start_paused, mix, 0.0)
+        Self::open_at(path, start_paused, mix, 0.0, false)
     }
 
-    pub fn open_at(path: PathBuf, start_paused: bool, mix: Option<StereoMix>, base_s: f64) -> Result<Option<Self>> {
+    /// `turned`: the camera was mounted upside down and its picture is shown
+    /// turned upright, so the sound's two sides change places
+    /// (`audio::FOA_HALF_TURN`).
+    pub fn open_at(path: PathBuf, start_paused: bool, mix: Option<StereoMix>, base_s: f64, turned: bool) -> Result<Option<Self>> {
         vr180_pipeline::decode::init();
         let base_s = if base_s.is_finite() { base_s.max(0.0) } else { 0.0 };
 
@@ -174,6 +177,7 @@ impl AudioPlayer {
                 cmd_rx,
                 start_paused,
                 mix,
+                turned,
             ) {
                 tracing::warn!("audio_player worker: {e}");
             }
@@ -247,6 +251,8 @@ fn decoder_worker(
     cmd_rx: crossbeam_channel::Receiver<AudioCmd>,
     start_paused: bool,
     mix: Option<StereoMix>,
+    // The pair is played with its two sides changed (a camera mounted upside down).
+    turned: bool,
 ) -> Result<()> {
     use ffmpeg_next as ffmpeg;
     use ffmpeg::software::resampling::Context as Resampler;
@@ -409,7 +415,13 @@ fn decoder_worker(
                         Some(q) => q.stereo(c),
                         None => vr180_pipeline::audio::foa_to_stereo_sample(c),
                     };
+                    let (l, r) = if turned { (r, l) } else { (l, r) };
                     if device_channels == 1 { g.push_back(0.5 * (l + r)); } else { g.push_back(l); g.push_back(r); }
+                }
+            } else if turned && device_channels == 2 {
+                for s in samples.chunks_exact(2) {
+                    g.push_back(s[1]);
+                    g.push_back(s[0]);
                 }
             } else {
                 g.extend(samples.iter().copied());

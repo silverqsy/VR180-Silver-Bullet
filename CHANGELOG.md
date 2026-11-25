@@ -85,6 +85,38 @@ three sizes to pick from.
   in `raw_pack.rs`'s); earlier versions of the app refuse it as a kind
   they do not know.
 
+### Insta360 X6: a camera mounted upside down
+
+Checked for the first time on footage that was shot upside down. The
+picture, the order of the eyes and the stabilization were right with the
+**Upside-down mount** switch on; four things around it were not.
+
+- **The switch sets itself.** An X6 clip or raw take says which way up the
+  camera was: its accelerometer reads one g toward the top of the picture
+  or toward its bottom. The switch follows that when a clip joins the list
+  or comes back with a project, and says so. Set by hand it stays as you
+  left it (**Follow the accelerometer** puts it back), and it is no longer
+  passed on to the next clip. A still has no such record: its switch is
+  set by hand as before.
+- **The stereo alignment stays with its lens.** The stereo offsets are a
+  rig's alignment, each lens's own small rotation, and upside down the two
+  eyes change lenses. The offsets used to stay with the output eye, so
+  each lens got the other's: on the footage the eyes came out 0.4° apart
+  in roll and 0.1° vertically, twice the rig's own error. They now go with
+  the lens (0.03°, as upright), and one alignment serves both ways a
+  camera can be mounted. **Auto align** asked for pitch and yaw the wrong
+  way round upside down; it now gives the same values either way up.
+- **The view angles act as you see them.** Pano yaw and pitch, and the
+  reframed view's pan and tilt, turned the view the opposite way upside
+  down.
+- **The sound is turned with the picture.** The microphones are turned
+  over with the camera, so left and right, and up and down, were reversed
+  against the picture. Stereo is written with its sides changed, the
+  360° Audio field turned half a turn about its front axis (Ambisonic is
+  encoded again for that instead of copied; APAC is made from the turned
+  field), and the preview plays it the same way. This follows from the
+  geometry and was checked on the files' channels, not by ear.
+
 ### Insta360 X6: raw video
 
 - **The take itself is written from the Source panel.** An archive copy

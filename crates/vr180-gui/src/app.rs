@@ -2306,7 +2306,7 @@ mod export_size_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Default::default(),
-            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, take: None, offline: None, before_take: None, copy: None, take_failed: None, stand_in: None,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, take: None, upside_down: None, offline: None, before_take: None, copy: None, take_failed: None, stand_in: None,
         };
         let x6 = |single_eye| Some(X6ClipInfo { window: None, ilog: Some(true), paraxial_native: 2086.97, single_lens: single_eye, single_eye });
         let two = item(SourceKind::Insta360Insv, x6(false));
@@ -2563,7 +2563,7 @@ mod take_tests {
             fisheye_eye_w: 5760, fisheye_eye_h: 5760, width: 5760, height: 5760,
             settings: Settings::default(), status, selected, x6: None, raw_one_lens: false, raw_frame: None, four_channel_sound: false,
             take: kind.is_raw_video().then(|| TakeFacts { capture_bytes: 96_000_000_000, archive: archive.map(note), outside: 0.163 }),
-            offline: None, before_take: None, copy: None, take_failed: None, stand_in: None,
+            upside_down: None, offline: None, before_take: None, copy: None, take_failed: None, stand_in: None,
         }
     }
 
@@ -3133,6 +3133,43 @@ mod take_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The Upside-down mount switch follows the clip's accelerometer until
+    /// the user sets it by hand; a clip without such a record keeps what
+    /// it has. Settings kept from before the switch could follow anything
+    /// follow it.
+    #[test]
+    fn the_upside_down_switch_follows_the_accelerometer() {
+        let mut s = Settings::default();
+        assert!(s.camera_upside_down_auto && !s.camera_upside_down);
+        follow_the_mount(&mut s, Some(true));
+        assert!(s.camera_upside_down);
+        follow_the_mount(&mut s, None);
+        assert!(s.camera_upside_down, "nothing to go by: as it was");
+        follow_the_mount(&mut s, Some(false));
+        assert!(!s.camera_upside_down);
+        // Set by hand: it stays, whatever the accelerometer says.
+        let mut by_hand = Settings { camera_upside_down: true, camera_upside_down_auto: false, ..Default::default() };
+        follow_the_mount(&mut by_hand, Some(false));
+        assert!(by_hand.camera_upside_down && !by_hand.camera_upside_down_auto);
+        // A clip's settings from a project written before: the switch as it was, and free to follow.
+        let old: Settings = serde_json::from_str(r#"{"camera_upside_down":false,"stereo_roll_deg":-0.23}"#).unwrap();
+        assert!(old.camera_upside_down_auto && !old.camera_upside_down && old.stereo_roll_deg == -0.23);
+        let mut old = old;
+        follow_the_mount(&mut old, Some(true));
+        assert!(old.camera_upside_down);
+        // The list takes the fact in with the clip's other facts.
+        let mut entry = entry("/takes/TAKE", SourceKind::X6Raw, false, None, BatchStatus::Idle);
+        entry.upside_down = Some(true);
+        follow_the_mount(&mut entry.settings, entry.upside_down);
+        assert!(entry.settings.camera_upside_down && entry.export_settings().output_view_adjust().upside_down);
+        // Other sources have no such record.
+        assert_eq!(mounted_upside_down(SourceKind::Insta360Dng, std::path::Path::new("/nonexistent/a.dng")), None);
+        assert_eq!(mounted_upside_down(SourceKind::X6Raw, std::path::Path::new("/nonexistent/TAKE")), None);
+        for text in [UPSIDE_DOWN_HOVER, "Set from the clip's accelerometer.", "Follow the accelerometer", "The switch was set by hand. This puts it back to what the clip's accelerometer says."] {
+            assert_ne!(tr_zh(text), text, "{text}");
+        }
+    }
+
     /// A take and its copy opened together are one recording: the take is
     /// the one that is opened. A copy opened by itself is opened.
     #[test]
@@ -3218,7 +3255,7 @@ mod ettr_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Settings { ettr_stops, ..Default::default() },
-            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, take: None, offline: None, before_take: None, copy: None, take_failed: None, stand_in: None,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, take: None, upside_down: None, offline: None, before_take: None, copy: None, take_failed: None, stand_in: None,
         }
     }
 
@@ -3834,6 +3871,9 @@ struct BatchItem {
     four_channel_sound: bool,
     /// A raw take's own size, and what it says of itself as an archive copy.
     take: Option<TakeFacts>,
+    /// Which way up the camera was, where the clip's accelerometer says
+    /// ([`mounted_upside_down`]): the Upside-down mount switch follows it.
+    upside_down: Option<bool>,
     /// The entry's file is not at hand (see [`OfflineClip`]); what the
     /// fields above say of the file is then empty.
     offline: Option<OfflineClip>,
@@ -3914,6 +3954,28 @@ struct ClipFacts {
     raw_frame: Option<RawFrame>,
     four_channel_sound: bool,
     take: Option<TakeFacts>,
+    upside_down: Option<bool>,
+}
+
+/// Whether the camera was mounted upside down for the clip at `path`, from
+/// its accelerometer: an X6 clip's or raw take's first seconds of it.
+/// `None` for a source without one (a still, another camera), and where the
+/// record says nothing. Touches the file.
+fn mounted_upside_down(kind: vr180_pipeline::SourceKind, path: &std::path::Path) -> Option<bool> {
+    match kind {
+        vr180_pipeline::SourceKind::X6Raw => vr180_pipeline::x6_raw::mounted_upside_down(path),
+        vr180_pipeline::SourceKind::Insta360Insv => vr180_pipeline::insv_imu::file_mounted_upside_down(path),
+        _ => None,
+    }
+}
+
+/// The Upside-down mount switch of a clip whose accelerometer says
+/// `detected`: it follows the accelerometer unless the user has set it by
+/// hand. Nothing changes for a clip without such a record.
+fn follow_the_mount(settings: &mut crate::decoder::Settings, detected: Option<bool>) {
+    if let (true, Some(upside_down)) = (settings.camera_upside_down_auto, detected) {
+        settings.camera_upside_down = upside_down;
+    }
 }
 
 impl ClipFacts {
@@ -3968,6 +4030,7 @@ impl ClipFacts {
             raw_frame: RawFrame::read(source_kind, path),
             four_channel_sound: four_channel_sound(source_kind, path),
             take: TakeFacts::read(source_kind, path),
+            upside_down: mounted_upside_down(source_kind, path),
         })
     }
 }
@@ -4041,6 +4104,7 @@ impl BatchItem {
             raw_frame: None,
             four_channel_sound: false,
             take: None,
+            upside_down: None,
             offline: Some(OfflineClip { token, looking: true, file: clip.file.clone(), segments: clip.segments.clone(), base }),
             before_take: None,
             copy: None,
@@ -4077,7 +4141,10 @@ impl BatchItem {
         self.raw_frame = facts.raw_frame;
         self.four_channel_sound = facts.four_channel_sound;
         self.take = facts.take;
+        self.upside_down = facts.upside_down;
         self.offline = None;
+        // Which way up the camera was is the file's to say.
+        follow_the_mount(&mut self.settings, self.upside_down);
     }
 
     /// A raw take as the camera wrote it: what an archive copy is made of.
@@ -4332,6 +4399,9 @@ fn set_cur_lang(l: Lang) {
 /// the export (`display_colour`), and what it says about itself.
 const MATCH_PLAYBACK_LABEL: &str = "Match QuickTime";
 const MATCH_PLAYBACK_HOVER: &str = "Show the preview the way Apple's players (QuickTime, Safari, Apple Vision Pro) show the exported file: read with Apple's Rec.709 video curve, so the mid-tones come out a little brighter. Off, the picture is shown as sRGB, which is closer to most players on Windows. Only the preview changes: the exported file is the same either way.";
+
+/// What the Upside-down mount switch says about itself.
+const UPSIDE_DOWN_HOVER: &str = "The camera was mounted upside down. The picture is turned upright, the two eyes change sides, and the sound is turned with them. The stereo alignment stays with its lens and the view angles act as you see them, so one set of values serves both ways the camera can be mounted. An X6 clip or raw take sets this by itself from its accelerometer.";
 
 /// What the export bar's "Join into one file" says about itself.
 const JOIN_HOVER: &str = "Export the clips in the order of the list and write them as ONE file, one after the other, with hard cuts. Every clip keeps its own trim and settings. They have to come out at the same frame size and frame rate (pick one size for all of them in Format). The file's sound is the first clip's Audio choice: stereo, or Ambisonic / APAC when every clip has four-channel sound. Clips in the Lens Space view through the camera's lens are joined as an Apple Immersive Video file (.aivu, macOS 26 or later, for Apple Vision Pro): it holds a lens for every clip, so clips of different recording modes and cameras can share it. Drag a clip by its handle (☰) to change the order.";
@@ -4746,6 +4816,11 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Format" => "格式",
         "Swap L↔R eyes" => "交换左右眼",
         "Upside-down mount (180°)" => "倒装 (180°)",
+        "The camera was mounted upside down. The picture is turned upright, the two eyes change sides, and the sound is turned with them. The stereo alignment stays with its lens and the view angles act as you see them, so one set of values serves both ways the camera can be mounted. An X6 clip or raw take sets this by itself from its accelerometer."
+            => "相机是倒着装的。画面转正，左右眼互换，声音也跟着转。两眼对位跟着镜头走，视角调整按你看到的方向起作用，所以同一套数值正装倒装都能用。X6 的片段和 raw 素材会按加速度计自动设置这个开关。",
+        "Set from the clip's accelerometer." => "已按素材的加速度计自动设置。",
+        "Follow the accelerometer" => "跟随加速度计",
+        "The switch was set by hand. This puts it back to what the clip's accelerometer says." => "这个开关是手动设置的。点这里恢复为素材加速度计给出的结果。",
         "Stabilization (VQF 6D, BRAW)" => "防抖 (VQF 6D, BRAW)",
         "Stabilization (DJI camera quats)" => "防抖（DJI 相机四元数）",
         "Stabilization (Insta360 gyro)" => "防抖（Insta360 陀螺仪）",
@@ -6895,7 +6970,7 @@ impl App {
                 continue;
             }
             let Some(facts) = ClipFacts::read(&path) else { continue };
-            let ClipFacts { source_kind, fisheye_eye_w, fisheye_eye_h, x6, raw_one_lens, raw_frame, four_channel_sound, .. } = facts;
+            let ClipFacts { source_kind, fisheye_eye_w, fisheye_eye_h, x6, raw_one_lens, raw_frame, four_channel_sound, upside_down, .. } = facts;
             let take = facts.take.clone();
             let is_loaded_clip = self.loaded_path.as_deref() == Some(path.as_path());
             // A NEW clip inherits ITS kind's template (OSV / .360 / … kept
@@ -6935,7 +7010,11 @@ impl App {
                 // How a clip was exposed is its own, and its file does not
                 // say: never inherited from the last clip's setup.
                 settings.ettr_stops = 0.0;
+                // Which way up the camera was is the clip's own too, and its
+                // accelerometer says: the last clip's switch is not passed on.
+                settings.camera_upside_down_auto = true;
             }
+            follow_the_mount(&mut settings, upside_down);
             self.batch.push(BatchItem {
                 path,
                 fps: facts.fps,
@@ -6951,6 +7030,7 @@ impl App {
                 raw_frame,
                 four_channel_sound,
                 take,
+                upside_down,
                 offline: None,
                 before_take: None,
                 copy: None,
@@ -6980,9 +7060,16 @@ impl App {
         if item.status == BatchStatus::Running { return; }
         let keep_trim = (item.settings.trim_in_s, item.settings.trim_out_s);
         let keep_rs = (item.settings.rs_mode, item.settings.rs_readout_ms);
+        let keep_mount = (item.settings.camera_upside_down, item.settings.camera_upside_down_auto);
         item.settings = self.settings.clone();
         item.settings.trim_in_s = keep_trim.0;
         item.settings.trim_out_s = keep_trim.1;
+        // Which way up the camera was is each clip's own where its
+        // accelerometer says: one clip's switch is not another's. (A clip
+        // without such a record takes the switch like any other setting.)
+        if item.upside_down.is_some() {
+            (item.settings.camera_upside_down, item.settings.camera_upside_down_auto) = keep_mount;
+        }
         // RS mode + readout are per-clip — keep this item's own, don't copy mine.
         item.settings.rs_mode = keep_rs.0;
         item.settings.rs_readout_ms = keep_rs.1;
@@ -8616,8 +8703,10 @@ impl App {
                 Some(a) => a,
                 None => vr180_pipeline::x6_pair::audio_source(&audio_path),
             };
+            // (A camera mounted upside down: the sound's sides change places with the picture's.)
+            let turned = self.settings.camera_upside_down && self.clip.as_ref().is_some_and(|c| c.source_kind.is_x6_video());
             self.audio_player = if raw_take && take_audio_missing(&audio_path) { None } else { match crate::audio_player::AudioPlayer::open_at(
-                audio_path, start_paused, mix, audio_base_s,
+                audio_path, start_paused, mix, audio_base_s, turned,
             ) {
                 Ok(Some(player)) => Some(player),
                 Ok(None) => None,
@@ -13293,6 +13382,8 @@ impl App {
         // A single-eye clip: the same three outputs, one eye wide.
         let single_eye = self.clip_single_eye();
         let kind = self.clip.as_ref().map(|c| c.source_kind);
+        // Which way up the camera was, where the clip on screen's accelerometer says.
+        let mount_detected = self.active_clip.and_then(|i| self.batch.get(i)).and_then(|b| b.upside_down);
         let s = &mut self.settings;
 
         ui.horizontal(|ui| {
@@ -13349,8 +13440,27 @@ impl App {
                 ui.checkbox(&mut s.fisheye_swap_eyes, tr("Swap L↔R eyes"));
             }
             // 180° output rotation + implicit eye swap (flipping the rig
-            // mirrors the eye positions). Toggling reloads the clip.
-            ui.checkbox(&mut s.camera_upside_down, tr("Upside-down mount (180°)"));
+            // mirrors the eye positions). Toggling reloads the clip. A clip
+            // whose accelerometer says which way up the camera was sets it
+            // by itself; set by hand, it stays as the user left it.
+            if ui.checkbox(&mut s.camera_upside_down, tr("Upside-down mount (180°)")).on_hover_text(tr(UPSIDE_DOWN_HOVER)).changed() {
+                s.camera_upside_down_auto = false;
+            }
+            match (mount_detected, s.camera_upside_down_auto) {
+                (Some(_), true) => {
+                    ui.label(RichText::new(tr("Set from the clip's accelerometer.")).small().color(Color32::GRAY));
+                }
+                (Some(detected), false) => {
+                    if ui.small_button(tr("Follow the accelerometer"))
+                        .on_hover_text(tr("The switch was set by hand. This puts it back to what the clip's accelerometer says."))
+                        .clicked()
+                    {
+                        s.camera_upside_down_auto = true;
+                        s.camera_upside_down = detected;
+                    }
+                }
+                (None, _) => {}
+            }
         }
 
         // ── Crop mask — sources whose frame is a crop of the image circle.

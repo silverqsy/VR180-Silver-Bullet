@@ -61,10 +61,15 @@ pub struct ViewAdjust {
     /// Camera mounted upside-down: rotate the output 180° in-plane.
     /// Because the YPR convention is `R = Ry·Rx·Rz(roll)` with roll
     /// innermost, this is EXACTLY `roll += 180°` on both eyes — the
-    /// flip applies to the output ray first, so pano/stereo sliders
-    /// and stabilization still act in unflipped world space. The
-    /// caller must ALSO swap the L/R eye assignment (an upside-down
-    /// rig mirrors the eye positions); see `Settings::effective_swap_eyes`.
+    /// flip applies to the output ray first, so stabilization still acts
+    /// in unflipped world space. The caller must ALSO swap the L/R eye
+    /// assignment (an upside-down rig mirrors the eye positions); see
+    /// `Settings::effective_swap_eyes`.
+    ///
+    /// The angles keep their meaning under it ([`Self::per_eye_matrices`]):
+    /// the global ones act as the viewer sees them, and the stereo ones stay
+    /// with their lens, so one alignment of a rig serves both ways it can be
+    /// mounted.
     pub upside_down: bool,
 }
 
@@ -101,17 +106,33 @@ impl ViewAdjust {
     }
 
     /// Build `(R_view_left, R_view_right)` row-major 3×3 matrices.
+    ///
+    /// Upside down, each angle keeps what it means to the user:
+    ///
+    /// - The global angles act as the viewer sees them. The half turn is
+    ///   innermost, so a yaw or a pitch written before it acts in the
+    ///   camera's frame, which the viewer sees turned: it goes in with its
+    ///   sign reversed, and the matrix is the upright one followed by the
+    ///   half turn (`Rz(180°) · R`). A roll about the view axis is the same
+    ///   in both frames.
+    /// - The stereo angles are a rig's alignment: each lens's own small
+    ///   rotation. The eye swap gives each OUTPUT eye the other lens, so the
+    ///   offsets change sides with it: the left eye gets what the right eye
+    ///   has upright (`R · Rz(180°)` of that eye). Measured on footage shot
+    ///   upside down: with the offsets left on their output eye the two
+    ///   eyes were twice the rig's own error apart (0.4° of roll), with
+    ///   them on their lens as near as upright (0.03°).
     pub fn per_eye_matrices(&self) -> ([f32; 9], [f32; 9]) {
-        let flip = if self.upside_down { 180.0 } else { 0.0 };
+        let (flip, seen) = if self.upside_down { (180.0, -1.0) } else { (0.0, 1.0) };
         let left = ypr_to_mat3_row_major(
-            self.pano_yaw_deg - self.stereo_yaw_deg,
-            self.pano_pitch_deg - self.stereo_pitch_deg,
-            self.pano_roll_deg - self.stereo_roll_deg + flip,
+            seen * (self.pano_yaw_deg - self.stereo_yaw_deg),
+            seen * (self.pano_pitch_deg - self.stereo_pitch_deg),
+            self.pano_roll_deg - seen * self.stereo_roll_deg + flip,
         );
         let right = ypr_to_mat3_row_major(
-            self.pano_yaw_deg + self.stereo_yaw_deg,
-            self.pano_pitch_deg + self.stereo_pitch_deg,
-            self.pano_roll_deg + self.stereo_roll_deg + flip,
+            seen * (self.pano_yaw_deg + self.stereo_yaw_deg),
+            seen * (self.pano_pitch_deg + self.stereo_pitch_deg),
+            self.pano_roll_deg + seen * self.stereo_roll_deg + flip,
         );
         (left, right)
     }
@@ -185,6 +206,53 @@ mod tests {
         for i in 0..9 {
             assert!(approx_eq(l[i], l_expected[i]));
             assert!(approx_eq(r[i], r_expected[i]));
+        }
+    }
+
+    /// Upside down, the global angles act as the viewer sees them: the view
+    /// is the upright one with the same angles, followed by the half turn.
+    #[test]
+    fn upside_down_the_global_angles_act_as_seen() {
+        let half_turn = ypr_to_mat3_row_major(0.0, 0.0, 180.0);
+        for (yaw, pitch, roll) in [(12.0, 0.0, 0.0), (0.0, -7.0, 0.0), (0.0, 0.0, 5.0), (13.0, -7.0, 5.0)] {
+            let upright = ViewAdjust { pano_yaw_deg: yaw, pano_pitch_deg: pitch, pano_roll_deg: roll, ..ViewAdjust::IDENTITY };
+            let turned = ViewAdjust { upside_down: true, ..upright };
+            let (l, r) = turned.per_eye_matrices();
+            let expected = mat3_mul_row_major(&half_turn, &upright.per_eye_matrices().0);
+            for i in 0..9 {
+                assert!(approx_eq(l[i], expected[i]) && approx_eq(r[i], expected[i]), "yaw {yaw} pitch {pitch} roll {roll} [{i}]: {} {} against {}", l[i], r[i], expected[i]);
+            }
+        }
+        // A yaw to the right is a yaw to the right: the ray the centre of the picture looks along moves the same way
+        // in the scene, whichever way up the camera is. (Upright, the centre ray goes to +x; upside down the scene's
+        // right is the camera's -x.)
+        let centre = |m: &[f32; 9]| [m[2], m[5], m[8]];
+        let upright = ViewAdjust { pano_yaw_deg: 10.0, ..ViewAdjust::IDENTITY };
+        let turned = ViewAdjust { upside_down: true, ..upright };
+        let (u, t) = (centre(&upright.per_eye_matrices().0), centre(&turned.per_eye_matrices().0));
+        assert!(u[0] > 0.1 && approx_eq(t[0], -u[0]) && approx_eq(t[1], -u[1]) && approx_eq(t[2], u[2]), "{u:?} {t:?}");
+    }
+
+    /// Upside down, the stereo offsets stay with their lens: the left eye,
+    /// which then shows the lens the right eye shows upright, gets that
+    /// eye's offsets, ahead of the half turn.
+    #[test]
+    fn upside_down_the_stereo_offsets_stay_with_their_lens() {
+        let half_turn = ypr_to_mat3_row_major(0.0, 0.0, 180.0);
+        let upright = ViewAdjust { stereo_yaw_deg: -0.07, stereo_pitch_deg: 0.08, stereo_roll_deg: -0.23, ..ViewAdjust::IDENTITY };
+        let turned = ViewAdjust { upside_down: true, ..upright };
+        let (l_up, r_up) = upright.per_eye_matrices();
+        let (l, r) = turned.per_eye_matrices();
+        let (l_expected, r_expected) = (mat3_mul_row_major(&r_up, &half_turn), mat3_mul_row_major(&l_up, &half_turn));
+        for i in 0..9 {
+            assert!(approx_eq(l[i], l_expected[i]) && approx_eq(r[i], r_expected[i]), "[{i}]: {} {} against {} {}", l[i], r[i], l_expected[i], r_expected[i]);
+        }
+        // Nothing but the half turn where nothing is set, and no identity then.
+        let bare = ViewAdjust { upside_down: true, ..ViewAdjust::IDENTITY };
+        assert!(!bare.is_identity());
+        let (l, r) = bare.per_eye_matrices();
+        for i in 0..9 {
+            assert!(approx_eq(l[i], half_turn[i]) && approx_eq(r[i], half_turn[i]));
         }
     }
 }

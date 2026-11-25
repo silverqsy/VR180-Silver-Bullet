@@ -747,6 +747,14 @@ fn eac_audio_source(cfg: &FisheyeExportConfig) -> (PathBuf, Option<PathBuf>) {
     }
 }
 
+/// The clip was shot with the camera upside down and its picture is turned
+/// upright: its sound is turned with it (`audio::FOA_HALF_TURN`: left and
+/// right change places, and up and down). The microphones are the X6's
+/// own, fixed to its body.
+fn sound_turned(cfg: &FisheyeExportConfig) -> bool {
+    cfg.view_adjust.upside_down && cfg.source_kind.is_x6_video()
+}
+
 fn source_audio_start_s(cfg: &FisheyeExportConfig) -> f64 {
     if cfg.source_kind == SourceKind::X6Raw {
         return crate::x6_raw::audio_source(&cfg.source_path).map_or(0.0, |(_, start)| start);
@@ -793,9 +801,20 @@ fn finalize_eac_audio(
 
         AudioTrack::Ambisonic => match crate::audio::probe_spatial_4ch(&audio_src) {
             Ok(Some(info)) => {
-                let n = crate::audio::mux_video_with_audio_stream(
-                    &audio_src, video_tmp, out, src_offset_s, Some(dur_s),
-                    Some(info.stream_index))?;
+                // A camera mounted upside down: the field is turned with the picture, which a copy of the track
+                // cannot do. The window is encoded again, turned, and that is what is put beside the video.
+                let turned = sound_turned(cfg).then(|| video_only_temp_path(out).with_extension("foa_turned.m4a"));
+                let n = match &turned {
+                    Some(tmp) => {
+                        let made = crate::audio::foa_half_turn_to_aac(&audio_src, tmp, src_offset_s, Some(dur_s), 256_000)
+                            .and_then(|_| crate::audio::mux_video_with_audio_stream(tmp, video_tmp, out, 0.0, Some(dur_s), None));
+                        std::fs::remove_file(tmp).ok();
+                        made?
+                    }
+                    None => crate::audio::mux_video_with_audio_stream(
+                        &audio_src, video_tmp, out, src_offset_s, Some(dur_s),
+                        Some(info.stream_index))?,
+                };
                 drop_tmp(&audio_tmp);
                 if n > 0 {
                     std::fs::remove_file(video_tmp).ok();
@@ -818,8 +837,13 @@ fn finalize_eac_audio(
             #[cfg(target_os = "macos")]
             {
                 let wav = video_tmp.with_extension("ambi.wav");
-                match crate::audio::extract_ambisonic_to_wav_window(
-                    &audio_src, &wav, src_offset_s, Some(dur_s)) {
+                // (Turned with the picture where the camera was mounted upside down.)
+                let extracted = if sound_turned(cfg) {
+                    crate::audio::foa_half_turn_to_wav(&audio_src, &wav, src_offset_s, Some(dur_s)).map(|_| ())
+                } else {
+                    crate::audio::extract_ambisonic_to_wav_window(&audio_src, &wav, src_offset_s, Some(dur_s)).map(|_| ())
+                };
+                match extracted {
                     Ok(_) => {
                         let r = crate::helpers::spawn_apac_encode(
                             &wav, Some(video_tmp), out, 256_000);
@@ -1065,7 +1089,7 @@ fn stereo_audio_source(cfg: &FisheyeExportConfig, t_in: f64, dur_s: f64) -> (Pat
         && src.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("wav"))
     {
         let out = video_only_temp_path(&cfg.output_path).with_extension("take_stereo.m4a");
-        match crate::audio::stereo_to_aac(&src, &out, t_in, Some(dur_s), 192_000) {
+        match crate::audio::stereo_to_aac_as(&src, &out, t_in, Some(dur_s), 192_000, sound_turned(cfg)) {
             Ok(_) => return (out.clone(), Some(out), 0.0),
             Err(e) => tracing::warn!("raw take: stereo WAV to AAC failed ({e}); muxing the file as is"),
         }
@@ -1073,13 +1097,25 @@ fn stereo_audio_source(cfg: &FisheyeExportConfig, t_in: f64, dur_s: f64) -> (Pat
     if cfg.source_kind.is_x6_video() {
         if let Ok(Some(_)) = crate::audio::probe_foa_aac(&src) {
             let out = video_only_temp_path(&cfg.output_path).with_extension("foa_stereo.m4a");
-            match crate::audio::foa_to_stereo_aac(&src, &out, t_in, Some(dur_s), 192_000) {
+            // (Of the field turned with the picture where the camera was mounted upside down.)
+            match crate::audio::foa_to_stereo_aac_as(&src, &out, t_in, Some(dur_s), 192_000, sound_turned(cfg)) {
                 Ok(_) => {
                     if let Some(t) = tmp { std::fs::remove_file(t).ok(); }
                     return (out.clone(), Some(out), 0.0);
                 }
                 Err(e) => tracing::warn!(
                     "X6 360° Audio → stereo decode failed ({e}); muxing the 4-channel track as is"),
+            }
+        } else if sound_turned(cfg) {
+            // A plain stereo track of a camera mounted upside down: its two sides change places, which a copy of
+            // the track cannot do.
+            let out = video_only_temp_path(&cfg.output_path).with_extension("turned_stereo.m4a");
+            match crate::audio::stereo_to_aac_as(&src, &out, t_in, Some(dur_s), 192_000, true) {
+                Ok(_) => {
+                    if let Some(t) = tmp { std::fs::remove_file(t).ok(); }
+                    return (out.clone(), Some(out), 0.0);
+                }
+                Err(e) => tracing::warn!("upside-down mount: the stereo track could not be turned ({e}); muxing it as recorded"),
             }
         }
     }

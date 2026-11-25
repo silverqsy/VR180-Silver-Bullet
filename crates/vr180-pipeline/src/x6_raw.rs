@@ -204,6 +204,26 @@ pub fn single_eye(path: &Path) -> bool {
     one
 }
 
+/// Whether the take `path` names was shot with the camera upside down
+/// ([`crate::insv_imu::mounted_upside_down`]), from the first seconds of
+/// its accelerometer record. `None`: it has none, or the record says
+/// nothing (a camera on its side).
+pub fn mounted_upside_down(path: &Path) -> Option<bool> {
+    use std::io::Read;
+    let dir = x6b::take_dir(path)?;
+    let mut head = Vec::new();
+    File::open(dir.join(x6b::ACCEL_FILE)).ok()?.take(1 << 18).read_to_end(&mut head).ok()?;
+    const G: f32 = 9.80665;
+    // counter_ticks,x,y,z (m/s²); the last line of the head may be cut short and is left out.
+    let text = String::from_utf8_lossy(&head);
+    let mut lines: Vec<&str> = text.lines().skip(1).collect();
+    lines.pop();
+    crate::insv_imu::mounted_upside_down(lines.iter().filter_map(|line| {
+        let mut fields = line.split(',').skip(1).map(|f| f.trim().parse::<f32>());
+        Some([fields.next()?.ok()? / G, fields.next()?.ok()? / G, fields.next()?.ok()? / G])
+    }))
+}
+
 /// What the take `path` names says of itself as an archive copy
 /// ([`crate::raw_archive`]); `None` for a camera's take. A take is looked at
 /// once (its `clip.json`); later calls touch no file.
@@ -1692,6 +1712,38 @@ impl FisheyePairIter for X6RawIter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A take says which way up the camera was through the first seconds of
+    /// its accelerometer record.
+    #[test]
+    fn a_take_says_which_way_up_the_camera_was() {
+        let dir = std::env::temp_dir().join(format!("vr180-mount-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(x6b::CLIP_FILE), r#"{"layout":"paired-bayer-v1","fps_setting":60,"size":[3840,3840]}"#).unwrap();
+        // No record: nothing to go by.
+        assert_eq!(mounted_upside_down(&dir), None);
+        let record = |x: f32| {
+            let mut text = String::from("counter_ticks,x,y,z\n");
+            for k in 0..400u64 {
+                text.push_str(&format!("{},{},{},{}\n", 330359180137 + k * 19300, x + 0.01 * (k % 3) as f32, -0.2, 0.02));
+            }
+            text
+        };
+        std::fs::write(dir.join(x6b::ACCEL_FILE), record(-9.84)).unwrap();
+        assert_eq!(mounted_upside_down(&dir), Some(false));
+        std::fs::write(dir.join(x6b::ACCEL_FILE), record(9.86)).unwrap();
+        assert_eq!(mounted_upside_down(&dir), Some(true));
+        // One of the take's own files names the take as well.
+        assert_eq!(mounted_upside_down(&dir.join(x6b::CAPTURE_FILE)), Some(true));
+        // On its side: the record says nothing.
+        std::fs::write(dir.join(x6b::ACCEL_FILE), record(0.4)).unwrap();
+        assert_eq!(mounted_upside_down(&dir), None);
+        // A record that holds a header and no more.
+        std::fs::write(dir.join(x6b::ACCEL_FILE), "counter_ticks,x,y,z\n").unwrap();
+        assert_eq!(mounted_upside_down(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The part of a frame a lens puts a picture on: a circle around its
     /// principal point, cut by the frame where the frame is the smaller.

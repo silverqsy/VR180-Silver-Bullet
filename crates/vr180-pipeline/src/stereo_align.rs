@@ -278,9 +278,13 @@ pub fn measure_stereo_align(
     dxs.sort_by(|x, y| x.partial_cmp(y).unwrap());
     let d_yaw = solve_yaw(&dxs);
 
+    // Upside down the offsets stay with their lens (`ViewAdjust::per_eye_matrices`): as the viewer sees it, and that
+    // is how the disparity is measured, a pitch and a yaw offset act on the same eye as upright and a roll offset on
+    // the other one. So the roll that is asked for goes the other way.
+    let sign_roll = if cfg.view_adjust.upside_down { -SIGN_ROLL } else { SIGN_ROLL };
     Ok(StereoAlignResult {
         d_stereo_pitch_deg: SIGN_PITCH * 0.5 * a.to_degrees(),
-        d_stereo_roll_deg:  SIGN_ROLL  * 0.5 * b.to_degrees(),
+        d_stereo_roll_deg:  sign_roll  * 0.5 * b.to_degrees(),
         d_stereo_yaw_deg:   d_yaw.map(|y| SIGN_YAW * 0.5 * y.to_degrees()),
         residual_deg: rms.to_degrees(),
         patches: kept.len(),

@@ -5278,6 +5278,66 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       on screen is noticed when a run starts or the clip is selected again,
       not at once.
 
+53. **A camera mounted upside down: detected, and its alignment, view
+    angles and sound put right (2026-11-25, Mac; UNRELEASED).** The first
+    footage shot upside down (two raw takes of one shoot) and the user's
+    word to fix everything found: the three defects noted when the switch
+    was looked at with upright clips, and the missing detection.
+    - **What was right already** (switch on; headless renders and exports
+      of a 3840 60 fps and a 6000 30 fps take): the picture upright and not
+      mirrored, the eyes on their sides (near objects further left in the
+      right eye), the stabilization as good as upright (frame to frame
+      0.005° rms against 0.36° unstabilized; an upright take 0.0035°).
+    - **Detection** (`insv_imu::mounted_upside_down`): the accelerometer at
+      rest reads one g along the body's upward axis, which through the
+      motion basis is the camera's −y (the picture's top) the right way up
+      and +y turned over; the median of the samples decides, less than half
+      a g says nothing. A raw take: the first 256 KB of `accel.csv`
+      (`x6_raw::mounted_upside_down`, about a millisecond); a camera file:
+      the first 4000 samples of its motion record
+      (`insta360::read_insta360_first_motion`, a few KB). On the takes at
+      hand: +9.8 m/s² on the two shot upside down, −9.8 on the other
+      thirty-odd, upright camera files upright. In the list:
+      `ClipFacts::upside_down` → `BatchItem::upside_down`;
+      `Settings::camera_upside_down_auto` (default on, also for settings
+      kept from before) makes the switch follow it (`follow_the_mount`, at
+      `take_facts` and when a clip is added); a click on the switch turns
+      following off; the kind's template no longer passes the switch on,
+      and *Apply settings to all* leaves each such clip its own.
+    - **The stereo offsets** (`ViewAdjust::per_eye_matrices`): they went by
+      OUTPUT eye, and upside down each output eye shows the other lens.
+      Measured with the alignment solver (deltas pitch / roll): upright
+      with the rig's offsets −0.04 / +0.05; upside down with them +0.11 /
+      +0.42 and +0.11 / +0.40 (two frame sizes), with none +0.03 / +0.20,
+      with all three negated −0.06 / −0.03. Now the left eye upside down is
+      the right eye's upright matrix followed by the half turn (`R ·
+      Rz(180°)`), which in the formula is a sign on all three.
+    - **The global angles**: the half turn is innermost, so a yaw or pitch
+      ahead of it acted in the camera's frame, reversed to the viewer. Now
+      `Rz(180°) · R` of the upright view: yaw and pitch go in reversed,
+      roll as it is. The reframed view's pan and tilt come through the
+      same angles.
+    - **Auto align** (`stereo_align`): its deltas are in the viewer's
+      frame; with the offsets on their lens, pitch and yaw act on the same
+      side as upright and roll on the other, so the roll it returns is
+      negated upside down. With no offsets it now asks for +0.03 / −0.20
+      upside down, the upright rig's own values (+0.04 / −0.19).
+    - **The sound** (`audio::FOA_HALF_TURN`, `fisheye_export::
+      sound_turned`, X6 sources only): W and X kept, Y and Z negated.
+      Stereo: the pair's matrix with its sides changed
+      (`foa_to_stereo_aac_as`), a plain stereo track through
+      `Mix::SwapSides`; Ambisonic: the window encoded again turned
+      (`foa_half_turn_to_aac`, 256 kb/s) in place of the copy; APAC: the
+      turned WAV; the preview player swaps the pair. Checked on exports of
+      one take with and without the switch: stereo left = the other's right
+      (0.999), the four channels +0.996 / −0.993 / −0.999 / +0.999. NOT
+      listened to: that the camera's own processing does not already turn
+      the field is taken from the geometry (nothing in the files speaks of
+      orientation).
+    - **Not done.** Other cameras' sound upside down (the switch is shown
+      for them too); a still has no accelerometer and stays by hand; the
+      window not seen; nothing on Windows.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

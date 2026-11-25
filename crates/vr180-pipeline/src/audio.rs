@@ -119,6 +119,25 @@ pub const FOA_STEREO_MATRIX: [[f32; 4]; 2] = [
     [0.5, -0.353_553_4, 0.0, 0.353_553_4],
 ];
 
+/// A first-order field turned half a turn about its front axis, rows and
+/// columns `[W, Y, Z, X]`: left and right change places, and so do up and
+/// down. This is what the sound of a camera mounted upside down needs: its
+/// microphones were turned with it, and the picture is shown turned back,
+/// so a sound to the viewer's left was recorded on the camera's right.
+pub const FOA_HALF_TURN: [[f32; 4]; 4] = [
+    [1.0,  0.0,  0.0, 0.0],
+    [0.0, -1.0,  0.0, 0.0],
+    [0.0,  0.0, -1.0, 0.0],
+    [0.0,  0.0,  0.0, 1.0],
+];
+
+/// [`FOA_STEREO_MATRIX`] of that turned field: the same pair with its two
+/// sides changed.
+pub const FOA_STEREO_MATRIX_HALF_TURN: [[f32; 4]; 2] = [
+    [0.5, -0.353_553_4, 0.0, 0.353_553_4],
+    [0.5,  0.353_553_4, 0.0, 0.353_553_4],
+];
+
 /// One sample of `[W, Y, Z, X]` → `[L, R]` through [`FOA_STEREO_MATRIX`].
 #[inline]
 pub fn foa_to_stereo_sample(wyzx: [f32; 4]) -> [f32; 2] {
@@ -426,16 +445,24 @@ pub enum Mix<'a> {
     QuadFoa { gain: f32, cal: QuadCalibration },
     /// The QooCam capsules → the stereo pair through [`QuadEncoder`].
     QuadStereo { gain: f32, cal: QuadCalibration },
+    /// A TWO-channel track with its sides changed: left for right. The one
+    /// mix that is not of four channels.
+    SwapSides,
 }
 
 impl Mix<'_> {
     fn out_channels(&self) -> usize {
-        match self { Mix::Matrix(m) => m.len(), Mix::QuadFoa { .. } => 4, Mix::QuadStereo { .. } => 2 }
+        match self { Mix::Matrix(m) => m.len(), Mix::QuadFoa { .. } => 4, Mix::QuadStereo { .. } | Mix::SwapSides => 2 }
+    }
+
+    /// Channels of the track it mixes.
+    fn in_channels(&self) -> usize {
+        match self { Mix::SwapSides => 2, _ => 4 }
     }
 }
 
 /// A [`Mix`] in flight: the matrix, or the encoder with its state.
-enum MixState<'a> { Matrix(&'a [[f32; 4]]), QuadFoa(QuadEncoder), QuadStereo(QuadEncoder) }
+enum MixState<'a> { Matrix(&'a [[f32; 4]]), QuadFoa(QuadEncoder), QuadStereo(QuadEncoder), SwapSides }
 
 impl<'a> MixState<'a> {
     fn new(mix: Mix<'a>, rate: u32) -> Self {
@@ -443,6 +470,7 @@ impl<'a> MixState<'a> {
             Mix::Matrix(m) => MixState::Matrix(m),
             Mix::QuadFoa { gain, cal } => MixState::QuadFoa(QuadEncoder::new(rate, gain).with_calibration(cal)),
             Mix::QuadStereo { gain, cal } => MixState::QuadStereo(QuadEncoder::new(rate, gain).with_calibration(cal)),
+            Mix::SwapSides => MixState::SwapSides,
         }
     }
     #[inline]
@@ -453,6 +481,16 @@ impl<'a> MixState<'a> {
             },
             MixState::QuadFoa(e) => out.extend_from_slice(&e.foa(s)),
             MixState::QuadStereo(e) => out.extend_from_slice(&e.stereo(s)),
+            // (Two channels at a time: `mix_into`.)
+            MixState::SwapSides => {}
+        }
+    }
+
+    /// Packed samples of the track through the mix, onto `out`.
+    fn mix_into(&mut self, src: &[f32], out: &mut Vec<f32>) {
+        match self {
+            MixState::SwapSides => for s in src.chunks_exact(2) { out.extend_from_slice(&[s[1], s[0]]); },
+            _ => for s in src.chunks_exact(4) { self.apply([s[0], s[1], s[2], s[3]], out); },
         }
     }
 }
@@ -678,8 +716,8 @@ fn transcode_audio_window(
     let rate = decoder.rate();
     let src_layout = normalized_layout(decoder.channel_layout());
     let in_ch = src_layout.channels().max(1) as usize;
-    if mix.is_some() && in_ch != 4 {
-        return Err(Error::Ffmpeg(format!("a 4-channel mix needs 4 input channels, stream has {in_ch}")));
+    if let Some(wanted) = mix.map(|m| m.in_channels()).filter(|n| *n != in_ch) {
+        return Err(Error::Ffmpeg(format!("a {wanted}-channel mix needs {wanted} input channels, stream has {in_ch}")));
     }
     // Decoded frames → packed f32 at the source rate (format change only).
     let mut to_f32 = ffmpeg::software::resampling::Context::get(
@@ -817,7 +855,7 @@ fn transcode_audio_window(
             *d -= take;
         }
         match mix_state.as_mut() {
-            Some(m) => for s in src.chunks_exact(4) { m.apply([s[0], s[1], s[2], s[3]], pending); },
+            Some(m) => m.mix_into(src, pending),
             None => pending.extend_from_slice(src),
         }
     };
@@ -858,6 +896,12 @@ fn transcode_audio_window(
 /// `.m4a` starting at its own 0, like [`foa_to_stereo_aac`]. Returns the
 /// samples written.
 pub fn stereo_to_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Option<f64>, bit_rate: usize) -> Result<u64> {
+    stereo_to_aac_as(input, output_m4a, offset_s, dur_s, bit_rate, false)
+}
+
+/// [`stereo_to_aac`]; `turned`: with the two sides changed, for a camera
+/// that was mounted upside down ([`FOA_HALF_TURN`] has why).
+pub fn stereo_to_aac_as(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Option<f64>, bit_rate: usize, turned: bool) -> Result<u64> {
     let (stream_index, channels, _rate) = probe_any_audio(input)?
         .ok_or_else(|| Error::Ffmpeg(format!("no audio track in {input:?}")))?;
     if channels != 2 {
@@ -866,7 +910,7 @@ pub fn stereo_to_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Opti
     let t0 = std::time::Instant::now();
     let n = transcode_audio_window(
         input, stream_index, output_m4a, offset_s, dur_s,
-        None, AudioOut::AacStereo { bit_rate },
+        turned.then_some(Mix::SwapSides), AudioOut::AacStereo { bit_rate },
     )?;
     tracing::info!(m4a = %output_m4a.display(), samples = n, took_ms = t0.elapsed().as_millis() as u64,
         "audio: encoded a stereo window to AAC");
@@ -904,17 +948,42 @@ pub fn four_channel_to_wav(input: &Path, output_wav: &Path) -> Result<u64> {
 /// `None`); the file starts exactly at `offset_s`, so a mux plays it from
 /// its own 0. Returns the number of samples written.
 pub fn foa_to_stereo_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Option<f64>, bit_rate: usize) -> Result<u64> {
+    foa_to_stereo_aac_as(input, output_m4a, offset_s, dur_s, bit_rate, false)
+}
+
+/// [`foa_to_stereo_aac`]; `turned`: of the field turned half a turn about
+/// its front axis, for a camera that was mounted upside down
+/// ([`FOA_HALF_TURN`]).
+pub fn foa_to_stereo_aac_as(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Option<f64>, bit_rate: usize, turned: bool) -> Result<u64> {
     let info = probe_foa_aac(input)?
         .ok_or_else(|| Error::Ffmpeg(format!("no 4-channel AAC (360° Audio) track in {input:?}")))?;
     let t0 = std::time::Instant::now();
+    let matrix = if turned { &FOA_STEREO_MATRIX_HALF_TURN[..] } else { &FOA_STEREO_MATRIX[..] };
     let n = transcode_audio_window(
         input, info.stream_index, output_m4a, offset_s, dur_s,
-        Some(Mix::Matrix(&FOA_STEREO_MATRIX[..])), AudioOut::AacStereo { bit_rate },
+        Some(Mix::Matrix(matrix)), AudioOut::AacStereo { bit_rate },
     )?;
     tracing::info!(m4a = %output_m4a.display(), samples = n, sample_rate = info.sample_rate,
         window_start_s = offset_s, window_s = dur_s.unwrap_or(f64::NAN), took_ms = t0.elapsed().as_millis() as u64,
         "X6 360° Audio: decoded first-order AmbiX to a front-facing stereo AAC");
     Ok(n)
+}
+
+/// The window of a first-order AmbiX track turned half a turn about its
+/// front axis ([`FOA_HALF_TURN`]), as a four-channel AAC `.m4a` that starts
+/// at its own 0: the sound field of a camera that was mounted upside down,
+/// which cannot be copied as it is. Returns the samples written.
+pub fn foa_half_turn_to_aac(input: &Path, output_m4a: &Path, offset_s: f64, dur_s: Option<f64>, bit_rate: usize) -> Result<u64> {
+    let info = probe_spatial_4ch(input)?
+        .ok_or_else(|| Error::Ffmpeg(format!("no 4-channel ambisonic track in {input:?}")))?;
+    transcode_audio_window(input, info.stream_index, output_m4a, offset_s, dur_s, Some(Mix::Matrix(&FOA_HALF_TURN[..])), AudioOut::Aac4 { bit_rate })
+}
+
+/// The same turned field as a 24-bit WAV: what the APAC encoder is given.
+pub fn foa_half_turn_to_wav(input: &Path, output_wav: &Path, offset_s: f64, dur_s: Option<f64>) -> Result<u64> {
+    let info = probe_spatial_4ch(input)?
+        .ok_or_else(|| Error::Ffmpeg(format!("no 4-channel ambisonic track in {input:?}")))?;
+    transcode_audio_window(input, info.stream_index, output_wav, offset_s, dur_s, Some(Mix::Matrix(&FOA_HALF_TURN[..])), AudioOut::Pcm24 { channels: 4 })
 }
 
 /// Peak the export window will reach, normalised so a QooCam export is
@@ -1531,6 +1600,36 @@ pub fn mux_video_with_audio_stream(
 #[cfg(test)]
 mod foa_tests {
     use super::*;
+
+    /// The sound of a camera mounted upside down: the field turned half a
+    /// turn about its front axis, and the stereo pair of that field.
+    #[test]
+    fn a_field_turned_half_a_turn_changes_its_sides_and_its_height() {
+        let through = |m: &[[f32; 4]], v: [f32; 4]| -> Vec<f32> { m.iter().map(|row| (0..4).map(|k| row[k] * v[k]).sum()).collect() };
+        // W and the front stay; left and up change sign.
+        assert_eq!(through(&FOA_HALF_TURN, [0.3, 0.5, -0.2, 0.7]), vec![0.3, -0.5, 0.2, 0.7]);
+        // Twice is no turn.
+        let twice = through(&FOA_HALF_TURN, [0.3, -0.5, 0.2, 0.7]);
+        assert_eq!(twice, vec![0.3, 0.5, -0.2, 0.7]);
+        // The stereo pair of the turned field is the pair with its two sides changed, for any sample.
+        for v in [[0.3f32, 0.5, -0.2, 0.7], [1.0, -1.0, 0.4, 0.0], [0.2, 0.0, 0.9, -0.6]] {
+            let [l, r] = foa_to_stereo_sample(v);
+            let turned = through(&FOA_STEREO_MATRIX_HALF_TURN, v);
+            assert!((turned[0] - r).abs() < 1e-6 && (turned[1] - l).abs() < 1e-6, "{v:?}");
+            let turned_field: Vec<f32> = through(&FOA_HALF_TURN, v);
+            let again = foa_to_stereo_sample([turned_field[0], turned_field[1], turned_field[2], turned_field[3]]);
+            assert!((again[0] - r).abs() < 1e-6 && (again[1] - l).abs() < 1e-6, "{v:?}");
+        }
+        // The one mix of two channels.
+        assert_eq!((Mix::SwapSides.in_channels(), Mix::SwapSides.out_channels()), (2, 2));
+        assert_eq!((Mix::Matrix(&FOA_HALF_TURN[..]).in_channels(), Mix::Matrix(&FOA_HALF_TURN[..]).out_channels()), (4, 4));
+        let mut out = Vec::new();
+        MixState::new(Mix::SwapSides, 48_000).mix_into(&[0.1, 0.2, 0.3, 0.4], &mut out);
+        assert_eq!(out, vec![0.2, 0.1, 0.4, 0.3]);
+        out.clear();
+        MixState::new(Mix::Matrix(&FOA_HALF_TURN[..]), 48_000).mix_into(&[0.3, 0.5, -0.2, 0.7], &mut out);
+        assert_eq!(out, vec![0.3, -0.5, 0.2, 0.7]);
+    }
 
     #[test]
     fn frontal_source_is_centred_and_left_source_favours_left() {

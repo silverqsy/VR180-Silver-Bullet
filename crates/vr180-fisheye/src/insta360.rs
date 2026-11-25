@@ -691,6 +691,29 @@ pub fn read_insta360_meta(path: &Path) -> Result<Insta360Meta> {
     read_meta(path, true)
 }
 
+/// The first `samples` motion samples of the file, and nothing else of its
+/// motion record: enough to say which way up the camera was, at the cost
+/// of a few KB (the whole record is a megabyte a minute).
+pub fn read_insta360_first_motion(path: &Path, samples: usize) -> Result<Vec<InsvImuSample>> {
+    let mut f = std::fs::File::open(path)?;
+    let file_len = f.metadata()?.len();
+    let (entries, _) = read_directory(&mut f, file_len)?;
+    let find = |id: u16| entries.iter().copied().find(|e| e.id == id);
+    // (The sensors' ranges are in the identity record.)
+    let mut meta = Insta360Meta::default();
+    if let Some(loc) = find(REC_IDENTITY) {
+        parse_identity(&read_record(&mut f, loc)?, &mut meta);
+    }
+    let Some(loc) = find(REC_IMU) else { return Ok(Vec::new()) };
+    let len = (loc.size as usize).min(samples * 20);
+    f.seek(SeekFrom::Start(loc.payload_start))?;
+    let mut bytes = vec![0u8; len];
+    f.read_exact(&mut bytes)?;
+    let acc_lsb = meta.acc_range_g.map(|r| 32768.0 / r as f32).unwrap_or(INSV_ACCEL_LSB_PER_G);
+    let gyr_lsb = meta.gyro_range_dps.map(|r| 32768.0 / r as f32).unwrap_or(INSV_GYRO_LSB_PER_DPS);
+    Ok(parse_imu(&bytes, acc_lsb, gyr_lsb))
+}
+
 fn read_meta(path: &Path, with_motion: bool) -> Result<Insta360Meta> {
     let mut f = std::fs::File::open(path)?;
     let file_len = f.metadata()?.len();
