@@ -5104,8 +5104,9 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       stayed on: kept with the project and the session, so the next Export
       wrote copies where a video was meant.
     - **Where they are.** `draw_take_tools` under `draw_source_info`, for a
-      raw take on screen: two buttons, *Archive copy* and *Camera original
-      DNGs*; the open one (`TakeTools::open`) shows its choices, the takes a
+      raw take on screen: the heading *RAW Footage Archiving* and two
+      buttons, *Compressed archive* and *Camera original DNGs* (the
+      user's names for them); the open one (`TakeTools::open`) shows its choices, the takes a
       run would write with what is written of each, where the folders go,
       and the button that starts the run. `take_tools_ui` is a function of
       its view (`TakeToolsView`) so the tests paint and click it. A run is

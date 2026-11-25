@@ -834,6 +834,10 @@ enum TakeAsk {
     Keep,
 }
 
+/// The heading over the two buttons, and what the buttons say.
+const TAKE_TOOLS_TITLE: &str = "RAW Footage Archiving";
+const TAKE_ARCHIVE_LABEL: &str = "Compressed archive";
+const TAKE_ORIGINALS_LABEL: &str = "Camera original DNGs";
 const TAKE_ARCHIVE_HOVER: &str = "A smaller copy of the take for keeping, which opens like the take.";
 const TAKE_ARCHIVE_NOTE: &str = "The take's folder again with a smaller capture, which opens like the take: every frame, its timing and the files beside it are kept. The take itself is left as it is.";
 const TAKE_EXACT_NOTE: &str = "Every sample is kept as the camera recorded it, and each frame is read back and compared before it is written. Most takes come out a quarter to a third smaller, a 14-bit take that keeps every value about an eighth.";
@@ -1696,7 +1700,7 @@ mod export_size_tests {
         assert!(text.contains("DNG sequence") && text.contains("Every frame as a linear DNG in a folder") && text.contains("Codec"), "{text}");
         // (The folder of the camera's own frames is still named where enhanced frames are explained.)
         let offers = |text: &str, choice: &str| text.lines().any(|line| line == choice);
-        for gone in ["Archive copy", "Camera original", "Developed view"] {
+        for gone in ["Archive copy", "Compressed archive", "Camera original", "Camera original DNGs", "Developed view"] {
             assert!(!offers(&text, gone), "{gone}: {text}");
         }
         assert!(!text.contains("bit a pixel") && !text.contains("sensor's own"), "{text}");
@@ -2375,6 +2379,9 @@ mod take_tests {
         }
     }
 
+    /// The take tools with neither button open: their heading and the two.
+    const CLOSED: &str = "RAW Footage Archiving\nCompressed archive\nCamera original DNGs";
+
     /// Everything the take tools paint, and what they ask for. `click`: a
     /// text on them to click first; what is painted and asked for is then
     /// what follows the click.
@@ -2508,12 +2515,12 @@ mod take_tests {
         let takes = [take("TAKE", 120.0, (Some(12.3), Some(45.6)))];
         let view = TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true };
         let mut tools = TakeTools::default();
-        // Closed: the two buttons, nothing else.
+        // Closed: the heading and the two buttons, nothing else.
         let (text, ask) = shown(&mut tools, &view, None);
-        assert_eq!((text.as_str(), ask), ("Archive copy\nCamera original DNGs", None));
+        assert_eq!((text.as_str(), ask), (CLOSED, None));
 
         // The archive copy: its sizes, the stretch from In to Out by default, and what that leaves out.
-        let (text, ask) = shown(&mut tools, &view, Some("Archive copy"));
+        let (text, ask) = shown(&mut tools, &view, Some("Compressed archive"));
         assert_eq!((tools.open, ask), (Some(TakeTool::Archive), None));
         for said in [
             "Lossless: every sample kept", "High quality: 1 bit a pixel", "Custom", TAKE_ARCHIVE_NOTE, TAKE_LOSSY_NOTE,
@@ -2578,7 +2585,7 @@ mod take_tests {
         // A take that is no copy and cannot be copied (its description did not read): nothing is claimed of it.
         let unread = [take("TAKE", 33.3, (None, None))];
         let (text, _) = shown(&mut tools, &TakeToolsView { archive: &[], originals: &unread, copies: &[], failed: &[], out_dir: None, idle: true }, None);
-        assert_eq!(text, "Archive copy\nCamera original DNGs");
+        assert_eq!(text, CLOSED);
 
         let takes = [take("TAKE", 120.0, (None, None))];
         let copy = |name: &str| TakeCopy { dir: format!("/takes/{name}_Archive").into(), begins_s: 0.0, bytes: 5_400_000_000, source_bytes: 8_000_000_000 };
@@ -2610,11 +2617,11 @@ mod take_tests {
         let (text, _) = shown(&mut tools, &view, Some("Whole take"));
         assert!(tools.originals_whole && !tools.archive_whole && text.contains("3600 frames"), "{text}");
         // The other button closes this one's choices and opens its own.
-        let (text, _) = shown(&mut tools, &view, Some("Archive copy"));
+        let (text, _) = shown(&mut tools, &view, Some("Compressed archive"));
         assert!(tools.open == Some(TakeTool::Archive) && !text.contains(TAKE_ORIGINALS_NOTE), "{text}");
         // Clicked again, it closes.
-        let (text, _) = shown(&mut tools, &view, Some("Archive copy"));
-        assert_eq!((tools.open, text.as_str()), (None, "Archive copy\nCamera original DNGs"));
+        let (text, _) = shown(&mut tools, &view, Some("Compressed archive"));
+        assert_eq!((tools.open, text.as_str()), (None, CLOSED));
 
         let lossy = [TakeView { copy: true, lossy_copy: true, ..take("TAKE_Archive", 33.3, (None, None)) }];
         let mut tools = TakeTools { open: Some(TakeTool::Originals), ..Default::default() };
@@ -2628,7 +2635,7 @@ mod take_tests {
         for text in [
             TAKE_ARCHIVE_HOVER, TAKE_ARCHIVE_NOTE, TAKE_EXACT_NOTE, TAKE_LOSSY_NOTE, TAKE_STRETCH_NOTE, TAKE_COPY_SOURCE_NOTE, TAKE_ORIGINALS_NOTE,
             TAKE_ORIGINALS_PLACE_NOTE, TAKE_LOSSY_SOURCE_NOTE, TAKE_USE_COPY_HOVER, TAKE_BUSY_HOVER,
-            "Archive copy", "Camera original DNGs", "Lossless: every sample kept", "High quality: 1 bit a pixel", "Custom", "bit a pixel",
+            TAKE_TOOLS_TITLE, TAKE_ARCHIVE_LABEL, TAKE_ORIGINALS_LABEL, "Archive copy", "Lossless: every sample kept", "High quality: 1 bit a pixel", "Custom", "bit a pixel",
             "Range", "In to Out", "Whole take", "Use the copy", "Use all the copies",
         ] {
             assert_ne!(tr_zh(text), text, "{text}");
@@ -3952,6 +3959,8 @@ fn tr_zh(en: &'static str) -> &'static str {
         "View" => "视图",
         "DNG sequence" => "DNG 序列",
         "Archive copy" => "存档副本",
+        "RAW Footage Archiving" => "RAW 素材存档",
+        "Compressed archive" => "压缩存档",
         "Camera original DNGs" => "相机原片 DNG",
         "The take's folder again with a smaller capture, which opens like the take: every frame, its timing and the files beside it are kept. The take itself is left as it is."
             => "再写一份素材文件夹，采集文件更小，打开方式和原素材一样：每一帧、它的时间信息和旁边的文件都保留。原素材保持不动。",
@@ -11588,8 +11597,9 @@ impl App {
         }
     }
 
-    /// Under the facts of a raw take on screen: the two things written of
-    /// the take itself ([`TakeJob`]), each behind its button.
+    /// Under the facts of a raw take on screen, under a heading of their
+    /// own: the two things written of the take itself ([`TakeJob`]), each
+    /// behind its button.
     fn draw_take_tools(&mut self, ui: &mut egui::Ui) {
         if !self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) {
             return;
@@ -11619,8 +11629,8 @@ impl App {
         }
     }
 
-    /// The take tools themselves: a button each, and under the one that is
-    /// open its choices, what a run would write of which take and what it
+    /// The take tools themselves: their heading, a button each, and under
+    /// the one that is open its choices, what a run would write of which take and what it
     /// would leave out, where that goes, and the button that starts it.
     /// Nothing here is an export choice: a run is started by its button,
     /// for that run. Returns what was asked for.
@@ -11629,11 +11639,12 @@ impl App {
         let note = |ui: &mut egui::Ui, text: &str| { ui.label(RichText::new(text).small().color(Color32::GRAY)); };
         let warn = |ui: &mut egui::Ui, text: &str| { ui.label(RichText::new(text).small().color(Color32::from_rgb(255, 200, 120))); };
         let mut ask = None;
-        ui.add_space(4.0);
+        ui.add_space(6.0);
+        ui.label(RichText::new(tr(TAKE_TOOLS_TITLE)).strong());
         ui.horizontal_wrapped(|ui| {
             for (tool, label, hover) in [
-                (TakeTool::Archive, "Archive copy", TAKE_ARCHIVE_HOVER),
-                (TakeTool::Originals, "Camera original DNGs", TAKE_ORIGINALS_NOTE),
+                (TakeTool::Archive, TAKE_ARCHIVE_LABEL, TAKE_ARCHIVE_HOVER),
+                (TakeTool::Originals, TAKE_ORIGINALS_LABEL, TAKE_ORIGINALS_NOTE),
             ] {
                 let mut open = tools.open == Some(tool);
                 if ui.toggle_value(&mut open, tr(label)).on_hover_text(tr(hover)).changed() {

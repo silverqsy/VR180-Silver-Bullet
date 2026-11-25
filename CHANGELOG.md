@@ -6,11 +6,12 @@
 
 A raw take is large: 40 to 80 GB a minute. The camera has to write a
 gigabyte a second, and packs its samples with what a processor can do at
-that pace. **Archive copy**, a button under a raw take's facts in the
-Source panel, writes the take's folder again with a smaller capture, and
-the app opens the copy like the take: every frame with its number and its
-timing, the gyro log, the lens record and the sound beside it, the same
-development, stabilization and exports. There are three sizes to pick from.
+that pace. Under **RAW Footage Archiving**, below a raw take's facts in the
+Source panel, **Compressed archive** writes the take's folder again with a
+smaller capture, and the app opens that archive copy like the take: every
+frame with its number and its timing, the gyro log, the lens record and the
+sound beside it, the same development, stabilization and exports. There are
+three sizes to pick from.
 
 - **Lossless.** Every sample is kept as the camera recorded it. Most takes
   come out a quarter to a third smaller (23 to 40 % on the takes measured);
@@ -66,7 +67,9 @@ development, stabilization and exports. There are three sizes to pick from.
   until now a kind of DNG sequence in Export format) are not views of the
   take: no size, grade, stabilization or noise reduction applies to them,
   and what they write is read again as a source. Each has its own button
-  under the take's facts. It runs for the ticked takes, or for the one on
+  under the take's facts, under the heading RAW Footage Archiving
+  (**Compressed archive** and **Camera original DNGs**). It runs for the
+  ticked takes, or for the one on
   screen, from In to Out or whole, through the export queue (progress,
   Skip and Stop in the export bar), and leaves what was exported or waits
   to be as it found it. Export format keeps the take's views: a video, or
