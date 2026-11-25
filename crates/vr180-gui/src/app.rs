@@ -561,6 +561,16 @@ fn spatial_view_scaled_note(template: &str, hfov_deg: f32, aspect_w_over_h: f32)
         .replace("{limit}", &format!("{shown_h:.0}")))
 }
 
+/// How small an archive copy of a raw clip is to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+enum ArchiveSize {
+    /// One bit a pixel: the largest lossy copy worth making.
+    #[default]
+    HighQuality,
+    /// The bits a pixel picked by hand.
+    Custom,
+}
+
 /// Output container for a STILL source (Insta360 X6 `.dng`). Videos
 /// use `ExportCodec`; stills use this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -709,7 +719,7 @@ impl ExportResolution {
 /// is above zero; a folder of DNG frames (the developed view or the camera's
 /// own) and a still are written without it, whatever the clip's setting.
 fn export_runs_noise_filter(kind: vr180_pipeline::SourceKind, denoise_strength: f32, opts: &ExportOptions) -> bool {
-    denoise_strength > 0.0 && !kind.is_still() && !(kind.is_raw_video() && opts.raw_dng_sequence)
+    denoise_strength > 0.0 && !kind.is_still() && !(kind.is_raw_video() && (opts.raw_dng_sequence || opts.raw_archive))
 }
 
 /// Which list of sizes a clip picks from. Each list has a choice of its
@@ -891,6 +901,14 @@ pub(crate) struct ExportOptions {
     /// eye per frame: no projection, no stabilization, no grade) and not
     /// the developed view.
     raw_dng_original: bool,
+    /// A raw video clip exports as an archive copy: the take's folder again
+    /// with a far smaller capture, which opens like the take (used only
+    /// when the source is a raw video; a DNG sequence is then off).
+    raw_archive: bool,
+    /// The size of that copy: the app's own choice, or the bits a pixel below.
+    raw_archive_size: ArchiveSize,
+    /// Bits a pixel of a copy whose size is picked by hand.
+    raw_archive_bits: f32,
     /// A raw video clip's frames come from the folder of its camera-original
     /// DNGs where a raw converter has enhanced them (the folder beside the
     /// take, see `default_frames_dir_for`).
@@ -1168,7 +1186,7 @@ mod export_size_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, lens_space, stabilized, single_eye, raw);
+                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, lens_space, stabilized, single_eye, raw, false);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -1251,6 +1269,34 @@ mod export_size_tests {
         assert!(!export_runs_noise_filter(raw, 0.71, &frames) && !export_runs_noise_filter(raw, 0.71, &original));
         // Another clip in the same list is a video whatever the raw option says.
         assert!(export_runs_noise_filter(vr180_pipeline::SourceKind::Insta360Insv, 0.5, &original));
+    }
+
+    /// An archive copy of a raw take: the take's own frames at a size in
+    /// bits a pixel, with no view, no size list, no codec and no noise
+    /// filter; its folder is named after the take.
+    #[test]
+    fn an_archive_copy_is_a_size_in_bits_and_a_folder() {
+        let mut opts = ExportOptions { raw_archive: true, ..Default::default() };
+        assert_eq!(opts.archive_bits(), Some(1.0));
+        let text = panel_text_full(&mut opts, (11520, 5760), None, None, false, false, Some(EnhancedFrames::Absent));
+        assert!(text.contains("Archive copy") && text.contains("High quality: 1 bit a pixel") && text.contains("Custom"), "{text}");
+        // 1 bit of 11520 × 5760 thirty times a second: 14.9 GB a minute.
+        assert!(text.contains("about 14.9 GB a minute"), "{text}");
+        assert!(!text.contains("Codec") && !text.contains("(native)") && !text.contains("Camera original"), "{text}");
+        // A size picked by hand stays between the two ends.
+        opts.raw_archive_size = super::ArchiveSize::Custom;
+        for (asked, got) in [(0.75f32, 0.75f64), (0.2, 0.5), (3.0, 1.0)] {
+            opts.raw_archive_bits = asked;
+            assert!((opts.archive_bits().unwrap() - got).abs() < 1e-6);
+        }
+        assert_eq!(ExportOptions::default().archive_bits(), None);
+        // Picking a DNG sequence in the panel is not for this test to click; the two never export together: the copy comes first.
+        let raw = vr180_pipeline::SourceKind::X6Raw;
+        assert!(!export_runs_noise_filter(raw, 0.71, &opts));
+        assert_eq!(App::default_archive_dir_for(std::path::Path::new("/takes/TAKE")), std::path::PathBuf::from("/takes/TAKE_Archive"));
+        // What a file kept from before this option holds: no copy.
+        let kept: ExportOptions = serde_json::from_str(r#"{"raw_dng_sequence":true}"#).unwrap();
+        assert!(kept.raw_dng_sequence && !kept.raw_archive && kept.raw_archive_size == super::ArchiveSize::HighQuality);
     }
 
     /// The export of a raw take carries both sizes: the one picked without
@@ -2228,7 +2274,7 @@ mod spatial_export_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, None, false, false, None);
+                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, None, false, false, None, false);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -2390,6 +2436,16 @@ impl ExportOptions {
         }
     }
 
+    /// Bits a pixel of the archive copy a raw clip exports as; `None` when
+    /// it exports as something else.
+    fn archive_bits(&self) -> Option<f64> {
+        use vr180_pipeline::raw_archive::{BITS_LEAST, BITS_MOST};
+        self.raw_archive.then(|| match self.raw_archive_size {
+            ArchiveSize::HighQuality => BITS_MOST,
+            ArchiveSize::Custom => (self.raw_archive_bits as f64).clamp(BITS_LEAST, BITS_MOST),
+        })
+    }
+
     /// The codec an export of a clip with `settings` really uses: spatial
     /// video only where it exists ([`spatial_video_available`], and never
     /// for a still); everywhere else that choice runs as H.265. The choice
@@ -2419,6 +2475,9 @@ impl Default for ExportOptions {
             codec: ExportCodec::H265,
             raw_dng_sequence: false,
             raw_dng_original: false,
+            raw_archive: false,
+            raw_archive_size: ArchiveSize::HighQuality,
+            raw_archive_bits: 0.75,
             raw_use_enhanced: true,
             still_format: StillFormatChoice::Png16,
             resolution: ExportResolution::R8k,
@@ -2924,6 +2983,23 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Output" => "输出",
         "View" => "视图",
         "DNG sequence" => "DNG 序列",
+        "Archive copy" => "存档副本",
+        "every sample kept" => "每个样本都保留",
+        "This clip is an archive copy of a take, made by this app: not the camera's own recording." => "这个片段是素材的存档副本，由本软件制作，不是相机自己的记录。",
+        "High quality: 1 bit a pixel" => "高质量：每像素 1 bit",
+        "Custom" => "自定义",
+        "bit a pixel" => "bit 每像素",
+        "about" => "约",
+        "a minute" => "每分钟",
+        "A smaller copy of the take for keeping, which opens like the take." => "素材的一个更小的副本，用于存档，打开方式和原素材一样。",
+        "The take's folder again with a capture a fraction of the size, which opens like the take: every frame, its timing and the files beside it are kept. The copy is lossy: at 1 bit a pixel a frame is off by less than its own noise; below that the shadows lose their grain when they are lifted. Only the stretch between In and Out is copied. The take itself is left as it is."
+            => "再写一份素材文件夹，采集文件只有原来的几分之一大，打开方式和原素材一样：每一帧、它的时间信息和旁边的文件都保留。副本是有损的：每像素 1 bit 时，一帧的偏差小于它自身的噪声；再低，暗部提亮后会失去颗粒。只复制入点到出点之间的部分。原素材保持不动。",
+        "An archive copy holds the take's own frames: the view and its size, the grade, stabilization and noise reduction are not applied to them."
+            => "存档副本保存的是素材自己的帧：视图及其尺寸、调色、防抖和降噪都不会作用到它们上面。",
+        "This clip is an archive copy of a take: a copy is made from the camera's take, not from another copy."
+            => "这个片段本身就是素材的存档副本：副本要从相机的原素材制作，不能从另一个副本制作。",
+        "An archive copy is a folder for each clip: it cannot be joined. Pick a video format in Format."
+            => "存档副本是每个片段一个文件夹，无法拼接。请在“格式”里选择一种视频格式。",
         "Developed view" => "显影后的画面",
         "Use enhanced frames" => "使用增强后的帧",
         "Camera original frames are the sensor's own: the view and its size, the grade, stabilization and noise reduction are not applied to them."
@@ -4352,6 +4428,16 @@ impl App {
             .join(format!("{stem}_{}", if original { "OriginalDNG" } else { "DNG" }))
     }
 
+    /// The folder of a raw video clip's archive copy: `<source_stem>_Archive`
+    /// next to the take's folder.
+    fn default_archive_dir_for(source: &std::path::Path) -> PathBuf {
+        let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+        source.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+            .join(format!("{stem}_Archive"))
+    }
+
     /// `<source_stem>_SBS.<png|jpg|dng>` next to the source (stills).
     fn default_still_output_for(source: &std::path::Path, format: StillFormatChoice) -> PathBuf {
         let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
@@ -4734,6 +4820,7 @@ impl App {
         let still_format = self.batch_opts.unwrap_or(self.export_opts).still_format;
         let raw_frames = cfg.source_kind.is_raw_video() && self.batch_opts.unwrap_or(self.export_opts).raw_dng_sequence;
         let raw_original = raw_frames && self.batch_opts.unwrap_or(self.export_opts).raw_dng_original;
+        let raw_archive = self.batch_opts.unwrap_or(self.export_opts).archive_bits().filter(|_| cfg.source_kind.is_raw_video());
 
         // Stop preview playback when it reads the SAME file as the export
         // (they'd race on the decoder / file). Previewing a DIFFERENT clip
@@ -4794,6 +4881,13 @@ impl App {
                         fps_avg: done as f32 / t0.elapsed().as_secs_f32().max(1e-3),
                     });
                 })
+            } else if let Some(bits) = raw_archive {
+                // A raw video clip as an archive copy of its take.
+                vr180_pipeline::raw_archive::export_archive(
+                    &cfg.source_path, &cfg.output_path, cfg.trim_in_s, cfg.trim_out_s, bits,
+                    move |p| { let _ = progress_tx2.try_send(p); },
+                    cancel_for_thread,
+                ).map(|_| ())
             } else if raw_original {
                 // A raw video clip's frames as the sensor recorded them.
                 vr180_pipeline::sensor_dng::export_sensor_dng_sequence(
@@ -5434,6 +5528,8 @@ impl App {
     fn batch_output_for(&self, item: &BatchItem, opts: &ExportOptions) -> PathBuf {
         let mut out = if item.source_kind.is_still() {
             Self::default_still_output_for(&item.path, opts.still_format)
+        } else if item.source_kind.is_raw_video() && opts.raw_archive {
+            Self::default_archive_dir_for(&item.path)
         } else if item.source_kind.is_raw_video() && opts.raw_dng_sequence {
             Self::default_frames_dir_for(&item.path, opts.raw_dng_original)
         } else {
@@ -5488,6 +5584,9 @@ impl App {
             let name = clip_label(&item.path);
             if item.source_kind.is_still() {
                 return Err(format!("{name} {}", tr("is a still photo: a joined file is made of video clips.")));
+            }
+            if item.source_kind.is_raw_video() && opts.raw_archive {
+                return Err(tr("An archive copy is a folder for each clip: it cannot be joined. Pick a video format in Format.").to_string());
             }
             if item.source_kind.is_raw_video() && opts.raw_dng_sequence {
                 return Err(tr("A DNG sequence is a folder of frames for each clip: it cannot be joined. Pick a video format in Format.").to_string());
@@ -7574,9 +7673,14 @@ impl App {
         };
         let raw_frames = self.export_opts.raw_dng_sequence
             && self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
+        let raw_archive = self.export_opts.archive_bits()
+            .filter(|_| self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()));
         let fmt_label = if is_still {
             // A still has no codec / bitrate: container + size only.
             format!("{} · {}", self.export_opts.still_format.label(), res_label)
+        } else if let Some(bits) = raw_archive {
+            // The take's own frames, smaller: neither the view nor its size applies.
+            format!("{} · {bits:.2} {}", tr("Archive copy"), tr("bit a pixel"))
         } else if raw_frames && self.export_opts.raw_dng_original {
             // The sensor's own frames: neither the view nor its size applies.
             format!("{} · {} · 3840 × 3840 {}", tr("DNG sequence"), tr("camera original"), tr("per eye"))
@@ -7767,6 +7871,8 @@ impl App {
             let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
             // A raw video clip, and what is known of its enhanced frames.
             let raw_video = enhanced;
+            let archive_source = raw_video.is_some()
+                && self.loaded_path.as_deref().is_some_and(|p| vr180_pipeline::x6_raw::archive_note(p).is_some());
             let native_dims = self.native_sbs_dims();
             let single_eye = self.clip_single_eye();
             // A Crop clip's native-sharpness canvas (side by side, or the one
@@ -7787,7 +7893,7 @@ impl App {
                         self.settings.reframe_aspect_if_active(),
                         (self.settings.reframe_hfov_deg, self.settings.reframe_defish),
                         clip_fps, is_still, native_dims, sharp_dims, lens_space,
-                        self.settings.stabilize, single_eye, raw_video);
+                        self.settings.stabilize, single_eye, raw_video, archive_source);
                 });
             self.show_export_settings = open;
         }
@@ -7821,6 +7927,8 @@ impl App {
         // frames), and what is known of its enhanced frames; `None` for any
         // other clip.
         raw_video: Option<EnhancedFrames>,
+        // The clip is an archive copy of a raw take: no copy is made of it.
+        archive_source: bool,
     ) {
         // Spatial video is offered for the reframed view on macOS. Selected
         // on a clip it does not exist for, the choice shows (and exports) as
@@ -7835,7 +7943,11 @@ impl App {
         // The camera's own frames have no view and no size to pick: the list
         // that would offer one is not shown for them.
         let camera_original = raw_video.is_some() && !is_still && opts.raw_dng_sequence && opts.raw_dng_original;
-        if camera_original {
+        let archive_copy = raw_video.is_some() && !is_still && opts.raw_archive && !archive_source;
+        if archive_copy {
+            ui.label(RichText::new(tr("An archive copy holds the take's own frames: the view and its size, the grade, stabilization and noise reduction are not applied to them."))
+                .small().color(Color32::GRAY));
+        } else if camera_original {
             ui.label(RichText::new(tr("Resolution")).strong());
             ui.label(format!("3840 × 3840 {}", tr("per eye")));
             ui.label(RichText::new(tr("Camera original frames are the sensor's own: the view and its size, the grade, stabilization and noise reduction are not applied to them."))
@@ -7991,7 +8103,36 @@ impl App {
         }
 
         if let Some(found) = raw_video {
-            ui.checkbox(&mut opts.raw_dng_sequence, tr("DNG sequence"));
+            if archive_source {
+                ui.label(RichText::new(tr("This clip is an archive copy of a take: a copy is made from the camera's take, not from another copy."))
+                    .small().color(Color32::GRAY));
+            } else {
+                if ui.checkbox(&mut opts.raw_archive, tr("Archive copy")).changed() && opts.raw_archive {
+                    opts.raw_dng_sequence = false;
+                }
+                if opts.raw_archive {
+                    ui.radio_value(&mut opts.raw_archive_size, ArchiveSize::HighQuality, tr("High quality: 1 bit a pixel"));
+                    ui.radio_value(&mut opts.raw_archive_size, ArchiveSize::Custom, tr("Custom"));
+                    if opts.raw_archive_size == ArchiveSize::Custom {
+                        ui.add(egui::Slider::new(&mut opts.raw_archive_bits, 0.5..=1.0).step_by(0.05).fixed_decimals(2).suffix(format!(" {}", tr("bit a pixel"))));
+                    }
+                    // What a minute of this clip comes to at the size picked.
+                    if let (Some(bits), Some((w, h))) = (opts.archive_bits(), native_dims) {
+                        let gb = bits * w as f64 * h as f64 * fps as f64 * 60.0 / 8.0 / 1e9;
+                        ui.label(format!("{} {gb:.1} GB {}", tr("about"), tr("a minute")));
+                    }
+                    ui.label(RichText::new(tr("The take's folder again with a capture a fraction of the size, which opens like the take: every frame, its timing and the files beside it are kept. The copy is lossy: at 1 bit a pixel a frame is off by less than its own noise; below that the shadows lose their grain when they are lifted. Only the stretch between In and Out is copied. The take itself is left as it is."))
+                        .small().color(Color32::GRAY));
+                    ui.add_space(8.0);
+                    return;
+                }
+                ui.label(RichText::new(tr("A smaller copy of the take for keeping, which opens like the take."))
+                    .small().color(Color32::GRAY));
+                ui.add_space(8.0);
+            }
+            if ui.checkbox(&mut opts.raw_dng_sequence, tr("DNG sequence")).changed() && opts.raw_dng_sequence {
+                opts.raw_archive = false;
+            }
             if opts.raw_dng_sequence {
                 ui.radio_value(&mut opts.raw_dng_original, false, tr("Developed view"));
                 ui.label(RichText::new(tr("Every frame as a linear DNG in a folder, with this clip's raw development settings inside each file."))
@@ -10544,6 +10685,16 @@ impl App {
                             let text = RichText::new(dropped_frames_label(holes, zh));
                             ui.label(if holes.is_empty() { text } else { text.color(DROPPED_COLOR) });
                         }).response.on_hover_text(dropped_frames_hover(holes, zh));
+                    }
+                    // An archive copy of a raw take: what it was made as.
+                    if let Some(note) = Some(p).filter(|_| c.source_kind.is_raw_video()).and_then(|p| vr180_pipeline::x6_raw::archive_note(p)) {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr("Archive copy")).color(Color32::GRAY).small());
+                            ui.label(match note.bits_per_pixel {
+                                Some(bits) if !note.exact => format!("{bits:.2} {}", tr("bit a pixel")),
+                                _ => tr("every sample kept").to_string(),
+                            });
+                        }).response.on_hover_text(tr("This clip is an archive copy of a take, made by this app: not the camera's own recording."));
                     }
                     if let Some(rate) = bitrate_label(&c.video_bitrates_bps, c.file_bitrate_bps, true) {
                         ui.horizontal(|ui| {

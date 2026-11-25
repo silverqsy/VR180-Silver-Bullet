@@ -204,6 +204,23 @@ pub fn single_eye(path: &Path) -> bool {
     one
 }
 
+/// What the take `path` names says of itself as an archive copy
+/// ([`crate::raw_archive`]); `None` for a camera's take. A take is looked at
+/// once (its `clip.json`); later calls touch no file.
+pub fn archive_note(path: &Path) -> Option<x6b::ArchiveNote> {
+    static KNOWN: OnceLock<Mutex<HashMap<PathBuf, Option<x6b::ArchiveNote>>>> = OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some(note) = known.lock().ok().and_then(|k| k.get(path).cloned()) {
+        return note;
+    }
+    let dir = x6b::take_dir(path)?;
+    let note = x6b::read_archive_note(&dir);
+    if let Ok(mut k) = known.lock() {
+        k.insert(path.to_path_buf(), note.clone());
+    }
+    note
+}
+
 /// A take, opened: its description and its pairs in request order.
 #[derive(Debug)]
 pub struct TakeIndex {
@@ -348,17 +365,46 @@ pub fn describe(path: &Path) -> Result<Take> {
     x6b::read_take(&dir).map_err(take_err)?.map_err(|why| take_err(format!("{}: {why}", dir.display())))
 }
 
+/// Read and decode the pair at `entry`, whatever kind of record holds it:
+/// the camera's ([`x6b::decode_pair`]) or an archive copy's
+/// ([`crate::raw_archive`]). `record` is scratch space reused across calls.
+pub fn decode_pair(file: &mut File, entry: &PairEntry, format: x6b::Format, channels: Channels, record: &mut Vec<u8>, out: &mut [u16], threads: usize) -> Result<()> {
+    if entry.profile != x6b::Profile::Archive {
+        return x6b::decode_pair(file, entry, format, channels, record, out, threads).map_err(take_err);
+    }
+    x6b::read_record(file, entry, record).map_err(take_err)?;
+    let got = crate::raw_archive::decode_record(record, format.layout, channels, out)?;
+    if got.request != entry.request || got.exposure_ns != entry.exposure_ns {
+        return Err(take_err(format!("byte {} holds request {}, {} expected", entry.offset, got.request, entry.request)));
+    }
+    Ok(())
+}
+
+/// Decode a pair read by [`x6b::read_record`], whatever kind of record it
+/// is ([`decode_pair`]).
+pub fn decode_record(record: &[u8], format: x6b::Format, channels: Channels, out: &mut [u16], threads: usize) -> Result<PairEntry> {
+    if x6b::is_archive_record(record) {
+        return crate::raw_archive::decode_record(record, format.layout, channels, out);
+    }
+    x6b::decode_record(record, format, channels, out, threads).map_err(take_err)
+}
+
 /// A kept pair list starts with one of these: a row per pair of a capture
-/// whose pairs are one record each, or of one with a record for each eye
-/// (the second record's place and both integration times after the rest).
+/// whose pairs are one record each, of one with a record for each eye (the
+/// second record's place and both integration times after the rest), or of
+/// an archive copy (both integration times after the rest).
 const INDEX_MAGIC: &[u8; 8] = b"X6BIDX01";
 const INDEX_MAGIC_EYES: &[u8; 8] = b"X6BIDX02";
+const INDEX_MAGIC_ARCHIVE: &[u8; 8] = b"X6BIDX03";
 const INDEX_ROW: usize = 37;
 const INDEX_ROW_EYES: usize = INDEX_ROW + 32;
+const INDEX_ROW_ARCHIVE: usize = INDEX_ROW + 16;
 
-/// The start and the row length of `take`'s kept pair list.
-fn index_form(take: &Take) -> (&'static [u8; 8], usize) {
+/// The start and the row length of the kept pair list of `take`, whose
+/// records are an archive copy's (`archive`) or the camera's.
+fn index_form(take: &Take, archive: bool) -> (&'static [u8; 8], usize) {
     match take.layout {
+        _ if archive => (INDEX_MAGIC_ARCHIVE, INDEX_ROW_ARCHIVE),
         Layout::EyeRecords(_) => (INDEX_MAGIC_EYES, INDEX_ROW_EYES),
         _ => (INDEX_MAGIC, INDEX_ROW),
     }
@@ -376,7 +422,8 @@ fn index_file(take: &Take, modified: Option<std::time::SystemTime>) -> Option<Pa
 
 fn load_index(file: &Path, take: &Take) -> Option<Vec<PairEntry>> {
     let bytes = std::fs::read(file).ok()?;
-    let (magic, row) = index_form(take);
+    let archive = bytes.starts_with(INDEX_MAGIC_ARCHIVE);
+    let (magic, row) = index_form(take, archive);
     let rest = bytes.strip_prefix(magic)?;
     if rest.len() < 16 {
         return None;
@@ -392,6 +439,8 @@ fn load_index(file: &Path, take: &Take) -> Option<Vec<PairEntry>> {
         let u64_at = |o: usize| u64::from_le_bytes(r[o..o + 8].try_into().unwrap());
         let (other, shutter_ns) = if row == INDEX_ROW_EYES {
             (Some((u64_at(37), u64_at(45))), [u64_at(53), u64_at(61)])
+        } else if row == INDEX_ROW_ARCHIVE {
+            (None, [u64_at(37), u64_at(45)])
         } else {
             (None, [0; 2])
         };
@@ -413,12 +462,12 @@ fn load_index(file: &Path, take: &Take) -> Option<Vec<PairEntry>> {
         fits(p.offset, p.len) && p.other.map_or(true, |(offset, len)| fits(offset, len))
     };
     let ok = out.windows(2).all(|w| w[0].request < w[1].request)
-        && out.iter().all(|p| in_window(p) && p.profile.records(take.layout, take.fps_setting) && inside(p));
+        && out.iter().all(|p| in_window(p) && p.profile.records(take.layout, take.fps_setting) && inside(p) && (p.profile == x6b::Profile::Archive) == archive);
     ok.then_some(out)
 }
 
 fn store_index(file: &Path, take: &Take, pairs: &[PairEntry]) {
-    let (magic, row) = index_form(take);
+    let (magic, row) = index_form(take, pairs.first().is_some_and(|p| p.profile == x6b::Profile::Archive));
     let mut bytes = magic.to_vec();
     bytes.extend_from_slice(&take.capture_bytes.to_le_bytes());
     bytes.extend_from_slice(&(pairs.len() as u64).to_le_bytes());
@@ -432,6 +481,10 @@ fn store_index(file: &Path, take: &Take, pairs: &[PairEntry]) {
         if row == INDEX_ROW_EYES {
             let (offset, len) = p.other.unwrap_or((0, 0));
             for v in [offset, len, p.shutter_ns[0], p.shutter_ns[1]] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+        } else if row == INDEX_ROW_ARCHIVE {
+            for v in p.shutter_ns {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
         }
@@ -1171,8 +1224,7 @@ impl ReadAhead {
                 let count = index.take.layout.samples();
                 let mut samples = spares.try_recv().ok().filter(|b| b.len() == count)
                     .unwrap_or_else(|| vec![0u16; count]);
-                let read = x6b::decode_pair(&mut file, &entry, index.take.format(), Channels::Both, &mut record, &mut samples, 0)
-                    .map_err(take_err);
+                let read = decode_pair(&mut file, &entry, index.take.format(), Channels::Both, &mut record, &mut samples, 0);
                 let failed = read.is_err();
                 // The consumer went away (the export's end, a seek): stop.
                 if tx.send(read.map(|()| (i, samples))).is_err() || failed {
@@ -1392,8 +1444,7 @@ impl X6RawIter {
     /// Decode frame `i`'s mosaics into the iterator's buffer.
     pub fn decode_frame(&mut self, i: usize) -> Result<&[u16]> {
         let entry = *self.index.pairs.get(i).ok_or_else(|| take_err(format!("frame {i} is past the take's end")))?;
-        x6b::decode_pair(&mut self.file, &entry, self.index.take.format(), Channels::Both, &mut self.record, &mut self.samples, 0)
-            .map_err(take_err)?;
+        decode_pair(&mut self.file, &entry, self.index.take.format(), Channels::Both, &mut self.record, &mut self.samples, 0)?;
         Ok(&self.samples)
     }
 

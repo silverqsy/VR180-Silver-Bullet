@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Insta360 X6: an archive copy of a raw take
+
+A raw take is large: 40 to 80 GB a minute. The camera has to write a
+gigabyte a second, and packs its samples with what a processor can do at
+that pace. **Archive copy**, in Export format for a raw clip, writes the
+take's folder again with a capture about a third of the size, and the app
+opens the copy like the take: every frame with its number and its timing,
+the gyro log, the lens record and the sound beside it, the same
+development, stabilization and exports.
+
+- **How large.** *High quality* aims at 1 bit a pixel, where a take holds
+  about 3: 13 to 16 GB a minute for the frames the camera records.
+  *Custom* takes any size from 0.5 to 1 bit a pixel. The panel shows what a
+  minute of the clip comes to.
+- **What is lost.** The copy is lossy. A sample's value is first turned
+  into one of 1024 codes that follow the sensor's noise, measured on the
+  take: two values the noise cannot tell apart share a code, two it can are
+  several codes apart, in the shadows as in the highlights. Each of a
+  frame's four colour planes is then stored as a picture by the graphics
+  hardware's HEVC encoder. At 1 bit a pixel a sample comes back off by
+  about its own noise or less: mid-tones look as they did, and a deep
+  shadow lifted hard keeps a grain, a coarser one. Towards 0.5 bit lifted
+  shadows turn to flat patches and fine texture softens. Saturated samples
+  stay saturated, and none becomes one.
+- **What is kept.** Every picture stands alone: the copy seeks and plays
+  like the take. Only the stretch between In and Out is copied. The take
+  is not touched, and a copy is made from a camera's take, never from
+  another copy. A clip that is a copy says so in File info, with the bits a
+  pixel it came to.
+- **The file.** The copy's capture is a file of records like the take's, a
+  record a pair (the format is in `x6b.rs`'s notes); earlier versions of the
+  app refuse it as a kind they do not know.
+
 ### Insta360 X6: raw video
 
 - **A 5760 × 5760 frame stored to within one code value.** A take with a

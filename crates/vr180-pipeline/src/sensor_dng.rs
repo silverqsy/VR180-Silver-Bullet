@@ -459,7 +459,7 @@ impl<'a> PairWriter<'a> {
 
     /// Unpack `record` (the pair `entry` of the capture) and write its files.
     fn write(&self, record: &[u8], samples: &mut [u16], scratch: &mut EyeScratch, entry: &PairEntry) -> Result<WrittenPair> {
-        let got = x6b::decode_record(record, self.format, Channels::Both, samples, 1).map_err(|e| Error::Ffmpeg(e.to_string()))?;
+        let got = crate::x6_raw::decode_record(record, self.format, Channels::Both, samples, 1)?;
         if got.request != entry.request {
             return Err(Error::Ffmpeg(format!("byte {} of the capture holds request {}, {} expected", entry.offset, got.request, entry.request)));
         }

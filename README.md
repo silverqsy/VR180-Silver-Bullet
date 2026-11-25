@@ -72,7 +72,8 @@ Studio).
   hold. Any frame, or the whole clip, can be written as DNG: the projected
   picture, or the two frames as the sensors recorded them. On macOS,
   frames enhanced with Camera Raw's Super Resolution are used for exports
-  up to 16384×8192.
+  up to 16384×8192. A take can be written again as an **archive
+  copy** about a third of its size, which opens like the take.
 - **Export**: hardware H.265 or ProRes 4:2:2, up to 8K (8192×4096), on a
   zero-copy GPU path (VideoToolbox on macOS, NVDEC → CUDA → NVENC on
   Windows). Audio is muxed inline — stereo, ambisonic, or APAC spatial on

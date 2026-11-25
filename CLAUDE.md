@@ -4938,6 +4938,85 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       the default settings). None where the camera is steady, none
       unstabilized, none in a lens frame, which is black there.
 
+49. **An archive copy of a raw take (2026-11-24, Mac; UNRELEASED).** The
+    ask: a raw take is too large to keep (40 to 80 GB a minute: the takes
+    at hand hold 2.8 to 5.3 bits a pixel), so a converter that spends the
+    computer's time on making it smaller. Lossy is acceptable as a choice;
+    the copy has to give the same experience in the app, with a small loss
+    of speed at most; it is to be a pack file like the take's.
+    - **What it is.** Export format ▸ *Archive copy* for a raw clip
+      (`ExportOptions::raw_archive`, `ArchiveSize`, `archive_bits`): the
+      take's folder again as `<take>_Archive`, every file beside the capture
+      copied as it is, `clip.json` with an `archive` record (kind, bits
+      asked for and come to, the take it was made from, the encoder and its
+      setting, the noise, the error), the closing record rewritten last so
+      that a copy that did not finish does not open. *High quality* is
+      1 bit a pixel, *Custom* 0.5 to 1; only the stretch between In and Out
+      is copied; a copy of a copy is refused.
+    - **The file** (`x6b.rs`, "An archive copy"): records of the app's own
+      kind, signature `SBARCH1`, a record a pair: the request number, both
+      exposure starts and integration times, a CRC-32C of the pictures, the
+      value each of 1024 codes stands for, eight pictures.
+      `Profile::Archive` is last in `Profile::ALL`;
+      `scan_pairs` goes by the first record's signature; a kept pair list
+      has a third form (`X6BIDX03`, with the integration times).
+    - **How a picture is made** (`raw_archive.rs`): (1) the take's noise,
+      variance `a (v − black) + b`, from two frames in a row at three places
+      of the stretch, on the flat parts only (`noise_of`); (2) the codes
+      (`Curve`): two neighbouring values are as many codes apart as noise
+      deviations, times one factor for the curve, 8 at most, and the white
+      level 40 codes off so that a saturated sample comes back as one and no
+      other does; where a take's values are the levels of a table that
+      gives every level a few codes; (3) each colour plane is a picture of
+      its own, one intra-coded HEVC access unit (Main 10, the codes in the
+      luma, full range, its parameter sets inside) from
+      `hevc_videotoolbox`, `hevc_nvenc` or `libx265`, whichever opens
+      first; (4) one quality for the whole take, found by halving on three
+      frames until they come to the bits asked for (nothing is derived
+      from the picture frame by frame).
+    - **How it is read.** `x6_raw::decode_pair` / `decode_record` are what
+      every reader calls now (the iterator, its read-ahead thread, the clip
+      statistics, the camera-original DNG writer) and hand an archive
+      record to `raw_archive::decode_record`: a pair's eight pictures
+      through eight decoders kept in a pool, on the graphics hardware where
+      one attaches (VideoToolbox, D3D11VA and CUDA are tried in turn
+      through libav: no line of it is gated by platform), else in software,
+      then written into the mosaic through the codes' values. Everything
+      after the mosaic is the take's own path.
+    - **Measured (Mac, M5 Max; a 5760², a 6000² and a 3840² 60 fps take,
+      ten seconds of each):** 3.23 / 2.64 / 3.09 bits a pixel in the take,
+      0.96 / 0.88 / 0.98 in the copy (8.0 to 2.4, 7.1 to 2.4, 6.8 to 2.2
+      GB); a sample is 1.0 values rms from the take's on the 5760² frame,
+      0.9 of its noise in the shadows and 0.7 at the top; on the 60 fps
+      take, whose values are a table of 297 levels, 82 % of the samples
+      come back on their own level and 18 % on the next. Every saturated
+      sample of the frames looked at is saturated in the copy. The copy
+      takes 32 / 34 / 23 s (the take is read from a network share), a pair
+      of the copy decodes in 28 / 30 / 19 ms against 10 / 10 / 6 ms for the
+      take's own records, 48 / – / 23 ms in software. An unstabilized
+      export of the same two frames from the copy and from the take:
+      45.6 dB apart.
+    - **What was tried and left.** FFV1 for a copy that keeps every sample:
+      27 to 41 % smaller than the take, but 130 to 175 ms a pair to decode.
+      The plain codes through the encoder: its error is the same number of
+      codes at every level, so the shadows carry it all. Software decoders
+      beside the hardware ones: a picture a core takes on is done long
+      after the engine would have had it. More than 1 bit a pixel: a copy
+      that keeps every sample is smaller.
+    - **Checked.** Unit tests (the container, the codes, the noise fit, a
+      picture through the encoder and back); one on a real take, named by
+      `VR180_ARCHIVE_TAKE` (the copy opens as a take with the same frames,
+      numbers, stamps and integration times; one channel alone; no copy of
+      a copy; a stopped copy leaves nothing), run on the three takes; the
+      stored export list of every source kind: 32 of 32 video lines as
+      stored (the 7 DNG lines carry the version number and were made
+      again).
+    - **Not seen, not done.** The option was never clicked in the window;
+      nothing here was built or run on Windows, where the NVENC settings
+      and the hardware decode are written blind; a copy of a 60 fps take decodes in 19 ms a pair, more than a
+      frame's time at 60 a second. Next: a copy that keeps every sample,
+      with a coder of its own for the speed.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`

@@ -885,7 +885,7 @@ fn meter_take(
         let i = index.frame_at(t);
         let Some(entry) = index.pairs.get(i) else { continue };
         if x6b::read_record(&mut file, entry, &mut record).is_err() { continue; }
-        if x6b::decode_record(&record, take.format(), x6b::Channels::One(channel), &mut samples, 0).is_err() { continue; }
+        if crate::x6_raw::decode_record(&record, take.format(), x6b::Channels::One(channel), &mut samples, 0).is_err() { continue; }
         let eye = &samples[at..at + w * h];
         let mut copy = vec![0f32; METER_SIDE * METER_SIDE * 3];
         for (p, (start, shows)) in places.iter().enumerate() {
