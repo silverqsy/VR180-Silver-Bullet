@@ -307,6 +307,11 @@ pub struct App {
     /// `export_opts` frozen at run start so mid-run edits can't change
     /// later items.
     batch_opts: Option<ExportOptions>,
+    /// The run in flight writes the takes themselves and not their view
+    /// ([`TakeRun`], started from the Source panel); `None`: an export.
+    take_run: Option<TakeRun>,
+    /// The Source panel's choices for such a run.
+    take_tools: TakeTools,
     /// Output folder override. `None` = next to each source file.
     batch_out_dir: Option<PathBuf>,
     /// Set by the "Skip current" button so completion marks the item
@@ -562,7 +567,7 @@ fn spatial_view_scaled_note(template: &str, hfov_deg: f32, aspect_w_over_h: f32)
 }
 
 /// How small an archive copy of a raw clip is to be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ArchiveSize {
     /// Every sample kept: as small as that allows.
     Lossless,
@@ -571,6 +576,445 @@ enum ArchiveSize {
     HighQuality,
     /// The bits a pixel picked by hand.
     Custom,
+}
+
+/// What the Source panel writes of a raw take ITSELF, and not of the view
+/// of it: no view, no size, no grade, no stabilization and no noise filter
+/// applies, and what is written is read again as a source (a copy opens
+/// like the take; the camera's own frames are where enhanced frames and a
+/// raw converter's settings are looked for). Not an export choice: each is
+/// started by its own button, for that one run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TakeJob {
+    /// An archive copy of the take, at this many bits a pixel (`None`:
+    /// every sample kept).
+    Archive(Option<f64>),
+    /// The frames as the sensor recorded them: one Bayer DNG an eye.
+    Originals,
+}
+
+/// A run of the queue that writes [`TakeJob`]s.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TakeRun {
+    job: TakeJob,
+    /// The whole take, whatever its trim (`false`: from In to Out).
+    whole: bool,
+}
+
+/// What a run of the queue writes of a clip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RunOutput {
+    /// A still photo's file.
+    Still,
+    /// The take itself ([`TakeJob`]).
+    Take(TakeJob),
+    /// A raw clip's developed view as a folder of DNG frames.
+    DngFrames,
+    /// The view as a video file.
+    Video,
+}
+
+/// What a run writes of a clip of `kind`: the take itself in a run started
+/// for that (`take`), else the view as `opts` say.
+fn run_output(take: Option<TakeRun>, kind: vr180_pipeline::SourceKind, opts: &ExportOptions) -> RunOutput {
+    if kind.is_still() {
+        RunOutput::Still
+    } else if let Some(run) = take.filter(|_| kind.is_raw_video()) {
+        RunOutput::Take(run.job)
+    } else if kind.is_raw_video() && opts.raw_dng_sequence {
+        RunOutput::DngFrames
+    } else {
+        RunOutput::Video
+    }
+}
+
+/// The list entries a run of `job` started now would write: the ticked
+/// clips it is for, or the clip on screen (`active`) alone when none of
+/// those is ticked. An archive copy is made of a camera's take; the
+/// camera's own frames are written from any raw take.
+fn take_clips(batch: &[BatchItem], active: Option<usize>, job: TakeJob) -> Vec<usize> {
+    let fits = |b: &BatchItem| match job {
+        TakeJob::Archive(_) => b.camera_take(),
+        TakeJob::Originals => b.ready() && b.source_kind.is_raw_video(),
+    };
+    let ticked: Vec<usize> = batch.iter().enumerate().filter(|(_, b)| b.selected && fits(b)).map(|(i, _)| i).collect();
+    if !ticked.is_empty() {
+        return ticked;
+    }
+    active.filter(|&i| batch.get(i).is_some_and(fits)).into_iter().collect()
+}
+
+/// A run that writes the takes themselves begins: the export queue's state
+/// is put aside, and the run's `clips` alone are armed.
+fn queue_put_aside(batch: &mut [BatchItem], clips: &[usize]) {
+    for item in batch.iter_mut() {
+        item.before_take = Some(std::mem::replace(&mut item.status, BatchStatus::Idle));
+    }
+    for &i in clips {
+        batch[i].status = BatchStatus::Queued;
+        batch[i].take_failed = None;
+    }
+}
+
+/// Such a run (of `job`) is over: the export queue is as the run found it,
+/// and a take the run could not write keeps the reason.
+fn queue_brought_back(batch: &mut [BatchItem], job: Option<TakeJob>) {
+    for item in batch.iter_mut() {
+        let Some(before) = item.before_take.take() else { continue };
+        if let (Some(job), BatchStatus::Failed(why)) = (job, std::mem::replace(&mut item.status, before)) {
+            item.take_failed = Some((job, why.trim_start_matches("ffmpeg: ").to_string()));
+        }
+    }
+}
+
+/// Which of the two has its choices open in the Source panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TakeTool { Archive, Originals }
+
+/// The Source panel's choices for the two.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TakeTools {
+    open: Option<TakeTool>,
+    /// The size of an archive copy, and the bits a pixel of one picked by
+    /// hand (kept across launches, see `App::save_take_copy`).
+    size: ArchiveSize,
+    bits: f32,
+    /// The whole take is written, whatever its trim.
+    archive_whole: bool,
+    originals_whole: bool,
+}
+
+impl Default for TakeTools {
+    fn default() -> Self {
+        Self { open: None, size: ArchiveSize::default(), bits: 0.75, archive_whole: false, originals_whole: false }
+    }
+}
+
+impl TakeTools {
+    /// The bits a pixel of the archive copy picked (`None`: every sample kept).
+    fn archive_bits(&self) -> Option<f64> {
+        use vr180_pipeline::raw_archive::{BITS_LEAST, BITS_MOST};
+        match self.size {
+            ArchiveSize::Lossless => None,
+            ArchiveSize::HighQuality => Some(BITS_MOST),
+            ArchiveSize::Custom => Some((self.bits as f64).clamp(BITS_LEAST, BITS_MOST)),
+        }
+    }
+
+    /// The choice as the file that keeps it says it, and back.
+    fn kept(&self) -> String {
+        match self.size {
+            ArchiveSize::Lossless => format!("lossless {:.2}", self.bits),
+            ArchiveSize::HighQuality => format!("high {:.2}", self.bits),
+            ArchiveSize::Custom => format!("custom {:.2}", self.bits),
+        }
+    }
+
+    /// The run the archive button starts for `takes`, and the one of the
+    /// camera's own frames: a run of takes without a trim writes them whole
+    /// whatever is picked.
+    fn archive_run(&self, takes: &[TakeView]) -> TakeRun {
+        TakeRun { job: TakeJob::Archive(self.archive_bits()), whole: self.archive_whole || !takes.iter().any(|t| t.written(false).2) }
+    }
+
+    fn originals_run(&self, takes: &[TakeView]) -> TakeRun {
+        TakeRun { job: TakeJob::Originals, whole: self.originals_whole || !takes.iter().any(|t| t.written(false).2) }
+    }
+
+    fn from_kept(text: &str) -> Self {
+        let mut words = text.split_whitespace();
+        let size = match words.next() {
+            Some("lossless") => ArchiveSize::Lossless,
+            Some("custom") => ArchiveSize::Custom,
+            _ => ArchiveSize::HighQuality,
+        };
+        let bits = words.next().and_then(|w| w.parse::<f32>().ok()).filter(|b| b.is_finite()).map_or(0.75, |b| b.clamp(0.5, 1.0));
+        Self { size, bits, ..Default::default() }
+    }
+}
+
+/// What the list keeps of a raw take beyond its frame.
+#[derive(Debug, Clone, PartialEq)]
+struct TakeFacts {
+    /// The length of its capture.
+    capture_bytes: u64,
+    /// What it says of itself as an archive copy (`None`: a camera's take).
+    archive: Option<vr180_fisheye::x6b::ArchiveNote>,
+}
+
+impl TakeFacts {
+    /// Read them from the take's small files; `None` for any other source.
+    fn read(kind: vr180_pipeline::SourceKind, path: &std::path::Path) -> Option<Self> {
+        if !kind.is_raw_video() {
+            return None;
+        }
+        let take = vr180_pipeline::x6_raw::describe(path).ok()?;
+        Some(Self { capture_bytes: take.capture_bytes, archive: vr180_pipeline::x6_raw::archive_note(path) })
+    }
+}
+
+/// An archive copy a run made of a list entry's take.
+#[derive(Debug, Clone, PartialEq)]
+struct TakeCopy {
+    /// The copy's folder.
+    dir: PathBuf,
+    /// When its first frame lies in the take, seconds from the take's first.
+    begins_s: f64,
+    /// Its length, and the length of the same frames in the take.
+    bytes: u64,
+    source_bytes: u64,
+}
+
+/// A take as the Source panel's two operations show it.
+#[derive(Debug, Clone, PartialEq)]
+struct TakeView {
+    path: PathBuf,
+    fps: f32,
+    duration_s: f64,
+    /// Its trim as set (the clip on screen: as it is set right now).
+    trim: (Option<f64>, Option<f64>),
+    frame_samples: u64,
+    capture_bytes: u64,
+    /// It is an archive copy, and one that does not hold every sample.
+    copy: bool,
+    lossy_copy: bool,
+}
+
+impl TakeView {
+    /// The seconds a run writes of it, from and to, and whether that is
+    /// less than the take: its stretch from In to Out, or all of it
+    /// (`whole`, and a take without a trim).
+    fn written(&self, whole: bool) -> (f64, f64, bool) {
+        let all = self.duration_s.max(0.0);
+        let from = self.trim.0.unwrap_or(0.0).clamp(0.0, all);
+        let to = self.trim.1.unwrap_or(all).clamp(from, all);
+        let half = 0.5 / self.fps.max(1.0) as f64;
+        if whole || (from <= half && to >= all - half) { (0.0, all, false) } else { (from, to, true) }
+    }
+
+    /// The length in its capture of `seconds` of it, near enough.
+    fn bytes_of(&self, seconds: f64) -> u64 {
+        if self.duration_s <= 0.0 {
+            return 0;
+        }
+        (self.capture_bytes as f64 * (seconds / self.duration_s).clamp(0.0, 1.0)).round() as u64
+    }
+
+    fn name(&self) -> String {
+        clip_label(&self.path)
+    }
+}
+
+/// What the Source panel's take tools are shown for.
+struct TakeToolsView<'a> {
+    /// The takes a run of archive copies started now would write, and
+    /// those a run of the camera's own frames would.
+    archive: &'a [TakeView],
+    originals: &'a [TakeView],
+    /// The copies made so far that have not taken their take's place: the
+    /// take's place in the list, and the copy.
+    copies: &'a [(usize, TakeCopy)],
+    /// The takes the last run could not write: what it was to write, the
+    /// take's name and the reason.
+    failed: &'a [(TakeJob, String, String)],
+    /// The folder exports go to when it is not the source's own (its name).
+    out_dir: Option<&'a str>,
+    /// No run is in flight.
+    idle: bool,
+}
+
+/// What was asked for there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TakeAsk {
+    Start(TakeRun),
+    /// The copy made of this list entry takes its place, or every copy its take's.
+    UseCopy(usize),
+    UseCopies,
+    /// The size picked is to be kept for the next launch.
+    Keep,
+}
+
+const TAKE_ARCHIVE_HOVER: &str = "A smaller copy of the take for keeping, which opens like the take.";
+const TAKE_ARCHIVE_NOTE: &str = "The take's folder again with a smaller capture, which opens like the take: every frame, its timing and the files beside it are kept. The take itself is left as it is.";
+const TAKE_EXACT_NOTE: &str = "Every sample is kept as the camera recorded it, and each frame is read back and compared before it is written. Most takes come out a quarter to a third smaller, a 14-bit take that keeps every value about an eighth.";
+const TAKE_LOSSY_NOTE: &str = "The copy is lossy: at 1 bit a pixel a frame is off by less than its own noise; below that the shadows lose their grain when they are lifted.";
+const TAKE_STRETCH_NOTE: &str = "A copy of a stretch is a shorter clip. What the app takes from a whole clip, such as the tone statistics and the stabilizer's reference, is then taken from the stretch, so its picture can differ slightly from the same stretch of the take.";
+const TAKE_COPY_SOURCE_NOTE: &str = "This clip is an archive copy of a take: a copy is made from the camera's take, not from another copy.";
+const TAKE_ORIGINALS_NOTE: &str = "Every frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number. No projection, no stabilization, no grading — for running the frames through a raw converter first.";
+const TAKE_ORIGINALS_PLACE_NOTE: &str = "The folder of that name beside the take is also where the app looks for enhanced frames and for Camera Raw settings.";
+const TAKE_LOSSY_SOURCE_NOTE: &str = "This clip is a lossy archive copy: the frames written are the copy's, close to what the sensor recorded but not the same.";
+const TAKE_USE_COPY_HOVER: &str = "Puts the copy in the take's place in the list, with the take's settings. Nothing is deleted: the take stays where it is.";
+const TAKE_BUSY_HOVER: &str = "A run is in flight: this can start when it is over.";
+
+/// Takes listed one by one under a run's choices; a longer run names the rest by their number.
+const TAKES_LISTED: usize = 6;
+
+/// A length of time in a note.
+fn span_text(seconds: f64, zh: bool) -> String {
+    let s = seconds.max(0.0);
+    if s < 59.95 {
+        return if zh { format!("{s:.1} 秒") } else { format!("{s:.1} s") };
+    }
+    let total = s.round() as u64;
+    if zh { format!("{} 分 {} 秒", total / 60, total % 60) } else { format!("{} min {} s", total / 60, total % 60) }
+}
+
+/// A size on disk in a note.
+fn size_text(bytes: u64) -> String {
+    let gb = bytes as f64 / 1e9;
+    if gb >= 100.0 { format!("{gb:.0} GB") } else if gb >= 1.0 { format!("{gb:.1} GB") } else { format!("{:.0} MB", bytes as f64 / 1e6) }
+}
+
+/// One take of a run: its name and what the run writes of it.
+fn take_line(take: &TakeView, whole: bool, zh: bool) -> String {
+    let (from, to, cut) = take.written(whole);
+    let (name, all) = (take.name(), span_text(take.duration_s, zh));
+    if !cut {
+        return if zh { format!("{name} · 整条 · {all}") } else { format!("{name} · whole take · {all}") };
+    }
+    let kept = span_text(to - from, zh);
+    if zh {
+        format!("{name} · {} 到 {} · {all}中的 {kept}", format_time(from), format_time(to))
+    } else {
+        format!("{name} · {} to {} · {kept} of {all}", format_time(from), format_time(to))
+    }
+}
+
+/// What copies of the takes' stretches from In to Out leave out, said
+/// before they are made; `None` when no take of the run is trimmed.
+fn take_cut_warning(takes: &[TakeView], zh: bool) -> Option<String> {
+    let cut = takes.iter().filter(|t| t.written(false).2).count();
+    if cut == 0 {
+        return None;
+    }
+    if let [take] = takes {
+        let (from, to, _) = take.written(false);
+        let (before, after) = (from, (take.duration_s - to).max(0.0));
+        let half = 0.5 / take.fps.max(1.0) as f64;
+        let (kept, before_text, after_text) = (span_text(to - from, zh), span_text(before, zh), span_text(after, zh));
+        return Some(if zh {
+            let left = match (before > half, after > half) {
+                (true, true) => format!("入点之前的 {before_text}和出点之后的 {after_text}"),
+                (true, false) => format!("入点之前的 {before_text}"),
+                _ => format!("出点之后的 {after_text}"),
+            };
+            format!("副本只包含入点到出点之间的 {kept}：{left}不会进副本。确认这条素材别的部分都不要了，再删除原素材。")
+        } else {
+            let left = match (before > half, after > half) {
+                (true, true) => format!("the {before_text} before In and the {after_text} after Out are"),
+                (true, false) => format!("the {before_text} before In are"),
+                _ => format!("the {after_text} after Out are"),
+            };
+            format!("Only the {kept} between In and Out go into the copy: {left} left out. Keep the take until you are sure nothing else of it is wanted.")
+        });
+    }
+    Some(if zh {
+        format!("{cut} 条素材设了入出点：副本只包含各自入点到出点之间的部分，之外的不会进副本。确认别的部分都不要了，再删除原素材。")
+    } else {
+        format!("{cut} of these takes are trimmed: each copy holds only the stretch between In and Out, and what lies outside is left out. Keep the takes until you are sure nothing else of them is wanted.")
+    })
+}
+
+/// The sizes a run of archive copies comes to, before it is made: the
+/// takes', the part of them that is copied where that is less, and the
+/// copies' where it is known beforehand (a lossy copy's `bits` a pixel).
+fn take_sizes_text(takes: &[TakeView], whole: bool, bits: Option<f64>, zh: bool) -> String {
+    let (mut all, mut part, mut copy, mut cut) = (0u64, 0u64, 0f64, false);
+    for take in takes {
+        let (from, to, less) = take.written(whole);
+        all += take.capture_bytes;
+        part += if less { take.bytes_of(to - from) } else { take.capture_bytes };
+        copy += bits.unwrap_or(0.0) * take.frame_samples as f64 * ((to - from) * take.fps as f64).round() / 8.0;
+        cut |= less;
+    }
+    let n = takes.len();
+    let mut text = match (n, zh) {
+        (1, true) => format!("原素材 {}", size_text(all)),
+        (1, false) => format!("Take {}", size_text(all)),
+        (_, true) => format!("{n} 条素材共 {}", size_text(all)),
+        (_, false) => format!("{n} takes {}", size_text(all)),
+    };
+    if cut {
+        text.push_str(&if zh { format!(" · 要复制的部分 {}", size_text(part)) } else { format!(" · the part copied {}", size_text(part)) });
+    }
+    if bits.is_some() {
+        text.push_str(&match (n, zh) {
+            (1, true) => format!(" · 副本约 {}", size_text(copy as u64)),
+            (1, false) => format!(" · the copy about {}", size_text(copy as u64)),
+            (_, true) => format!(" · 副本共约 {}", size_text(copy as u64)),
+            (_, false) => format!(" · the copies about {}", size_text(copy as u64)),
+        });
+    }
+    text
+}
+
+/// Where a run's folders go: beside each take, or in the output folder
+/// picked in the export bar (`out_dir`: its name), named after the take.
+fn take_place_text(takes: &[TakeView], job: TakeJob, out_dir: Option<&str>, zh: bool) -> String {
+    // (Several takes: each folder is named after its own.)
+    let name = clip_label(&App::take_job_dir_for(match takes {
+        [take] => &take.path,
+        _ => std::path::Path::new(if zh { "<素材名>" } else { "<take>" }),
+    }, job));
+    match (out_dir, zh) {
+        (None, true) => format!("写在素材旁边：{name}"),
+        (None, false) => format!("Written beside the take: {name}"),
+        (Some(dir), true) => format!("写到输出文件夹 {dir}：{name}"),
+        (Some(dir), false) => format!("Written into the output folder {dir}: {name}"),
+    }
+}
+
+/// What the button that starts a run of `n` takes says.
+fn take_start_label(job: TakeJob, n: usize, zh: bool) -> String {
+    match (job, n, zh) {
+        (TakeJob::Archive(_), 1, true) => "制作存档副本".into(),
+        (TakeJob::Archive(_), 1, false) => "Make the archive copy".into(),
+        (TakeJob::Archive(_), n, true) => format!("制作 {n} 个存档副本"),
+        (TakeJob::Archive(_), n, false) => format!("Make {n} archive copies"),
+        (TakeJob::Originals, 1, true) => "导出相机原片 DNG".into(),
+        (TakeJob::Originals, 1, false) => "Write the camera original DNGs".into(),
+        (TakeJob::Originals, n, true) => format!("导出 {n} 条素材的相机原片 DNG"),
+        (TakeJob::Originals, n, false) => format!("Write the camera original DNGs of {n} takes"),
+    }
+}
+
+/// A copy a run has made: its folder, its size, and that size beside the
+/// same frames in the take.
+fn take_copy_line(copy: &TakeCopy, zh: bool) -> String {
+    let name = clip_label(&copy.dir);
+    if copy.bytes == 0 || copy.source_bytes == 0 {
+        return format!("✓ {name}");
+    }
+    let (size, share) = (size_text(copy.bytes), copy.bytes as f64 * 100.0 / copy.source_bytes as f64);
+    if zh { format!("✓ {name} · {size}，是原素材同样这些帧的 {share:.0}%") } else { format!("✓ {name} · {size}, {share:.0}% of the same frames in the take") }
+}
+
+/// What the Source panel says of a clip that is an archive copy: how it
+/// was made, and which stretch of its take it holds when it is not all of
+/// it.
+fn archive_note_text(note: &vr180_fisheye::x6b::ArchiveNote, zh: bool) -> String {
+    let kind = match note.bits_per_pixel {
+        Some(bits) if !note.exact => format!("{bits:.2} {}", if zh { tr_zh("bit a pixel") } else { "bit a pixel" }),
+        _ => (if zh { tr_zh("every sample kept") } else { "every sample kept" }).to_string(),
+    };
+    match (note.stretch(), zh) {
+        (None, _) => kind,
+        (Some((first, pairs, of)), true) => format!("{kind} · 原素材 {of} 帧中的第 {} 到 {} 帧", first + 1, first + pairs),
+        (Some((first, pairs, of)), false) => format!("{kind} · frames {} to {} of the take's {of}", first + 1, first + pairs),
+    }
+}
+
+/// The settings a take's list entry goes on with when the copy `copy` made
+/// of it takes its place: the take's own, its trim moved to the copy's
+/// time (a copy of a stretch begins where the stretch did, and lasts
+/// `copy_duration_s`). An end of the trim that falls on the copy's own end
+/// is no trim.
+fn settings_for_copy(settings: &crate::decoder::Settings, copy: &TakeCopy, copy_duration_s: f64, fps: f32) -> crate::decoder::Settings {
+    let half = 0.5 / fps.max(1.0) as f64;
+    let mut out = settings.clone();
+    out.trim_in_s = settings.trim_in_s.map(|t| t - copy.begins_s).filter(|t| *t > half);
+    out.trim_out_s = settings.trim_out_s.map(|t| t - copy.begins_s).filter(|t| *t < copy_duration_s - half).map(|t| t.max(0.0));
+    out
 }
 
 /// Output container for a STILL source (Insta360 X6 `.dng`). Videos
@@ -718,10 +1162,10 @@ impl ExportResolution {
 
 /// Whether an export of a clip runs the noise filter, which is what the
 /// export bar's "NR" says: a video file does when the clip's Noise Reduction
-/// is above zero; a folder of DNG frames (the developed view or the camera's
-/// own) and a still are written without it, whatever the clip's setting.
+/// is above zero; a folder of DNG frames and a still are written without
+/// it, whatever the clip's setting.
 fn export_runs_noise_filter(kind: vr180_pipeline::SourceKind, denoise_strength: f32, opts: &ExportOptions) -> bool {
-    denoise_strength > 0.0 && !kind.is_still() && !(kind.is_raw_video() && (opts.raw_dng_sequence || opts.raw_archive))
+    denoise_strength > 0.0 && !kind.is_still() && !(kind.is_raw_video() && opts.raw_dng_sequence)
 }
 
 /// Which list of sizes a clip picks from. Each list has a choice of its
@@ -896,21 +1340,16 @@ impl ProResProfile {
 #[serde(default)]
 pub(crate) struct ExportOptions {
     codec: ExportCodec,
-    /// A raw video clip exports as a folder of DNG frames instead of a
-    /// video file (used only when the source is a raw video).
+    /// A raw video clip exports as a folder of DNG frames, the developed
+    /// view, instead of a video file (used only when the source is a raw
+    /// video).
     raw_dng_sequence: bool,
-    /// The frames of that folder are the sensor's own (one Bayer DNG per
-    /// eye per frame: no projection, no stabilization, no grade) and not
-    /// the developed view.
-    raw_dng_original: bool,
-    /// A raw video clip exports as an archive copy: the take's folder again
-    /// with a far smaller capture, which opens like the take (used only
-    /// when the source is a raw video; a DNG sequence is then off).
-    raw_archive: bool,
-    /// The size of that copy: the app's own choice, or the bits a pixel below.
-    raw_archive_size: ArchiveSize,
-    /// Bits a pixel of a copy whose size is picked by hand.
-    raw_archive_bits: f32,
+    /// Read from a file of a version in which the camera's own frames were
+    /// a kind of that folder, and never written: they are no export any
+    /// more ([`TakeJob::Originals`]), and a file that had picked them must
+    /// not export the developed view in their place ([`Self::settled`]).
+    #[serde(rename = "raw_dng_original", skip_serializing)]
+    was_dng_original: bool,
     /// A raw video clip's frames come from the folder of its camera-original
     /// DNGs where a raw converter has enhanced them (the folder beside the
     /// take, see `default_frames_dir_for`).
@@ -1188,7 +1627,7 @@ mod export_size_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, lens_space, stabilized, single_eye, raw, false);
+                App::export_options_ui(ui, opts, "test", None, (90.0, 0.0), 29.97, false, Some(native), sharp, lens_space, stabilized, single_eye, raw);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -1246,65 +1685,55 @@ mod export_size_tests {
         assert!(!text.contains("16384") && !text.contains("enhanced"), "{text}");
     }
 
-    /// The camera's own frames are written as they are: Export format shows
-    /// their size instead of a list to pick from, and the export bar's "NR"
-    /// is for exports that do run the noise filter.
+    /// The Format window of a raw take offers its view: a video, or the
+    /// developed view as a folder of DNG frames. The take itself (an archive
+    /// copy, the camera's own frames) is no export, and is not there.
     #[test]
-    fn camera_original_frames_have_no_size_to_pick_and_no_noise_filter() {
+    fn the_format_window_of_a_raw_take_offers_its_view_only() {
         use ExportResolution::Native;
-        let mut opts = ExportOptions { resolution: Native, raw_dng_sequence: true, raw_dng_original: true, ..Default::default() };
+        let mut opts = ExportOptions { resolution: Native, ..Default::default() };
         let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Absent));
-        assert!(text.contains("3840 × 3840 per eye") && text.contains("sensor's own"), "{text}");
-        assert!(!text.contains("(native)") && !text.contains("8192 × 4096") && !text.contains("Use enhanced frames"), "{text}");
-        // The developed view is a picture of a size: its list is there.
-        opts.raw_dng_original = false;
+        assert!(text.contains("DNG sequence") && text.contains("Every frame as a linear DNG in a folder") && text.contains("Codec"), "{text}");
+        // (The folder of the camera's own frames is still named where enhanced frames are explained.)
+        let offers = |text: &str, choice: &str| text.lines().any(|line| line == choice);
+        for gone in ["Archive copy", "Camera original", "Developed view"] {
+            assert!(!offers(&text, gone), "{gone}: {text}");
+        }
+        assert!(!text.contains("bit a pixel") && !text.contains("sensor's own"), "{text}");
+        // The folder of frames is a picture of a size: its list is there, the codec is not.
+        opts.raw_dng_sequence = true;
         let text = panel_text_full(&mut opts, (7680, 3840), None, None, false, false, Some(EnhancedFrames::Absent));
-        assert!(text.contains("7680 × 3840 (native)") && text.contains("Use enhanced frames"), "{text}");
+        assert!(text.contains("7680 × 3840 (native)") && text.contains("Use enhanced frames") && !text.contains("Codec"), "{text}");
+        assert!(!offers(&text, "Archive copy") && !offers(&text, "Camera original") && !offers(&text, "Developed view"), "{text}");
         assert_eq!(opts.resolution, Native);
 
+        // The export bar's "NR" is for exports that do run the noise filter.
         let raw = vr180_pipeline::SourceKind::X6Raw;
         let video = ExportOptions::default();
-        let frames = ExportOptions { raw_dng_sequence: true, ..Default::default() };
-        let original = ExportOptions { raw_dng_sequence: true, raw_dng_original: true, ..Default::default() };
         assert!(export_runs_noise_filter(raw, 0.71, &video));
         assert!(!export_runs_noise_filter(raw, 0.0, &video));
-        assert!(!export_runs_noise_filter(raw, 0.71, &frames) && !export_runs_noise_filter(raw, 0.71, &original));
+        assert!(!export_runs_noise_filter(raw, 0.71, &opts));
         // Another clip in the same list is a video whatever the raw option says.
-        assert!(export_runs_noise_filter(vr180_pipeline::SourceKind::Insta360Insv, 0.5, &original));
+        assert!(export_runs_noise_filter(vr180_pipeline::SourceKind::Insta360Insv, 0.5, &opts));
     }
 
-    /// An archive copy of a raw take: the take's own frames at a size in
-    /// bits a pixel, with no view, no size list, no codec and no noise
-    /// filter; its folder is named after the take.
+    /// Export choices kept by a version in which the take itself was one of
+    /// them: the camera's own frames, picked there, do not come back as an
+    /// export of the developed view, and nothing of them is written again.
     #[test]
-    fn an_archive_copy_is_a_size_in_bits_and_a_folder() {
-        let mut opts = ExportOptions { raw_archive: true, ..Default::default() };
-        assert_eq!(opts.archive_copy(), Some(Some(1.0)));
-        let text = panel_text_full(&mut opts, (11520, 5760), None, None, false, false, Some(EnhancedFrames::Absent));
-        assert!(text.contains("Archive copy") && text.contains("Lossless: every sample kept") && text.contains("High quality: 1 bit a pixel") && text.contains("Custom"), "{text}");
-        assert!(text.contains("The copy is lossy"), "{text}");
-        // 1 bit of 11520 × 5760 thirty times a second: 14.9 GB a minute.
-        assert!(text.contains("about 14.9 GB a minute"), "{text}");
-        assert!(!text.contains("Codec") && !text.contains("(native)") && !text.contains("Camera original"), "{text}");
-        // A size picked by hand stays between the two ends.
-        opts.raw_archive_size = super::ArchiveSize::Custom;
-        for (asked, got) in [(0.75f32, 0.75f64), (0.2, 0.5), (3.0, 1.0)] {
-            opts.raw_archive_bits = asked;
-            assert!((opts.archive_copy().unwrap().unwrap() - got).abs() < 1e-6);
-        }
-        assert_eq!(ExportOptions::default().archive_copy(), None);
-        // A copy that keeps every sample has no size to pick, and says what it keeps.
-        opts.raw_archive_size = super::ArchiveSize::Lossless;
-        assert_eq!(opts.archive_copy(), Some(None));
-        let text = panel_text_full(&mut opts, (11520, 5760), None, None, false, false, Some(EnhancedFrames::Absent));
-        assert!(text.contains("Every sample is kept") && !text.contains("GB a minute") && !text.contains("The copy is lossy") && !text.contains("Codec"), "{text}");
-        // Picking a DNG sequence in the panel is not for this test to click; the two never export together: the copy comes first.
-        let raw = vr180_pipeline::SourceKind::X6Raw;
-        assert!(!export_runs_noise_filter(raw, 0.71, &opts));
+    fn choices_kept_from_before_the_take_left_the_format_window() {
+        let picked: ExportOptions = serde_json::from_str(r#"{"raw_dng_sequence":true,"raw_dng_original":true}"#).unwrap();
+        assert_eq!(picked.settled(), ExportOptions::default());
+        let developed: ExportOptions = serde_json::from_str(r#"{"raw_dng_sequence":true,"raw_dng_original":false}"#).unwrap();
+        assert_eq!(developed.settled(), ExportOptions { raw_dng_sequence: true, ..Default::default() });
+        let plain: ExportOptions = serde_json::from_str(r#"{"raw_dng_sequence":true}"#).unwrap();
+        assert!(plain.settled().raw_dng_sequence);
+        // An archive copy was a choice there for a while: a file that holds it exports the view.
+        let copy: ExportOptions = serde_json::from_str(r#"{"raw_archive":true,"raw_archive_size":"Lossless","raw_archive_bits":0.6}"#).unwrap();
+        assert_eq!(copy.settled(), ExportOptions::default());
+        let written = serde_json::to_string(&ExportOptions { raw_dng_sequence: true, ..Default::default() }).unwrap();
+        assert!(written.contains("raw_dng_sequence") && !written.contains("raw_dng_original") && !written.contains("archive"), "{written}");
         assert_eq!(App::default_archive_dir_for(std::path::Path::new("/takes/TAKE")), std::path::PathBuf::from("/takes/TAKE_Archive"));
-        // What a file kept from before this option holds: no copy.
-        let kept: ExportOptions = serde_json::from_str(r#"{"raw_dng_sequence":true}"#).unwrap();
-        assert!(kept.raw_dng_sequence && !kept.raw_archive && kept.raw_archive_size == super::ArchiveSize::HighQuality);
     }
 
     /// The export of a raw take carries both sizes: the one picked without
@@ -1685,7 +2114,7 @@ mod export_size_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Default::default(),
-            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, offline: None,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, take: None, offline: None, before_take: None, copy: None, take_failed: None,
         };
         let x6 = |single_eye| Some(X6ClipInfo { window: None, ilog: Some(true), paraxial_native: 2086.97, single_lens: single_eye, single_eye });
         let two = item(SourceKind::Insta360Insv, x6(false));
@@ -1919,6 +2348,482 @@ mod join_and_project_tests {
 }
 
 #[cfg(test)]
+mod take_tests {
+    use super::*;
+    use crate::decoder::Settings;
+    use vr180_pipeline::SourceKind;
+
+    /// A take of 5760² twice over at 30 frames a second and 0.8 GB a second.
+    fn take(name: &str, duration_s: f64, trim: (Option<f64>, Option<f64>)) -> TakeView {
+        TakeView {
+            path: PathBuf::from(format!("/takes/{name}")), fps: 30.0, duration_s, trim,
+            frame_samples: 2 * 5760 * 5760, capture_bytes: (duration_s * 0.8e9) as u64, copy: false, lossy_copy: false,
+        }
+    }
+
+    fn entry(path: &str, kind: SourceKind, selected: bool, archive: Option<bool>, status: BatchStatus) -> BatchItem {
+        let note = |exact: bool| vr180_fisheye::x6b::ArchiveNote {
+            exact, target_bits_per_pixel: (!exact).then_some(1.0), bits_per_pixel: Some(1.0), source_bits_per_pixel: Some(3.2), source: None,
+            pairs: None, pairs_of_source: None, first_pair: None, first_pair_s: None,
+        };
+        BatchItem {
+            path: path.into(), fps: 30.0, duration_sec: 120.0, source_kind: kind,
+            fisheye_eye_w: 5760, fisheye_eye_h: 5760, width: 5760, height: 5760,
+            settings: Settings::default(), status, selected, x6: None, raw_one_lens: false, raw_frame: None, four_channel_sound: false,
+            take: kind.is_raw_video().then(|| TakeFacts { capture_bytes: 96_000_000_000, archive: archive.map(note) }),
+            offline: None, before_take: None, copy: None, take_failed: None,
+        }
+    }
+
+    /// Everything the take tools paint, and what they ask for. `click`: a
+    /// text on them to click first; what is painted and asked for is then
+    /// what follows the click.
+    fn shown(tools: &mut TakeTools, view: &TakeToolsView, click: Option<&str>) -> (String, Option<TakeAsk>) {
+        fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::Shape::Text(text) => out.push((text.galley.text().to_string(), text.pos)),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut texts: Vec<(String, egui::Pos2)> = Vec::new();
+        let mut ask = None;
+        let mut frame = |events: Vec<egui::Event>, tools: &mut TakeTools, texts: &mut Vec<(String, egui::Pos2)>, ask: &mut Option<TakeAsk>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(340.0, 3000.0))),
+                events,
+                ..Default::default()
+            };
+            let out = ctx.run_ui(input, |ui| {
+                if let Some(asked) = App::take_tools_ui(ui, tools, view) {
+                    *ask = Some(asked);
+                }
+            });
+            texts.clear();
+            out.shapes.iter().for_each(|clipped| collect(&clipped.shape, texts));
+        };
+        // Two frames: a new context lays its first one out without sizes to go by.
+        frame(Vec::new(), tools, &mut texts, &mut ask);
+        frame(Vec::new(), tools, &mut texts, &mut ask);
+        if let Some(label) = click {
+            let at = texts.iter().find(|(text, _)| text == label).unwrap_or_else(|| panic!("no {label:?} among {texts:?}")).1 + egui::vec2(3.0, 3.0);
+            let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            ask = None;
+            frame(vec![egui::Event::PointerMoved(at)], tools, &mut texts, &mut ask);
+            frame(vec![button(true)], tools, &mut texts, &mut ask);
+            frame(vec![button(false)], tools, &mut texts, &mut ask);
+            frame(Vec::new(), tools, &mut texts, &mut ask);
+        }
+        (texts.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join("\n"), ask)
+    }
+
+    #[test]
+    fn what_a_run_writes_of_a_take() {
+        assert_eq!(take("A", 120.0, (None, None)).written(false), (0.0, 120.0, false));
+        assert_eq!(take("A", 120.0, (Some(12.3), Some(45.6))).written(false), (12.3, 45.6, true));
+        assert_eq!(take("A", 120.0, (Some(12.3), None)).written(false), (12.3, 120.0, true));
+        assert_eq!(take("A", 120.0, (None, Some(45.6))).written(false), (0.0, 45.6, true));
+        // The whole take, whatever its trim.
+        assert_eq!(take("A", 120.0, (Some(12.3), Some(45.6))).written(true), (0.0, 120.0, false));
+        // A trim that leaves out less than half a frame at either end leaves nothing out.
+        assert_eq!(take("A", 120.0, (Some(0.01), Some(119.99))).written(false), (0.0, 120.0, false));
+        // Ends past the take, or in the wrong order, stay inside it.
+        assert_eq!(take("A", 120.0, (Some(-3.0), Some(500.0))).written(false), (0.0, 120.0, false));
+        assert_eq!(take("A", 120.0, (Some(50.0), Some(20.0))).written(false), (50.0, 50.0, true));
+        // A third of the take is a third of its capture.
+        assert_eq!(take("A", 120.0, (None, None)).bytes_of(40.0), 32_000_000_000);
+        assert_eq!(take("A", 0.0, (None, None)).bytes_of(40.0), 0);
+    }
+
+    /// Before a copy of a stretch is made the user is told what it leaves
+    /// out, in both languages, with the lengths.
+    #[test]
+    fn the_warning_says_what_a_copy_leaves_out() {
+        let both = [take("A", 120.0, (Some(12.3), Some(45.6)))];
+        let en = take_cut_warning(&both, false).unwrap();
+        assert!(en.contains("Only the 33.3 s between In and Out") && en.contains("the 12.3 s before In and the 1 min 14 s after Out are left out") && en.contains("Keep the take"), "{en}");
+        let zh = take_cut_warning(&both, true).unwrap();
+        assert!(zh.contains("入点到出点之间的 33.3 秒") && zh.contains("入点之前的 12.3 秒和出点之后的 1 分 14 秒不会进副本") && zh.contains("再删除原素材"), "{zh}");
+        let head = take_cut_warning(&[take("A", 120.0, (Some(12.3), None))], false).unwrap();
+        assert!(head.contains("the 12.3 s before In are left out") && !head.contains("after Out"), "{head}");
+        let tail = take_cut_warning(&[take("A", 120.0, (None, Some(45.6)))], true).unwrap();
+        assert!(tail.contains("出点之后的 1 分 14 秒不会进副本") && !tail.contains("入点之前"), "{tail}");
+        // Nothing to say of a take without a trim.
+        assert_eq!(take_cut_warning(&[take("A", 120.0, (None, None))], false), None);
+        // Several takes: how many of them are trimmed.
+        let several = [take("A", 120.0, (Some(12.3), Some(45.6))), take("B", 60.0, (None, None)), take("C", 60.0, (None, Some(30.0)))];
+        let en = take_cut_warning(&several, false).unwrap();
+        assert!(en.starts_with("2 of these takes are trimmed") && en.contains("Keep the takes"), "{en}");
+        assert!(take_cut_warning(&several, true).unwrap().starts_with("2 条素材设了入出点"));
+        assert_eq!(take_cut_warning(&several[1..2], false), None);
+    }
+
+    #[test]
+    fn the_sizes_a_run_comes_to() {
+        let cut = [take("A", 120.0, (Some(12.3), Some(45.6)))];
+        // 33.3 s of 120 s at 0.8 GB a second; one bit of 2 × 5760² samples, 999 times.
+        assert_eq!(take_sizes_text(&cut, false, Some(1.0), false), "Take 96.0 GB · the part copied 26.6 GB · the copy about 8.3 GB");
+        assert_eq!(take_sizes_text(&cut, false, Some(1.0), true), "原素材 96.0 GB · 要复制的部分 26.6 GB · 副本约 8.3 GB");
+        // A copy that keeps every sample is as large as its frames make it: no size is promised.
+        assert_eq!(take_sizes_text(&cut, false, None, false), "Take 96.0 GB · the part copied 26.6 GB");
+        // The whole take.
+        assert_eq!(take_sizes_text(&cut, true, Some(0.5), false), "Take 96.0 GB · the copy about 14.9 GB");
+        let several = [take("A", 120.0, (Some(12.3), Some(45.6))), take("B", 60.0, (None, None))];
+        assert_eq!(take_sizes_text(&several, false, Some(1.0), false), "2 takes 144 GB · the part copied 74.6 GB · the copies about 23.2 GB");
+        assert_eq!(take_sizes_text(&several, true, None, true), "2 条素材共 144 GB");
+        assert_eq!((size_text(950_000_000), size_text(5_400_000_000), size_text(144_000_000_000)), ("950 MB".into(), "5.4 GB".into(), "144 GB".into()));
+        assert_eq!((span_text(33.34, false), span_text(59.97, false), span_text(74.4, true), span_text(-1.0, false)), ("33.3 s".into(), "1 min 0 s".into(), "1 分 14 秒".into(), "0.0 s".into()));
+    }
+
+    #[test]
+    fn a_take_is_listed_with_what_is_written_of_it() {
+        let cut = take("TAKE", 120.0, (Some(12.3), Some(45.6)));
+        assert_eq!(take_line(&cut, false, false), "TAKE · 00:12.30 to 00:45.60 · 33.3 s of 2 min 0 s");
+        assert_eq!(take_line(&cut, false, true), "TAKE · 00:12.30 到 00:45.60 · 2 分 0 秒中的 33.3 秒");
+        assert_eq!(take_line(&cut, true, false), "TAKE · whole take · 2 min 0 s");
+        assert_eq!(take_line(&take("TAKE", 9.5, (None, None)), false, true), "TAKE · 整条 · 9.5 秒");
+        // Where the folders go, and what the button says.
+        let archive = TakeJob::Archive(None);
+        assert_eq!(take_place_text(std::slice::from_ref(&cut), archive, None, false), "Written beside the take: TAKE_Archive");
+        assert_eq!(take_place_text(std::slice::from_ref(&cut), TakeJob::Originals, None, true), "写在素材旁边：TAKE_OriginalDNG");
+        assert_eq!(take_place_text(std::slice::from_ref(&cut), archive, Some("Disk"), false), "Written into the output folder Disk: TAKE_Archive");
+        let two = [cut.clone(), take("OTHER", 60.0, (None, None))];
+        assert_eq!(take_place_text(&two, archive, None, false), "Written beside the take: <take>_Archive");
+        assert_eq!(take_place_text(&two, TakeJob::Originals, Some("Disk"), true), "写到输出文件夹 Disk：<素材名>_OriginalDNG");
+        assert_eq!((take_start_label(archive, 1, false), take_start_label(archive, 3, true)), ("Make the archive copy".into(), "制作 3 个存档副本".into()));
+        assert_eq!((take_start_label(TakeJob::Originals, 1, true), take_start_label(TakeJob::Originals, 2, false)), ("导出相机原片 DNG".into(), "Write the camera original DNGs of 2 takes".into()));
+        // A copy that was made, beside the same frames of its take.
+        let copy = TakeCopy { dir: "/takes/TAKE_Archive".into(), begins_s: 12.3, bytes: 5_400_000_000, source_bytes: 8_000_000_000 };
+        assert_eq!(take_copy_line(&copy, false), "✓ TAKE_Archive · 5.4 GB, 68% of the same frames in the take");
+        assert_eq!(take_copy_line(&copy, true), "✓ TAKE_Archive · 5.4 GB，是原素材同样这些帧的 68%");
+        assert_eq!(take_copy_line(&TakeCopy { source_bytes: 0, ..copy }, false), "✓ TAKE_Archive");
+    }
+
+    /// The Source panel: two buttons under the clip's facts; the one that is
+    /// open shows its choices, what the run would write and leave out, and
+    /// the button that starts that run.
+    #[test]
+    fn the_take_tools_show_what_a_run_would_write_and_start_it() {
+        let takes = [take("TAKE", 120.0, (Some(12.3), Some(45.6)))];
+        let view = TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true };
+        let mut tools = TakeTools::default();
+        // Closed: the two buttons, nothing else.
+        let (text, ask) = shown(&mut tools, &view, None);
+        assert_eq!((text.as_str(), ask), ("Archive copy\nCamera original DNGs", None));
+
+        // The archive copy: its sizes, the stretch from In to Out by default, and what that leaves out.
+        let (text, ask) = shown(&mut tools, &view, Some("Archive copy"));
+        assert_eq!((tools.open, ask), (Some(TakeTool::Archive), None));
+        for said in [
+            "Lossless: every sample kept", "High quality: 1 bit a pixel", "Custom", TAKE_ARCHIVE_NOTE, TAKE_LOSSY_NOTE,
+            "Range", "In to Out", "Whole take", "TAKE · 00:12.30 to 00:45.60 · 33.3 s of 2 min 0 s",
+            "Only the 33.3 s between In and Out go into the copy", TAKE_STRETCH_NOTE,
+            "Take 96.0 GB · the part copied 26.6 GB · the copy about 8.3 GB", "Written beside the take: TAKE_Archive", "Make the archive copy",
+        ] {
+            assert!(text.contains(said), "{said}: {text}");
+        }
+        assert!(!text.contains(TAKE_EXACT_NOTE) && !text.contains("Use the copy"), "{text}");
+        // Its button starts that run, and nothing else.
+        let (_, ask) = shown(&mut tools, &view, Some("Make the archive copy"));
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(Some(1.0)), whole: false })));
+
+        // The whole take: nothing is left out, and nothing is warned of.
+        let (text, ask) = shown(&mut tools, &view, Some("Whole take"));
+        assert!(tools.archive_whole && ask.is_none());
+        assert!(text.contains("TAKE · whole take · 2 min 0 s") && text.contains("Take 96.0 GB · the copy about 29.9 GB"), "{text}");
+        assert!(!text.contains("go into the copy") && !text.contains(TAKE_STRETCH_NOTE) && !text.contains("the part copied"), "{text}");
+        // Every sample kept: the size picked is to be kept, and no size is promised.
+        let (text, ask) = shown(&mut tools, &view, Some("Lossless: every sample kept"));
+        assert_eq!((tools.size, ask), (ArchiveSize::Lossless, Some(TakeAsk::Keep)));
+        assert!(text.contains(TAKE_EXACT_NOTE) && !text.contains(TAKE_LOSSY_NOTE) && !text.contains("the copy about"), "{text}");
+        let (_, ask) = shown(&mut tools, &view, Some("Make the archive copy"));
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(None), whole: true })));
+        // A size picked by hand.
+        let (text, _) = shown(&mut tools, &view, Some("Custom"));
+        assert_eq!(tools.size, ArchiveSize::Custom);
+        assert!(text.contains("\n0.75\n") && text.contains("bit a pixel") && text.contains("the copy about 22.4 GB"), "{text}");
+        assert_eq!(tools.archive_run(&takes), TakeRun { job: TakeJob::Archive(Some(0.75)), whole: true });
+
+        // While a run is in flight nothing starts.
+        let busy = TakeToolsView { idle: false, ..TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true } };
+        let (text, ask) = shown(&mut tools, &busy, Some("Make the archive copy"));
+        assert!(text.contains("Make the archive copy") && ask.is_none(), "{ask:?}");
+
+        // A take without a trim: no range to pick, nothing left out.
+        let plain = [take("PLAIN", 60.0, (None, None))];
+        let mut tools = TakeTools { open: Some(TakeTool::Archive), ..Default::default() };
+        let (text, _) = shown(&mut tools, &TakeToolsView { archive: &plain, originals: &plain, copies: &[], failed: &[], out_dir: Some("Disk"), idle: true }, None);
+        assert!(text.contains("PLAIN · whole take · 1 min 0 s") && text.contains("Written into the output folder Disk: PLAIN_Archive"), "{text}");
+        assert!(!text.contains("Range") && !text.contains("In to Out") && !text.contains("left out"), "{text}");
+        assert_eq!(tools.archive_run(&plain), TakeRun { job: TakeJob::Archive(Some(1.0)), whole: true });
+
+        // Several takes: each with what is written of it, the rest of a long run by their number.
+        let many: Vec<TakeView> = (0..8).map(|k| take(&format!("T{k}"), 60.0, if k == 0 { (Some(10.0), None) } else { (None, None) })).collect();
+        let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &many, originals: &many, copies: &[], failed: &[], out_dir: None, idle: true }, Some("Make 8 archive copies"));
+        assert!(text.contains("T0 · 00:10.00 to 01:00.00 · 50.0 s of 1 min 0 s") && text.contains("T5 · whole take") && !text.contains("T6 ·") && text.contains("and 2 more"), "{text}");
+        assert!(text.contains("1 of these takes are trimmed") && text.contains("<take>_Archive"), "{text}");
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(Some(1.0)), whole: false })));
+    }
+
+    /// A clip that is an archive copy: no copy is made of it. The copies a
+    /// run made can each take their take's place in the list.
+    #[test]
+    fn copies_are_not_copied_and_can_take_their_takes_place() {
+        let on_screen = [TakeView { copy: true, ..take("TAKE_Archive", 33.3, (None, None)) }];
+        let mut tools = TakeTools { open: Some(TakeTool::Archive), ..Default::default() };
+        let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &[], originals: &on_screen, copies: &[], failed: &[], out_dir: None, idle: true }, None);
+        assert!(text.contains(TAKE_COPY_SOURCE_NOTE) && !text.contains("Make the archive copy") && !text.contains("Lossless"), "{text}");
+        assert_eq!(ask, None);
+        // A take that is no copy and cannot be copied (its description did not read): nothing is claimed of it.
+        let unread = [take("TAKE", 33.3, (None, None))];
+        let (text, _) = shown(&mut tools, &TakeToolsView { archive: &[], originals: &unread, copies: &[], failed: &[], out_dir: None, idle: true }, None);
+        assert_eq!(text, "Archive copy\nCamera original DNGs");
+
+        let takes = [take("TAKE", 120.0, (None, None))];
+        let copy = |name: &str| TakeCopy { dir: format!("/takes/{name}_Archive").into(), begins_s: 0.0, bytes: 5_400_000_000, source_bytes: 8_000_000_000 };
+        let one = [(4usize, copy("TAKE"))];
+        let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &takes, originals: &takes, copies: &one, failed: &[], out_dir: None, idle: true }, Some("Use the copy"));
+        assert!(text.contains("✓ TAKE_Archive · 5.4 GB, 68% of the same frames in the take") && !text.contains("Use all the copies"), "{text}");
+        assert_eq!(ask, Some(TakeAsk::UseCopy(4)));
+        let two = [(4usize, copy("TAKE")), (7usize, copy("OTHER"))];
+        let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &takes, originals: &takes, copies: &two, failed: &[], out_dir: None, idle: true }, Some("Use all the copies"));
+        assert!(text.contains("✓ OTHER_Archive"), "{text}");
+        assert_eq!(ask, Some(TakeAsk::UseCopies));
+    }
+
+    /// The camera's own frames: from In to Out by default, as before, and
+    /// from a lossy copy with a word on what they then are.
+    #[test]
+    fn the_cameras_own_frames_are_written_from_the_source_panel() {
+        let takes = [take("TAKE", 120.0, (Some(12.3), Some(45.6)))];
+        let mut tools = TakeTools::default();
+        let view = TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true };
+        let (text, _) = shown(&mut tools, &view, Some("Camera original DNGs"));
+        assert_eq!(tools.open, Some(TakeTool::Originals));
+        for said in [TAKE_ORIGINALS_NOTE, "Range", "TAKE · 00:12.30 to 00:45.60 · 33.3 s of 2 min 0 s", "999 frames", "Written beside the take: TAKE_OriginalDNG", TAKE_ORIGINALS_PLACE_NOTE, "Write the camera original DNGs"] {
+            assert!(text.contains(said), "{said}: {text}");
+        }
+        assert!(!text.contains("Lossless") && !text.contains(TAKE_LOSSY_SOURCE_NOTE) && !text.contains("go into the copy"), "{text}");
+        let (_, ask) = shown(&mut tools, &view, Some("Write the camera original DNGs"));
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Originals, whole: false })));
+        let (text, _) = shown(&mut tools, &view, Some("Whole take"));
+        assert!(tools.originals_whole && !tools.archive_whole && text.contains("3600 frames"), "{text}");
+        // The other button closes this one's choices and opens its own.
+        let (text, _) = shown(&mut tools, &view, Some("Archive copy"));
+        assert!(tools.open == Some(TakeTool::Archive) && !text.contains(TAKE_ORIGINALS_NOTE), "{text}");
+        // Clicked again, it closes.
+        let (text, _) = shown(&mut tools, &view, Some("Archive copy"));
+        assert_eq!((tools.open, text.as_str()), (None, "Archive copy\nCamera original DNGs"));
+
+        let lossy = [TakeView { copy: true, lossy_copy: true, ..take("TAKE_Archive", 33.3, (None, None)) }];
+        let mut tools = TakeTools { open: Some(TakeTool::Originals), ..Default::default() };
+        let (text, _) = shown(&mut tools, &TakeToolsView { archive: &[], originals: &lossy, copies: &[], failed: &[], out_dir: Some("Disk"), idle: true }, None);
+        assert!(text.contains(TAKE_LOSSY_SOURCE_NOTE) && !text.contains(TAKE_ORIGINALS_PLACE_NOTE) && !text.contains("Range"), "{text}");
+    }
+
+    /// Every word of the take tools is there in Chinese.
+    #[test]
+    fn the_take_tools_read_in_both_languages() {
+        for text in [
+            TAKE_ARCHIVE_HOVER, TAKE_ARCHIVE_NOTE, TAKE_EXACT_NOTE, TAKE_LOSSY_NOTE, TAKE_STRETCH_NOTE, TAKE_COPY_SOURCE_NOTE, TAKE_ORIGINALS_NOTE,
+            TAKE_ORIGINALS_PLACE_NOTE, TAKE_LOSSY_SOURCE_NOTE, TAKE_USE_COPY_HOVER, TAKE_BUSY_HOVER,
+            "Archive copy", "Camera original DNGs", "Lossless: every sample kept", "High quality: 1 bit a pixel", "Custom", "bit a pixel",
+            "Range", "In to Out", "Whole take", "Use the copy", "Use all the copies",
+        ] {
+            assert_ne!(tr_zh(text), text, "{text}");
+        }
+    }
+
+    /// Which takes a run writes: the ticked ones it is for, else the clip
+    /// on screen. A copy is made of a camera's take only.
+    #[test]
+    fn which_takes_a_run_writes() {
+        let raw = SourceKind::X6Raw;
+        let idle = || BatchStatus::Idle;
+        let mut batch = vec![
+            entry("/takes/A", raw, true, None, idle()),
+            entry("/takes/A_Archive", raw, true, Some(true), idle()),
+            entry("/clips/b.insv", SourceKind::Insta360Insv, true, None, idle()),
+            entry("/takes/C", raw, false, None, idle()),
+        ];
+        let (archive, originals) = (TakeJob::Archive(None), TakeJob::Originals);
+        assert_eq!(take_clips(&batch, Some(3), archive), vec![0]);
+        assert_eq!(take_clips(&batch, Some(3), originals), vec![0, 1]);
+        // Nothing ticked that the run is for: the clip on screen, where it is for that.
+        batch.iter_mut().for_each(|b| b.selected = false);
+        batch[2].selected = true;
+        assert_eq!((take_clips(&batch, Some(3), archive), take_clips(&batch, Some(3), originals)), (vec![3], vec![3]));
+        assert_eq!((take_clips(&batch, Some(1), archive), take_clips(&batch, Some(1), originals)), (vec![], vec![1]));
+        assert_eq!((take_clips(&batch, Some(2), archive), take_clips(&batch, None, originals)), (vec![], vec![]));
+        // A take whose files are not at hand, or whose description did not read, is left out.
+        batch[3].take = None;
+        assert_eq!(take_clips(&batch, Some(3), archive), Vec::<usize>::new());
+        assert!(entry("/takes/A", raw, false, None, idle()).camera_take() && !entry("/takes/A", raw, false, Some(false), idle()).camera_take());
+        assert_eq!((entry("/takes/A", raw, false, None, idle()).frame_samples(), BatchItem { raw_one_lens: true, ..entry("/takes/A", raw, false, None, idle()) }.frame_samples()), (2 * 5760 * 5760, 5760 * 5760));
+    }
+
+    /// A run that writes the takes themselves leaves the export queue as it
+    /// found it: what was exported stays exported, what waits still waits,
+    /// and the run's own outcomes are not taken for exports.
+    #[test]
+    fn a_take_run_leaves_the_export_queue_as_it_found_it() {
+        let raw = SourceKind::X6Raw;
+        let before = [BatchStatus::Done, BatchStatus::Idle, BatchStatus::Failed("x".into()), BatchStatus::Queued, BatchStatus::Skipped];
+        let mut batch: Vec<BatchItem> = before.iter().enumerate().map(|(i, s)| entry(&format!("/takes/T{i}"), raw, false, None, s.clone())).collect();
+        queue_put_aside(&mut batch, &[1, 4]);
+        // The run's takes alone are armed: an export that was waiting does not run as part of it.
+        assert_eq!(batch.iter().map(|b| b.status.clone()).collect::<Vec<_>>(),
+            vec![BatchStatus::Idle, BatchStatus::Queued, BatchStatus::Idle, BatchStatus::Idle, BatchStatus::Queued]);
+        batch[1].status = BatchStatus::Done;
+        batch[4].status = BatchStatus::Failed("ffmpeg: archive copy: the disk is full".into());
+        let job = TakeJob::Archive(None);
+        queue_brought_back(&mut batch, Some(job));
+        assert_eq!(batch.iter().map(|b| b.status.clone()).collect::<Vec<_>>(), before.to_vec());
+        assert!(batch.iter().all(|b| b.before_take.is_none()));
+        // The take the run could not write keeps the reason; an export that had failed before is no such take.
+        assert_eq!(batch.iter().map(|b| b.take_failed.clone()).collect::<Vec<_>>(),
+            vec![None, None, None, None, Some((job, "archive copy: the disk is full".to_string()))]);
+        // Nothing put aside: nothing to bring back.
+        batch[0].status = BatchStatus::Running;
+        queue_brought_back(&mut batch, Some(job));
+        assert_eq!((batch[0].status.clone(), batch[2].take_failed.clone()), (BatchStatus::Running, None));
+        // The next run of that take starts without the old reason.
+        queue_put_aside(&mut batch, &[4]);
+        assert_eq!(batch[4].take_failed, None);
+        queue_brought_back(&mut batch, None);
+
+        // What could not be written is said under the button it belongs to.
+        let takes = [take("TAKE", 60.0, (None, None))];
+        let failed = [(job, "T4".to_string(), "archive copy: the disk is full".to_string()), (TakeJob::Originals, "T2".to_string(), "no room".to_string())];
+        let view = TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &failed, out_dir: None, idle: true };
+        let (text, _) = shown(&mut TakeTools { open: Some(TakeTool::Archive), ..Default::default() }, &view, None);
+        assert!(text.contains("✗ T4: archive copy: the disk is full") && !text.contains("T2"), "{text}");
+        let (text, _) = shown(&mut TakeTools { open: Some(TakeTool::Originals), ..Default::default() }, &view, None);
+        assert!(text.contains("✗ T2: no room") && !text.contains("T4"), "{text}");
+    }
+
+    /// An archive copy reads the folder of camera-original DNGs of the take
+    /// it was made from when it has none of its own: what was enhanced for
+    /// the take goes on being used once the copy has taken its place.
+    #[test]
+    fn a_copy_reads_its_takes_camera_originals() {
+        let root = std::env::temp_dir().join(format!("vr180-copy-originals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let clip = |archive: &str| format!(r#"{{"layout":"paired-bayer-v1","fps_setting":60,"size":[3840,3840]{archive}}}"#);
+        for (dir, archive) in [("TAKE", String::new()), ("TAKE_Archive", r#","archive":{"version":1,"kind":"exact","source":"TAKE"}"#.to_string()),
+            ("LONE_Archive", r#","archive":{"version":1,"kind":"lossy","source":"LONE"}"#.to_string())]
+        {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("clip.json"), clip(&archive)).unwrap();
+        }
+        std::fs::create_dir_all(root.join("TAKE_OriginalDNG/CAM0")).unwrap();
+        assert_eq!(App::originals_dir_for(&root.join("TAKE")), root.join("TAKE_OriginalDNG"));
+        assert_eq!(App::originals_dir_for(&root.join("TAKE_Archive")), root.join("TAKE_OriginalDNG"));
+        // Its take's folder is not beside it: its own name, as for any take.
+        assert_eq!(App::originals_dir_for(&root.join("LONE_Archive")), root.join("LONE_Archive_OriginalDNG"));
+        // Frames written from the copy itself come first.
+        std::fs::create_dir_all(root.join("TAKE_Archive_OriginalDNG")).unwrap();
+        assert_eq!(App::originals_dir_for(&root.join("TAKE_Archive")), root.join("TAKE_Archive_OriginalDNG"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a run writes of a clip: the take itself only in a run started
+    /// for that, and only of a raw take.
+    #[test]
+    fn a_run_writes_the_take_or_its_view() {
+        let (raw, insv, still) = (SourceKind::X6Raw, SourceKind::Insta360Insv, SourceKind::Insta360Dng);
+        let video = ExportOptions::default();
+        let frames = ExportOptions { raw_dng_sequence: true, ..Default::default() };
+        let copy = TakeRun { job: TakeJob::Archive(None), whole: false };
+        let originals = TakeRun { job: TakeJob::Originals, whole: true };
+        assert_eq!(run_output(None, raw, &video), RunOutput::Video);
+        assert_eq!(run_output(None, raw, &frames), RunOutput::DngFrames);
+        assert_eq!(run_output(None, insv, &frames), RunOutput::Video);
+        assert_eq!(run_output(None, still, &frames), RunOutput::Still);
+        // Whatever the export choices are.
+        for opts in [&video, &frames] {
+            assert_eq!(run_output(Some(copy), raw, opts), RunOutput::Take(TakeJob::Archive(None)));
+            assert_eq!(run_output(Some(originals), raw, opts), RunOutput::Take(TakeJob::Originals));
+            assert_eq!(run_output(Some(copy), insv, opts), RunOutput::Video);
+        }
+        assert_eq!(App::take_job_dir_for(std::path::Path::new("/takes/TAKE"), TakeJob::Archive(Some(1.0))), PathBuf::from("/takes/TAKE_Archive"));
+        assert_eq!(App::take_job_dir_for(std::path::Path::new("/takes/TAKE"), TakeJob::Originals), PathBuf::from("/takes/TAKE_OriginalDNG"));
+        // What a finished run says it did.
+        assert_eq!((run_done_text(3, None, true), run_done_text(1, Some(copy.job), false), run_done_text(2, Some(copy.job), false)),
+            ("3 exported".into(), "1 archive copy made".into(), "2 archive copies made".into()));
+        assert_eq!((run_done_text(2, Some(copy.job), true), run_done_text(1, Some(originals.job), false), run_done_text(2, Some(originals.job), true)),
+            ("已制作 2 个存档副本".into(), "camera original DNGs of 1 take written".into(), "已导出 2 条素材的相机原片 DNG".into()));
+    }
+
+    /// The copy takes the take's place with the take's settings; a copy of
+    /// a stretch begins where the stretch did, and the trim moves with it.
+    #[test]
+    fn the_copy_goes_on_with_the_takes_settings() {
+        let trimmed = Settings { trim_in_s: Some(12.3), trim_out_s: Some(45.6), ettr_stops: 0.5, ..Default::default() };
+        let copy = |begins_s: f64| TakeCopy { dir: "/takes/TAKE_Archive".into(), begins_s, bytes: 1, source_bytes: 2 };
+        // The copy of that stretch is the stretch: no trim is left. (Its first frame is the one nearest In.)
+        let s = settings_for_copy(&trimmed, &copy(12.3), 33.3, 30.0);
+        assert_eq!((s.trim_in_s, s.trim_out_s, s.ettr_stops), (None, None, 0.5));
+        let s = settings_for_copy(&trimmed, &copy(12.3133), 33.3, 30.0);
+        assert_eq!((s.trim_in_s, s.trim_out_s), (None, None));
+        // A copy of the whole take: the trim is the take's.
+        let s = settings_for_copy(&trimmed, &copy(0.0), 120.0, 30.0);
+        assert_eq!((s.trim_in_s, s.trim_out_s), (Some(12.3), Some(45.6)));
+        // The trim was moved after the copy was made: it lies in the copy where it lay in the take.
+        let moved = Settings { trim_in_s: Some(15.0), trim_out_s: Some(40.0), ..Default::default() };
+        let s = settings_for_copy(&moved, &copy(12.3), 33.3, 30.0);
+        assert!((s.trim_in_s.unwrap() - 2.7).abs() < 1e-9 && (s.trim_out_s.unwrap() - 27.7).abs() < 1e-9, "{:?} {:?}", s.trim_in_s, s.trim_out_s);
+        // Past the copy's ends: no trim there.
+        let wide = Settings { trim_in_s: Some(5.0), trim_out_s: Some(100.0), ..Default::default() };
+        let s = settings_for_copy(&wide, &copy(12.3), 33.3, 30.0);
+        assert_eq!((s.trim_in_s, s.trim_out_s), (None, None));
+        let s = settings_for_copy(&Settings::default(), &copy(12.3), 33.3, 30.0);
+        assert_eq!((s.trim_in_s, s.trim_out_s), (None, None));
+    }
+
+    /// The size picked for an archive copy is kept across launches; what
+    /// else the panel holds starts over.
+    #[test]
+    fn the_size_picked_is_kept() {
+        for (size, bits) in [(ArchiveSize::Lossless, 0.75f32), (ArchiveSize::HighQuality, 0.75), (ArchiveSize::Custom, 0.6)] {
+            let tools = TakeTools { size, bits, open: Some(TakeTool::Archive), archive_whole: true, originals_whole: true };
+            assert_eq!(TakeTools::from_kept(&tools.kept()), TakeTools { size, bits, ..Default::default() });
+        }
+        assert_eq!(TakeTools::from_kept(""), TakeTools::default());
+        assert_eq!(TakeTools::from_kept("something else"), TakeTools::default());
+        assert_eq!(TakeTools::from_kept("custom 7").bits, 1.0);
+        assert_eq!(TakeTools::from_kept("custom nan").bits, 0.75);
+        let d = TakeTools::default();
+        assert_eq!((d.size, d.archive_bits(), d.archive_whole, d.originals_whole), (ArchiveSize::HighQuality, Some(1.0), false, false));
+        assert_eq!(TakeTools { size: ArchiveSize::Lossless, ..d }.archive_bits(), None);
+        for (asked, got) in [(0.75f32, 0.75f64), (0.2, 0.5), (3.0, 1.0)] {
+            assert!((TakeTools { size: ArchiveSize::Custom, bits: asked, ..d }.archive_bits().unwrap() - got).abs() < 1e-6);
+        }
+    }
+
+    /// A clip that is an archive copy says how it was made, and which
+    /// stretch of its take it holds when that is not all of it.
+    #[test]
+    fn a_copy_says_which_stretch_of_its_take_it_holds() {
+        let whole = vr180_fisheye::x6b::ArchiveNote {
+            exact: true, target_bits_per_pixel: None, bits_per_pixel: Some(2.1), source_bits_per_pixel: Some(3.2), source: Some("TAKE".into()),
+            pairs: Some(1800), pairs_of_source: Some(1800), first_pair: Some(0), first_pair_s: Some(0.0),
+        };
+        assert_eq!(archive_note_text(&whole, false), "every sample kept");
+        assert_eq!(archive_note_text(&whole, true), "每个样本都保留");
+        let part = vr180_fisheye::x6b::ArchiveNote { pairs: Some(300), first_pair: Some(368), ..whole.clone() };
+        assert_eq!(archive_note_text(&part, false), "every sample kept · frames 369 to 668 of the take's 1800");
+        assert_eq!(archive_note_text(&part, true), "每个样本都保留 · 原素材 1800 帧中的第 369 到 668 帧");
+        let lossy = vr180_fisheye::x6b::ArchiveNote { exact: false, target_bits_per_pixel: Some(1.0), bits_per_pixel: Some(0.97), ..part };
+        assert_eq!(archive_note_text(&lossy, false), "0.97 bit a pixel · frames 369 to 668 of the take's 1800");
+        // A copy made before the note said so: no word on it.
+        let old = vr180_fisheye::x6b::ArchiveNote { pairs: None, pairs_of_source: None, first_pair: None, first_pair_s: None, ..lossy };
+        assert_eq!(archive_note_text(&old, false), "0.97 bit a pixel");
+    }
+}
+
+#[cfg(test)]
 mod ettr_tests {
     use super::{takes_ilog, App, BatchItem, BatchStatus, ExportOptions, X6ClipInfo};
     use crate::decoder::Settings;
@@ -1935,7 +2840,7 @@ mod ettr_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Settings { ettr_stops, ..Default::default() },
-            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, offline: None,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, take: None, offline: None, before_take: None, copy: None, take_failed: None,
         }
     }
 
@@ -2282,7 +3187,7 @@ mod spatial_export_tests {
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
-                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, None, false, false, None, false);
+                App::export_options_ui(ui, opts, "test", Some(aspect), (hfov_deg, defish), 29.97, false, None, None, None, false, false, None);
             });
             text.clear();
             out.shapes.iter().for_each(|clipped| collect(&clipped.shape, &mut text));
@@ -2444,16 +3349,14 @@ impl ExportOptions {
         }
     }
 
-    /// The archive copy a raw clip exports as: the bits a pixel of a lossy
-    /// one, or `Some(None)` for one that keeps every sample; `None` when the
-    /// clip exports as something else.
-    fn archive_copy(&self) -> Option<Option<f64>> {
-        use vr180_pipeline::raw_archive::{BITS_LEAST, BITS_MOST};
-        self.raw_archive.then(|| match self.raw_archive_size {
-            ArchiveSize::Lossless => None,
-            ArchiveSize::HighQuality => Some(BITS_MOST),
-            ArchiveSize::Custom => Some((self.raw_archive_bits as f64).clamp(BITS_LEAST, BITS_MOST)),
-        })
+    /// The options as read from a file: one written when the camera's own
+    /// frames were a kind of DNG sequence, with that kind picked, exports a
+    /// video again.
+    fn settled(mut self) -> Self {
+        if std::mem::take(&mut self.was_dng_original) {
+            self.raw_dng_sequence = false;
+        }
+        self
     }
 
     /// The codec an export of a clip with `settings` really uses: spatial
@@ -2484,10 +3387,7 @@ impl Default for ExportOptions {
         Self {
             codec: ExportCodec::H265,
             raw_dng_sequence: false,
-            raw_dng_original: false,
-            raw_archive: false,
-            raw_archive_size: ArchiveSize::HighQuality,
-            raw_archive_bits: 0.75,
+            was_dng_original: false,
             raw_use_enhanced: true,
             still_format: StillFormatChoice::Png16,
             resolution: ExportResolution::R8k,
@@ -2554,9 +3454,19 @@ struct BatchItem {
     /// The clip has four-channel sound a spatial track can be made of
     /// ([`four_channel_sound`]).
     four_channel_sound: bool,
+    /// A raw take's own size, and what it says of itself as an archive copy.
+    take: Option<TakeFacts>,
     /// The entry's file is not at hand (see [`OfflineClip`]); what the
     /// fields above say of the file is then empty.
     offline: Option<OfflineClip>,
+    /// The status the entry had when a run that writes the takes themselves
+    /// began ([`TakeRun`]): that run leaves the export queue as it found it.
+    before_take: Option<BatchStatus>,
+    /// The archive copy the last such run made of this take.
+    copy: Option<TakeCopy>,
+    /// Why the last such run did not write this take, and what it was to
+    /// write (the export queue's own status is back by then).
+    take_failed: Option<(TakeJob, String)>,
 }
 
 /// A clip's sound is four channels an Ambisonic or APAC track can be
@@ -2622,6 +3532,7 @@ struct ClipFacts {
     raw_one_lens: bool,
     raw_frame: Option<RawFrame>,
     four_channel_sound: bool,
+    take: Option<TakeFacts>,
 }
 
 impl ClipFacts {
@@ -2675,6 +3586,7 @@ impl ClipFacts {
             raw_one_lens: raw_take_of_one_lens(source_kind, path),
             raw_frame: RawFrame::read(source_kind, path),
             four_channel_sound: four_channel_sound(source_kind, path),
+            take: TakeFacts::read(source_kind, path),
         })
     }
 }
@@ -2721,8 +3633,40 @@ impl BatchItem {
             raw_one_lens: false,
             raw_frame: None,
             four_channel_sound: false,
+            take: None,
             offline: Some(OfflineClip { token, looking: true, file: clip.file.clone(), segments: clip.segments.clone(), base }),
+            before_take: None,
+            copy: None,
+            take_failed: None,
         }
+    }
+
+    /// The entry's file is `path`, and says `facts` of itself.
+    fn take_facts(&mut self, path: PathBuf, facts: ClipFacts) {
+        self.path = path;
+        self.source_kind = facts.source_kind;
+        self.fps = facts.fps;
+        self.duration_sec = facts.duration_sec;
+        self.width = facts.width;
+        self.height = facts.height;
+        self.fisheye_eye_w = facts.fisheye_eye_w;
+        self.fisheye_eye_h = facts.fisheye_eye_h;
+        self.x6 = facts.x6;
+        self.raw_one_lens = facts.raw_one_lens;
+        self.raw_frame = facts.raw_frame;
+        self.four_channel_sound = facts.four_channel_sound;
+        self.take = facts.take;
+        self.offline = None;
+    }
+
+    /// A raw take as the camera wrote it: what an archive copy is made of.
+    fn camera_take(&self) -> bool {
+        self.ready() && self.source_kind.is_raw_video() && self.take.as_ref().is_some_and(|t| t.archive.is_none())
+    }
+
+    /// The samples of one of its frames, both eyes together.
+    fn frame_samples(&self) -> u64 {
+        self.width as u64 * self.height as u64 * if self.single_eye() { 1 } else { 2 }
     }
 
     /// The file is at hand and its header has been read.
@@ -2768,7 +3712,7 @@ impl BatchItem {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum BatchStatus {
     /// Never exported (or explicitly re-armed). The default.
     Idle,
@@ -2801,6 +3745,20 @@ struct BatchSummary {
     elapsed: std::time::Duration,
     /// The one file the run's clips were joined into.
     joined: Option<PathBuf>,
+    /// The run wrote the takes themselves, and what of them.
+    take: Option<TakeJob>,
+}
+
+/// What a finished run has done, in a few words: its clips exported, or
+/// the takes themselves written (`take`).
+fn run_done_text(done: usize, take: Option<TakeJob>, zh: bool) -> String {
+    match (take, zh) {
+        (None, _) => format!("{done} exported"),
+        (Some(TakeJob::Archive(_)), true) => format!("已制作 {done} 个存档副本"),
+        (Some(TakeJob::Archive(_)), false) => format!("{done} archive {} made", if done == 1 { "copy" } else { "copies" }),
+        (Some(TakeJob::Originals), true) => format!("已导出 {done} 条素材的相机原片 DNG"),
+        (Some(TakeJob::Originals), false) => format!("camera original DNGs of {done} {} written", if done == 1 { "take" } else { "takes" }),
+    }
 }
 
 /// A run of the export queue whose clips are written as ONE file. Each
@@ -2994,30 +3952,37 @@ fn tr_zh(en: &'static str) -> &'static str {
         "View" => "视图",
         "DNG sequence" => "DNG 序列",
         "Archive copy" => "存档副本",
+        "Camera original DNGs" => "相机原片 DNG",
+        "The take's folder again with a smaller capture, which opens like the take: every frame, its timing and the files beside it are kept. The take itself is left as it is."
+            => "再写一份素材文件夹，采集文件更小，打开方式和原素材一样：每一帧、它的时间信息和旁边的文件都保留。原素材保持不动。",
+        "Every sample is kept as the camera recorded it, and each frame is read back and compared before it is written. Most takes come out a quarter to a third smaller, a 14-bit take that keeps every value about an eighth."
+            => "每个样本都和相机记录的一样，每一帧写入前都会读回来逐一核对。大多数素材能小四分之一到三分之一，每个值都保留的 14 bit 素材大约小八分之一。",
+        "The copy is lossy: at 1 bit a pixel a frame is off by less than its own noise; below that the shadows lose their grain when they are lifted."
+            => "副本是有损的：每像素 1 bit 时，一帧的偏差小于它自身的噪声；再低，暗部提亮后会失去颗粒。",
+        "A copy of a stretch is a shorter clip. What the app takes from a whole clip, such as the tone statistics and the stabilizer's reference, is then taken from the stretch, so its picture can differ slightly from the same stretch of the take."
+            => "只含一段的副本是一条更短的素材。软件按整条素材取的量，比如影调统计和防抖基准，会改成从这一段里取，画面可能与原素材的同一段略有不同。",
+        "The folder of that name beside the take is also where the app looks for enhanced frames and for Camera Raw settings."
+            => "素材旁边这个名字的文件夹，也是软件查找增强帧和 Camera Raw 设置的地方。",
+        "This clip is a lossy archive copy: the frames written are the copy's, close to what the sensor recorded but not the same."
+            => "这个片段是有损存档副本：写出的是副本里的帧，接近传感器的记录，但不完全相同。",
+        "Puts the copy in the take's place in the list, with the take's settings. Nothing is deleted: the take stays where it is."
+            => "在列表里用副本顶替这条素材，设置原样带过去。不删除任何东西：原素材留在原处。",
+        "A run is in flight: this can start when it is over." => "有任务正在进行：结束后才能开始。",
+        "Range" => "范围",
+        "In to Out" => "入点到出点",
+        "Whole take" => "整条素材",
+        "Use the copy" => "改用副本",
+        "Use all the copies" => "全部改用副本",
         "every sample kept" => "每个样本都保留",
         "This clip is an archive copy of a take, made by this app: not the camera's own recording." => "这个片段是素材的存档副本，由本软件制作，不是相机自己的记录。",
         "High quality: 1 bit a pixel" => "高质量：每像素 1 bit",
         "Lossless: every sample kept" => "无损：每个样本都保留",
-        "lossless" => "无损",
-        "The take's folder again with a smaller capture, which opens like the take: every frame, its timing and the files beside it are kept. Every sample is kept as the camera recorded it, and each frame is read back and compared before it is written. Most takes come out a quarter to a third smaller, a 14-bit take that keeps every value about an eighth. Only the stretch between In and Out is copied. The take itself is left as it is."
-            => "再写一份素材文件夹，采集文件更小，打开方式和原素材一样：每一帧、它的时间信息和旁边的文件都保留。每个样本都和相机记录的一样，每一帧写入前都会读回来逐一核对。大多数素材能小四分之一到三分之一，每个值都保留的 14 bit 素材大约小八分之一。只复制入点到出点之间的部分。原素材保持不动。",
         "Custom" => "自定义",
         "bit a pixel" => "bit 每像素",
-        "about" => "约",
-        "a minute" => "每分钟",
         "A smaller copy of the take for keeping, which opens like the take." => "素材的一个更小的副本，用于存档，打开方式和原素材一样。",
-        "The take's folder again with a capture a fraction of the size, which opens like the take: every frame, its timing and the files beside it are kept. The copy is lossy: at 1 bit a pixel a frame is off by less than its own noise; below that the shadows lose their grain when they are lifted. Only the stretch between In and Out is copied. The take itself is left as it is."
-            => "再写一份素材文件夹，采集文件只有原来的几分之一大，打开方式和原素材一样：每一帧、它的时间信息和旁边的文件都保留。副本是有损的：每像素 1 bit 时，一帧的偏差小于它自身的噪声；再低，暗部提亮后会失去颗粒。只复制入点到出点之间的部分。原素材保持不动。",
-        "An archive copy holds the take's own frames: the view and its size, the grade, stabilization and noise reduction are not applied to them."
-            => "存档副本保存的是素材自己的帧：视图及其尺寸、调色、防抖和降噪都不会作用到它们上面。",
         "This clip is an archive copy of a take: a copy is made from the camera's take, not from another copy."
             => "这个片段本身就是素材的存档副本：副本要从相机的原素材制作，不能从另一个副本制作。",
-        "An archive copy is a folder for each clip: it cannot be joined. Pick a video format in Format."
-            => "存档副本是每个片段一个文件夹，无法拼接。请在“格式”里选择一种视频格式。",
-        "Developed view" => "显影后的画面",
         "Use enhanced frames" => "使用增强后的帧",
-        "Camera original frames are the sensor's own: the view and its size, the grade, stabilization and noise reduction are not applied to them."
-            => "相机原片就是传感器记录的帧：视图及其尺寸、调色、防抖和降噪都不会作用到它们上面。",
         "Enhanced frames found:" => "已找到增强后的帧：",
         "No enhanced frame found for this clip: it exports from the capture." => "没有找到这个片段的增强帧：导出取自采集文件。",
         "Looking for enhanced frames…" => "正在查找增强后的帧…",
@@ -3025,10 +3990,7 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Enhanced frames (a raw converter's Super Resolution, in the folder of Camera original DNGs) are read on macOS only for now: this clip exports from the capture." => "增强后的帧（RAW 转换软件的超分辨率，位于相机原片 DNG 文件夹中）目前只有 macOS 能读取：这个片段从采集文件导出。",
         "This clip's enhanced frames hold more than 8192 × 4096 shows: the two larger sizes keep it. A stretch without enhanced frames exports at the size picked without them." => "这个片段的增强帧包含的细节多于 8192 × 4096 能呈现的：两档更大的尺寸可以保留这些细节。没有增强帧的区段按未使用增强帧时所选的尺寸导出。",
         "When the folder of Camera original DNGs is beside the take and a raw converter has enhanced its frames in place (Camera Raw's Super Resolution), each frame is taken from there, at the enhanced size. A frame that was not enhanced comes from the capture." => "素材旁边有相机原片 DNG 文件夹，并且其中的帧已在 RAW 转换软件里原地增强过时（Camera Raw 的超分辨率），每一帧从那里读取，按增强后的尺寸处理。没有增强过的帧仍取自采集文件。",
-        "Camera original" => "相机原片",
-        "camera original" => "相机原片",
         "Every frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number. No projection, no stabilization, no grading — for running the frames through a raw converter first." => "每一帧按传感器记录的原样导出：每眼一个 Bayer DNG，以相机的帧号命名。不投影、不防抖、不调色，适合先把每一帧交给 RAW 转换软件处理。",
-        "Every frame as a DNG in a folder: the developed view, or the sensor's own frames." => "每一帧导出为文件夹里的一个 DNG：可以是显影后的画面，也可以是传感器原片。",
         "Every frame as a linear DNG in a folder, with this clip's raw development settings inside each file." => "每一帧导出为一个线性 DNG，放进同一个文件夹，每个文件里带着这个片段的 RAW 显影设置。",
         "📷 Snapshot" => "📷 截图",
         "Original DNG" => "原片 DNG",
@@ -4090,6 +5052,8 @@ impl App {
             current_version_notes: None,
             audio_player: None,
             export_opts: ExportOptions::default(),
+            take_run: None,
+            take_tools: Self::load_take_copy(),
             batch: Vec::new(),
             active_clip: None,
             align_rx: None,
@@ -4193,6 +5157,28 @@ impl App {
                 let _ = std::fs::create_dir_all(dir);
             }
             let _ = std::fs::write(p, if self.lang == Lang::Zh { "zh" } else { "en" });
+        }
+    }
+
+    /// `…/VR180SilverBullet2.0/take_copy`: the size of an archive copy, as
+    /// last picked in the Source panel.
+    fn take_copy_config_path() -> Option<PathBuf> {
+        crate::decoder::Settings::config_path()
+            .and_then(|p| p.parent().map(|d| d.join("take_copy")))
+    }
+
+    fn load_take_copy() -> TakeTools {
+        Self::take_copy_config_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map_or_else(TakeTools::default, |text| TakeTools::from_kept(&text))
+    }
+
+    fn save_take_copy(&self) {
+        if let Some(p) = Self::take_copy_config_path() {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(p, self.take_tools.kept());
         }
     }
 
@@ -4310,6 +5296,7 @@ impl App {
         failed: usize,
         elapsed: std::time::Duration,
         n_run: usize,
+        take: Option<TakeJob>,
     ) {
         #[cfg(target_os = "macos")]
         {
@@ -4320,10 +5307,11 @@ impl App {
                 let (m, s) = (elapsed.as_secs() / 60, elapsed.as_secs() % 60);
                 if m > 0 { format!("{m}m {s}s") } else { format!("{s}s") }
             };
+            let what = run_done_text(done, take, false);
             let body = if failed > 0 {
-                format!("{done} exported, {failed} failed · {when}")
+                format!("{what}, {failed} failed · {when}")
             } else {
-                format!("{done} exported · {when}")
+                format!("{what} · {when}")
             }
             .replace('"', "'");
             // osascript is always present on macOS; spawn detached so the UI
@@ -4338,7 +5326,7 @@ impl App {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (done, failed, elapsed, n_run);
+            let _ = (done, failed, elapsed, n_run, take);
         }
     }
 
@@ -4353,9 +5341,11 @@ impl App {
                 if p.total_frames > 0 { return p.total_frames; }
             }
         }
+        // (A run that writes the takes themselves may leave their trim out.)
+        let whole = self.take_run.is_some_and(|run| run.whole);
         self.batch.get(i).map(|b| {
-            let t_in = b.settings.trim_in_s.unwrap_or(0.0).max(0.0);
-            let t_out = b.settings.trim_out_s.unwrap_or(b.duration_sec).min(b.duration_sec);
+            let t_in = b.settings.trim_in_s.filter(|_| !whole).unwrap_or(0.0).max(0.0);
+            let t_out = b.settings.trim_out_s.filter(|_| !whole).unwrap_or(b.duration_sec).min(b.duration_sec);
             ((t_out - t_in).max(0.0) * b.fps as f64).round().max(1.0) as u64
         }).unwrap_or(1)
     }
@@ -4452,6 +5442,30 @@ impl App {
             .join(format!("{stem}_Archive"))
     }
 
+    /// The folder a raw take's camera-original DNGs are READ from (enhanced
+    /// frames, a raw converter's settings): the one named after it, beside
+    /// it. An archive copy that has none of its own reads its take's, where
+    /// that is beside the copy: the frames there are named by the camera's
+    /// frame numbers, which a copy keeps. Touches the disk for a copy only.
+    fn originals_dir_for(source: &std::path::Path) -> PathBuf {
+        let own = Self::default_frames_dir_for(source, true);
+        let Some(take) = vr180_pipeline::x6_raw::archive_note(source).and_then(|note| note.source) else { return own };
+        if own.is_dir() {
+            return own;
+        }
+        let of_take = Self::default_frames_dir_for(&source.with_file_name(take), true);
+        if of_take.is_dir() { of_take } else { own }
+    }
+
+    /// The folder a run that writes the take itself puts `job`'s output in,
+    /// next to the take's folder.
+    fn take_job_dir_for(source: &std::path::Path, job: TakeJob) -> PathBuf {
+        match job {
+            TakeJob::Archive(_) => Self::default_archive_dir_for(source),
+            TakeJob::Originals => Self::default_frames_dir_for(source, true),
+        }
+    }
+
     /// `<source_stem>_SBS.<png|jpg|dng>` next to the source (stills).
     fn default_still_output_for(source: &std::path::Path, format: StillFormatChoice) -> PathBuf {
         let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
@@ -4526,12 +5540,10 @@ impl App {
         if due && probe.rx.is_none() {
             let (tx, rx) = crossbeam_channel::bounded(1);
             let asked = key.clone();
-            let source = vr180_pipeline::x6_raw::EnhancedSource {
-                dir: Self::default_frames_dir_for(&path, true),
-                t_in: self.settings.trim_in_s, t_out: self.settings.trim_out_s,
-            };
+            let (t_in, t_out) = (self.settings.trim_in_s, self.settings.trim_out_s);
             let repaint = ctx.clone();
             std::thread::spawn(move || {
+                let source = vr180_pipeline::x6_raw::EnhancedSource { dir: Self::originals_dir_for(&asked.0), t_in, t_out };
                 let side = vr180_pipeline::x6_raw::enhanced_side(&asked.0, &source);
                 let _ = tx.send((asked, side));
                 repaint.request_repaint();
@@ -4660,7 +5672,7 @@ impl App {
         // which the export takes where its stretch has some. A lens frame
         // and a reframed view keep the size they have.
         let raw_enhanced_dir = (source_kind.is_raw_video() && opts.raw_use_enhanced)
-            .then(|| Self::default_frames_dir_for(source_path, true))
+            .then(|| Self::originals_dir_for(source_path))
             .filter(|dir| dir.join("CAM0").is_dir());
         let raw_enhanced_eye = raw_enhanced_dir.as_ref()
             .filter(|_| !lens_frame_on && !projection.is_reframe())
@@ -4832,9 +5844,10 @@ impl App {
     ) {
         let output_path = cfg.output_path.clone();
         let still_format = self.batch_opts.unwrap_or(self.export_opts).still_format;
-        let raw_frames = cfg.source_kind.is_raw_video() && self.batch_opts.unwrap_or(self.export_opts).raw_dng_sequence;
-        let raw_original = raw_frames && self.batch_opts.unwrap_or(self.export_opts).raw_dng_original;
-        let raw_archive = self.batch_opts.unwrap_or(self.export_opts).archive_copy().filter(|_| cfg.source_kind.is_raw_video());
+        // (A run that writes the takes themselves has no view to export.)
+        let writes = run_output(self.take_run, cfg.source_kind, &self.batch_opts.unwrap_or(self.export_opts));
+        let take_job = match writes { RunOutput::Take(job) => Some(job), _ => None };
+        let raw_frames = writes == RunOutput::DngFrames;
 
         // Stop preview playback when it reads the SAME file as the export
         // (they'd race on the decoder / file). Previewing a DIFFERENT clip
@@ -4895,15 +5908,15 @@ impl App {
                         fps_avg: done as f32 / t0.elapsed().as_secs_f32().max(1e-3),
                     });
                 })
-            } else if let Some(size) = raw_archive {
-                // A raw video clip as an archive copy of its take.
+            } else if let Some(TakeJob::Archive(size)) = take_job {
+                // An archive copy of the take.
                 vr180_pipeline::raw_archive::export_archive(
                     &cfg.source_path, &cfg.output_path, cfg.trim_in_s, cfg.trim_out_s, size,
                     move |p| { let _ = progress_tx2.try_send(p); },
                     cancel_for_thread,
                 ).map(|_| ())
-            } else if raw_original {
-                // A raw video clip's frames as the sensor recorded them.
+            } else if take_job == Some(TakeJob::Originals) {
+                // The take's frames as the sensor recorded them.
                 vr180_pipeline::sensor_dng::export_sensor_dng_sequence(
                     &cfg.source_path, &cfg.output_path, cfg.trim_in_s, cfg.trim_out_s,
                     move |p| { let _ = progress_tx2.try_send(p); },
@@ -5261,6 +6274,12 @@ impl App {
                     };
                 }
                 self.batch_skip_flag = false;
+                // An archive copy that came out whole is known to its take's entry.
+                if matches!(self.take_run, Some(TakeRun { job: TakeJob::Archive(_), .. }))
+                    && self.batch.get(idx).is_some_and(|b| b.status == BatchStatus::Done)
+                {
+                    self.note_copy(idx, &job.output_path);
+                }
                 // One file or none: a joined run whose clip did not come
                 // out whole ends here, and the clips still waiting are not
                 // exported for a file that will not be made.
@@ -5276,6 +6295,7 @@ impl App {
                 } else {
                     // Stopped by the user.
                     self.end_join(Err(tr("stopped").to_string()));
+                    self.end_take_run();
                 }
             } else if self.join_run.as_ref().is_some_and(|j| j.joining) {
                 // The run's last job: its parts put together.
@@ -5439,6 +6459,7 @@ impl App {
             }
             let Some(facts) = ClipFacts::read(&path) else { continue };
             let ClipFacts { source_kind, fisheye_eye_w, fisheye_eye_h, x6, raw_one_lens, raw_frame, four_channel_sound, .. } = facts;
+            let take = facts.take.clone();
             let is_loaded_clip = self.loaded_path.as_deref() == Some(path.as_path());
             // A NEW clip inherits ITS kind's template (OSV / .360 / … kept
             // independent); the already-loaded clip keeps its live edits.
@@ -5492,7 +6513,11 @@ impl App {
                 raw_one_lens,
                 raw_frame,
                 four_channel_sound,
+                take,
                 offline: None,
+                before_take: None,
+                copy: None,
+                take_failed: None,
             });
             if is_loaded_clip {
                 // The loaded clip just joined the list — link it up.
@@ -5530,9 +6555,11 @@ impl App {
             item.settings.ettr_stops = 0.0;
         }
         // Re-arm a previously finished item so the change exports on the
-        // next Start.
-        if !matches!(item.status, BatchStatus::Queued) {
-            item.status = BatchStatus::Idle;
+        // next Start (while a run writes the takes themselves, the export
+        // status is the one put aside for it).
+        let status = item.before_take.as_mut().unwrap_or(&mut item.status);
+        if !matches!(status, BatchStatus::Queued) {
+            *status = BatchStatus::Idle;
         }
     }
 
@@ -5540,15 +6567,12 @@ impl App {
     /// folder (or next to the source), auto-renamed ` (2)`, ` (3)`… on
     /// collision rather than overwriting or silently skipping.
     fn batch_output_for(&self, item: &BatchItem, opts: &ExportOptions) -> PathBuf {
-        let mut out = if item.source_kind.is_still() {
-            Self::default_still_output_for(&item.path, opts.still_format)
-        } else if item.source_kind.is_raw_video() && opts.raw_archive {
-            Self::default_archive_dir_for(&item.path)
-        } else if item.source_kind.is_raw_video() && opts.raw_dng_sequence {
-            Self::default_frames_dir_for(&item.path, opts.raw_dng_original)
-        } else {
-            Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye(),
-                item.settings.lens_frame_view(item.source_kind))
+        let mut out = match run_output(self.take_run, item.source_kind, opts) {
+            RunOutput::Still => Self::default_still_output_for(&item.path, opts.still_format),
+            RunOutput::Take(job) => Self::take_job_dir_for(&item.path, job),
+            RunOutput::DngFrames => Self::default_frames_dir_for(&item.path, false),
+            RunOutput::Video => Self::default_output_for(&item.path, opts.codec_for(&item.export_settings(), false), item.single_eye(),
+                item.settings.lens_frame_view(item.source_kind)),
         };
         if let Some(dir) = &self.batch_out_dir {
             if let Some(name) = out.file_name() {
@@ -5598,9 +6622,6 @@ impl App {
             let name = clip_label(&item.path);
             if item.source_kind.is_still() {
                 return Err(format!("{name} {}", tr("is a still photo: a joined file is made of video clips.")));
-            }
-            if item.source_kind.is_raw_video() && opts.raw_archive {
-                return Err(tr("An archive copy is a folder for each clip: it cannot be joined. Pick a video format in Format.").to_string());
             }
             if item.source_kind.is_raw_video() && opts.raw_dng_sequence {
                 return Err(tr("A DNG sequence is a folder of frames for each clip: it cannot be joined. Pick a video format in Format.").to_string());
@@ -5656,6 +6677,7 @@ impl App {
     /// Start a run of `run` (list entries, in order): as ONE file when that
     /// is chosen and there are several clips, else each to its own.
     fn start_run(&mut self, run: Vec<usize>) {
+        self.end_take_run();
         self.join_notice = None;
         self.joined_output = None;
         if self.join_clips && run.len() >= 2 {
@@ -5676,6 +6698,62 @@ impl App {
             self.batch[i].status = BatchStatus::Queued;
         }
         self.begin_run(run);
+    }
+
+    /// Start a run that writes the takes themselves ([`TakeRun`]): through
+    /// the export queue, so its progress, Skip and Stop, and the hand-over
+    /// while the window is covered are those of any export. The queue's own
+    /// state is put aside for the run and comes back when it is over
+    /// ([`Self::end_take_run`]): what was exported, or waits to be, is not
+    /// touched by it. Never joined: each take is written to a folder of its
+    /// own.
+    fn start_take_run(&mut self, run: TakeRun) {
+        if self.export_job.is_some() || self.batch_running {
+            return;
+        }
+        self.sync_active_clip_settings();
+        self.end_take_run();
+        let clips = take_clips(&self.batch, self.active_clip, run.job);
+        if clips.is_empty() {
+            tracing::warn!("take run: no raw take to write");
+            return;
+        }
+        self.join_notice = None;
+        self.joined_output = None;
+        self.join_run = None;
+        queue_put_aside(&mut self.batch, &clips);
+        if matches!(run.job, TakeJob::Archive(_)) {
+            for &i in &clips {
+                self.batch[i].copy = None;
+            }
+        }
+        tracing::info!("take run: {:?} of {} takes, {}", run.job, clips.len(), if run.whole { "whole" } else { "from In to Out" });
+        self.take_run = Some(run);
+        self.begin_run(clips);
+    }
+
+    /// A run that wrote the takes themselves is over, ended or stopped: the
+    /// export queue is as that run found it.
+    fn end_take_run(&mut self) {
+        let job = self.take_run.take().map(|run| run.job);
+        queue_brought_back(&mut self.batch, job);
+    }
+
+    /// The archive copy a run has just written into `dir` for list entry
+    /// `idx`: what its folder says of it (two small reads).
+    fn note_copy(&mut self, idx: usize, dir: &std::path::Path) {
+        let Some(item) = self.batch.get_mut(idx) else { return };
+        let note = vr180_fisheye::x6b::read_archive_note(dir);
+        let bytes = std::fs::metadata(dir.join(vr180_fisheye::x6b::CAPTURE_FILE)).map(|m| m.len()).unwrap_or(0);
+        let pairs = note.as_ref().and_then(|n| n.pairs).unwrap_or(0);
+        let source_bytes = note.as_ref().and_then(|n| n.source_bits_per_pixel)
+            .map_or(0, |bits| (bits * (pairs * item.frame_samples()) as f64 / 8.0).round() as u64);
+        item.copy = Some(TakeCopy {
+            dir: dir.to_path_buf(),
+            begins_s: note.as_ref().and_then(|n| n.first_pair_s).unwrap_or(0.0),
+            bytes,
+            source_bytes,
+        });
     }
 
     /// The clips of a joined run are all written: put them together, as
@@ -5791,10 +6869,12 @@ impl App {
         self.batch_opts = None;
         self.batch_started_at = None;
         self.batch_run_indices.clear();
+        let take = self.take_run.map(|run| run.job);
         if done + failed > 0 {
-            self.notify_run_complete(done, failed, elapsed, n_run);
-            self.last_batch_summary = Some(BatchSummary { done, failed, elapsed, joined: self.joined_output.take() });
+            self.notify_run_complete(done, failed, elapsed, n_run, take);
+            self.last_batch_summary = Some(BatchSummary { done, failed, elapsed, joined: self.joined_output.take(), take });
         }
+        self.end_take_run();
     }
 
     /// Export every not-yet-done clip in the list (Idle / Failed / Skipped).
@@ -5840,6 +6920,10 @@ impl App {
         let item_path = self.batch[idx].path.clone();
         let segments = self.clip_segments(&item_path);
         let (mut cfg, eac_stab) = self.export_cfg_for(idx, &output, &opts, segments);
+        if self.take_run.is_some_and(|run| run.whole) {
+            cfg.trim_in_s = None;
+            cfg.trim_out_s = None;
+        }
         if let Some((k, _, dir, sound)) = &part {
             // Every part carries what the joined file's one track is made
             // of: stereo, or the clip's four-channel sound field.
@@ -7610,7 +8694,8 @@ impl App {
         let running = self.batch_running;
         let run_progress = self.overall_run_progress();
         let run_opts = self.batch_opts.unwrap_or(self.export_opts);
-        let cur_nr = self.batch_current
+        // (A run that writes the takes themselves filters nothing.)
+        let cur_nr = self.take_run.is_none() && self.batch_current
             .and_then(|i| self.batch.get(i))
             .map_or(false, |b| export_runs_noise_filter(b.source_kind, b.settings.denoise_strength, &run_opts));
         let n_all = self.batch.iter().filter(|b| b.ready() && matches!(b.status,
@@ -7687,20 +8772,9 @@ impl App {
         };
         let raw_frames = self.export_opts.raw_dng_sequence
             && self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
-        let raw_archive = self.export_opts.archive_copy()
-            .filter(|_| self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()));
         let fmt_label = if is_still {
             // A still has no codec / bitrate: container + size only.
             format!("{} · {}", self.export_opts.still_format.label(), res_label)
-        } else if let Some(size) = raw_archive {
-            // The take's own frames, smaller: neither the view nor its size applies.
-            match size {
-                Some(bits) => format!("{} · {bits:.2} {}", tr("Archive copy"), tr("bit a pixel")),
-                None => format!("{} · {}", tr("Archive copy"), tr("lossless")),
-            }
-        } else if raw_frames && self.export_opts.raw_dng_original {
-            // The sensor's own frames: neither the view nor its size applies.
-            format!("{} · {} · 3840 × 3840 {}", tr("DNG sequence"), tr("camera original"), tr("per eye"))
         } else if raw_frames {
             format!("{} · {}", tr("DNG sequence"), res_label)
         } else { format!("{} · {}{}{}",
@@ -7725,7 +8799,7 @@ impl App {
             } else if s.joined.is_some() {
                 if cur_lang() == Lang::Zh { format!("✓ 已合成 {} 个片段 · {took}", s.done) } else { format!("✓ {} clips joined · {took}", s.done) }
             } else {
-                format!("✓ {} exported · {took}", s.done)
+                format!("✓ {} · {took}", run_done_text(s.done, s.take, cur_lang() == Lang::Zh))
             };
             // The joined file's name goes with the hint.
             let hover = match s.joined.as_deref().map(clip_label) {
@@ -7888,8 +8962,6 @@ impl App {
             let is_still = self.clip.as_ref().map(|c| c.source_kind.is_still()).unwrap_or(false);
             // A raw video clip, and what is known of its enhanced frames.
             let raw_video = enhanced;
-            let archive_source = raw_video.is_some()
-                && self.loaded_path.as_deref().is_some_and(|p| vr180_pipeline::x6_raw::archive_note(p).is_some());
             let native_dims = self.native_sbs_dims();
             let single_eye = self.clip_single_eye();
             // A Crop clip's native-sharpness canvas (side by side, or the one
@@ -7910,7 +8982,7 @@ impl App {
                         self.settings.reframe_aspect_if_active(),
                         (self.settings.reframe_hfov_deg, self.settings.reframe_defish),
                         clip_fps, is_still, native_dims, sharp_dims, lens_space,
-                        self.settings.stabilize, single_eye, raw_video, archive_source);
+                        self.settings.stabilize, single_eye, raw_video);
                 });
             self.show_export_settings = open;
         }
@@ -7944,8 +9016,6 @@ impl App {
         // frames), and what is known of its enhanced frames; `None` for any
         // other clip.
         raw_video: Option<EnhancedFrames>,
-        // The clip is an archive copy of a raw take: no copy is made of it.
-        archive_source: bool,
     ) {
         // Spatial video is offered for the reframed view on macOS. Selected
         // on a clip it does not exist for, the choice shows (and exports) as
@@ -7957,19 +9027,7 @@ impl App {
             ExportCodec::Spatial if !spatial_offered => ExportCodec::H265,
             c => c,
         };
-        // The camera's own frames have no view and no size to pick: the list
-        // that would offer one is not shown for them.
-        let camera_original = raw_video.is_some() && !is_still && opts.raw_dng_sequence && opts.raw_dng_original;
-        let archive_copy = raw_video.is_some() && !is_still && opts.raw_archive && !archive_source;
-        if archive_copy {
-            ui.label(RichText::new(tr("An archive copy holds the take's own frames: the view and its size, the grade, stabilization and noise reduction are not applied to them."))
-                .small().color(Color32::GRAY));
-        } else if camera_original {
-            ui.label(RichText::new(tr("Resolution")).strong());
-            ui.label(format!("3840 × 3840 {}", tr("per eye")));
-            ui.label(RichText::new(tr("Camera original frames are the sensor's own: the view and its size, the grade, stabilization and noise reduction are not applied to them."))
-                .small().color(Color32::GRAY));
-        } else if let Some(aspect) = reframe {
+        if let Some(aspect) = reframe {
             // Reframed view: the exact viewport at a per-eye size.
             ui.label(RichText::new(tr(if single_eye { "Size" } else { "Per-eye size" })).strong());
             opts.reframe_size = opts.reframe_size.clamped(is_still, aspect);
@@ -8120,57 +9178,16 @@ impl App {
         }
 
         if let Some(found) = raw_video {
-            if archive_source {
-                ui.label(RichText::new(tr("This clip is an archive copy of a take: a copy is made from the camera's take, not from another copy."))
-                    .small().color(Color32::GRAY));
-            } else {
-                if ui.checkbox(&mut opts.raw_archive, tr("Archive copy")).changed() && opts.raw_archive {
-                    opts.raw_dng_sequence = false;
-                }
-                if opts.raw_archive {
-                    ui.radio_value(&mut opts.raw_archive_size, ArchiveSize::Lossless, tr("Lossless: every sample kept"));
-                    ui.radio_value(&mut opts.raw_archive_size, ArchiveSize::HighQuality, tr("High quality: 1 bit a pixel"));
-                    ui.radio_value(&mut opts.raw_archive_size, ArchiveSize::Custom, tr("Custom"));
-                    if opts.raw_archive_size == ArchiveSize::Custom {
-                        ui.add(egui::Slider::new(&mut opts.raw_archive_bits, 0.5..=1.0).step_by(0.05).fixed_decimals(2).suffix(format!(" {}", tr("bit a pixel"))));
-                    }
-                    // What a minute of this clip comes to at the size picked (a copy that keeps every sample is as large as its frames make it).
-                    if let (Some(Some(bits)), Some((w, h))) = (opts.archive_copy(), native_dims) {
-                        let gb = bits * w as f64 * h as f64 * fps as f64 * 60.0 / 8.0 / 1e9;
-                        ui.label(format!("{} {gb:.1} GB {}", tr("about"), tr("a minute")));
-                    }
-                    ui.label(RichText::new(if opts.raw_archive_size == ArchiveSize::Lossless {
-                        tr("The take's folder again with a smaller capture, which opens like the take: every frame, its timing and the files beside it are kept. Every sample is kept as the camera recorded it, and each frame is read back and compared before it is written. Most takes come out a quarter to a third smaller, a 14-bit take that keeps every value about an eighth. Only the stretch between In and Out is copied. The take itself is left as it is.")
-                    } else {
-                        tr("The take's folder again with a capture a fraction of the size, which opens like the take: every frame, its timing and the files beside it are kept. The copy is lossy: at 1 bit a pixel a frame is off by less than its own noise; below that the shadows lose their grain when they are lifted. Only the stretch between In and Out is copied. The take itself is left as it is.")
-                    }).small().color(Color32::GRAY));
-                    ui.add_space(8.0);
-                    return;
-                }
-                ui.label(RichText::new(tr("A smaller copy of the take for keeping, which opens like the take."))
-                    .small().color(Color32::GRAY));
-                ui.add_space(8.0);
-            }
-            if ui.checkbox(&mut opts.raw_dng_sequence, tr("DNG sequence")).changed() && opts.raw_dng_sequence {
-                opts.raw_archive = false;
-            }
-            if opts.raw_dng_sequence {
-                ui.radio_value(&mut opts.raw_dng_original, false, tr("Developed view"));
-                ui.label(RichText::new(tr("Every frame as a linear DNG in a folder, with this clip's raw development settings inside each file."))
-                    .small().color(Color32::GRAY));
-                ui.radio_value(&mut opts.raw_dng_original, true, tr("Camera original"));
-                ui.label(RichText::new(tr("Every frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number. No projection, no stabilization, no grading — for running the frames through a raw converter first."))
-                    .small().color(Color32::GRAY));
-                ui.add_space(8.0);
-                if !opts.raw_dng_original {
-                    Self::enhanced_frames_ui(ui, opts, found);
-                }
-                return;
-            }
-            ui.label(RichText::new(tr("Every frame as a DNG in a folder: the developed view, or the sensor's own frames."))
+            // (The take itself, as an archive copy or as the camera's own
+            // frames, is written from the Source panel: neither is a view.)
+            ui.checkbox(&mut opts.raw_dng_sequence, tr("DNG sequence"));
+            ui.label(RichText::new(tr("Every frame as a linear DNG in a folder, with this clip's raw development settings inside each file."))
                 .small().color(Color32::GRAY));
             ui.add_space(8.0);
             Self::enhanced_frames_ui(ui, opts, found);
+            if opts.raw_dng_sequence {
+                return;
+            }
         }
 
         ui.label(RichText::new(tr("Codec")).strong());
@@ -8479,7 +9496,7 @@ impl App {
         self.join_notice = None;
         self.restore_activate = None;
         self.restore_clicked = None;
-        self.export_opts = project.export;
+        self.export_opts = project.export.settled();
         self.join_clips = project.join_clips;
         self.batch_out_dir = project.output_folder.clone();
         self.project_path = file;
@@ -8580,20 +9597,7 @@ impl App {
             self.remove_clip(idx);
             return;
         }
-        let item = &mut self.batch[idx];
-        item.path = path.clone();
-        item.source_kind = facts.source_kind;
-        item.fps = facts.fps;
-        item.duration_sec = facts.duration_sec;
-        item.width = facts.width;
-        item.height = facts.height;
-        item.fisheye_eye_w = facts.fisheye_eye_w;
-        item.fisheye_eye_h = facts.fisheye_eye_h;
-        item.x6 = facts.x6;
-        item.raw_one_lens = facts.raw_one_lens;
-        item.raw_frame = facts.raw_frame;
-        item.four_channel_sound = facts.four_channel_sound;
-        item.offline = None;
+        self.batch[idx].take_facts(path.clone(), facts);
         if let Some(files) = segments {
             self.merge_groups.insert(path, files);
         }
@@ -10522,6 +11526,7 @@ impl App {
             ui.separator();
         }
         self.draw_source_info(ui);
+        self.draw_take_tools(ui);
 
         // Generic side-by-side .mp4/.mov: raw dual fisheye (needs the lens
         // dewarp) or an already-dewarped VR180 half-equirect? Off by default
@@ -10562,6 +11567,230 @@ impl App {
                     .small().color(Color32::GRAY));
             }
             _ => {}
+        }
+    }
+
+    /// A list entry as the Source panel's take tools show it (the clip on
+    /// screen with its trim as it is set right now).
+    fn take_view(&self, idx: usize) -> TakeView {
+        let b = &self.batch[idx];
+        let live = self.active_clip == Some(idx) && self.loaded_path.as_deref() == Some(b.path.as_path());
+        let settings = if live { &self.settings } else { &b.settings };
+        TakeView {
+            path: b.path.clone(),
+            fps: b.fps,
+            duration_s: b.duration_sec,
+            trim: (settings.trim_in_s, settings.trim_out_s),
+            frame_samples: b.frame_samples(),
+            capture_bytes: b.take.as_ref().map_or(0, |t| t.capture_bytes),
+            copy: b.take.as_ref().is_some_and(|t| t.archive.is_some()),
+            lossy_copy: b.take.as_ref().and_then(|t| t.archive.as_ref()).is_some_and(|n| !n.exact),
+        }
+    }
+
+    /// Under the facts of a raw take on screen: the two things written of
+    /// the take itself ([`TakeJob`]), each behind its button.
+    fn draw_take_tools(&mut self, ui: &mut egui::Ui) {
+        if !self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) {
+            return;
+        }
+        let archive: Vec<TakeView> = take_clips(&self.batch, self.active_clip, TakeJob::Archive(None)).into_iter().map(|i| self.take_view(i)).collect();
+        let originals: Vec<TakeView> = take_clips(&self.batch, self.active_clip, TakeJob::Originals).into_iter().map(|i| self.take_view(i)).collect();
+        let copies: Vec<(usize, TakeCopy)> = self.batch.iter().enumerate().filter_map(|(i, b)| Some((i, b.copy.clone()?))).collect();
+        let failed: Vec<(TakeJob, String, String)> = self.batch.iter()
+            .filter_map(|b| b.take_failed.as_ref().map(|(job, why)| (*job, clip_label(&b.path), why.clone())))
+            .collect();
+        let out_dir = self.batch_out_dir.as_deref().map(clip_label);
+        let view = TakeToolsView {
+            archive: &archive, originals: &originals, copies: &copies, failed: &failed, out_dir: out_dir.as_deref(),
+            idle: self.export_job.is_none() && !self.batch_running,
+        };
+        match Self::take_tools_ui(ui, &mut self.take_tools, &view) {
+            Some(TakeAsk::Start(run)) => self.start_take_run(run),
+            Some(TakeAsk::UseCopy(idx)) => self.use_copy(idx),
+            Some(TakeAsk::UseCopies) => {
+                // (Each entry keeps its place: the list does not move under the loop.)
+                for (idx, _) in copies {
+                    self.use_copy(idx);
+                }
+            }
+            Some(TakeAsk::Keep) => self.save_take_copy(),
+            None => {}
+        }
+    }
+
+    /// The take tools themselves: a button each, and under the one that is
+    /// open its choices, what a run would write of which take and what it
+    /// would leave out, where that goes, and the button that starts it.
+    /// Nothing here is an export choice: a run is started by its button,
+    /// for that run. Returns what was asked for.
+    fn take_tools_ui(ui: &mut egui::Ui, tools: &mut TakeTools, view: &TakeToolsView) -> Option<TakeAsk> {
+        let zh = cur_lang() == Lang::Zh;
+        let note = |ui: &mut egui::Ui, text: &str| { ui.label(RichText::new(text).small().color(Color32::GRAY)); };
+        let warn = |ui: &mut egui::Ui, text: &str| { ui.label(RichText::new(text).small().color(Color32::from_rgb(255, 200, 120))); };
+        let mut ask = None;
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            for (tool, label, hover) in [
+                (TakeTool::Archive, "Archive copy", TAKE_ARCHIVE_HOVER),
+                (TakeTool::Originals, "Camera original DNGs", TAKE_ORIGINALS_NOTE),
+            ] {
+                let mut open = tools.open == Some(tool);
+                if ui.toggle_value(&mut open, tr(label)).on_hover_text(tr(hover)).changed() {
+                    tools.open = open.then_some(tool);
+                }
+            }
+        });
+        // The choice between In to Out and the whole take, where a trim
+        // makes them differ.
+        let range = |ui: &mut egui::Ui, whole: &mut bool, takes: &[TakeView]| {
+            if takes.iter().any(|t| t.written(false).2) {
+                ui.label(RichText::new(tr("Range")).strong());
+                ui.radio_value(whole, false, tr("In to Out"));
+                ui.radio_value(whole, true, tr("Whole take"));
+            }
+        };
+        // The takes of a run, one by one, with what is written of each.
+        let listed = |ui: &mut egui::Ui, whole: bool, takes: &[TakeView]| {
+            for take in takes.iter().take(TAKES_LISTED) {
+                ui.label(RichText::new(take_line(take, whole, zh)).small());
+            }
+            if takes.len() > TAKES_LISTED {
+                let more = takes.len() - TAKES_LISTED;
+                ui.label(RichText::new(if zh { format!("另有 {more} 条") } else { format!("and {more} more") }).small());
+            }
+        };
+        // The takes the last run of this kind could not write, and why.
+        let failed = |ui: &mut egui::Ui, archive: bool| {
+            for (_, name, why) in view.failed.iter().filter(|(job, _, _)| matches!(job, TakeJob::Archive(_)) == archive) {
+                ui.label(RichText::new(format!("✗ {name}: {why}")).small().color(Color32::from_rgb(230, 110, 110)));
+            }
+        };
+        let start = |ui: &mut egui::Ui, job: TakeJob, n: usize| -> bool {
+            ui.add_enabled(view.idle, egui::Button::new(RichText::new(take_start_label(job, n, zh)).strong()))
+                .on_disabled_hover_text(tr(TAKE_BUSY_HOVER))
+                .clicked()
+        };
+        match tools.open {
+            Some(TakeTool::Archive) => {
+                ui.add_space(2.0);
+                if view.archive.is_empty() {
+                    // (No camera's take among them: copies, or a take whose description did not read.)
+                    if view.originals.iter().any(|t| t.copy) {
+                        note(ui, tr(TAKE_COPY_SOURCE_NOTE));
+                    }
+                } else {
+                    let before = (tools.size, tools.bits);
+                    ui.radio_value(&mut tools.size, ArchiveSize::Lossless, tr("Lossless: every sample kept"));
+                    ui.radio_value(&mut tools.size, ArchiveSize::HighQuality, tr("High quality: 1 bit a pixel"));
+                    ui.radio_value(&mut tools.size, ArchiveSize::Custom, tr("Custom"));
+                    if tools.size == ArchiveSize::Custom {
+                        ui.add(egui::Slider::new(&mut tools.bits, 0.5..=1.0).step_by(0.05).fixed_decimals(2).suffix(format!(" {}", tr("bit a pixel"))));
+                    }
+                    if before != (tools.size, tools.bits) {
+                        ask = Some(TakeAsk::Keep);
+                    }
+                    note(ui, tr(TAKE_ARCHIVE_NOTE));
+                    note(ui, tr(if tools.archive_bits().is_none() { TAKE_EXACT_NOTE } else { TAKE_LOSSY_NOTE }));
+                    ui.add_space(4.0);
+                    range(ui, &mut tools.archive_whole, view.archive);
+                    let run = tools.archive_run(view.archive);
+                    let (whole, bits) = (run.whole, tools.archive_bits());
+                    listed(ui, whole, view.archive);
+                    if !whole {
+                        if let Some(text) = take_cut_warning(view.archive, zh) {
+                            warn(ui, &text);
+                            note(ui, tr(TAKE_STRETCH_NOTE));
+                        }
+                    }
+                    note(ui, &take_sizes_text(view.archive, whole, bits, zh));
+                    note(ui, &take_place_text(view.archive, run.job, view.out_dir, zh));
+                    ui.add_space(2.0);
+                    if start(ui, run.job, view.archive.len()) {
+                        ask = Some(TakeAsk::Start(run));
+                    }
+                }
+                failed(ui, true);
+                // The copies made: each can take its take's place in the list.
+                if !view.copies.is_empty() {
+                    ui.add_space(4.0);
+                }
+                for (idx, copy) in view.copies {
+                    ui.label(RichText::new(take_copy_line(copy, zh)).small().color(Color32::from_rgb(120, 200, 120)));
+                    if ui.add_enabled(view.idle, egui::Button::new(tr("Use the copy")).small()).on_hover_text(tr(TAKE_USE_COPY_HOVER)).clicked() {
+                        ask = Some(TakeAsk::UseCopy(*idx));
+                    }
+                }
+                if view.copies.len() > 1
+                    && ui.add_enabled(view.idle, egui::Button::new(tr("Use all the copies")).small()).on_hover_text(tr(TAKE_USE_COPY_HOVER)).clicked()
+                {
+                    ask = Some(TakeAsk::UseCopies);
+                }
+                ui.add_space(4.0);
+            }
+            Some(TakeTool::Originals) if !view.originals.is_empty() => {
+                ui.add_space(2.0);
+                note(ui, tr(TAKE_ORIGINALS_NOTE));
+                if view.originals.iter().any(|t| t.lossy_copy) {
+                    warn(ui, tr(TAKE_LOSSY_SOURCE_NOTE));
+                }
+                ui.add_space(4.0);
+                range(ui, &mut tools.originals_whole, view.originals);
+                let run = tools.originals_run(view.originals);
+                listed(ui, run.whole, view.originals);
+                let frames: u64 = view.originals.iter().map(|t| { let (from, to, _) = t.written(run.whole); ((to - from) * t.fps as f64).round() as u64 }).sum();
+                note(ui, &if zh { format!("共 {frames} 帧") } else { format!("{frames} frames") });
+                note(ui, &take_place_text(view.originals, run.job, view.out_dir, zh));
+                if view.out_dir.is_none() {
+                    note(ui, tr(TAKE_ORIGINALS_PLACE_NOTE));
+                }
+                ui.add_space(2.0);
+                if start(ui, run.job, view.originals.len()) {
+                    ask = Some(TakeAsk::Start(run));
+                }
+                failed(ui, false);
+                ui.add_space(4.0);
+            }
+            _ => {}
+        }
+        ask
+    }
+
+    /// The archive copy made of list entry `idx` takes the take's place in
+    /// the list: the same entry with the take's settings, its file the
+    /// copy. A copy of a stretch begins where the stretch did, so the
+    /// entry's trim moves with it ([`settings_for_copy`]). Nothing on disk
+    /// is touched: the take stays where it is.
+    fn use_copy(&mut self, idx: usize) {
+        if self.batch_running || self.export_job.is_some() {
+            return;
+        }
+        self.sync_active_clip_settings();
+        let Some(copy) = self.batch.get(idx).and_then(|b| b.copy.clone()) else { return };
+        // The copy is in the list already: that entry is the one to go on with.
+        if let Some(there) = self.batch.iter().position(|b| b.path == copy.dir) {
+            self.batch[idx].copy = None;
+            self.select_clip(there);
+            return;
+        }
+        let Some(facts) = ClipFacts::read(&copy.dir) else {
+            tracing::warn!("list: the copy {} does not open: the take keeps its place", copy.dir.display());
+            self.batch[idx].copy = None;
+            return;
+        };
+        let on_screen = self.active_clip == Some(idx);
+        let item = &mut self.batch[idx];
+        item.settings = settings_for_copy(&item.settings, &copy, facts.duration_sec, facts.fps);
+        let take = std::mem::take(&mut item.path);
+        item.take_facts(copy.dir.clone(), facts);
+        item.status = BatchStatus::Idle;
+        item.copy = None;
+        item.take_failed = None;
+        tracing::info!("list: the copy {} takes the place of {}", copy.dir.display(), take.display());
+        if on_screen {
+            self.settings = self.batch[idx].settings.clone();
+            self.suppress_reseed_once = true;
+            self.load_file_inner(copy.dir, true);
         }
     }
 
@@ -10709,12 +11938,9 @@ impl App {
                     }
                     // An archive copy of a raw take: what it was made as.
                     if let Some(note) = Some(p).filter(|_| c.source_kind.is_raw_video()).and_then(|p| vr180_pipeline::x6_raw::archive_note(p)) {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new(tr("Archive copy")).color(Color32::GRAY).small());
-                            ui.label(match note.bits_per_pixel {
-                                Some(bits) if !note.exact => format!("{bits:.2} {}", tr("bit a pixel")),
-                                _ => tr("every sample kept").to_string(),
-                            });
+                            ui.label(archive_note_text(&note, cur_lang() == Lang::Zh));
                         }).response.on_hover_text(tr("This clip is an archive copy of a take, made by this app: not the camera's own recording."));
                     }
                     if let Some(rate) = bitrate_label(&c.video_bitrates_bps, c.file_bitrate_bps, true) {
@@ -10960,10 +12186,10 @@ impl App {
             // beside the take. On a thread: the folder may be on a share.
             if let (true, Some(take)) = (read, self.loaded_path.clone()) {
                 let t_s = self.current_display.as_ref().map_or(0.0, |d| d.timestamp_s as f64);
-                let dir = Self::default_frames_dir_for(&take, true);
                 let (tx, rx) = crossbeam_channel::bounded(1);
                 let (path, repaint) = (take.clone(), ui.ctx().clone());
                 std::thread::spawn(move || {
+                    let dir = Self::originals_dir_for(&path);
                     let found = vr180_pipeline::x6_raw::camera_raw_settings(&path, &dir, t_s).map_err(|e| e.to_string());
                     let _ = tx.send(found);
                     repaint.request_repaint();

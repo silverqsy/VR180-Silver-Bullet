@@ -1208,6 +1208,8 @@ pub fn archive_take(
         "source_bits_per_pixel": thousandth(source_bits),
         "pairs": count,
         "pairs_of_source": index.frames(),
+        "first_pair": frames.start,
+        "first_pair_s": (index.pts_s(frames.start) * 1e6).round() / 1e6,
         "coding": if lossy.is_some() { "hevc-planes" } else { "exact-planes" },
         "made_by": format!("VR180 Silver Bullet {}", env!("CARGO_PKG_VERSION")),
     });
@@ -1424,16 +1426,18 @@ mod tests {
         assert!(decode_record(&record, layout, Channels::Both, &mut back[1..], 0).is_err());
     }
 
-    /// A copy that keeps every sample of a take on disk
-    /// (`VR180_ARCHIVE_TAKE=<its folder>`): smaller than the take, and every
-    /// sample of every frame of it is the take's.
+    /// A copy that keeps every sample of a stretch of a take on disk
+    /// (`VR180_ARCHIVE_TAKE=<its folder>`): smaller than the take, every
+    /// sample of every frame of it is the take's, and it says which stretch
+    /// of the take it holds.
     #[test]
     fn a_copy_that_keeps_every_sample_is_the_take() {
         let Some(take) = std::env::var_os("VR180_ARCHIVE_TAKE").map(std::path::PathBuf::from) else { return };
         let dir = std::env::temp_dir().join(format!("vr180-archive-exact-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let index = x6_raw::open(&take).unwrap();
-        let frames = 0..index.frames().min(6);
+        let first = 2.min(index.frames().saturating_sub(1));
+        let frames = first..index.frames().min(first + 6);
         let never = AtomicBool::new(false);
         let report = archive_take(&take, &dir, frames.clone(), &ArchiveOptions { bits_per_pixel: None, encoder: None }, |_| {}, &never).unwrap();
         println!("{report:?}");
@@ -1443,19 +1447,24 @@ mod tests {
         let copy = x6_raw::open(&dir).unwrap();
         assert_eq!((copy.frames(), copy.take.layout, copy.take.fps_setting), (frames.len(), index.take.layout, index.take.fps_setting));
         assert_eq!(copy.shutter_ns, index.shutter_ns[frames.clone()]);
-        assert!(x6_raw::archive_note(&dir).is_some_and(|n| n.exact && n.target_bits_per_pixel.is_none() && n.bits_per_pixel.is_some()));
+        let note = x6_raw::archive_note(&dir).expect("the copy's note");
+        assert!(note.exact && note.target_bits_per_pixel.is_none() && note.bits_per_pixel.is_some() && note.source_bits_per_pixel.is_some(), "{note:?}");
+        // The stretch it holds, and when that begins in the take.
+        assert_eq!((note.pairs, note.pairs_of_source, note.first_pair), (Some(frames.len() as u64), Some(index.frames() as u64), Some(first as u64)));
+        assert_eq!(note.stretch(), (frames.len() < index.frames()).then_some((first as u64, frames.len() as u64, index.frames() as u64)));
+        assert!((note.first_pair_s.unwrap() - index.pts_s(first)).abs() < 1e-6, "{note:?}");
         let layout = index.take.layout;
         let (mut record, mut theirs, mut ours) = (Vec::new(), vec![0u16; layout.samples()], vec![1u16; layout.samples()]);
         let (mut source, mut copied) = (File::open(index.take.capture_path()).unwrap(), File::open(copy.take.capture_path()).unwrap());
         for i in frames.clone() {
             x6_raw::decode_pair(&mut source, &index.pairs[i], index.take.format(), Channels::Both, &mut record, &mut theirs, 0).unwrap();
-            x6_raw::decode_pair(&mut copied, &copy.pairs[i], copy.take.format(), Channels::Both, &mut record, &mut ours, 0).unwrap();
+            x6_raw::decode_pair(&mut copied, &copy.pairs[i - first], copy.take.format(), Channels::Both, &mut record, &mut ours, 0).unwrap();
             assert!(theirs == ours, "frame {i} of the copy is not the take's");
         }
         if layout.channels() == 2 {
             let mut one = vec![3u16; layout.samples()];
             x6_raw::decode_pair(&mut copied, &copy.pairs[0], copy.take.format(), Channels::One(0), &mut record, &mut one, 2).unwrap();
-            x6_raw::decode_pair(&mut source, &index.pairs[0], index.take.format(), Channels::Both, &mut record, &mut theirs, 0).unwrap();
+            x6_raw::decode_pair(&mut source, &index.pairs[first], index.take.format(), Channels::Both, &mut record, &mut theirs, 0).unwrap();
             assert!(one[..layout.eye_samples()] == theirs[..layout.eye_samples()] && one[layout.eye_samples()..].iter().all(|v| *v == 3));
         }
         // A copy is not made of a copy, of whichever kind.

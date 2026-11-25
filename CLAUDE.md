@@ -3044,8 +3044,9 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      the lens frame the video export writes (`FrameSource::open` resolves
      it with `resolve_lens_frame`; before 2026-11-16 these frames held the
      equidistant disc).
-   - **Sensor frames** (`sensor_dng.rs`, export option "DNG sequence" →
-     "Camera original", `ExportOptions::raw_dng_original`, folder
+   - **Sensor frames** (`sensor_dng.rs`; the Source panel's *Camera
+     original DNGs*, `TakeJob::Originals`, see item 50: until 2026-11-24
+     the export option "DNG sequence" → "Camera original"; folder
      `<stem>_OriginalDNG`): the take's frames as recorded, one CFA DNG per
      channel per pair, `CAM0/<request:09>.dng` + `CAM1/…`, no GPU and
      nothing of the app's rendering. File = one little-endian IFD, 14-bit,
@@ -3080,7 +3081,8 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      `export_runs_noise_filter` says when an export runs the filter (a
      video file; never a folder of DNG frames or a still), and Export
      format shows "3840 × 3840 per eye" in place of the list for Camera
-     original.
+     original. (Since item 50 the camera's own frames are no export
+     choice, and Export format has nothing to say of them.)
    - **Enhanced frames** (2026-11-16; `enhanced_dng.rs`, `jxl_macos.rs`,
      `X6RawIter::with_enhanced_frames`, `FisheyeExportConfig::
      raw_enhanced_dir`, GUI `ExportOptions::raw_use_enhanced` → the
@@ -4944,16 +4946,21 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
     computer's time on making it smaller. Lossy is acceptable as a choice;
     the copy has to give the same experience in the app, with a small loss
     of speed at most; it is to be a pack file like the take's.
-    - **What it is.** Export format ▸ *Archive copy* for a raw clip
-      (`ExportOptions::raw_archive`, `ArchiveSize`, `archive_copy`): the
+    - **What it is.** The Source panel's *Archive copy* for a raw take
+      (item 50: `TakeJob::Archive`, `TakeTools`, `ArchiveSize`; it was an
+      Export format choice, `ExportOptions::raw_archive`, for the day this
+      item was written): the
       take's folder again as `<take>_Archive`, every file beside the capture
       copied as it is, `clip.json` with an `archive` record (kind, bits
       asked for and come to, the take it was made from, the encoder and its
       setting, the noise, the error), the closing record rewritten last so
       that a copy that did not finish does not open. *Lossless* keeps every
       sample, *High quality* is 1 bit a pixel, *Custom* 0.5 to 1 (the
-      default is still *High quality*); only the stretch between In and Out
-      is copied; a copy of a copy is refused.
+      default is still *High quality*); the stretch between In and Out is
+      copied, or the whole take; a copy of a copy is refused. The note also
+      says which stretch of its take the copy holds (`pairs`,
+      `pairs_of_source`, `first_pair`, `first_pair_s`;
+      `x6b::ArchiveNote::stretch`).
     - **The file** (`x6b.rs`, "An archive copy"): records of the app's own
       kind, signature `SBARCH1`, a record a pair: the request number, both
       exposure starts and integration times, a CRC-32C of the pictures, the
@@ -5080,6 +5087,79 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       still checks where it reads (about a tenth of its time), and vector
       instructions for the classes and the plain bits were left for when
       the speed is wanted.
+
+50. **The take itself is written from the Source panel (2026-11-24, Mac;
+    UNRELEASED).** The user's point: an archive copy is no export choice.
+    It is something done to the source before the work on it, of one kind
+    with the camera-original DNG sequence; and cutting away what is not
+    wanted of a take is itself a way to make an archive small, so the trim
+    stays, with enough said about it.
+    - **The line that is drawn.** An export writes a VIEW of a clip. An
+      archive copy and the camera's own frames write the TAKE: no view, no
+      size, no grade, no stabilization, no noise filter, and what they write
+      is read again as a source (a copy opens like the take; the folder of
+      camera originals is where enhanced frames and Camera Raw settings are
+      looked for). In code they never used more of an export than the take's
+      path, a folder and In and Out. As export choices they were a mode that
+      stayed on: kept with the project and the session, so the next Export
+      wrote copies where a video was meant.
+    - **Where they are.** `draw_take_tools` under `draw_source_info`, for a
+      raw take on screen: two buttons, *Archive copy* and *Camera original
+      DNGs*; the open one (`TakeTools::open`) shows its choices, the takes a
+      run would write with what is written of each, where the folders go,
+      and the button that starts the run. `take_tools_ui` is a function of
+      its view (`TakeToolsView`) so the tests paint and click it. A run is
+      for the ticked takes it applies to, else the take on screen
+      (`take_clips`; an archive copy is made of a camera's take only).
+      Export format keeps a raw take's views: a video, or "DNG sequence",
+      now the developed view alone. `ExportOptions` lost `raw_archive*` and
+      `raw_dng_original`; a file of 2.6.0 that had Camera original picked
+      reads it into `was_dng_original` and `settled()` turns the DNG
+      sequence off (it would otherwise export the developed view). The size
+      picked for a copy is kept in `…/take_copy` beside `lang`.
+    - **The run.** `start_take_run(TakeRun { job, whole })` goes through
+      the export queue (`begin_run`, the bar's progress, Skip, Stop, the
+      hand-over while the window is covered) and is never joined.
+      `run_output` is the one place that says what a run writes of a clip
+      (`spawn_export_job`, `batch_output_for`). The queue's own state is put
+      aside for the run and brought back when it ends or is stopped
+      (`queue_put_aside` / `queue_brought_back`, `BatchItem::before_take`):
+      an archive run does not mark clips exported, and an export left
+      waiting by a Stop does not run as part of it. A take the run could
+      not write keeps the reason (`take_failed`), said under its button.
+      `whole` clears the job's trim.
+    - **What is said before a copy of a stretch** (`take_cut_warning`,
+      amber): how long the stretch is, how much is left out before In and
+      after Out, to keep the take until nothing else of it is wanted; that
+      a copy of a stretch is a shorter clip (the tone statistics and the
+      stabilization's reference then come from the stretch); the take's
+      size, the part copied, and the copy's where it is known beforehand (a
+      lossy one's). The default range is In to Out for both; *Whole take*
+      is the other choice, shown when a trim makes them differ. A clip that
+      is a copy of a stretch says which frames of its take it holds
+      (`archive_note_text`).
+    - **Going on with the copy** (`use_copy`): the list entry keeps its
+      place and its settings, its file becomes the copy; the trim moves by
+      where the copy begins in the take (`settings_for_copy`,
+      `first_pair_s`); nothing on disk is touched. `originals_dir_for`: a
+      copy without a folder of camera originals of its own reads its
+      take's, where that is beside it (the files are named by the camera's
+      frame numbers, which a copy keeps), so enhanced frames and the Camera
+      Raw read go on working.
+    - **Checked.** Unit tests: the tools painted and clicked headlessly
+      (the buttons open and close, the sizes, the range, the warning, the
+      run each button starts, nothing starting while a run is in flight,
+      the copies and *Use the copy*), the texts in both languages, which
+      takes a run writes, the queue put aside and brought back, the moved
+      trim, the kept size, the old project flag, the folder a copy reads.
+      On a real take: a lossless copy of two seconds from the middle, its
+      note (first pair 90 of 1659, 3.003 s), every pair the take's.
+    - **Not seen, not done.** None of this was clicked in the window: the
+      run's glue in `App` (`start_take_run`, `note_copy`, `use_copy`) is
+      covered by its parts, not by a run of the app. Nothing built or run
+      on Windows. A second run of the camera's own frames for another
+      stretch still goes to a new folder (` (2)`), which the lookup of
+      enhanced frames does not read.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

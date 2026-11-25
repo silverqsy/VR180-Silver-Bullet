@@ -1791,21 +1791,46 @@ pub struct ArchiveNote {
     pub exact: bool,
     /// Bits a pixel a lossy copy was aimed at.
     pub target_bits_per_pixel: Option<f64>,
-    /// Bits a pixel the copy came to.
+    /// Bits a pixel the copy came to, and the same pairs in the take.
     pub bits_per_pixel: Option<f64>,
+    pub source_bits_per_pixel: Option<f64>,
     /// The folder name of the take it was made from.
     pub source: Option<String>,
+    /// The pairs the copy holds, and the pairs of that take.
+    pub pairs: Option<u64>,
+    pub pairs_of_source: Option<u64>,
+    /// Where in that take the copy begins: the place of its first pair
+    /// there, and that pair's time from the take's first, in seconds.
+    pub first_pair: Option<u64>,
+    pub first_pair_s: Option<f64>,
+}
+
+impl ArchiveNote {
+    /// The copy holds a stretch of its take and not all of it: the place of
+    /// its first pair in the take, its pairs, and the take's. `None` for a
+    /// copy of the whole take, and for one that does not say.
+    pub fn stretch(&self) -> Option<(u64, u64, u64)> {
+        let (pairs, of) = (self.pairs?, self.pairs_of_source?);
+        (pairs < of).then(|| (self.first_pair.unwrap_or(0), pairs, of))
+    }
 }
 
 /// The note of the archive copy `dir` holds; `None` for a camera's take.
 pub fn read_archive_note(dir: &Path) -> Option<ArchiveNote> {
     let clip: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(CLIP_FILE)).ok()?).ok()?;
     let note = clip.get("archive")?.as_object()?;
+    let number = |key: &str| note.get(key).and_then(|v| v.as_f64());
+    let count = |key: &str| note.get(key).and_then(|v| v.as_u64());
     Some(ArchiveNote {
         exact: note.get("kind").and_then(|k| k.as_str()) == Some("exact"),
-        target_bits_per_pixel: note.get("target_bits_per_pixel").and_then(|v| v.as_f64()),
-        bits_per_pixel: note.get("bits_per_pixel").and_then(|v| v.as_f64()),
+        target_bits_per_pixel: number("target_bits_per_pixel"),
+        bits_per_pixel: number("bits_per_pixel"),
+        source_bits_per_pixel: number("source_bits_per_pixel"),
         source: note.get("source").and_then(|v| v.as_str()).map(str::to_owned),
+        pairs: count("pairs"),
+        pairs_of_source: count("pairs_of_source"),
+        first_pair: count("first_pair"),
+        first_pair_s: number("first_pair_s"),
     })
 }
 
@@ -4094,9 +4119,21 @@ mod tests {
         // What the folder says of itself.
         assert_eq!(read_archive_note(&dir), None);
         std::fs::write(dir.join(CLIP_FILE), r#"{"layout":"paired-bayer-v1","fps_setting":60,"size":[3840,3840],"archive":{"version":1,"kind":"lossy","target_bits_per_pixel":1.0,"bits_per_pixel":0.97,"source":"a take"}}"#).unwrap();
-        assert_eq!(read_archive_note(&dir), Some(ArchiveNote { exact: false, target_bits_per_pixel: Some(1.0), bits_per_pixel: Some(0.97), source: Some("a take".into()) }));
-        std::fs::write(dir.join(CLIP_FILE), r#"{"layout":"paired-bayer-v1","fps_setting":60,"size":[3840,3840],"archive":{"version":1,"kind":"exact","bits_per_pixel":2.1,"source":"a take"}}"#).unwrap();
-        assert_eq!(read_archive_note(&dir), Some(ArchiveNote { exact: true, target_bits_per_pixel: None, bits_per_pixel: Some(2.1), source: Some("a take".into()) }));
+        let plain = ArchiveNote {
+            exact: false, target_bits_per_pixel: Some(1.0), bits_per_pixel: Some(0.97), source_bits_per_pixel: None, source: Some("a take".into()),
+            pairs: None, pairs_of_source: None, first_pair: None, first_pair_s: None,
+        };
+        assert_eq!(read_archive_note(&dir), Some(plain.clone()));
+        assert_eq!(plain.stretch(), None);
+        // A copy of a stretch says where in its take it lies; one of the whole take is no stretch.
+        std::fs::write(dir.join(CLIP_FILE), r#"{"layout":"paired-bayer-v1","fps_setting":60,"size":[3840,3840],"archive":{"version":1,"kind":"exact","bits_per_pixel":2.1,"source_bits_per_pixel":3.2,"source":"a take","pairs":300,"pairs_of_source":1800,"first_pair":368,"first_pair_s":6.1333}}"#).unwrap();
+        let part = ArchiveNote {
+            exact: true, target_bits_per_pixel: None, bits_per_pixel: Some(2.1), source_bits_per_pixel: Some(3.2), source: Some("a take".into()),
+            pairs: Some(300), pairs_of_source: Some(1800), first_pair: Some(368), first_pair_s: Some(6.1333),
+        };
+        assert_eq!(read_archive_note(&dir), Some(part.clone()));
+        assert_eq!(part.stretch(), Some((368, 300, 1800)));
+        assert_eq!(ArchiveNote { pairs: Some(1800), first_pair: Some(0), ..part }.stretch(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

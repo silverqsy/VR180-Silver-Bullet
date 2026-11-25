@@ -6,11 +6,11 @@
 
 A raw take is large: 40 to 80 GB a minute. The camera has to write a
 gigabyte a second, and packs its samples with what a processor can do at
-that pace. **Archive copy**, in Export format for a raw clip, writes the
-take's folder again with a smaller capture, and the app opens the copy like
-the take: every frame with its number and its timing, the gyro log, the
-lens record and the sound beside it, the same development, stabilization
-and exports. There are three sizes to pick from.
+that pace. **Archive copy**, a button under a raw take's facts in the
+Source panel, writes the take's folder again with a smaller capture, and
+the app opens the copy like the take: every frame with its number and its
+timing, the gyro log, the lens record and the sound beside it, the same
+development, stabilization and exports. There are three sizes to pick from.
 
 - **Lossless.** Every sample is kept as the camera recorded it. Most takes
   come out a quarter to a third smaller (23 to 40 % on the takes measured);
@@ -24,8 +24,7 @@ and exports. There are three sizes to pick from.
   a pair of 5760 × 5760 on an M5 Max).
 - **High quality** aims at 1 bit a pixel, where a take holds about 3: 13 to
   16 GB a minute for the frames the camera records. **Custom** takes any
-  size from 0.5 to 1 bit a pixel. The panel shows what a minute of the clip
-  comes to.
+  size from 0.5 to 1 bit a pixel. The panel shows what the copy comes to.
 - **What the two smaller ones lose.** They are lossy. A sample's value is
   first turned into one of 1024 codes that follow the sensor's noise,
   measured on the take: two values the noise cannot tell apart share a
@@ -36,13 +35,25 @@ and exports. There are three sizes to pick from.
   they did, and a deep shadow lifted hard keeps a grain, a coarser one.
   Towards 0.5 bit lifted shadows turn to flat patches and fine texture
   softens. Saturated samples stay saturated, and none becomes one.
+- **A stretch, or the whole take.** A trimmed take is copied from In to
+  Out, or whole: leaving out what is not wanted of a take often saves more
+  than the packing does. Before the copy is made the panel says how much
+  of the take goes into it and how much is left out before In and after
+  Out, and what the take, the part copied and the copy come to. A copy of
+  a stretch is a shorter clip: what the app takes from a whole clip (the
+  tone statistics, the stabilization's reference) it then takes from that
+  stretch.
 - **What is kept.** Every picture stands alone: the copy seeks and plays
-  like the take. Only the stretch between In and Out is copied (what the
-  app takes from a whole clip, the tone statistics and the stabilization's
-  reference, it then takes from that stretch). The take is not touched,
-  and a copy is made from a camera's take, never from another copy. A clip
-  that is a copy says so in File info: the bits a pixel it came to, or that
-  every sample is kept.
+  like the take. The take is not touched, and a copy is made from a
+  camera's take, never from another copy. A clip that is a copy says so
+  under its name: the bits a pixel it came to, or that every sample is
+  kept, and which frames of its take it holds when that is not all of
+  them.
+- **Going on with the copy.** Once a copy is written, **Use the copy** puts
+  it in the take's place in the list with the take's settings (the trim
+  moves with a copy of a stretch). Nothing is deleted. A copy goes on
+  reading its take's folder of camera original DNGs where that is beside
+  it, so frames enhanced for the take are still used.
 - **The file.** The copy's capture is a file of records like the take's, a
   record a pair (the format is in `x6b.rs`'s notes, the lossless pictures
   in `raw_pack.rs`'s); earlier versions of the app refuse it as a kind
@@ -50,6 +61,18 @@ and exports. There are three sizes to pick from.
 
 ### Insta360 X6: raw video
 
+- **The take itself is written from the Source panel.** An archive copy
+  and the **Camera original DNGs** (every frame as the sensor recorded it,
+  until now a kind of DNG sequence in Export format) are not views of the
+  take: no size, grade, stabilization or noise reduction applies to them,
+  and what they write is read again as a source. Each has its own button
+  under the take's facts. It runs for the ticked takes, or for the one on
+  screen, from In to Out or whole, through the export queue (progress,
+  Skip and Stop in the export bar), and leaves what was exported or waits
+  to be as it found it. Export format keeps the take's views: a video, or
+  the developed view as a DNG sequence, so Export never writes anything
+  else. A project saved with Camera original picked exports a video
+  again.
 - **A 5760 × 5760 frame stored to within one code value.** A take with a
   record for each eye may store its 5760 × 5760 frames that way too, the
   whole view or the middle of the sensor. 2.6.0 read that frame only with
