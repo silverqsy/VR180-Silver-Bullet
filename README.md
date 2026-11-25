@@ -73,7 +73,8 @@ Studio).
   picture, or the two frames as the sensors recorded them. On macOS,
   frames enhanced with Camera Raw's Super Resolution are used for exports
   up to 16384×8192. A take can be written again as an **archive
-  copy** about a third of its size, which opens like the take.
+  copy** that opens like the take: lossless (most takes a quarter to a
+  third smaller), or lossy at about a third of the take's size.
 - **Export**: hardware H.265 or ProRes 4:2:2, up to 8K (8192×4096), on a
   zero-copy GPU path (VideoToolbox on macOS, NVDEC → CUDA → NVENC on
   Windows). Audio is muxed inline — stereo, ambisonic, or APAC spatial on

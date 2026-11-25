@@ -4945,18 +4945,21 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
     the copy has to give the same experience in the app, with a small loss
     of speed at most; it is to be a pack file like the take's.
     - **What it is.** Export format ▸ *Archive copy* for a raw clip
-      (`ExportOptions::raw_archive`, `ArchiveSize`, `archive_bits`): the
+      (`ExportOptions::raw_archive`, `ArchiveSize`, `archive_copy`): the
       take's folder again as `<take>_Archive`, every file beside the capture
       copied as it is, `clip.json` with an `archive` record (kind, bits
       asked for and come to, the take it was made from, the encoder and its
       setting, the noise, the error), the closing record rewritten last so
-      that a copy that did not finish does not open. *High quality* is
-      1 bit a pixel, *Custom* 0.5 to 1; only the stretch between In and Out
+      that a copy that did not finish does not open. *Lossless* keeps every
+      sample, *High quality* is 1 bit a pixel, *Custom* 0.5 to 1 (the
+      default is still *High quality*); only the stretch between In and Out
       is copied; a copy of a copy is refused.
     - **The file** (`x6b.rs`, "An archive copy"): records of the app's own
       kind, signature `SBARCH1`, a record a pair: the request number, both
       exposure starts and integration times, a CRC-32C of the pictures, the
-      value each of 1024 codes stands for, eight pictures.
+      value each of 1024 codes stands for, eight pictures. A record that
+      keeps every sample (`ARCHIVE_EXACT_PLANES`) lists, in place of the
+      codes, the values a sample can have as runs of evenly spaced ones.
       `Profile::Archive` is last in `Profile::ALL`;
       `scan_pairs` goes by the first record's signature; a kept pair list
       has a third form (`X6BIDX03`, with the integration times).
@@ -4974,6 +4977,31 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       first; (4) one quality for the whole take, found by halving on three
       frames until they come to the bits asked for (nothing is derived
       from the picture frame by frame).
+    - **A copy that keeps every sample** (`raw_pack.rs`, written for the
+      speed of its reader). A sample is coded as its place among the values
+      the take can have (a table's levels are one apart, whatever they are;
+      a frame whose values are all a multiple of a power of two, ten bits in
+      a record of fourteen, is coded by those multiples). Each colour plane
+      apart. Predicted as the mean of the sample to the left and of the
+      middle between the one above and the one above to the right. Classed
+      by seven differences among the samples of the two rows above (26
+      classes, and one for a stripe's first row), each class with its own
+      static table of 29 tokens (the differences up to ±6 each their own,
+      larger ones by magnitude with plain bits), counted over the plane.
+      rANS, 12-bit shares, 16-bit words, eight coders dealt out by column,
+      each with a stream of its own; stripes of 128 rows, a job for the
+      even rows of a mosaic stripe and one for the odd. What decided it,
+      all measured on real frames: the median predictor of the lossless
+      standards costs 3 to 9 % more than a mean on this noise; classes
+      taken from the rows above alone cost nothing against ones that use
+      the sample to the left, and let a row's tokens be read before its
+      samples are put together; a predictor without the sample to the left
+      (which would let a row be rebuilt with vector instructions, or on a
+      GPU) costs 6.4 %; the chain from a sample to the next is one addition
+      and one halving, and where none of eight tokens has plain bits a
+      table gives what is left of the sample. The archive writer reads
+      every record back and compares it with the frame before it is
+      written.
     - **How it is read.** `x6_raw::decode_pair` / `decode_record` are what
       every reader calls now (the iterator, its read-ahead thread, the clip
       statistics, the camera-original DNG writer) and hand an archive
@@ -4981,7 +5009,10 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       through eight decoders kept in a pool, on the graphics hardware where
       one attaches (VideoToolbox, D3D11VA and CUDA are tried in turn
       through libav: no line of it is gated by platform), else in software,
-      then written into the mosaic through the codes' values. Everything
+      then written into the mosaic through the codes' values. A record
+      that keeps every sample goes to `raw_pack::decode_mosaics` on the
+      reader's threads. The record's checksum is taken on a thread of its
+      own while the pictures decode (8 ms for 24 MB on one core). Everything
       after the mosaic is the take's own path.
     - **Measured (Mac, M5 Max; a 5760², a 6000² and a 3840² 60 fps take,
       ten seconds of each):** 3.23 / 2.64 / 3.09 bits a pixel in the take,
@@ -4995,9 +5026,28 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       of the copy decodes in 28 / 30 / 19 ms against 10 / 10 / 6 ms for the
       take's own records, 48 / – / 23 ms in software. An unstabilized
       export of the same two frames from the copy and from the take:
-      45.6 dB apart.
+      45.6 dB apart (part of that is the copy being a shorter clip: see
+      below).
+    - **Measured, the copy that keeps every sample (same machine):** the
+      same ten seconds: 3.21 / 2.74 / 3.07 bits a pixel to 2.17 / 1.64 /
+      2.09 (8.0 to 5.4, 7.4 to 4.4, 6.8 to 4.6 GB) in 34 / 36 / 24 s, the
+      same time as the lossy copy (reading the take is what it waits for).
+      Six frames of each of 16 more takes of every layout at hand: 23 to
+      40 % smaller, and 12 to 14 % for the two takes of fourteen bits with
+      every value kept, which are noise for the most part. A pair read and
+      decoded through the reader: 13.2 / 14.3 / 6.3 ms against 10.5 / 11.5 /
+      4.8 ms for the take's own records and 25 / 27 / 17 ms for the lossy
+      copy; one core rebuilds 540 million samples a second. Writing a pair
+      takes 26 ms.
     - **What was tried and left.** FFV1 for a copy that keeps every sample:
       27 to 41 % smaller than the take, but 130 to 175 ms a pair to decode.
+      A first coder of this app's own with the median predictor, classes
+      that use the sample to the left and one coder a stripe: 40 ms a pair
+      and 25 more to put the planes back into the mosaic. A neural
+      processor has no place in an exact coder (its results are not the
+      same bit for bit from one chip or system to the next); a GPU reader
+      would need the stream cut into thousands of independent ones and the
+      predictor above, and the GPU is what develops the frames.
       The plain codes through the encoder: its error is the same number of
       codes at every level, so the shadows carry it all. Software decoders
       beside the hardware ones: a picture a core takes on is done long
@@ -5010,12 +5060,26 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       a copy; a stopped copy leaves nothing), run on the three takes; the
       stored export list of every source kind: 32 of 32 video lines as
       stored (the 7 DNG lines carry the version number and were made
-      again).
+      again). For the copy that keeps every sample: the coder's own tests
+      (mosaics of every kind and size there and back, damaged pictures
+      refused without reading past their end); a record there and back; the
+      test on a real take run on 19 takes, every sample of six frames
+      compared; all 1200 pairs of the three ten-second copies and all pairs
+      of two whole takes compared with the takes'; **exports of the same
+      stretch from those two whole takes and from their copies, with and
+      without stabilization, are the same frames** (a copy of a stretch is
+      a shorter clip: the tone statistics and the stabilization's reference
+      are then taken from the stretch, and its exports differ from the
+      take's for that reason, not for its samples).
     - **Not seen, not done.** The option was never clicked in the window;
       nothing here was built or run on Windows, where the NVENC settings
-      and the hardware decode are written blind; a copy of a 60 fps take decodes in 19 ms a pair, more than a
-      frame's time at 60 a second. Next: a copy that keeps every sample,
-      with a coder of its own for the speed.
+      and the hardware decode are written blind; a lossy copy of a 60 fps
+      take decodes in 17 ms a pair, more than a frame's time at 60 a second
+      (the copy that keeps every sample: 6.3 ms). The exact coder is plain
+      Rust without a line that depends on the processor: its token reader
+      still checks where it reads (about a tenth of its time), and vector
+      instructions for the classes and the plain bits were left for when
+      the speed is wanted.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

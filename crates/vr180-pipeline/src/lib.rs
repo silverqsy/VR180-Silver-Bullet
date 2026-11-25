@@ -16,6 +16,7 @@ pub mod clip_stats;
 pub mod decode;
 pub mod dji_imu;
 pub mod raw_archive;
+pub mod raw_pack;
 pub mod raw_chroma;
 pub mod raw_color;
 pub mod raw_develop;

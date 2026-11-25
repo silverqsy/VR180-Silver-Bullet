@@ -2,8 +2,13 @@
 //! fraction of the size, which the app opens like the take itself.
 //!
 //! The camera writes a gigabyte a second and packs its samples with what a
-//! processor can do at that pace. A computer has the time to do better, and
-//! a copy that need not hold every sample exactly can be far smaller still:
+//! processor can do at that pace. A computer has the time to do better.
+//!
+//! A copy that keeps every sample ([`x6b::ARCHIVE_EXACT_PLANES`]) is about a
+//! third smaller than the take: its pictures are [`crate::raw_pack`]'s, and
+//! every record is read back and compared with the frame it was made from
+//! before it is written. A copy that need not hold every sample exactly can
+//! be far smaller still:
 //!
 //! 1. **The codes.** A sample's value is turned into one of 1024 codes
 //!    ([`Curve`]). The codes lie where the noise needs them: two values the
@@ -36,6 +41,7 @@ use std::sync::Mutex;
 use ffmpeg_next as ffmpeg;
 use vr180_fisheye::x6b::{self, ArchiveHeader, Channels, Layout, PairEntry, Profile, ARCHIVE_PICTURES};
 
+use crate::raw_pack::{self, Numbers};
 use crate::x6_raw;
 use crate::{Error, Result};
 
@@ -762,27 +768,51 @@ fn recycle(pictures: Vec<Picture>) {
 
 /// Decode the archive record `record` holds into `out`, the layout's
 /// samples: channel 0's frame, then channel 1's (a take of one lens: its one
-/// channel). A channel that is not asked for is left as it is.
-pub fn decode_record(record: &[u8], layout: Layout, channels: Channels, out: &mut [u16]) -> Result<PairEntry> {
+/// channel). A channel that is not asked for is left as it is. `threads`
+/// (0: one a core) is for a record that keeps every sample; the pictures of
+/// a lossy one go to the decoders this module keeps.
+pub fn decode_record(record: &[u8], layout: Layout, channels: Channels, out: &mut [u16], threads: usize) -> Result<PairEntry> {
     if out.len() != layout.samples() {
         return Err(err("output buffer is not the record's size"));
     }
-    let (header, pictures) = x6b::archive_pictures(record, layout).map_err(err)?;
-    let (width, height) = (layout.width(), layout.height());
+    let (header, pictures, summed) = x6b::archive_parts(record, layout).map_err(err)?;
+    let (width, height, per) = (layout.width(), layout.height(), layout.eye_samples());
     let wanted: Vec<usize> = (0..header.channels).filter(|c| !matches!(channels, Channels::One(only) if header.channels > 1 && only != *c)).collect();
     let units: Vec<&[u8]> = wanted.iter().flat_map(|c| pictures[c * ARCHIVE_PICTURES..(c + 1) * ARCHIVE_PICTURES].iter().copied()).collect();
-    let planes = decode_pictures(&units, width / 2, height / 2)?;
-    for (k, channel) in wanted.iter().enumerate() {
-        let eye = &mut out[channel * layout.eye_samples()..(channel + 1) * layout.eye_samples()];
-        put_planes(&planes[k * ARCHIVE_PICTURES..(k + 1) * ARCHIVE_PICTURES], width, height, &header.values, eye);
-    }
-    recycle(planes);
+    let mut decode = || -> Result<()> {
+        if header.coding == x6b::ARCHIVE_EXACT_PLANES {
+            let numbers = Numbers::from_runs(header.runs.clone())?;
+            if wanted.len() == header.channels {
+                return raw_pack::decode_mosaics(&units, width, height, &numbers, out, threads);
+            }
+            for (k, channel) in wanted.iter().enumerate() {
+                raw_pack::decode_mosaics(&units[k * ARCHIVE_PICTURES..(k + 1) * ARCHIVE_PICTURES], width, height, &numbers, &mut out[channel * per..(channel + 1) * per], threads)?;
+            }
+            return Ok(());
+        }
+        let planes = decode_pictures(&units, width / 2, height / 2)?;
+        for (k, channel) in wanted.iter().enumerate() {
+            let eye = &mut out[channel * per..(channel + 1) * per];
+            put_planes(&planes[k * ARCHIVE_PICTURES..(k + 1) * ARCHIVE_PICTURES], width, height, &header.values, eye);
+        }
+        recycle(planes);
+        Ok(())
+    };
+    // The record's checksum is taken while its pictures are decoded (it is some milliseconds of one
+    // core for a record that keeps every sample); a record whose sum is wrong is damaged, whatever
+    // its pictures decoded to.
+    let (decoded, sum) = std::thread::scope(|scope| {
+        let sum = scope.spawn(|| x6b::archive_sum(&header, summed));
+        (decode(), sum.join().unwrap_or_else(|_| Err(vr180_fisheye::Error::Insv("the checksum's thread stopped".into()))))
+    });
+    sum.map_err(err)?;
+    decoded?;
     let one = header.channels == 1;
     Ok(PairEntry {
         request: header.request, offset: 0, len: header.len, profile: Profile::Archive,
         exposure_ns: if one { [header.exposure_ns[0]; 2] } else { header.exposure_ns },
         other: None,
-        shutter_ns: if one { [header.shutter_ns[0]; 2] } else { header.shutter_ns },
+        shutter_ns: header.shutter_ns,
     })
 }
 
@@ -791,8 +821,9 @@ pub fn decode_record(record: &[u8], layout: Layout, channels: Channels, out: &mu
 /// What an archive copy is to be.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ArchiveOptions {
-    /// Bits a pixel to aim at ([`BITS_LEAST`] to [`BITS_MOST`]).
-    pub bits_per_pixel: f64,
+    /// Bits a pixel to aim at ([`BITS_LEAST`] to [`BITS_MOST`]); `None`:
+    /// every sample is kept, and the copy is as large as that takes.
+    pub bits_per_pixel: Option<f64>,
     /// The encoder to write the pictures with; `None`: the first of
     /// [`PictureEncoder::ALL`] that opens.
     pub encoder: Option<PictureEncoder>,
@@ -806,7 +837,7 @@ pub const BITS_MOST: f64 = 1.0;
 
 impl Default for ArchiveOptions {
     fn default() -> Self {
-        Self { bits_per_pixel: BITS_MOST, encoder: None }
+        Self { bits_per_pixel: Some(BITS_MOST), encoder: None }
     }
 }
 
@@ -821,6 +852,9 @@ pub struct ArchiveReport {
     /// Bits a pixel of the copy, and of those pairs in the take.
     pub bits_per_pixel: f64,
     pub source_bits_per_pixel: f64,
+    /// Every sample of the copy is the take's.
+    pub exact: bool,
+    /// What wrote the pictures.
     pub encoder: &'static str,
     /// The encoder's own quality setting.
     pub setting: f64,
@@ -884,6 +918,19 @@ fn quality_for(kind: PictureEncoder, target: f64, frames: &[Vec<u16>], layout: L
     Ok(best)
 }
 
+/// What a lossy copy is made with: found on a few of the take's frames
+/// before the copy starts, once for the whole take.
+struct Lossy {
+    target: f64,
+    /// Where in the take the frames looked at are, and the frames.
+    places: Vec<usize>,
+    looked: Vec<Vec<u16>>,
+    noise: (f64, f64),
+    curve: Curve,
+    kind: PictureEncoder,
+    quality: f64,
+}
+
 /// Write the frames `frames` of the take `source` names as an archive copy
 /// into the folder `dir` (made here; it must not hold a capture yet).
 ///
@@ -907,7 +954,6 @@ pub fn archive_take(
     if index.pairs[frames.start].profile == Profile::Archive {
         return Err(err(format!("{} is an archive copy already: a copy is made from the camera's take", take.dir.display())));
     }
-    let target = options.bits_per_pixel.clamp(BITS_LEAST, BITS_MOST);
     let capture = dir.join(x6b::CAPTURE_FILE);
     if capture.exists() {
         return Err(err(format!("{} holds a capture already", dir.display())));
@@ -916,122 +962,190 @@ pub fn archive_take(
         return Err(err("the copy cannot be written into the take's own folder"));
     }
     let (width, height, channels, per) = (layout.width(), layout.height(), layout.channels(), layout.eye_samples());
+    if width % 2 != 0 || height % 2 != 0 {
+        return Err(err(format!("a frame of {width} x {height} has no four colour planes of one size")));
+    }
     let mut file = File::open(take.capture_path())?;
     let mut record = Vec::new();
     let mut decode = |i: usize, out: &mut Vec<u16>| -> Result<()> {
         out.resize(layout.samples(), 0);
         x6_raw::decode_pair(&mut file, &index.pairs[i], take.format(), Channels::Both, &mut record, out, 0)
     };
-
-    // The frames looked at: spread over the stretch, each with the one after it.
     let count = frames.len();
-    let places: Vec<usize> = (0..LOOKED_AT.min(count)).map(|k| frames.start + (2 * k + 1) * count / (2 * LOOKED_AT.min(count))).collect();
-    let mut looked: Vec<Vec<u16>> = Vec::new();
-    let mut after: Vec<Vec<u16>> = Vec::new();
-    for &i in &places {
-        let mut frame = Vec::new();
-        decode(i, &mut frame)?;
-        looked.push(frame);
-        if i + 1 < index.frames() {
-            let mut next = Vec::new();
-            decode(i + 1, &mut next)?;
-            after.push(next);
-        }
-    }
-    let pairs_of: Vec<(&[u16], &[u16])> = looked.iter().zip(&after).map(|(a, b)| (&a[..], &b[..])).collect();
-    let noise = noise_of(&pairs_of, width, height, take.black_level, take.white_level);
-    // The smallest value the frames hold, and a little below it.
-    let lowest = looked.iter().flat_map(|f| f.iter().step_by(7)).copied().min().unwrap_or(0);
-    let values = index.pairs[frames.start].profile.sample_values();
-    let below = values.partition_point(|v| *v < lowest).saturating_sub(4);
-    let curve = Curve::new(&values, values.get(below).copied().unwrap_or(0), take.black_level, take.white_level, noise);
-    drop(after);
 
-    // The encoder, and its setting for the bits asked for.
-    let mut opened = None;
-    let mut why = String::new();
-    for kind in options.encoder.map_or(PictureEncoder::ALL.to_vec(), |k| vec![k]) {
-        match quality_for(kind, target, &looked, layout, &curve) {
-            Ok((quality, bits)) => {
-                tracing::info!("archive copy: {} at {:.2} gives {bits:.3} bits a pixel on {} frames ({target:.2} asked for)", kind.name(), kind.setting(quality), looked.len());
-                opened = Some((kind, quality));
-                break;
+    let lossy = match options.bits_per_pixel {
+        None => None,
+        Some(bits) => {
+            let target = bits.clamp(BITS_LEAST, BITS_MOST);
+            // The frames looked at: spread over the stretch, each with the one after it.
+            let places: Vec<usize> = (0..LOOKED_AT.min(count)).map(|k| frames.start + (2 * k + 1) * count / (2 * LOOKED_AT.min(count))).collect();
+            let mut looked: Vec<Vec<u16>> = Vec::new();
+            let mut after: Vec<Vec<u16>> = Vec::new();
+            for &i in &places {
+                let mut frame = Vec::new();
+                decode(i, &mut frame)?;
+                looked.push(frame);
+                if i + 1 < index.frames() {
+                    let mut next = Vec::new();
+                    decode(i + 1, &mut next)?;
+                    after.push(next);
+                }
             }
-            Err(e) => why = format!("{why}{}: {e}; ", kind.name()),
+            let pairs_of: Vec<(&[u16], &[u16])> = looked.iter().zip(&after).map(|(a, b)| (&a[..], &b[..])).collect();
+            let noise = noise_of(&pairs_of, width, height, take.black_level, take.white_level);
+            // The smallest value the frames hold, and a little below it.
+            let lowest = looked.iter().flat_map(|f| f.iter().step_by(7)).copied().min().unwrap_or(0);
+            let values = index.pairs[frames.start].profile.sample_values();
+            let below = values.partition_point(|v| *v < lowest).saturating_sub(4);
+            let curve = Curve::new(&values, values.get(below).copied().unwrap_or(0), take.black_level, take.white_level, noise);
+            drop(pairs_of);
+            drop(after);
+
+            // The encoder, and its setting for the bits asked for.
+            let mut opened = None;
+            let mut why = String::new();
+            for kind in options.encoder.map_or(PictureEncoder::ALL.to_vec(), |k| vec![k]) {
+                match quality_for(kind, target, &looked, layout, &curve) {
+                    Ok((quality, bits)) => {
+                        tracing::info!("archive copy: {} at {:.2} gives {bits:.3} bits a pixel on {} frames ({target:.2} asked for)", kind.name(), kind.setting(quality), looked.len());
+                        opened = Some((kind, quality));
+                        break;
+                    }
+                    Err(e) => why = format!("{why}{}: {e}; ", kind.name()),
+                }
+            }
+            let Some((kind, quality)) = opened else { return Err(err(format!("no encoder writes the pictures ({why})"))) };
+            Some(Lossy { target, places, looked, noise, curve, kind, quality })
         }
-    }
-    let Some((kind, quality)) = opened else { return Err(err(format!("no encoder writes the pictures ({why})"))) };
+    };
 
     std::fs::create_dir_all(dir)?;
-    let written = (|| -> Result<(u64, u64)> {
-        let mut out = std::io::BufWriter::with_capacity(1 << 22, File::create(&capture)?);
-        let mut encoders: Vec<Encoder> = (0..channels).map(|_| Encoder::open(kind, width / 2, height / 2, quality)).collect::<Result<_>>()?;
-        let mut codes: Vec<Vec<u16>> = vec![Vec::new(); channels];
-        let (mut bytes, mut source_bytes) = (0u64, 0u64);
-        let mut next = frames.start;
-        // The records whose pictures have all come out of the encoders, written in order.
-        let mut write_ready = |encoders: &mut Vec<Encoder>, next: &mut usize, bytes: &mut u64| -> Result<()> {
-            while encoders.iter().all(|e| e.ready.len() >= ARCHIVE_PICTURES) {
-                let entry = &index.pairs[*next];
-                let mut pictures: Vec<Vec<u8>> = Vec::with_capacity(channels * ARCHIVE_PICTURES);
-                for (channel, encoder) in encoders.iter_mut().enumerate() {
-                    for plane in 0..ARCHIVE_PICTURES {
-                        let (number, unit) = encoder.ready.pop_front().expect("counted");
-                        if number != ((*next - frames.start) * ARCHIVE_PICTURES + plane) as i64 {
-                            return Err(err(format!("the encoder of channel {channel} handed picture {number} out of its turn")));
+    let header_of = |i: usize, coding: u32, values: Vec<u16>, runs: Vec<(u16, u16, u32)>| {
+        let entry = &index.pairs[i];
+        let shutter = index.shutter_ns[i];
+        ArchiveHeader {
+            coding, channels, width: width as u32, height: height as u32, request: entry.request,
+            exposure_ns: entry.exposure_ns, shutter_ns: [shutter[0].unwrap_or(0), shutter[1].unwrap_or(0)],
+            picture_len: [0; 2 * ARCHIVE_PICTURES], crc: 0,
+            source_profile: Profile::ALL.iter().position(|p| *p == entry.profile).unwrap_or(0) as u32,
+            values, runs, len: 0,
+        }
+    };
+    let written = match &lossy {
+        Some(Lossy { curve, kind, quality, .. }) => (|| -> Result<(u64, u64)> {
+            let mut out = std::io::BufWriter::with_capacity(1 << 22, File::create(&capture)?);
+            let mut encoders: Vec<Encoder> = (0..channels).map(|_| Encoder::open(*kind, width / 2, height / 2, *quality)).collect::<Result<_>>()?;
+            let mut codes: Vec<Vec<u16>> = vec![Vec::new(); channels];
+            let (mut bytes, mut source_bytes) = (0u64, 0u64);
+            let mut next = frames.start;
+            // The records whose pictures have all come out of the encoders, written in order.
+            let mut write_ready = |encoders: &mut Vec<Encoder>, next: &mut usize, bytes: &mut u64| -> Result<()> {
+                while encoders.iter().all(|e| e.ready.len() >= ARCHIVE_PICTURES) {
+                    let mut pictures: Vec<Vec<u8>> = Vec::with_capacity(channels * ARCHIVE_PICTURES);
+                    for (channel, encoder) in encoders.iter_mut().enumerate() {
+                        for plane in 0..ARCHIVE_PICTURES {
+                            let (number, unit) = encoder.ready.pop_front().expect("counted");
+                            if number != ((*next - frames.start) * ARCHIVE_PICTURES + plane) as i64 {
+                                return Err(err(format!("the encoder of channel {channel} handed picture {number} out of its turn")));
+                            }
+                            pictures.push(unit);
                         }
-                        pictures.push(unit);
                     }
+                    let refs: Vec<&[u8]> = pictures.iter().map(|p| &p[..]).collect();
+                    let record = x6b::archive_record(header_of(*next, x6b::ARCHIVE_HEVC_PLANES, curve.values().to_vec(), Vec::new()), &refs).map_err(err)?;
+                    out.write_all(&record)?;
+                    *bytes += record.len() as u64;
+                    *next += 1;
                 }
-                let shutter = index.shutter_ns[*next];
-                let header = ArchiveHeader {
-                    coding: x6b::ARCHIVE_HEVC_PLANES, channels, width: width as u32, height: height as u32, request: entry.request,
-                    exposure_ns: entry.exposure_ns, shutter_ns: [shutter[0].unwrap_or(0), shutter[1].unwrap_or(0)],
-                    picture_len: [0; 2 * ARCHIVE_PICTURES], crc: 0,
-                    source_profile: Profile::ALL.iter().position(|p| *p == entry.profile).unwrap_or(0) as u32,
-                    values: curve.values().to_vec(), len: 0,
-                };
-                let refs: Vec<&[u8]> = pictures.iter().map(|p| &p[..]).collect();
-                let record = x6b::archive_record(header, &refs).map_err(err)?;
-                out.write_all(&record)?;
-                *bytes += record.len() as u64;
-                *next += 1;
+                Ok(())
+            };
+            let mut frame = Vec::new();
+            for i in frames.clone() {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(err("stopped"));
+                }
+                decode(i, &mut frame)?;
+                let entry = &index.pairs[i];
+                source_bytes += entry.len + entry.other.map_or(0, |(_, len)| len);
+                // The channels' pictures are made side by side.
+                let sent: Vec<Result<()>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = encoders.iter_mut().zip(codes.iter_mut()).zip(frame.chunks_exact(per))
+                        .map(|((encoder, codes), mosaic)| scope.spawn(move || send_channel(encoder, mosaic, width, height, curve, codes)))
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(err("an encoder stopped")))).collect()
+                });
+                for result in sent {
+                    result?;
+                }
+                write_ready(&mut encoders, &mut next, &mut bytes)?;
+                progress((i + 1 - frames.start) as f32 / count as f32 * 0.98);
             }
-            Ok(())
-        };
-        let mut frame = Vec::new();
-        for i in frames.clone() {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(err("stopped"));
-            }
-            decode(i, &mut frame)?;
-            let entry = &index.pairs[i];
-            source_bytes += entry.len + entry.other.map_or(0, |(_, len)| len);
-            // The channels' pictures are made side by side.
-            let sent: Vec<Result<()>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = encoders.iter_mut().zip(codes.iter_mut()).zip(frame.chunks_exact(per))
-                    .map(|((encoder, codes), mosaic)| {
-                        let curve = &curve;
-                        scope.spawn(move || send_channel(encoder, mosaic, width, height, curve, codes))
-                    }).collect();
-                handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(err("an encoder stopped")))).collect()
-            });
-            for result in sent {
-                result?;
+            for encoder in encoders.iter_mut() {
+                encoder.finish()?;
             }
             write_ready(&mut encoders, &mut next, &mut bytes)?;
-            progress((i + 1 - frames.start) as f32 / count as f32 * 0.98);
-        }
-        for encoder in encoders.iter_mut() {
-            encoder.finish()?;
-        }
-        write_ready(&mut encoders, &mut next, &mut bytes)?;
-        if next != frames.end {
-            return Err(err(format!("the encoders handed the pictures of {} frames of {count}", next - frames.start)));
-        }
-        out.flush()?;
-        Ok((bytes, source_bytes))
-    })();
+            if next != frames.end {
+                return Err(err(format!("the encoders handed the pictures of {} frames of {count}", next - frames.start)));
+            }
+            out.flush()?;
+            Ok((bytes, source_bytes))
+        })(),
+        None => (|| -> Result<(u64, u64)> {
+            let mut out = std::io::BufWriter::with_capacity(1 << 22, File::create(&capture)?);
+            let (mut bytes, mut source_bytes) = (0u64, 0u64);
+            let (mut frame, mut back) = (Vec::new(), vec![0u16; layout.samples()]);
+            // The values a frame's samples can have go by the kind of record it was read from, and by
+            // the power of two that all of the frame's are a multiple of (a take of ten bits to a sample
+            // in a record of fourteen has every sixteenth value and none between).
+            let mut known: Option<((Profile, u32), Numbers)> = None;
+            let mut told = false;
+            for i in frames.clone() {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(err("stopped"));
+                }
+                decode(i, &mut frame)?;
+                let entry = &index.pairs[i];
+                source_bytes += entry.len + entry.other.map_or(0, |(_, len)| len);
+                let step = frame.iter().fold(0u16, |all, v| all | v).trailing_zeros().min(15);
+                if known.as_ref().map(|(kind, _)| *kind) != Some((entry.profile, step)) {
+                    let all = entry.profile.sample_values();
+                    let stepped: Vec<u16> = all.iter().copied().filter(|v| v.trailing_zeros() >= step).collect();
+                    known = Some(((entry.profile, step), Numbers::of(if stepped.is_empty() { &all } else { &stepped })));
+                }
+                let listed = known.as_ref().map(|(_, numbers)| numbers).filter(|n| !n.is_empty() && n.runs().len() <= x6b::ARCHIVE_RUNS_MOST);
+                let code = |numbers: &Numbers| -> Result<Vec<Vec<u8>>> {
+                    let mut pictures = Vec::with_capacity(channels * ARCHIVE_PICTURES);
+                    for mosaic in frame.chunks_exact(per) {
+                        pictures.extend(raw_pack::encode_mosaic(mosaic, width, height, numbers, 0)?);
+                    }
+                    Ok(pictures)
+                };
+                // A frame with a value its kind of record is not known to hold is coded by its values as they are.
+                let (pictures, numbers) = match listed.map(|numbers| (code(numbers), numbers)) {
+                    Some((Ok(pictures), numbers)) => (pictures, numbers.clone()),
+                    _ => {
+                        if !std::mem::replace(&mut told, true) {
+                            tracing::warn!("archive copy: request {} holds a value that is not among those of its kind of record: its samples are coded as they are", entry.request);
+                        }
+                        let all = Numbers::plain(u16::MAX);
+                        (code(&all)?, all)
+                    }
+                };
+                let refs: Vec<&[u8]> = pictures.iter().map(|p| &p[..]).collect();
+                let record = x6b::archive_record(header_of(i, x6b::ARCHIVE_EXACT_PLANES, Vec::new(), numbers.runs().to_vec()), &refs).map_err(err)?;
+                // A record is written once it has been read back as the frame it was made from.
+                decode_record(&record, layout, Channels::Both, &mut back, 0)?;
+                if back != frame {
+                    return Err(err(format!("request {} did not read back as the frame it was made from", entry.request)));
+                }
+                out.write_all(&record)?;
+                bytes += record.len() as u64;
+                progress((i + 1 - frames.start) as f32 / count as f32 * 0.98);
+            }
+            out.flush()?;
+            Ok((bytes, source_bytes))
+        })(),
+    };
     let (bytes, source_bytes) = match written {
         Ok(sizes) => sizes,
         Err(e) => {
@@ -1052,10 +1166,10 @@ pub fn archive_take(
         std::fs::copy(entry.path(), dir.join(&name))?;
     }
 
-    // How far the copy is from the take, on the frames looked at.
+    // How far a lossy copy is from the take, on the frames looked at.
     let bits = bytes as f64 * 8.0 / (count * layout.samples()) as f64;
     let (mut squares, mut in_codes, mut samples) = (0.0f64, 0.0f64, 0usize);
-    {
+    if let Some(Lossy { places, looked, curve, .. }) = &lossy {
         let mut copy = File::open(&capture)?;
         let (mut buf, mut back) = (Vec::new(), vec![0u16; layout.samples()]);
         let mut at = 0u64;
@@ -1068,7 +1182,7 @@ pub fn archive_take(
             if let Some(k) = places.iter().position(|&p| p == i) {
                 let entry = PairEntry { request: index.pairs[i].request, offset: at, len, profile: Profile::Archive, exposure_ns: index.pairs[i].exposure_ns, other: None, shutter_ns: [0; 2] };
                 x6b::read_record(&mut copy, &entry, &mut buf).map_err(err)?;
-                decode_record(&buf, layout, Channels::Both, &mut back)?;
+                decode_record(&buf, layout, Channels::Both, &mut back, 0)?;
                 for (a, b) in looked[k].iter().zip(&back).step_by(5) {
                     let d = *a as f64 - *b as f64;
                     squares += d * d;
@@ -1085,24 +1199,28 @@ pub fn archive_take(
     // What the folder says of itself, and the closing record last.
     let mut clip: serde_json::Value = serde_json::from_slice(&std::fs::read(take.dir.join(x6b::CLIP_FILE))?).map_err(err)?;
     let source_bits = source_bytes as f64 * 8.0 / (count * layout.samples()) as f64;
+    let thousandth = |v: f64| (v * 1000.0).round() / 1000.0;
+    let mut note = serde_json::json!({
+        "version": 1,
+        "kind": if lossy.is_some() { "lossy" } else { "exact" },
+        "bits_per_pixel": thousandth(bits),
+        "source": take.dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+        "source_bits_per_pixel": thousandth(source_bits),
+        "pairs": count,
+        "pairs_of_source": index.frames(),
+        "coding": if lossy.is_some() { "hevc-planes" } else { "exact-planes" },
+        "made_by": format!("VR180 Silver Bullet {}", env!("CARGO_PKG_VERSION")),
+    });
+    if let (Some(Lossy { target, noise, kind, quality, .. }), Some(note)) = (&lossy, note.as_object_mut()) {
+        note.insert("target_bits_per_pixel".into(), (*target).into());
+        note.insert("encoder".into(), kind.name().into());
+        note.insert("encoder_setting".into(), kind.setting(*quality).into());
+        note.insert("noise".into(), serde_json::json!([noise.0, noise.1]));
+        note.insert("error_rms".into(), thousandth(error_rms).into());
+        note.insert("error_in_codes".into(), thousandth(error_in_codes).into());
+    }
     if let Some(object) = clip.as_object_mut() {
-        object.insert("archive".into(), serde_json::json!({
-            "version": 1,
-            "kind": "lossy",
-            "target_bits_per_pixel": target,
-            "bits_per_pixel": (bits * 1000.0).round() / 1000.0,
-            "source": take.dir.file_name().map(|n| n.to_string_lossy().into_owned()),
-            "source_bits_per_pixel": (source_bits * 1000.0).round() / 1000.0,
-            "pairs": count,
-            "pairs_of_source": index.frames(),
-            "coding": "hevc-planes",
-            "encoder": kind.name(),
-            "encoder_setting": kind.setting(quality),
-            "noise": [noise.0, noise.1],
-            "error_rms": (error_rms * 1000.0).round() / 1000.0,
-            "error_in_codes": (error_in_codes * 1000.0).round() / 1000.0,
-            "made_by": format!("VR180 Silver Bullet {}", env!("CARGO_PKG_VERSION")),
-        }));
+        object.insert("archive".into(), note);
     }
     std::fs::write(dir.join(x6b::CLIP_FILE), serde_json::to_vec_pretty(&clip).map_err(err)?)?;
     let mut seal: serde_json::Value = serde_json::from_slice(&std::fs::read(take.dir.join(x6b::SEAL_FILE))?).map_err(err)?;
@@ -1121,22 +1239,34 @@ pub fn archive_take(
     }
     std::fs::write(dir.join(x6b::SEAL_FILE), serde_json::to_vec_pretty(&seal).map_err(err)?)?;
     progress(1.0);
-    let report = ArchiveReport {
-        pairs: count, source_bytes, bytes, bits_per_pixel: bits, source_bits_per_pixel: source_bits,
-        encoder: kind.name(), setting: kind.setting(quality), noise, error_rms, error_in_codes, seconds: started.elapsed().as_secs_f64(),
+    let seconds = started.elapsed().as_secs_f64();
+    let sizes = format!("{count} frames, {:.2} GB to {:.2} GB ({source_bits:.2} to {bits:.2} bits a pixel)", source_bytes as f64 / 1e9, bytes as f64 / 1e9);
+    let report = match &lossy {
+        Some(Lossy { noise, kind, quality, .. }) => {
+            tracing::info!("archive copy of {}: {sizes} through {} at {:.2}, {error_rms:.2} values rms from the take ({error_in_codes:.2} codes), {seconds:.1} s",
+                take.dir.display(), kind.name(), kind.setting(*quality));
+            ArchiveReport {
+                pairs: count, source_bytes, bytes, bits_per_pixel: bits, source_bits_per_pixel: source_bits, exact: false,
+                encoder: kind.name(), setting: kind.setting(*quality), noise: *noise, error_rms, error_in_codes, seconds,
+            }
+        }
+        None => {
+            tracing::info!("archive copy of {}: {sizes}, every sample kept and every record read back, {seconds:.1} s", take.dir.display());
+            ArchiveReport {
+                pairs: count, source_bytes, bytes, bits_per_pixel: bits, source_bits_per_pixel: source_bits, exact: true,
+                encoder: "exact", setting: 0.0, noise: (0.0, 0.0), error_rms: 0.0, error_in_codes: 0.0, seconds,
+            }
+        }
     };
-    tracing::info!(
-        "archive copy of {}: {count} frames, {:.2} GB to {:.2} GB ({:.2} to {:.2} bits a pixel) through {} at {:.2}, {:.2} values rms from the take ({:.2} codes), {:.1} s",
-        take.dir.display(), source_bytes as f64 / 1e9, bytes as f64 / 1e9, source_bits, bits, kind.name(), kind.setting(quality), error_rms, error_in_codes, report.seconds);
     Ok(report)
 }
 
 /// [`archive_take`] as the exporter runs it: the frames between `t_in` and
 /// `t_out` (seconds from the first frame; either end open when `None`, the
-/// way the other exports pick them), at `bits_per_pixel`, with the
-/// exporter's progress.
+/// way the other exports pick them), at `bits_per_pixel` (`None`: every
+/// sample kept), with the exporter's progress.
 pub fn export_archive(
-    source: &Path, dir: &Path, t_in: Option<f64>, t_out: Option<f64>, bits_per_pixel: f64,
+    source: &Path, dir: &Path, t_in: Option<f64>, t_out: Option<f64>, bits_per_pixel: Option<f64>,
     mut progress: impl FnMut(crate::fisheye_export::ExportProgress), cancel: std::sync::Arc<AtomicBool>,
 ) -> Result<ArchiveReport> {
     let index = x6_raw::open(source)?;
@@ -1252,6 +1382,85 @@ mod tests {
         // One that has them is left as it is.
         assert_eq!(annex_b(&unit, &[]).unwrap(), unit);
         assert!(annex_b(&packet, &[]).is_err());
+    }
+
+    /// A record that keeps every sample: a frame's two mosaics come back as
+    /// they were, one channel alone is that channel, and a record whose
+    /// bytes changed is called damaged whatever its pictures read as.
+    #[test]
+    fn a_record_that_keeps_every_sample_reads_back_as_the_frame() {
+        let layout = Layout::EyeRecords(x6b::EyeFrame { width: 96, height: 72, coded: 96 });
+        let (width, height, per) = (layout.width(), layout.height(), layout.eye_samples());
+        let values: Vec<u16> = (0..85).chain((0..405).map(|i| 86 + 2 * i)).chain(896..1024).collect();
+        let numbers = Numbers::of(&values);
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let frame: Vec<u16> = (0..2 * per).map(|i| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values[(40 + (i % width) * 3 + (i / width) % height + (state >> 60) as usize).min(values.len() - 1)]
+        }).collect();
+        let mut pictures: Vec<Vec<u8>> = Vec::new();
+        for mosaic in frame.chunks_exact(per) {
+            pictures.extend(raw_pack::encode_mosaic(mosaic, width, height, &numbers, 0).unwrap());
+        }
+        let refs: Vec<&[u8]> = pictures.iter().map(|p| &p[..]).collect();
+        let header = ArchiveHeader {
+            coding: x6b::ARCHIVE_EXACT_PLANES, channels: 2, width: width as u32, height: height as u32, request: 77,
+            exposure_ns: [5_000_000, 5_000_100], shutter_ns: [1_000_000, 1_000_000], picture_len: [0; 2 * ARCHIVE_PICTURES], crc: 0,
+            source_profile: 3, values: Vec::new(), runs: numbers.runs().to_vec(), len: 0,
+        };
+        let record = x6b::archive_record(header, &refs).unwrap();
+        let mut back = vec![0u16; 2 * per];
+        let entry = decode_record(&record, layout, Channels::Both, &mut back, 0).unwrap();
+        assert_eq!((entry.request, entry.exposure_ns, entry.profile, entry.len as usize), (77, [5_000_000, 5_000_100], Profile::Archive, record.len()));
+        assert!(back == frame);
+        let mut one = vec![7u16; 2 * per];
+        decode_record(&record, layout, Channels::One(1), &mut one, 1).unwrap();
+        assert!(one[per..] == frame[per..] && one[..per].iter().all(|v| *v == 7));
+        let mut damaged = record.clone();
+        damaged[x6b::BLOCK as usize + pictures[0].len() + 40] ^= 4;
+        assert!(decode_record(&damaged, layout, Channels::Both, &mut back, 0).unwrap_err().to_string().contains("damaged"));
+        assert!(decode_record(&record, layout, Channels::Both, &mut back[1..], 0).is_err());
+    }
+
+    /// A copy that keeps every sample of a take on disk
+    /// (`VR180_ARCHIVE_TAKE=<its folder>`): smaller than the take, and every
+    /// sample of every frame of it is the take's.
+    #[test]
+    fn a_copy_that_keeps_every_sample_is_the_take() {
+        let Some(take) = std::env::var_os("VR180_ARCHIVE_TAKE").map(std::path::PathBuf::from) else { return };
+        let dir = std::env::temp_dir().join(format!("vr180-archive-exact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let index = x6_raw::open(&take).unwrap();
+        let frames = 0..index.frames().min(6);
+        let never = AtomicBool::new(false);
+        let report = archive_take(&take, &dir, frames.clone(), &ArchiveOptions { bits_per_pixel: None, encoder: None }, |_| {}, &never).unwrap();
+        println!("{report:?}");
+        assert!(report.exact && report.pairs == frames.len() && report.error_rms == 0.0);
+        // (A third smaller for most takes; one of fourteen bits with every value kept is noise for the most part, and an eighth smaller.)
+        assert!(report.bits_per_pixel < 0.92 * report.source_bits_per_pixel, "{report:?}");
+        let copy = x6_raw::open(&dir).unwrap();
+        assert_eq!((copy.frames(), copy.take.layout, copy.take.fps_setting), (frames.len(), index.take.layout, index.take.fps_setting));
+        assert_eq!(copy.shutter_ns, index.shutter_ns[frames.clone()]);
+        assert!(x6_raw::archive_note(&dir).is_some_and(|n| n.exact && n.target_bits_per_pixel.is_none() && n.bits_per_pixel.is_some()));
+        let layout = index.take.layout;
+        let (mut record, mut theirs, mut ours) = (Vec::new(), vec![0u16; layout.samples()], vec![1u16; layout.samples()]);
+        let (mut source, mut copied) = (File::open(index.take.capture_path()).unwrap(), File::open(copy.take.capture_path()).unwrap());
+        for i in frames.clone() {
+            x6_raw::decode_pair(&mut source, &index.pairs[i], index.take.format(), Channels::Both, &mut record, &mut theirs, 0).unwrap();
+            x6_raw::decode_pair(&mut copied, &copy.pairs[i], copy.take.format(), Channels::Both, &mut record, &mut ours, 0).unwrap();
+            assert!(theirs == ours, "frame {i} of the copy is not the take's");
+        }
+        if layout.channels() == 2 {
+            let mut one = vec![3u16; layout.samples()];
+            x6_raw::decode_pair(&mut copied, &copy.pairs[0], copy.take.format(), Channels::One(0), &mut record, &mut one, 2).unwrap();
+            x6_raw::decode_pair(&mut source, &index.pairs[0], index.take.format(), Channels::Both, &mut record, &mut theirs, 0).unwrap();
+            assert!(one[..layout.eye_samples()] == theirs[..layout.eye_samples()] && one[layout.eye_samples()..].iter().all(|v| *v == 3));
+        }
+        // A copy is not made of a copy, of whichever kind.
+        assert!(archive_take(&dir, &dir.with_extension("again"), 0..2, &ArchiveOptions::default(), |_| {}, &never).unwrap_err().to_string().contains("already"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A take named by `VR180_ARCHIVE_TAKE` (skipped without one): its first

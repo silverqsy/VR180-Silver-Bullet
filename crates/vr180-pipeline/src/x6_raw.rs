@@ -373,7 +373,7 @@ pub fn decode_pair(file: &mut File, entry: &PairEntry, format: x6b::Format, chan
         return x6b::decode_pair(file, entry, format, channels, record, out, threads).map_err(take_err);
     }
     x6b::read_record(file, entry, record).map_err(take_err)?;
-    let got = crate::raw_archive::decode_record(record, format.layout, channels, out)?;
+    let got = crate::raw_archive::decode_record(record, format.layout, channels, out, threads)?;
     if got.request != entry.request || got.exposure_ns != entry.exposure_ns {
         return Err(take_err(format!("byte {} holds request {}, {} expected", entry.offset, got.request, entry.request)));
     }
@@ -384,7 +384,7 @@ pub fn decode_pair(file: &mut File, entry: &PairEntry, format: x6b::Format, chan
 /// is ([`decode_pair`]).
 pub fn decode_record(record: &[u8], format: x6b::Format, channels: Channels, out: &mut [u16], threads: usize) -> Result<PairEntry> {
     if x6b::is_archive_record(record) {
-        return crate::raw_archive::decode_record(record, format.layout, channels, out);
+        return crate::raw_archive::decode_record(record, format.layout, channels, out, threads);
     }
     x6b::decode_record(record, format, channels, out, threads).map_err(take_err)
 }

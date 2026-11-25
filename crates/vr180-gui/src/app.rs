@@ -564,6 +564,8 @@ fn spatial_view_scaled_note(template: &str, hfov_deg: f32, aspect_w_over_h: f32)
 /// How small an archive copy of a raw clip is to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 enum ArchiveSize {
+    /// Every sample kept: as small as that allows.
+    Lossless,
     /// One bit a pixel: the largest lossy copy worth making.
     #[default]
     HighQuality,
@@ -1277,9 +1279,10 @@ mod export_size_tests {
     #[test]
     fn an_archive_copy_is_a_size_in_bits_and_a_folder() {
         let mut opts = ExportOptions { raw_archive: true, ..Default::default() };
-        assert_eq!(opts.archive_bits(), Some(1.0));
+        assert_eq!(opts.archive_copy(), Some(Some(1.0)));
         let text = panel_text_full(&mut opts, (11520, 5760), None, None, false, false, Some(EnhancedFrames::Absent));
-        assert!(text.contains("Archive copy") && text.contains("High quality: 1 bit a pixel") && text.contains("Custom"), "{text}");
+        assert!(text.contains("Archive copy") && text.contains("Lossless: every sample kept") && text.contains("High quality: 1 bit a pixel") && text.contains("Custom"), "{text}");
+        assert!(text.contains("The copy is lossy"), "{text}");
         // 1 bit of 11520 × 5760 thirty times a second: 14.9 GB a minute.
         assert!(text.contains("about 14.9 GB a minute"), "{text}");
         assert!(!text.contains("Codec") && !text.contains("(native)") && !text.contains("Camera original"), "{text}");
@@ -1287,9 +1290,14 @@ mod export_size_tests {
         opts.raw_archive_size = super::ArchiveSize::Custom;
         for (asked, got) in [(0.75f32, 0.75f64), (0.2, 0.5), (3.0, 1.0)] {
             opts.raw_archive_bits = asked;
-            assert!((opts.archive_bits().unwrap() - got).abs() < 1e-6);
+            assert!((opts.archive_copy().unwrap().unwrap() - got).abs() < 1e-6);
         }
-        assert_eq!(ExportOptions::default().archive_bits(), None);
+        assert_eq!(ExportOptions::default().archive_copy(), None);
+        // A copy that keeps every sample has no size to pick, and says what it keeps.
+        opts.raw_archive_size = super::ArchiveSize::Lossless;
+        assert_eq!(opts.archive_copy(), Some(None));
+        let text = panel_text_full(&mut opts, (11520, 5760), None, None, false, false, Some(EnhancedFrames::Absent));
+        assert!(text.contains("Every sample is kept") && !text.contains("GB a minute") && !text.contains("The copy is lossy") && !text.contains("Codec"), "{text}");
         // Picking a DNG sequence in the panel is not for this test to click; the two never export together: the copy comes first.
         let raw = vr180_pipeline::SourceKind::X6Raw;
         assert!(!export_runs_noise_filter(raw, 0.71, &opts));
@@ -2436,13 +2444,15 @@ impl ExportOptions {
         }
     }
 
-    /// Bits a pixel of the archive copy a raw clip exports as; `None` when
-    /// it exports as something else.
-    fn archive_bits(&self) -> Option<f64> {
+    /// The archive copy a raw clip exports as: the bits a pixel of a lossy
+    /// one, or `Some(None)` for one that keeps every sample; `None` when the
+    /// clip exports as something else.
+    fn archive_copy(&self) -> Option<Option<f64>> {
         use vr180_pipeline::raw_archive::{BITS_LEAST, BITS_MOST};
         self.raw_archive.then(|| match self.raw_archive_size {
-            ArchiveSize::HighQuality => BITS_MOST,
-            ArchiveSize::Custom => (self.raw_archive_bits as f64).clamp(BITS_LEAST, BITS_MOST),
+            ArchiveSize::Lossless => None,
+            ArchiveSize::HighQuality => Some(BITS_MOST),
+            ArchiveSize::Custom => Some((self.raw_archive_bits as f64).clamp(BITS_LEAST, BITS_MOST)),
         })
     }
 
@@ -2987,6 +2997,10 @@ fn tr_zh(en: &'static str) -> &'static str {
         "every sample kept" => "每个样本都保留",
         "This clip is an archive copy of a take, made by this app: not the camera's own recording." => "这个片段是素材的存档副本，由本软件制作，不是相机自己的记录。",
         "High quality: 1 bit a pixel" => "高质量：每像素 1 bit",
+        "Lossless: every sample kept" => "无损：每个样本都保留",
+        "lossless" => "无损",
+        "The take's folder again with a smaller capture, which opens like the take: every frame, its timing and the files beside it are kept. Every sample is kept as the camera recorded it, and each frame is read back and compared before it is written. Most takes come out a quarter to a third smaller, a 14-bit take that keeps every value about an eighth. Only the stretch between In and Out is copied. The take itself is left as it is."
+            => "再写一份素材文件夹，采集文件更小，打开方式和原素材一样：每一帧、它的时间信息和旁边的文件都保留。每个样本都和相机记录的一样，每一帧写入前都会读回来逐一核对。大多数素材能小四分之一到三分之一，每个值都保留的 14 bit 素材大约小八分之一。只复制入点到出点之间的部分。原素材保持不动。",
         "Custom" => "自定义",
         "bit a pixel" => "bit 每像素",
         "about" => "约",
@@ -4820,7 +4834,7 @@ impl App {
         let still_format = self.batch_opts.unwrap_or(self.export_opts).still_format;
         let raw_frames = cfg.source_kind.is_raw_video() && self.batch_opts.unwrap_or(self.export_opts).raw_dng_sequence;
         let raw_original = raw_frames && self.batch_opts.unwrap_or(self.export_opts).raw_dng_original;
-        let raw_archive = self.batch_opts.unwrap_or(self.export_opts).archive_bits().filter(|_| cfg.source_kind.is_raw_video());
+        let raw_archive = self.batch_opts.unwrap_or(self.export_opts).archive_copy().filter(|_| cfg.source_kind.is_raw_video());
 
         // Stop preview playback when it reads the SAME file as the export
         // (they'd race on the decoder / file). Previewing a DIFFERENT clip
@@ -4881,10 +4895,10 @@ impl App {
                         fps_avg: done as f32 / t0.elapsed().as_secs_f32().max(1e-3),
                     });
                 })
-            } else if let Some(bits) = raw_archive {
+            } else if let Some(size) = raw_archive {
                 // A raw video clip as an archive copy of its take.
                 vr180_pipeline::raw_archive::export_archive(
-                    &cfg.source_path, &cfg.output_path, cfg.trim_in_s, cfg.trim_out_s, bits,
+                    &cfg.source_path, &cfg.output_path, cfg.trim_in_s, cfg.trim_out_s, size,
                     move |p| { let _ = progress_tx2.try_send(p); },
                     cancel_for_thread,
                 ).map(|_| ())
@@ -7673,14 +7687,17 @@ impl App {
         };
         let raw_frames = self.export_opts.raw_dng_sequence
             && self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video());
-        let raw_archive = self.export_opts.archive_bits()
+        let raw_archive = self.export_opts.archive_copy()
             .filter(|_| self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()));
         let fmt_label = if is_still {
             // A still has no codec / bitrate: container + size only.
             format!("{} · {}", self.export_opts.still_format.label(), res_label)
-        } else if let Some(bits) = raw_archive {
+        } else if let Some(size) = raw_archive {
             // The take's own frames, smaller: neither the view nor its size applies.
-            format!("{} · {bits:.2} {}", tr("Archive copy"), tr("bit a pixel"))
+            match size {
+                Some(bits) => format!("{} · {bits:.2} {}", tr("Archive copy"), tr("bit a pixel")),
+                None => format!("{} · {}", tr("Archive copy"), tr("lossless")),
+            }
         } else if raw_frames && self.export_opts.raw_dng_original {
             // The sensor's own frames: neither the view nor its size applies.
             format!("{} · {} · 3840 × 3840 {}", tr("DNG sequence"), tr("camera original"), tr("per eye"))
@@ -8111,18 +8128,22 @@ impl App {
                     opts.raw_dng_sequence = false;
                 }
                 if opts.raw_archive {
+                    ui.radio_value(&mut opts.raw_archive_size, ArchiveSize::Lossless, tr("Lossless: every sample kept"));
                     ui.radio_value(&mut opts.raw_archive_size, ArchiveSize::HighQuality, tr("High quality: 1 bit a pixel"));
                     ui.radio_value(&mut opts.raw_archive_size, ArchiveSize::Custom, tr("Custom"));
                     if opts.raw_archive_size == ArchiveSize::Custom {
                         ui.add(egui::Slider::new(&mut opts.raw_archive_bits, 0.5..=1.0).step_by(0.05).fixed_decimals(2).suffix(format!(" {}", tr("bit a pixel"))));
                     }
-                    // What a minute of this clip comes to at the size picked.
-                    if let (Some(bits), Some((w, h))) = (opts.archive_bits(), native_dims) {
+                    // What a minute of this clip comes to at the size picked (a copy that keeps every sample is as large as its frames make it).
+                    if let (Some(Some(bits)), Some((w, h))) = (opts.archive_copy(), native_dims) {
                         let gb = bits * w as f64 * h as f64 * fps as f64 * 60.0 / 8.0 / 1e9;
                         ui.label(format!("{} {gb:.1} GB {}", tr("about"), tr("a minute")));
                     }
-                    ui.label(RichText::new(tr("The take's folder again with a capture a fraction of the size, which opens like the take: every frame, its timing and the files beside it are kept. The copy is lossy: at 1 bit a pixel a frame is off by less than its own noise; below that the shadows lose their grain when they are lifted. Only the stretch between In and Out is copied. The take itself is left as it is."))
-                        .small().color(Color32::GRAY));
+                    ui.label(RichText::new(if opts.raw_archive_size == ArchiveSize::Lossless {
+                        tr("The take's folder again with a smaller capture, which opens like the take: every frame, its timing and the files beside it are kept. Every sample is kept as the camera recorded it, and each frame is read back and compared before it is written. Most takes come out a quarter to a third smaller, a 14-bit take that keeps every value about an eighth. Only the stretch between In and Out is copied. The take itself is left as it is.")
+                    } else {
+                        tr("The take's folder again with a capture a fraction of the size, which opens like the take: every frame, its timing and the files beside it are kept. The copy is lossy: at 1 bit a pixel a frame is off by less than its own noise; below that the shadows lose their grain when they are lifted. Only the stretch between In and Out is copied. The take itself is left as it is.")
+                    }).small().color(Color32::GRAY));
                     ui.add_space(8.0);
                     return;
                 }

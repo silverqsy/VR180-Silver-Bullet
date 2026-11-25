@@ -167,7 +167,7 @@
 //! | 0 | 8 bytes | `SBARCH1\0` |
 //! | 8 | `u32` | 1 |
 //! | 12 | `u32` | length of the record, header and padding included |
-//! | 16 | `u32` | how the pictures are coded ([`ARCHIVE_HEVC_PLANES`]) |
+//! | 16 | `u32` | how the pictures are coded ([`ARCHIVE_HEVC_PLANES`] or [`ARCHIVE_EXACT_PLANES`]) |
 //! | 20 | `u32` | channels in the record, 1 or 2 |
 //! | 24, 28 | `u32` | a channel's frame, width and height |
 //! | 32 | `u32` | the pair's request number |
@@ -175,17 +175,27 @@
 //! | 40, 48 | `u64` | exposure start of each channel, nanoseconds |
 //! | 56, 64 | `u64` | integration time of each channel, nanoseconds (0: not known) |
 //! | 72 | `u32` | CRC-32C of the pictures' bytes |
-//! | 76 | `u32` | codes a sample is stored in (1024) |
+//! | 76 | `u32` | codes a sample is stored in (1024); of an exact record, the runs of values listed at 128 |
 //! | 80 | `u32` × 8 | the length of each picture: channel 0's, then channel 1's |
 //! | 112 | `u32` | the kind of record the pair was read from (its place in [`Profile::ALL`]) |
 //! | 128 | `u16` × 1024 | the sensor value each code stands for |
+//! | 128 | (`u16`, `u16`, `u32`) × runs | of an exact record: the values a sample can have, as runs of evenly spaced ones (first value, step, count), rising |
 //!
-//! [`ARCHIVE_HEVC_PLANES`]: each of a frame's four colour planes (the
-//! samples of even rows and even columns, even rows and odd columns, odd
-//! rows and even columns, odd rows and odd columns, in that order) is a
-//! picture of half the frame's width and height, its samples turned into
-//! 10-bit codes, stored as one intra-coded HEVC access unit with its
-//! parameter sets (Annex B, Main 10, the codes in the luma, full range).
+//! A frame's four colour planes (the samples of even rows and even columns,
+//! even rows and odd columns, odd rows and even columns, odd rows and odd
+//! columns, in that order) are a picture each, of half the frame's width
+//! and height.
+//!
+//! [`ARCHIVE_HEVC_PLANES`]: a plane's samples are turned into 10-bit codes
+//! and stored as one intra-coded HEVC access unit with its parameter sets
+//! (Annex B, Main 10, the codes in the luma, full range). What comes back
+//! is close to the take's samples, not the samples themselves.
+//!
+//! [`ARCHIVE_EXACT_PLANES`]: every sample is kept. A sample is coded as its
+//! place among the values the header lists, predicted from its neighbours,
+//! and what is left of it goes through a range coder; the pipeline's
+//! `raw_pack` module says how, bit for bit.
+//!
 //! This module reads the container; the pictures are decoded by the
 //! pipeline, which links the video libraries.
 
@@ -1499,6 +1509,10 @@ pub const ARCHIVE_SIGNATURE: &[u8; 8] = b"SBARCH1\0";
 /// A picture a colour plane, each one intra-coded HEVC access unit of
 /// 10-bit codes.
 pub const ARCHIVE_HEVC_PLANES: u32 = 1;
+/// A picture a colour plane, every sample kept (the pipeline's `raw_pack`).
+pub const ARCHIVE_EXACT_PLANES: u32 = 2;
+/// Runs of values the header of an exact record has room for.
+pub const ARCHIVE_RUNS_MOST: usize = (BLOCK as usize - ARCHIVE_VALUES_AT) / 8;
 /// Pictures a channel of an archive record holds: its four colour planes.
 pub const ARCHIVE_PICTURES: usize = 4;
 /// Codes a sample of an archive record is stored in.
@@ -1509,7 +1523,8 @@ const ARCHIVE_VALUES_AT: usize = 128;
 /// The header of a record of an archive copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveHeader {
-    /// How the pictures are coded ([`ARCHIVE_HEVC_PLANES`]).
+    /// How the pictures are coded ([`ARCHIVE_HEVC_PLANES`] or
+    /// [`ARCHIVE_EXACT_PLANES`]).
     pub coding: u32,
     pub channels: usize,
     /// A channel's frame.
@@ -1527,8 +1542,12 @@ pub struct ArchiveHeader {
     /// [`Profile::ALL`].
     pub source_profile: u32,
     /// The sensor value each code stands for ([`ARCHIVE_CODES`] of them,
-    /// never falling).
+    /// never falling); none in an exact record.
     pub values: Vec<u16>,
+    /// Of an exact record: the values a sample can have, as runs of evenly
+    /// spaced ones, `(first value, step, count)`, rising. A sample is
+    /// stored as its value's place among them.
+    pub runs: Vec<(u16, u16, u32)>,
     /// Length of the record, header and padding included.
     pub len: u64,
 }
@@ -1546,12 +1565,16 @@ impl ArchiveHeader {
             return Err(err(format!("the record at byte {at} is not one of an archive copy")));
         }
         let channels = layout.channels();
+        let (coding, listed) = (u32_at(16), u32_at(76) as usize);
         let fields_ok = u32_at(8) == 1
-            && u32_at(16) == ARCHIVE_HEVC_PLANES
             && u32_at(20) as usize == channels
             && (u32_at(24), u32_at(28)) == (layout.width() as u32, layout.height() as u32)
             && u32_at(36) as usize == ARCHIVE_PICTURES
-            && u32_at(76) as usize == ARCHIVE_CODES;
+            && match coding {
+                ARCHIVE_HEVC_PLANES => listed == ARCHIVE_CODES,
+                ARCHIVE_EXACT_PLANES => (1..=ARCHIVE_RUNS_MOST).contains(&listed),
+                _ => return Err(err(format!("the record at byte {at} is coded in a way this build does not read ({coding}): a newer one wrote it"))),
+            };
         if !fields_ok {
             return Err(err(format!("invalid header at byte {at}")));
         }
@@ -1567,16 +1590,32 @@ impl ArchiveHeader {
         if len % BLOCK != 0 || len != BLOCK + pad(payload) {
             return Err(err(format!("invalid record size at byte {at}")));
         }
-        let values: Vec<u16> = (0..ARCHIVE_CODES)
-            .map(|c| u16::from_le_bytes([h[ARCHIVE_VALUES_AT + 2 * c], h[ARCHIVE_VALUES_AT + 2 * c + 1]]))
-            .collect();
-        if values.windows(2).any(|w| w[1] < w[0]) {
-            return Err(err(format!("the record at byte {at} states values that fall")));
+        let falls = || err(format!("the record at byte {at} states values that fall"));
+        let (mut values, mut runs) = (Vec::new(), Vec::new());
+        if coding == ARCHIVE_EXACT_PLANES {
+            let mut next = 0u64;
+            for r in 0..listed {
+                let o = ARCHIVE_VALUES_AT + 8 * r;
+                let (first, step, count) = (u16::from_le_bytes([h[o], h[o + 1]]), u16::from_le_bytes([h[o + 2], h[o + 3]]), u32_at(o + 4));
+                let last = first as u64 + count.saturating_sub(1) as u64 * step as u64;
+                if count == 0 || step == 0 || (first as u64) < next || last > u16::MAX as u64 {
+                    return Err(falls());
+                }
+                next = last + 1;
+                runs.push((first, step, count));
+            }
+        } else {
+            values = (0..ARCHIVE_CODES)
+                .map(|c| u16::from_le_bytes([h[ARCHIVE_VALUES_AT + 2 * c], h[ARCHIVE_VALUES_AT + 2 * c + 1]]))
+                .collect();
+            if values.windows(2).any(|w| w[1] < w[0]) {
+                return Err(falls());
+            }
         }
         Ok(Self {
-            coding: u32_at(16), channels, width: u32_at(24), height: u32_at(28), request: u32_at(32),
+            coding, channels, width: u32_at(24), height: u32_at(28), request: u32_at(32),
             exposure_ns: [u64_at(40), u64_at(48)], shutter_ns: [u64_at(56), u64_at(64)],
-            picture_len, crc: u32_at(72), source_profile: u32_at(112), values, len,
+            picture_len, crc: u32_at(72), source_profile: u32_at(112), values, runs, len,
         })
     }
 
@@ -1599,7 +1638,10 @@ impl ArchiveHeader {
         put32(32, self.request);
         put32(36, ARCHIVE_PICTURES as u32);
         put32(72, self.crc);
-        put32(76, ARCHIVE_CODES as u32);
+        put32(76, if self.coding == ARCHIVE_EXACT_PLANES { self.runs.len() } else { ARCHIVE_CODES } as u32);
+        for (r, (_, _, count)) in self.runs.iter().take(ARCHIVE_RUNS_MOST).enumerate() {
+            put32(ARCHIVE_VALUES_AT + 8 * r + 4, *count);
+        }
         for (i, n) in self.picture_len.iter().enumerate() {
             put32(80 + 4 * i, *n);
         }
@@ -1607,8 +1649,16 @@ impl ArchiveHeader {
         for (i, v) in self.exposure_ns.iter().chain(&self.shutter_ns).enumerate() {
             h[40 + 8 * i..48 + 8 * i].copy_from_slice(&v.to_le_bytes());
         }
-        for (c, v) in self.values.iter().take(ARCHIVE_CODES).enumerate() {
-            h[ARCHIVE_VALUES_AT + 2 * c..ARCHIVE_VALUES_AT + 2 * c + 2].copy_from_slice(&v.to_le_bytes());
+        if self.coding == ARCHIVE_EXACT_PLANES {
+            for (r, (first, step, _)) in self.runs.iter().take(ARCHIVE_RUNS_MOST).enumerate() {
+                let o = ARCHIVE_VALUES_AT + 8 * r;
+                h[o..o + 2].copy_from_slice(&first.to_le_bytes());
+                h[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+            }
+        } else {
+            for (c, v) in self.values.iter().take(ARCHIVE_CODES).enumerate() {
+                h[ARCHIVE_VALUES_AT + 2 * c..ARCHIVE_VALUES_AT + 2 * c + 2].copy_from_slice(&v.to_le_bytes());
+            }
         }
         h
     }
@@ -1630,8 +1680,13 @@ pub fn is_archive(take: &Take) -> Result<bool> {
 /// from `pictures` (channel 0's four, then channel 1's), the pictures, and
 /// zeros up to the next 4096-byte boundary.
 pub fn archive_record(mut header: ArchiveHeader, pictures: &[&[u8]]) -> Result<Vec<u8>> {
-    if pictures.len() != header.channels * ARCHIVE_PICTURES || header.values.len() != ARCHIVE_CODES || pictures.iter().any(|p| p.is_empty()) {
-        return Err(err("an archive record takes four pictures a channel and a value for every code"));
+    let listed = match header.coding {
+        ARCHIVE_HEVC_PLANES => header.values.len() == ARCHIVE_CODES && header.runs.is_empty(),
+        ARCHIVE_EXACT_PLANES => header.values.is_empty() && (1..=ARCHIVE_RUNS_MOST).contains(&header.runs.len()),
+        _ => false,
+    };
+    if pictures.len() != header.channels * ARCHIVE_PICTURES || !listed || pictures.iter().any(|p| p.is_empty()) {
+        return Err(err("an archive record takes four pictures a channel, and a value for every code or the runs of its values"));
     }
     header.picture_len = [0; 2 * ARCHIVE_PICTURES];
     for (len, picture) in header.picture_len.iter_mut().zip(pictures) {
@@ -1652,20 +1707,35 @@ pub fn archive_record(mut header: ArchiveHeader, pictures: &[&[u8]]) -> Result<V
 /// The header and the pictures of the archive record `record` holds (read
 /// by [`read_record`]), checked against the header's checksum.
 pub fn archive_pictures(record: &[u8], layout: Layout) -> Result<(ArchiveHeader, Vec<&[u8]>)> {
+    let (header, pictures, bytes) = archive_parts(record, layout)?;
+    archive_sum(&header, bytes)?;
+    Ok((header, pictures))
+}
+
+/// Whether `bytes`, the pictures of a record one after the other, are what
+/// `header`'s checksum was taken of.
+pub fn archive_sum(header: &ArchiveHeader, bytes: &[u8]) -> Result<()> {
+    if crc32c(bytes) != header.crc {
+        return Err(err("a record's checksum is not that of its bytes: damaged"));
+    }
+    Ok(())
+}
+
+/// [`archive_pictures`] without its check, and with the bytes the check is
+/// of: for a reader that runs [`archive_sum`] beside its decoding, on a
+/// thread of its own, and goes by what the sum says once both are done.
+pub fn archive_parts(record: &[u8], layout: Layout) -> Result<(ArchiveHeader, Vec<&[u8]>, &[u8])> {
     let header = ArchiveHeader::parse(record, layout, 0)?;
     let Some(payload) = record.get(BLOCK as usize..BLOCK as usize + header.payload()) else {
         return Err(err("truncated record"));
     };
-    if crc32c(payload) != header.crc {
-        return Err(err("a record's checksum is not that of its bytes: damaged"));
-    }
     let mut pictures = Vec::with_capacity(header.channels * ARCHIVE_PICTURES);
     let mut at = 0usize;
     for &n in &header.picture_len[..header.channels * ARCHIVE_PICTURES] {
         pictures.push(&payload[at..at + n as usize]);
         at += n as usize;
     }
-    Ok((header, pictures))
+    Ok((header, pictures, payload))
 }
 
 /// [`scan_pairs`] of an archive copy: one header a record, the records in
@@ -1701,10 +1771,10 @@ fn scan_archive(take: &Take, mut progress: impl FnMut(u64, u64) -> bool) -> Resu
         if at + h.len > size {
             return Err(err(format!("truncated record at byte {at}")));
         }
-        // A take of one lens has its one stamp for both eyes, as its own records do.
+        // A take of one lens has its one stamp for both eyes, as its own records do (and an
+        // integration time for the one channel it has, as the take's list of them does).
         let exposure_ns = if h.channels == 1 { [h.exposure_ns[0]; 2] } else { h.exposure_ns };
-        let shutter_ns = if h.channels == 1 { [h.shutter_ns[0]; 2] } else { h.shutter_ns };
-        pairs.push(PairEntry { request: h.request, offset: at, len: h.len, profile: Profile::Archive, exposure_ns, other: None, shutter_ns });
+        pairs.push(PairEntry { request: h.request, offset: at, len: h.len, profile: Profile::Archive, exposure_ns, other: None, shutter_ns: h.shutter_ns });
         at += h.len;
     }
     if pairs.len() as u64 != take.seal.pairs {
@@ -3961,7 +4031,7 @@ mod tests {
         let header = |request: u32, channels: usize, side: u32| ArchiveHeader {
             coding: ARCHIVE_HEVC_PLANES, channels, width: side, height: side, request,
             exposure_ns: [1_000_000 * request as u64, 1_000_000 * request as u64 - 29_000], shutter_ns: [4_992_000, 4_992_100],
-            picture_len: [0; 8], crc: 0, source_profile: 4, values: values.clone(), len: 0,
+            picture_len: [0; 8], crc: 0, source_profile: 4, values: values.clone(), runs: Vec::new(), len: 0,
         };
         let pictures: Vec<Vec<u8>> = (0..8u8).map(|k| (0..1000 + 37 * k as usize).map(|i| (i as u8).wrapping_mul(k + 3)).collect()).collect();
         let refs: Vec<&[u8]> = pictures.iter().map(|p| &p[..]).collect();
@@ -3978,6 +4048,24 @@ mod tests {
         assert!(archive_pictures(&damaged, Layout::Paired).unwrap_err().to_string().contains("damaged"));
         assert!(archive_pictures(&record[..8000], Layout::Paired).is_err());
         assert!(archive_record(header(500, 2, 3840), &refs[..4]).is_err());
+        // A record that keeps every sample states the values a sample can have, not a value for every code.
+        let runs = vec![(0u16, 1u16, 85u32), (86, 2, 405), (896, 1, 128)];
+        let exact = |runs: &[(u16, u16, u32)]| ArchiveHeader { coding: ARCHIVE_EXACT_PLANES, values: Vec::new(), runs: runs.to_vec(), ..header(500, 2, 3840) };
+        let kept = archive_record(exact(&runs), &refs).unwrap();
+        let (got, back) = archive_pictures(&kept, Layout::Paired).unwrap();
+        assert_eq!((got.coding, &got.runs, got.values.len(), got.request, got.len as usize), (ARCHIVE_EXACT_PLANES, &runs, 0, 500, kept.len()));
+        assert!(back.iter().zip(&pictures).all(|(a, b)| *a == &b[..]));
+        assert!(archive_record(exact(&[]), &refs).is_err());
+        assert!(archive_record(ArchiveHeader { values: values.clone(), ..exact(&runs) }, &refs).is_err());
+        assert!(archive_record(ArchiveHeader { runs: runs.clone(), ..header(500, 2, 3840) }, &refs).is_err());
+        // Runs that do not rise, or go past sixteen bits, and a coding this build does not know.
+        for bad in [vec![(8u16, 8u16, 4u32), (16, 1, 2)], vec![(65000, 100, 9)], vec![(0, 0, 3)], vec![(0, 1, 0)]] {
+            let record = archive_record(exact(&bad), &refs).unwrap();
+            assert!(archive_pictures(&record, Layout::Paired).unwrap_err().to_string().contains("values that fall"), "{bad:?}");
+        }
+        let mut newer = kept.clone();
+        newer[16] = 3;
+        assert!(archive_pictures(&newer, Layout::Paired).unwrap_err().to_string().contains("newer"));
         // The records the camera writes are not decoded as one, nor the other way round.
         assert!(decode_record(&record, Format::paired(60), Channels::Both, &mut vec![0u16; 2 * EYE_SAMPLES], 1).unwrap_err().to_string().contains("archive"));
 
@@ -4007,6 +4095,8 @@ mod tests {
         assert_eq!(read_archive_note(&dir), None);
         std::fs::write(dir.join(CLIP_FILE), r#"{"layout":"paired-bayer-v1","fps_setting":60,"size":[3840,3840],"archive":{"version":1,"kind":"lossy","target_bits_per_pixel":1.0,"bits_per_pixel":0.97,"source":"a take"}}"#).unwrap();
         assert_eq!(read_archive_note(&dir), Some(ArchiveNote { exact: false, target_bits_per_pixel: Some(1.0), bits_per_pixel: Some(0.97), source: Some("a take".into()) }));
+        std::fs::write(dir.join(CLIP_FILE), r#"{"layout":"paired-bayer-v1","fps_setting":60,"size":[3840,3840],"archive":{"version":1,"kind":"exact","bits_per_pixel":2.1,"source":"a take"}}"#).unwrap();
+        assert_eq!(read_archive_note(&dir), Some(ArchiveNote { exact: true, target_bits_per_pixel: None, bits_per_pixel: Some(2.1), source: Some("a take".into()) }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
