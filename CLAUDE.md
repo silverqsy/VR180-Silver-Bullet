@@ -5163,6 +5163,116 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       still checks where it reads (about a tenth of its time), and vector
       instructions for the classes and the plain bits were left for when
       the speed is wanted.
+    - **WINDOWS (2026-11-25, Windows box, RTX 4090 with driver 610.88, i9-13900K;
+      items 49 to 52).** Pulled `f665037`. It builds as pushed; tests core 63,
+      fisheye 88, braw 6, pipeline 321 of 322 with the GPU ones (the one is
+      the fingerprint tool), gui 86. The 61 exports of the A/B set are
+      byte-identical per stream to the 2.6.0 build's, with the same 38
+      engagements of a fast arm; the 36 preview-probe cases print the same
+      lines (one case lost its device once: the NVIDIA driver logged an error
+      at that second, event 153, the only one in the system log in thirty
+      days; three repeats print the stored lines).
+      - **As pushed, a lossy copy made on Windows was written by libx265
+        and read in software.** Four things, all in `raw_archive.rs`:
+        (1) `hevc_nvenc` did not open ("Gop Length should be greater than
+        number of B frames + 1"): to that encoder a picture that stands
+        alone is a GOP of 0, not of 1. Its setting went down to 10 only: a
+        take of little noise comes to 0.6 bits a pixel there and wants 6 for
+        one, so the range is 45 to 1 now (whole numbers: a setting is tried
+        once, `quality_for`). (2) libx265 with a key frame interval of 1
+        states the intra profile of the range extensions (`profile_idc` 4),
+        which Direct3D's decoder refuses ("No decoder device for codec
+        found"); libav then goes on in software inside the same context, on
+        one thread and without a word: 156 ms a pair of 5760 x 5760. It is
+        given an interval of 2 with closed groups now, every picture still
+        marked an I picture: Main 10, every picture an IDR (with open groups
+        all but the first came out as CRA pictures, for which a decoder
+        makes up reference pictures: "Error constructing the frame RPS").
+        Bits and error as before (0.97 bits a pixel and 1.94 values rms
+        then, 1.02 and 1.84 now, on pairs of one stretch). **MAC SIDE: a copy the
+        software encoder writes states Main 10 now**; the hardware reads it.
+        (3) A Direct3D decoder sizes its pool for sixteen reference pictures
+        and a few more, and the driver commits them before the decoder finds
+        out whether it takes the stream: 2 GB a decoder for the pictures of
+        a 5760 frame, 16 GB at the peak for the eight a pair was read by.
+        `small_pool` (from `pick_format`) gives it a pool of `D3D11_POOL` = 4
+        (two are in use at most): 450 MB. `pick_format` goes by the kind of
+        device that is attached (it handed CUDA's format to a Direct3D
+        device). (4) `HARDWARE_DECODERS`: two through Direct3D, eight
+        elsewhere as before. A pair of 5760 x 5760 through 1 / 2 / 3 / 4 / 8
+        decoders: 99 / 67 / 67 / 67 / 68 ms; of 3840 x 3840: 48 / 32 / 32 /
+        32 ms. Twice that many are kept between frames: with a lossy copy of
+        a 5760 take open the app holds four decoders, 1.8 GB (as pushed
+        up to sixteen were kept). A decoder the hardware does not take a picture
+        from says so now (`Decoder::hardware` is set false when a software
+        frame comes back), `NO_HARDWARE` is set, and from then on eight
+        software decoders with their threads read the pictures: a copy of
+        the old libx265 kind in 59 ms a pair (its pictures have rows that
+        decode side by side), NVENC's pictures in 152 ms.
+      - **A copy of a stretch of a ONE-LENS take was taken for as long as
+        its take until it was walked** (shared code, any system): its
+        closing record kept the take's window of sensor frame numbers, and
+        `x6_raw::probe` reads a take's length off that window. A copy of
+        four frames from the middle of a 5.9 s take was listed as 5.9 s, and
+        the trim of a clip that reads such a copy in its take's place was
+        laid by that length (`a_project_whose_take_is_gone_opens_its_copy`
+        fails on a one-lens take as pushed). `archive_take` now writes the
+        part of the window the stretch covers, by the frames' times (a
+        record of the copy does not keep the sensor's number), and `gaps`
+        with it.
+      - **The real-take tests** (`VR180_ARCHIVE_TAKE`, the pipeline's two
+        and the app's one) pass on eleven takes: 3840 at 30, 50 and 60, one
+        lens at 7680, 5504, 4912 with fourteen bits, 3968, 5760 scaled and
+        at the sensor's own pixels, 6000, 4608 x 3968; every lossy copy
+        through `hevc_nvenc` and read by the hardware.
+      - **Measured.** Lossy at 1 bit a pixel through NVENC: five seconds of
+        a 5760 take (150 pairs) in 29 s, 4.76 to 1.21 GB (3.83 to 0.97 bits
+        a pixel), 1.86 values rms; a whole 3840 60 fps take (797 pairs) in
+        47 s, 9.44 to 3.10 GB. The take is read from the share meanwhile
+        (380 to 430 MB/s in a plain read; a lossless copy of pairs of the
+        same 5760 stretch takes the same 195 ms a pair overall, so the
+        encoder is not what these runs wait for; where the time goes was
+        not taken apart). NVENC against
+        libx265 on the same twenty pairs at the same size: 27.8 against 28.9
+        values rms of fourteen bits, and a fifth of the time. Reading a pair back: 67 ms for 5760 x
+        5760 and 32 ms for 3840 x 3840 through the card's decoder, 152 ms in
+        software. **That is the card's video engine and no setting of the
+        app's**: one decoder alone takes 138 of these pictures a second
+        (1.2 MB each), eight a pair. In the app a lossy copy of a 5760 take
+        plays at 12 to 13 shown a second (the wait for a frame is 76 to
+        80 ms); one of a 3840 take is read in time for the preview's 30
+        (not played in the app). Lossless: twenty pairs of the
+        5760 take 3.83 to 2.74 bits a pixel, the whole 3840 take 9.44 to
+        6.33 GB in 64 s; read back in 18.5 ms and 10.6 ms a pair. Every one
+        of the 20.4 thousand million samples inside the image circle of that
+        whole copy is the take's, every one outside is 64.
+      - **An export from the lossless copy is the export from the take,
+        byte for byte**: the same second of both through the plane feed and
+        NVENC, stabilized, with sound (NVENC writes the same file twice
+        here). From the lossy copy the same frame is 0.86 of 255 away on
+        the mean, 22 at most.
+      - **Seen, not acted on.** In a lossy copy a few samples in a million
+        are far off: of the 512 million of twenty pairs, 353 (NVENC) and 1224
+        (libx265) are off by 1024 values of fourteen bits or more, the worst
+        9216 for 10752, where the noise is about 80. Of 3.44 million saturated
+        samples ten came back unsaturated and three others saturated
+        (NVENC, the 5760 take). Other cards' decoders (Intel, AMD) are not
+        measured: neither the pool nor the two decoders.
+      - **In the app** (a scratch app folder, the output folder set to one
+        of its own). The heading and its two buttons are there for a raw
+        take; *Compressed archive* shows its sizes, the range, the amber
+        note, what the take, the part and the copy come to, and where the
+        copy goes. *Make the archive copy* of two seconds of a 5760 take:
+        56 frames, 1.78 to 0.45 GB through `hevc_nvenc` in 12 s; of a 3840
+        take: 120 frames, 1.38 to 0.45 GB in 9 s (setting 6: below the old
+        floor). The panel's line and the export bar say it is made. **The
+        mark before both was an empty box on Windows**: the light check
+        mark (U+2713) is in a Mac's system fonts and in none of those the
+        app loads on Windows; the export bar's "done" has had it since that
+        bar was written. `DONE_MARK` is the heavy one (U+2714), which the
+        built-in fonts hold on every system; a test checks. A session that
+        names a take which is not there opens its copy from the output
+        folder, with the notice and the "In place of" row.
 
 50. **The take itself is written from the Source panel (2026-11-24, Mac;
     UNRELEASED).** The user's point: an archive copy is no export choice.
@@ -5419,6 +5529,23 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
     - **Not done.** Other cameras' sound upside down (the switch is shown
       for them too); a still has no accelerometer and stays by hand; the
       window not seen; nothing on Windows.
+    - **WINDOWS (2026-11-25, Windows box).** Of the twenty-one takes of
+      the last two shoots two read +9.6 and +10.1 m/s² on the
+      accelerometer's first axis, the others −8.8 to −10.9: the two shot
+      upside down. In the app the switch of such a take is ticked when the
+      take is opened, with "Set from the clip's accelerometer" under it,
+      the picture is upright, and the session keeps the switch on for that
+      take and off for the upright one beside it. Exports of two seconds of
+      one of them through the plane feed and NVENC, with the switch and
+      without (the local export harness has `VR180_UPSIDE_DOWN` for it):
+      with it the picture is upright, not mirrored, and a near object lies
+      further left in the right eye. Stereo: each side is the other
+      export's other side (0.999 and 1.000). Ambisonic: the four channels
+      +0.996 / −0.994 / −0.999 / +1.000, the SA3D box there; the turned
+      track starts 11.6 ms after the copied one, which starts on a packet
+      as a copied track does (item 20). The temporary sound files go
+      through the muxer named in the code (item 20), so both are written
+      with this box's FFmpeg.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

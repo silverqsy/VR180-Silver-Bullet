@@ -80,6 +80,15 @@ three sizes to pick from.
   again. A copy holds every file of its take's folder, and goes on
   reading the take's folder of camera original DNGs where that is beside
   it, so frames enhanced for the take are still used.
+- **On Windows.** The pictures of a lossy copy are written by the NVIDIA
+  card's encoder where there is one (five seconds of a 5760 × 5760 take
+  from a network share in half a minute), else in software, which takes
+  several times as long. They are read by the card's video decoder,
+  and that sets the pace of a lossy copy there: a pair of 5760 × 5760 in
+  67 ms on an RTX 4090, 12 to 13 frames a second in the preview; one of
+  3840 × 3840 in 32 ms. A lossless copy is read by the processor: 18.5 ms
+  and 10.6 ms for the same frames. For the largest frames the lossless copy
+  is the one that plays like the take.
 - **The file.** The copy's capture is a file of records like the take's, a
   record a pair (the format is in `x6b.rs`'s notes, the lossless pictures
   in `raw_pack.rs`'s); earlier versions of the app refuse it as a kind
