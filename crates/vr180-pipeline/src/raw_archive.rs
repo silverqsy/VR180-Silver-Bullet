@@ -338,7 +338,8 @@ impl PictureEncoder {
         let q = quality.clamp(0.0, 1.0);
         match self {
             Self::VideoToolbox => 30.0 + 70.0 * q,
-            Self::Nvenc => (45.0 - 35.0 * q).round(),
+            // (Whole numbers, down to 1: a take of little noise wants 6 for a bit a pixel, where 10 gives 0.6.)
+            Self::Nvenc => (45.0 - 44.0 * q).round(),
             Self::X265 => 34.0 - 30.0 * q,
         }
     }
@@ -399,6 +400,9 @@ impl Encoder {
                     set_opt(raw, "power_efficient", "0")?;
                 }
                 PictureEncoder::Nvenc => {
+                    // To this encoder a picture that stands alone is a GOP of no length: one of 1 it refuses
+                    // ("Gop Length should be greater than number of B frames + 1").
+                    (*raw).gop_size = 0;
                     set_opt(raw, "preset", "p6")?;
                     set_opt(raw, "tune", "hq")?;
                     set_opt(raw, "profile", "main10")?;
@@ -407,9 +411,17 @@ impl Encoder {
                     set_opt(raw, "forced-idr", "1")?;
                 }
                 PictureEncoder::X265 => {
+                    // A key frame interval of 1 makes this encoder state the intra profile of the range
+                    // extensions, which no graphics hardware decodes (Direct3D: "No decoder device for codec
+                    // found"), and the copy is then read in software for good. With an interval of 2 it states
+                    // Main 10 like the other two; every picture is still one that stands alone: `send` marks
+                    // each an I picture, and with closed groups that is an IDR (with open ones, the encoder's
+                    // own choice, all but the first come out as CRA pictures, and a decoder handed one out of
+                    // its place makes up the reference pictures it thinks are missing).
+                    (*raw).gop_size = 2;
                     set_opt(raw, "preset", "fast")?;
                     set_opt(raw, "crf", &format!("{setting:.2}"))?;
-                    set_opt(raw, "x265-params", "keyint=1:min-keyint=1:repeat-headers=1:range=full:log-level=error")?;
+                    set_opt(raw, "x265-params", "keyint=2:min-keyint=1:open-gop=0:bframes=0:repeat-headers=1:range=full:log-level=error")?;
                     (*raw).thread_count = 0;
                 }
             }
@@ -581,13 +593,47 @@ const HARDWARE: [(ffmpeg::ffi::AVHWDeviceType, ffmpeg::ffi::AVPixelFormat); 3] =
     (ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA, ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_CUDA),
 ];
 
-/// The decoder asks which of the formats it offers to use: a hardware one
-/// this module set up, else the last, which is the one in memory.
-unsafe extern "C" fn pick_format(_ctx: *mut ffmpeg::ffi::AVCodecContext, offered: *const ffmpeg::ffi::AVPixelFormat) -> ffmpeg::ffi::AVPixelFormat {
+/// Pictures a Direct3D decoder keeps room for. It would size its pool for
+/// the sixteen reference pictures a stream may have and a few more, and the
+/// driver commits every one of them: 2 GB of the card's memory a decoder
+/// for the pictures of a 5760 frame, 16 GB for the eight a pair is read by.
+/// A picture here stands alone and is fetched before the next goes in: two
+/// are in use at most (a pool of two was enough for the pictures NVENC
+/// writes), and this is as many again.
+const D3D11_POOL: i32 = 4;
+
+/// Give the Direct3D decoder `ctx` a pool of [`D3D11_POOL`] pictures in
+/// place of the one it would make for itself. Where this does not work the
+/// decoder is left to make its own.
+unsafe fn small_pool(ctx: *mut ffmpeg::ffi::AVCodecContext, format: ffmpeg::ffi::AVPixelFormat) {
+    let mut frames: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
+    if ffmpeg::ffi::avcodec_get_hw_frames_parameters(ctx, (*ctx).hw_device_ctx, format, &mut frames) < 0 || frames.is_null() {
+        return;
+    }
+    let pool = (*frames).data as *mut ffmpeg::ffi::AVHWFramesContext;
+    (*pool).initial_pool_size = (*pool).initial_pool_size.min(D3D11_POOL);
+    if ffmpeg::ffi::av_hwframe_ctx_init(frames) < 0 {
+        ffmpeg::ffi::av_buffer_unref(&mut frames);
+        return;
+    }
+    ffmpeg::ffi::av_buffer_unref(&mut (*ctx).hw_frames_ctx);
+    (*ctx).hw_frames_ctx = frames;
+}
+
+/// The decoder asks which of the formats it offers to use: the one of the
+/// hardware this module attached to it, else the last, which is the one in
+/// memory. (It asks again, without the hardware's, when the hardware does
+/// not take the stream.)
+unsafe extern "C" fn pick_format(ctx: *mut ffmpeg::ffi::AVCodecContext, offered: *const ffmpeg::ffi::AVPixelFormat) -> ffmpeg::ffi::AVPixelFormat {
+    let device = (*ctx).hw_device_ctx;
+    let attached = (!device.is_null()).then(|| (*((*device).data as *mut ffmpeg::ffi::AVHWDeviceContext)).type_);
     let mut p = offered;
     let mut last = *offered;
     while *p != ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
-        if HARDWARE.iter().any(|(_, format)| *format == *p) {
+        if HARDWARE.iter().any(|(kind, format)| *format == *p && Some(*kind) == attached) {
+            if *p == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_D3D11 {
+                small_pool(ctx, *p);
+            }
             return *p;
         }
         last = *p;
@@ -655,7 +701,13 @@ impl Decoder {
                 return Err(err(format!("a picture does not decode: {e}")));
             }
         }
-        let frame = if HARDWARE.iter().any(|(_, format)| ffmpeg::format::Pixel::from(*format) == frame.format()) {
+        let from_hardware = HARDWARE.iter().any(|(_, format)| ffmpeg::format::Pixel::from(*format) == frame.format());
+        // The hardware did not take the stream (libav then goes on in software by itself, without a word):
+        // this is a software decoder from here on, and says so.
+        if self.hardware && !from_hardware {
+            self.hardware = false;
+        }
+        let frame = if from_hardware {
             let fits = |f: &ffmpeg::frame::Video| f.format() == ffmpeg::format::Pixel::P010LE && (f.width() as usize, f.height() as usize) == (width, height);
             let mut in_memory = spare.filter(fits).unwrap_or_else(ffmpeg::frame::Video::empty);
             crate::decode::download_hw_frame(&frame, &mut in_memory)?;
@@ -698,17 +750,30 @@ fn frame_pool() -> &'static Mutex<Vec<ffmpeg::frame::Video>> {
 /// engine would have had it, and the pair waits for it.
 const DECODERS: usize = 2 * ARCHIVE_PICTURES;
 
-/// No decoder attaches to the graphics hardware here (found out once).
+/// As many of them on the graphics hardware. Through Direct3D, two: there
+/// each decoder holds memory of the card for its pictures (450 MB for those
+/// of a 5760 frame, see [`D3D11_POOL`]), and more of them bring nothing (a
+/// pair of 5760 x 5760 on an NVIDIA card: 99 ms through one decoder, 67
+/// through two, three, four and eight; 48 and 32 ms for one of 3840 x
+/// 3840). Other cards' engines are not measured.
+const HARDWARE_DECODERS: usize = if cfg!(target_os = "windows") { 2 } else { DECODERS };
+
+/// No decoder attaches to the graphics hardware here, or the hardware does
+/// not take the pictures (found out once): they are read in software.
 static NO_HARDWARE: AtomicBool = AtomicBool::new(false);
 
 /// Decode `units` (pictures of `width × height`) side by side, in their
 /// order.
 fn decode_pictures(units: &[&[u8]], width: usize, height: usize) -> Result<Vec<Picture>> {
-    let want = units.len().min(DECODERS).max(1);
     let hardware = !NO_HARDWARE.load(Ordering::Relaxed) && std::env::var_os("VR180_ARCHIVE_SOFTWARE").is_none();
+    let want = units.len().min(if hardware { HARDWARE_DECODERS } else { DECODERS }).max(1);
     let mut decoders: Vec<Decoder> = {
         let mut pool = decoder_pool().lock().map_err(|_| err("the decoders are gone"))?;
-        // (A decoder that fell back to software stays in use: the pool is of whatever works here.)
+        // (Once the pictures are read in software the hardware's decoders are let go: a pair would wait for
+        // the few of them among the many.)
+        if !hardware {
+            pool.retain(|decoder| !decoder.hardware);
+        }
         let keep = pool.len().saturating_sub(want);
         pool.split_off(keep)
     };
@@ -752,9 +817,20 @@ fn decode_pictures(units: &[&[u8]], width: usize, height: usize) -> Result<Vec<P
             });
         }
     });
+    // A decoder the hardware did not take a picture from reads in software: so do all from here on, as many
+    // side by side as a pair has pictures (the few the hardware is given would be far too few).
+    if hardware && decoders.iter().any(|decoder| !decoder.hardware) {
+        NO_HARDWARE.store(true, Ordering::Relaxed);
+        // (These were opened for the hardware, without the threads a software decoder is given: new ones next time.)
+        decoders.clear();
+    }
+    // Kept for the next frames: twice what a pair is read by (the preview and an export read side by side).
+    // On the hardware no more than that: the app's readers at work together when a clip is opened left eight
+    // Direct3D decoders behind, 3.3 GB of the card's memory for a clip of 5760 x 5760 for as long as it ran.
     if let Ok(mut pool) = decoder_pool().lock() {
         pool.append(&mut decoders);
-        pool.truncate(2 * DECODERS);
+        let kept = 2 * if NO_HARDWARE.load(Ordering::Relaxed) || !hardware { DECODERS } else { HARDWARE_DECODERS };
+        pool.truncate(kept);
     }
     if let Some(e) = failed.into_inner().ok().flatten() {
         return Err(e);
@@ -926,9 +1002,19 @@ fn bits_at(kind: PictureEncoder, quality: f64, frames: &[Vec<u16>], layout: Layo
 fn quality_for(kind: PictureEncoder, target: f64, frames: &[Vec<u16>], layout: Layout, curve: &Curve) -> Result<(f64, f64)> {
     let (mut lo, mut hi) = (0.0f64, 1.0f64);
     let mut best = (0.5, f64::INFINITY);
+    // (An encoder whose setting is a whole number is asked once for each.)
+    let mut tried: Vec<(f64, f64)> = Vec::new();
     for _ in 0..9 {
         let mid = 0.5 * (lo + hi);
-        let bits = bits_at(kind, mid, frames, layout, curve)?;
+        let setting = kind.setting(mid);
+        let bits = match tried.iter().find(|(s, _)| *s == setting) {
+            Some((_, bits)) => *bits,
+            None => {
+                let bits = bits_at(kind, mid, frames, layout, curve)?;
+                tried.push((setting, bits));
+                bits
+            }
+        };
         if (bits / target).ln().abs() < (best.1 / target).ln().abs() {
             best = (mid, bits);
         }
@@ -1312,6 +1398,17 @@ pub fn archive_take(
         } else {
             object.insert("frames".into(), count.into());
             object.remove("received_pairs");
+            // The window is of the sensor's own frame numbers, which a record of the copy does not keep: the
+            // part of it the stretch covers, by the frames' times (a number a frame period). Left as the take's,
+            // a copy of a stretch would be taken for as long as its take until it is walked.
+            let (lo, _) = take.seal.request_window;
+            let number = |i: usize| lo as u64 + (index.pts_s(i) / index.dt_s()).round().max(0.0) as u64;
+            let first = number(frames.start);
+            let last = number(frames.end - 1).max(first + count as u64 - 1);
+            object.insert("hardware_window".into(), serde_json::json!([first, last]));
+            if object.contains_key("gaps") {
+                object.insert("gaps".into(), (last + 1 - first - count as u64).into());
+            }
         }
     }
     std::fs::write(dir.join(x6b::SEAL_FILE), serde_json::to_vec_pretty(&seal).map_err(err)?)?;
