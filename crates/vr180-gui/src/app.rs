@@ -1196,15 +1196,20 @@ fn take_start_label(job: TakeJob, of: TakeSet, n: usize, zh: bool) -> String {
     }
 }
 
+/// The mark of something done (one the built-in fonts hold: a test checks.
+/// The lighter check mark is in a Mac's system fonts and in none of a
+/// Windows system's that the app loads, where it was drawn as an empty box).
+const DONE_MARK: &str = "✔";
+
 /// A copy a run has made: its folder, its size, and that size beside the
 /// same frames in the take.
 fn take_copy_line(copy: &TakeCopy, zh: bool) -> String {
     let name = clip_label(&copy.dir);
     if copy.bytes == 0 || copy.source_bytes == 0 {
-        return format!("✓ {name}");
+        return format!("{DONE_MARK} {name}");
     }
     let (size, share) = (size_text(copy.bytes), copy.bytes as f64 * 100.0 / copy.source_bytes as f64);
-    if zh { format!("✓ {name} · {size}，是原素材同样这些帧的 {share:.0}%") } else { format!("✓ {name} · {size}, {share:.0}% of the same frames in the take") }
+    if zh { format!("{DONE_MARK} {name} · {size}，是原素材同样这些帧的 {share:.0}%") } else { format!("{DONE_MARK} {name} · {size}, {share:.0}% of the same frames in the take") }
 }
 
 /// Why a take was not written, as the panel says it: the pipeline's own
@@ -3063,9 +3068,14 @@ mod take_tests {
         assert_eq!((take_start_label(TakeJob::Originals, ticked, 2, true), take_start_label(TakeJob::Originals, ticked, 2, false)), ("导出相机原片 DNG：勾选的 2 条".into(), "Write the camera original DNGs: 2 ticked takes".into()));
         // A copy that was made, beside the same frames of its take.
         let copy = TakeCopy { dir: "/takes/TAKE_Archive".into(), bytes: 5_400_000_000, source_bytes: 8_000_000_000 };
-        assert_eq!(take_copy_line(&copy, false), "✓ TAKE_Archive · 5.4 GB, 68% of the same frames in the take");
-        assert_eq!(take_copy_line(&copy, true), "✓ TAKE_Archive · 5.4 GB，是原素材同样这些帧的 68%");
-        assert_eq!(take_copy_line(&TakeCopy { source_bytes: 0, ..copy }, false), "✓ TAKE_Archive");
+        assert_eq!(take_copy_line(&copy, false), "✔ TAKE_Archive · 5.4 GB, 68% of the same frames in the take");
+        assert_eq!(take_copy_line(&copy, true), "✔ TAKE_Archive · 5.4 GB，是原素材同样这些帧的 68%");
+        assert_eq!(take_copy_line(&TakeCopy { source_bytes: 0, ..copy }, false), "✔ TAKE_Archive");
+        // The mark is drawn by the fonts the app always has.
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let font = egui::FontId::default();
+        assert!(DONE_MARK.chars().all(|c| ctx.fonts_mut(|f| f.has_glyph(&font, c))), "{DONE_MARK}");
     }
 
     /// The Source panel: two buttons under the clip's facts; the one that is
@@ -3196,7 +3206,7 @@ mod take_tests {
         assert!(!text.contains(TAKE_COPIED_NOTE), "{text}");
         let two = [copy("TAKE"), copy("OTHER")];
         let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &takes, originals: &takes, copies: &two, failed: &[], out_dir: None, idle: true, ..Default::default() }, None);
-        assert!(text.contains("✓ TAKE_Archive · 5.4 GB, 68% of the same frames in the take") && text.contains("✓ OTHER_Archive") && text.contains(TAKE_COPIED_NOTE), "{text}");
+        assert!(text.contains("✔ TAKE_Archive · 5.4 GB, 68% of the same frames in the take") && text.contains("✔ OTHER_Archive") && text.contains(TAKE_COPIED_NOTE), "{text}");
         assert_eq!(ask, None);
         // The only thing to click there is what starts a run.
         for gone in ["Use the copy", "Use all the copies", "Delete", "Move"] {
@@ -10082,11 +10092,11 @@ impl App {
                       else { Color32::from_rgb(120, 200, 120) };
             let took = format_eta(s.elapsed.as_secs_f64());
             let txt = if s.failed > 0 {
-                format!("✓ {} done · {} failed · {took}", s.done, s.failed)
+                format!("{DONE_MARK} {} done · {} failed · {took}", s.done, s.failed)
             } else if s.joined.is_some() {
-                if cur_lang() == Lang::Zh { format!("✓ 已合成 {} 个片段 · {took}", s.done) } else { format!("✓ {} clips joined · {took}", s.done) }
+                if cur_lang() == Lang::Zh { format!("{DONE_MARK} 已合成 {} 个片段 · {took}", s.done) } else { format!("{DONE_MARK} {} clips joined · {took}", s.done) }
             } else {
-                format!("✓ {} · {took}", run_done_text(s.done, s.take, cur_lang() == Lang::Zh))
+                format!("{DONE_MARK} {} · {took}", run_done_text(s.done, s.take, cur_lang() == Lang::Zh))
             };
             // The joined file's name goes with the hint.
             let hover = match (s.joined.as_deref().map(clip_label), &s.note) {
