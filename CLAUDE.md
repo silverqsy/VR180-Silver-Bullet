@@ -5139,14 +5139,13 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       is the other choice, shown when a trim makes them differ. A clip that
       is a copy of a stretch says which frames of its take it holds
       (`archive_note_text`).
-    - **Going on with the copy** (`use_copy`): the list entry keeps its
-      place and its settings, its file becomes the copy; the trim moves by
-      where the copy begins in the take (`settings_for_copy`,
-      `first_pair_s`); nothing on disk is touched. `originals_dir_for`: a
-      copy without a folder of camera originals of its own reads its
-      take's, where that is beside it (the files are named by the camera's
-      frame numbers, which a copy keeps), so enhanced frames and the Camera
-      Raw read go on working.
+    - **Going on with the copy.** At first a button, *Use the copy*, put a
+      written copy in the take's place; item 52 replaced it the next day
+      (the take first, its copy by itself when the take is gone).
+      `originals_dir_for`: a copy without a folder of camera originals of
+      its own reads its take's, where that is beside it (the files are
+      named by the camera's frame numbers, which a copy keeps), so enhanced
+      frames and the Camera Raw read go on working.
     - **Checked.** Unit tests: the tools painted and clicked headlessly
       (the buttons open and close, the sizes, the range, the warning, the
       run each button starts, nothing starting while a run is in flight,
@@ -5228,6 +5227,56 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       not** (the video files are no test of that: two exports of ONE take
       differ in their video packets, the hardware encoder is not repeatable
       from run to run). Not seen in the window; nothing on Windows.
+
+52. **The take first, its archive copy when the take is gone (2026-11-25,
+    Mac; UNRELEASED).** The user asked what the app reads when a take and
+    its copy both exist (until then: whichever folder a list entry named,
+    and a button to swap them), and settled it: the take while it is
+    there, the copy by itself when it is not; a take opened together with
+    its copy is opened alone; and once a copy is made the user is told the
+    take may be moved or deleted, which the app never does.
+    - **A clip is its take.** A list entry reads its take; `BatchItem::
+      stand_in` (`StandIn`: the take's path, where the copy lies in it, the
+      trim on either file) marks one that reads a copy in the take's place,
+      with `path` the copy. A project and the session name the TAKE and
+      hold the trim as it lies on the take (`BatchItem::as_saved`): a clip
+      found as its copy today is the take again when the take is back.
+    - **Which file** (`source_choice`, applied by `settle_source`): the
+      take when it is there; else `copy_standing_in`: a folder beside where
+      the take was, or in the output folder, whose name begins with the
+      take's and whose note names the take as its source; of several, one
+      that keeps every sample, then the most pairs, then the most bits a
+      pixel. Asked when a project's clip is looked for (`locate_clip`, on
+      the restore thread: `Located::stand_in`), when a clip is selected,
+      when a run starts (each of its clips), and when the take itself is
+      added to a list whose entry stands in for it. The clip on screen is
+      loaded again where its file changes, and the list says what happened
+      (`stand_in_notice`; after a project opens, once for all:
+      `restore_done`). The facts of such a clip have a row "In place of".
+    - **The trim.** `CopyExtent` (from the copy's note: `first_pair_s`,
+      `first_pair`, `pairs`, `pairs_of_source`, and the copy's length):
+      `trim_in_copy` (an end at or past the copy's own end is no trim),
+      `trim_in_take` (a stretch's own ends are a trim on the take: the clip
+      is that stretch on either file; its Out half a frame before the last
+      frame's end, so that a next frame that is a little early stays out).
+      A trim not touched on the copy goes back to the take to the digit
+      (`StandIn::trim_on_take` / `trim_on_copy`).
+    - **Opening** (`resolve_raw_takes`, `without_copies_of_opened_takes`):
+      of what is opened together, a copy whose take is opened too is left
+      out and named in the note. A copy opened by itself is a clip of its
+      own (no stand-in: its entry names the copy).
+    - **After a copy is made** (`TAKE_COPIED_NOTE`): the take can be moved
+      away or deleted, by the user; the app moves and deletes nothing, and
+      has no control that would. *Use the copy* is gone.
+    - **Checked.** Unit tests: the copy found among look-alikes and in the
+      output folder, the order among several, the take preferred and
+      returned to, the trim there and back, what a project saves, what is
+      opened together; on a real take, a project whose take is gone finds
+      a copy of four frames from the take's middle with the place of the
+      stretch. Not run: the app itself (`settle_source` and the restore are
+      covered by their parts); a take that goes away while it is the clip
+      on screen is noticed when a run starts or the clip is selected again,
+      not at once.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

@@ -67,10 +67,18 @@ three sizes to pick from.
   under its name: the bits a pixel it came to, or that every sample of the
   picture is kept, that its corners are black, and which frames of its
   take it holds when that is not all of them.
-- **Going on with the copy.** Once a copy is written, **Use the copy** puts
-  it in the take's place in the list with the take's settings (the trim
-  moves with a copy of a stretch). Nothing is deleted. A copy goes on
-  reading its take's folder of camera original DNGs where that is beside
+- **The take first, its copy when the take is gone.** A clip is its take.
+  Once a copy is written the panel says that the take can be moved away
+  or deleted: by you, the app moves and deletes nothing. When a take in
+  the list or in a project is no longer where it was, the app reads its
+  copy in its place: a folder beside where the take was, or in the output
+  folder, named after the take and saying that it was made of it (of
+  several, one that keeps every sample first, then the one that holds the
+  most of the take). The clip keeps its settings, its trim lies in a copy
+  of a stretch where the stretch lay in the take, and the clip's facts say
+  which take the copy stands in for. A take that comes back is read
+  again. A copy holds every file of its take's folder, and goes on
+  reading the take's folder of camera original DNGs where that is beside
   it, so frames enhanced for the take are still used.
 - **The file.** The copy's capture is a file of records like the take's, a
   record a pair (the format is in `x6b.rs`'s notes, the lossless pictures
@@ -93,6 +101,9 @@ three sizes to pick from.
   the developed view as a DNG sequence, so Export never writes anything
   else. A project saved with Camera original picked exports a video
   again.
+- **A take opened together with its archive copy is opened alone.** A
+  folder that holds both gives the take; the copy is left out and named in
+  the note. A copy opened by itself opens as a clip of its own.
 - **A 5760 × 5760 frame stored to within one code value.** A take with a
   record for each eye may store its 5760 × 5760 frames that way too, the
   whole view or the middle of the sensor. 2.6.0 read that frame only with

@@ -766,11 +766,164 @@ impl TakeFacts {
 struct TakeCopy {
     /// The copy's folder.
     dir: PathBuf,
-    /// When its first frame lies in the take, seconds from the take's first.
-    begins_s: f64,
     /// Its length, and the length of the same frames in the take.
     bytes: u64,
     source_bytes: u64,
+}
+
+/// The stretch of its take an archive copy holds, in the take's seconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CopyExtent {
+    /// When the copy's first frame lies in the take, and how long the copy is.
+    begins_s: f64,
+    duration_s: f64,
+    /// It begins with the take's first frame, and ends with its last.
+    from_start: bool,
+    to_end: bool,
+}
+
+impl CopyExtent {
+    /// From what the copy says of itself (one that does not say is taken
+    /// to hold its whole take), and the copy's own length.
+    fn of(note: &vr180_fisheye::x6b::ArchiveNote, duration_s: f64) -> Self {
+        let first = note.first_pair.unwrap_or(0);
+        let to_end = match (note.pairs, note.pairs_of_source) {
+            (Some(pairs), Some(of)) => first + pairs >= of,
+            _ => true,
+        };
+        Self { begins_s: note.first_pair_s.unwrap_or(0.0).max(0.0), duration_s, from_start: first == 0, to_end }
+    }
+
+    /// A trim set on the take, as it lies in the copy: an end that falls on
+    /// the copy's own end, or past it, is no trim there.
+    fn trim_in_copy(&self, trim: (Option<f64>, Option<f64>), fps: f32) -> (Option<f64>, Option<f64>) {
+        let half = 0.5 / fps.max(1.0) as f64;
+        (
+            trim.0.map(|t| t - self.begins_s).filter(|t| *t > half),
+            trim.1.map(|t| t - self.begins_s).filter(|t| *t < self.duration_s - half).map(|t| t.max(0.0)),
+        )
+    }
+
+    /// A trim set on the copy, as it lies in the take. Where the copy is a
+    /// stretch of the take its own ends are a trim there: the clip is that
+    /// stretch, whichever of the two files it is read from. (The copy's
+    /// end as a trim: half a frame before where its last frame ends, so
+    /// that the take's next frame, a little early as frames can be, stays
+    /// out.)
+    fn trim_in_take(&self, trim: (Option<f64>, Option<f64>), fps: f32) -> (Option<f64>, Option<f64>) {
+        let half = 0.5 / fps.max(1.0) as f64;
+        (
+            match trim.0 { Some(t) => Some(self.begins_s + t), None => (!self.from_start).then_some(self.begins_s) },
+            match trim.1 { Some(t) => Some(self.begins_s + t), None => (!self.to_end).then_some(self.begins_s + self.duration_s - half) },
+        )
+    }
+}
+
+/// A list entry that reads an archive copy in the place of its take, which
+/// is not at hand. The entry stays the take's: a project names the take,
+/// and the take is read again once it is back.
+#[derive(Debug, Clone, PartialEq)]
+struct StandIn {
+    take: PathBuf,
+    /// Where the copy lies in that take.
+    extent: CopyExtent,
+    /// The entry's trim on the take when the copy took its place, and what
+    /// that became on the copy: a trim not touched since goes back to the
+    /// take as it was, to the digit.
+    trim_on_take: (Option<f64>, Option<f64>),
+    trim_on_copy: (Option<f64>, Option<f64>),
+}
+
+impl StandIn {
+    /// The copy `extent` describes is read in the place of `take`, whose
+    /// entry has the trim `trim_on_take`.
+    fn of(take: PathBuf, extent: CopyExtent, trim_on_take: (Option<f64>, Option<f64>), fps: f32) -> Self {
+        Self { take, extent, trim_on_take, trim_on_copy: extent.trim_in_copy(trim_on_take, fps) }
+    }
+
+    /// The entry's trim `now`, set on the copy, as it lies in the take.
+    fn trim_in_take(&self, now: (Option<f64>, Option<f64>), fps: f32) -> (Option<f64>, Option<f64>) {
+        if now == self.trim_on_copy { self.trim_on_take } else { self.extent.trim_in_take(now, fps) }
+    }
+}
+
+/// The archive copy to read in the place of the take that was at `take`: a
+/// folder beside where the take was, or in `also` (the output folder),
+/// whose name begins with the take's and whose note says it was made of
+/// that take. Of several: one that keeps every sample before one that does
+/// not, then the one that holds the most of the take, then the one of the
+/// most bits a pixel. Touches the disk.
+fn copy_standing_in(take: &std::path::Path, also: Option<&std::path::Path>) -> Option<(PathBuf, vr180_fisheye::x6b::ArchiveNote)> {
+    let name = take.file_name()?.to_str()?;
+    let mut found: Vec<(PathBuf, vr180_fisheye::x6b::ArchiveNote)> = Vec::new();
+    for dir in [take.parent(), also].into_iter().flatten() {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let file_name = entry.file_name();
+            let Some(folder) = file_name.to_str() else { continue };
+            if folder == name || !folder.starts_with(name) || found.iter().any(|(path, _)| *path == entry.path()) {
+                continue;
+            }
+            if let Some(note) = vr180_fisheye::x6b::read_archive_note(&entry.path()).filter(|n| n.source.as_deref() == Some(name)) {
+                found.push((entry.path(), note));
+            }
+        }
+    }
+    found.sort_by(|(a_path, a), (b_path, b)| {
+        let rank = |n: &vr180_fisheye::x6b::ArchiveNote| (n.exact, n.pairs.unwrap_or(u64::MAX), n.bits_per_pixel.unwrap_or(0.0));
+        let (ra, rb) = (rank(a), rank(b));
+        rb.0.cmp(&ra.0).then(rb.1.cmp(&ra.1)).then(rb.2.total_cmp(&ra.2)).then(a_path.cmp(b_path))
+    });
+    found.into_iter().next()
+}
+
+/// Which file a list entry is to read.
+#[derive(Debug, Clone, PartialEq)]
+enum SourceChoice {
+    /// The one it reads.
+    Same,
+    /// Its take, which is back.
+    Take(PathBuf),
+    /// This archive copy, in the place of its take that is not there.
+    Copy(PathBuf, vr180_fisheye::x6b::ArchiveNote),
+}
+
+/// The file an entry that reads `path` is to read: the take first, a copy
+/// of it only while the take is not at hand (`stand_in`: the entry reads a
+/// copy in its take's place already; `also`: the output folder, where a
+/// copy may have been written). Touches the disk.
+fn source_choice(path: &std::path::Path, stand_in: Option<&StandIn>, also: Option<&std::path::Path>) -> SourceChoice {
+    match stand_in {
+        Some(stand_in) if vr180_pipeline::x6_raw::is_take(&stand_in.take) => SourceChoice::Take(stand_in.take.clone()),
+        Some(_) => SourceChoice::Same,
+        None if path.exists() => SourceChoice::Same,
+        None => copy_standing_in(path, also).map_or(SourceChoice::Same, |(dir, note)| SourceChoice::Copy(dir, note)),
+    }
+}
+
+/// Of what is opened together, without the archive copies whose take is
+/// opened too: a take and its copy are one recording, and the take is the
+/// one to work on. `source_of`: the take a folder says it is a copy of.
+/// Returns what is opened and the copies left out.
+fn without_copies_of_opened_takes(paths: Vec<PathBuf>, source_of: impl Fn(&std::path::Path) -> Option<String>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let names: std::collections::HashSet<String> = paths.iter().filter_map(|p| Some(p.file_name()?.to_str()?.to_owned())).collect();
+    paths.into_iter().partition(|p| !source_of(p).is_some_and(|take| names.contains(&take)))
+}
+
+/// What the list says when several of a project's takes are read from
+/// their copies.
+fn stand_ins_notice(takes: usize, zh: bool) -> String {
+    if zh { format!("{takes} 条原素材不在：改读它们的存档副本。") } else { format!("{takes} takes are not at hand: their archive copies are read in their place.") }
+}
+
+/// What the list says when an entry changes the file it reads.
+fn stand_in_notice(take: &std::path::Path, copy: &std::path::Path, to_copy: bool, zh: bool) -> String {
+    let (take, copy) = (clip_label(take), clip_label(copy));
+    match (to_copy, zh) {
+        (true, true) => format!("{take} 不在：改读它的存档副本 {copy}。"),
+        (true, false) => format!("{take} is not at hand: its archive copy {copy} is read in its place."),
+        (false, true) => format!("{take} 回来了：重新读原素材，不再读副本 {copy}。"),
+        (false, false) => format!("{take} is back: it is read again, and its archive copy {copy} no longer."),
+    }
 }
 
 /// A take as the Source panel's two operations show it.
@@ -821,9 +974,8 @@ struct TakeToolsView<'a> {
     /// those a run of the camera's own frames would.
     archive: &'a [TakeView],
     originals: &'a [TakeView],
-    /// The copies made so far that have not taken their take's place: the
-    /// take's place in the list, and the copy.
-    copies: &'a [(usize, TakeCopy)],
+    /// The copies the last runs made of takes in the list.
+    copies: &'a [TakeCopy],
     /// The takes the last run could not write: what it was to write, the
     /// take's name and the reason.
     failed: &'a [(TakeJob, String, String)],
@@ -837,9 +989,6 @@ struct TakeToolsView<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TakeAsk {
     Start(TakeRun),
-    /// The copy made of this list entry takes its place, or every copy its take's.
-    UseCopy(usize),
-    UseCopies,
     /// The size picked is to be kept for the next launch.
     Keep,
 }
@@ -858,7 +1007,8 @@ const TAKE_COPY_SOURCE_NOTE: &str = "This clip is an archive copy of a take: a c
 const TAKE_ORIGINALS_NOTE: &str = "Every frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number. No projection, no stabilization, no grading — for running the frames through a raw converter first.";
 const TAKE_ORIGINALS_PLACE_NOTE: &str = "The folder of that name beside the take is also where the app looks for enhanced frames and for Camera Raw settings.";
 const TAKE_LOSSY_SOURCE_NOTE: &str = "This clip is a lossy archive copy: the frames written are the copy's, close to what the sensor recorded but not the same.";
-const TAKE_USE_COPY_HOVER: &str = "Puts the copy in the take's place in the list, with the take's settings. Nothing is deleted: the take stays where it is.";
+const TAKE_COPIED_NOTE: &str = "The take can now be moved away or deleted. That is yours to do: the app moves and deletes nothing. Once the take is gone the app reads its copy in its place, as long as the copy stays beside where the take was, or in the output folder.";
+const STAND_IN_HOVER: &str = "The take this clip belongs to is not at hand: its archive copy is read in its place. When the take is back, it is read again.";
 const TAKE_BUSY_HOVER: &str = "A run is in flight: this can start when it is over.";
 
 /// Takes listed one by one under a run's choices; a longer run names the rest by their number.
@@ -1058,18 +1208,6 @@ fn archive_note_text(note: &vr180_fisheye::x6b::ArchiveNote, zh: bool) -> String
     }
 }
 
-/// The settings a take's list entry goes on with when the copy `copy` made
-/// of it takes its place: the take's own, its trim moved to the copy's
-/// time (a copy of a stretch begins where the stretch did, and lasts
-/// `copy_duration_s`). An end of the trim that falls on the copy's own end
-/// is no trim.
-fn settings_for_copy(settings: &crate::decoder::Settings, copy: &TakeCopy, copy_duration_s: f64, fps: f32) -> crate::decoder::Settings {
-    let half = 0.5 / fps.max(1.0) as f64;
-    let mut out = settings.clone();
-    out.trim_in_s = settings.trim_in_s.map(|t| t - copy.begins_s).filter(|t| *t > half);
-    out.trim_out_s = settings.trim_out_s.map(|t| t - copy.begins_s).filter(|t| *t < copy_duration_s - half).map(|t| t.max(0.0));
-    out
-}
 
 /// Output container for a STILL source (Insta360 X6 `.dng`). Videos
 /// use `ExportCodec`; stills use this.
@@ -2168,7 +2306,7 @@ mod export_size_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Default::default(),
-            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, take: None, offline: None, before_take: None, copy: None, take_failed: None,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, take: None, offline: None, before_take: None, copy: None, take_failed: None, stand_in: None,
         };
         let x6 = |single_eye| Some(X6ClipInfo { window: None, ilog: Some(true), paraxial_native: 2086.97, single_lens: single_eye, single_eye });
         let two = item(SourceKind::Insta360Insv, x6(false));
@@ -2425,7 +2563,7 @@ mod take_tests {
             fisheye_eye_w: 5760, fisheye_eye_h: 5760, width: 5760, height: 5760,
             settings: Settings::default(), status, selected, x6: None, raw_one_lens: false, raw_frame: None, four_channel_sound: false,
             take: kind.is_raw_video().then(|| TakeFacts { capture_bytes: 96_000_000_000, archive: archive.map(note), outside: 0.163 }),
-            offline: None, before_take: None, copy: None, take_failed: None,
+            offline: None, before_take: None, copy: None, take_failed: None, stand_in: None,
         }
     }
 
@@ -2551,7 +2689,7 @@ mod take_tests {
         assert_eq!((take_start_label(archive, 1, false), take_start_label(archive, 3, true)), ("Make the archive copy".into(), "制作 3 个存档副本".into()));
         assert_eq!((take_start_label(TakeJob::Originals, 1, true), take_start_label(TakeJob::Originals, 2, false)), ("导出相机原片 DNG".into(), "Write the camera original DNGs of 2 takes".into()));
         // A copy that was made, beside the same frames of its take.
-        let copy = TakeCopy { dir: "/takes/TAKE_Archive".into(), begins_s: 12.3, bytes: 5_400_000_000, source_bytes: 8_000_000_000 };
+        let copy = TakeCopy { dir: "/takes/TAKE_Archive".into(), bytes: 5_400_000_000, source_bytes: 8_000_000_000 };
         assert_eq!(take_copy_line(&copy, false), "✓ TAKE_Archive · 5.4 GB, 68% of the same frames in the take");
         assert_eq!(take_copy_line(&copy, true), "✓ TAKE_Archive · 5.4 GB，是原素材同样这些帧的 68%");
         assert_eq!(take_copy_line(&TakeCopy { source_bytes: 0, ..copy }, false), "✓ TAKE_Archive");
@@ -2633,9 +2771,11 @@ mod take_tests {
     }
 
     /// A clip that is an archive copy: no copy is made of it. The copies a
-    /// run made can each take their take's place in the list.
+    /// run made are listed with what they came to, and the user is told
+    /// that the takes may now be moved or deleted: by them, the app offers
+    /// no control that does it.
     #[test]
-    fn copies_are_not_copied_and_can_take_their_takes_place() {
+    fn copies_are_not_copied_and_the_takes_are_the_users_to_remove() {
         let on_screen = [TakeView { copy: true, ..take("TAKE_Archive", 33.3, (None, None)) }];
         let mut tools = TakeTools { open: Some(TakeTool::Archive), ..Default::default() };
         let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &[], originals: &on_screen, copies: &[], failed: &[], out_dir: None, idle: true }, None);
@@ -2647,15 +2787,19 @@ mod take_tests {
         assert_eq!(text, CLOSED);
 
         let takes = [take("TAKE", 120.0, (None, None))];
-        let copy = |name: &str| TakeCopy { dir: format!("/takes/{name}_Archive").into(), begins_s: 0.0, bytes: 5_400_000_000, source_bytes: 8_000_000_000 };
-        let one = [(4usize, copy("TAKE"))];
-        let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &takes, originals: &takes, copies: &one, failed: &[], out_dir: None, idle: true }, Some("Use the copy"));
-        assert!(text.contains("✓ TAKE_Archive · 5.4 GB, 68% of the same frames in the take") && !text.contains("Use all the copies"), "{text}");
-        assert_eq!(ask, Some(TakeAsk::UseCopy(4)));
-        let two = [(4usize, copy("TAKE")), (7usize, copy("OTHER"))];
-        let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &takes, originals: &takes, copies: &two, failed: &[], out_dir: None, idle: true }, Some("Use all the copies"));
-        assert!(text.contains("✓ OTHER_Archive"), "{text}");
-        assert_eq!(ask, Some(TakeAsk::UseCopies));
+        let copy = |name: &str| TakeCopy { dir: format!("/takes/{name}_Archive").into(), bytes: 5_400_000_000, source_bytes: 8_000_000_000 };
+        // Before a copy is made nothing is said of removing the take.
+        let (text, _) = shown(&mut tools, &TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true }, None);
+        assert!(!text.contains(TAKE_COPIED_NOTE), "{text}");
+        let two = [copy("TAKE"), copy("OTHER")];
+        let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &takes, originals: &takes, copies: &two, failed: &[], out_dir: None, idle: true }, None);
+        assert!(text.contains("✓ TAKE_Archive · 5.4 GB, 68% of the same frames in the take") && text.contains("✓ OTHER_Archive") && text.contains(TAKE_COPIED_NOTE), "{text}");
+        assert_eq!(ask, None);
+        // The only thing to click there is what starts a run.
+        for gone in ["Use the copy", "Use all the copies", "Delete", "Move"] {
+            assert!(!text.lines().any(|line| line.starts_with(gone)), "{gone}: {text}");
+        }
+        assert!(TAKE_COPIED_NOTE.contains("yours to do") && TAKE_COPIED_NOTE.contains("moves and deletes nothing"));
     }
 
     /// The camera's own frames: from In to Out by default, as before, and
@@ -2693,9 +2837,9 @@ mod take_tests {
     fn the_take_tools_read_in_both_languages() {
         for text in [
             TAKE_ARCHIVE_HOVER, TAKE_ARCHIVE_NOTE, TAKE_EXACT_NOTE, TAKE_LOSSY_NOTE, TAKE_STRETCH_NOTE, TAKE_COPY_SOURCE_NOTE, TAKE_ORIGINALS_NOTE,
-            TAKE_ORIGINALS_PLACE_NOTE, TAKE_LOSSY_SOURCE_NOTE, TAKE_USE_COPY_HOVER, TAKE_BUSY_HOVER,
+            TAKE_ORIGINALS_PLACE_NOTE, TAKE_LOSSY_SOURCE_NOTE, TAKE_COPIED_NOTE, STAND_IN_HOVER, TAKE_BUSY_HOVER,
             TAKE_TOOLS_TITLE, TAKE_ARCHIVE_LABEL, TAKE_ORIGINALS_LABEL, "Archive copy", TAKE_EXACT_LABEL, "High quality: 1 bit a pixel", "Custom", "bit a pixel",
-            "Range", "In to Out", "Whole take", "Use the copy", "Use all the copies",
+            "Range", "In to Out", "Whole take", "In place of",
         ] {
             assert_ne!(tr_zh(text), text, "{text}");
         }
@@ -2827,30 +2971,187 @@ mod take_tests {
             ("已制作 2 个存档副本".into(), "camera original DNGs of 1 take written".into(), "已导出 2 条素材的相机原片 DNG".into()));
     }
 
-    /// The copy takes the take's place with the take's settings; a copy of
-    /// a stretch begins where the stretch did, and the trim moves with it.
+    fn note(exact: bool, pairs: Option<(u64, u64, u64)>, source: &str) -> vr180_fisheye::x6b::ArchiveNote {
+        vr180_fisheye::x6b::ArchiveNote {
+            exact, target_bits_per_pixel: (!exact).then_some(1.0), bits_per_pixel: Some(if exact { 2.1 } else { 0.95 }), source_bits_per_pixel: Some(3.2),
+            source: Some(source.into()), pairs: pairs.map(|p| p.1), pairs_of_source: pairs.map(|p| p.2), first_pair: pairs.map(|p| p.0),
+            first_pair_s: pairs.map(|p| p.0 as f64 / 30.0), outside_black: None,
+        }
+    }
+
+    /// A clip is its take, whichever file it is read from: a trim set on
+    /// the take lies in a copy where the copy lies in the take, and comes
+    /// back to the take as it was.
     #[test]
-    fn the_copy_goes_on_with_the_takes_settings() {
-        let trimmed = Settings { trim_in_s: Some(12.3), trim_out_s: Some(45.6), ettr_stops: 0.5, ..Default::default() };
-        let copy = |begins_s: f64| TakeCopy { dir: "/takes/TAKE_Archive".into(), begins_s, bytes: 1, source_bytes: 2 };
-        // The copy of that stretch is the stretch: no trim is left. (Its first frame is the one nearest In.)
-        let s = settings_for_copy(&trimmed, &copy(12.3), 33.3, 30.0);
-        assert_eq!((s.trim_in_s, s.trim_out_s, s.ettr_stops), (None, None, 0.5));
-        let s = settings_for_copy(&trimmed, &copy(12.3133), 33.3, 30.0);
-        assert_eq!((s.trim_in_s, s.trim_out_s), (None, None));
-        // A copy of the whole take: the trim is the take's.
-        let s = settings_for_copy(&trimmed, &copy(0.0), 120.0, 30.0);
-        assert_eq!((s.trim_in_s, s.trim_out_s), (Some(12.3), Some(45.6)));
-        // The trim was moved after the copy was made: it lies in the copy where it lay in the take.
-        let moved = Settings { trim_in_s: Some(15.0), trim_out_s: Some(40.0), ..Default::default() };
-        let s = settings_for_copy(&moved, &copy(12.3), 33.3, 30.0);
-        assert!((s.trim_in_s.unwrap() - 2.7).abs() < 1e-9 && (s.trim_out_s.unwrap() - 27.7).abs() < 1e-9, "{:?} {:?}", s.trim_in_s, s.trim_out_s);
+    fn a_trim_follows_the_clip_between_take_and_copy() {
+        // A copy of the stretch from 12.3 s on, 33.3 s long, of a take of 120 s at 30 a second.
+        let stretch = CopyExtent::of(&note(true, Some((369, 999, 3600)), "TAKE"), 33.3);
+        assert_eq!(stretch, CopyExtent { begins_s: 12.3, duration_s: 33.3, from_start: false, to_end: false });
+        // The trim the copy was made by is the whole copy: no trim there. (Its first frame is the one nearest In.)
+        assert_eq!(stretch.trim_in_copy((Some(12.3), Some(45.6)), 30.0), (None, None));
+        assert_eq!(stretch.trim_in_copy((Some(12.31), Some(45.59)), 30.0), (None, None));
+        // Back on the take the clip is that stretch again: from the copy's first frame to half a frame before the
+        // end of its last (the take's next frame, a little early as frames can be, stays out).
+        let (t_in, t_out) = stretch.trim_in_take((None, None), 30.0);
+        assert!((t_in.unwrap() - 12.3).abs() < 1e-9 && (t_out.unwrap() - (45.6 - 1.0 / 60.0)).abs() < 1e-9, "{t_in:?} {t_out:?}");
+        // A trim moved after the copy was made lies in the copy where it lay in the take, and comes back as it was.
+        let (t_in, t_out) = stretch.trim_in_copy((Some(15.0), Some(40.0)), 30.0);
+        assert!((t_in.unwrap() - 2.7).abs() < 1e-9 && (t_out.unwrap() - 27.7).abs() < 1e-9, "{t_in:?} {t_out:?}");
+        let (t_in, t_out) = stretch.trim_in_take((t_in, t_out), 30.0);
+        assert!((t_in.unwrap() - 15.0).abs() < 1e-9 && (t_out.unwrap() - 40.0).abs() < 1e-9, "{t_in:?} {t_out:?}");
         // Past the copy's ends: no trim there.
-        let wide = Settings { trim_in_s: Some(5.0), trim_out_s: Some(100.0), ..Default::default() };
-        let s = settings_for_copy(&wide, &copy(12.3), 33.3, 30.0);
-        assert_eq!((s.trim_in_s, s.trim_out_s), (None, None));
-        let s = settings_for_copy(&Settings::default(), &copy(12.3), 33.3, 30.0);
-        assert_eq!((s.trim_in_s, s.trim_out_s), (None, None));
+        assert_eq!(stretch.trim_in_copy((Some(5.0), Some(100.0)), 30.0), (None, None));
+        assert_eq!(stretch.trim_in_copy((None, None), 30.0), (None, None));
+
+        // A copy of the whole take: the trim is the take's, both ways.
+        let whole = CopyExtent::of(&note(true, Some((0, 3600, 3600)), "TAKE"), 120.0);
+        assert_eq!(whole, CopyExtent { begins_s: 0.0, duration_s: 120.0, from_start: true, to_end: true });
+        assert_eq!(whole.trim_in_copy((Some(12.3), Some(45.6)), 30.0), (Some(12.3), Some(45.6)));
+        assert_eq!(whole.trim_in_take((Some(12.3), Some(45.6)), 30.0), (Some(12.3), Some(45.6)));
+        assert_eq!(whole.trim_in_take((None, None), 30.0), (None, None));
+        // A copy that begins with the take and ends before it, and one that does not say what it holds.
+        let head = CopyExtent::of(&note(false, Some((0, 900, 3600)), "TAKE"), 30.0);
+        assert_eq!(head.trim_in_take((None, None), 30.0), (None, Some(30.0 - 1.0 / 60.0)));
+        assert_eq!(CopyExtent::of(&note(false, None, "TAKE"), 30.0), CopyExtent { begins_s: 0.0, duration_s: 30.0, from_start: true, to_end: true });
+
+        // An entry that reads a copy in its take's place is saved as the take, with its trim there: the trim it
+        // had on the take, to the digit, while it has not been touched on the copy.
+        let mut entry = entry("/takes/TAKE_Archive", SourceKind::X6Raw, false, Some(true), BatchStatus::Idle);
+        let on_copy = Settings { ettr_stops: 0.5, ..Default::default() };
+        assert_eq!(entry.as_saved(&on_copy), (PathBuf::from("/takes/TAKE_Archive"), on_copy.clone()));
+        let stand_in = StandIn::of("/takes/TAKE".into(), stretch, (Some(12.3), Some(45.6)), 30.0);
+        assert_eq!(stand_in.trim_on_copy, (None, None));
+        entry.stand_in = Some(stand_in);
+        let (file, saved) = entry.as_saved(&on_copy);
+        assert_eq!((file, saved.trim_in_s, saved.trim_out_s, saved.ettr_stops), (PathBuf::from("/takes/TAKE"), Some(12.3), Some(45.6), 0.5));
+        // Moved on the copy: where that lies in the take.
+        let moved = Settings { trim_in_s: Some(2.7), ..on_copy.clone() };
+        let (_, saved) = entry.as_saved(&moved);
+        assert!((saved.trim_in_s.unwrap() - 15.0).abs() < 1e-9 && (saved.trim_out_s.unwrap() - (45.6 - 1.0 / 60.0)).abs() < 1e-9, "{:?} {:?}", saved.trim_in_s, saved.trim_out_s);
+        assert_eq!((stand_ins_notice(3, false), stand_ins_notice(3, true)),
+            ("3 takes are not at hand: their archive copies are read in their place.".to_string(), "3 条原素材不在：改读它们的存档副本。".to_string()));
+    }
+
+    /// The take first, a copy of it only while the take is not at hand:
+    /// found beside where the take was, or in the output folder, by its
+    /// name and by what it says it was made of.
+    #[test]
+    fn a_missing_take_is_read_from_its_copy_and_a_take_that_is_back_from_itself() {
+        let root = std::env::temp_dir().join(format!("vr180-stand-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let folder = |dir: &std::path::Path, archive: Option<&str>| {
+            std::fs::create_dir_all(dir).unwrap();
+            let archive = archive.map(|a| format!(r#","archive":{a}"#)).unwrap_or_default();
+            std::fs::write(dir.join("clip.json"), format!(r#"{{"layout":"paired-bayer-v1","fps_setting":60,"size":[3840,3840]{archive}}}"#)).unwrap();
+        };
+        let (takes, out) = (root.join("takes"), root.join("out"));
+        let take = takes.join("TAKE");
+        // Nothing there: nothing to read in its place, and the entry stays as it is.
+        std::fs::create_dir_all(&takes).unwrap();
+        assert_eq!(copy_standing_in(&take, None), None);
+        assert_eq!(source_choice(&take, None, None), SourceChoice::Same);
+        // A lossy copy beside where the take was.
+        folder(&takes.join("TAKE_Archive"), Some(r#"{"version":1,"kind":"lossy","bits_per_pixel":0.95,"source":"TAKE","pairs":900,"pairs_of_source":900,"first_pair":0}"#));
+        // What is not that: a copy of another take under a name that begins alike, a take that is no copy, a file.
+        folder(&takes.join("TAKE_Archive_of_another"), Some(r#"{"version":1,"kind":"exact","source":"TAKE2","pairs":900,"pairs_of_source":900}"#));
+        folder(&takes.join("TAKE_2"), None);
+        std::fs::write(takes.join("TAKE_SBS.mp4"), b"x").unwrap();
+        let found = copy_standing_in(&take, None).expect("the copy");
+        assert_eq!((found.0.as_path(), found.1.exact, found.1.source.as_deref()), (takes.join("TAKE_Archive").as_path(), false, Some("TAKE")));
+        assert_eq!(source_choice(&take, None, None), SourceChoice::Copy(found.0.clone(), found.1.clone()));
+        // One that keeps every sample comes first, wherever it is: here in the output folder.
+        folder(&out.join("TAKE_Archive (2)"), Some(r#"{"version":1,"kind":"exact","bits_per_pixel":2.1,"source":"TAKE","pairs":300,"pairs_of_source":900,"first_pair":100}"#));
+        assert_eq!(copy_standing_in(&take, None).unwrap().0, takes.join("TAKE_Archive"));
+        assert_eq!(copy_standing_in(&take, Some(&out)).unwrap().0, out.join("TAKE_Archive (2)"));
+        // Of two of a kind, the one that holds more of the take.
+        folder(&out.join("TAKE_Archive (3)"), Some(r#"{"version":1,"kind":"exact","bits_per_pixel":2.1,"source":"TAKE","pairs":900,"pairs_of_source":900,"first_pair":0}"#));
+        assert_eq!(copy_standing_in(&take, Some(&out)).unwrap().0, out.join("TAKE_Archive (3)"));
+
+        // The take is there: it is read, whatever copies lie about.
+        folder(&take, None);
+        assert_eq!(source_choice(&take, None, Some(&out)), SourceChoice::Same);
+        // An entry that reads a copy in the take's place: back to the take once it is there, and not before.
+        let stand_in = StandIn::of(take.clone(), CopyExtent { begins_s: 0.0, duration_s: 30.0, from_start: true, to_end: true }, (None, None), 30.0);
+        assert_eq!(source_choice(&out.join("TAKE_Archive (3)"), Some(&stand_in), Some(&out)), SourceChoice::Take(take.clone()));
+        std::fs::remove_dir_all(&take).unwrap();
+        assert_eq!(source_choice(&out.join("TAKE_Archive (3)"), Some(&stand_in), Some(&out)), SourceChoice::Same);
+        // A file of another kind that is gone has no copy to stand in.
+        assert_eq!(source_choice(&takes.join("clip.insv"), None, Some(&out)), SourceChoice::Same);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // What the list says when an entry changes its file, in both languages.
+        let (take, copy) = (std::path::Path::new("/takes/TAKE"), std::path::Path::new("/takes/TAKE_Archive"));
+        assert_eq!(stand_in_notice(take, copy, true, false), "TAKE is not at hand: its archive copy TAKE_Archive is read in its place.");
+        assert_eq!(stand_in_notice(take, copy, true, true), "TAKE 不在：改读它的存档副本 TAKE_Archive。");
+        assert_eq!(stand_in_notice(take, copy, false, false), "TAKE is back: it is read again, and its archive copy TAKE_Archive no longer.");
+        assert_eq!(stand_in_notice(take, copy, false, true), "TAKE 回来了：重新读原素材，不再读副本 TAKE_Archive。");
+    }
+
+    /// A project names a take; the take is gone and a copy of a stretch of
+    /// it lies where it was (a take on disk named by `VR180_ARCHIVE_TAKE`,
+    /// skipped without one): the clip is found as that copy, with the place
+    /// of the stretch in the take, and as the take itself while that is
+    /// there.
+    #[test]
+    fn a_project_whose_take_is_gone_opens_its_copy() {
+        let Some(take) = std::env::var_os("VR180_ARCHIVE_TAKE").map(PathBuf::from) else { return };
+        let name = take.file_name().unwrap().to_owned();
+        let root = std::env::temp_dir().join(format!("vr180-gone-take-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let index = vr180_pipeline::x6_raw::open(&take).unwrap();
+        let first = 30.min(index.frames().saturating_sub(1));
+        let frames = first..index.frames().min(first + 4);
+        let copy = root.join(format!("{}_Archive", name.to_string_lossy()));
+        vr180_pipeline::raw_archive::archive_take(&take, &copy, frames.clone(), &vr180_pipeline::raw_archive::ArchiveOptions::default(), |_| {}, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        // The take is where the project says: it is the clip.
+        let there = crate::project::FileRef::new(&take, None);
+        let found = locate_clip(&there, None, None, Some(&root)).expect("the take");
+        assert!(found.path == take && found.stand_in.is_none());
+        // The project names a take that was in `root` and is not: its copy there is read in its place.
+        let gone = crate::project::FileRef::new(&root.join(&name), None);
+        let found = locate_clip(&gone, None, None, None).expect("the copy");
+        let stand_in = found.stand_in.expect("in the take's place");
+        assert_eq!((found.path.as_path(), stand_in.take.as_path()), (copy.as_path(), root.join(&name).as_path()));
+        assert!(found.facts.source_kind.is_raw_video() && found.facts.take.as_ref().is_some_and(|t| t.archive.is_some()));
+        let extent = stand_in.extent;
+        assert!((extent.begins_s - index.pts_s(first)).abs() < 1e-5 && !extent.from_start, "{extent:?}");
+        assert_eq!(extent.to_end, frames.end == index.frames());
+        assert!((extent.duration_s - found.facts.duration_sec).abs() < 1e-9 && (extent.duration_s - frames.len() as f64 / found.facts.fps as f64).abs() < 0.5 / found.facts.fps as f64, "{extent:?}");
+        // A trim set on the take that covers the stretch is the whole copy; one inside it lies where it lay.
+        let dt = 1.0 / found.facts.fps as f64;
+        let trim = (Some(index.pts_s(first)), Some(index.pts_s(frames.end - 1) + dt));
+        assert_eq!(extent.trim_in_copy(trim, found.facts.fps), (None, None));
+        let (t_in, _) = extent.trim_in_copy((Some(index.pts_s(first + 2)), None), found.facts.fps);
+        assert!((t_in.unwrap() - (index.pts_s(first + 2) - index.pts_s(first))).abs() < 1e-5);
+        // Nothing where the take was and no copy either: not found.
+        assert!(locate_clip(&crate::project::FileRef::new(&root.join("ANOTHER"), None), None, None, None).is_none());
+        // The copy elsewhere, in the output folder: found there.
+        let elsewhere = crate::project::FileRef::new(&std::env::temp_dir().join("vr180-nowhere").join(&name), None);
+        assert!(locate_clip(&elsewhere, None, None, None).is_none());
+        assert_eq!(locate_clip(&elsewhere, None, None, Some(&root)).map(|l| l.path), Some(copy.clone()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A take and its copy opened together are one recording: the take is
+    /// the one that is opened. A copy opened by itself is opened.
+    #[test]
+    fn a_take_opened_with_its_copy_is_opened_alone() {
+        let source_of = |p: &std::path::Path| match p.file_name()?.to_str()? {
+            "TAKE_Archive" | "TAKE_Archive (2)" => Some("TAKE".to_string()),
+            "LONE_Archive" => Some("LONE".to_string()),
+            _ => None,
+        };
+        let paths = |names: &[&str]| names.iter().map(|n| PathBuf::from(format!("/takes/{n}"))).collect::<Vec<_>>();
+        let (opened, left) = without_copies_of_opened_takes(paths(&["OTHER", "TAKE", "TAKE_Archive", "LONE_Archive", "clip.insv", "TAKE_Archive (2)"]), source_of);
+        assert_eq!(opened, paths(&["OTHER", "TAKE", "LONE_Archive", "clip.insv"]));
+        assert_eq!(left, paths(&["TAKE_Archive", "TAKE_Archive (2)"]));
+        // The take is elsewhere than its copy: the same recording all the same.
+        let (opened, left) = without_copies_of_opened_takes(vec!["/disk/TAKE_Archive".into(), "/takes/TAKE".into()], source_of);
+        assert_eq!((opened, left), (vec![PathBuf::from("/takes/TAKE")], vec![PathBuf::from("/disk/TAKE_Archive")]));
+        // A copy opened by itself, or with other takes than its own.
+        let (opened, left) = without_copies_of_opened_takes(paths(&["TAKE_Archive", "OTHER"]), source_of);
+        assert_eq!((opened, left), (paths(&["TAKE_Archive", "OTHER"]), Vec::new()));
     }
 
     /// The size picked for an archive copy is kept across launches; what
@@ -2917,7 +3218,7 @@ mod ettr_tests {
             fps: 29.97, duration_sec: 10.0, source_kind,
             fisheye_eye_w: 3840, fisheye_eye_h: 3840, width: 3840, height: 3840,
             settings: Settings { ettr_stops, ..Default::default() },
-            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, take: None, offline: None, before_take: None, copy: None, take_failed: None,
+            status: BatchStatus::Idle, selected: false, x6, raw_one_lens: false, raw_frame: None, four_channel_sound: false, take: None, offline: None, before_take: None, copy: None, take_failed: None, stand_in: None,
         }
     }
 
@@ -3544,6 +3845,9 @@ struct BatchItem {
     /// Why the last such run did not write this take, and what it was to
     /// write (the export queue's own status is back by then).
     take_failed: Option<(TakeJob, String)>,
+    /// The entry reads an archive copy in the place of its take, which is
+    /// not at hand ([`StandIn`]): `path` is then the copy.
+    stand_in: Option<StandIn>,
 }
 
 /// A clip's sound is four channels an Ambisonic or APAC track can be
@@ -3673,23 +3977,49 @@ impl ClipFacts {
 /// their headers say (`None`: not found, or not a readable source).
 struct RestoredClip {
     token: u64,
-    found: Option<(PathBuf, Option<Vec<PathBuf>>, ClipFacts)>,
+    found: Option<Located>,
 }
 
-/// Where a project's clip is now, and what its file says. Touches the disk.
+/// Where a project's clip is now and what its file says.
+struct Located {
+    path: PathBuf,
+    /// The files of its recording, where it is made of several.
+    segments: Option<Vec<PathBuf>>,
+    facts: ClipFacts,
+    /// `path` is an archive copy read in the place of the take the project
+    /// names, which is not at hand.
+    stand_in: Option<StandIn>,
+}
+
+/// Where a project's clip is now, and what its file says: the file the
+/// project names, or, for a raw take that is not there, an archive copy of
+/// it beside where it was or in `also` (the output folder). Touches the
+/// disk.
 fn locate_clip(
     file: &crate::project::FileRef,
     segments: Option<&[crate::project::FileRef]>,
     base: Option<&std::path::Path>,
-) -> Option<(PathBuf, Option<Vec<PathBuf>>, ClipFacts)> {
-    let path = file.resolve(base)?;
+    also: Option<&std::path::Path>,
+) -> Option<Located> {
+    let Some(path) = file.resolve(base) else {
+        // Where the take was when the project was written, and where that is from the project file now.
+        let moved = base.zip(file.relative.as_deref()).map(|(base, relative)| crate::project::join_relative(base, relative));
+        return [Some(file.path.clone()), moved].into_iter().flatten().find_map(|take| {
+            let (path, note) = copy_standing_in(&take, also)?;
+            let facts = ClipFacts::read(&path)?;
+            let extent = CopyExtent::of(&note, facts.duration_sec);
+            // (The entry's trim is put in when the entry takes this in.)
+            let stand_in = StandIn::of(take, extent, (None, None), facts.fps);
+            Some(Located { path, segments: None, facts, stand_in: Some(stand_in) })
+        });
+    };
     // A recording of several files is there when all of them are.
     let segments = match segments {
         None => None,
         Some(files) => Some(files.iter().map(|f| f.resolve(base)).collect::<Option<Vec<_>>>()?),
     };
     let facts = ClipFacts::read(&path)?;
-    Some((path, segments, facts))
+    Some(Located { path, segments, facts, stand_in: None })
 }
 
 impl BatchItem {
@@ -3715,6 +4045,20 @@ impl BatchItem {
             before_take: None,
             copy: None,
             take_failed: None,
+            stand_in: None,
+        }
+    }
+
+    /// The file a project names for this entry, and its trim there: the
+    /// take's, also while a copy is read in the take's place.
+    fn as_saved(&self, settings: &crate::decoder::Settings) -> (PathBuf, crate::decoder::Settings) {
+        match &self.stand_in {
+            None => (self.path.clone(), settings.clone()),
+            Some(stand_in) => {
+                let mut settings = settings.clone();
+                (settings.trim_in_s, settings.trim_out_s) = stand_in.trim_in_take((settings.trim_in_s, settings.trim_out_s), self.fps);
+                (stand_in.take.clone(), settings)
+            }
         }
     }
 
@@ -4044,14 +4388,15 @@ fn tr_zh(en: &'static str) -> &'static str {
             => "素材旁边这个名字的文件夹，也是软件查找增强帧和 Camera Raw 设置的地方。",
         "This clip is a lossy archive copy: the frames written are the copy's, close to what the sensor recorded but not the same."
             => "这个片段是有损存档副本：写出的是副本里的帧，接近传感器的记录，但不完全相同。",
-        "Puts the copy in the take's place in the list, with the take's settings. Nothing is deleted: the take stays where it is."
-            => "在列表里用副本顶替这条素材，设置原样带过去。不删除任何东西：原素材留在原处。",
+        "The take can now be moved away or deleted. That is yours to do: the app moves and deletes nothing. Once the take is gone the app reads its copy in its place, as long as the copy stays beside where the take was, or in the output folder."
+            => "原素材现在可以移走或删除。这一步由你来做，软件不移动也不删除任何东西。原素材不在以后，软件会改读它的副本，前提是副本留在原素材原来位置的旁边，或者在输出文件夹里。",
+        "The take this clip belongs to is not at hand: its archive copy is read in its place. When the take is back, it is read again."
+            => "这条素材的原素材不在，现在读的是它的存档副本。原素材回来以后会重新读原素材。",
+        "In place of" => "顶替原素材",
         "A run is in flight: this can start when it is over." => "有任务正在进行：结束后才能开始。",
         "Range" => "范围",
         "In to Out" => "入点到出点",
         "Whole take" => "整条素材",
-        "Use the copy" => "改用副本",
-        "Use all the copies" => "全部改用副本",
         "every sample kept" => "每个样本都保留",
         "This clip is an archive copy of a take, made by this app: not the camera's own recording." => "这个片段是素材的存档副本，由本软件制作，不是相机自己的记录。",
         "High quality: 1 bit a pixel" => "高质量：每像素 1 bit",
@@ -4925,6 +5270,12 @@ fn resolve_raw_takes(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Option<String>) {
         } else if !out.contains(&p) {
             out.push(p);
         }
+    }
+    // A take and its archive copy are one recording: opened together, the take is the one that is opened.
+    let (out, left) = without_copies_of_opened_takes(out, |p| vr180_pipeline::x6_raw::archive_note(p).and_then(|note| note.source));
+    for copy in &left {
+        tracing::info!("import: {} is an archive copy of a take opened with it: left out", copy.display());
+        notes.push(format!("{}: an archive copy of a take that is opened with it, left out", clip_label(copy)));
     }
     (out, (!notes.is_empty()).then(|| notes.join("\n")))
 }
@@ -6496,6 +6847,8 @@ impl App {
             self.look_again(idx);
             return;
         }
+        // Its take first, an archive copy only while the take is not at hand.
+        self.settle_source(idx);
         let Some(path) = self.batch.get(idx).map(|b| b.path.clone()) else { return; };
         self.sync_active_clip_settings();
         self.settings = self.batch[idx].settings.clone();
@@ -6530,6 +6883,11 @@ impl App {
         for path in paths {
             if self.batch.iter().any(|b| b.path == path) {
                 continue; // already in the list
+            }
+            // The take an entry reads a copy in the place of: it is back, and that entry reads it again.
+            if let Some(i) = self.batch.iter().position(|b| b.stand_in.as_ref().is_some_and(|s| s.take == path)) {
+                self.settle_source(i);
+                continue;
             }
             if vr180_pipeline::x6_pair::plan_for(&path)
                 .is_some_and(|take| self.batch.iter().any(|b| take.paths.contains(&b.path)))
@@ -6597,6 +6955,7 @@ impl App {
                 before_take: None,
                 copy: None,
                 take_failed: None,
+                stand_in: None,
             });
             if is_loaded_clip {
                 // The loaded clip just joined the list — link it up.
@@ -6757,6 +7116,10 @@ impl App {
     /// is chosen and there are several clips, else each to its own.
     fn start_run(&mut self, run: Vec<usize>) {
         self.end_take_run();
+        // Each clip is read from its take, or from the take's copy while the take is not at hand.
+        for &i in &run {
+            self.settle_source(i);
+        }
         self.join_notice = None;
         self.joined_output = None;
         if self.join_clips && run.len() >= 2 {
@@ -6792,6 +7155,11 @@ impl App {
         }
         self.sync_active_clip_settings();
         self.end_take_run();
+        for i in 0..self.batch.len() {
+            if self.batch[i].selected || self.active_clip == Some(i) {
+                self.settle_source(i);
+            }
+        }
         let clips = take_clips(&self.batch, self.active_clip, run.job);
         if clips.is_empty() {
             tracing::warn!("take run: no raw take to write");
@@ -6827,12 +7195,7 @@ impl App {
         let pairs = note.as_ref().and_then(|n| n.pairs).unwrap_or(0);
         let source_bytes = note.as_ref().and_then(|n| n.source_bits_per_pixel)
             .map_or(0, |bits| (bits * (pairs * item.frame_samples()) as f64 / 8.0).round() as u64);
-        item.copy = Some(TakeCopy {
-            dir: dir.to_path_buf(),
-            begins_s: note.as_ref().and_then(|n| n.first_pair_s).unwrap_or(0.0),
-            bytes,
-            source_bytes,
-        });
+        item.copy = Some(TakeCopy { dir: dir.to_path_buf(), bytes, source_bytes });
     }
 
     /// The clips of a joined run are all written: put them together, as
@@ -9517,12 +9880,14 @@ impl App {
             None => {
                 // The sidebar edits the clip on screen in `self.settings`.
                 let live = self.active_clip == Some(i) && self.loaded_path.as_ref() == Some(&item.path);
+                // (An entry that reads a copy in its take's place is saved as the take, with its trim there.)
+                let (file, settings) = item.as_saved(if live { &self.settings } else { &item.settings });
                 ProjectClip {
-                    file: FileRef::new(&item.path, base),
+                    file: FileRef::new(&file, base),
                     segments: self.merge_groups.get(&item.path)
                         .map(|files| files.iter().map(|f| FileRef::new(f, base)).collect()),
                     selected: item.selected,
-                    settings: if live { self.settings.clone() } else { item.settings.clone() },
+                    settings,
                 }
             }
         }).collect();
@@ -9618,12 +9983,14 @@ impl App {
         self.restore_owed += requests.len();
         let tx = self.restore_tx.clone();
         let ctx = self.egui_ctx.clone();
+        // (Where an archive copy may lie besides next to its take.)
+        let also = self.batch_out_dir.clone();
         std::thread::spawn(move || {
             for (token, file, segments, base) in requests {
                 // A reader that gives up on a file must not leave its entry
                 // "looking" for good: it counts as not found.
                 let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    locate_clip(&file, segments.as_deref(), base.as_deref())
+                    locate_clip(&file, segments.as_deref(), base.as_deref(), also.as_deref())
                 })).unwrap_or(None);
                 if tx.send(RestoredClip { token, found }).is_err() {
                     break;
@@ -9664,7 +10031,7 @@ impl App {
         // The entry may be gone: removed while it was looked for, or the
         // list replaced.
         let Some(idx) = self.batch.iter().position(|b| b.offline.as_ref().is_some_and(|o| o.token == token)) else { return };
-        let Some((path, segments, facts)) = restored.found else {
+        let Some(Located { path, segments, facts, stand_in }) = restored.found else {
             if let Some(off) = self.batch[idx].offline.as_mut() {
                 off.looking = false;
             }
@@ -9676,7 +10043,17 @@ impl App {
             self.remove_clip(idx);
             return;
         }
+        let fps = facts.fps;
         self.batch[idx].take_facts(path.clone(), facts);
+        // The take is not at hand and a copy of it is read in its place: the project's trim, set on the take,
+        // lies in the copy where the copy lies in the take.
+        if let Some(found) = stand_in {
+            let item = &mut self.batch[idx];
+            let stand_in = StandIn::of(found.take, found.extent, (item.settings.trim_in_s, item.settings.trim_out_s), fps);
+            (item.settings.trim_in_s, item.settings.trim_out_s) = stand_in.trim_on_copy;
+            tracing::info!("project: {} is not at hand: its archive copy {} is read in its place", stand_in.take.display(), path.display());
+            item.stand_in = Some(stand_in);
+        }
         if let Some(files) = segments {
             self.merge_groups.insert(path, files);
         }
@@ -9708,6 +10085,14 @@ impl App {
         let missing = self.batch.iter().filter(|b| !b.ready()).count();
         if missing > 0 {
             tracing::warn!("project: {missing} of {} clips were not found", self.batch.len());
+        }
+        // The takes that are not at hand and are read from their archive copies: said once.
+        let zh = cur_lang() == Lang::Zh;
+        let standing: Vec<&BatchItem> = self.batch.iter().filter(|b| b.stand_in.is_some()).collect();
+        match standing.as_slice() {
+            [] => {}
+            [one] => self.import_notice = one.stand_in.as_ref().map(|s| stand_in_notice(&s.take, &one.path, true, zh)),
+            many => self.import_notice = Some(stand_ins_notice(many.len(), zh)),
         }
         // What the project file holds is the list as it now stands.
         if self.project_path.is_some() && std::mem::take(&mut self.restore_from_file) {
@@ -11677,7 +12062,7 @@ impl App {
         }
         let archive: Vec<TakeView> = take_clips(&self.batch, self.active_clip, TakeJob::Archive(None)).into_iter().map(|i| self.take_view(i)).collect();
         let originals: Vec<TakeView> = take_clips(&self.batch, self.active_clip, TakeJob::Originals).into_iter().map(|i| self.take_view(i)).collect();
-        let copies: Vec<(usize, TakeCopy)> = self.batch.iter().enumerate().filter_map(|(i, b)| Some((i, b.copy.clone()?))).collect();
+        let copies: Vec<TakeCopy> = self.batch.iter().filter_map(|b| b.copy.clone()).collect();
         let failed: Vec<(TakeJob, String, String)> = self.batch.iter()
             .filter_map(|b| b.take_failed.as_ref().map(|(job, why)| (*job, clip_label(&b.path), why.clone())))
             .collect();
@@ -11688,13 +12073,6 @@ impl App {
         };
         match Self::take_tools_ui(ui, &mut self.take_tools, &view) {
             Some(TakeAsk::Start(run)) => self.start_take_run(run),
-            Some(TakeAsk::UseCopy(idx)) => self.use_copy(idx),
-            Some(TakeAsk::UseCopies) => {
-                // (Each entry keeps its place: the list does not move under the loop.)
-                for (idx, _) in copies {
-                    self.use_copy(idx);
-                }
-            }
             Some(TakeAsk::Keep) => self.save_take_copy(),
             None => {}
         }
@@ -11796,20 +12174,13 @@ impl App {
                     }
                 }
                 failed(ui, true);
-                // The copies made: each can take its take's place in the list.
+                // The copies made, and what may be done with their takes now: by the user, never by the app.
                 if !view.copies.is_empty() {
                     ui.add_space(4.0);
-                }
-                for (idx, copy) in view.copies {
-                    ui.label(RichText::new(take_copy_line(copy, zh)).small().color(Color32::from_rgb(120, 200, 120)));
-                    if ui.add_enabled(view.idle, egui::Button::new(tr("Use the copy")).small()).on_hover_text(tr(TAKE_USE_COPY_HOVER)).clicked() {
-                        ask = Some(TakeAsk::UseCopy(*idx));
+                    for copy in view.copies {
+                        ui.label(RichText::new(take_copy_line(copy, zh)).small().color(Color32::from_rgb(120, 200, 120)));
                     }
-                }
-                if view.copies.len() > 1
-                    && ui.add_enabled(view.idle, egui::Button::new(tr("Use all the copies")).small()).on_hover_text(tr(TAKE_USE_COPY_HOVER)).clicked()
-                {
-                    ask = Some(TakeAsk::UseCopies);
+                    note(ui, tr(TAKE_COPIED_NOTE));
                 }
                 ui.add_space(4.0);
             }
@@ -11841,42 +12212,50 @@ impl App {
         ask
     }
 
-    /// The archive copy made of list entry `idx` takes the take's place in
-    /// the list: the same entry with the take's settings, its file the
-    /// copy. A copy of a stretch begins where the stretch did, so the
-    /// entry's trim moves with it ([`settings_for_copy`]). Nothing on disk
-    /// is touched: the take stays where it is.
-    fn use_copy(&mut self, idx: usize) {
-        if self.batch_running || self.export_job.is_some() {
-            return;
-        }
-        self.sync_active_clip_settings();
-        let Some(copy) = self.batch.get(idx).and_then(|b| b.copy.clone()) else { return };
-        // The copy is in the list already: that entry is the one to go on with.
-        if let Some(there) = self.batch.iter().position(|b| b.path == copy.dir) {
-            self.batch[idx].copy = None;
-            self.select_clip(there);
-            return;
-        }
-        let Some(facts) = ClipFacts::read(&copy.dir) else {
-            tracing::warn!("list: the copy {} does not open: the take keeps its place", copy.dir.display());
-            self.batch[idx].copy = None;
-            return;
+    /// List entry `idx` reads the file it is to read ([`source_choice`]):
+    /// its take first, an archive copy of the take only while the take is
+    /// not at hand. Where that changes the file, the entry's trim moves
+    /// with it (a copy of a stretch begins where the stretch did), the list
+    /// says so, and a clip on screen is loaded again. Nothing on disk is
+    /// touched. Returns whether the file changed.
+    fn settle_source(&mut self, idx: usize) -> bool {
+        let Some(item) = self.batch.get(idx).filter(|b| b.ready() && b.status != BatchStatus::Running) else { return false };
+        let (to, note) = match source_choice(&item.path, item.stand_in.as_ref(), self.batch_out_dir.as_deref()) {
+            SourceChoice::Same => return false,
+            SourceChoice::Take(take) => (take, None),
+            SourceChoice::Copy(dir, note) => (dir, Some(note)),
         };
+        let Some(facts) = ClipFacts::read(&to) else {
+            tracing::warn!("list: {} does not open: {} is read on", to.display(), item.path.display());
+            return false;
+        };
+        // (The clip on screen is edited in `self.settings`.)
+        self.sync_active_clip_settings();
         let on_screen = self.active_clip == Some(idx);
+        let zh = cur_lang() == Lang::Zh;
         let item = &mut self.batch[idx];
-        item.settings = settings_for_copy(&item.settings, &copy, facts.duration_sec, facts.fps);
-        let take = std::mem::take(&mut item.path);
-        item.take_facts(copy.dir.clone(), facts);
-        item.status = BatchStatus::Idle;
+        let trim = (item.settings.trim_in_s, item.settings.trim_out_s);
+        let (trim, stand_in, notice) = match (note, item.stand_in.take()) {
+            (Some(note), _) => {
+                let stand_in = StandIn::of(item.path.clone(), CopyExtent::of(&note, facts.duration_sec), trim, facts.fps);
+                (stand_in.trim_on_copy, Some(stand_in), stand_in_notice(&item.path, &to, true, zh))
+            }
+            (None, Some(was)) => (was.trim_in_take(trim, item.fps), None, stand_in_notice(&to, &item.path, false, zh)),
+            (None, None) => return false,
+        };
+        tracing::info!("list: {} is read in the place of {}", to.display(), item.path.display());
+        (item.settings.trim_in_s, item.settings.trim_out_s) = trim;
+        item.take_facts(to.clone(), facts);
+        item.stand_in = stand_in;
         item.copy = None;
         item.take_failed = None;
-        tracing::info!("list: the copy {} takes the place of {}", copy.dir.display(), take.display());
+        self.import_notice = Some(notice);
         if on_screen {
             self.settings = self.batch[idx].settings.clone();
             self.suppress_reseed_once = true;
-            self.load_file_inner(copy.dir, true);
+            self.load_file_inner(to, true);
         }
+        true
     }
 
     /// Put a clip of the list in another place; what points into the list
@@ -12027,6 +12406,13 @@ impl App {
                             ui.label(RichText::new(tr("Archive copy")).color(Color32::GRAY).small());
                             ui.label(archive_note_text(&note, cur_lang() == Lang::Zh));
                         }).response.on_hover_text(tr("This clip is an archive copy of a take, made by this app: not the camera's own recording."));
+                    }
+                    // The copy is read in the place of its take, which is not at hand.
+                    if let Some(stand_in) = self.active_clip.and_then(|i| self.batch.get(i)).filter(|b| b.path == *p).and_then(|b| b.stand_in.as_ref()) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(tr("In place of")).color(Color32::GRAY).small());
+                            ui.label(clip_label(&stand_in.take));
+                        }).response.on_hover_text(tr(STAND_IN_HOVER));
                     }
                     if let Some(rate) = bitrate_label(&c.video_bitrates_bps, c.file_bitrate_bps, true) {
                         ui.horizontal(|ui| {
