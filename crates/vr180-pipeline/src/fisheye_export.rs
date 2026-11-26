@@ -266,7 +266,9 @@ pub struct FisheyeExportConfig {
     pub raw_enhanced_dir: Option<PathBuf>,
     /// The per-eye size of the output when the export does read enhanced
     /// frames; `eye_w × eye_h` is its size when it reads the capture.
-    /// Settled before the first frame ([`Self::settle_raw_enhanced`]).
+    /// Settled before the first frame ([`Self::settle_raw_enhanced`]). For
+    /// a lens frame, a size beyond the take's own frame is the size the
+    /// frame is written at ([`lens_frame_request`]).
     pub raw_enhanced_eye: Option<(u32, u32)>,
 }
 
@@ -1474,8 +1476,13 @@ pub fn export_fisheye(
     let larger = cfg.raw_enhanced_eye;
     if !cfg.settle_raw_enhanced(cfg.trim_in_s, cfg.trim_out_s) {
         if let Some((w, h)) = larger.filter(|l| *l != (cfg.eye_w, cfg.eye_h)) {
-            append_export_path_note(&format!(
-                "no enhanced frames for this stretch: written at {} × {} per eye, not {w} × {h}", cfg.eye_w, cfg.eye_h));
+            append_export_path_note(&if cfg.lens_frame == LensFrameOut::Off {
+                format!("no enhanced frames for this stretch: written at {} × {} per eye, not {w} × {h}", cfg.eye_w, cfg.eye_h)
+            } else {
+                // (A lens frame's size is fixed further down: a stabilized
+                // one at the take's own size carries its margin.)
+                format!("no enhanced frames for this stretch: written at the size picked without them, not {w} × {h} per eye")
+            });
         }
     }
     // A reframed view is not VR180 — never tag it as one.
@@ -1622,9 +1629,11 @@ const LENS_FRAME_PICTURE_SLACK_DEG: f32 = 2.0;
 
 /// The frame of a lens-frame export, sized for the export. A stabilized
 /// frame carries a margin for the picture the stabilizer shifts
-/// (`lens_frame::STABILIZER_MARGIN`), the same for every clip; a reduced copy
-/// (`reduced_to`: the size asked for, when that is smaller than the source's
-/// frame) keeps its size and holds the wider field at a smaller scale. With
+/// (`lens_frame::STABILIZER_MARGIN`), the same for every clip; a frame of a
+/// size that was asked for (`reduced_to`: a reduced copy, a frame held to an
+/// encoder's limit, a size of a raw take's enhanced frames, see
+/// [`lens_frame_request`]) keeps its size and holds the wider field at a
+/// smaller scale. With
 /// the stabilizer off the picture stays where the source's is: the frame's
 /// lens is then stated only as far as `reach_deg`, the last angle the source
 /// has a picture at, and what the view adjust turns it by.
@@ -1652,7 +1661,7 @@ fn size_lens_frame(
         tracing::info!(
             "fisheye_export: stabilized lens frame — {} px added at each border of {}x{}: {}x{} per view{}",
             m, frame.width, frame.height, held.width, held.height,
-            if reduced_to.is_some() { " (a reduced copy: the frame keeps its size, the picture is scaled)" } else { "" },
+            if reduced_to.is_some() { " (a frame of a size asked for: it keeps that size, the picture is scaled)" } else { "" },
         );
         held
     };
@@ -1674,8 +1683,16 @@ fn size_lens_frame(
 ///   scaled into the size asked for. (An encoder with a frame limit: NVENC
 ///   takes 8192 pixels a side, and a 3840² eye with its margin is 4224².)
 ///   Without stabilization it is the recorded frame.
-fn lens_frame_request(asked: (u32, u32), src: (u32, u32), stabilized: bool) -> ((u32, u32), Option<(u32, u32)>) {
+/// - A larger size asked of a source whose pictures are larger than its frame
+///   (`enhanced`: a raw take read from the frames a raw converter enhanced)
+///   is the size of the frame: those pictures hold what a frame of the
+///   recording's own size cannot, so the frame is drawn at the size asked
+///   for, and keeps it when stabilized, as a reduced copy does.
+fn lens_frame_request(asked: (u32, u32), src: (u32, u32), stabilized: bool, enhanced: bool) -> ((u32, u32), Option<(u32, u32)>) {
     if asked.0.min(asked.1) > src.0.min(src.1) {
+        if enhanced {
+            return (asked, Some(asked));
+        }
         let (gw, gh) = crate::lens_frame::stabilized_dims(src.0, src.1);
         (src, (stabilized && (gw > asked.0 || gh > asked.1)).then_some(asked))
     } else {
@@ -1706,7 +1723,11 @@ pub(crate) fn resolve_lens_frame(cfg: &mut FisheyeExportConfig) -> Result<Option
     let (left, right) = resolve_calib_pair(&lenses_only, src_w, src_h, imu.as_ref());
     let mono = single_eye_source(cfg);
     let sources: Vec<&FisheyeCalib> = if mono { vec![&left] } else { vec![&left, &right] };
-    let ((base_w, base_h), reduced) = lens_frame_request((cfg.eye_w, cfg.eye_h), (src_w, src_h), cfg.stabilize);
+    // A raw take read from its enhanced frames ([`FisheyeExportConfig::settle_raw_enhanced`]
+    // keeps the folder only where the stretch has some): its pictures are
+    // larger than the frame `source_eye_dims` names.
+    let enhanced = cfg.source_kind.is_raw_video() && cfg.raw_enhanced_dir.is_some();
+    let ((base_w, base_h), reduced) = lens_frame_request((cfg.eye_w, cfg.eye_h), (src_w, src_h), cfg.stabilize, enhanced);
     let frame = crate::lens_frame::LensFrame::from_sources(&sources, base_w, base_h).ok_or_else(|| Error::Ffmpeg(
         "no lens frame can be made for this source (a file that is already VR180 has no lens) — export it as VR180".into()))?;
     for (eye, c) in ["left", "right"].iter().zip(&sources) {
@@ -2922,7 +2943,7 @@ fn resolve_eac_lens_frame(cfg: &mut FisheyeExportConfig) -> Result<Option<(crate
     let dims = crate::decode::probe_video(path).map(|p| vr180_core::eac::Dims::new(p.width, p.height))?;
     // The cross's side stands for the recording's size here.
     let cross = dims.cross_w();
-    let ((base_w, base_h), reduced) = lens_frame_request((cfg.eye_w, cfg.eye_h), (cross, cross), cfg.stabilize);
+    let ((base_w, base_h), reduced) = lens_frame_request((cfg.eye_w, cfg.eye_h), (cross, cross), cfg.stabilize, false);
     let frame = crate::lens_frame::LensFrame::equidistant(base_w, base_h, EAC_LENS_FRAME_HALF_FOV_DEG)
         .ok_or_else(|| Error::Ffmpeg("no lens frame of this size".into()))?;
     // The cross holds the front face and, of each side face, the strip of
@@ -5095,28 +5116,70 @@ mod lens_frame_tests {
     fn a_size_beyond_the_recording_holds_the_stabilized_frame() {
         let src = (3840, 3840);
         // The recording's own size, and a reduced copy: as before.
-        assert_eq!(lens_frame_request(src, src, true), (src, None));
-        assert_eq!(lens_frame_request(src, src, false), (src, None));
-        assert_eq!(lens_frame_request((2048, 2048), src, true), ((2048, 2048), Some((2048, 2048))));
-        assert_eq!(lens_frame_request((2048, 2048), src, false), ((2048, 2048), Some((2048, 2048))));
+        assert_eq!(lens_frame_request(src, src, true, false), (src, None));
+        assert_eq!(lens_frame_request(src, src, false, false), (src, None));
+        assert_eq!(lens_frame_request((2048, 2048), src, true, false), ((2048, 2048), Some((2048, 2048))));
+        assert_eq!(lens_frame_request((2048, 2048), src, false, false), ((2048, 2048), Some((2048, 2048))));
         // 4096 asked of a 3840 eye: the frame is built at 3840 either way;
         // stabilized, its 4224 are held to 4096, and without, nothing is.
-        assert_eq!(lens_frame_request((4096, 4096), src, true), (src, Some((4096, 4096))));
-        assert_eq!(lens_frame_request((4096, 4096), src, false), (src, None));
+        assert_eq!(lens_frame_request((4096, 4096), src, true, false), (src, Some((4096, 4096))));
+        assert_eq!(lens_frame_request((4096, 4096), src, false, false), (src, None));
         // Room enough for the margin: the recorded frame with its margin.
-        assert_eq!(lens_frame_request((4096, 4096), (3712, 3712), true), ((3712, 3712), None));
-        assert_eq!(lens_frame_request((4224, 4224), src, true), (src, None));
+        assert_eq!(lens_frame_request((4096, 4096), (3712, 3712), true, false), ((3712, 3712), None));
+        assert_eq!(lens_frame_request((4224, 4224), src, true, false), (src, None));
 
         // The frame that comes of it: 4096 a side, the whole stabilized field
         // in it, 4096 / 4224 of the recording's scale.
         let f = LensFrame::equidistant(3840, 3840, super::EAC_LENS_FRAME_HALF_FOV_DEG).unwrap();
-        let (base, held) = lens_frame_request((4096, 4096), src, true);
+        let (base, held) = lens_frame_request((4096, 4096), src, true, false);
         assert_eq!((base, f.width), (src, 3840));
         let out = size_lens_frame(f, true, &ViewAdjust::IDENTITY, held, 92.25).unwrap();
         assert_eq!((out.width, out.height), (4096, 4096));
         assert!((out.focal / f.focal - 4096.0 / 4224.0).abs() < 1e-6, "{}", out.focal / f.focal);
-        let free = size_lens_frame(f, false, &ViewAdjust::IDENTITY, lens_frame_request((4096, 4096), src, false).1, 92.25).unwrap();
+        let free = size_lens_frame(f, false, &ViewAdjust::IDENTITY, lens_frame_request((4096, 4096), src, false, false).1, 92.25).unwrap();
         assert_eq!((free.width, free.height, free.focal), (3840, 3840, f.focal));
+    }
+
+    /// A raw take read from its enhanced frames has pictures larger than its
+    /// frame: a size asked beyond the frame is then the size of the frame,
+    /// stabilized or not. At the take's own size, and below, nothing differs.
+    #[test]
+    fn a_size_beyond_the_frame_is_written_from_enhanced_pictures() {
+        let src = (3840, 3840);
+        for asked in [(6560, 6560), (8192, 8192)] {
+            assert_eq!(lens_frame_request(asked, src, true, true), (asked, Some(asked)));
+            assert_eq!(lens_frame_request(asked, src, false, true), (asked, Some(asked)));
+        }
+        for stabilized in [false, true] {
+            assert_eq!(lens_frame_request(src, src, stabilized, true), lens_frame_request(src, src, stabilized, false));
+            assert_eq!(lens_frame_request((2048, 2048), src, stabilized, true), lens_frame_request((2048, 2048), src, stabilized, false));
+        }
+
+        // The frames that come of it, from the lens of the take's own frame.
+        let (l, r) = fisheye_lenses();
+        let own = LensFrame::from_sources(&[&l, &r], 3840, 3840).expect("a lens frame");
+        for side in [6560u32, 8192] {
+            let (base, held) = lens_frame_request((side, side), src, true, true);
+            let built = LensFrame::from_sources(&[&l, &r], base.0, base.1).expect("a lens frame");
+            // Not stabilized: the take's frame at the size asked for, the same field.
+            let still = size_lens_frame(built, false, &ViewAdjust::IDENTITY, held, 104.0).unwrap();
+            assert_eq!((still.width, still.height), (side, side));
+            assert!((still.focal / own.focal - side as f32 / 3840.0).abs() < 1e-5, "{side}: {}", still.focal / own.focal);
+            assert_eq!((still.xi, still.k1, still.k2), (own.xi, own.k1, own.k2));
+            let (a, b) = (still.half_angles(), own.half_angles());
+            assert!((a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4, "{side}: {a:?} against {b:?}");
+            // Stabilized: that size too, the stabilizer's margin inside it, so
+            // the field is the one the take's own stabilized frame holds (the
+            // margin is a whole number of pixel pairs at either size).
+            let moved = size_lens_frame(built, true, &ViewAdjust::IDENTITY, held, 104.0).unwrap();
+            assert_eq!((moved.width, moved.height), (side, side));
+            let margin = built.margin_px();
+            assert!((moved.focal / built.focal - side as f32 / (side + 2 * margin) as f32).abs() < 1e-6, "{side}: {}", moved.focal / built.focal);
+            let grown = size_lens_frame(own, true, &ViewAdjust::IDENTITY, None, 104.0).unwrap();
+            assert_eq!((grown.width, grown.height), (4224, 4224));
+            let (a, b) = (moved.half_angles(), grown.half_angles());
+            assert!((a[0] - b[0]).abs() < 5e-3 && (a[1] - b[1]).abs() < 5e-3, "{side}: {a:?} against {b:?}");
+        }
     }
 
     /// A lens whose image would not hold the frame is refused, not written.

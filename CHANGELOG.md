@@ -141,6 +141,18 @@ picture, the order of the eyes and the stabilization were right with the
   whole view or the middle of the sensor. 2.6.0 read that frame only with
   every value kept, and refused such a take as one it did not know. It
   opens now, like a take of 6000 × 6000.
+- **Enhanced frames in the Lens Space view.** A take whose frames were
+  enhanced in a raw converter has the two larger sizes in the Lens Space
+  view as well, **13120 × 6560** and **16384 × 8192**, under the choice
+  the VR180 view keeps for them. Until now a lens frame was written at
+  the take's own size whatever its frames held. At either size the frame
+  is the take's frame scaled to it, the lens in the file scaled with it,
+  and a stabilized frame keeps the size with the stabilizer's margin
+  inside it. A stretch without enhanced frames exports at the size picked
+  without them, and the export bar says so. Checked on a take, stabilized
+  and not: both sizes lie on the frame of the take's own size to a
+  twentieth of a pixel, and hold detail finer than that frame can; 0.53
+  and 0.63 s a frame pair on an M5 Max.
 
 ## 2.6.0 — 2026-11-24
 

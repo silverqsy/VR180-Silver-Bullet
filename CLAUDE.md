@@ -3147,8 +3147,9 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      a size picked on one sort of clip never changes another's). An
      export carries BOTH sizes: `eye_w × eye_h` = the one picked without
      enhanced frames, `FisheyeExportConfig::raw_enhanced_eye` = the one
-     picked for them (canvas views only: not a lens frame, not a
-     reframed view), and the PIPELINE decides before anything is sized
+     picked for them (a canvas, or a lens frame's own size, see LENS
+     FRAME SIZES below; not a reframed view), and the PIPELINE decides
+     before anything is sized
      (`settle_raw_enhanced(t_in, t_out)`, first thing in
      `export_fisheye` and in `raw_export::FrameSource::open`; it goes by
      `x6_raw::enhanced_side`, the iterator's own search): enhanced
@@ -3164,6 +3165,36 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
      line under "Use enhanced frames"). The preview's sharpening scale
      follows the size an export would write (`raw_export_eye_w`); the
      snapshot and its frame DNG stay at the plain size.
+     LENS FRAME SIZES (2026-11-26; the user: the Lens Space view had no
+     larger size with enhanced frames, and should have the VR180 view's
+     two). A lens frame of a take whose enhanced frames were found picks
+     from `SizeList::Enhanced` too (`ExportOptions::lens_frame_eye_dims`
+     takes the list): the take's own size and the 8K choice mean what
+     they mean without enhanced frames, `R13k` / `R16k` are the frame at
+     that size (`lens_frame_sized_dims`: the frame's shape, its longer
+     side on 6560 / 8192), and that goes into `raw_enhanced_eye`. In the
+     pipeline a size beyond the source's own frame was only ever room
+     for the stabilized frame (`lens_frame_request`: never an
+     enlargement); for a raw take read from enhanced frames
+     (`raw_enhanced_dir` still set once `settle_raw_enhanced` has run)
+     it is the frame's size: built at it, and kept when stabilized, the
+     margin inside as in a reduced copy. Nothing else moved: no folder,
+     no frame in the stretch or the option off give the frame as it was.
+     Measured with the harness (`X6_LENS=1 X6_ENHANCED=<folder>
+     X6_ENHANCED_EYE=6560|8192`, a 3840² take, stabilized and not):
+     13120×6560 and 16384×8192 written, the file's lens scaled with the
+     frame (focal × side / 3840; stabilized × side / (side + 2·margin));
+     resampled onto the frame of the take's own size the pictures agree
+     to 0.03–0.05 px in the median and 0.35 px at most (73–80 blocks an
+     eye); with sharpening off the larger frames hold energy past that
+     frame's Nyquist limit, a fifth of what the top of its band holds;
+     the frame DNG and the DNG sequence come out at the same sizes; a
+     stretch without enhanced frames is written at the plain size with
+     the bar's note; 0.53 / 0.63 s a pair. The lists that hold lens
+     frames of raw takes (kinds 46 lines, one-lens 20) are unchanged.
+     Not stabilized, 8192 is 6.7 % more than the enhanced picture's own
+     7680: the sizes are the VR180 view's two, as asked, not the
+     picture's. Not seen in the app's window.
      The harness: `X6_ENHANCED=<folder>`. CFG: `#[cfg(target_os =
      "macos")] mod jxl_macos` in `lib.rs` and ONE gated pair of blocks in
      `enhanced_dng::decode_tile` (the other arm returns an error); nothing
