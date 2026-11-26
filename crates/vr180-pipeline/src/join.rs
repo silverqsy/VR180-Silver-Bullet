@@ -247,16 +247,47 @@ pub enum Mismatch {
     View,
 }
 
-/// The part an export of `cfg` would be (`one_eye`: its source holds one
-/// eye, which the caller knows from its own probe).
-pub fn planned_part(cfg: &crate::fisheye_export::FisheyeExportConfig, one_eye: bool) -> std::result::Result<PlannedPart, Unjoinable> {
-    planned_part_where(cfg, one_eye, immersive_available())
+/// Whether the parts of a joined file read their takes' enhanced frames:
+/// all of them do, or none does. `found`: for each part, whether its export
+/// would read some by itself
+/// ([`FisheyeExportConfig::reads_enhanced_frames`](crate::fisheye_export::FisheyeExportConfig::reads_enhanced_frames);
+/// `false` for a part that is no raw take). A file made of parts from
+/// enhanced frames and parts from the capture would change its look from one
+/// clip to the next, and at a size picked for enhanced frames its frame as
+/// well; so one part without them leaves them out of every part
+/// ([`FisheyeExportConfig::without_enhanced_frames`](crate::fisheye_export::FisheyeExportConfig::without_enhanced_frames)).
+pub fn parts_read_enhanced(found: &[bool]) -> bool {
+    !found.is_empty() && found.iter().all(|has| *has)
+}
+
+/// What the caller knows of a part's source beyond its configuration, from
+/// its own probe and, for a raw take's enhanced frames, from a lookup or a
+/// decision of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartSource {
+    /// The source holds one eye.
+    pub one_eye: bool,
+    /// One eye of the source's frame, pixels (the side of a `.360` clip's
+    /// cross): what a lens frame is sized against.
+    pub eye: (u32, u32),
+    /// The export reads its take's enhanced frames, and is written at the
+    /// size picked for them.
+    pub enhanced: bool,
+}
+
+/// The part an export of `cfg` would be: the frame it writes
+/// ([`crate::fisheye_export::written_eye_dims`]: a size picked for enhanced
+/// frames where it reads those, a lens frame's margin or the size it is
+/// held to), its rate, its encoding and what it says of its picture.
+pub fn planned_part(cfg: &crate::fisheye_export::FisheyeExportConfig, source: PartSource) -> std::result::Result<PlannedPart, Unjoinable> {
+    planned_part_where(cfg, source, immersive_available())
 }
 
 /// [`planned_part`] on a system that can (`immersive`) or cannot join lens
 /// frames.
-pub fn planned_part_where(cfg: &crate::fisheye_export::FisheyeExportConfig, one_eye: bool, immersive: bool) -> std::result::Result<PlannedPart, Unjoinable> {
+pub fn planned_part_where(cfg: &crate::fisheye_export::FisheyeExportConfig, source: PartSource, immersive: bool) -> std::result::Result<PlannedPart, Unjoinable> {
     use crate::fisheye_export::{FisheyeExportProjection as P, LensFrameOut, EAC_LENS_FRAME_HALF_FOV_DEG, FISHEYE_OUT_FULL_FOV_DEG};
+    let PartSource { one_eye, eye, enhanced } = source;
     if cfg.spatial.is_some() {
         return Err(Unjoinable::Spatial);
     }
@@ -277,8 +308,9 @@ pub fn planned_part_where(cfg: &crate::fisheye_export::FisheyeExportConfig, one_
             youtube: cfg.inject_youtube_vr180 && !cfg.inject_apmp, apple: cfg.inject_apmp, one_eye,
         },
     };
+    let (eye_w, eye_h) = crate::fisheye_export::written_eye_dims(cfg, eye, enhanced);
     Ok(PlannedPart {
-        frame: (if one_eye { cfg.eye_w } else { cfg.eye_w * 2 }, cfg.eye_h),
+        frame: (if one_eye { eye_w } else { eye_w * 2 }, eye_h),
         fps: cfg.fps,
         encoder: cfg.encoder,
         depth_or_profile: if cfg.encoder.is_prores() { cfg.prores_profile } else { cfg.bit_depth as i32 },

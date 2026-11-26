@@ -154,6 +154,30 @@ picture, the order of the eyes and the stabilization were right with the
   twentieth of a pixel, and hold detail finer than that frame can; 0.53
   and 0.63 s a frame pair on an M5 Max.
 
+### Joined files: enhanced frames in every clip or in none
+
+- **All of the clips, or none.** A file joined from several clips reads a
+  raw take's enhanced frames only when every clip of the run has some for
+  its stretch. One clip without them (a take whose frames were not
+  enhanced, a stretch past the enhanced ones, a clip of another camera)
+  leaves them out of the whole file: every clip is then read from the
+  capture, at the size picked without enhanced frames, so the file keeps
+  one look and one frame size from its first clip to its last. The run
+  starts by looking through the takes' folders (the export bar says so,
+  for a second or two), and where enhanced frames are left out although
+  some clips have them, the bar and the run's summary name the first clip
+  that has none.
+- **The frame each clip is really written at.** Before a joined run starts
+  its clips are compared at the size their exports write, not at the size
+  asked for. That differs for a Lens Space clip through the camera's lens,
+  whose frame is 5 % larger on each side when the clip is stabilized, and
+  for a take read from enhanced frames at a size picked for those. Two
+  such clips used to pass the check and were found to differ only when
+  the finished parts were put together, after every clip had been
+  exported; they are now named before anything is written, and for two
+  Lens Space clips of which one is stabilized the note says that this is
+  what sets them apart.
+
 ## 2.6.0 — 2026-11-24
 
 ### Insta360 X6: raw video

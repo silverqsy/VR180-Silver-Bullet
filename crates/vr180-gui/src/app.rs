@@ -351,6 +351,8 @@ pub struct App {
     join_run: Option<JoinRun>,
     /// The file the last run joined its clips into (for the summary).
     joined_output: Option<PathBuf>,
+    /// What that run said of enhanced frames it left out ([`JoinRun::note`]).
+    joined_note: Option<String>,
     /// Why a joined export did not start, or did not end in a joined file
     /// (shown in the export bar until dismissed).
     join_notice: Option<String>,
@@ -2464,8 +2466,14 @@ mod join_and_project_tests {
         ProResProfile, JOIN_HOVER, PROJECT_HOVER};
     use crate::decoder::{FisheyeOutputMode, Settings};
     use std::path::{Path, PathBuf};
-    use vr180_pipeline::join::{mismatch, planned_part, planned_part_where, Mismatch, PlannedPart, Unjoinable};
+    use vr180_pipeline::join::{mismatch, planned_part, planned_part_where, Mismatch, PartSource, PlannedPart, Unjoinable};
     use vr180_pipeline::SourceKind;
+
+    /// What a plan knows of a clip of `kind` whose eye is `eye` pixels a
+    /// side, read from the capture.
+    fn source_of(kind: SourceKind, eye: u32, one_eye: bool) -> PartSource {
+        PartSource { one_eye, eye: super::native_eye_dims(kind, eye, eye, eye, eye), enhanced: false }
+    }
 
     /// The part a clip would be in a joined run: `kind`, `eye` pixels a
     /// side, at `fps`.
@@ -2474,7 +2482,7 @@ mod join_and_project_tests {
             Path::new("/nonexistent/in.insv"), Path::new(""), fps, kind,
             eye, eye, eye, eye, None, settings, opts, Vec::new(),
         );
-        planned_part(&cfg, one_eye)
+        planned_part(&cfg, source_of(kind, eye, one_eye))
     }
 
     #[test]
@@ -2538,7 +2546,7 @@ mod join_and_project_tests {
             Path::new("/nonexistent/in"), Path::new(""), 29.97, kind, 3840, 3840, 3840, 3840, None, s, &opts, Vec::new());
         let osv = framed_cfg(SourceKind::DjiOsv, &lens);
         // Where such a file can be written: a part of its own kind.
-        let framed = planned_part_where(&osv, false, true).unwrap();
+        let framed = planned_part_where(&osv, source_of(SourceKind::DjiOsv, 3840, false), true).unwrap();
         assert!(framed.immersive() && !a.immersive() && !b.immersive());
         assert_eq!(mismatch(&framed, &framed.clone()), None);
         // Beside a disc or a half-equirect it is another view (or another frame).
@@ -2546,15 +2554,234 @@ mod join_and_project_tests {
             assert!(mismatch(&framed, other).is_some());
         }
         // A clip of another camera in the same view: one file, whatever its lens.
-        let x6 = planned_part_where(&framed_cfg(SourceKind::Insta360Insv, &lens), false, true).unwrap();
+        let x6 = planned_part_where(&framed_cfg(SourceKind::Insta360Insv, &lens), source_of(SourceKind::Insta360Insv, 3840, false), true).unwrap();
         if x6.frame == framed.frame {
             assert_eq!(mismatch(&framed, &x6), None);
         }
         // Nowhere else, and never with one eye.
-        assert_eq!(planned_part_where(&osv, false, false).unwrap_err(), Unjoinable::LensFrame);
-        assert_eq!(planned_part_where(&framed_cfg(SourceKind::Insta360Insv, &lens.for_single_eye()), true, true).unwrap_err(), Unjoinable::LensFrame);
+        assert_eq!(planned_part_where(&osv, source_of(SourceKind::DjiOsv, 3840, false), false).unwrap_err(), Unjoinable::LensFrame);
+        assert_eq!(planned_part_where(&framed_cfg(SourceKind::Insta360Insv, &lens.for_single_eye()), source_of(SourceKind::Insta360Insv, 3840, true), true).unwrap_err(), Unjoinable::LensFrame);
         // And this system says the one or the other.
         assert_eq!(part_of(SourceKind::DjiOsv, 3840, 29.97, &lens, &opts, false).is_ok(), vr180_pipeline::join::immersive_available());
+    }
+
+    /// A clip of the list, as a joined run's plan reads it.
+    fn clip(path: &Path, kind: SourceKind, eye: u32, fps: f32, settings: &Settings) -> super::BatchItem {
+        super::BatchItem {
+            path: path.into(), fps, duration_sec: 10.0, source_kind: kind,
+            fisheye_eye_w: eye, fisheye_eye_h: eye, width: eye, height: eye,
+            settings: settings.clone(), status: super::BatchStatus::Idle, selected: false, x6: None, raw_one_lens: false, raw_frame: None,
+            four_channel_sound: false, take: None, upside_down: None, offline: None, before_take: None, copy: None, take_failed: None, stand_in: None,
+        }
+    }
+
+    /// The clips' exports as a joined run plans them (`App::export_cfg_for`).
+    fn exports_of(batch: &[super::BatchItem], opts: &ExportOptions) -> Vec<vr180_pipeline::fisheye_export::FisheyeExportConfig> {
+        batch.iter().map(|item| App::build_export_cfg(
+            &item.path, Path::new(""), item.fps, item.source_kind,
+            item.fisheye_eye_w, item.fisheye_eye_h, item.width, item.height, item.sharp_eye(),
+            &item.export_settings(), opts, Vec::new())).collect()
+    }
+
+    /// A part is planned at the frame its export writes: a lens frame with
+    /// the stabilizer's margin, a raw take read from enhanced frames at the
+    /// size picked for those. Two clips that only look alike before that
+    /// are told apart at the start of the run.
+    #[test]
+    fn a_part_is_planned_at_the_frame_it_is_written_at() {
+        use ExportResolution::{Native, R13k, R16k};
+        let native = ExportOptions { resolution: Native, ..Default::default() };
+        let lens = Settings { fisheye_output_mode: FisheyeOutputMode::Fisheye, lens_space: crate::decoder::LensSpaceLens::Camera, ..Default::default() };
+        let still = Settings { stabilize: false, ..lens.clone() };
+        assert!(lens.stabilize);
+        let framed = |kind: SourceKind, eye: u32, s: &Settings, opts: &ExportOptions| planned_part_where(
+            &App::build_export_cfg(Path::new("/nonexistent/in"), Path::new(""), 29.97, kind, eye, eye, eye, eye, None, s, opts, Vec::new()),
+            source_of(kind, eye, false), true).unwrap();
+        // A stabilized lens frame carries its margin, one that is not does
+        // not: the two do not share a file, and the plan says so.
+        let (moved, fixed) = (framed(SourceKind::DjiOsv, 3840, &lens, &native), framed(SourceKind::DjiOsv, 3840, &still, &native));
+        assert_eq!((moved.frame, fixed.frame), ((8448, 4224), (7680, 3840)));
+        assert_eq!(mismatch(&moved, &fixed), Some(Mismatch::Frame((8448, 4224), (7680, 3840))));
+        assert_eq!(mismatch(&moved, &framed(SourceKind::Insta360Insv, 3840, &lens, &native)), None);
+        // A reduced copy keeps its size either way.
+        let small = ExportOptions::default();
+        assert_eq!(framed(SourceKind::Insta360Insv, 4864, &lens, &small).frame, framed(SourceKind::Insta360Insv, 4864, &still, &small).frame);
+        assert_eq!(framed(SourceKind::Insta360Insv, 4864, &lens, &small).frame, (8192, 4096));
+        // A `.360` clip's lens frame is its cross, with the margin too.
+        let gopro = |s: &Settings| planned_part_where(
+            &App::build_export_cfg(Path::new("/nonexistent/in.360"), Path::new(""), 29.97, SourceKind::GoProEac, 0, 0, 5952, 1920, None, s, &native, Vec::new()),
+            PartSource { one_eye: false, eye: super::native_eye_dims(SourceKind::GoProEac, 0, 0, 5952, 1920), enhanced: false }, true).unwrap();
+        let cross = vr180_pipeline::lens_frame::stabilized_dims(3936, 3936);
+        assert_eq!((gopro(&lens).frame, gopro(&still).frame), ((cross.0 * 2, cross.1), (7872, 3936)));
+
+        // A raw take with its folder of camera-original DNGs beside it: the
+        // size picked for enhanced frames where the part reads them, the
+        // size picked without where it does not.
+        let root = std::env::temp_dir().join(format!("vr180-join-enhanced-size-{}", std::process::id()));
+        let take = root.join("TAKE");
+        std::fs::create_dir_all(root.join("TAKE_OriginalDNG/CAM0")).unwrap();
+        let raw = |s: &Settings, opts: &ExportOptions, enhanced: bool| planned_part_where(
+            &App::build_export_cfg(&take, Path::new(""), 59.94, SourceKind::X6Raw, 3840, 3840, 3840, 3840, None, s, opts, Vec::new()),
+            PartSource { enhanced, ..source_of(SourceKind::X6Raw, 3840, false) }, true).unwrap();
+        let vr = Settings::default();
+        let big = ExportOptions { enhanced_resolution: R16k, ..Default::default() };
+        assert_eq!((raw(&vr, &big, false).frame, raw(&vr, &big, true).frame), ((8192, 4096), (16384, 8192)));
+        assert_eq!(raw(&vr, &ExportOptions { enhanced_resolution: R13k, ..big }, true).frame, (13120, 6560));
+        // A lens frame: the size picked for enhanced frames is the frame's,
+        // stabilized or not; from the capture it is the take's own frame.
+        let big_native = ExportOptions { resolution: Native, ..big };
+        assert_eq!((raw(&lens, &big_native, true).frame, raw(&still, &big_native, true).frame), ((16384, 8192), (16384, 8192)));
+        assert_eq!((raw(&lens, &big_native, false).frame, raw(&still, &big_native, false).frame), ((8448, 4224), (7680, 3840)));
+        // A clip that is no raw take has no such frames to read.
+        let osv = App::build_export_cfg(Path::new("/nonexistent/in.osv"), Path::new(""), 29.97, SourceKind::DjiOsv, 3840, 3840, 3840, 3840, None, &vr, &big, Vec::new());
+        assert_eq!(planned_part_where(&osv, PartSource { enhanced: true, ..source_of(SourceKind::DjiOsv, 3840, false) }, true).unwrap().frame, (8192, 4096));
+        // And a take without the folder, or with the option off, neither.
+        let alone = App::build_export_cfg(&root.join("OTHER"), Path::new(""), 59.94, SourceKind::X6Raw, 3840, 3840, 3840, 3840, None, &vr, &big, Vec::new());
+        assert_eq!(planned_part_where(&alone, PartSource { enhanced: true, ..source_of(SourceKind::X6Raw, 3840, false) }, true).unwrap().frame, (8192, 4096));
+        assert_eq!(raw(&vr, &ExportOptions { raw_use_enhanced: false, ..big }, true).frame, (8192, 4096));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The parts of a joined file read their takes' enhanced frames all or
+    /// none: one clip without them leaves them out of every part, and the
+    /// run says so when some clips have them.
+    #[test]
+    fn a_joined_file_reads_enhanced_frames_in_every_part_or_in_none() {
+        use super::{join_check_outcome, join_enhanced_note};
+        use ExportResolution::{Native, R16k};
+        // Every clip has some: they are read. One has none: the capture,
+        // and that clip is named. No clip has any: nothing to say.
+        assert_eq!(join_check_outcome(&[Some(true), Some(true), Some(true)], 3), (true, None));
+        assert_eq!(join_check_outcome(&[Some(true), Some(false), Some(true)], 3), (false, Some(1)));
+        assert_eq!(join_check_outcome(&[Some(false), Some(true)], 2), (false, Some(0)));
+        assert_eq!(join_check_outcome(&[Some(false), Some(false)], 2), (false, None));
+        // A clip that could read none (no raw take, no folder) counts as one without.
+        assert_eq!(join_check_outcome(&[Some(true), None], 2), (false, Some(1)));
+        assert_eq!(join_check_outcome(&[None, Some(false)], 2), (false, None));
+        // A look that was stopped has no answer for the run: the capture.
+        assert_eq!(join_check_outcome(&[], 2), (false, None));
+        assert_eq!(join_check_outcome(&[Some(true)], 2), (false, None));
+        assert!(vr180_pipeline::join::parts_read_enhanced(&[true, true]) && !vr180_pipeline::join::parts_read_enhanced(&[true, false]));
+        assert!(!vr180_pipeline::join::parts_read_enhanced(&[]));
+        let (en, zh) = (join_enhanced_note("B.insv", false), join_enhanced_note("B.insv", true));
+        assert!(en.contains("B.insv") && zh.contains("B.insv") && en != zh, "{en} / {zh}");
+
+        // What a run settles before it starts.
+        let root = std::env::temp_dir().join(format!("vr180-join-enhanced-plan-{}", std::process::id()));
+        for take in ["A", "B", "C"] {
+            std::fs::create_dir_all(root.join(format!("{take}_OriginalDNG/CAM0"))).unwrap();
+        }
+        let vr = Settings::default();
+        let raw = |name: &str, eye: u32, fps: f32| clip(&root.join(name), SourceKind::X6Raw, eye, fps, &vr);
+        let plan = |batch: &[super::BatchItem], opts: &ExportOptions| {
+            let run: Vec<usize> = (0..batch.len()).collect();
+            App::join_enhanced_plan(batch, &run, exports_of(batch, opts))
+        };
+        let big = ExportOptions { enhanced_resolution: R16k, ..Default::default() };
+        // Two takes that could both read enhanced frames: their folders are
+        // looked through, and the parts agree either way.
+        let two = [raw("A", 3840, 59.94), raw("B", 3840, 59.94)];
+        let (immersive, enhanced, check) = plan(&two, &big).unwrap();
+        let check = check.expect("a look");
+        assert_eq!((immersive, enhanced), (false, None));
+        assert!(check.exports.iter().all(|e| e.is_some()) && check.exports.len() == 2);
+        assert_eq!((check.agree_plain.clone(), check.agree_enhanced.clone()), (Ok(()), Ok(())));
+        // A clip of another camera beside them: read from the capture
+        // whatever the folders hold, which are looked through for the note.
+        let mixed = [raw("A", 3840, 29.97), clip(Path::new("/nonexistent/in.osv"), SourceKind::DjiOsv, 3840, 29.97, &vr)];
+        let (_, enhanced, check) = plan(&mixed, &big).unwrap();
+        let check = check.expect("a look");
+        assert_eq!(enhanced, None);
+        assert_eq!(check.exports.iter().map(|e| e.is_some()).collect::<Vec<_>>(), vec![true, false]);
+        assert_eq!((check.agree_plain.clone(), check.agree_enhanced.clone()), (Ok(()), Ok(())));
+        // No take with a folder: nothing to look for.
+        let plain = [raw("X", 3840, 59.94), raw("Y", 3840, 59.94)];
+        let (_, enhanced, check) = plan(&plain, &big).unwrap();
+        assert!(enhanced == Some(false) && check.is_none());
+        // The option off: the same.
+        let (_, enhanced, check) = plan(&two, &ExportOptions { raw_use_enhanced: false, ..big }).unwrap();
+        assert!(enhanced == Some(false) && check.is_none());
+
+        // Takes of two frame sizes, each at its own size without enhanced
+        // frames and at 16384 × 8192 with: one file only from enhanced
+        // frames, which the look decides.
+        let sizes = [raw("A", 3840, 59.94), raw("C", 5760, 59.94)];
+        let own = ExportOptions { resolution: Native, ..big };
+        let (_, enhanced, check) = plan(&sizes, &own).unwrap();
+        let check = check.expect("a look");
+        assert_eq!(enhanced, None);
+        assert_eq!(check.agree_enhanced, Ok(()));
+        let why = check.agree_plain.clone().expect_err("two sizes from the capture");
+        assert!(why.contains("7680 × 3840") && why.contains("11520 × 5760") && why.contains('A') && why.contains('C'), "{why}");
+        // And the other way round: one size without, each its own with.
+        let (_, _, check) = plan(&sizes, &ExportOptions { enhanced_resolution: Native, ..Default::default() }).unwrap();
+        let check = check.expect("a look");
+        assert_eq!(check.agree_plain, Ok(()));
+        assert!(check.agree_enhanced.clone().expect_err("two sizes from enhanced frames").contains("11520 × 5760"));
+        // Clips that cannot be one file either way are refused at once.
+        let rates = [raw("A", 3840, 59.94), raw("B", 3840, 29.97)];
+        let why = plan(&rates, &big).err().expect("two frame rates");
+        assert!(why.contains("59.94") && why.contains("29.97"), "{why}");
+        // So is a mixed run whose clips do not agree from the capture.
+        let odd = [raw("A", 3840, 29.97), clip(Path::new("/nonexistent/in.insv"), SourceKind::Insta360Insv, 3712, 29.97, &vr)];
+        assert!(plan(&odd, &own).is_err());
+        // Two Lens Space clips, one stabilized and one not, where such
+        // clips can be joined at all: refused at once, with what mends it.
+        if vr180_pipeline::join::immersive_available() {
+            let lens = Settings { fisheye_output_mode: FisheyeOutputMode::Fisheye, lens_space: crate::decoder::LensSpaceLens::Camera, ..Default::default() };
+            let fixed = Settings { stabilize: false, ..lens.clone() };
+            let osv = |name: &str, s: &Settings| clip(Path::new(name), SourceKind::DjiOsv, 3840, 29.97, s);
+            let why = plan(&[osv("/nonexistent/a.osv", &lens), osv("/nonexistent/b.osv", &fixed)], &own).err().expect("two frames");
+            assert!(why.contains("8448 × 4224") && why.contains("7680 × 3840") && why.contains(super::JOIN_LENS_MARGIN_HINT), "{why}");
+            assert!(plan(&[osv("/nonexistent/a.osv", &lens), osv("/nonexistent/b.osv", &lens)], &own).is_ok());
+            // Clips of two sizes are another matter: no word of stabilization.
+            let why = plan(&[osv("/nonexistent/a.osv", &lens), clip(Path::new("/nonexistent/c.insv"), SourceKind::Insta360Insv, 3712, 29.97, &lens)], &own).err().expect("two frames");
+            assert!(!why.contains(super::JOIN_LENS_MARGIN_HINT), "{why}");
+        }
+        // The look: a part that could read none is not asked, and a look
+        // that is stopped has no answer.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let (_, _, check) = plan(&mixed, &big).unwrap();
+        // (The folders here hold no frame: no enhanced one either.)
+        assert_eq!(super::join_look(&check.unwrap().exports, &stop), Some(vec![Some(false), None]));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, _, check) = plan(&two, &big).unwrap();
+        assert_eq!(super::join_look(&check.unwrap().exports, &stop), None);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // On a real take (named by `VR180_ENHANCED_TAKE`, with
+        // `VR180_ENHANCED_AT=<a>,<b>`: seconds at which a stretch of a fifth
+        // of a second holds an enhanced frame, and holds none; skipped
+        // without them): a clip whose stretch holds one and a clip whose
+        // stretch does not are read from the capture, both, and the second
+        // is named; two clips that both hold one are read from enhanced
+        // frames.
+        let Some(sample) = std::env::var_os("VR180_ENHANCED_TAKE").map(PathBuf::from) else { return };
+        let at: Vec<f64> = std::env::var("VR180_ENHANCED_AT").unwrap_or_default().split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        let (Some(&with), Some(&without)) = (at.first(), at.get(1)) else { return };
+        let stretch = |t_in: f64, t_out: f64| clip(&sample, SourceKind::X6Raw, 3840, 29.97, &Settings { trim_in_s: Some(t_in), trim_out_s: Some(t_out), ..Default::default() });
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let outcome = |batch: &[super::BatchItem]| {
+            let (_, enhanced, check) = plan(batch, &big).unwrap();
+            assert_eq!(enhanced, None);
+            let check = check.expect("a look");
+            let found = super::join_look(&check.exports, &stop).expect("an answer");
+            (found.clone(), join_check_outcome(&found, batch.len()), check.agree_plain, check.agree_enhanced)
+        };
+        let (found, decided, agree_plain, agree_enhanced) = outcome(&[stretch(with, with + 0.2), stretch(without, without + 0.2)]);
+        assert_eq!((found, decided), (vec![Some(true), Some(false)], (false, Some(1))));
+        assert_eq!((agree_plain, agree_enhanced), (Ok(()), Ok(())));
+        let (found, decided, _, _) = outcome(&[stretch(with, with + 0.2), stretch(with + 0.05, with + 0.15)]);
+        assert_eq!((found, decided), (vec![Some(true), Some(true)], (true, None)));
+        // A part's export does as the run decided.
+        let exports = exports_of(&[stretch(with, with + 0.2)], &big);
+        assert!(exports[0].reads_enhanced_frames());
+        let mut kept = exports[0].clone();
+        assert!(kept.settle_raw_enhanced(kept.trim_in_s, kept.trim_out_s));
+        assert_eq!((kept.eye_w, kept.eye_h), (8192, 8192));
+        let mut left_out = exports[0].clone().without_enhanced_frames();
+        assert!(!left_out.reads_enhanced_frames() && !left_out.settle_raw_enhanced(left_out.trim_in_s, left_out.trim_out_s));
+        assert_eq!((left_out.eye_w, left_out.eye_h, left_out.raw_enhanced_dir.clone()), (4096, 4096, None));
     }
 
     #[test]
@@ -2567,7 +2794,7 @@ mod join_and_project_tests {
         }
         for text in [
             JOIN_HOVER, PROJECT_HOVER, "Join into one file", "Join all", "Join selected", "Export the ticked clips as one file",
-            "joining the clips…", "Not joined", "the clips exported so far are in", "was not exported", "no clip was exported",
+            "joining the clips…", "enhanced frames left out", "Looking for enhanced frames…", super::JOIN_LENS_MARGIN_HINT, "Not joined", "the clips exported so far are in", "was not exported", "no clip was exported",
             "stopped", "Drag to change the order", "is a still photo: a joined file is made of video clips.",
             "A DNG sequence is a folder of frames for each clip: it cannot be joined. Pick a video format in Format.",
             "A spatial video cannot be joined: export the clips one by one, or pick H.265 or ProRes in Format.",
@@ -4274,6 +4501,16 @@ impl BatchItem {
         self.offline.is_none()
     }
 
+    /// What a joined run's plan takes from this entry's own probe, with
+    /// whether its export reads its take's enhanced frames (`enhanced`).
+    fn part_source(&self, enhanced: bool) -> vr180_pipeline::join::PartSource {
+        vr180_pipeline::join::PartSource {
+            one_eye: self.single_eye(),
+            eye: native_eye_dims(self.source_kind, self.fisheye_eye_w, self.fisheye_eye_h, self.width, self.height),
+            enhanced,
+        }
+    }
+
     /// The source holds ONE eye (see `ClipInfo::single_eye`).
     fn single_eye(&self) -> bool {
         self.x6.is_some_and(|x| x.single_eye) || self.raw_one_lens
@@ -4345,6 +4582,8 @@ struct BatchSummary {
     elapsed: std::time::Duration,
     /// The one file the run's clips were joined into.
     joined: Option<PathBuf>,
+    /// What the run said of that file (enhanced frames it left out).
+    note: Option<String>,
     /// The run wrote the takes themselves, and what of them.
     take: Option<TakeJob>,
 }
@@ -4388,6 +4627,105 @@ struct JoinRun {
     immersive: bool,
     /// The parts are written; they are being put together.
     joining: bool,
+    /// The parts read their takes' enhanced frames: all of them, or none
+    /// (the user's rule for a joined file, 2026-11-26: only when every clip
+    /// to be joined uses them, else they are left out). `None` while the
+    /// takes' folders are looked through, as the run's first job.
+    enhanced: Option<bool>,
+    /// That job ([`JoinCheck`]), for a run with a clip that could read
+    /// enhanced frames.
+    check: Option<JoinCheck>,
+    /// Enhanced frames were left out although some clips have them
+    /// ([`join_enhanced_note`]): said in the export bar while the run is in
+    /// flight, and with its summary.
+    note: Option<String>,
+}
+
+/// One eye of a clip at its own size, pixels: the eye of a fisheye source's
+/// frame, the side of a `.360` clip's cross, the frame itself of anything
+/// else. What an export at the clip's own size writes per eye, and what a
+/// lens frame is sized against.
+fn native_eye_dims(kind: vr180_pipeline::SourceKind, fisheye_eye_w: u32, fisheye_eye_h: u32, width: u32, height: u32) -> (u32, u32) {
+    if fisheye_eye_w > 0 {
+        (fisheye_eye_w, fisheye_eye_h)
+    } else if kind.is_eac() {
+        // GoPro EAC: a SQUARE half-equirect per eye at the cross's
+        // native resolution (cross_w = 2·tile_w + 1920; 3936 on Max).
+        // Full quality vs the preview's ≤2048-clamped square.
+        let cross_w = 2 * (width.saturating_sub(1920) / 4) + 1920;
+        (cross_w.max(512), cross_w.max(512))
+    } else {
+        (width.max(512), height.max(512))
+    }
+}
+
+/// The first job of a joined run with raw takes that could read enhanced
+/// frames: each such take's folder is looked through for its clip's
+/// stretch, on a thread (thousands of files, often on a share). The parts
+/// of one file read enhanced frames all or none
+/// (`vr180_pipeline::join::parts_read_enhanced`), so the run has to know
+/// before its first clip is written.
+struct JoinCheck {
+    /// The parts' exports as planned, in the run's order, for those that
+    /// could read enhanced frames (`None`: no raw take, no folder beside
+    /// it, or the option off). Taken when the job starts.
+    exports: Vec<Option<vr180_pipeline::fisheye_export::FisheyeExportConfig>>,
+    /// Whether the parts come out as one shape read from the capture, and
+    /// read from enhanced frames (`Err`: why not, for the user). A size
+    /// picked for enhanced frames is not the size picked without them.
+    agree_plain: Result<(), String>,
+    agree_enhanced: Result<(), String>,
+    /// The lookup's answer when the job is done: a part a place, `None`
+    /// for a part that was not asked.
+    found: Option<crossbeam_channel::Receiver<Vec<Option<bool>>>>,
+}
+
+/// The look itself ([`JoinCheck`]): for each part that could read enhanced
+/// frames (`Some`), whether its take's folder holds some for the part's
+/// stretch. `None`: stopped (`stop`) before it was through. Lists folders:
+/// for a thread of its own.
+fn join_look(
+    exports: &[Option<vr180_pipeline::fisheye_export::FisheyeExportConfig>],
+    stop: &std::sync::atomic::AtomicBool,
+) -> Option<Vec<Option<bool>>> {
+    let mut found = Vec::with_capacity(exports.len());
+    for export in exports {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        found.push(export.as_ref().map(|export| export.reads_enhanced_frames()));
+    }
+    Some(found)
+}
+
+/// What a joined run does once its takes' folders are looked through
+/// (`found`: a part a place, `None` for a clip that could read no enhanced
+/// frames; `parts`: the run's clips): whether its parts read enhanced
+/// frames, which they do when every one of them has some; and, where they
+/// are left out although some clips have them, the place of the first clip
+/// that has none, to be named. An answer that does not cover the run (the
+/// look was stopped) reads the capture.
+fn join_check_outcome(found: &[Option<bool>], parts: usize) -> (bool, Option<usize>) {
+    if found.len() != parts {
+        return (false, None);
+    }
+    let has: Vec<bool> = found.iter().map(|f| *f == Some(true)).collect();
+    let enhanced = vr180_pipeline::join::parts_read_enhanced(&has);
+    (enhanced, if enhanced || !has.contains(&true) { None } else { has.iter().position(|h| !h) })
+}
+
+/// What a refusal adds for two Lens Space clips whose frames differ because
+/// one is stabilized and the other is not.
+const JOIN_LENS_MARGIN_HINT: &str = "In the Lens Space view a stabilized clip's frame is larger than that of a clip that is not stabilized: turn stabilization on for both clips, or off for both.";
+
+/// What a joined run says when it leaves enhanced frames out although some
+/// of its clips have them: `name` is the first clip that has none.
+fn join_enhanced_note(name: &str, zh: bool) -> String {
+    if zh {
+        format!("未使用增强帧：合成文件只有在每个片段都有增强帧时才读取，{name} 没有。")
+    } else {
+        format!("Enhanced frames left out: a joined file reads them only when every clip has some, and {name} has none.")
+    }
 }
 
 /// A clip's name in a message: its file's (a raw take's folder's).
@@ -5050,6 +5388,8 @@ fn tr_zh(en: &'static str) -> &'static str {
         "Join selected" => "合成所选",
         "Export the ticked clips as one file" => "把勾选的片段导出为一个文件",
         "joining the clips…" => "正在合成片段…",
+        "enhanced frames left out" => "未使用增强帧",
+        "In the Lens Space view a stabilized clip's frame is larger than that of a clip that is not stabilized: turn stabilization on for both clips, or off for both." => "镜头空间视图下，开启防抖的片段画幅比未开启防抖的片段大：请让两个片段都开启防抖，或都关闭。",
         "Not joined" => "未合成",
         "the clips exported so far are in" => "已导出的片段保留在",
         "was not exported" => "没有导出成功",
@@ -5699,6 +6039,7 @@ impl App {
             join_clips: false,
             join_run: None,
             joined_output: None,
+            joined_note: None,
             join_notice: None,
             project_path: None,
             project_saved: None,
@@ -6228,17 +6569,7 @@ impl App {
         // half-equirect VR180 we use the source eye dims (or fallback
         // for non-fisheye sources). For fisheye pass-through we use
         // the raw source eye dims since the projection is bypassed.
-        let native_eye = if fisheye_eye_w > 0 {
-            (fisheye_eye_w, fisheye_eye_h)
-        } else if source_kind.is_eac() {
-            // GoPro EAC: a SQUARE half-equirect per eye at the cross's
-            // native resolution (cross_w = 2·tile_w + 1920; 3936 on Max).
-            // Full quality vs the preview's ≤2048-clamped square.
-            let cross_w = 2 * (width.saturating_sub(1920) / 4) + 1920;
-            (cross_w.max(512), cross_w.max(512))
-        } else {
-            (width.max(512), height.max(512))
-        };
+        let native_eye = native_eye_dims(source_kind, fisheye_eye_w, fisheye_eye_h, width, height);
         let (mut eye_w, mut eye_h) = native_eye;
         // 8K target: render the projection itself at 4096² per eye
         // (8192×4096 SBS). The projection samples the native source
@@ -6870,7 +7201,10 @@ impl App {
         if job.handle.is_finished() {
             let job = self.export_job.take().unwrap();
             let result = job.handle.join();
+            // (A joined run's look for enhanced frames writes nothing.)
+            let looked = self.batch_current.is_none() && self.join_run.as_ref().is_some_and(|j| j.enhanced.is_none());
             match &result {
+                Ok(Ok(())) if looked => tracing::info!("join: the takes' folders looked through in {:.2?}", job.started_at.elapsed()),
                 Ok(Ok(())) => tracing::info!(
                     "export: done → {} (took {:.2?})",
                     job.output_path.display(), job.started_at.elapsed()
@@ -6918,6 +7252,10 @@ impl App {
                     self.end_join(Err(tr("stopped").to_string()));
                     self.end_take_run();
                 }
+            } else if self.join_run.as_ref().is_some_and(|j| j.enhanced.is_none()) {
+                // The run's first job: its takes' folders looked through
+                // for enhanced frames.
+                self.end_join_check();
             } else if self.join_run.as_ref().is_some_and(|j| j.joining) {
                 // The run's last job: its parts put together.
                 self.end_join(match result {
@@ -7255,8 +7593,7 @@ impl App {
     /// `opts`: where it and its parts go. `Err`: why these clips cannot be
     /// one file, for the user. Nothing is written yet.
     fn plan_join(&self, run: &[usize], opts: &ExportOptions) -> Result<JoinRun, String> {
-        use vr180_pipeline::join::{mismatch, planned_part, Unjoinable};
-        let mut first: Option<(String, vr180_pipeline::join::PlannedPart)> = None;
+        let mut exports = Vec::with_capacity(run.len());
         let mut parts = Vec::with_capacity(run.len());
         for (k, &i) in run.iter().enumerate() {
             let item = &self.batch[i];
@@ -7268,19 +7605,7 @@ impl App {
                 return Err(tr("A DNG sequence is a folder of frames for each clip: it cannot be joined. Pick a video format in Format.").to_string());
             }
             // (No segments: what the export writes does not depend on them.)
-            let (cfg, _) = self.export_cfg_for(i, std::path::Path::new(""), opts, Vec::new());
-            let part = planned_part(&cfg, item.single_eye()).map_err(|why| match why {
-                Unjoinable::Spatial => tr("A spatial video cannot be joined: export the clips one by one, or pick H.265 or ProRes in Format.").to_string(),
-                Unjoinable::LensFrame => format!("{name} {}", tr("is in the Lens Space view through the camera's lens. Clips in that view are joined as an Apple Immersive Video file, which needs macOS 26 or later and two eyes in every clip: here they cannot be joined. Pick the Equidistant lens, or another view.")),
-            })?;
-            match &first {
-                None => first = Some((name, part)),
-                Some((first_name, a)) => {
-                    if let Some(why) = mismatch(a, &part) {
-                        return Err(join_mismatch_text(first_name, &name, why, cur_lang() == Lang::Zh));
-                    }
-                }
-            }
+            exports.push(self.export_cfg_for(i, std::path::Path::new(""), opts, Vec::new()).0);
             // A part is named as the clip's own export would be, with its
             // place in front: what is left behind when no file is joined
             // can be used as it is.
@@ -7288,6 +7613,7 @@ impl App {
                 item.settings.lens_frame_view(item.source_kind));
             parts.push((item.path.clone(), format!("{:02}_{}", k + 1, clip_label(&own))));
         }
+        let (immersive, enhanced, check) = Self::join_enhanced_plan(&self.batch, run, exports)?;
         let head = &self.batch[run[0]];
         let four_channel: Vec<bool> = run.iter().map(|&i| self.batch[i].four_channel_sound).collect();
         let sound = joined_sound(head.settings.audio_format, &four_channel).map_err(|odd| {
@@ -7295,7 +7621,6 @@ impl App {
             format!("{name} {}", tr("has no four-channel sound: a joined file with Ambisonic or APAC sound needs it in every clip. Set the first clip's Audio to Stereo, or leave this clip out."))
         })?;
         // (The parts agree on it: a lens frame beside anything else is another view.)
-        let immersive = first.as_ref().is_some_and(|(_, part)| part.immersive());
         let mut output = joined_output_for(&head.path, opts.codec_for(&head.export_settings(), false), head.single_eye(), immersive);
         if let Some(dir) = &self.batch_out_dir {
             if let Some(name) = output.file_name() {
@@ -7312,7 +7637,93 @@ impl App {
             sound,
             immersive,
             joining: false,
+            enhanced,
+            check,
+            note: None,
         })
+    }
+
+    /// What a joined run of `run` has to settle about enhanced frames, from
+    /// its parts' exports as planned (`exports`, in the run's order): every
+    /// part of the file reads them, or none does. A clip that cannot read
+    /// any (no raw take, no folder beside it, the option off) settles that
+    /// for the run; where a clip could, its folder is looked through first,
+    /// as the run's first job ([`JoinCheck`]). Returns whether the parts
+    /// are lens frames, what is settled already (`None`: the look decides)
+    /// and that job. `Err`: why these clips cannot be one file either way.
+    fn join_enhanced_plan(
+        batch: &[BatchItem],
+        run: &[usize],
+        exports: Vec<vr180_pipeline::fisheye_export::FisheyeExportConfig>,
+    ) -> Result<(bool, Option<bool>, Option<JoinCheck>), String> {
+        let could: Vec<bool> = exports.iter().map(|c| c.source_kind.is_raw_video() && c.raw_enhanced_dir.is_some()).collect();
+        let plain = Self::join_parts_agree(batch, run, &exports, false);
+        let (immersive, agree) = if !could.contains(&true) {
+            return Ok((plain?.immersive(), Some(false), None));
+        } else if could.contains(&false) {
+            // Read from the capture whatever the folders hold: they are
+            // looked through only to say so where frames are left out.
+            (plain?.immersive(), (Ok(()), Ok(())))
+        } else {
+            // A size picked for enhanced frames is not the size picked
+            // without them: which of the two the run's parts have to agree
+            // at is known once the folders are looked through. A refusal
+            // that is the same either way needs no look.
+            let with = Self::join_parts_agree(batch, run, &exports, true);
+            if let (Err(a), Err(b)) = (&plain, &with) {
+                if a == b {
+                    return Err(a.clone());
+                }
+            }
+            let immersive = [&plain, &with].into_iter().find_map(|p| p.as_ref().ok()).is_some_and(|p| p.immersive());
+            (immersive, (plain.map(|_| ()), with.map(|_| ())))
+        };
+        Ok((immersive, None, Some(JoinCheck {
+            exports: exports.into_iter().zip(&could).map(|(export, could)| could.then_some(export)).collect(),
+            agree_plain: agree.0,
+            agree_enhanced: agree.1,
+            found: None,
+        })))
+    }
+
+    /// The parts a joined run of `run` would be made of, from their exports
+    /// as planned (`exports`, in the run's order), read from their takes'
+    /// enhanced frames (`enhanced`) or from the capture: the first part
+    /// when they come out as one shape, or why they do not, for the user.
+    /// Each part's frame is the one its export writes
+    /// (`vr180_pipeline::join::planned_part`).
+    fn join_parts_agree(
+        batch: &[BatchItem],
+        run: &[usize],
+        exports: &[vr180_pipeline::fisheye_export::FisheyeExportConfig],
+        enhanced: bool,
+    ) -> Result<vr180_pipeline::join::PlannedPart, String> {
+        use vr180_pipeline::join::{mismatch, planned_part, Mismatch, Unjoinable};
+        let mut first: Option<(String, vr180_pipeline::join::PlannedPart, bool)> = None;
+        for (&i, cfg) in run.iter().zip(exports) {
+            let item = &batch[i];
+            let name = clip_label(&item.path);
+            let part = planned_part(cfg, item.part_source(enhanced)).map_err(|why| match why {
+                Unjoinable::Spatial => tr("A spatial video cannot be joined: export the clips one by one, or pick H.265 or ProRes in Format.").to_string(),
+                Unjoinable::LensFrame => format!("{name} {}", tr("is in the Lens Space view through the camera's lens. Clips in that view are joined as an Apple Immersive Video file, which needs macOS 26 or later and two eyes in every clip: here they cannot be joined. Pick the Equidistant lens, or another view.")),
+            })?;
+            match &first {
+                None => first = Some((name, part, cfg.stabilize)),
+                Some((first_name, a, stabilized)) => {
+                    if let Some(why) = mismatch(a, &part) {
+                        let mut text = join_mismatch_text(first_name, &name, why, cur_lang() == Lang::Zh);
+                        // Two lens frames of one size apart by the
+                        // stabilizer's margin: no size in Format mends that.
+                        if matches!(why, Mismatch::Frame(..)) && a.immersive() && part.immersive() && *stabilized != cfg.stabilize {
+                            text.push(' ');
+                            text.push_str(tr(JOIN_LENS_MARGIN_HINT));
+                        }
+                        return Err(text);
+                    }
+                }
+            }
+        }
+        first.map(|(_, part, _)| part).ok_or_else(|| tr("no clip was exported").to_string())
     }
 
     /// Start a run of `run` (list entries, in order): as ONE file when that
@@ -7325,6 +7736,7 @@ impl App {
         }
         self.join_notice = None;
         self.joined_output = None;
+        self.joined_note = None;
         if self.join_clips && run.len() >= 2 {
             match self.plan_join(&run, &self.export_opts) {
                 Ok(plan) => {
@@ -7370,6 +7782,7 @@ impl App {
         }
         self.join_notice = None;
         self.joined_output = None;
+        self.joined_note = None;
         self.join_run = None;
         queue_put_aside(&mut self.batch, &clips);
         if matches!(run.job, TakeJob::Archive(_)) {
@@ -7467,6 +7880,7 @@ impl App {
                 let _ = std::fs::remove_dir(&join.parts_dir);
                 tracing::info!("join: done → {}", join.output.display());
                 self.joined_output = Some(join.output);
+                self.joined_note = join.note;
             }
             Err(why) => {
                 let why = why.trim_start_matches("ffmpeg: ").trim_start_matches("join: ").to_string();
@@ -7517,7 +7931,7 @@ impl App {
         let take = self.take_run.map(|run| run.job);
         if done + failed > 0 {
             self.notify_run_complete(done, failed, elapsed, n_run, take);
-            self.last_batch_summary = Some(BatchSummary { done, failed, elapsed, joined: self.joined_output.take(), take });
+            self.last_batch_summary = Some(BatchSummary { done, failed, elapsed, joined: self.joined_output.take(), note: self.joined_note.take(), take });
         }
         self.end_take_run();
     }
@@ -7544,6 +7958,12 @@ impl App {
     }
 
     fn start_next_batch_item(&mut self) {
+        // A joined run that has yet to learn whether its parts read
+        // enhanced frames looks for them before its first clip.
+        if self.join_run.as_ref().is_some_and(|j| j.enhanced.is_none()) {
+            self.start_join_check();
+            return;
+        }
         let Some(idx) = self.batch.iter().position(|b| b.status == BatchStatus::Queued) else {
             // Queue drained. A run that writes one file puts its parts
             // together now; any other is complete.
@@ -7556,10 +7976,10 @@ impl App {
         // A clip of a joined run is written to its part.
         let part = self.join_run.as_ref().and_then(|j| {
             let k = j.parts.iter().position(|(clip, _)| *clip == self.batch[idx].path)?;
-            Some((k, j.parts[k].1.clone(), j.parts_dir.clone(), j.sound))
+            Some((k, j.parts[k].1.clone(), j.parts_dir.clone(), j.sound, j.enhanced.unwrap_or(false)))
         });
         let output = match &part {
-            Some((_, file, _, _)) => file.clone(),
+            Some((_, file, _, _, _)) => file.clone(),
             None => self.batch_output_for(&self.batch[idx], &opts),
         };
         let item_path = self.batch[idx].path.clone();
@@ -7569,7 +7989,11 @@ impl App {
             cfg.trim_in_s = None;
             cfg.trim_out_s = None;
         }
-        if let Some((k, _, dir, sound)) = &part {
+        if let Some((k, _, dir, sound, enhanced)) = &part {
+            // Enhanced frames: every part of the file reads them, or none.
+            if !enhanced {
+                cfg = cfg.without_enhanced_frames();
+            }
             // Every part carries what the joined file's one track is made
             // of: stereo, or the clip's four-channel sound field.
             cfg.audio_track = match sound {
@@ -7604,13 +8028,105 @@ impl App {
     fn stop_batch(&mut self) {
         self.batch_running = false;
         self.batch_opts = None;
-        let joining = self.join_run.as_ref().is_some_and(|j| j.joining);
+        // A joined run's own jobs: its first (the look for enhanced frames)
+        // and its last (the parts put together).
+        let joining = self.join_run.as_ref().is_some_and(|j| j.joining || j.enhanced.is_none());
         if let Some(job) = self.export_job.as_ref() {
             if self.batch_current.is_some() {
                 self.batch_skip_flag = true; // mark the cut-short item Skipped
                 job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             } else if joining {
                 job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// A joined run's first job, where a clip could read enhanced frames
+    /// ([`JoinCheck`]): each such take's folder is looked through for its
+    /// clip's stretch, on a thread. The run goes on from
+    /// [`Self::end_join_check`].
+    fn start_join_check(&mut self) {
+        let Some(join) = self.join_run.as_mut() else { return };
+        let Some(check) = join.check.as_mut() else {
+            // Nothing to look up: the parts read the capture.
+            join.enhanced = Some(false);
+            self.start_next_batch_item();
+            return;
+        };
+        let exports = std::mem::take(&mut check.exports);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        check.found = Some(rx);
+        let output = join.output.clone();
+        // (The bar shows the last export's note until an export clears it.)
+        vr180_pipeline::fisheye_export::set_export_path_note(None);
+        tracing::info!("join: looking for enhanced frames in {} of {} takes", exports.iter().flatten().count(), exports.len());
+        let (_progress_tx, progress_rx) = crossbeam_channel::bounded(1);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = cancel.clone();
+        let handle = std::thread::spawn(move || -> vr180_pipeline::Result<()> {
+            if let Some(found) = join_look(&exports, &stop) {
+                let _ = tx.send(found);
+            }
+            Ok(())
+        });
+        self.export_job = Some(ExportJob {
+            output_path: output,
+            handle,
+            progress_rx,
+            cancel,
+            last_progress: None,
+            started_at: std::time::Instant::now(),
+        });
+    }
+
+    /// The look for enhanced frames is over: the run's parts read them, all
+    /// or none, and are checked against each other at the size that goes
+    /// with it. Then the first clip is written, or the run ends here with
+    /// the reason and nothing exported.
+    fn end_join_check(&mut self) {
+        let Some(join) = self.join_run.as_mut() else { return };
+        let check = join.check.take();
+        let found: Vec<Option<bool>> = check.as_ref()
+            .and_then(|c| c.found.as_ref())
+            .and_then(|rx| rx.try_recv().ok())
+            .unwrap_or_default();
+        let unqueue = |batch: &mut Vec<BatchItem>| {
+            for b in batch.iter_mut() {
+                if b.status == BatchStatus::Queued {
+                    b.status = BatchStatus::Idle;
+                }
+            }
+        };
+        if !self.batch_running {
+            // Stopped by the user while it looked.
+            unqueue(&mut self.batch);
+            self.end_join(Err(tr("stopped").to_string()));
+            return;
+        }
+        let (enhanced, odd) = join_check_outcome(&found, join.parts.len());
+        // Left out although some clips have them: say which clip has none.
+        let note = odd.map(|odd| join_enhanced_note(&join.parts.get(odd).map(|(clip, _)| clip_label(clip)).unwrap_or_default(), cur_lang() == Lang::Zh));
+        let agree = match check {
+            Some(c) => if enhanced { c.agree_enhanced } else { c.agree_plain },
+            None => Ok(()),
+        };
+        tracing::info!("join: enhanced frames found {found:?}: the parts read {}", if enhanced { "them" } else { "the capture" });
+        match agree {
+            Ok(()) => {
+                if let Some(note) = &note {
+                    tracing::warn!("join: {note}");
+                }
+                join.enhanced = Some(enhanced);
+                join.note = note;
+                self.start_next_batch_item();
+            }
+            Err(why) => {
+                // These clips cannot be one file after all: none is exported.
+                tracing::warn!("join: not started: {why}");
+                unqueue(&mut self.batch);
+                self.join_run = None;
+                self.join_notice = Some(why);
+                self.finish_run();
             }
         }
     }
@@ -9358,6 +9874,10 @@ impl App {
         // The run's last job: its parts being put together.
         let join_progress = self.join_run.as_ref().filter(|j| j.joining)
             .map(|_| self.export_job.as_ref().and_then(|j| j.last_progress));
+        // Its first: the takes' folders looked through for enhanced frames.
+        let join_checking = self.join_run.as_ref().is_some_and(|j| j.enhanced.is_none());
+        // Enhanced frames left out of a joined run, and why.
+        let join_note = self.join_run.as_ref().and_then(|j| j.note.clone());
         let can_export = self.export_job.is_none() && !running;
         let has_active = self.active_clip.is_some();
         let out_label = match &self.batch_out_dir {
@@ -9450,9 +9970,10 @@ impl App {
                 format!("✓ {} · {took}", run_done_text(s.done, s.take, cur_lang() == Lang::Zh))
             };
             // The joined file's name goes with the hint.
-            let hover = match s.joined.as_deref().map(clip_label) {
-                Some(name) => format!("{name}\n{}", tr("Click to dismiss")),
-                None => tr("Click to dismiss").to_string(),
+            let hover = match (s.joined.as_deref().map(clip_label), &s.note) {
+                (Some(name), Some(note)) => format!("{name}\n{note}\n{}", tr("Click to dismiss")),
+                (Some(name), None) => format!("{name}\n{}", tr("Click to dismiss")),
+                (None, _) => tr("Click to dismiss").to_string(),
             };
             (txt, col, hover)
         });
@@ -9478,6 +9999,9 @@ impl App {
                         ui.add(egui::ProgressBar::new(frac).desired_width(240.0)
                             .text(format!("{:.0}%", frac * 100.0)));
                         ui.label(RichText::new(tr("joining the clips…")).color(Color32::from_rgb(120, 180, 255)));
+                    } else if join_checking {
+                        ui.spinner();
+                        ui.label(RichText::new(tr("Looking for enhanced frames…")).color(Color32::from_rgb(120, 180, 255)));
                     } else if let Some((done, total, eta, pos, n)) = run_progress {
                         let frac = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
                         ui.add(egui::ProgressBar::new(frac).desired_width(240.0)
@@ -9505,6 +10029,13 @@ impl App {
                     if let Some(note) = vr180_pipeline::fisheye_export::export_path_note() {
                         ui.label(RichText::new(format!("⚠ {note}"))
                             .small().color(Color32::from_rgb(230, 160, 90)));
+                    }
+                    // A joined run that leaves enhanced frames out says so
+                    // (the bar has room for a few words: why is on hover).
+                    if let Some(note) = &join_note {
+                        ui.label(RichText::new(format!("⚠ {}", tr("enhanced frames left out")))
+                            .small().color(Color32::from_rgb(230, 160, 90)))
+                            .on_hover_text(note);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button(tr("Stop")).clicked() { do_stop = true; }

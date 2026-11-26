@@ -3643,6 +3643,51 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       the joined file is whole and stay where they are, and that is said,
       when there is none. "Export all" with the box ticked is the whole
       list, whatever was exported before.
+    - **Planned at the frame written; enhanced frames all or none**
+      (2026-11-26). Two things a plan got wrong, both found only when the
+      finished parts were joined (`join_obstacle`: "… is HEVC 16384 × 8192,
+      … is HEVC 8192 × 4096"). (1) `planned_part` read `cfg.eye_w`, the
+      size ASKED for: a stabilized lens frame is written with its margin
+      and a raw take read from enhanced frames at `raw_enhanced_eye`. Now
+      `fisheye_export::written_eye_dims(cfg, src_eye, enhanced)`: the
+      sizes `settle_raw_enhanced` and `resolve_lens_frame` /
+      `resolve_eac_lens_frame` come to, without opening the source
+      (`lens_frame_written` = `lens_frame_request` + the margin; a test
+      holds it to `size_lens_frame` over 84 cases), and
+      `planned_part(cfg, PartSource { one_eye, eye, enhanced })`, `eye`
+      from the GUI's own probe (`native_eye_dims`, which
+      `build_export_cfg` uses too). (2) The user's rule for enhanced
+      frames in a joined file: only when every clip to be joined uses
+      them, else they are ignored. `join::parts_read_enhanced`; a part
+      that does not read them is exported as
+      `cfg.without_enhanced_frames()`. Whether a part would read some
+      (`cfg.reads_enhanced_frames()`) means listing its take's folder, so
+      a run with a clip that could (a raw take, its folder there, the
+      option on) starts with a job of its own, the run's FIRST
+      `ExportJob` as the join is its last: `plan_join` →
+      `join_enhanced_plan` (the parts compared both ways,
+      `join_parts_agree(.., enhanced)`: a refusal that is the same either
+      way is said at once, else a `JoinCheck` holds both verdicts) →
+      `start_next_batch_item` sees `JoinRun.enhanced == None` →
+      `start_join_check` (`join_look` on a thread) → `poll_export_job` →
+      `end_join_check` (`join_check_outcome`: all found → enhanced; the
+      verdict that goes with it; a refusal ends the run with nothing
+      exported) → the clips. The bar shows "Looking for enhanced frames…",
+      Stop works, and where frames are left out although some clips have
+      them the bar says "enhanced frames left out" (hover:
+      `join_enhanced_note`, the first clip without) and the summary's
+      hover repeats it. Two lens frames apart by the stabilizer's margin
+      alone get a sentence more in the refusal (`JOIN_LENS_MARGIN_HINT`:
+      no size in Format mends that). Tests: the two in `join_and_project_tests`
+      (`a_part_is_planned_at_the_frame_it_is_written_at`,
+      `a_joined_file_reads_enhanced_frames_in_every_part_or_in_none`, the
+      second also on a sample take with one enhanced frame where that is
+      at hand). With the harness on a take whose first stretch is
+      enhanced: two parts from the capture join (8192 × 4096), two from
+      enhanced frames join (16384 × 8192), one of each is refused at the
+      join as before, which the plan now never gets to. NOT run in the
+      app's window: `start_join_check` / `end_join_check` and the Stop
+      during the look are read, not exercised.
     - **The list.** `reorder.rs`: a row's handle is a drag source and the
       row the place to let go (`Move::place_of` renumbers `active_clip`,
       `batch_current` and `batch_run_indices`). Its glyph is one the
@@ -3945,7 +3990,7 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       test; asked once), `helpers::spawn_aivu_wrap` (macOS; progress lines,
       cancel kills it and removes the file). `join::Described::LensFrame`,
       `PlannedPart::immersive()`, `immersive_available()`;
-      `planned_part_where(cfg, one_eye, immersive)` is `planned_part` with
+      `planned_part_where(cfg, source, immersive)` is `planned_part` with
       the system's answer handed in (what the tests use).
       `join::join_immersive(parts, output, sound, …)`: `join_parts` (the
       old `join_exports` body, which now also returns each part's packet
