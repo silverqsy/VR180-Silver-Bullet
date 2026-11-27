@@ -26,6 +26,7 @@
 //! | `VR180_PROBE_STILL` | `1` also renders each moment's zoom still (the magnifier's and the snapshot's picture) | off |
 //! | `VR180_PROBE_STILL_CAP` | width cap of that still's eye, `0` = native | `2048` |
 //! | `VR180_PROBE_FRAME_STATS` | `1` leaves the clip unsampled: every frame is developed and toned by its own statistics, as the app shows it until the clip's are in | the clip's |
+//! | `VR180_PROBE_TRIM` | the clip's in and out points, seconds: `<in>,<out>` (a moment after the out point is shown there, as a click on the timeline does) | none |
 
 use super::{
     start_decoder, DecodedFrame, DecoderCommand, DecoderConfig, DecoderControl, DetailCache,
@@ -77,6 +78,11 @@ fn settings_for(path: &Path) -> anyhow::Result<Settings> {
         let v: Vec<f32> = v.split(',').map(|x| x.trim().parse()).collect::<Result<_, _>>()?;
         let g = |i: usize| v.get(i).copied().unwrap_or(0.0);
         s.tone = vr180_pipeline::tone_linear::ToneSettings { exposure: g(0), contrast: g(1), highlights: g(2), shadows: g(3), whites: g(4), blacks: g(5) };
+    }
+    if let Some(v) = switch("VR180_PROBE_TRIM") {
+        let v: Vec<f64> = v.split(',').map(|x| x.trim().parse()).collect::<Result<_, _>>()?;
+        anyhow::ensure!(v.len() == 2, "VR180_PROBE_TRIM: <in>,<out>");
+        (s.trim_in_s, s.trim_out_s) = (Some(v[0]), Some(v[1]));
     }
     let kind = vr180_pipeline::source_kind::detect(path)?;
     if switch("VR180_PROBE_LENS").as_deref() == Some("equidistant") {
