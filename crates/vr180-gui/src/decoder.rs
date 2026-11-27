@@ -251,8 +251,9 @@ pub struct Settings {
     pub still_native_zoom: bool,
     pub preview_eye_w: u32,
     /// Trim-in time in seconds. `None` = play from clip start.
-    /// Honored by the decoder loop: when playback hits `trim_out_s`,
-    /// it seeks back to `trim_in_s` (or 0 if `None`) and continues.
+    /// Honored by the decoder loop: when playback that began at or before
+    /// `trim_out_s` reaches it, it seeks back to `trim_in_s` (or 0 if
+    /// `None`) and continues (`trim_loop_target`).
     pub trim_in_s: Option<f64>,
     /// Trim-out time in seconds. `None` = play to clip end.
     pub trim_out_s: Option<f64>,
@@ -2672,6 +2673,8 @@ fn run_fisheye_frames<F: PreviewFeed>(
     let mut start_wall: Option<std::time::Instant> = None;
     let mut paused_offset = std::time::Duration::ZERO;
     let mut force_render_next = false;
+    // The time of the first frame since the last seek (`frame_idx` 0).
+    let mut run_first_s = 0.0_f64;
     // The feed starts at the trim's in point.
     if let Some(t_in) = control.settings.read().trim_in_s.filter(|t| *t > 0.001) {
         time_offset = t_in;
@@ -2780,9 +2783,10 @@ fn run_fisheye_frames<F: PreviewFeed>(
         let pts_s = feed.pts_s();
         let frame_t_rel = preview_frame_t_rel(pts_s, time_offset, frame_idx as f64 * preview_dt);
         let frame_t_abs = time_offset + frame_t_rel;
+        if frame_idx == 0 { run_first_s = frame_t_abs; }
         let trim = {
             let s = control.settings.read();
-            s.trim_out_s.filter(|out_t| frame_t_abs >= *out_t).map(|_| s.trim_in_s.unwrap_or(0.0))
+            trim_loop_target((s.trim_in_s, s.trim_out_s), !control.paused.load(Ordering::SeqCst), run_first_s, frame_t_abs, dt)
         };
         if let Some(in_t) = trim {
             restart_at!(in_t);
@@ -3203,6 +3207,8 @@ fn run_fisheye_zerocopy(
 
     // ── Pacing / control state (same model as run_fisheye) ───────────
     let mut frame_idx: u32 = 0;
+    // The time of the first frame since the last seek (`frame_idx` 0).
+    let mut run_first_s = 0.0_f64;
     let mut time_offset: f64 = 0.0;
     let mut skipped_count: u32 = 0;
     let mut start_wall: Option<std::time::Instant> = None;
@@ -3347,20 +3353,18 @@ fn run_fisheye_zerocopy(
         // `preview_frame_t_rel`: holds through dropped-frame holes).
         let frame_t_rel = preview_frame_t_rel(fh.pair.pts_s(), time_offset, frame_idx as f64 * preview_dt);
         let frame_t_abs = time_offset + frame_t_rel;
-        {
+        if frame_idx == 0 { run_first_s = frame_t_abs; }
+        let trim = {
             let s = control.settings.read();
-            if let Some(out_t) = s.trim_out_s {
-                if frame_t_abs >= out_t {
-                    let in_t = s.trim_in_s.unwrap_or(0.0);
-                    drop(s);
-                    let _ = iter_cmd_tx.send(IterCmd::Seek(in_t));
-                    expected_gen = expected_gen.wrapping_add(1);
-                    time_offset = in_t; frame_idx = 0; start_wall = None;
-                    paused_offset = std::time::Duration::ZERO; force_render_next = true;
-                    let prev = current.take(); retire_frame(&mut retire_q, prev);
-                    continue 'main;
-                }
-            }
+            trim_loop_target((s.trim_in_s, s.trim_out_s), !control.paused.load(Ordering::SeqCst), run_first_s, frame_t_abs, dt)
+        };
+        if let Some(in_t) = trim {
+            let _ = iter_cmd_tx.send(IterCmd::Seek(in_t));
+            expected_gen = expected_gen.wrapping_add(1);
+            time_offset = in_t; frame_idx = 0; start_wall = None;
+            paused_offset = std::time::Duration::ZERO; force_render_next = true;
+            let prev = current.take(); retire_frame(&mut retire_q, prev);
+            continue 'main;
         }
 
         // Pause handling (re-render current source on slider changes).
@@ -4354,6 +4358,8 @@ fn run_zero_copy(
 
     // segment-relative frame index (resets to 0 on Seek / trim loop)
     let mut frame_idx: u32 = 0;
+    // The time of the first frame since the last seek (`frame_idx` 0).
+    let mut run_first_s = 0.0_f64;
     // clip-absolute time at frame_idx = 0 (updated on Seek / trim loop)
     let mut time_offset: f64 = 0.0;
     let mut skipped_count: u32 = 0;
@@ -4460,23 +4466,21 @@ fn run_zero_copy(
         //       segment-relative.
         let frame_t_rel = frame_idx as f64 * dt;
         let frame_t_abs = time_offset + frame_t_rel;
-        {
+        if frame_idx == 0 { run_first_s = frame_t_abs; }
+        let trim = {
             let s = control.settings.read();
-            if let Some(out_t) = s.trim_out_s {
-                if frame_t_abs >= out_t {
-                    let in_t = s.trim_in_s.unwrap_or(0.0);
-                    drop(s);
-                    held_pair = None;
-                    decoder.seek(in_t)?;
-                    time_offset = in_t;
-                    frame_idx = 0;
-                    start_wall = None;
-                    paused_offset = std::time::Duration::ZERO;
-                    force_render_next = true;
-                    tracing::debug!("decoder (zc): trim loop → {:.3}s", in_t);
-                    continue 'main;
-                }
-            }
+            trim_loop_target((s.trim_in_s, s.trim_out_s), !control.paused.load(Ordering::SeqCst), run_first_s, frame_t_abs, dt)
+        };
+        if let Some(in_t) = trim {
+            held_pair = None;
+            decoder.seek(in_t)?;
+            time_offset = in_t;
+            frame_idx = 0;
+            start_wall = None;
+            paused_offset = std::time::Duration::ZERO;
+            force_render_next = true;
+            tracing::debug!("decoder (zc): trim loop → {:.3}s", in_t);
+            continue 'main;
         }
 
         // ── 3. Settings changed → rebuild per-eye bundle. Done before
@@ -4733,6 +4737,8 @@ fn run_eac_zerocopy(
     }
 
     let mut frame_idx: u32 = 0;
+    // The time of the first frame since the last seek (`frame_idx` 0).
+    let mut run_first_s = 0.0_f64;
     let mut time_offset: f64 = 0.0;
     let mut skipped_count: u32 = 0;
     let mut start_wall: Option<std::time::Instant> = None;
@@ -4795,22 +4801,20 @@ fn run_eac_zerocopy(
 
         let frame_t_rel = frame_idx as f64 * dt;
         let frame_t_abs = time_offset + frame_t_rel;
-        {
+        if frame_idx == 0 { run_first_s = frame_t_abs; }
+        let trim = {
             let s = control.settings.read();
-            if let Some(out_t) = s.trim_out_s {
-                if frame_t_abs >= out_t {
-                    let in_t = s.trim_in_s.unwrap_or(0.0);
-                    drop(s);
-                    held_pair = None;
-                    iter.seek(in_t)?;
-                    time_offset = in_t;
-                    frame_idx = 0;
-                    start_wall = None;
-                    paused_offset = std::time::Duration::ZERO;
-                    force_render_next = true;
-                    continue 'main;
-                }
-            }
+            trim_loop_target((s.trim_in_s, s.trim_out_s), !control.paused.load(Ordering::SeqCst), run_first_s, frame_t_abs, dt)
+        };
+        if let Some(in_t) = trim {
+            held_pair = None;
+            iter.seek(in_t)?;
+            time_offset = in_t;
+            frame_idx = 0;
+            start_wall = None;
+            paused_offset = std::time::Duration::ZERO;
+            force_render_next = true;
+            continue 'main;
         }
 
         let current_gen = control.settings_generation.load(Ordering::SeqCst);
@@ -4993,6 +4997,8 @@ fn run_cpu_assemble(
     let mut cross_b = vec![0u8; cw * cw * 3];
 
     let mut frame_idx: u32 = 0;
+    // The time of the first frame since the last seek (`frame_idx` 0).
+    let mut run_first_s = 0.0_f64;
     let mut time_offset: f64 = 0.0;
     let mut skipped_count: u32 = 0;
     let mut start_wall: Option<std::time::Instant> = None;
@@ -5053,22 +5059,20 @@ fn run_cpu_assemble(
 
         let frame_t_rel = frame_idx as f64 * dt;
         let frame_t_abs = time_offset + frame_t_rel;
-        {
+        if frame_idx == 0 { run_first_s = frame_t_abs; }
+        let trim = {
             let s = control.settings.read();
-            if let Some(out_t) = s.trim_out_s {
-                if frame_t_abs >= out_t {
-                    let in_t = s.trim_in_s.unwrap_or(0.0);
-                    drop(s);
-                    held_pair = None;
-                    decoder.seek(in_t)?;
-                    time_offset = in_t;
-                    frame_idx = 0;
-                    start_wall = None;
-                    paused_offset = std::time::Duration::ZERO;
-                    force_render_next = true;
-                    continue 'main;
-                }
-            }
+            trim_loop_target((s.trim_in_s, s.trim_out_s), !control.paused.load(Ordering::SeqCst), run_first_s, frame_t_abs, dt)
+        };
+        if let Some(in_t) = trim {
+            held_pair = None;
+            decoder.seek(in_t)?;
+            time_offset = in_t;
+            frame_idx = 0;
+            start_wall = None;
+            paused_offset = std::time::Duration::ZERO;
+            force_render_next = true;
+            continue 'main;
         }
 
         let current_gen = control.settings_generation.load(Ordering::SeqCst);
@@ -5490,6 +5494,20 @@ fn frame_time_s(pts_s: f64, row: u32, dt: f64) -> f64 {
 /// target, and the pacing clock rebases through `Duration::from_secs_f64`.
 fn preview_frame_t_rel(pts_s: f64, time_offset: f64, counter_rel: f64) -> f64 {
     if pts_s.is_finite() && pts_s >= 0.0 { (pts_s - time_offset).max(0.0) } else { counter_rel }
+}
+
+/// Where the preview goes on from when it is at the trim's out point: the
+/// in point, or the clip's start when there is none. Only playback goes
+/// back, and only a stretch that began at the out point's frame or before
+/// it (`first_s`: its first frame since the last seek, within half a frame
+/// period `dt` of the out point when on that frame: a seek lands on the
+/// frame nearest its target). A paused frame stays on screen, and a click
+/// on the timeline after the out point shows that part of the clip and
+/// plays on through it, so a later out point can be looked for.
+fn trim_loop_target(trim: (Option<f64>, Option<f64>), playing: bool, first_s: f64, frame_s: f64, dt: f64) -> Option<f64> {
+    let (trim_in, trim_out) = trim;
+    let out = trim_out?;
+    (playing && first_s <= out + 0.5 * dt && frame_s >= out).then(|| trim_in.unwrap_or(0.0))
 }
 
 fn gpmf_cache(
@@ -6592,5 +6610,41 @@ mod preview_dims_tests {
         let (_tex, ow, oh) = render_still_from_pair(&pipeline, kind, &disc, 30.0, &pair, None, None, 0, None, None, None)
             .expect("render").expect("a still");
         assert_eq!((ow, oh), (2 * h, h));
+    }
+}
+
+#[cfg(test)]
+mod trim_loop_tests {
+    use super::trim_loop_target;
+
+    const DT: f64 = 1.0 / 60.0;
+
+    #[test]
+    fn playback_from_inside_the_trim_goes_back_at_the_out_point() {
+        let trim = (Some(5.0), Some(20.0));
+        assert_eq!(trim_loop_target(trim, true, 10.0, 20.0 - DT, DT), None);
+        assert_eq!(trim_loop_target(trim, true, 10.0, 20.0, DT), Some(5.0));
+        assert_eq!(trim_loop_target((None, Some(20.0)), true, 10.0, 20.0, DT), Some(0.0));
+        assert_eq!(trim_loop_target((Some(5.0), None), true, 10.0, 999.0, DT), None);
+    }
+
+    #[test]
+    fn a_frame_after_the_out_point_can_be_looked_at_and_played_from() {
+        let trim = (Some(5.0), Some(20.0));
+        // A click after the out point, paused and then playing on.
+        assert_eq!(trim_loop_target(trim, false, 25.0, 25.0, DT), None);
+        assert_eq!(trim_loop_target(trim, true, 25.0, 31.0, DT), None);
+        // The frame right after the out point's.
+        assert_eq!(trim_loop_target(trim, true, 20.0 + DT, 20.0 + DT, DT), None);
+        // Paused on the out point's frame (an out point just set there).
+        assert_eq!(trim_loop_target(trim, false, 10.0, 20.0, DT), None);
+    }
+
+    #[test]
+    fn playing_from_the_out_points_frame_goes_back() {
+        let trim = (Some(5.0), Some(20.0));
+        assert_eq!(trim_loop_target(trim, true, 20.0, 20.0, DT), Some(5.0));
+        // The seek's first frame a little off the time clicked.
+        assert_eq!(trim_loop_target(trim, true, 20.0 + 0.4 * DT, 20.0 + 0.4 * DT, DT), Some(5.0));
     }
 }
