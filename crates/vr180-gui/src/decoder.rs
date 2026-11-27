@@ -1297,11 +1297,30 @@ impl DecoderControl {
     pub fn wake_ui(&self) {
         if let Some(c) = &self.ui_ctx { c.request_repaint(); }
     }
+
+    /// The picture went back to `in_s` at the trim's out point: the UI
+    /// takes the sound there too ([`Self::take_trim_loop`]). Called by the
+    /// worker once its seek there is done.
+    pub fn note_trim_loop(&self, in_s: f64) {
+        tracing::info!("preview: out point reached, back to the in point at {in_s:.3} s");
+        *self.trim_looped_to.lock() = Some(in_s);
+        self.wake_ui();
+    }
+
+    /// Where the picture went back to at the trim's out point since the
+    /// last call, if it did.
+    pub fn take_trim_loop(&self) -> Option<f64> {
+        self.trim_looped_to.lock().take()
+    }
 }
 
 #[derive(Default)]
 pub struct DecoderControl {
     pub paused: AtomicBool,
+    /// Set by the worker when the picture went back to the in point at the
+    /// trim's out point (`note_trim_loop`): the sound player plays on by
+    /// itself and moves only when told, so the UI takes it there too.
+    pub trim_looped_to: parking_lot::Mutex<Option<f64>>,
     /// The UI's egui context, for [`Self::wake_ui`] (`None` headless).
     pub ui_ctx: Option<egui::Context>,
     pub settings: RwLock<Settings>,
@@ -2790,6 +2809,7 @@ fn run_fisheye_frames<F: PreviewFeed>(
         };
         if let Some(in_t) = trim {
             restart_at!(in_t);
+            control.note_trim_loop(in_t);
             continue 'main;
         }
 
@@ -3364,6 +3384,7 @@ fn run_fisheye_zerocopy(
             time_offset = in_t; frame_idx = 0; start_wall = None;
             paused_offset = std::time::Duration::ZERO; force_render_next = true;
             let prev = current.take(); retire_frame(&mut retire_q, prev);
+            control.note_trim_loop(in_t);
             continue 'main;
         }
 
@@ -4480,6 +4501,7 @@ fn run_zero_copy(
             paused_offset = std::time::Duration::ZERO;
             force_render_next = true;
             tracing::debug!("decoder (zc): trim loop → {:.3}s", in_t);
+            control.note_trim_loop(in_t);
             continue 'main;
         }
 
@@ -4814,6 +4836,7 @@ fn run_eac_zerocopy(
             start_wall = None;
             paused_offset = std::time::Duration::ZERO;
             force_render_next = true;
+            control.note_trim_loop(in_t);
             continue 'main;
         }
 
@@ -5072,6 +5095,7 @@ fn run_cpu_assemble(
             start_wall = None;
             paused_offset = std::time::Duration::ZERO;
             force_render_next = true;
+            control.note_trim_loop(in_t);
             continue 'main;
         }
 
@@ -6638,6 +6662,16 @@ mod trim_loop_tests {
         assert_eq!(trim_loop_target(trim, true, 20.0 + DT, 20.0 + DT, DT), None);
         // Paused on the out point's frame (an out point just set there).
         assert_eq!(trim_loop_target(trim, false, 10.0, 20.0, DT), None);
+    }
+
+    #[test]
+    fn the_jump_back_is_handed_to_the_ui_once() {
+        let control = super::DecoderControl::default();
+        assert_eq!(control.take_trim_loop(), None);
+        control.note_trim_loop(4.0);
+        control.note_trim_loop(5.0);
+        assert_eq!(control.take_trim_loop(), Some(5.0));
+        assert_eq!(control.take_trim_loop(), None);
     }
 
     #[test]

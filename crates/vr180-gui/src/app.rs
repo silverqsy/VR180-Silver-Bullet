@@ -8386,6 +8386,13 @@ impl App {
     /// are dropped — which is the right behavior for "real-time, no
     /// buffering" playback.
     fn drain_frames(&mut self, ctx: &egui::Context) {
+        // The picture went back to the in point at the trim's out point:
+        // the sound goes there too.
+        if let Some(t) = self.control.as_ref().and_then(|c| c.take_trim_loop()) {
+            if let Some(player) = &self.audio_player {
+                player.seek_to(t);
+            }
+        }
         let Some(rx) = &self.frame_rx else { return; };
         let mut newest: Option<DecodedFrame> = None;
         let mut drained = 0u32;
@@ -9266,6 +9273,7 @@ impl App {
             imu_progress: Default::default(),
             stab_loading: std::sync::atomic::AtomicBool::new(false),
             eye_match_readout: parking_lot::Mutex::new(None),
+            trim_looped_to: parking_lot::Mutex::new(None),
         });
         let pipeline = self.pipeline.clone();
         let control_for_thread = control.clone();
@@ -9391,6 +9399,11 @@ impl App {
     fn seek_to(&mut self, target_s: f64) {
         if !self.decoder_alive {
             self.spawn_decoder(false);
+        }
+        // A jump back at the out point not yet followed is overtaken by this
+        // seek: the sound goes where the picture is sent now.
+        if let Some(ctl) = &self.control {
+            let _ = ctl.take_trim_loop();
         }
         if let Some(tx) = &self.cmd_tx {
             let _ = tx.send(DecoderCommand::Seek(target_s.max(0.0)));
