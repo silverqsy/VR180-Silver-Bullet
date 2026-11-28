@@ -5635,6 +5635,54 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       entry for the two fixes of 2026-11-27). The sound at the jump back
       has not been listened to on either system.
 
+55. **`app.rs` in parts (2026-11-28, Mac; nothing the app does is
+    changed).** The file had grown to 15300 lines. It is 1670 now: the
+    `App` struct, `App::new`, and the frame (`impl eframe::App`). The rest
+    is in modules of `app`, files under `crates/vr180-gui/src/app/`.
+    - **The parts.** `lang` (the language switch, `tr` / `tr_zh`, the CJK
+      font); `take_tools` (item 50: the archive copy and the camera
+      original DNGs); `export_options` (`ExportOptions`, the sizes, what
+      is known of enhanced frames, the Format window); `clips`
+      (`BatchItem`, `ClipFacts`, settings carried between clips);
+      `joined` (item 36's run); `export_run` (`build_export_cfg`, the
+      jobs, the export bar); `session` (projects and the last session);
+      `load` (imports, the load on its thread); `clip_info` (`ClipInfo`,
+      File info); `playback` (`spawn_decoder`, the frames the worker
+      sends, the timeline, a clip's statistics, `maybe_push_settings`);
+      `display_3d`; `snapshot`; `dialogs` (file pickers, the updater's
+      popover); `panels` (source, stabilization, sound, rolling shutter,
+      `fine_slider`); `panel_colour`; `panel_lens`. The eight test modules
+      are files under their old names (`take_tests`, `export_size_tests`
+      and the rest), still modules of `app`: no test is renamed.
+    - **How the parts see each other.** Each part begins `use super::*;`
+      and `app` takes each part's names (`use part::*;`), so a name means
+      what it meant in the one file. A function an older item says is in
+      `app.rs` is found with `grep -rn "fn name" crates/vr180-gui/src/app*`.
+      What had no visibility became `pub(super)` where it moved: an item,
+      the fields of a moved struct, a method. A NEW item of a part needs
+      `pub(super)` to be seen from another part, and the compiler says so;
+      `App`'s fields stay private, its parts are inside `app`.
+      `export_options` is handed on to the crate (`pub(crate) use`): the
+      preview probe names `ExportOptions`. `panel_colour`'s names are
+      taken for the tests alone, `panel_lens`'s not at all: nothing else
+      names them.
+    - **Checked.** Every item, every method of `App` and every test, 481
+      in all: the same tokens before and after but for that visibility,
+      compared by a parser, and every comment line is still there. Three
+      doc comments were then put right by hand (`8a3a4ef`: the line on
+      what `App` is, the doc lines of long-gone functions on
+      `lang_config_path`, and `spawn_decoder` moved from the load to the
+      playback). The same 43 warnings; tests braw 6, core 63, fisheye 87,
+      gui 91 under the same names, pipeline 313; the type check with the
+      macOS branches off has its one known line; the release build draws
+      the 59 preview lines of the kinds list as stored.
+    - **Windows: not compiled there.** The 88 Windows-gated pieces of the
+      workspace read the same in both trees. Three are in the app's
+      functions: one stayed (`on_exit`), two went with their functions
+      (`draw_3d_display` in `display_3d.rs`, `export_device` in
+      `export_run.rs`). The 22 gates inside moved functions went with
+      their lines.
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`
