@@ -630,20 +630,41 @@ fn run_output(take: Option<TakeRun>, kind: vr180_pipeline::SourceKind, opts: &Ex
     }
 }
 
-/// The list entries a run of `job` started now would write: the ticked
-/// clips it is for, or the clip on screen (`active`) alone when none of
-/// those is ticked. An archive copy is made of a camera's take; the
-/// camera's own frames are written from any raw take.
-fn take_clips(batch: &[BatchItem], active: Option<usize>, job: TakeJob) -> Vec<usize> {
+/// Whose takes a run of the Source panel's tools writes. Each has a start
+/// button of its own: the tools stand under the facts of the clip on
+/// screen, so a run is of that clip, and a tick in the list sends no run
+/// elsewhere unless the button of the ticked clips is the one clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TakeSet {
+    /// The clip on screen, ticked or not.
+    OnScreen,
+    /// The clips ticked in the list.
+    Ticked,
+}
+
+/// The list entries a run of `job` for `of` started now would write: the
+/// clip on screen (`active`), or the ticked clips, where the run is for
+/// them. An archive copy is made of a camera's take; the camera's own
+/// frames are written from any raw take.
+fn take_clips(batch: &[BatchItem], active: Option<usize>, job: TakeJob, of: TakeSet) -> Vec<usize> {
     let fits = |b: &BatchItem| match job {
         TakeJob::Archive(_) => b.camera_take(),
         TakeJob::Originals => b.ready() && b.source_kind.is_raw_video(),
     };
-    let ticked: Vec<usize> = batch.iter().enumerate().filter(|(_, b)| b.selected && fits(b)).map(|(i, _)| i).collect();
-    if !ticked.is_empty() {
-        return ticked;
+    match of {
+        TakeSet::OnScreen => active.filter(|&i| batch.get(i).is_some_and(fits)).into_iter().collect(),
+        TakeSet::Ticked => batch.iter().enumerate().filter(|(_, b)| b.selected && fits(b)).map(|(i, _)| i).collect(),
     }
-    active.filter(|&i| batch.get(i).is_some_and(fits)).into_iter().collect()
+}
+
+/// The entries behind a tool's two start buttons: the clip on screen, and
+/// the ticked clips. The second has none where the only clip ticked is the
+/// one on screen: the first button is that run.
+fn take_buttons(batch: &[BatchItem], active: Option<usize>, job: TakeJob) -> (Vec<usize>, Vec<usize>) {
+    let on_screen = take_clips(batch, active, job, TakeSet::OnScreen);
+    let ticked = take_clips(batch, active, job, TakeSet::Ticked);
+    let ticked = if ticked == on_screen { Vec::new() } else { ticked };
+    (on_screen, ticked)
 }
 
 /// A run that writes the takes themselves begins: the export queue's state
@@ -971,11 +992,16 @@ impl TakeView {
 }
 
 /// What the Source panel's take tools are shown for.
+#[derive(Default)]
 struct TakeToolsView<'a> {
-    /// The takes a run of archive copies started now would write, and
-    /// those a run of the camera's own frames would.
+    /// The take on screen, where a run of archive copies started now would
+    /// write it, and where a run of the camera's own frames would.
     archive: &'a [TakeView],
     originals: &'a [TakeView],
+    /// The ticked takes such runs would write, behind a start button of
+    /// their own ([`take_buttons`]).
+    archive_ticked: &'a [TakeView],
+    originals_ticked: &'a [TakeView],
     /// The copies the last runs made of takes in the list.
     copies: &'a [TakeCopy],
     /// The takes the last run could not write: what it was to write, the
@@ -990,7 +1016,8 @@ struct TakeToolsView<'a> {
 /// What was asked for there.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TakeAsk {
-    Start(TakeRun),
+    /// A run, and whose takes it is of.
+    Start(TakeRun, TakeSet),
     /// The size picked is to be kept for the next launch.
     Keep,
 }
@@ -1009,6 +1036,10 @@ const TAKE_COPY_SOURCE_NOTE: &str = "This clip is an archive copy of a take: a c
 const TAKE_ORIGINALS_NOTE: &str = "Every frame as the sensor recorded it: one Bayer DNG per eye, named by the camera's frame number. No projection, no stabilization, no grading — for running the frames through a raw converter first.";
 const TAKE_ORIGINALS_PLACE_NOTE: &str = "The folder of that name beside the take is also where the app looks for enhanced frames and for Camera Raw settings.";
 const TAKE_LOSSY_SOURCE_NOTE: &str = "This clip is a lossy archive copy: the frames written are the copy's, close to what the sensor recorded but not the same.";
+const TAKE_LOSSY_TICKED_NOTE: &str = "Lossy archive copies are among the ticked clips: the frames written of those are the copies', close to what the sensor recorded but not the same.";
+/// Over the takes of each start button, where a tool shows both.
+const TAKE_ON_SCREEN_TITLE: &str = "This take";
+const TAKE_TICKED_TITLE: &str = "Ticked takes";
 const TAKE_COPIED_NOTE: &str = "The take can now be moved away or deleted. That is yours to do: the app moves and deletes nothing. Once the take is gone the app reads its copy in its place, as long as the copy stays beside where the take was, or in the output folder.";
 const STAND_IN_HOVER: &str = "The take this clip belongs to is not at hand: its archive copy is read in its place. When the take is back, it is read again.";
 const TAKE_BUSY_HOVER: &str = "A run is in flight: this can start when it is over.";
@@ -1146,17 +1177,22 @@ fn take_place_text(takes: &[TakeView], job: TakeJob, out_dir: Option<&str>, zh: 
     }
 }
 
-/// What the button that starts a run of `n` takes says.
-fn take_start_label(job: TakeJob, n: usize, zh: bool) -> String {
-    match (job, n, zh) {
-        (TakeJob::Archive(_), 1, true) => "制作存档副本".into(),
-        (TakeJob::Archive(_), 1, false) => "Make the archive copy".into(),
-        (TakeJob::Archive(_), n, true) => format!("制作 {n} 个存档副本"),
-        (TakeJob::Archive(_), n, false) => format!("Make {n} archive copies"),
-        (TakeJob::Originals, 1, true) => "导出相机原片 DNG".into(),
-        (TakeJob::Originals, 1, false) => "Write the camera original DNGs".into(),
-        (TakeJob::Originals, n, true) => format!("导出 {n} 条素材的相机原片 DNG"),
-        (TakeJob::Originals, n, false) => format!("Write the camera original DNGs of {n} takes"),
+/// What the button that starts a run says: what the run writes, and whose
+/// takes it is of (`n` of them, where they are the ticked ones).
+fn take_start_label(job: TakeJob, of: TakeSet, n: usize, zh: bool) -> String {
+    let several = of == TakeSet::Ticked && n != 1;
+    let what = match (job, zh) {
+        (TakeJob::Archive(_), true) => "制作存档副本",
+        (TakeJob::Archive(_), false) if several => "Make the archive copies",
+        (TakeJob::Archive(_), false) => "Make the archive copy",
+        (TakeJob::Originals, true) => "导出相机原片 DNG",
+        (TakeJob::Originals, false) => "Write the camera original DNGs",
+    };
+    match (of, zh) {
+        (TakeSet::OnScreen, true) => format!("{what}：当前素材"),
+        (TakeSet::OnScreen, false) => format!("{what}: this take"),
+        (TakeSet::Ticked, true) => format!("{what}：勾选的 {n} 条"),
+        (TakeSet::Ticked, false) => format!("{what}: {n} ticked take{}", if several { "s" } else { "" }),
     }
 }
 
@@ -3018,8 +3054,13 @@ mod take_tests {
         let two = [cut.clone(), take("OTHER", 60.0, (None, None))];
         assert_eq!(take_place_text(&two, archive, None, false), "Written beside the take: <take>_Archive");
         assert_eq!(take_place_text(&two, TakeJob::Originals, Some("Disk"), true), "写到输出文件夹 Disk：<素材名>_OriginalDNG");
-        assert_eq!((take_start_label(archive, 1, false), take_start_label(archive, 3, true)), ("Make the archive copy".into(), "制作 3 个存档副本".into()));
-        assert_eq!((take_start_label(TakeJob::Originals, 1, true), take_start_label(TakeJob::Originals, 2, false)), ("导出相机原片 DNG".into(), "Write the camera original DNGs of 2 takes".into()));
+        // What a start button says: what its run writes, and whose takes it is of.
+        let (this, ticked) = (TakeSet::OnScreen, TakeSet::Ticked);
+        assert_eq!((take_start_label(archive, this, 1, false), take_start_label(archive, this, 1, true)), ("Make the archive copy: this take".into(), "制作存档副本：当前素材".into()));
+        assert_eq!((take_start_label(archive, ticked, 3, false), take_start_label(archive, ticked, 3, true)), ("Make the archive copies: 3 ticked takes".into(), "制作存档副本：勾选的 3 条".into()));
+        assert_eq!((take_start_label(archive, ticked, 1, false), take_start_label(archive, ticked, 1, true)), ("Make the archive copy: 1 ticked take".into(), "制作存档副本：勾选的 1 条".into()));
+        assert_eq!((take_start_label(TakeJob::Originals, this, 1, true), take_start_label(TakeJob::Originals, this, 1, false)), ("导出相机原片 DNG：当前素材".into(), "Write the camera original DNGs: this take".into()));
+        assert_eq!((take_start_label(TakeJob::Originals, ticked, 2, true), take_start_label(TakeJob::Originals, ticked, 2, false)), ("导出相机原片 DNG：勾选的 2 条".into(), "Write the camera original DNGs: 2 ticked takes".into()));
         // A copy that was made, beside the same frames of its take.
         let copy = TakeCopy { dir: "/takes/TAKE_Archive".into(), bytes: 5_400_000_000, source_bytes: 8_000_000_000 };
         assert_eq!(take_copy_line(&copy, false), "✓ TAKE_Archive · 5.4 GB, 68% of the same frames in the take");
@@ -3033,7 +3074,7 @@ mod take_tests {
     #[test]
     fn the_take_tools_show_what_a_run_would_write_and_start_it() {
         let takes = [take("TAKE", 120.0, (Some(12.3), Some(45.6)))];
-        let view = TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true };
+        let view = TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true, ..Default::default() };
         let mut tools = TakeTools::default();
         // Closed: the heading and the two buttons, nothing else.
         let (text, ask) = shown(&mut tools, &view, None);
@@ -3047,14 +3088,16 @@ mod take_tests {
             "The corners of the frame outside the lens's image circle, 16% of its samples, hold no picture, only stray light and noise: they are stored as black.",
             "Range", "In to Out", "Whole take", "TAKE · 00:12.30 to 00:45.60 · 33.3 s of 2 min 0 s",
             "Only the 33.3 s between In and Out go into the copy", TAKE_STRETCH_NOTE,
-            "Take 96.0 GB · the part copied 26.6 GB · the copy about 8.3 GB", "Written beside the take: TAKE_Archive", "Make the archive copy",
+            "Take 96.0 GB · the part copied 26.6 GB · the copy about 8.3 GB", "Written beside the take: TAKE_Archive", "Make the archive copy: this take",
         ] {
             assert!(text.contains(said), "{said}: {text}");
         }
         assert!(!text.contains(TAKE_EXACT_NOTE) && !text.contains("Use the copy"), "{text}");
+        // One start button, for the take on screen: nothing is ticked besides it, and nothing is headed.
+        assert!(!text.contains("ticked") && !text.contains(TAKE_ON_SCREEN_TITLE) && !text.contains(TAKE_TICKED_TITLE), "{text}");
         // Its button starts that run, and nothing else.
-        let (_, ask) = shown(&mut tools, &view, Some("Make the archive copy"));
-        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(Some(1.0)), whole: false })));
+        let (_, ask) = shown(&mut tools, &view, Some("Make the archive copy: this take"));
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(Some(1.0)), whole: false }, TakeSet::OnScreen)));
 
         // The whole take: nothing is left out, and nothing is warned of.
         let (text, ask) = shown(&mut tools, &view, Some("Whole take"));
@@ -3066,8 +3109,8 @@ mod take_tests {
         assert_eq!((tools.size, ask), (ArchiveSize::Lossless, Some(TakeAsk::Keep)));
         assert!(text.contains(TAKE_EXACT_NOTE) && !text.contains(TAKE_LOSSY_NOTE) && !text.contains("the copy about"), "{text}");
         assert!(text.contains("stored as black"), "{text}");
-        let (_, ask) = shown(&mut tools, &view, Some("Make the archive copy"));
-        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(None), whole: true })));
+        let (_, ask) = shown(&mut tools, &view, Some("Make the archive copy: this take"));
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(None), whole: true }, TakeSet::OnScreen)));
         // A size picked by hand.
         let (text, _) = shown(&mut tools, &view, Some("Custom"));
         assert_eq!(tools.size, ArchiveSize::Custom);
@@ -3075,15 +3118,15 @@ mod take_tests {
         assert_eq!(tools.archive_run(&takes), TakeRun { job: TakeJob::Archive(Some(0.75)), whole: true });
 
         // While a run is in flight nothing starts.
-        let busy = TakeToolsView { idle: false, ..TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true } };
-        let (text, ask) = shown(&mut tools, &busy, Some("Make the archive copy"));
-        assert!(text.contains("Make the archive copy") && ask.is_none(), "{ask:?}");
+        let busy = TakeToolsView { idle: false, ..TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true, ..Default::default() } };
+        let (text, ask) = shown(&mut tools, &busy, Some("Make the archive copy: this take"));
+        assert!(text.contains("Make the archive copy: this take") && ask.is_none(), "{ask:?}");
 
         // A take without a trim, whose frame is the middle of the sensor: no range to pick, nothing left out, no
         // corner outside the image circle to say anything of.
         let plain = [TakeView { outside: 0.0, ..take("PLAIN", 60.0, (None, None)) }];
         let mut tools = TakeTools { open: Some(TakeTool::Archive), ..Default::default() };
-        let (text, _) = shown(&mut tools, &TakeToolsView { archive: &plain, originals: &plain, copies: &[], failed: &[], out_dir: Some("Disk"), idle: true }, None);
+        let (text, _) = shown(&mut tools, &TakeToolsView { archive: &plain, originals: &plain, copies: &[], failed: &[], out_dir: Some("Disk"), idle: true, ..Default::default() }, None);
         assert!(text.contains("PLAIN · whole take · 1 min 0 s") && text.contains("Written into the output folder Disk: PLAIN_Archive"), "{text}");
         assert!(!text.contains("Range") && !text.contains("In to Out") && !text.contains("left out") && !text.contains("image circle"), "{text}");
         assert_eq!(tools.archive_run(&plain), TakeRun { job: TakeJob::Archive(Some(1.0)), whole: true });
@@ -3094,12 +3137,33 @@ mod take_tests {
         assert_eq!(take_corners_note(&mixed, false).unwrap(), "The corners of a frame outside the lens's image circle hold no picture, only stray light and noise: they are stored as black.");
         assert!(take_corners_note(&mixed, true).unwrap().contains("存成黑"));
 
-        // Several takes: each with what is written of it, the rest of a long run by their number.
+        // Takes ticked in the list besides the one on screen: a second start button, for them. Each of the two
+        // stands under its heading and its takes, each take with what is written of it, the rest of a long run
+        // by their number.
         let many: Vec<TakeView> = (0..8).map(|k| take(&format!("T{k}"), 60.0, if k == 0 { (Some(10.0), None) } else { (None, None) })).collect();
-        let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &many, originals: &many, copies: &[], failed: &[], out_dir: None, idle: true }, Some("Make 8 archive copies"));
+        let both = TakeToolsView { archive: &plain, originals: &plain, archive_ticked: &many, originals_ticked: &many, idle: true, ..Default::default() };
+        let (text, ask) = shown(&mut tools, &both, Some("Make the archive copies: 8 ticked takes"));
         assert!(text.contains("T0 · 00:10.00 to 01:00.00 · 50.0 s of 1 min 0 s") && text.contains("T5 · whole take") && !text.contains("T6 ·") && text.contains("and 2 more"), "{text}");
         assert!(text.contains("1 of these takes are trimmed") && text.contains("<take>_Archive"), "{text}");
-        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(Some(1.0)), whole: false })));
+        assert_eq!(text.matches(TAKE_STRETCH_NOTE).count(), 1, "{text}");
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(Some(1.0)), whole: false }, TakeSet::Ticked)));
+        // The take on screen comes first, and its button starts a run of it alone: whole here, as it has no trim.
+        let lines: Vec<&str> = text.lines().collect();
+        let at = |said: &str| lines.iter().position(|line| *line == said).unwrap_or_else(|| panic!("{said}: {text}"));
+        let order = [TAKE_ON_SCREEN_TITLE, "PLAIN · whole take · 1 min 0 s", "Written beside the take: PLAIN_Archive", "Make the archive copy: this take",
+            TAKE_TICKED_TITLE, "T0 · 00:10.00 to 01:00.00 · 50.0 s of 1 min 0 s", "Written beside the take: <take>_Archive", "Make the archive copies: 8 ticked takes"];
+        assert!(order.windows(2).all(|pair| at(pair[0]) < at(pair[1])), "{text}");
+        let (_, ask) = shown(&mut tools, &both, Some("Make the archive copy: this take"));
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(Some(1.0)), whole: true }, TakeSet::OnScreen)));
+        // One take ticked, and another on screen: the first button is still the take on screen's, and the ticked
+        // take's own says that it is the ticked one.
+        let other = [take("OTHER", 600.0, (Some(39.3), Some(230.2)))];
+        let two = TakeToolsView { archive: &plain, originals: &plain, archive_ticked: &other, originals_ticked: &other, idle: true, ..Default::default() };
+        let (text, ask) = shown(&mut tools, &two, Some("Make the archive copy: this take"));
+        assert!(text.contains("Make the archive copy: 1 ticked take") && text.contains("Written beside the take: OTHER_Archive"), "{text}");
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(Some(1.0)), whole: true }, TakeSet::OnScreen)));
+        let (_, ask) = shown(&mut tools, &two, Some("Make the archive copy: 1 ticked take"));
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(Some(1.0)), whole: false }, TakeSet::Ticked)));
     }
 
     /// A clip that is an archive copy: no copy is made of it. The copies a
@@ -3110,21 +3174,28 @@ mod take_tests {
     fn copies_are_not_copied_and_the_takes_are_the_users_to_remove() {
         let on_screen = [TakeView { copy: true, ..take("TAKE_Archive", 33.3, (None, None)) }];
         let mut tools = TakeTools { open: Some(TakeTool::Archive), ..Default::default() };
-        let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &[], originals: &on_screen, copies: &[], failed: &[], out_dir: None, idle: true }, None);
+        let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &[], originals: &on_screen, copies: &[], failed: &[], out_dir: None, idle: true, ..Default::default() }, None);
         assert!(text.contains(TAKE_COPY_SOURCE_NOTE) && !text.contains("Make the archive copy") && !text.contains("Lossless"), "{text}");
         assert_eq!(ask, None);
+        // A take ticked in the list while a copy is on screen: the copy is still not copied, and the ticked take
+        // has its button.
+        let ticked = [take("OTHER", 60.0, (None, None))];
+        let view = TakeToolsView { originals: &on_screen, archive_ticked: &ticked, originals_ticked: &ticked, idle: true, ..Default::default() };
+        let (text, ask) = shown(&mut tools, &view, Some("Make the archive copy: 1 ticked take"));
+        assert!(text.contains(TAKE_COPY_SOURCE_NOTE) && text.contains("OTHER · whole take · 1 min 0 s") && !text.contains("this take") && !text.contains(TAKE_TICKED_TITLE), "{text}");
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Archive(Some(1.0)), whole: true }, TakeSet::Ticked)));
         // A take that is no copy and cannot be copied (its description did not read): nothing is claimed of it.
         let unread = [take("TAKE", 33.3, (None, None))];
-        let (text, _) = shown(&mut tools, &TakeToolsView { archive: &[], originals: &unread, copies: &[], failed: &[], out_dir: None, idle: true }, None);
+        let (text, _) = shown(&mut tools, &TakeToolsView { archive: &[], originals: &unread, copies: &[], failed: &[], out_dir: None, idle: true, ..Default::default() }, None);
         assert_eq!(text, CLOSED);
 
         let takes = [take("TAKE", 120.0, (None, None))];
         let copy = |name: &str| TakeCopy { dir: format!("/takes/{name}_Archive").into(), bytes: 5_400_000_000, source_bytes: 8_000_000_000 };
         // Before a copy is made nothing is said of removing the take.
-        let (text, _) = shown(&mut tools, &TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true }, None);
+        let (text, _) = shown(&mut tools, &TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true, ..Default::default() }, None);
         assert!(!text.contains(TAKE_COPIED_NOTE), "{text}");
         let two = [copy("TAKE"), copy("OTHER")];
-        let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &takes, originals: &takes, copies: &two, failed: &[], out_dir: None, idle: true }, None);
+        let (text, ask) = shown(&mut tools, &TakeToolsView { archive: &takes, originals: &takes, copies: &two, failed: &[], out_dir: None, idle: true, ..Default::default() }, None);
         assert!(text.contains("✓ TAKE_Archive · 5.4 GB, 68% of the same frames in the take") && text.contains("✓ OTHER_Archive") && text.contains(TAKE_COPIED_NOTE), "{text}");
         assert_eq!(ask, None);
         // The only thing to click there is what starts a run.
@@ -3140,15 +3211,24 @@ mod take_tests {
     fn the_cameras_own_frames_are_written_from_the_source_panel() {
         let takes = [take("TAKE", 120.0, (Some(12.3), Some(45.6)))];
         let mut tools = TakeTools::default();
-        let view = TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true };
+        let view = TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &[], out_dir: None, idle: true, ..Default::default() };
         let (text, _) = shown(&mut tools, &view, Some("Camera original DNGs"));
         assert_eq!(tools.open, Some(TakeTool::Originals));
-        for said in [TAKE_ORIGINALS_NOTE, "Range", "TAKE · 00:12.30 to 00:45.60 · 33.3 s of 2 min 0 s", "999 frames", "Written beside the take: TAKE_OriginalDNG", TAKE_ORIGINALS_PLACE_NOTE, "Write the camera original DNGs"] {
+        for said in [TAKE_ORIGINALS_NOTE, "Range", "TAKE · 00:12.30 to 00:45.60 · 33.3 s of 2 min 0 s", "999 frames", "Written beside the take: TAKE_OriginalDNG", TAKE_ORIGINALS_PLACE_NOTE, "Write the camera original DNGs: this take"] {
             assert!(text.contains(said), "{said}: {text}");
         }
-        assert!(!text.contains("Lossless") && !text.contains(TAKE_LOSSY_SOURCE_NOTE) && !text.contains("go into the copy"), "{text}");
-        let (_, ask) = shown(&mut tools, &view, Some("Write the camera original DNGs"));
-        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Originals, whole: false })));
+        assert!(!text.contains("Lossless") && !text.contains(TAKE_LOSSY_SOURCE_NOTE) && !text.contains("go into the copy") && !text.contains("ticked"), "{text}");
+        let (_, ask) = shown(&mut tools, &view, Some("Write the camera original DNGs: this take"));
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Originals, whole: false }, TakeSet::OnScreen)));
+        // The ticked takes have a start button of their own; a lossy copy among them is said to be one there.
+        let ticked = [take("OTHER", 60.0, (None, None)), TakeView { copy: true, lossy_copy: true, ..take("OLD_Archive", 10.0, (None, None)) }];
+        let both = TakeToolsView { archive: &takes, originals: &takes, originals_ticked: &ticked, idle: true, ..Default::default() };
+        let (text, ask) = shown(&mut tools, &both, Some("Write the camera original DNGs: 2 ticked takes"));
+        assert!(text.contains(TAKE_LOSSY_TICKED_NOTE) && !text.contains(TAKE_LOSSY_SOURCE_NOTE), "{text}");
+        assert!(text.contains(TAKE_ON_SCREEN_TITLE) && text.contains(TAKE_TICKED_TITLE) && text.contains("999 frames") && text.contains("2100 frames"), "{text}");
+        assert!(text.contains("Write the camera original DNGs: this take") && text.contains("Written beside the take: <take>_OriginalDNG"), "{text}");
+        assert_eq!(text.matches(TAKE_ORIGINALS_PLACE_NOTE).count(), 1, "{text}");
+        assert_eq!(ask, Some(TakeAsk::Start(TakeRun { job: TakeJob::Originals, whole: true }, TakeSet::Ticked)));
         let (text, _) = shown(&mut tools, &view, Some("Whole take"));
         assert!(tools.originals_whole && !tools.archive_whole && text.contains("3600 frames"), "{text}");
         // The other button closes this one's choices and opens its own.
@@ -3160,7 +3240,7 @@ mod take_tests {
 
         let lossy = [TakeView { copy: true, lossy_copy: true, ..take("TAKE_Archive", 33.3, (None, None)) }];
         let mut tools = TakeTools { open: Some(TakeTool::Originals), ..Default::default() };
-        let (text, _) = shown(&mut tools, &TakeToolsView { archive: &[], originals: &lossy, copies: &[], failed: &[], out_dir: Some("Disk"), idle: true }, None);
+        let (text, _) = shown(&mut tools, &TakeToolsView { archive: &[], originals: &lossy, copies: &[], failed: &[], out_dir: Some("Disk"), idle: true, ..Default::default() }, None);
         assert!(text.contains(TAKE_LOSSY_SOURCE_NOTE) && !text.contains(TAKE_ORIGINALS_PLACE_NOTE) && !text.contains("Range"), "{text}");
     }
 
@@ -3169,7 +3249,8 @@ mod take_tests {
     fn the_take_tools_read_in_both_languages() {
         for text in [
             TAKE_ARCHIVE_HOVER, TAKE_ARCHIVE_NOTE, TAKE_EXACT_NOTE, TAKE_LOSSY_NOTE, TAKE_STRETCH_NOTE, TAKE_COPY_SOURCE_NOTE, TAKE_ORIGINALS_NOTE,
-            TAKE_ORIGINALS_PLACE_NOTE, TAKE_LOSSY_SOURCE_NOTE, TAKE_COPIED_NOTE, STAND_IN_HOVER, TAKE_BUSY_HOVER,
+            TAKE_ORIGINALS_PLACE_NOTE, TAKE_LOSSY_SOURCE_NOTE, TAKE_LOSSY_TICKED_NOTE, TAKE_COPIED_NOTE, STAND_IN_HOVER, TAKE_BUSY_HOVER,
+            TAKE_ON_SCREEN_TITLE, TAKE_TICKED_TITLE,
             TAKE_TOOLS_TITLE, TAKE_ARCHIVE_LABEL, TAKE_ORIGINALS_LABEL, "Archive copy", TAKE_EXACT_LABEL, "High quality: 1 bit a pixel", "Custom", "bit a pixel",
             "Range", "In to Out", "Whole take", "In place of",
         ] {
@@ -3177,12 +3258,14 @@ mod take_tests {
         }
     }
 
-    /// Which takes a run writes: the ticked ones it is for, else the clip
-    /// on screen. A copy is made of a camera's take only.
+    /// Which takes a run writes: the clip on screen, or the ticked ones,
+    /// as the button clicked says. A tick in the list sends a run of the
+    /// clip on screen nowhere else. A copy is made of a camera's take only.
     #[test]
     fn which_takes_a_run_writes() {
         let raw = SourceKind::X6Raw;
         let idle = || BatchStatus::Idle;
+        let (this, ticked) = (TakeSet::OnScreen, TakeSet::Ticked);
         let mut batch = vec![
             entry("/takes/A", raw, true, None, idle()),
             entry("/takes/A_Archive", raw, true, Some(true), idle()),
@@ -3190,17 +3273,26 @@ mod take_tests {
             entry("/takes/C", raw, false, None, idle()),
         ];
         let (archive, originals) = (TakeJob::Archive(None), TakeJob::Originals);
-        assert_eq!(take_clips(&batch, Some(3), archive), vec![0]);
-        assert_eq!(take_clips(&batch, Some(3), originals), vec![0, 1]);
-        // Nothing ticked that the run is for: the clip on screen, where it is for that.
+        // The clip on screen, whatever is ticked elsewhere in the list.
+        assert_eq!((take_clips(&batch, Some(3), archive, this), take_clips(&batch, Some(3), originals, this)), (vec![3], vec![3]));
+        // The ticked ones the run is for, behind the other button.
+        assert_eq!((take_clips(&batch, Some(3), archive, ticked), take_clips(&batch, Some(3), originals, ticked)), (vec![0], vec![0, 1]));
+        assert_eq!((take_buttons(&batch, Some(3), archive), take_buttons(&batch, Some(3), originals)), ((vec![3], vec![0]), (vec![3], vec![0, 1])));
+        // The one on screen is ticked with others: it is in both runs.
+        assert_eq!(take_buttons(&batch, Some(0), originals), (vec![0], vec![0, 1]));
+        // It is the only one ticked that the run is for: one button, the first.
+        assert_eq!(take_buttons(&batch, Some(0), archive), (vec![0], vec![]));
+        // A copy on screen: none is made of it, and the ticked take keeps its button.
+        assert_eq!((take_buttons(&batch, Some(1), archive), take_buttons(&batch, Some(1), originals)), ((vec![], vec![0]), (vec![1], vec![0, 1])));
+        // Nothing ticked that the run is for: the clip on screen alone, where it is for that.
         batch.iter_mut().for_each(|b| b.selected = false);
         batch[2].selected = true;
-        assert_eq!((take_clips(&batch, Some(3), archive), take_clips(&batch, Some(3), originals)), (vec![3], vec![3]));
-        assert_eq!((take_clips(&batch, Some(1), archive), take_clips(&batch, Some(1), originals)), (vec![], vec![1]));
-        assert_eq!((take_clips(&batch, Some(2), archive), take_clips(&batch, None, originals)), (vec![], vec![]));
+        assert_eq!((take_buttons(&batch, Some(3), archive), take_buttons(&batch, Some(3), originals)), ((vec![3], vec![]), (vec![3], vec![])));
+        assert_eq!((take_buttons(&batch, Some(1), archive), take_buttons(&batch, Some(1), originals)), ((vec![], vec![]), (vec![1], vec![])));
+        assert_eq!((take_buttons(&batch, Some(2), archive), take_buttons(&batch, None, originals)), ((vec![], vec![]), (vec![], vec![])));
         // A take whose files are not at hand, or whose description did not read, is left out.
         batch[3].take = None;
-        assert_eq!(take_clips(&batch, Some(3), archive), Vec::<usize>::new());
+        assert_eq!(take_clips(&batch, Some(3), archive, this), Vec::<usize>::new());
         assert!(entry("/takes/A", raw, false, None, idle()).camera_take() && !entry("/takes/A", raw, false, Some(false), idle()).camera_take());
         assert_eq!((entry("/takes/A", raw, false, None, idle()).frame_samples(), BatchItem { raw_one_lens: true, ..entry("/takes/A", raw, false, None, idle()) }.frame_samples()), (2 * 5760 * 5760, 5760 * 5760));
     }
@@ -3238,7 +3330,7 @@ mod take_tests {
         // What could not be written is said under the button it belongs to.
         let takes = [take("TAKE", 60.0, (None, None))];
         let failed = [(job, "T4".to_string(), "archive copy: the disk is full".to_string()), (TakeJob::Originals, "T2".to_string(), "no room".to_string())];
-        let view = TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &failed, out_dir: None, idle: true };
+        let view = TakeToolsView { archive: &takes, originals: &takes, copies: &[], failed: &failed, out_dir: None, idle: true, ..Default::default() };
         let (text, _) = shown(&mut TakeTools { open: Some(TakeTool::Archive), ..Default::default() }, &view, None);
         assert!(text.contains("✗ T4: archive copy: the disk is full") && !text.contains("T2"), "{text}");
         let (text, _) = shown(&mut TakeTools { open: Some(TakeTool::Originals), ..Default::default() }, &view, None);
@@ -4908,6 +5000,10 @@ fn tr_zh(en: &'static str) -> &'static str {
             => "素材旁边这个名字的文件夹，也是软件查找增强帧和 Camera Raw 设置的地方。",
         "This clip is a lossy archive copy: the frames written are the copy's, close to what the sensor recorded but not the same."
             => "这个片段是有损存档副本：写出的是副本里的帧，接近传感器的记录，但不完全相同。",
+        "Lossy archive copies are among the ticked clips: the frames written of those are the copies', close to what the sensor recorded but not the same."
+            => "勾选的片段里有有损存档副本：它们写出的是副本里的帧，接近传感器的记录，但不完全相同。",
+        "This take" => "当前素材",
+        "Ticked takes" => "勾选的素材",
         "The take can now be moved away or deleted. That is yours to do: the app moves and deletes nothing. Once the take is gone the app reads its copy in its place, as long as the copy stays beside where the take was, or in the output folder."
             => "原素材现在可以移走或删除。这一步由你来做，软件不移动也不删除任何东西。原素材不在以后，软件会改读它的副本，前提是副本留在原素材原来位置的旁边，或者在输出文件夹里。",
         "The take this clip belongs to is not at hand: its archive copy is read in its place. When the take is back, it is read again."
@@ -7757,25 +7853,30 @@ impl App {
         self.begin_run(run);
     }
 
-    /// Start a run that writes the takes themselves ([`TakeRun`]): through
+    /// Start a run that writes the takes themselves ([`TakeRun`]), of the
+    /// clip on screen or of the ticked clips (`of`, the button clicked): through
     /// the export queue, so its progress, Skip and Stop, and the hand-over
     /// while the window is covered are those of any export. The queue's own
     /// state is put aside for the run and comes back when it is over
     /// ([`Self::end_take_run`]): what was exported, or waits to be, is not
     /// touched by it. Never joined: each take is written to a folder of its
     /// own.
-    fn start_take_run(&mut self, run: TakeRun) {
+    fn start_take_run(&mut self, run: TakeRun, of: TakeSet) {
         if self.export_job.is_some() || self.batch_running {
             return;
         }
         self.sync_active_clip_settings();
         self.end_take_run();
         for i in 0..self.batch.len() {
-            if self.batch[i].selected || self.active_clip == Some(i) {
+            let asked = match of {
+                TakeSet::OnScreen => self.active_clip == Some(i),
+                TakeSet::Ticked => self.batch[i].selected,
+            };
+            if asked {
                 self.settle_source(i);
             }
         }
-        let clips = take_clips(&self.batch, self.active_clip, run.job);
+        let clips = take_clips(&self.batch, self.active_clip, run.job, of);
         if clips.is_empty() {
             tracing::warn!("take run: no raw take to write");
             return;
@@ -7790,7 +7891,12 @@ impl App {
                 self.batch[i].copy = None;
             }
         }
-        tracing::info!("take run: {:?} of {} takes, {}", run.job, clips.len(), if run.whole { "whole" } else { "from In to Out" });
+        tracing::info!(
+            "take run: {:?} of {} takes ({}), {}",
+            run.job, clips.len(),
+            match of { TakeSet::OnScreen => "the clip on screen", TakeSet::Ticked => "the ticked clips" },
+            if run.whole { "whole" } else { "from In to Out" },
+        );
         self.take_run = Some(run);
         self.begin_run(clips);
     }
@@ -12829,34 +12935,40 @@ impl App {
 
     /// Under the facts of a raw take on screen, under a heading of their
     /// own: the two things written of the take itself ([`TakeJob`]), each
-    /// behind its button.
+    /// behind its button. A run is of the take on screen; the ticked takes
+    /// have a start button of their own beside it ([`take_buttons`]).
     fn draw_take_tools(&mut self, ui: &mut egui::Ui) {
         if !self.clip.as_ref().is_some_and(|c| c.source_kind.is_raw_video()) {
             return;
         }
-        let archive: Vec<TakeView> = take_clips(&self.batch, self.active_clip, TakeJob::Archive(None)).into_iter().map(|i| self.take_view(i)).collect();
-        let originals: Vec<TakeView> = take_clips(&self.batch, self.active_clip, TakeJob::Originals).into_iter().map(|i| self.take_view(i)).collect();
+        let views = |clips: Vec<usize>| -> Vec<TakeView> { clips.into_iter().map(|i| self.take_view(i)).collect() };
+        let (archive, archive_ticked) = take_buttons(&self.batch, self.active_clip, TakeJob::Archive(None));
+        let (originals, originals_ticked) = take_buttons(&self.batch, self.active_clip, TakeJob::Originals);
+        let (archive, archive_ticked, originals, originals_ticked) = (views(archive), views(archive_ticked), views(originals), views(originals_ticked));
         let copies: Vec<TakeCopy> = self.batch.iter().filter_map(|b| b.copy.clone()).collect();
         let failed: Vec<(TakeJob, String, String)> = self.batch.iter()
             .filter_map(|b| b.take_failed.as_ref().map(|(job, why)| (*job, clip_label(&b.path), why.clone())))
             .collect();
         let out_dir = self.batch_out_dir.as_deref().map(clip_label);
         let view = TakeToolsView {
-            archive: &archive, originals: &originals, copies: &copies, failed: &failed, out_dir: out_dir.as_deref(),
+            archive: &archive, originals: &originals, archive_ticked: &archive_ticked, originals_ticked: &originals_ticked,
+            copies: &copies, failed: &failed, out_dir: out_dir.as_deref(),
             idle: self.export_job.is_none() && !self.batch_running,
         };
         match Self::take_tools_ui(ui, &mut self.take_tools, &view) {
-            Some(TakeAsk::Start(run)) => self.start_take_run(run),
+            Some(TakeAsk::Start(run, of)) => self.start_take_run(run, of),
             Some(TakeAsk::Keep) => self.save_take_copy(),
             None => {}
         }
     }
 
     /// The take tools themselves: their heading, a button each, and under
-    /// the one that is open its choices, what a run would write of which take and what it
-    /// would leave out, where that goes, and the button that starts it.
-    /// Nothing here is an export choice: a run is started by its button,
-    /// for that run. Returns what was asked for.
+    /// the one that is open its choices, and then for the take on screen,
+    /// and for the ticked takes where there are any besides it: what a run
+    /// would write of which take and what it would leave out, where that
+    /// goes, and the button that starts that run, which says whose takes
+    /// it is of. Nothing here is an export choice: a run is started by its
+    /// button, for that run. Returns what was asked for.
     fn take_tools_ui(ui: &mut egui::Ui, tools: &mut TakeTools, view: &TakeToolsView) -> Option<TakeAsk> {
         let zh = cur_lang() == Lang::Zh;
         let note = |ui: &mut egui::Ui, text: &str| { ui.label(RichText::new(text).small().color(Color32::GRAY)); };
@@ -12876,13 +12988,18 @@ impl App {
             }
         });
         // The choice between In to Out and the whole take, where a trim
-        // makes them differ.
-        let range = |ui: &mut egui::Ui, whole: &mut bool, takes: &[TakeView]| {
-            if takes.iter().any(|t| t.written(false).2) {
+        // makes them differ for a take of either start button.
+        let range = |ui: &mut egui::Ui, whole: &mut bool, sets: [&[TakeView]; 2]| {
+            if sets.iter().any(|takes| takes.iter().any(|t| t.written(false).2)) {
                 ui.label(RichText::new(tr("Range")).strong());
                 ui.radio_value(whole, false, tr("In to Out"));
                 ui.radio_value(whole, true, tr("Whole take"));
             }
+        };
+        // Over the takes of each start button, where both are there: whose they are.
+        let heading = |ui: &mut egui::Ui, of: TakeSet| {
+            ui.add_space(4.0);
+            ui.label(RichText::new(tr(match of { TakeSet::OnScreen => TAKE_ON_SCREEN_TITLE, TakeSet::Ticked => TAKE_TICKED_TITLE })).strong());
         };
         // The takes of a run, one by one, with what is written of each.
         let listed = |ui: &mut egui::Ui, whole: bool, takes: &[TakeView]| {
@@ -12900,20 +13017,20 @@ impl App {
                 ui.label(RichText::new(format!("✗ {name}: {}", take_failed_text(why, zh))).small().color(Color32::from_rgb(230, 110, 110)));
             }
         };
-        let start = |ui: &mut egui::Ui, job: TakeJob, n: usize| -> bool {
-            ui.add_enabled(view.idle, egui::Button::new(RichText::new(take_start_label(job, n, zh)).strong()))
+        let start = |ui: &mut egui::Ui, job: TakeJob, of: TakeSet, n: usize| -> bool {
+            ui.add_enabled(view.idle, egui::Button::new(RichText::new(take_start_label(job, of, n, zh)).strong()).wrap())
                 .on_disabled_hover_text(tr(TAKE_BUSY_HOVER))
                 .clicked()
         };
         match tools.open {
             Some(TakeTool::Archive) => {
                 ui.add_space(2.0);
-                if view.archive.is_empty() {
-                    // (No camera's take among them: copies, or a take whose description did not read.)
-                    if view.originals.iter().any(|t| t.copy) {
-                        note(ui, tr(TAKE_COPY_SOURCE_NOTE));
-                    }
-                } else {
+                let sets = [(TakeSet::OnScreen, view.archive), (TakeSet::Ticked, view.archive_ticked)];
+                // (No copy of the clip on screen: it is a copy itself, or a take whose description did not read.)
+                if view.archive.is_empty() && view.originals.iter().any(|t| t.copy) {
+                    note(ui, tr(TAKE_COPY_SOURCE_NOTE));
+                }
+                if sets.iter().any(|(_, takes)| !takes.is_empty()) {
                     let before = (tools.size, tools.bits);
                     ui.radio_value(&mut tools.size, ArchiveSize::Lossless, tr(TAKE_EXACT_LABEL));
                     ui.radio_value(&mut tools.size, ArchiveSize::HighQuality, tr("High quality: 1 bit a pixel"));
@@ -12926,25 +13043,38 @@ impl App {
                     }
                     note(ui, tr(TAKE_ARCHIVE_NOTE));
                     note(ui, tr(if tools.archive_bits().is_none() { TAKE_EXACT_NOTE } else { TAKE_LOSSY_NOTE }));
-                    if let Some(text) = take_corners_note(view.archive, zh) {
+                    let all: Vec<TakeView> = view.archive.iter().chain(view.archive_ticked).cloned().collect();
+                    if let Some(text) = take_corners_note(&all, zh) {
                         note(ui, &text);
                     }
                     ui.add_space(4.0);
-                    range(ui, &mut tools.archive_whole, view.archive);
-                    let run = tools.archive_run(view.archive);
-                    let (whole, bits) = (run.whole, tools.archive_bits());
-                    listed(ui, whole, view.archive);
-                    if !whole {
-                        if let Some(text) = take_cut_warning(view.archive, zh) {
-                            warn(ui, &text);
-                            note(ui, tr(TAKE_STRETCH_NOTE));
+                    range(ui, &mut tools.archive_whole, [view.archive, view.archive_ticked]);
+                    let (both, bits) = (sets.iter().all(|(_, takes)| !takes.is_empty()), tools.archive_bits());
+                    // (What a copy of a stretch is: said once.)
+                    let mut stretch_said = false;
+                    for (of, takes) in sets {
+                        if takes.is_empty() {
+                            continue;
                         }
-                    }
-                    note(ui, &take_sizes_text(view.archive, whole, bits, zh));
-                    note(ui, &take_place_text(view.archive, run.job, view.out_dir, zh));
-                    ui.add_space(2.0);
-                    if start(ui, run.job, view.archive.len()) {
-                        ask = Some(TakeAsk::Start(run));
+                        if both {
+                            heading(ui, of);
+                        }
+                        let run = tools.archive_run(takes);
+                        listed(ui, run.whole, takes);
+                        if !run.whole {
+                            if let Some(text) = take_cut_warning(takes, zh) {
+                                warn(ui, &text);
+                                if !std::mem::replace(&mut stretch_said, true) {
+                                    note(ui, tr(TAKE_STRETCH_NOTE));
+                                }
+                            }
+                        }
+                        note(ui, &take_sizes_text(takes, run.whole, bits, zh));
+                        note(ui, &take_place_text(takes, run.job, view.out_dir, zh));
+                        ui.add_space(2.0);
+                        if start(ui, run.job, of, takes.len()) {
+                            ask = Some(TakeAsk::Start(run, of));
+                        }
                     }
                 }
                 failed(ui, true);
@@ -12958,25 +13088,39 @@ impl App {
                 }
                 ui.add_space(4.0);
             }
-            Some(TakeTool::Originals) if !view.originals.is_empty() => {
+            Some(TakeTool::Originals) if !view.originals.is_empty() || !view.originals_ticked.is_empty() => {
                 ui.add_space(2.0);
                 note(ui, tr(TAKE_ORIGINALS_NOTE));
-                if view.originals.iter().any(|t| t.lossy_copy) {
-                    warn(ui, tr(TAKE_LOSSY_SOURCE_NOTE));
+                let sets = [(TakeSet::OnScreen, view.originals, TAKE_LOSSY_SOURCE_NOTE), (TakeSet::Ticked, view.originals_ticked, TAKE_LOSSY_TICKED_NOTE)];
+                for (_, takes, lossy) in sets {
+                    if takes.iter().any(|t| t.lossy_copy) {
+                        warn(ui, tr(lossy));
+                    }
                 }
                 ui.add_space(4.0);
-                range(ui, &mut tools.originals_whole, view.originals);
-                let run = tools.originals_run(view.originals);
-                listed(ui, run.whole, view.originals);
-                let frames: u64 = view.originals.iter().map(|t| { let (from, to, _) = t.written(run.whole); ((to - from) * t.fps as f64).round() as u64 }).sum();
-                note(ui, &if zh { format!("共 {frames} 帧") } else { format!("{frames} frames") });
-                note(ui, &take_place_text(view.originals, run.job, view.out_dir, zh));
-                if view.out_dir.is_none() {
-                    note(ui, tr(TAKE_ORIGINALS_PLACE_NOTE));
-                }
-                ui.add_space(2.0);
-                if start(ui, run.job, view.originals.len()) {
-                    ask = Some(TakeAsk::Start(run));
+                range(ui, &mut tools.originals_whole, [view.originals, view.originals_ticked]);
+                let both = sets.iter().all(|(_, takes, _)| !takes.is_empty());
+                // (What else the folder beside a take is for: said once.)
+                let mut place_said = view.out_dir.is_some();
+                for (of, takes, _) in sets {
+                    if takes.is_empty() {
+                        continue;
+                    }
+                    if both {
+                        heading(ui, of);
+                    }
+                    let run = tools.originals_run(takes);
+                    listed(ui, run.whole, takes);
+                    let frames: u64 = takes.iter().map(|t| { let (from, to, _) = t.written(run.whole); ((to - from) * t.fps as f64).round() as u64 }).sum();
+                    note(ui, &if zh { format!("共 {frames} 帧") } else { format!("{frames} frames") });
+                    note(ui, &take_place_text(takes, run.job, view.out_dir, zh));
+                    if !std::mem::replace(&mut place_said, true) {
+                        note(ui, tr(TAKE_ORIGINALS_PLACE_NOTE));
+                    }
+                    ui.add_space(2.0);
+                    if start(ui, run.job, of, takes.len()) {
+                        ask = Some(TakeAsk::Start(run, of));
+                    }
                 }
                 failed(ui, false);
                 ui.add_space(4.0);

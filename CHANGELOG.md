@@ -125,11 +125,13 @@ picture, the order of the eyes and the stabilization were right with the
   take: no size, grade, stabilization or noise reduction applies to them,
   and what they write is read again as a source. Each has its own button
   under the take's facts, under the heading RAW Footage Archiving
-  (**Compressed archive** and **Camera original DNGs**). It runs for the
-  ticked takes, or for the one on
-  screen, from In to Out or whole, through the export queue (progress,
-  Skip and Stop in the export bar), and leaves what was exported or waits
-  to be as it found it. Export format keeps the take's views: a video, or
+  (**Compressed archive** and **Camera original DNGs**). A run is of the
+  take on screen, and its start button says so; takes ticked in the list
+  besides it have a start button of their own under it, each with what
+  would be written of its takes. A run goes from In to Out or whole,
+  through the export queue (progress, Skip and Stop in the export bar),
+  and leaves what was exported or waits to be as it found it. Export
+  format keeps the take's views: a video, or
   the developed view as a DNG sequence, so Export never writes anything
   else. A project saved with Camera original picked exports a video
   again.

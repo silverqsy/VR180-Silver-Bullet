@@ -5186,8 +5186,14 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       run would write with what is written of each, where the folders go,
       and the button that starts the run. `take_tools_ui` is a function of
       its view (`TakeToolsView`) so the tests paint and click it. A run is
-      for the ticked takes it applies to, else the take on screen
-      (`take_clips`; an archive copy is made of a camera's take only).
+      of the take on screen, and the ticked takes have a start button of
+      their own under it, each button saying whose takes its run is of
+      (`TakeSet`, `take_buttons`, `take_clips`; an archive copy is made of
+      a camera's take only). Until then the ticked takes won over the one
+      on screen: the tools stand under the facts of the take on screen, and
+      a tick kept from an earlier launch sent a run to another take. The
+      export bar's "Export selected" keeps its rule (the ticked clips, else
+      the one on screen).
       Export format keeps a raw take's views: a video, or "DNG sequence",
       now the developed view alone. `ExportOptions` lost `raw_archive*` and
       `raw_dng_original`; a file of 2.6.0 that had Camera original picked
