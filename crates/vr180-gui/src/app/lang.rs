@@ -643,14 +643,6 @@ pub(super) fn install_cjk_font(ctx: &egui::Context) {
 }
 
 impl App {
-    /// Pick an output path and spawn the export worker. No-op if no
-    /// clip is loaded, an export is already in flight, or the source
-    /// is GoPro EAC (the existing CLI handles that family).
-    /// Top-toolbar Export button — opens the options window. The actual
-    /// export kicks off from `commit_export()` once the user confirms.
-    /// Export just the ACTIVE clip — a "batch of one". Routes through the
-    /// SAME queue runner as "Export all": a single export is a one-item run,
-    /// so there's one code path, one set of output settings, one progress UI.
     /// `…/VR180SilverBullet2.0/lang` — the UI-language preference file.
     pub(super) fn lang_config_path() -> Option<PathBuf> {
         crate::decoder::Settings::config_path()

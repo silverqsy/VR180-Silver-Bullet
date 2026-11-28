@@ -20,58 +20,63 @@ use crate::decoder::{
     DecodedFrame, DecoderCommand, DecoderConfig, DecoderControl, Settings, start_decoder,
 };
 
+// The app in parts. A part is a module of `app`, and what it holds goes by
+// its name here as it did when the parts were one file.
+mod clip_info;
+mod clips;
+mod dialogs;
+mod display_3d;
+mod export_options;
+mod export_run;
+mod joined;
+mod lang;
+mod load;
+mod panel_colour;
+mod panel_lens;
+mod panels;
+mod playback;
+mod session;
+mod snapshot;
+mod take_tools;
+
+use clip_info::*;
+use clips::*;
+use dialogs::*;
+use display_3d::*;
+pub(crate) use export_options::*;
+use export_run::*;
+use joined::*;
+use lang::*;
+use load::*;
 #[cfg(test)]
-mod file_info_tests;
+use panel_colour::*;
+use panels::*;
+use playback::*;
+use session::*;
+use snapshot::*;
+use take_tools::*;
+
 #[cfg(test)]
-mod export_size_tests;
-#[cfg(test)]
-mod join_and_project_tests;
-#[cfg(test)]
-mod take_tests;
+mod camera_raw_tests;
 #[cfg(test)]
 mod ettr_tests;
 #[cfg(test)]
-mod spatial_export_tests;
+mod export_size_tests;
+#[cfg(test)]
+mod file_info_tests;
+#[cfg(test)]
+mod join_and_project_tests;
 #[cfg(test)]
 mod reframe_bitrate_tests;
 #[cfg(test)]
-mod camera_raw_tests;
-mod lang;
-use lang::*;
-mod take_tools;
-use take_tools::*;
-mod export_options;
-pub(crate) use export_options::*;
-mod clips;
-use clips::*;
-mod joined;
-use joined::*;
-mod export_run;
-use export_run::*;
-mod session;
-use session::*;
-mod load;
-use load::*;
-mod clip_info;
-use clip_info::*;
-mod playback;
-use playback::*;
-mod display_3d;
-use display_3d::*;
-mod snapshot;
-use snapshot::*;
-mod dialogs;
-use dialogs::*;
-mod panels;
-use panels::*;
-mod panel_colour;
+mod spatial_export_tests;
 #[cfg(test)]
-use panel_colour::*;
-mod panel_lens;
+mod take_tests;
 
 /// The app's project file: the list with the export bar's choices.
 type Project = crate::project::Project<ExportOptions>;
 
+/// The single egui application.
 pub struct App {
     /// The UI context, handed to decoder workers so they can repaint the
     /// window when a frame lands (`DecoderControl::wake_ui`).

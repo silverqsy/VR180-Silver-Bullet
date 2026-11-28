@@ -2,8 +2,6 @@
 
 use super::*;
 
-/// The single egui application.
-
 /// What a worker-thread file picker came back with. One variant per call
 /// site; `Cancelled` covers the user dismissing the panel.
 pub(super) enum DialogResult {
