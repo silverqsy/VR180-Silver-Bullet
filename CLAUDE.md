@@ -5614,6 +5614,26 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       circle is the take's, each outside is 64.
     - The local export harness names a joined part's source as
       `join::PartSource` now (gitignored, it no longer compiled).
+    - **MAC SIDE PULLED IT (2026-11-28, Mac):** fast-forward `cf1336f` to
+      `fde40ae`, the five Windows commits: the 2.6.0 status line, the
+      archive copy's encoders and decoders in `raw_archive.rs`, the done
+      mark, two of notes. It builds; tests braw 6, core 63, fisheye 87,
+      gui 91, pipeline 313. No line inside a macOS-gated item changed.
+      What of it a Mac runs, checked here:
+      - Both encoders a Mac has write pictures its hardware reads. Four
+        planes of 1920² and of 2880² through `hevc_videotoolbox` and
+        through `libx265` with the new interval: each picture an IDR with
+        its parameter sets, read back with `NO_HARDWARE` still unset, 4 ms
+        and 8 ms for the four once the decoders are open. `pick_format`
+        takes VideoToolbox's format for a VideoToolbox device as before.
+      - The real-take tests (`VR180_ARCHIVE_TAKE`, the pipeline's two and
+        the app's one) pass on a 5760 take of two lenses and on a
+        one-lens take, the copy of a stretch with its window among them.
+      - The stored lists were not run: none of them makes or reads an
+        archive copy, and the rest of the range is the mark's string.
+      The CHANGELOG has the preview's in and out points now (it had no
+      entry for the two fixes of 2026-11-27). The sound at the jump back
+      has not been listened to on either system.
 
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app

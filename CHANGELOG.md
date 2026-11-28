@@ -189,6 +189,18 @@ picture, the order of the eyes and the stabilization were right with the
   Lens Space clips of which one is stabilized the note says that this is
   what sets them apart.
 
+### Preview: the in and out points
+
+- **After the out point.** A click on the timeline after the out point
+  shows that part of the clip, and playback started there runs on through
+  it, so a later out point can be looked for. Until now the preview went
+  back to the in point at once, and setting the out point on a paused
+  frame did the same. Only playback that began at the out point or before
+  it goes back to the in point there; a paused frame stays on screen.
+- **The sound goes back with the picture.** When playback reached the out
+  point and went back to the in point, the sound played on past the out
+  point. It goes back with the picture now.
+
 ## 2.6.0 — 2026-11-24
 
 ### Insta360 X6: raw video
