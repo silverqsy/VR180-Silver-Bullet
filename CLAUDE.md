@@ -5547,6 +5547,74 @@ URL), toolbar badge + popover UX, whole-`.app` swap + relaunch on macOS
       through the muxer named in the code (item 20), so both are written
       with this box's FFmpeg.
 
+54. **The commits of 2026-11-26 to 28 on Windows (2026-11-28, Windows box,
+    RTX 4090; UNRELEASED).** Pulled `f665037` → `cf1336f`, six commits: the
+    Lens Space sizes of enhanced frames (item 34), a joined run planned at
+    the frame written and enhanced frames in every clip or in none (item
+    36), the preview's out point, the probe's in and out points, the Source
+    panel's two start buttons (item 50). The four Windows commits of
+    2026-11-25 were rebased onto them (one conflict, a test line of
+    `app.rs`: the Mac's `..Default::default()` with the heavy check mark).
+    It builds as pushed and no code was changed for it. Tests: braw 6, core
+    63, fisheye 88, gui 93, pipeline 323 of 324 with the GPU ones (the one
+    is the fingerprint tool).
+    - **Nothing that was there moved.** The 61 exports of the A/B set are
+      byte-identical per stream to the build of 2026-11-25, with the same
+      engagements of a fast arm, and the 36 preview-probe cases print the
+      same lines.
+    - **The preview's out point** (`bce85a8`, `dff59c7`, `3140344`; this
+      file had no note of them). `decoder::trim_loop_target` is the one
+      rule of the five preview loops: playback that began at the out
+      point's frame or before it goes back to the in point there; a paused
+      frame stays on screen; playback started after the out point runs on.
+      The worker hands the jump to the UI (`DecoderControl::note_trim_loop`,
+      `take_trim_loop` in `drain_frames`), which takes the sound there too;
+      a seek made meanwhile overtakes it. `VR180_PROBE_TRIM=<in>,<out>` sets
+      the two points for the probe. ON WINDOWS: the two Windows-only loops
+      (`run_fisheye_zerocopy`, `run_eac_zerocopy`) got the edit by text and
+      compile. Probe, in 0.5 and out 1.2 s, moments 0.8 / 1.2 / 1.6 / 2.4 s:
+      a frame for every moment on the D3D11 worker (X6, Osmo, QooCam), the
+      EAC worker, the CPU loop (the X6 clip decoded in software, a raw
+      take, Blackmagic RAW) and the `.360` CPU loop. In the app: an X6 clip
+      trimmed to 5.0–6.5 s goes back to the in point every 1.48 to 1.51 s
+      of play (six times in nine seconds; the log says "preview: out point
+      reached"), a `.360` clip trimmed to 80.0–81.5 s every 1.50 s on the
+      EAC worker; a click on the timeline at 12 s, after the out point,
+      shows that frame, and four seconds of play from there end at 16.18 s
+      with no jump back. The sound's jump was not listened to (it is the
+      seek a click on the timeline sends).
+    - **A joined run with raw takes** (item 36's check job, which the Mac
+      had read and not run). In the app, two takes (3840² at 60, each with
+      a folder of camera-original frames beside it) as one file: the run's
+      first job looks through the folders (0.5 ms: this system reads no
+      enhanced frames, `enhanced_dng::decodable()`, so "the parts read the
+      capture"), the two parts go through NVENC (60 frames each, 17 a
+      second), and the joined file is 8192 × 4096, 120 frames, stereo, its
+      parts' folder gone.
+    - **Lens Space sizes.** For a raw take in the Lens Space view the
+      Format window lists the frame with its margin (8448 × 4224) and the
+      size held to the encoder (8192 × 4096), no larger one, and has its
+      one line on enhanced frames. A configuration that asks for a larger
+      size all the same (a project made on a Mac), through the harness
+      with the folder set and 8192 or 6560 an eye asked for: written at the
+      size picked without enhanced frames (a stabilized lens frame 8192 ×
+      4096, an unstabilized one 7680 × 3840, the VR180 view 8192 × 4096),
+      with the bar's note "no enhanced frames for this stretch". On Windows
+      the whole reason is that none can be read: the note is left as it is.
+    - **The Source panel's buttons.** One take on screen and another
+      ticked: both headings and both start buttons are there; "this take"
+      writes the take on screen alone (log: "of 1 takes (the clip on
+      screen)"), "1 ticked take" the ticked one alone; both copies went to
+      the output folder, nothing beside the takes, and the done mark is
+      drawn before each.
+    - **An archive copy made on a Mac reads on Windows.** A lossless copy
+      of a stretch (11442 pairs of a 3840² 60 fps take, 89 GB), every 97th
+      pair of it, 118 pairs: numbers, stamps and integration times are the
+      take's, each of the 3.02 thousand million samples inside the image
+      circle is the take's, each outside is 64.
+    - The local export harness names a joined part's source as
+      `join::PartSource` now (gitignored, it no longer compiled).
+
 27. **2.5.5 release (2026-11-07, Mac) — PUBLISHED: tag `v2.5.5` @ `90f11b7`
    (`gh release edit v2.5.5 --draft=false --latest`; assets = DMG + mac app
    zip + darwin-only `latest.json`, live at `releases/latest/download/latest.json`
